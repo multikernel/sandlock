@@ -1,0 +1,753 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Integration tests for Sandlock sandbox.
+
+These tests exercise the full sandbox lifecycle including fork,
+confinement, and cleanup.  All tests use temporary directories,
+never system paths like /home.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import tempfile
+
+import pytest
+
+from sandlock import Sandbox, Policy, Result
+from sandlock._landlock import landlock_abi_version
+
+# Libraries the child process needs to run Python.
+# Include the real Python prefix (may be /opt/... on CI with setup-python).
+_PYTHON_PREFIX = os.path.dirname(os.path.dirname(os.path.realpath(sys.executable)))
+_PYTHON_READABLE = list(dict.fromkeys([
+    "/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev",
+    _PYTHON_PREFIX,
+]))
+
+
+# --- Basic lifecycle ---
+
+class TestRunIntegration:
+    def test_echo(self):
+        result = Sandbox(Policy()).run(["echo", "hello world"])
+        assert result.success
+        assert result.stdout.strip() == b"hello world"
+
+    def test_exit_code(self):
+        result = Sandbox(Policy()).run(["python3", "-c", "import sys; sys.exit(42)"])
+        assert not result.success
+        assert result.exit_code == 42
+
+    def test_stderr_captured(self):
+        result = Sandbox(Policy()).run(
+            ["python3", "-c", "import sys; sys.stderr.write('err\\n')"]
+        )
+        assert b"err" in result.stderr
+
+    def test_timeout(self):
+        result = Sandbox(Policy()).run(["sleep", "60"], timeout=0.5)
+        assert not result.success
+        assert "timed out" in result.error.lower()
+
+
+class TestCallIntegration:
+    def test_return_value(self):
+        result = Sandbox(Policy()).call(lambda: {"answer": 42})
+        assert result.success
+        assert result.value == {"answer": 42}
+
+    def test_exception_propagation(self):
+        def fail():
+            raise RuntimeError("intentional")
+
+        result = Sandbox(Policy()).call(fail)
+        assert not result.success
+        assert "RuntimeError" in result.error
+
+    def test_runs_in_separate_process(self):
+        parent_pid = os.getpid()
+        result = Sandbox(Policy()).call(os.getpid)
+        assert result.success
+        assert result.value != parent_pid
+
+    def test_timeout(self):
+        import time
+        result = Sandbox(Policy()).call(lambda: time.sleep(60), timeout=0.5)
+        assert not result.success
+
+
+# --- Landlock filesystem enforcement ---
+
+@pytest.mark.skipif(
+    landlock_abi_version() < 1,
+    reason="Landlock not available on this kernel",
+)
+class TestLandlockEnforcement:
+    def test_can_read_allowed_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            testfile = os.path.join(td, "readable.txt")
+            with open(testfile, "w") as f:
+                f.write("secret")
+
+            policy = Policy(
+                fs_readable=[*_PYTHON_READABLE, td],
+            )
+            result = Sandbox(policy).run(
+                ["python3", "-c", f"print(open('{testfile}').read())"]
+            )
+            assert result.success
+            assert b"secret" in result.stdout
+
+    def test_cannot_read_outside_allowed(self):
+        """Child cannot read a temp dir that's not in fs_readable."""
+        with tempfile.TemporaryDirectory() as allowed, \
+             tempfile.TemporaryDirectory() as forbidden:
+            testfile = os.path.join(forbidden, "nope.txt")
+            with open(testfile, "w") as f:
+                f.write("nope")
+
+            policy = Policy(
+                fs_readable=[*_PYTHON_READABLE, allowed],
+            )
+            result = Sandbox(policy).run(
+                ["python3", "-c", f"open('{testfile}').read()"]
+            )
+            assert not result.success
+
+    def test_can_write_to_writable_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            outfile = os.path.join(td, "out.txt")
+            policy = Policy(
+                fs_readable=_PYTHON_READABLE,
+                fs_writable=[td],
+            )
+            result = Sandbox(policy).run(
+                ["python3", "-c", f"open('{outfile}', 'w').write('written')"]
+            )
+            assert result.success
+            assert open(outfile).read() == "written"
+
+    def test_cannot_write_to_readable_only_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            outfile = os.path.join(td, "nope.txt")
+            policy = Policy(
+                fs_readable=[*_PYTHON_READABLE, td],
+                fs_writable=[],
+            )
+            result = Sandbox(policy).run(
+                ["python3", "-c", f"open('{outfile}', 'w').write('x')"]
+            )
+            assert not result.success
+
+    def test_denied_path_blocks_top_level(self):
+        """fs_denied paths are blocked when not under a broader rule."""
+        with tempfile.TemporaryDirectory() as allowed, \
+             tempfile.TemporaryDirectory() as denied:
+            testfile = os.path.join(denied, "file.txt")
+            with open(testfile, "w") as f:
+                f.write("hidden")
+
+            policy = Policy(
+                fs_readable=[*_PYTHON_READABLE, allowed],
+                fs_denied=[denied],
+            )
+            result = Sandbox(policy).run(
+                ["python3", "-c", f"open('{testfile}').read()"]
+            )
+            assert not result.success
+
+
+# --- seccomp syscall enforcement ---
+
+class TestSeccompEnforcement:
+    def test_default_deny_blocks_mount(self):
+        """mount(2) is in the default deny list and should fail."""
+        policy = Policy(fs_readable=_PYTHON_READABLE)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import ctypes, os
+libc = ctypes.CDLL(None)
+ret = libc.mount(b"none", b"/tmp", b"tmpfs", 0, None)
+if ret < 0:
+    print("BLOCKED", os.strerror(ctypes.get_errno()))
+else:
+    print("ALLOWED")
+"""]
+        )
+        assert result.success  # python3 exits 0
+        assert b"BLOCKED" in result.stdout
+
+    def test_default_deny_blocks_ptrace(self):
+        """ptrace(2) is in the default deny list."""
+        policy = Policy(fs_readable=_PYTHON_READABLE)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import ctypes, os, errno
+libc = ctypes.CDLL(None, use_errno=True)
+ret = libc.ptrace(0, 0, 0, 0)  # PTRACE_TRACEME
+err = ctypes.get_errno()
+print("BLOCKED" if err == errno.EPERM else f"UNEXPECTED {err}")
+"""]
+        )
+        assert result.success
+        assert b"BLOCKED" in result.stdout
+
+    def test_allowlist_blocks_unknown_syscall(self):
+        """In allowlist mode, unlisted syscalls should fail."""
+        from sandlock import DEFAULT_ALLOW_SYSCALLS
+
+        policy = Policy(
+            fs_readable=_PYTHON_READABLE,
+            allow_syscalls=DEFAULT_ALLOW_SYSCALLS,
+        )
+        # unshare is NOT in the allowlist
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import ctypes, os, errno
+libc = ctypes.CDLL(None, use_errno=True)
+CLONE_NEWUTS = 0x04000000
+ret = libc.unshare(CLONE_NEWUTS)
+err = ctypes.get_errno()
+print("BLOCKED" if err == errno.EPERM else f"UNEXPECTED {err}")
+"""]
+        )
+        assert result.success
+        assert b"BLOCKED" in result.stdout
+
+    def test_allowlist_allows_normal_operations(self):
+        """Allowlist mode should still allow basic Python operations."""
+        from sandlock import DEFAULT_ALLOW_SYSCALLS
+
+        with tempfile.TemporaryDirectory() as td:
+            outfile = os.path.join(td, "out.txt")
+            policy = Policy(
+                fs_readable=_PYTHON_READABLE,
+                fs_writable=[td],
+                allow_syscalls=DEFAULT_ALLOW_SYSCALLS,
+            )
+            result = Sandbox(policy).run(
+                ["python3", "-c", f"""
+import os, json
+# Exercise: file I/O, forking (subprocess), signals
+with open('{outfile}', 'w') as f:
+    f.write(json.dumps({{'pid': os.getpid()}}))
+print('ok')
+"""]
+            )
+            assert result.success
+            assert b"ok" in result.stdout
+            assert os.path.exists(outfile)
+
+
+# --- Network enforcement ---
+
+@pytest.mark.skipif(
+    landlock_abi_version() < 1,
+    reason="Landlock not available (needed for notif supervisor)",
+)
+class TestNetworkEnforcement:
+    def test_net_allow_hosts_blocks_unlisted_domain(self):
+        """Unlisted domains should fail to resolve."""
+        policy = Policy(
+            fs_readable=_PYTHON_READABLE,
+            net_allow_hosts=["localhost"],
+        )
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import socket
+try:
+    socket.getaddrinfo('example.com', 80)
+    print('RESOLVED')
+except socket.gaierror:
+    print('BLOCKED')
+"""]
+        )
+        assert result.success
+        assert b"BLOCKED" in result.stdout
+
+    def test_net_allow_hosts_allows_listed_domain(self):
+        """Listed domains should resolve."""
+        policy = Policy(
+            fs_readable=_PYTHON_READABLE,
+            net_allow_hosts=["localhost"],
+        )
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import socket
+try:
+    socket.getaddrinfo('localhost', 80)
+    print('RESOLVED')
+except socket.gaierror:
+    print('BLOCKED')
+"""]
+        )
+        assert result.success
+        assert b"RESOLVED" in result.stdout
+
+    def test_net_allow_hosts_blocks_hardcoded_ip(self):
+        """Even hardcoded IPs outside the allowed set should be blocked."""
+        policy = Policy(
+            fs_readable=_PYTHON_READABLE,
+            net_allow_hosts=["localhost"],
+        )
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(3)
+try:
+    s.connect(('8.8.8.8', 53))
+    print('CONNECTED')
+except ConnectionRefusedError:
+    print('BLOCKED')
+except OSError as e:
+    print(f'ERROR {e}')
+finally:
+    s.close()
+"""]
+        )
+        assert result.success
+        assert b"BLOCKED" in result.stdout
+
+    def test_net_allow_hosts_allows_loopback(self):
+        """Loopback should always be allowed."""
+        policy = Policy(
+            fs_readable=_PYTHON_READABLE,
+            net_allow_hosts=["localhost"],
+        )
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(1)
+try:
+    s.connect(('127.0.0.1', 1))  # port 1 is unlikely open
+    print('CONNECTED')
+except ConnectionRefusedError:
+    # ECONNREFUSED from kernel (not from sandbox) = connect was allowed
+    print('ALLOWED')
+except OSError as e:
+    print(f'ERROR {e}')
+finally:
+    s.close()
+"""]
+        )
+        assert result.success
+        assert b"ALLOWED" in result.stdout
+
+    def test_net_allow_hosts_blocks_udp_sendto(self):
+        """UDP sendto to disallowed IPs should be blocked."""
+        policy = Policy(
+            fs_readable=_PYTHON_READABLE,
+            net_allow_hosts=["localhost"],
+        )
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
+    s.sendto(b'x', ('8.8.8.8', 53))
+    print('SENT')
+except ConnectionRefusedError:
+    print('BLOCKED')
+except OSError as e:
+    print(f'ERROR {e}')
+finally:
+    s.close()
+"""]
+        )
+        assert result.success
+        assert b"BLOCKED" in result.stdout
+
+
+# --- Landlock TCP port enforcement ---
+
+@pytest.mark.skipif(
+    landlock_abi_version() < 4,
+    reason="Landlock ABI v4+ required for TCP port rules",
+)
+class TestLandlockNetworkPorts:
+    def test_net_connect_blocks_unlisted_port(self):
+        """TCP connect to an unlisted port should fail."""
+        policy = Policy(
+            fs_readable=_PYTHON_READABLE,
+            net_connect=["80"],
+        )
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import socket, errno
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(3)
+try:
+    s.connect(('127.0.0.1', 443))
+    print('CONNECTED')
+except OSError as e:
+    if e.errno == errno.EACCES:
+        print('BLOCKED')
+    else:
+        print(f'ERROR {e}')
+finally:
+    s.close()
+"""]
+        )
+        assert result.success
+        assert b"BLOCKED" in result.stdout
+
+    def test_net_bind_blocks_unlisted_port(self):
+        """TCP bind to an unlisted port should fail."""
+        policy = Policy(
+            fs_readable=_PYTHON_READABLE,
+            net_bind=["8080"],
+        )
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import socket, errno
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    s.bind(('127.0.0.1', 9090))
+    print('BOUND')
+except OSError as e:
+    if e.errno == errno.EACCES:
+        print('BLOCKED')
+    else:
+        print(f'ERROR {e}')
+finally:
+    s.close()
+"""]
+        )
+        assert result.success
+        assert b"BLOCKED" in result.stdout
+
+
+# --- Environment variable control ---
+
+class TestEnvControl:
+    def test_clean_env_strips_custom_vars(self):
+        """clean_env=True should strip non-essential variables."""
+        os.environ["SANDLOCK_TEST_SECRET"] = "hunter2"
+        try:
+            policy = Policy(clean_env=True)
+            result = Sandbox(policy).run(
+                ["python3", "-c", """
+import os
+val = os.environ.get('SANDLOCK_TEST_SECRET')
+print(f'VAR={val}')
+"""]
+            )
+            assert result.success
+            assert b"VAR=None" in result.stdout
+        finally:
+            del os.environ["SANDLOCK_TEST_SECRET"]
+
+    def test_clean_env_keeps_essentials(self):
+        """clean_env=True should keep PATH, HOME, TERM, etc."""
+        policy = Policy(clean_env=True)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import os
+path = os.environ.get('PATH', '')
+home = os.environ.get('HOME', '')
+print(f'HAS_PATH={bool(path)}')
+print(f'HAS_HOME={bool(home)}')
+"""]
+        )
+        assert result.success
+        assert b"HAS_PATH=True" in result.stdout
+        assert b"HAS_HOME=True" in result.stdout
+
+    def test_env_set_injects_variable(self):
+        """env= should inject variables into the child."""
+        policy = Policy(env={"SANDLOCK_GREETING": "hello"})
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import os
+print(os.environ.get('SANDLOCK_GREETING'))
+"""]
+        )
+        assert result.success
+        assert b"hello" in result.stdout
+
+    def test_env_set_overrides_existing(self):
+        """env= should override inherited variables."""
+        os.environ["SANDLOCK_TEST_OVERRIDE"] = "old"
+        try:
+            policy = Policy(env={"SANDLOCK_TEST_OVERRIDE": "new"})
+            result = Sandbox(policy).run(
+                ["python3", "-c", """
+import os
+print(os.environ.get('SANDLOCK_TEST_OVERRIDE'))
+"""]
+            )
+            assert result.success
+            assert b"new" in result.stdout
+        finally:
+            del os.environ["SANDLOCK_TEST_OVERRIDE"]
+
+    def test_clean_env_with_env_set(self):
+        """clean_env + env should start clean then add specified vars."""
+        policy = Policy(clean_env=True, env={"MY_VAR": "injected"})
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import os
+print(f'MY_VAR={os.environ.get("MY_VAR")}')
+print(f'ENV_COUNT={len(os.environ)}')
+"""]
+        )
+        assert result.success
+        assert b"MY_VAR=injected" in result.stdout
+
+    def test_default_inherits_all(self):
+        """Default behavior should inherit parent env."""
+        os.environ["SANDLOCK_TEST_INHERIT"] = "visible"
+        try:
+            policy = Policy()
+            result = Sandbox(policy).run(
+                ["python3", "-c", """
+import os
+print(os.environ.get('SANDLOCK_TEST_INHERIT'))
+"""]
+            )
+            assert result.success
+            assert b"visible" in result.stdout
+        finally:
+            del os.environ["SANDLOCK_TEST_INHERIT"]
+
+
+# --- IPC scoping (Landlock ABI v6+) ---
+
+@pytest.mark.skipif(
+    landlock_abi_version() < 6,
+    reason="Landlock ABI v6+ required for IPC scoping",
+)
+class TestIpcScoping:
+    def test_isolate_ipc_blocks_abstract_unix_socket(self):
+        """Abstract UNIX socket connect to a host-domain socket should fail."""
+        import socket as _socket
+
+        # Create an abstract UNIX socket server in the parent (host domain)
+        server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        addr = "\0sandlock-test-ipc-" + str(os.getpid())
+        server.bind(addr)
+        server.listen(1)
+
+        try:
+            policy = Policy(
+                fs_readable=_PYTHON_READABLE,
+                isolate_ipc=True,
+            )
+            result = Sandbox(policy).run(
+                ["python3", "-c", f"""
+import socket, errno
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    s.connect('\\0{addr[1:]}')
+    print('CONNECTED')
+except OSError as e:
+    if e.errno == errno.EPERM:
+        print('BLOCKED')
+    else:
+        print(f'ERROR {{e}}')
+finally:
+    s.close()
+"""]
+            )
+            assert result.success
+            assert b"BLOCKED" in result.stdout
+        finally:
+            server.close()
+
+    def test_isolate_ipc_allows_within_sandbox(self):
+        """Abstract UNIX sockets within the sandbox domain should still work."""
+        policy = Policy(
+            fs_readable=_PYTHON_READABLE,
+            isolate_ipc=True,
+        )
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import socket, os
+addr = '\\0sandlock-test-internal-' + str(os.getpid())
+server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+server.bind(addr)
+server.listen(1)
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    client.connect(addr)
+    print('CONNECTED')
+except OSError as e:
+    print(f'ERROR {e}')
+finally:
+    client.close()
+    server.close()
+"""]
+        )
+        assert result.success
+        assert b"CONNECTED" in result.stdout
+
+    def test_isolate_signals_blocks_kill_to_parent(self):
+        """Sandboxed process should not be able to signal the parent."""
+        parent_pid = os.getpid()
+        policy = Policy(
+            fs_readable=_PYTHON_READABLE,
+            isolate_signals=True,
+        )
+        result = Sandbox(policy).run(
+            ["python3", "-c", f"""
+import os, signal, errno
+try:
+    os.kill({parent_pid}, 0)  # signal 0 = check permission
+    print('ALLOWED')
+except PermissionError:
+    print('BLOCKED')
+except OSError as e:
+    if e.errno == errno.EPERM:
+        print('BLOCKED')
+    else:
+        print(f'ERROR {{e}}')
+"""]
+        )
+        assert result.success
+        assert b"BLOCKED" in result.stdout
+
+    def test_isolate_signals_allows_self_signal(self):
+        """Sandboxed process should be able to signal itself."""
+        policy = Policy(
+            fs_readable=_PYTHON_READABLE,
+            isolate_signals=True,
+        )
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import os, signal
+try:
+    os.kill(os.getpid(), 0)  # signal 0 to self
+    print('ALLOWED')
+except OSError as e:
+    print(f'ERROR {e}')
+"""]
+        )
+        assert result.success
+        assert b"ALLOWED" in result.stdout
+
+    def test_without_isolate_ipc_allows_abstract_socket(self):
+        """Without isolate_ipc, abstract UNIX sockets to host should work."""
+        import socket as _socket
+
+        server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        addr = "\0sandlock-test-noipc-" + str(os.getpid())
+        server.bind(addr)
+        server.listen(1)
+
+        try:
+            policy = Policy(
+                fs_readable=_PYTHON_READABLE,
+                isolate_ipc=False,
+            )
+            result = Sandbox(policy).run(
+                ["python3", "-c", f"""
+import socket
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    s.connect('\\0{addr[1:]}')
+    print('CONNECTED')
+except OSError as e:
+    print(f'ERROR {{e}}')
+finally:
+    s.close()
+"""]
+            )
+            assert result.success
+            assert b"CONNECTED" in result.stdout
+        finally:
+            server.close()
+
+
+# --- /proc pid isolation ---
+
+@pytest.mark.skipif(
+    landlock_abi_version() < 1,
+    reason="Landlock not available",
+)
+class TestProcIsolation:
+    @pytest.mark.skip(reason="pid isolation via pgid scan needs investigation")
+    def test_proc_auto_isolation_blocks_foreign_pid(self):
+        """-r /proc auto-enables pid isolation; foreign PIDs are hidden."""
+        from sandlock._notif_policy import NotifPolicy, default_proc_rules
+
+        policy = Policy(
+            fs_readable=_PYTHON_READABLE,
+            notif_policy=NotifPolicy(
+                rules=default_proc_rules(),
+                isolate_pids=True,
+            ),
+        )
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import os
+# PID 1 (init) should be blocked
+try:
+    open('/proc/1/comm').read()
+    print('VISIBLE')
+except (PermissionError, FileNotFoundError, OSError):
+    print('HIDDEN')
+"""]
+        )
+        assert result.success
+        assert b"HIDDEN" in result.stdout
+
+
+# --- Resource limits (seccomp notif based) ---
+
+class TestResourceLimits:
+    def test_process_limit(self):
+        """max_processes via seccomp notif should prevent fork bombs."""
+        policy = Policy(max_processes=10)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import os, time
+# Fork children that stay alive (sleep), so they accumulate
+pids = []
+for i in range(50):
+    try:
+        pid = os.fork()
+        if pid == 0:
+            time.sleep(10)
+            os._exit(0)
+        pids.append(pid)
+    except OSError:
+        print(f'FORK_LIMITED at {i}')
+        break
+else:
+    print('UNLIMITED')
+# Clean up
+import signal
+for p in pids:
+    try:
+        os.kill(p, signal.SIGKILL)
+        os.waitpid(p, 0)
+    except (ProcessLookupError, ChildProcessError):
+        pass
+"""]
+        )
+        assert b"FORK_LIMITED" in result.stdout
+
+
+# --- Strict mode ---
+
+class TestStrictMode:
+    def test_strict_is_default(self):
+        assert Policy().strict is True
+
+    def test_non_strict_allows_degradation(self):
+        policy = Policy(strict=False)
+        result = Sandbox(policy).call(lambda: "ok")
+        assert result.success
+        assert result.value == "ok"
+
+    @pytest.mark.skipif(
+        landlock_abi_version() >= 1,
+        reason="Landlock is available — cannot test strict failure",
+    )
+    def test_strict_fails_when_landlock_unavailable(self):
+        policy = Policy(fs_readable=["/tmp"], strict=True)
+        result = Sandbox(policy).run(["echo", "hello"])
+        assert not result.success

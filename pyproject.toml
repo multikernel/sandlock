@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sandlock"
+version = "0.1.0"
+description = "Lightweight process sandbox using Landlock, seccomp, and seccomp user notification"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+readme = "README.md"
+authors = [
+    { name = "Cong Wang", email = "cwang@multikernel.io" },
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+]
+
+[project.urls]
+Homepage = "https://github.com/multikernel/sandlock"
+
+[project.scripts]
+sandlock = "sandlock.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
