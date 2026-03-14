@@ -56,6 +56,24 @@ def read_bytes(pid: int, addr: int, length: int) -> bytes:
         os.close(fd)
 
 
+def write_bytes(pid: int, addr: int, data: bytes) -> None:
+    """Write raw bytes to a child process's memory.
+
+    Args:
+        pid: Target process ID.
+        addr: Virtual address in the target's address space.
+        data: Bytes to write.
+
+    Raises:
+        OSError: If /proc/<pid>/mem cannot be written.
+    """
+    fd = os.open(f"/proc/{pid}/mem", os.O_WRONLY)
+    try:
+        os.pwrite(fd, data, addr)
+    finally:
+        os.close(fd)
+
+
 def resolve_openat_path(pid: int, dirfd: int, pathname_addr: int) -> str:
     """Resolve the full path for an openat(dirfd, pathname, ...) call.
 

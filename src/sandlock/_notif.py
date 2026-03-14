@@ -24,7 +24,7 @@ from typing import Optional
 
 from .exceptions import NotifError
 from ._notif_policy import NotifAction, NotifPolicy
-from ._procfs import read_bytes, resolve_openat_path
+from ._procfs import read_bytes, write_bytes, resolve_openat_path
 from ._seccomp import (
     AUDIT_ARCH,
     BPF_ABS,
@@ -355,6 +355,72 @@ def _parse_msghdr_dest_ip(pid: int, msghdr_addr: int) -> str | None:
     return _parse_dest_ip(pid, name_addr, name_len)
 
 
+# --- getdents64 helpers ---
+
+def _build_dirent64(d_ino: int, d_off: int, d_type: int, name: str) -> bytes:
+    """Build a single linux_dirent64 entry.
+
+    struct linux_dirent64 {
+        u64  d_ino;      // 0
+        s64  d_off;      // 8
+        u16  d_reclen;   // 16
+        u8   d_type;     // 18
+        char d_name[];   // 19+
+    };
+    d_reclen is 8-byte aligned.
+    """
+    name_bytes = name.encode("utf-8") + b"\0"
+    # 19 bytes header + name + padding to 8-byte alignment
+    reclen = 19 + len(name_bytes)
+    reclen = (reclen + 7) & ~7  # align to 8
+    buf = bytearray(reclen)
+    struct.pack_into("QqHB", buf, 0, d_ino, d_off, reclen, d_type)
+    buf[19:19 + len(name_bytes)] = name_bytes
+    return bytes(buf)
+
+
+def _build_filtered_dirents(sandbox_pids: set[int]) -> list[bytes]:
+    """Build a list of dirent64 entries for /proc, filtering out foreign PIDs.
+
+    Reads the real /proc directory in the supervisor process and builds
+    synthetic dirent64 entries, excluding PID directories not in sandbox_pids.
+    """
+    DT_DIR = 4
+    DT_REG = 8
+    DT_LNK = 10
+    entries = []
+    d_off = 0
+    try:
+        with os.scandir("/proc") as it:
+            for entry in it:
+                name = entry.name
+                # Filter out foreign PID directories
+                if name.isdigit():
+                    if int(name) not in sandbox_pids:
+                        continue
+
+                d_off += 1
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        d_type = DT_DIR
+                    elif entry.is_symlink():
+                        d_type = DT_LNK
+                    else:
+                        d_type = DT_REG
+                except OSError:
+                    d_type = DT_REG
+
+                try:
+                    d_ino = entry.inode()
+                except OSError:
+                    d_ino = 0
+
+                entries.append(_build_dirent64(d_ino, d_off, d_type, name))
+    except OSError:
+        pass
+    return entries
+
+
 # --- Notification supervisor ---
 
 class NotifSupervisor:
@@ -384,6 +450,8 @@ class NotifSupervisor:
         self._brk_base: dict[int, int] = {}  # pid → last known brk
         self._proc_count: int = 1     # Start at 1 (the initial child)
         self._proc_pids: set[int] = {child_pid}  # All known sandbox PIDs
+        # getdents /proc filtering: fd → list of remaining dirent entries
+        self._proc_dir_cache: dict[int, list[bytes]] = {}
 
     def start(self) -> None:
         """Start the supervisor thread."""
@@ -497,6 +565,14 @@ class NotifSupervisor:
 
         if nr in (nr_connect, nr_sendto, nr_sendmsg) and self._policy.allowed_ips:
             self._handle_net(notif, nr)
+            return
+
+        # --- /proc readdir PID filtering ---
+        nr_getdents64 = _SYSCALL_NR.get("getdents64")
+        nr_getdents = _SYSCALL_NR.get("getdents")
+
+        if nr in (nr_getdents64, nr_getdents) and self._policy.isolate_pids:
+            self._handle_getdents(notif)
             return
 
         # --- Filesystem: open / openat virtualization ---
@@ -658,7 +734,76 @@ class NotifSupervisor:
         # The new child's PID is unknown until it makes its first
         # intercepted syscall — tracked lazily via _record_pid.
         self._proc_pids.add(notif.pid)
+        # Invalidate /proc readdir cache so new PIDs appear
+        self._proc_dir_cache.clear()
         self._respond_continue(notif.id)
+
+    def _handle_getdents(self, notif: SeccompNotif) -> None:
+        """Handle getdents64/getdents — filter /proc readdir to hide foreign PIDs.
+
+        On first call for a given fd, reads all /proc entries from the
+        supervisor, filters out foreign PIDs, builds dirent64 entries,
+        and caches them.  Each call returns as many cached entries as fit
+        in the child's buffer, then returns 0 when exhausted.
+        """
+        pid = notif.pid
+        child_fd_num = notif.data.args[0] & 0xFFFFFFFF
+        buf_addr = notif.data.args[1]
+        buf_size = notif.data.args[2] & 0xFFFFFFFF
+
+        # Check if the fd points to /proc
+        try:
+            target = os.readlink(f"/proc/{pid}/fd/{child_fd_num}")
+        except OSError:
+            self._respond_continue(notif.id)
+            return
+
+        if target != "/proc":
+            self._respond_continue(notif.id)
+            return
+
+        # Build cache on first call for this fd
+        cache_key = (pid, child_fd_num)
+        if cache_key not in self._proc_dir_cache:
+            sandbox_pids = None
+            if self._pids_fn is not None:
+                sandbox_pids = set(self._pids_fn())
+            if sandbox_pids is None:
+                self._respond_continue(notif.id)
+                return
+
+            entries = _build_filtered_dirents(sandbox_pids)
+            self._proc_dir_cache[cache_key] = entries
+
+        entries = self._proc_dir_cache[cache_key]
+
+        if not self._id_valid(notif.id):
+            return
+
+        # Pack as many entries as fit into buf_size
+        result = bytearray()
+        consumed = 0
+        for entry in entries:
+            if len(result) + len(entry) > buf_size:
+                break
+            result.extend(entry)
+            consumed += 1
+
+        # Remove consumed entries from cache
+        if consumed > 0:
+            self._proc_dir_cache[cache_key] = entries[consumed:]
+        elif not entries:
+            # All entries consumed — clean up cache
+            del self._proc_dir_cache[cache_key]
+
+        # Write to child memory and return byte count
+        try:
+            if result:
+                write_bytes(pid, buf_addr, bytes(result))
+            self._respond_val(notif.id, len(result))
+        except OSError:
+            self._proc_dir_cache.pop(cache_key, None)
+            self._respond_continue(notif.id)
 
     def _id_valid(self, notif_id: int) -> bool:
         """Check if a notification ID is still valid (TOCTTOU check)."""
@@ -677,6 +822,19 @@ class NotifSupervisor:
         resp.val = 0
         resp.error = 0
         resp.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE
+        _libc.ioctl(
+            ctypes.c_int(self._notify_fd),
+            ctypes.c_ulong(SECCOMP_IOCTL_NOTIF_SEND),
+            ctypes.byref(resp),
+        )
+
+    def _respond_val(self, notif_id: int, val: int) -> None:
+        """Return a specific value as the syscall result."""
+        resp = SeccompNotifResp()
+        resp.id = notif_id
+        resp.val = val
+        resp.error = 0
+        resp.flags = 0
         _libc.ioctl(
             ctypes.c_int(self._notify_fd),
             ctypes.c_ulong(SECCOMP_IOCTL_NOTIF_SEND),

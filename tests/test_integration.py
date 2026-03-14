@@ -694,6 +694,63 @@ except (PermissionError, FileNotFoundError, OSError):
         assert result.success
         assert b"HIDDEN" in result.stdout
 
+    def test_getdents_hides_foreign_pids(self):
+        """readdir(/proc) should only show sandbox PIDs when isolate_pids=True."""
+        from sandlock._notif_policy import NotifPolicy, default_proc_rules
+
+        policy = Policy(
+            fs_readable=_PYTHON_READABLE,
+            notif_policy=NotifPolicy(
+                rules=default_proc_rules(),
+                isolate_pids=True,
+            ),
+        )
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import os
+# List /proc and collect numeric (PID) entries
+pids = [e for e in os.listdir('/proc') if e.isdigit()]
+my_pid = str(os.getpid())
+# Our own PID should be visible
+if my_pid in pids:
+    print(f'SELF_VISIBLE')
+else:
+    print(f'SELF_HIDDEN')
+# PID 1 (init) should NOT be visible
+if '1' in pids:
+    print('INIT_VISIBLE')
+else:
+    print('INIT_HIDDEN')
+print(f'PID_COUNT={len(pids)}')
+"""]
+        )
+        assert result.success
+        assert b"INIT_HIDDEN" in result.stdout
+        # Should have very few PIDs (just the sandbox's own)
+        for line in result.stdout.decode().splitlines():
+            if line.startswith("PID_COUNT="):
+                count = int(line.split("=")[1])
+                assert count < 10, f"Too many PIDs visible: {count}"
+
+    def test_always_isolates_when_proc_readable(self):
+        """PID isolation is always on when /proc is in fs_readable."""
+        policy = Policy(
+            fs_readable=_PYTHON_READABLE,
+        )
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import os
+pids = [e for e in os.listdir('/proc') if e.isdigit()]
+if '1' in pids:
+    print('INIT_VISIBLE')
+else:
+    print('INIT_HIDDEN')
+print(f'PID_COUNT={len(pids)}')
+"""]
+        )
+        assert result.success
+        assert b"INIT_HIDDEN" in result.stdout
+
 
 # --- Resource limits (seccomp notif based) ---
 

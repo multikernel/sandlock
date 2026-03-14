@@ -80,7 +80,7 @@ def _pidfd_poll(pidfd: int, timeout_s: float) -> bool:
 
 # --- Syscalls to intercept for notification ---
 
-def _notif_syscall_names(policy: "Policy") -> list[str]:
+def _notif_syscall_names(notif: "NotifPolicy") -> list[str]:
     """Return the list of syscalls to intercept via user notification.
 
     openat is always intercepted.  open is added on x86_64 (not
@@ -91,13 +91,16 @@ def _notif_syscall_names(policy: "Policy") -> list[str]:
     names = ["openat"]
     if "open" in _SYSCALL_NR:
         names.append("open")
-    notif = policy.notif_policy
     if notif is not None and notif.allowed_ips:
         names.extend(["connect", "sendto"])
     if notif is not None and notif.max_memory_bytes > 0:
         names.extend(["mmap", "munmap", "brk", "mremap"])
     if notif is not None and notif.max_processes > 0:
         names.extend(["clone", "fork", "vfork"])
+    if notif is not None and notif.isolate_pids:
+        names.append("getdents64")
+        if "getdents" in _SYSCALL_NR:
+            names.append("getdents")
     # Deduplicate (clone/open may already be in the list)
     return list(dict.fromkeys(names))
 
@@ -298,8 +301,18 @@ class SandboxContext:
             self._control_fd = -1
 
     def __enter__(self) -> "SandboxContext":
-        notif_policy = self._policy.notif_policy
-        use_notif = notif_policy is not None
+        # Auto-enable /proc PID isolation when /proc is readable
+        self._notif_policy = self._policy.notif_policy
+        if self._notif_policy is None and any(
+            p == "/proc" or p.rstrip("/") == "/proc"
+            for p in self._policy.fs_readable
+        ):
+            from ._notif_policy import NotifPolicy, default_proc_rules
+            self._notif_policy = NotifPolicy(
+                rules=default_proc_rules(),
+                isolate_pids=True,
+            )
+        use_notif = self._notif_policy is not None
 
         # Pre-import modules used in the child BEFORE fork — the child's
         # Landlock policy won't include the sandlock source directory, so
@@ -442,7 +455,7 @@ class SandboxContext:
                         from ._landlock import _set_no_new_privs
                         _set_no_new_privs()
                         notify_fd = install_notif_filter(
-                            _notif_syscall_names(self._policy),
+                            _notif_syscall_names(self._notif_policy),
                             deny_syscalls=deny,
                             allow_syscalls=allow,
                         )
@@ -547,7 +560,7 @@ class SandboxContext:
                     parent_sock.close()
                     pids_fn = lambda pgid=pid: _pids_by_pgid(pgid)  # noqa: E731
                     self._supervisor = NotifSupervisor(
-                        notify_fd, pid, notif_policy,
+                        notify_fd, pid, self._notif_policy,
                         pids_fn=pids_fn,
                     )
                     self._supervisor.start()

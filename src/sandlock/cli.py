@@ -76,21 +76,6 @@ def cmd_run(args: argparse.Namespace) -> int:
     else:
         policy = Policy(**cli_kwargs)
 
-    # Auto-enable /proc pid isolation when /proc is readable
-    readable = list(policy.fs_readable)
-    if readable and any(
-        p == "/proc" or p.rstrip("/") == "/proc" for p in readable
-    ):
-        from ._notif_policy import NotifPolicy, default_proc_rules
-        if policy.notif_policy is None:
-            import dataclasses
-            policy = dataclasses.replace(
-                policy,
-                notif_policy=NotifPolicy(
-                    rules=default_proc_rules(),
-                    isolate_pids=True,
-                ),
-            )
     sb = Sandbox(policy)
 
     if args.interactive:
