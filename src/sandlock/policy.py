@@ -144,9 +144,10 @@ class Policy:
     max_memory: str | int | None = None
     """Memory limit. String like '512M' or int bytes."""
 
-    max_processes: int | None = None
+    max_processes: int = 64
     """Maximum total forks allowed in the sandbox (lifetime count,
-    not concurrent).  Enforced by the seccomp notif supervisor."""
+    not concurrent).  Enforced by the seccomp notif supervisor.
+    Also enables fork interception needed for checkpoint freeze."""
 
     max_cpu: int | None = None
     """CPU throttle as a percentage of one core (1–100).  E.g. ``50``

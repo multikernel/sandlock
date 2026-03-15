@@ -224,10 +224,11 @@ class TestSandboxBranchIntegration(unittest.TestCase):
         self.assertEqual(list(eff.fs_writable), ["/mnt/ws/@uuid"])
         self.assertEqual(list(eff.fs_readable), ["/mnt/ws/@uuid/data", "/usr"])
 
-    def test_effective_policy_no_branch_returns_original(self):
+    def test_effective_policy_no_branch_preserves_fs_paths(self):
         sb = self._make_sandbox(fs_writable=["/tmp"])
         eff = sb._effective_policy()
-        self.assertIs(eff, sb._policy)
+        self.assertEqual(list(eff.fs_writable), ["/tmp"])
+        self.assertEqual(list(eff.fs_readable), [])
 
     @mock.patch("sandlock._branchfs.ensure_mount")
     @mock.patch("sandlock._branchfs.SandboxBranch.commit")

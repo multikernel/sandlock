@@ -54,7 +54,7 @@ class TestPolicy:
         assert p.net_bind == []
         assert p.net_connect == []
         assert p.max_memory is None
-        assert p.max_processes is None
+        assert p.max_processes == 64
         assert p.max_cpu is None
         assert p.close_fds is True
 

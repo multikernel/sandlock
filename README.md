@@ -283,7 +283,7 @@ class Policy:
 
     # Resources (seccomp notif + SIGSTOP/SIGCONT)
     max_memory: str | int | None = None  # '512M'
-    max_processes: int | None = None     # per-sandbox fork count
+    max_processes: int = 64              # per-sandbox fork count
     max_cpu: int | None = None            # 50 = 50% of one core (SIGSTOP/SIGCONT)
 
     # Environment

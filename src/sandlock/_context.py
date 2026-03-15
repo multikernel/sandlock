@@ -359,15 +359,23 @@ class SandboxContext:
     def __enter__(self) -> "SandboxContext":
         # Auto-enable /proc PID isolation when /proc is readable
         self._notif_policy = self._policy.notif_policy
-        if self._notif_policy is None and any(
+        has_proc = any(
             p == "/proc" or p.rstrip("/") == "/proc"
             for p in self._policy.fs_readable
-        ):
+        )
+        if has_proc:
             from ._notif_policy import NotifPolicy, default_proc_rules
-            self._notif_policy = NotifPolicy(
-                rules=default_proc_rules(),
-                isolate_pids=True,
-            )
+            import dataclasses
+            if self._notif_policy is None:
+                self._notif_policy = NotifPolicy(
+                    rules=default_proc_rules(),
+                    isolate_pids=True,
+                )
+            elif not self._notif_policy.isolate_pids:
+                self._notif_policy = dataclasses.replace(
+                    self._notif_policy,
+                    isolate_pids=True,
+                )
         use_notif = self._notif_policy is not None
 
         # Pre-import modules used in the child BEFORE fork — the child's

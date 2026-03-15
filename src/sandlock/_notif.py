@@ -452,6 +452,10 @@ class NotifSupervisor:
         self._proc_pids: set[int] = {child_pid}  # All known sandbox PIDs
         # getdents /proc filtering: fd → list of remaining dirent entries
         self._proc_dir_cache: dict[int, list[bytes]] = {}
+        # Fork-hold state for checkpoint freeze
+        self._hold_forks: bool = False
+        self._hold_lock = threading.Lock()
+        self._held_notif_ids: list[int] = []
 
     def start(self) -> None:
         """Start the supervisor thread."""
@@ -468,8 +472,29 @@ class NotifSupervisor:
         )
         self._thread.start()
 
+    def hold_forks(self) -> None:
+        """Enter hold mode: fork/clone notifications are not responded to.
+
+        The kernel keeps the calling process blocked until we respond.
+        This creates a clean freeze barrier for checkpoint.
+        """
+        with self._hold_lock:
+            self._hold_forks = True
+
+    def release_forks(self) -> None:
+        """Exit hold mode: respond CONTINUE to all held fork notifications."""
+        with self._hold_lock:
+            self._hold_forks = False
+            for notif_id in self._held_notif_ids:
+                try:
+                    self._respond_continue(notif_id)
+                except OSError:
+                    pass  # Process may have died while waiting
+            self._held_notif_ids.clear()
+
     def stop(self) -> None:
         """Signal the supervisor to stop and wait for it."""
+        self.release_forks()  # Unblock any held processes before stopping
         try:
             os.write(self._stop_w, b"x")
         except OSError:
@@ -729,6 +754,13 @@ class NotifSupervisor:
         if self._proc_count >= self._policy.max_processes:
             self._respond_errno(notif.id, errno.EAGAIN)
             return
+
+        # In hold mode, don't respond — process stays blocked in kernel
+        with self._hold_lock:
+            if self._hold_forks:
+                self._held_notif_ids.append(notif.id)
+                return
+
         self._proc_count += 1
         # Record the calling PID (the parent doing the fork).
         # The new child's PID is unknown until it makes its first

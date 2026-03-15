@@ -272,29 +272,24 @@ class Sandbox:
     def checkpoint(self) -> "Checkpoint":
         """Checkpoint the running sandbox.
 
-        Captures two layers of state:
+        Captures three layers of state:
 
         1. **OS-level** (always, transparent): ptrace dumps registers,
-           memory contents, and file descriptors.  The child does not
-           need to know or cooperate.
+           memory contents, and file descriptors.
 
         2. **App-level** (optional, cooperative): If ``exec()`` was
-           called with ``save_fn``, triggers it via the control socket
-           and receives raw bytes.  This covers state ptrace can't see
-           (sockets, epoll, application-level caches).
+           called with ``save_fn``, triggers it via the control socket.
 
         3. **Filesystem** (if BranchFS active): O(1) COW snapshot.
 
-        Sequence:
-            1. SIGSTOP process group       — pause all processes
-            2. branchfs create             — O(1) fs snapshot
-            3. ptrace dump                 — registers, memory, fds
-            4. SIGCONT                     — let child run save_fn
-            5. trigger save_fn (optional)  — 1-byte write on control socket
-            6. receive app_state bytes     — raw bytes, no pickle
-            7. resume
-
-        Requires a running process.
+        Freeze sequence (cgroup-like, no root):
+            1. supervisor.hold_forks()     -- block all fork/clone in kernel
+            2. SIGSTOP each tracked PID    -- stop running processes
+            3. branchfs snapshot           -- O(1) fs snapshot
+            4. ptrace dump                 -- registers, memory, fds
+            5. SIGCONT + save_fn           -- app-level state (optional)
+            6. supervisor.release_forks()  -- unblock held forks
+            7. SIGCONT all                 -- resume
 
         Returns:
             Checkpoint with OS state, optional app state, and branch ref.
@@ -307,37 +302,62 @@ class Sandbox:
             raise SandboxError("No running process to checkpoint")
 
         pid = self._ctx.pid
+        supervisor = self._ctx._supervisor
 
-        # 1. Pause for consistency
-        os.killpg(pid, signal.SIGSTOP)
+        # 1. Hold forks -- any in-flight fork blocks in kernel
+        if supervisor is not None:
+            supervisor.hold_forks()
 
-        # 2. Snapshot filesystem via BranchFS (O(1))
-        snapshot_branch_id = None
-        if self._branch is not None:
-            from ._branchfs import SandboxBranch
-            snapshot = SandboxBranch(
-                self._branch.mount_root,
-                parent_path=self._branch.path,
-            )
-            snapshot.create()
-            snapshot_branch_id = snapshot.branch_id
+        try:
+            # 2. Stop all tracked PIDs individually
+            if supervisor is not None:
+                for p in supervisor.tracked_pids:
+                    try:
+                        os.kill(p, signal.SIGSTOP)
+                    except ProcessLookupError:
+                        pass
+            else:
+                os.killpg(pid, signal.SIGSTOP)
 
-        # 3. Transparent OS-level dump (while stopped)
-        process_state = dump_process_state(pid)
+            # 3. Snapshot filesystem via BranchFS (O(1))
+            snapshot_branch_id = None
+            if self._branch is not None:
+                from ._branchfs import SandboxBranch
+                snapshot = SandboxBranch(
+                    self._branch.mount_root,
+                    parent_path=self._branch.path,
+                )
+                snapshot.create()
+                snapshot_branch_id = snapshot.branch_id
 
-        # 4. App-level state (optional — requires save_fn + resume)
-        app_state = None
-        control_fd = self._ctx.control_fd
-        if control_fd >= 0:
-            os.killpg(pid, signal.SIGCONT)
-            try:
-                app_state = request_app_state(control_fd)
-            except (EOFError, RuntimeError):
-                pass
-            os.killpg(pid, signal.SIGSTOP)
+            # 4. Transparent OS-level dump (while stopped)
+            process_state = dump_process_state(pid)
 
-        # 5. Resume
-        os.killpg(pid, signal.SIGCONT)
+            # 5. App-level state (optional -- requires save_fn + resume)
+            app_state = None
+            control_fd = self._ctx.control_fd
+            if control_fd >= 0:
+                os.kill(pid, signal.SIGCONT)
+                try:
+                    app_state = request_app_state(control_fd)
+                except (EOFError, RuntimeError):
+                    pass
+                os.kill(pid, signal.SIGSTOP)
+
+        finally:
+            # 6. Release held forks
+            if supervisor is not None:
+                supervisor.release_forks()
+
+            # 7. Resume all
+            if supervisor is not None:
+                for p in supervisor.tracked_pids:
+                    try:
+                        os.kill(p, signal.SIGCONT)
+                    except ProcessLookupError:
+                        pass
+            else:
+                os.killpg(pid, signal.SIGCONT)
 
         return Checkpoint(
             process_state=process_state,
