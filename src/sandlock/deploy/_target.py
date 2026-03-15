@@ -147,6 +147,57 @@ def load_targets(config_path: Path | None = None) -> dict[str, Target]:
     return targets
 
 
+@dataclass(frozen=True)
+class Cluster:
+    """A group of targets."""
+
+    name: str
+    """Cluster name (the key under [cluster.*])."""
+
+    nodes: list[str]
+    """List of target names in this cluster."""
+
+
+def load_clusters(config_path: Path | None = None) -> dict[str, Cluster]:
+    """Load all clusters from sandlock.toml."""
+    if config_path is None:
+        config_path = _find_config()
+    if config_path is None:
+        raise FileNotFoundError(
+            "No sandlock.toml found. Create one in the project root or "
+            "~/.config/sandlock/sandlock.toml"
+        )
+
+    with open(config_path, "rb") as f:
+        data = tomllib.load(f)
+
+    clusters_data = data.get("cluster", {})
+    if not isinstance(clusters_data, dict):
+        raise ValueError(f"{config_path}: [cluster] must be a table")
+
+    clusters = {}
+    for name, spec in clusters_data.items():
+        if not isinstance(spec, dict):
+            raise ValueError(f"{config_path}: [cluster.{name}] must be a table")
+        if "nodes" not in spec:
+            raise ValueError(f"{config_path}: [cluster.{name}] requires 'nodes'")
+        nodes = spec["nodes"]
+        if not isinstance(nodes, list):
+            raise ValueError(f"{config_path}: [cluster.{name}].nodes must be a list")
+        clusters[name] = Cluster(name=name, nodes=nodes)
+
+    return clusters
+
+
+def load_cluster(name: str, config_path: Path | None = None) -> Cluster:
+    """Load a single cluster by name."""
+    clusters = load_clusters(config_path)
+    if name not in clusters:
+        available = ", ".join(sorted(clusters.keys())) or "(none)"
+        raise KeyError(f"cluster '{name}' not found. Available: {available}")
+    return clusters[name]
+
+
 def load_target(name: str, config_path: Path | None = None) -> Target:
     """Load a single target by name.
 

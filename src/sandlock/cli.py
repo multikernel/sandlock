@@ -209,6 +209,94 @@ def cmd_deploy(args: argparse.Namespace) -> int:
     return run_deploy(args)
 
 
+def cmd_schedule(args: argparse.Namespace) -> int:
+    """Schedule a command on the best node in a cluster."""
+    try:
+        from .deploy._scheduler import schedule
+        from .deploy._sandbox import RemoteSandbox
+    except ImportError:
+        print(
+            "error: sandlock[deploy] not installed.\n"
+            "Install with: pip install sandlock[deploy]",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        target = schedule(args.cluster)
+    except Exception as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    print(f"Selected: {target.name} ({target.host})", file=sys.stderr)
+
+    workdir = target.workdir
+    profile = args.profile or target.profile
+
+    if profile:
+        sb = RemoteSandbox(profile, host=target.host, workdir=workdir)
+    else:
+        sb = RemoteSandbox(
+            __import__("sandlock").Policy(), host=target.host, workdir=workdir,
+        )
+
+    try:
+        if args.exec_shell:
+            result = sb.run_shell(args.exec_shell, timeout=args.timeout)
+        elif args.command:
+            result = sb.run(args.command, timeout=args.timeout)
+        else:
+            print("error: no command specified", file=sys.stderr)
+            return 1
+
+        if result.stdout:
+            sys.stdout.buffer.write(result.stdout)
+        if result.stderr:
+            sys.stderr.buffer.write(result.stderr)
+        return result.exit_code
+    finally:
+        sb.close()
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """Show status of all nodes in a cluster."""
+    try:
+        from .deploy._scheduler import probe_cluster
+    except ImportError:
+        print(
+            "error: sandlock[deploy] not installed.\n"
+            "Install with: pip install sandlock[deploy]",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        statuses = probe_cluster(args.cluster)
+    except Exception as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    # Sort by name for consistent output
+    statuses.sort(key=lambda s: s.name)
+
+    # Header
+    print(f"{'NODE':<15} {'HOST':<30} {'CPU':>4} {'MEM':>8} {'LOAD':>6} {'STATUS'}")
+    print("-" * 75)
+
+    for s in statuses:
+        if s.reachable:
+            status = "ok"
+            if s.load_1m / max(s.cpus, 1) > 0.8:
+                status = "busy"
+            mem = f"{s.mem_available_mb}M"
+            print(f"{s.name:<15} {s.host:<30} {s.cpus:>4} {mem:>8} {s.load_1m:>6.2f} {status}")
+        else:
+            err = s.error or "unreachable"
+            print(f"{s.name:<15} {s.host:<30} {'—':>4} {'—':>8} {'—':>6} {err}")
+
+    return 0
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     """Check kernel support for sandbox features."""
     print(f"Sandlock {__version__}")
@@ -327,6 +415,21 @@ def main() -> None:
     deploy_p.add_argument("--no-verify", action="store_true",
                           help="Skip post-deploy verification")
     deploy_p.set_defaults(func=cmd_deploy)
+
+    # sandlock schedule
+    sched_p = sub.add_parser("schedule", help="Run on best node in a cluster")
+    sched_p.add_argument("cluster", help="Cluster name from sandlock.toml")
+    sched_p.add_argument("-e", "--exec-shell", metavar="CMD",
+                         help="Shell command to run")
+    sched_p.add_argument("command", nargs="*", help="Command to run")
+    sched_p.add_argument("-p", "--profile", metavar="NAME", help="Override profile")
+    sched_p.add_argument("-t", "--timeout", type=float, help="Timeout in seconds")
+    sched_p.set_defaults(func=cmd_schedule)
+
+    # sandlock status
+    status_p = sub.add_parser("status", help="Show cluster node status")
+    status_p.add_argument("cluster", help="Cluster name from sandlock.toml")
+    status_p.set_defaults(func=cmd_status)
 
     # sandlock check
     check_p = sub.add_parser("check", help="Check kernel support")
