@@ -649,6 +649,14 @@ class NotifSupervisor:
         if not self._id_valid(notif.id):
             return
 
+        # Virtualize /proc/net/tcp{,6} to hide other sandboxes' ports
+        if self._port_map is not None and (
+            path.endswith("/net/tcp") or path.endswith("/net/tcp6")
+        ):
+            content = self._filter_proc_net_tcp(path)
+            self._respond_virtualize(notif.id, content)
+            return
+
         # Apply policy (with sandbox pid set for isolation)
         sandbox_pids = None
         if self._policy.isolate_pids and self._pids_fn is not None:
@@ -830,6 +838,43 @@ class NotifSupervisor:
             pass
 
         self._respond_continue(notif.id)
+
+    def _filter_proc_net_tcp(self, path: str) -> bytes:
+        """Read /proc/net/tcp{,6} and filter to only show our ports.
+
+        Keeps the header line and lines where the local port belongs
+        to this sandbox's allocated slice.  Other sandboxes' ports and
+        host ports are hidden.
+        """
+        # Normalize to canonical path (resolve /proc/net → /proc/self/net)
+        canonical = path.replace("/proc/net/", "/proc/self/net/")
+        try:
+            with open(canonical) as f:
+                lines = f.readlines()
+        except OSError:
+            return b""
+
+        if not lines:
+            return b""
+
+        our_ports = self._port_map._pool_set
+        result = [lines[0]]  # Header
+
+        for line in lines[1:]:
+            # Format: "  sl  local_address:PORT ..."
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            try:
+                local = parts[1]  # e.g. "0100007F:9C40"
+                port_hex = local.split(":")[1]
+                port = int(port_hex, 16)
+                if port in our_ports:
+                    result.append(line)
+            except (IndexError, ValueError):
+                continue
+
+        return "".join(result).encode()
 
     def _handle_getsockname(self, notif: SeccompNotif) -> None:
         """Handle getsockname — do it in supervisor and rewrite real port to virtual.
