@@ -146,7 +146,7 @@ Parent                              Child
   │──────────────────────────────────>│
   │                                   ├─ 1. setpgid(0,0)
   │                                   ├─ 2. unshare(NEWUSER) (if privileged)
-  │                                   ├─ 3. RLIMIT_CPU (if cpu_budget)
+  │                                   ├─ 3. RLIMIT_CPU (if cpu_time)
   │                                   ├─ 4. chroot (optional)
   │                                   ├─ 5. Landlock (fs + net + IPC, irreversible)
   │                                   ├─ 6. Combined seccomp filter (irreversible)
@@ -280,7 +280,7 @@ class Policy:
     # Resources (seccomp notif + rlimit)
     max_memory: str | int | None = None  # '512M'
     max_processes: int | None = None     # per-sandbox fork count
-    cpu_budget: str | int | None = None  # '5m' total, divided by max_processes
+    cpu_time: str | int | None = None    # '30s' per-process RLIMIT_CPU
 
     # Environment
     clean_env: bool = False              # Minimal env (PATH, HOME, TERM, LANG, USER, SHELL)

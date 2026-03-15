@@ -471,7 +471,7 @@ class TestNamedCheckpoints(unittest.TestCase):
             Checkpoint.delete("ghost", store=self.store)
 
     def test_policy_survives_roundtrip(self):
-        policy = Policy(max_memory="1G", max_processes=100, cpu_budget="5m")
+        policy = Policy(max_memory="1G", max_processes=100, cpu_time="30s")
         cp = self._make_checkpoint(policy_data=pickle.dumps(policy))
         cp.save("pol", store=self.store)
 
@@ -479,7 +479,7 @@ class TestNamedCheckpoints(unittest.TestCase):
         restored = pickle.loads(loaded.policy_data)
         self.assertEqual(restored.max_memory, "1G")
         self.assertEqual(restored.max_processes, 100)
-        self.assertEqual(restored.cpu_budget, "5m")
+        self.assertEqual(restored.cpu_time, "30s")
 
     def test_list_ignores_non_checkpoint_dirs(self):
         """Directories without meta.json are not listed."""

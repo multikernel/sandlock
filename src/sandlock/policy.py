@@ -176,15 +176,14 @@ class Policy:
     """Memory limit. String like '512M' or int bytes."""
 
     max_processes: int | None = None
-    """Maximum total forks allowed in the sandbox (lifetime count, not
-    concurrent).  Also used to divide ``cpu_budget`` into per-process
-    RLIMIT_CPU.  Required when ``cpu_budget`` is set."""
+    """Maximum total forks allowed in the sandbox (lifetime count,
+    not concurrent).  Enforced by the seccomp notif supervisor."""
 
-    cpu_budget: str | int | None = None
-    """Total CPU time budget for the entire sandbox.  String like
-    ``'30s'``, ``'5m'``, ``'1h'`` or int seconds.  Divided evenly
-    across ``max_processes`` to set per-process RLIMIT_CPU.
-    Requires ``max_processes`` to be set."""
+    cpu_time: str | int | None = None
+    """Per-process CPU time limit.  String like ``'30s'``, ``'5m'``,
+    ``'1h'`` or int seconds.  Sets RLIMIT_CPU on the sandbox process
+    (inherited by children via fork).  Each process gets its own
+    counter, so worst-case total CPU is ``cpu_time * max_processes``."""
 
     # Optional chroot
     chroot: str | None = None
@@ -257,29 +256,10 @@ class Policy:
             return self.max_memory
         return parse_memory_size(self.max_memory)
 
-    def cpu_budget_secs(self) -> int | None:
-        """Return cpu_budget as whole seconds, or None if unset."""
-        if self.cpu_budget is None:
+    def cpu_time_secs(self) -> int | None:
+        """Return cpu_time as whole seconds, or None if unset."""
+        if self.cpu_time is None:
             return None
-        if isinstance(self.cpu_budget, int):
-            return self.cpu_budget
-        return parse_duration(self.cpu_budget)
-
-    def per_process_cpu_secs(self) -> int | None:
-        """Return per-process RLIMIT_CPU value in seconds, or None.
-
-        Divides cpu_budget by max_processes (rounded up, minimum 1s).
-
-        Raises:
-            PolicyError: If cpu_budget is set without max_processes.
-        """
-        budget = self.cpu_budget_secs()
-        if budget is None:
-            return None
-        if not self.max_processes or self.max_processes <= 0:
-            from .exceptions import PolicyError
-            raise PolicyError("cpu_budget requires max_processes to be set")
-        per_proc = budget // self.max_processes
-        if budget % self.max_processes:
-            per_proc += 1  # round up
-        return max(1, per_proc)
+        if isinstance(self.cpu_time, int):
+            return max(1, self.cpu_time)
+        return max(1, parse_duration(self.cpu_time))

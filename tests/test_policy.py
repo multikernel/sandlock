@@ -55,7 +55,7 @@ class TestPolicy:
         assert p.net_connect == []
         assert p.max_memory is None
         assert p.max_processes is None
-        assert p.cpu_budget is None
+        assert p.cpu_time is None
         assert p.close_fds is True
 
     def test_frozen(self):
@@ -75,29 +75,21 @@ class TestPolicy:
         p = Policy()
         assert p.memory_bytes() is None
 
-    def test_cpu_budget_duration(self):
-        p = Policy(cpu_budget="5m", max_processes=10)
-        assert p.cpu_budget_secs() == 300
-        assert p.per_process_cpu_secs() == 30
+    def test_cpu_time_duration(self):
+        p = Policy(cpu_time="5m")
+        assert p.cpu_time_secs() == 300
 
-    def test_cpu_budget_none(self):
+    def test_cpu_time_none(self):
         p = Policy()
-        assert p.cpu_budget_secs() is None
-        assert p.per_process_cpu_secs() is None
+        assert p.cpu_time_secs() is None
 
-    def test_cpu_budget_int(self):
-        p = Policy(cpu_budget=60, max_processes=8)
-        assert p.cpu_budget_secs() == 60
-        assert p.per_process_cpu_secs() == 8  # 60/8 = 7.5, rounded up
+    def test_cpu_time_int(self):
+        p = Policy(cpu_time=60)
+        assert p.cpu_time_secs() == 60
 
-    def test_cpu_budget_requires_max_processes(self):
-        p = Policy(cpu_budget="30s")
-        with pytest.raises(Exception):
-            p.per_process_cpu_secs()
-
-    def test_cpu_budget_minimum_1s(self):
-        p = Policy(cpu_budget=1, max_processes=100)
-        assert p.per_process_cpu_secs() == 1
+    def test_cpu_time_minimum_1s(self):
+        p = Policy(cpu_time=0)
+        assert p.cpu_time_secs() == 1
 
 
 class TestParsePorts:

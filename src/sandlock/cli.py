@@ -24,8 +24,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         cli_kwargs["max_memory"] = args.memory
     if args.processes:
         cli_kwargs["max_processes"] = args.processes
-    if args.cpu_budget:
-        cli_kwargs["cpu_budget"] = args.cpu_budget
+    if args.cpu_time:
+        cli_kwargs["cpu_time"] = args.cpu_time
     if args.strict:
         from ._seccomp import DEFAULT_ALLOW_SYSCALLS
         cli_kwargs["allow_syscalls"] = DEFAULT_ALLOW_SYSCALLS
@@ -195,7 +195,7 @@ def main() -> None:
     run_p.add_argument("-r", "--readable", action="append", help="Readable path")
     run_p.add_argument("-m", "--memory", help="Memory limit (e.g. 512M)")
     run_p.add_argument("-P", "--processes", type=int, help="Max processes")
-    run_p.add_argument("-c", "--cpu-budget", help="Total CPU time budget (e.g. 30s, 5m, 1h). Requires -P.")
+    run_p.add_argument("-c", "--cpu-time", help="Per-process CPU time limit (e.g. 30s, 5m, 1h)")
     run_p.add_argument("-t", "--timeout", type=float, help="Timeout in seconds")
     run_p.add_argument("--strict", action="store_true",
                        help="Allowlist mode: only permit known-safe syscalls")

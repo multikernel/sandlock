@@ -393,13 +393,12 @@ class SandboxContext:
                                 "User namespace unavailable and policy.privileged=True"
                             )
 
-                # 2. Apply CPU limit via RLIMIT_CPU (inherited by children)
-                #    cpu_budget / max_processes = per-process limit
-                per_proc_cpu = self._policy.per_process_cpu_secs()
-                if per_proc_cpu is not None:
+                # 2. Apply per-process CPU time limit via RLIMIT_CPU
+                cpu_secs = self._policy.cpu_time_secs()
+                if cpu_secs is not None:
                     import resource
                     resource.setrlimit(
-                        resource.RLIMIT_CPU, (per_proc_cpu, per_proc_cpu),
+                        resource.RLIMIT_CPU, (cpu_secs, cpu_secs),
                     )
 
                 # 3. chroot if requested
