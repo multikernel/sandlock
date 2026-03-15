@@ -12,7 +12,8 @@ sandlock run -w /tmp -r /usr -m 512M -- python3 untrusted.py
 ## Why Sandlock?
 
 Containers and VMs are powerful but heavy. Sandlock targets the gap: strict
-confinement without image builds, overlay filesystems, or root privileges.
+confinement without image builds or root privileges. Built-in OverlayFS COW
+protects your working directory automatically.
 
 | Feature | Sandlock | Container | MicroVM (Firecracker) | gVisor |
 |---|---|---|---|---|
@@ -26,6 +27,7 @@ confinement without image builds, overlay filesystems, or root privileges.
 | Resource limits | seccomp notif + SIGSTOP/SIGCONT | cgroup v2 | VM config | cgroup v2 |
 | Memory sharing | COW (fork), zero-copy | Bind-mount + re-init | Shared mem (explicit) | N/A |
 | Nesting | Native (fork) | Complex (DinD/DooD) | Not supported | Supported |
+| COW filesystem | OverlayFS (kernel) / BranchFS | Overlay | Block-level | N/A |
 | Checkpoint/restore | ptrace + BranchFS | CRIU | VM snapshot | N/A |
 
 \* Rootless containers exist but require user namespace support, `/etc/subuid` configuration, and `fuse-overlayfs`.
@@ -246,20 +248,33 @@ Denies: `/proc/kcore`, `/proc/kallsyms`, `/proc/keys`, `/sys/kernel/`, `/sys/fir
 Virtualizes: `/proc/self/mounts`, `/proc/self/mountinfo`.
 PID isolation: blocks access to `/proc/<foreign_pid>/`.
 
-### BranchFS: Copy-on-Write Filesystem
+### Copy-on-Write Filesystem
 
-With `fs_isolation=BRANCHFS`, sandbox writes go to an isolated COW branch
-on a [BranchFS](https://github.com/user/branchfs) FUSE mount. Writes are
-committed on success, discarded on failure. Nested sandboxes create child branches.
+Setting `workdir` automatically enables COW protection. Writes are committed
+on success, discarded on error. The sandbox `chdir`s into the workdir.
 
 ```python
-Policy(
-    fs_isolation=FsIsolation.BRANCHFS,
-    fs_mount="/mnt/workspace",
-    on_exit=BranchAction.COMMIT,
-    on_error=BranchAction.ABORT,
-)
+# OverlayFS (default, zero dependencies, Linux 5.11+)
+Policy(workdir="/opt/project")
+
+# BranchFS (optional, supports snapshots, requires branchfs FUSE binary)
+Policy(workdir="/opt/project", fs_isolation=FsIsolation.BRANCHFS)
 ```
+
+```bash
+sandlock run --workdir /opt/project -- python3 task.py
+```
+
+Two backends:
+
+| | OverlayFS | BranchFS |
+|---|---|---|
+| Dependencies | None (kernel built-in) | `branchfs` FUSE binary |
+| Kernel | >= 5.11 | Any with FUSE |
+| Nesting | Chained lowerdir | Native branches |
+| Snapshots | Manual | O(1) native |
+
+Nested sandboxes create child COW layers automatically.
 
 ### Checkpoint/Restore
 
@@ -319,9 +334,9 @@ class Policy:
     clean_env: bool = False              # Minimal env (PATH, HOME, TERM, LANG, USER, SHELL)
     env: Mapping[str, str] = {}          # Set/override env vars
 
-    # BranchFS COW isolation
-    fs_isolation: FsIsolation = NONE     # NONE | BRANCHFS
-    fs_mount: str | None = None          # BranchFS mount point
+    # COW isolation (auto-enabled by workdir)
+    workdir: str | None = None           # Working directory + COW protection
+    fs_isolation: FsIsolation = NONE     # NONE | OVERLAYFS | BRANCHFS
     on_exit: BranchAction = COMMIT       # COMMIT | ABORT | KEEP
     on_error: BranchAction = ABORT
 
