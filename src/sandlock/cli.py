@@ -47,11 +47,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         cli_kwargs["chroot"] = args.chroot
     if args.privileged:
         cli_kwargs["privileged"] = True
+    if args.workdir:
+        cli_kwargs["workdir"] = args.workdir
     if args.fs_isolation:
         from .policy import FsIsolation
         cli_kwargs["fs_isolation"] = FsIsolation(args.fs_isolation)
-    if args.fs_mount:
-        cli_kwargs["fs_mount"] = args.fs_mount
     if args.fs_storage:
         cli_kwargs["fs_storage"] = args.fs_storage
     if args.max_disk:
@@ -363,10 +363,10 @@ def main() -> None:
                        help="Allowed TCP bind port or range (e.g. 80, 8000-9000)")
     run_p.add_argument("--net-connect", action="append", metavar="PORT",
                        help="Allowed TCP connect port or range (e.g. 443, 1-1024)")
+    run_p.add_argument("--workdir", metavar="PATH",
+                       help="Working directory (auto-enables COW protection)")
     run_p.add_argument("--fs-isolation", choices=["none", "branchfs", "overlayfs"],
                        help="Filesystem isolation mode")
-    run_p.add_argument("--fs-mount", metavar="PATH",
-                       help="BranchFS mount point")
     run_p.add_argument("--fs-storage", metavar="PATH",
                        help="BranchFS storage directory (separate from mount)")
     run_p.add_argument("--max-disk", metavar="SIZE",

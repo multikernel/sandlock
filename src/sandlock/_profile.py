@@ -51,9 +51,10 @@ _SIMPLE_FIELDS: dict[str, type] = {
     "close_fds": bool,
     "strict": bool,
     "privileged": bool,
-    # BranchFS
+    # Workdir
+    "workdir": str,
+    # COW isolation
     "fs_isolation": str,
-    "fs_mount": str,
     "fs_storage": str,
     "max_disk": str,
     "on_exit": str,

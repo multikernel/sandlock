@@ -155,15 +155,15 @@ class TestPolicyFields(unittest.TestCase):
     def test_default_isolation_none(self):
         p = Policy()
         self.assertEqual(p.fs_isolation, FsIsolation.NONE)
-        self.assertIsNone(p.fs_mount)
+        self.assertIsNone(p.workdir)
 
     def test_branch_isolation(self):
         p = Policy(
             fs_isolation=FsIsolation.BRANCHFS,
-            fs_mount="/mnt/workspace",
+            workdir="/mnt/workspace",
         )
         self.assertEqual(p.fs_isolation, FsIsolation.BRANCHFS)
-        self.assertEqual(p.fs_mount, "/mnt/workspace")
+        self.assertEqual(p.workdir, "/mnt/workspace")
 
     def test_default_branch_actions(self):
         p = Policy()
@@ -191,7 +191,7 @@ class TestSandboxBranchIntegration(unittest.TestCase):
         self.assertIsNone(sb._setup_branch())
         self.assertIsNone(sb._branch)
 
-    def test_branch_requires_fs_mount(self):
+    def test_branch_requires_workdir(self):
         from sandlock.sandbox import Sandbox
         from sandlock.exceptions import SandboxError
         sb = Sandbox(Policy(fs_isolation=FsIsolation.BRANCHFS))
@@ -203,7 +203,7 @@ class TestSandboxBranchIntegration(unittest.TestCase):
     def test_setup_branch_creates(self, mock_create, mock_mount):
         sb = self._make_sandbox(
             fs_isolation=FsIsolation.BRANCHFS,
-            fs_mount="/mnt/ws",
+            workdir="/mnt/ws",
         )
         result = sb._setup_branch()
         self.assertIsNotNone(result)
@@ -215,7 +215,7 @@ class TestSandboxBranchIntegration(unittest.TestCase):
     def test_effective_policy_rewrites_paths(self, mock_path, mock_create, mock_mount):
         sb = self._make_sandbox(
             fs_isolation=FsIsolation.BRANCHFS,
-            fs_mount="/mnt/ws",
+            workdir="/mnt/ws",
             fs_writable=["/mnt/ws"],
             fs_readable=["/mnt/ws/data", "/usr"],
         )
@@ -236,7 +236,7 @@ class TestSandboxBranchIntegration(unittest.TestCase):
     def test_finish_branch_commit_on_success(self, mock_create, mock_commit, mock_mount):
         sb = self._make_sandbox(
             fs_isolation=FsIsolation.BRANCHFS,
-            fs_mount="/mnt/ws",
+            workdir="/mnt/ws",
             on_exit=BranchAction.COMMIT,
         )
         sb._setup_branch()
@@ -249,7 +249,7 @@ class TestSandboxBranchIntegration(unittest.TestCase):
     def test_finish_branch_abort_on_error(self, mock_create, mock_abort, mock_mount):
         sb = self._make_sandbox(
             fs_isolation=FsIsolation.BRANCHFS,
-            fs_mount="/mnt/ws",
+            workdir="/mnt/ws",
             on_error=BranchAction.ABORT,
         )
         sb._setup_branch()
@@ -263,7 +263,7 @@ class TestSandboxBranchIntegration(unittest.TestCase):
     def test_finish_branch_keep_does_nothing(self, mock_create, mock_abort, mock_commit, mock_mount):
         sb = self._make_sandbox(
             fs_isolation=FsIsolation.BRANCHFS,
-            fs_mount="/mnt/ws",
+            workdir="/mnt/ws",
             on_exit=BranchAction.KEEP,
         )
         sb._setup_branch()
@@ -282,13 +282,13 @@ class TestSandboxBranchIntegration(unittest.TestCase):
 
         parent = Sandbox(Policy(
             fs_isolation=FsIsolation.BRANCHFS,
-            fs_mount="/mnt/ws",
+            workdir="/mnt/ws",
         ))
         parent._setup_branch()
 
         child_sb = parent.sandbox(Policy(
             fs_isolation=FsIsolation.BRANCHFS,
-            fs_mount="/mnt/ws",
+            workdir="/mnt/ws",
         ))
         self.assertEqual(
             child_sb._parent_branch_path,

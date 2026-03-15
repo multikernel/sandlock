@@ -498,6 +498,15 @@ class SandboxContext:
                 if self._policy.chroot:
                     setup_chroot(self._policy.chroot)
 
+                # 2b. chdir to workdir if set
+                # Use the rewritten workdir path (may point to overlay merged dir)
+                if self._policy.workdir:
+                    # Check if overlay branch rewrote the path
+                    if self._overlay_branch is not None:
+                        os.chdir(str(self._overlay_branch.path))
+                    else:
+                        os.chdir(self._policy.workdir)
+
                 # 4. Landlock confinement (filesystem + network, irreversible)
                 writable = list(self._policy.fs_writable)
                 readable = list(self._policy.fs_readable)

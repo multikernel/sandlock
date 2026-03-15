@@ -194,13 +194,15 @@ class Policy:
     intercepts open/openat syscalls and applies path-based rules
     for /proc and /sys virtualization.  Requires Linux 5.6+."""
 
-    # BranchFS COW filesystem isolation
-    fs_isolation: FsIsolation = FsIsolation.NONE
-    """Filesystem isolation mode.  BRANCH requires a BranchFS mount."""
+    # Working directory
+    workdir: str | None = None
+    """Working directory for the sandbox.  The child chdir's here before
+    running.  Automatically enables OverlayFS COW protection — writes are
+    captured in a COW layer and committed on success, aborted on error."""
 
-    fs_mount: str | None = None
-    """BranchFS mount point.  Required when fs_isolation is BRANCHFS.
-    Auto-mounted if not already a BranchFS mount."""
+    # COW filesystem isolation
+    fs_isolation: FsIsolation = FsIsolation.NONE
+    """Filesystem isolation mode.  Auto-set to OVERLAYFS when workdir is set."""
 
     fs_storage: str | None = None
     """Separate storage directory for BranchFS COW deltas.

@@ -61,7 +61,7 @@ class Checkpoint:
     branch_id: str | None = None
     """BranchFS branch UUID (O(1) COW snapshot)."""
 
-    fs_mount: str | None = None
+    workdir: str | None = None
     """BranchFS mount point."""
 
     # App-level (optional, from save_fn)
@@ -82,7 +82,7 @@ class Checkpoint:
         Storage layout::
 
             <store>/<name>/
-            ├── meta.json          # branch_id, fs_mount, sandbox_id
+            ├── meta.json          # branch_id, workdir, sandbox_id
             ├── policy.dat         # serialized Policy bytes
             ├── app_state.bin      # raw app state (optional)
             └── process/           # OS-level state (optional)
@@ -114,7 +114,7 @@ class Checkpoint:
             # meta.json
             meta = {
                 "branch_id": self.branch_id,
-                "fs_mount": self.fs_mount,
+                "workdir": self.workdir,
                 "sandbox_id": self.sandbox_id,
             }
             (tmp_dir / "meta.json").write_text(json.dumps(meta))
@@ -227,7 +227,7 @@ class Checkpoint:
         return cls(
             process_state=process_state,
             branch_id=meta.get("branch_id"),
-            fs_mount=meta.get("fs_mount"),
+            workdir=meta.get("workdir"),
             app_state=app_state,
             policy_data=policy_data,
             sandbox_id=meta.get("sandbox_id"),

@@ -137,6 +137,7 @@ class RemoteSandbox:
             parts += _policy_to_cli_flags(self._policy)
         if self._workdir:
             parts += ["-r", self._workdir, "-w", self._workdir]
+            parts += ["--workdir", self._workdir]
         if timeout is not None:
             parts += ["-t", str(timeout)]
         return parts
@@ -152,10 +153,6 @@ class RemoteSandbox:
             Result with exit_code, stdout, stderr.
         """
         ssh = self._ensure_connected()
-
-        if self._workdir:
-            command = f"cd {shlex.quote(self._workdir)} && {command}"
-
         parts = self._base_parts(timeout) + ["-e", command]
         remote_cmd = " ".join(shlex.quote(p) for p in parts)
         exit_code, stdout, stderr = ssh.exec(remote_cmd)

@@ -376,7 +376,7 @@ class Sandbox:
         return Checkpoint(
             process_state=process_state,
             branch_id=snapshot_branch_id,
-            fs_mount=self._policy.fs_mount,
+            workdir=self._policy.workdir,
             app_state=app_state,
             policy_data=pickle.dumps(self._policy),
             sandbox_id=self._id,
@@ -410,11 +410,11 @@ class Sandbox:
         policy = pickle.loads(checkpoint.policy_data)
 
         # If checkpoint has a branch, create a child branch from it
-        if checkpoint.branch_id and checkpoint.fs_mount:
+        if checkpoint.branch_id and checkpoint.workdir:
             from ._branchfs import SandboxBranch
             from pathlib import Path
 
-            mount = Path(checkpoint.fs_mount)
+            mount = Path(checkpoint.workdir)
             checkpoint_branch_path = mount / f"@{checkpoint.branch_id}"
 
             # Override policy to fork from checkpoint branch
@@ -492,15 +492,22 @@ class Sandbox:
         Returns:
             SandboxBranch, OverlayBranch, or None.
         """
+        # workdir implies COW
+        if self._policy.workdir and self._policy.fs_isolation == FsIsolation.NONE:
+            import dataclasses
+            self._policy = dataclasses.replace(
+                self._policy, fs_isolation=FsIsolation.OVERLAYFS,
+            )
+
         if self._policy.fs_isolation == FsIsolation.NONE:
             return None
         if self._branch is not None:
             return self._branch
 
-        fs_mount = self._policy.fs_mount
-        if fs_mount is None:
+        workdir = self._policy.workdir
+        if workdir is None:
             raise SandboxError(
-                f"fs_isolation={self._policy.fs_isolation.value} requires fs_mount to be set"
+                f"fs_isolation={self._policy.fs_isolation.value} requires workdir to be set"
             )
 
         from pathlib import Path
@@ -508,7 +515,7 @@ class Sandbox:
         if self._policy.fs_isolation == FsIsolation.BRANCHFS:
             from ._branchfs import SandboxBranch, ensure_mount, is_branchfs_mount
 
-            mount_root = Path(fs_mount)
+            mount_root = Path(workdir)
 
             # Auto-mount BranchFS if not already mounted
             if not is_branchfs_mount(mount_root):
@@ -526,7 +533,7 @@ class Sandbox:
         elif self._policy.fs_isolation == FsIsolation.OVERLAYFS:
             from ._overlayfs import OverlayBranch
 
-            lower = Path(fs_mount)
+            lower = Path(workdir)
             storage = Path(self._policy.fs_storage) if self._policy.fs_storage else lower / ".sandlock_overlay"
 
             parent_branch = None
@@ -552,7 +559,7 @@ class Sandbox:
 
         # --- COW path rewriting (BranchFS and OverlayFS) ---
         if self._branch is not None:
-            mount = policy.fs_mount
+            mount = policy.workdir
             branch_path = str(self._branch.path)
 
             def _rewrite(paths):
@@ -629,11 +636,11 @@ class Sandbox:
 
     def _cleanup_mount(self) -> None:
         """Unmount BranchFS if we auto-mounted it."""
-        if self._owns_mount and self._policy.fs_mount:
+        if self._owns_mount and self._policy.workdir:
             from ._branchfs import unmount
             from pathlib import Path
             try:
-                unmount(Path(self._policy.fs_mount))
+                unmount(Path(self._policy.workdir))
             except Exception:
                 pass
             self._owns_mount = False

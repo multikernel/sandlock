@@ -31,12 +31,12 @@ class TestCheckpointDataclass(unittest.TestCase):
             policy_data=pickle.dumps(Policy()),
             app_state=b"hello",
             branch_id="abc123",
-            fs_mount="/mnt/ws",
+            workdir="/mnt/ws",
             sandbox_id="sb-1",
         )
         self.assertEqual(cp.app_state, b"hello")
         self.assertEqual(cp.branch_id, "abc123")
-        self.assertEqual(cp.fs_mount, "/mnt/ws")
+        self.assertEqual(cp.workdir, "/mnt/ws")
         self.assertEqual(cp.sandbox_id, "sb-1")
         self.assertIsNone(cp.process_state)
 
@@ -54,7 +54,7 @@ class TestCheckpointDataclass(unittest.TestCase):
         cp = Checkpoint()
         self.assertIsNone(cp.process_state)
         self.assertIsNone(cp.branch_id)
-        self.assertIsNone(cp.fs_mount)
+        self.assertIsNone(cp.workdir)
         self.assertIsNone(cp.app_state)
         self.assertIsNone(cp.sandbox_id)
         self.assertEqual(cp.policy_data, b"")
@@ -244,13 +244,13 @@ class TestSandboxCheckpointIntegration(unittest.TestCase):
         """from_checkpoint sets parent_branch_path when branch_id is present."""
         policy = Policy(
             fs_isolation=FsIsolation.BRANCHFS,
-            fs_mount="/mnt/ws",
+            workdir="/mnt/ws",
         )
         cp = Checkpoint(
             policy_data=pickle.dumps(policy),
             app_state=b"state",
             branch_id="snap-abc",
-            fs_mount="/mnt/ws",
+            workdir="/mnt/ws",
         )
 
         with mock.patch("sandlock.sandbox.Sandbox.call") as mock_call:
@@ -337,7 +337,7 @@ class TestNamedCheckpoints(unittest.TestCase):
             policy_data=pickle.dumps(Policy()),
             app_state=b"test_app_state",
             branch_id="br-001",
-            fs_mount="/mnt/ws",
+            workdir="/mnt/ws",
             sandbox_id="sb-42",
         )
         defaults.update(kwargs)
@@ -379,7 +379,7 @@ class TestNamedCheckpoints(unittest.TestCase):
 
         loaded = Checkpoint.load("env1", store=self.store)
         self.assertEqual(loaded.branch_id, "br-001")
-        self.assertEqual(loaded.fs_mount, "/mnt/ws")
+        self.assertEqual(loaded.workdir, "/mnt/ws")
         self.assertEqual(loaded.sandbox_id, "sb-42")
         self.assertEqual(loaded.app_state, b"test_app_state")
         self.assertEqual(loaded.policy_data, cp.policy_data)
