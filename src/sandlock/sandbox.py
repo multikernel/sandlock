@@ -41,7 +41,21 @@ class Sandbox:
             sb.resume()
     """
 
-    def __init__(self, policy: Policy | str, *, sandbox_id: str | None = None):
+    def __new__(cls, policy: "Policy | str", *, host: str | None = None, **kwargs):
+        if host is not None:
+            try:
+                from .deploy._sandbox import RemoteSandbox
+            except ImportError:
+                raise ImportError(
+                    "Remote sandbox requires sandlock[deploy]. "
+                    "Install with: pip install sandlock[deploy]"
+                ) from None
+            return RemoteSandbox(policy, host=host, **kwargs)
+        return super().__new__(cls)
+
+    def __init__(self, policy: Policy | str, *, host: str | None = None, sandbox_id: str | None = None, **kwargs):
+        if host is not None:
+            return  # RemoteSandbox already initialized via __new__
         if isinstance(policy, str):
             from ._profile import load_profile
             policy = load_profile(policy)

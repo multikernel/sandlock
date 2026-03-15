@@ -106,6 +106,32 @@ def cmd_run(args: argparse.Namespace) -> int:
         print("error: no command specified", file=sys.stderr)
         return 1
 
+    # Remote execution via SSH
+    if getattr(args, "host", None):
+        try:
+            from .deploy._sandbox import RemoteSandbox
+        except ImportError:
+            print(
+                "error: --host requires sandlock[deploy].\n"
+                "Install with: pip install sandlock[deploy]",
+                file=sys.stderr,
+            )
+            return 1
+
+        sb = RemoteSandbox(policy, host=args.host)
+        try:
+            if args.exec_shell:
+                result = sb.run_shell(args.exec_shell, timeout=args.timeout)
+            else:
+                result = sb.run(command, timeout=args.timeout)
+            if result.stdout:
+                sys.stdout.buffer.write(result.stdout)
+            if result.stderr:
+                sys.stderr.buffer.write(result.stderr)
+            return result.exit_code
+        finally:
+            sb.close()
+
     sb = Sandbox(policy)
 
     if args.interactive:
@@ -147,6 +173,20 @@ def cmd_profile_show(args: argparse.Namespace) -> int:
     print(f"# {path}")
     print(path.read_text(), end="")
     return 0
+
+
+def cmd_deploy(args: argparse.Namespace) -> int:
+    """Deploy sandlock to a remote host via SSH."""
+    try:
+        from .deploy._cli import run_deploy
+    except ImportError:
+        print(
+            "error: sandlock[deploy] not installed.\n"
+            "Install with: pip install sandlock[deploy]",
+            file=sys.stderr,
+        )
+        return 1
+    return run_deploy(args)
 
 
 def cmd_check(args: argparse.Namespace) -> int:
@@ -235,6 +275,8 @@ def main() -> None:
                        help="Start with minimal environment (PATH, HOME, USER, TERM, LANG)")
     run_p.add_argument("--env", action="append", metavar="KEY=VALUE",
                        help="Set environment variable in the sandbox")
+    run_p.add_argument("--host", metavar="USER@HOST",
+                       help="Run on remote host via SSH (requires sandlock[deploy])")
     run_p.set_defaults(func=cmd_run)
 
     # sandlock profile
@@ -249,6 +291,22 @@ def main() -> None:
     prof_show.set_defaults(func=cmd_profile_show)
 
     prof_p.set_defaults(func=lambda args: (prof_p.print_help(), 1)[1])
+
+    # sandlock deploy
+    deploy_p = sub.add_parser("deploy", help="Deploy sandlock to a remote host via SSH")
+    deploy_p.add_argument("host", help="Remote host (user@host)")
+    deploy_p.add_argument("-p", "--port", type=int, default=22, help="SSH port")
+    deploy_p.add_argument("-k", "--key", metavar="PATH", help="SSH private key file")
+    deploy_p.add_argument("--profile", metavar="NAME", help="Profile to push to remote")
+    deploy_p.add_argument("--pubkey", metavar="PATH",
+                          help="Public key file to add to remote authorized_keys")
+    deploy_p.add_argument("--force-command", action="store_true",
+                          help="Configure SSH ForceCommand to sandbox all sessions")
+    deploy_p.add_argument("--remote-python", default="python3",
+                          help="Python interpreter on remote (default: python3)")
+    deploy_p.add_argument("--no-verify", action="store_true",
+                          help="Skip post-deploy verification")
+    deploy_p.set_defaults(func=cmd_deploy)
 
     # sandlock check
     check_p = sub.add_parser("check", help="Check kernel support")

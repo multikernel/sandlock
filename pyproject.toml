@@ -18,6 +18,9 @@ classifiers = [
     "Operating System :: POSIX :: Linux",
 ]
 
+[project.optional-dependencies]
+deploy = ["paramiko>=3.0"]
+
 [project.urls]
 Homepage = "https://github.com/multikernel/sandlock"
 
