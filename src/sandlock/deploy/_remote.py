@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -116,6 +116,7 @@ def deploy(
         print(f"  profile uploaded to: {remote_profile}")
 
     # Step 3: Clone/pull git repo
+    repo_dir = None
     if repo:
         # Determine clone directory
         if workdir:
@@ -128,20 +129,24 @@ def deploy(
             rc, home_out, _ = ssh.exec("echo $HOME")
             repo_dir = f"{home_out.strip()}/{repo_name}"
 
-        rc, _, _ = ssh.exec(f"test -d {repo_dir}/.git")
+        q_dir = shlex.quote(repo_dir)
+        rc, _, _ = ssh.exec(f"test -d {q_dir}/.git")
         if rc == 0:
             print(f"Updating repo in {repo_dir}...")
-            pull_cmd = f"cd {repo_dir} && git pull"
+            pull_cmd = f"cd {q_dir} && git pull"
             if branch:
-                pull_cmd = f"cd {repo_dir} && git checkout {branch} && git pull"
+                q_branch = shlex.quote(branch)
+                pull_cmd = f"cd {q_dir} && git checkout {q_branch} && git pull"
             rc, out, err = ssh.exec(pull_cmd)
             if rc != 0:
                 raise RuntimeError(f"git pull failed:\n{err}")
         else:
             print(f"Cloning {repo} to {repo_dir}...")
-            clone_cmd = f"git clone {repo} {repo_dir}"
+            q_repo = shlex.quote(repo)
+            clone_cmd = f"git clone {q_repo} {q_dir}"
             if branch:
-                clone_cmd = f"git clone -b {branch} {repo} {repo_dir}"
+                q_branch = shlex.quote(branch)
+                clone_cmd = f"git clone -b {q_branch} {q_repo} {q_dir}"
             rc, out, err = ssh.exec(clone_cmd)
             if rc != 0:
                 raise RuntimeError(f"git clone failed:\n{err}")
@@ -149,8 +154,8 @@ def deploy(
 
     # Step 4: Run setup commands
     if setup:
-        run_dir = workdir or repo_dir if repo else None
-        setup_cmd = f"cd {run_dir} && {setup}" if run_dir else setup
+        run_dir = workdir or repo_dir
+        setup_cmd = f"cd {shlex.quote(run_dir)} && {setup}" if run_dir else setup
         print(f"Running setup: {setup}")
         rc, out, err = ssh.exec(setup_cmd)
         if rc != 0:

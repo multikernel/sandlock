@@ -26,7 +26,7 @@ Example::
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 if sys.version_info >= (3, 11):

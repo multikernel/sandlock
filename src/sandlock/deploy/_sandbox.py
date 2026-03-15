@@ -3,10 +3,7 @@
 
 from __future__ import annotations
 
-import dataclasses
-import json
 import shlex
-from typing import Any, Callable
 
 from ..policy import Policy
 from .._runner import Result
@@ -107,23 +104,7 @@ class RemoteSandbox:
 
     def _build_command(self, cmd: list[str], timeout: float | None = None) -> str:
         """Build the remote sandlock command string."""
-        parts = [self._sandlock_bin, "run"]
-
-        if self._profile_name:
-            parts += ["--profile", self._profile_name]
-        elif self._policy:
-            parts += _policy_to_cli_flags(self._policy)
-
-        # Auto-allow workdir in sandbox
-        if self._workdir:
-            parts += ["-r", self._workdir, "-w", self._workdir]
-
-        if timeout is not None:
-            parts += ["-t", str(timeout)]
-
-        parts.append("--")
-        parts += cmd
-
+        parts = self._base_parts(timeout) + ["--"] + cmd
         return " ".join(shlex.quote(p) for p in parts)
 
     def run(self, cmd: list[str], *, timeout: float | None = None) -> Result:
@@ -143,9 +124,22 @@ class RemoteSandbox:
         return Result(
             success=exit_code == 0,
             exit_code=exit_code,
-            stdout=stdout.encode() if isinstance(stdout, str) else stdout,
-            stderr=stderr.encode() if isinstance(stderr, str) else stderr,
+            stdout=stdout.encode(),
+            stderr=stderr.encode(),
         )
+
+    def _base_parts(self, timeout: float | None = None) -> list[str]:
+        """Build common sandlock run prefix."""
+        parts = [self._sandlock_bin, "run"]
+        if self._profile_name:
+            parts += ["--profile", self._profile_name]
+        elif self._policy:
+            parts += _policy_to_cli_flags(self._policy)
+        if self._workdir:
+            parts += ["-r", self._workdir, "-w", self._workdir]
+        if timeout is not None:
+            parts += ["-t", str(timeout)]
+        return parts
 
     def run_shell(self, command: str, *, timeout: float | None = None) -> Result:
         """Run a shell command string in a remote sandbox.
@@ -159,26 +153,18 @@ class RemoteSandbox:
         """
         ssh = self._ensure_connected()
 
-        parts = [self._sandlock_bin, "run"]
-        if self._profile_name:
-            parts += ["--profile", self._profile_name]
-        elif self._policy:
-            parts += _policy_to_cli_flags(self._policy)
         if self._workdir:
-            parts += ["-r", self._workdir, "-w", self._workdir]
-            command = f"cd {self._workdir} && {command}"
-        if timeout is not None:
-            parts += ["-t", str(timeout)]
-        parts += ["-e", command]
+            command = f"cd {shlex.quote(self._workdir)} && {command}"
 
+        parts = self._base_parts(timeout) + ["-e", command]
         remote_cmd = " ".join(shlex.quote(p) for p in parts)
         exit_code, stdout, stderr = ssh.exec(remote_cmd)
 
         return Result(
             success=exit_code == 0,
             exit_code=exit_code,
-            stdout=stdout.encode() if isinstance(stdout, str) else stdout,
-            stderr=stderr.encode() if isinstance(stderr, str) else stderr,
+            stdout=stdout.encode(),
+            stderr=stderr.encode(),
         )
 
     def close(self) -> None:

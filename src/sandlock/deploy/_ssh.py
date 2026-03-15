@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path, PurePosixPath
 
 import paramiko
@@ -63,7 +62,8 @@ class SSHSession:
         Prepends ~/.local/bin to PATH since non-interactive SSH
         sessions don't load shell profiles.
         """
-        assert self._client is not None
+        if self._client is None:
+            raise RuntimeError("SSH session not connected")
         wrapped = f'PATH="$HOME/.local/bin:$PATH" {command}'
         _, stdout, stderr = self._client.exec_command(wrapped)
         exit_code = stdout.channel.recv_exit_status()
@@ -71,7 +71,8 @@ class SSHSession:
 
     def upload(self, local_path: str | Path, remote_path: str) -> None:
         """Upload a file via SFTP."""
-        assert self._client is not None
+        if self._client is None:
+            raise RuntimeError("SSH session not connected")
         sftp = self._client.open_sftp()
         try:
             # Ensure remote directory exists
@@ -83,7 +84,8 @@ class SSHSession:
 
     def read_remote(self, remote_path: str) -> str | None:
         """Read a remote file, return None if it doesn't exist."""
-        assert self._client is not None
+        if self._client is None:
+            raise RuntimeError("SSH session not connected")
         sftp = self._client.open_sftp()
         try:
             with sftp.open(remote_path, "r") as f:
@@ -95,7 +97,8 @@ class SSHSession:
 
     def write_remote(self, remote_path: str, content: str, mode: int = 0o644) -> None:
         """Write content to a remote file."""
-        assert self._client is not None
+        if self._client is None:
+            raise RuntimeError("SSH session not connected")
         sftp = self._client.open_sftp()
         try:
             remote_dir = str(PurePosixPath(remote_path).parent)
