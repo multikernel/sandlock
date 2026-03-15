@@ -190,6 +190,7 @@ Enforced via **seccomp user notification** and **SIGSTOP/SIGCONT**, no cgroups o
 | Memory | seccomp notif on `mmap`/`munmap`/`brk`/`mremap` | `ENOMEM` when over budget |
 | Processes | seccomp notif on `clone`/`fork`/`vfork` | `EAGAIN` when at limit |
 | CPU | Parent-side SIGSTOP/SIGCONT on process group | Throttle to N% of one core |
+| Disk | BranchFS FUSE layer (`--max-disk`) | `ENOSPC` when quota exceeded |
 
 CPU throttling works like cgroup v2 `cpu.max` but without root: a supervisor
 thread cycles SIGSTOP/SIGCONT on the sandbox process group every 100ms.
