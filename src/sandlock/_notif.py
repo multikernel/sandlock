@@ -575,7 +575,8 @@ class NotifSupervisor:
     def _dispatch(self, notif: SeccompNotif) -> None:
         """Route a notification to the appropriate handler."""
         # Lazily track every PID that makes an intercepted syscall
-        self._proc_pids.add(notif.pid)
+        pid = notif.pid
+        self._proc_pids.add(pid)
         nr = notif.data.nr
 
         # --- Resource: memory tracking ---
