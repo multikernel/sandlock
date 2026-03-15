@@ -168,11 +168,13 @@ class SandboxContext:
         sandbox_id: str,
         *,
         save_fn: Callable[[], bytes] | None = None,
+        overlay_branch: "object | None" = None,
     ):
         self._target = target
         self._policy = policy
         self._sandbox_id = sandbox_id
         self._save_fn = save_fn
+        self._overlay_branch = overlay_branch or getattr(policy, '_overlay_branch', None)
         self._pid: Optional[int] = None
         self._pidfd: int = -1
         self._supervisor = None  # NotifSupervisor | None (lazy import)
@@ -399,8 +401,10 @@ class SandboxContext:
             from ._notif import install_notif_filter, send_fd  # noqa: F811
         if self._save_fn is not None:
             from ._checkpoint import start_child_listener  # noqa: F811
-        # User namespace is only needed for privileged mode (UID 0 mapping)
-        needs_userns = self._policy.privileged
+        # User namespace is needed for privileged mode or overlayfs
+        from .policy import FsIsolation
+        needs_overlay = self._policy.fs_isolation == FsIsolation.OVERLAYFS
+        needs_userns = self._policy.privileged or needs_overlay
         if needs_userns:
             from ._userns import unshare_user, setup_userns_in_parent, userns_available  # noqa: F811
 
@@ -478,6 +482,17 @@ class SandboxContext:
                             raise ConfinementError(
                                 "User namespace unavailable and policy.privileged=True"
                             )
+
+                # 1b. Mount namespace + overlayfs (if needed)
+                if needs_overlay and self._overlay_branch is not None:
+                    from ._overlayfs import mount_overlay, CLONE_NEWNS
+                    ret = _libc.unshare(ctypes.c_int(CLONE_NEWNS))
+                    if ret < 0:
+                        err = ctypes.get_errno()
+                        raise ConfinementError(
+                            f"unshare(NEWNS) failed: {os.strerror(err)}"
+                        )
+                    mount_overlay(self._overlay_branch)
 
                 # 2. chroot if requested
                 if self._policy.chroot:

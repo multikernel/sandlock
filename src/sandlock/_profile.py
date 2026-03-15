@@ -127,7 +127,7 @@ def policy_from_dict(data: dict, source: str = "<dict>") -> Policy:
                 kwargs[key] = FsIsolation(value)
             except ValueError:
                 raise PolicyError(
-                    f"{source}: fs_isolation must be 'none' or 'branchfs', "
+                    f"{source}: fs_isolation must be 'none', 'branchfs', or 'overlayfs', "
                     f"got {value!r}"
                 )
             continue

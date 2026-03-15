@@ -82,6 +82,7 @@ class FsIsolation(Enum):
 
     NONE = "none"        # Direct host writes (default)
     BRANCHFS = "branchfs"  # BranchFS COW isolation
+    OVERLAYFS = "overlayfs"  # OverlayFS COW (kernel built-in, no dependencies)
 
 
 class BranchAction(Enum):

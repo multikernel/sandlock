@@ -363,7 +363,7 @@ def main() -> None:
                        help="Allowed TCP bind port or range (e.g. 80, 8000-9000)")
     run_p.add_argument("--net-connect", action="append", metavar="PORT",
                        help="Allowed TCP connect port or range (e.g. 443, 1-1024)")
-    run_p.add_argument("--fs-isolation", choices=["none", "branchfs"],
+    run_p.add_argument("--fs-isolation", choices=["none", "branchfs", "overlayfs"],
                        help="Filesystem isolation mode")
     run_p.add_argument("--fs-mount", metavar="PATH",
                        help="BranchFS mount point")

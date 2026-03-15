@@ -77,6 +77,10 @@ def call_in_sandbox(
 
     # Use a non-closing-fds policy for the inner target since we need the pipe
     inner_policy = dataclasses.replace(policy, close_fds=False)
+    # Propagate overlay branch (not a dataclass field, lost by replace)
+    _ob = getattr(policy, '_overlay_branch', None)
+    if _ob is not None:
+        object.__setattr__(inner_policy, '_overlay_branch', _ob)
 
     try:
         with SandboxContext(
@@ -232,6 +236,9 @@ def run_command_in_sandbox(
             os._exit(127)
 
     inner_policy = dataclasses.replace(policy, close_fds=False)
+    _ob = getattr(policy, '_overlay_branch', None)
+    if _ob is not None:
+        object.__setattr__(inner_policy, '_overlay_branch', _ob)
 
     try:
         with SandboxContext(

@@ -447,7 +447,11 @@ class Sandbox:
         """
         child = Sandbox(policy)
         if self._branch is not None:
-            child._parent_branch_path = self._branch.path
+            from ._overlayfs import OverlayBranch
+            if isinstance(self._branch, OverlayBranch):
+                child._parent_overlay_branch = self._branch
+            else:
+                child._parent_branch_path = self._branch.path
         return child
 
     # --- Branch operations ---
@@ -481,14 +485,14 @@ class Sandbox:
     # --- Internal ---
 
     def _setup_branch(self):
-        """Create a BranchFS branch if policy requires it.
+        """Create a filesystem branch if policy requires COW isolation.
 
-        Auto-mounts BranchFS if not already mounted at fs_mount.
+        Supports BranchFS (FUSE) and OverlayFS (kernel built-in).
 
         Returns:
-            SandboxBranch or None.
+            SandboxBranch, OverlayBranch, or None.
         """
-        if self._policy.fs_isolation != FsIsolation.BRANCHFS:
+        if self._policy.fs_isolation == FsIsolation.NONE:
             return None
         if self._branch is not None:
             return self._branch
@@ -496,27 +500,42 @@ class Sandbox:
         fs_mount = self._policy.fs_mount
         if fs_mount is None:
             raise SandboxError(
-                "fs_isolation=BRANCHFS requires fs_mount to be set"
+                f"fs_isolation={self._policy.fs_isolation.value} requires fs_mount to be set"
             )
 
-        from ._branchfs import SandboxBranch, ensure_mount, is_branchfs_mount
         from pathlib import Path
 
-        mount_root = Path(fs_mount)
+        if self._policy.fs_isolation == FsIsolation.BRANCHFS:
+            from ._branchfs import SandboxBranch, ensure_mount, is_branchfs_mount
 
-        # Auto-mount BranchFS if not already mounted
-        if not is_branchfs_mount(mount_root):
-            ensure_mount(
-                mount_root,
-                storage=Path(self._policy.fs_storage) if self._policy.fs_storage else None,
-                max_disk=self._policy.max_disk,
-            )
-            self._owns_mount = True
+            mount_root = Path(fs_mount)
 
-        parent_path = self._parent_branch_path  # None for top-level
+            # Auto-mount BranchFS if not already mounted
+            if not is_branchfs_mount(mount_root):
+                ensure_mount(
+                    mount_root,
+                    storage=Path(self._policy.fs_storage) if self._policy.fs_storage else None,
+                    max_disk=self._policy.max_disk,
+                )
+                self._owns_mount = True
 
-        self._branch = SandboxBranch(mount_root, parent_path)
-        self._branch.create()
+            parent_path = self._parent_branch_path  # None for top-level
+            self._branch = SandboxBranch(mount_root, parent_path)
+            self._branch.create()
+
+        elif self._policy.fs_isolation == FsIsolation.OVERLAYFS:
+            from ._overlayfs import OverlayBranch
+
+            lower = Path(fs_mount)
+            storage = Path(self._policy.fs_storage) if self._policy.fs_storage else lower / ".sandlock_overlay"
+
+            parent_branch = None
+            if hasattr(self, '_parent_overlay_branch'):
+                parent_branch = self._parent_overlay_branch
+
+            self._branch = OverlayBranch(lower, storage, parent_branch)
+            self._branch.create()
+
         return self._branch
 
     def _effective_policy(self) -> Policy:
@@ -531,7 +550,7 @@ class Sandbox:
         policy = self._policy
         overrides: dict = {}
 
-        # --- BranchFS path rewriting ---
+        # --- COW path rewriting (BranchFS and OverlayFS) ---
         if self._branch is not None:
             mount = policy.fs_mount
             branch_path = str(self._branch.path)
@@ -597,8 +616,16 @@ class Sandbox:
                 )
 
         if not overrides:
-            return policy
-        return dataclasses.replace(policy, **overrides)
+            result = policy
+        else:
+            result = dataclasses.replace(policy, **overrides)
+
+        # Attach overlay branch for child-side mount (not a Policy field)
+        from ._overlayfs import OverlayBranch
+        if isinstance(self._branch, OverlayBranch):
+            object.__setattr__(result, '_overlay_branch', self._branch)
+
+        return result
 
     def _cleanup_mount(self) -> None:
         """Unmount BranchFS if we auto-mounted it."""
