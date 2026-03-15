@@ -357,6 +357,97 @@ class TestPortRemap:
         assert r2.success
         assert r2.value == "BLOCKED"
 
+    def test_proc_net_tcp_shows_own_port_only(self):
+        """/proc/net/tcp shows only the sandbox's own ports."""
+        import socket as sock_mod
+
+        def bind_and_read_proc():
+            s = sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM)
+            s.setsockopt(sock_mod.SOL_SOCKET, sock_mod.SO_REUSEADDR, 1)
+            s.bind(("127.0.0.1", 5000))
+            s.listen(1)
+            with open("/proc/net/tcp") as f:
+                lines = f.readlines()
+            s.close()
+            # Parse ports from /proc/net/tcp (skip header)
+            ports = []
+            for line in lines[1:]:
+                parts = line.split()
+                if len(parts) >= 2:
+                    port_hex = parts[1].split(":")[1]
+                    ports.append(int(port_hex, 16))
+            return ports
+
+        policy = Policy(
+            net_bind=["39000-39099"],
+            port_remap=True,
+            fs_readable=["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev"],
+        )
+        result = Sandbox(policy).call(bind_and_read_proc)
+
+        assert result.success
+        # Should see exactly one port: our remapped real port
+        assert len(result.value) == 1
+        assert 39000 <= result.value[0] <= 39099
+
+    def test_proc_net_tcp_hides_host_ports(self):
+        """/proc/net/tcp hides host ports (e.g. sshd on port 22)."""
+
+        def read_proc():
+            with open("/proc/net/tcp") as f:
+                lines = f.readlines()
+            ports = []
+            for line in lines[1:]:
+                parts = line.split()
+                if len(parts) >= 2:
+                    port_hex = parts[1].split(":")[1]
+                    ports.append(int(port_hex, 16))
+            return ports
+
+        policy = Policy(
+            net_bind=["39100-39199"],
+            port_remap=True,
+            fs_readable=["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev"],
+        )
+        result = Sandbox(policy).call(read_proc)
+
+        assert result.success
+        # No ports bound, so should see nothing
+        assert result.value == []
+        # Specifically, host port 22 (sshd) should NOT be visible
+        assert 22 not in result.value
+
+    def test_proc_net_tcp6_filtered(self):
+        """/proc/net/tcp6 is filtered the same way."""
+        import socket as sock_mod
+
+        def bind_ipv6_and_read():
+            s = sock_mod.socket(sock_mod.AF_INET6, sock_mod.SOCK_STREAM)
+            s.setsockopt(sock_mod.SOL_SOCKET, sock_mod.SO_REUSEADDR, 1)
+            s.bind(("::1", 6000))
+            s.listen(1)
+            with open("/proc/net/tcp6") as f:
+                lines = f.readlines()
+            s.close()
+            ports = []
+            for line in lines[1:]:
+                parts = line.split()
+                if len(parts) >= 2:
+                    port_hex = parts[1].split(":")[1]
+                    ports.append(int(port_hex, 16))
+            return ports
+
+        policy = Policy(
+            net_bind=["39200-39299"],
+            port_remap=True,
+            fs_readable=["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev"],
+        )
+        result = Sandbox(policy).call(bind_ipv6_and_read)
+
+        assert result.success
+        assert len(result.value) == 1
+        assert 39200 <= result.value[0] <= 39299
+
 
 class TestCpuThrottle:
     """Test SIGSTOP/SIGCONT CPU throttling."""
