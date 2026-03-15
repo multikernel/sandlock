@@ -494,22 +494,12 @@ class TestNamedCheckpoints(unittest.TestCase):
 class TestEndToEndCheckpoint(unittest.TestCase):
     """End-to-end checkpoint: start sandbox, checkpoint, restore, verify."""
 
-    def _ptrace_allowed(self):
-        """Check if ptrace is permitted (Yama scope 0 or CAP_SYS_PTRACE)."""
-        try:
-            val = open("/proc/sys/kernel/yama/ptrace_scope").read().strip()
-            return val == "0"
-        except FileNotFoundError:
-            return True
-
     def test_app_state_roundtrip(self):
-        """Checkpoint captures app state and restore receives it."""
+        """Checkpoint captures app state via save_fn and restores it."""
         import tempfile
         import time
         from sandlock.sandbox import Sandbox
-
-        if not self._ptrace_allowed():
-            self.skipTest("ptrace not permitted (yama ptrace_scope != 0)")
+        from sandlock._context import SandboxContext
 
         store = Path(tempfile.mkdtemp(prefix="sandlock_e2e_ckpt_"))
 
@@ -519,29 +509,52 @@ class TestEndToEndCheckpoint(unittest.TestCase):
             def save_fn():
                 return b"counter=42"
 
-            with Sandbox(policy) as sb:
-                sb.exec(["sleep", "60"], save_fn=save_fn)
-                time.sleep(0.2)
+            # Use a Python target (not exec) so the checkpoint listener
+            # thread survives -- exec replaces the process image and
+            # kills the listener.
+            def _target():
+                time.sleep(60)
 
-                cp = sb.checkpoint()
-                self.assertIsNotNone(cp.app_state)
-                self.assertEqual(cp.app_state, b"counter=42")
-                self.assertIsNotNone(cp.process_state)
+            ctx = SandboxContext(_target, policy, "e2e-test", save_fn=save_fn)
+            with ctx:
+                time.sleep(0.2)
+                pid = ctx.pid
+
+                # SIGSTOP + ptrace dump + app state
+                import signal
+                os.killpg(pid, signal.SIGSTOP)
+
+                from sandlock._ptrace import dump_process_state
+                process_state = dump_process_state(pid)
+
+                os.killpg(pid, signal.SIGCONT)
+
+                from sandlock._checkpoint import request_app_state
+                app_state = request_app_state(ctx.control_fd)
+
+                self.assertEqual(app_state, b"counter=42")
+                self.assertIsNotNone(process_state)
+
+                cp = Checkpoint(
+                    process_state=process_state,
+                    app_state=app_state,
+                    policy_data=pickle.dumps(policy),
+                    sandbox_id="e2e-test",
+                )
 
                 cp.save("e2e", store=store)
                 loaded = Checkpoint.load("e2e", store=store)
                 self.assertEqual(loaded.app_state, b"counter=42")
+                self.assertIsNotNone(loaded.process_state)
 
-            received = {}
-
+            # Restore
             def restore_fn(state):
-                received["state"] = state
+                assert state == b"counter=42"
 
             result = Sandbox.from_checkpoint(
                 loaded, restore_fn, timeout=5,
             )
-            self.assertTrue(result.success)
-            self.assertEqual(received["state"], b"counter=42")
+            self.assertTrue(result.success, f"restore failed: {result.error}")
         finally:
             import shutil
             shutil.rmtree(store, ignore_errors=True)

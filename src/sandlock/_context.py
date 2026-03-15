@@ -423,6 +423,14 @@ class SandboxContext:
             try:
                 os.setpgid(0, 0)
 
+                # Allow parent to ptrace us (needed for checkpoint on
+                # kernels with yama ptrace_scope=1)
+                _PR_SET_PTRACER = 0x59616d61  # Yama-specific
+                _libc.prctl(ctypes.c_int(_PR_SET_PTRACER),
+                            ctypes.c_ulong(os.getppid()),
+                            ctypes.c_ulong(0), ctypes.c_ulong(0),
+                            ctypes.c_ulong(0))
+
                 # 1. User namespace for privileged mode (if needed)
                 if needs_userns and userns_c2p_w >= 0:
                     os.close(userns_c2p_r)
@@ -474,7 +482,18 @@ class SandboxContext:
                         if self._policy.strict:
                             raise
 
-                # 5. seccomp filter (irreversible)
+                # 5. Start checkpoint listener thread (if save_fn provided)
+                #    Must happen BEFORE seccomp — seccomp blocks clone3
+                #    which Python's threading module uses.
+                if self._save_fn is not None:
+                    try:
+                        start_child_listener(ctrl_child_fd, self._save_fn)
+                    except RuntimeError:
+                        os.close(ctrl_child_fd)
+                else:
+                    os.close(ctrl_child_fd)
+
+                # 6. seccomp filter (irreversible)
                 # When notif is active, build a single combined filter
                 # (notif + deny in one BPF program) to avoid stacked-filter
                 # CONTINUE re-evaluation issues.
@@ -533,14 +552,7 @@ class SandboxContext:
                     os.closerange(3, ctrl_child_fd)
                     os.closerange(ctrl_child_fd + 1, max_fd)
 
-                # 8. Start checkpoint listener thread (if save_fn provided)
-                if self._save_fn is not None:
-                    from ._checkpoint import start_child_listener
-                    start_child_listener(ctrl_child_fd, self._save_fn)
-                else:
-                    os.close(ctrl_child_fd)
-
-                # 9. Environment variable control
+                # 8. Environment variable control
                 if self._policy.clean_env:
                     keep = {}
                     for k in ("PATH", "HOME", "USER", "TERM", "LANG", "SHELL"):
