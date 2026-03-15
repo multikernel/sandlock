@@ -33,6 +33,11 @@ from ._seccomp import apply_seccomp_filter
 from ._chroot import setup_chroot
 from .policy import Policy
 
+# Set after seccomp confinement in the child.  Any subsequent
+# SandboxContext in this process is nested and must skip the
+# notif filter (can't install two).
+_confined = False
+
 
 # --- pidfd helpers (Linux 5.3+, required by Sandlock) ---
 
@@ -432,6 +437,7 @@ class SandboxContext:
 
         if pid == 0:
             # === Child process ===
+            global _confined
             ctrl_parent.close()
             if parent_sock is not None:
                 parent_sock.close()
@@ -524,23 +530,28 @@ class SandboxContext:
                 )
 
                 if use_notif and child_sock is not None:
-                    try:
-                        from ._landlock import _set_no_new_privs
-                        _set_no_new_privs()
-                        notify_fd = install_notif_filter(
-                            _notif_syscall_names(self._notif_policy),
-                            deny_syscalls=deny,
-                            allow_syscalls=allow,
-                        )
-                        send_fd(child_sock, notify_fd)
-                        os.close(notify_fd)
-                    except Exception as e:
-                        if self._policy.strict:
-                            raise ConfinementError(
-                                f"seccomp notif filter failed: {e}"
-                            )
-                    finally:
+                    if _confined:
+                        # Nested sandbox: parent's supervisor already
+                        # intercepts our syscalls.  Skip notif filter.
                         child_sock.close()
+                    else:
+                        try:
+                            from ._landlock import _set_no_new_privs
+                            _set_no_new_privs()
+                            notify_fd = install_notif_filter(
+                                _notif_syscall_names(self._notif_policy),
+                                deny_syscalls=deny,
+                                allow_syscalls=allow,
+                            )
+                            send_fd(child_sock, notify_fd)
+                            os.close(notify_fd)
+                        except Exception as e:
+                            if self._policy.strict:
+                                raise ConfinementError(
+                                    f"seccomp notif filter failed: {e}"
+                                )
+                        finally:
+                            child_sock.close()
                     # Combined filter handles deny — install allowlist
                     # separately only if in allowlist mode (the combined
                     # filter can't enumerate all syscalls to deny).
@@ -560,6 +571,10 @@ class SandboxContext:
                             raise ConfinementError(
                                 "seccomp filter installation failed"
                             )
+
+                # Mark this process as confined so nested SandboxContext
+                # instances know to skip the notif filter.
+                _confined = True
 
                 # 7. Close inherited fds (exempt control socket)
                 if self._policy.close_fds:
