@@ -733,6 +733,47 @@ print('OK')
         )
         assert result.success
 
+    def test_proc_mounts_virtualized(self):
+        """/proc/mounts is virtualized to empty."""
+        policy = Policy(fs_readable=_PYTHON_READABLE)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+with open('/proc/mounts') as f:
+    data = f.read()
+assert data == '', f'/proc/mounts not empty: {len(data)} bytes'
+print('OK')
+"""]
+        )
+        assert result.success, result.error
+
+    def test_proc_self_mountinfo_virtualized(self):
+        """/proc/self/mountinfo is virtualized to empty."""
+        policy = Policy(fs_readable=_PYTHON_READABLE)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+with open('/proc/self/mountinfo') as f:
+    data = f.read()
+assert data == '', f'/proc/self/mountinfo not empty: {len(data)} bytes'
+print('OK')
+"""]
+        )
+        assert result.success, result.error
+
+    def test_proc_pid_mountinfo_virtualized(self):
+        """/proc/<pid>/mountinfo is virtualized to empty."""
+        policy = Policy(fs_readable=_PYTHON_READABLE)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import os
+pid = os.getpid()
+with open(f'/proc/{pid}/mountinfo') as f:
+    data = f.read()
+assert data == '', f'/proc/{pid}/mountinfo not empty: {len(data)} bytes'
+print('OK')
+"""]
+        )
+        assert result.success, result.error
+
 
 # --- Resource limits (seccomp notif based) ---
 

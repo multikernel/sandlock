@@ -195,14 +195,12 @@ def default_proc_rules() -> tuple[PathRule, ...]:
         PathRule("/sys/firmware/", NotifAction.DENY, errno.EACCES),
         PathRule("/sys/fs/cgroup/", NotifAction.DENY, errno.EACCES),
         # Virtualize mount info (hide host mounts)
-        PathRule(
-            "/proc/self/mountinfo", NotifAction.VIRTUALIZE,
-            virtual_content=b"",
-        ),
-        PathRule(
-            "/proc/self/mounts", NotifAction.VIRTUALIZE,
-            virtual_content=b"",
-        ),
+        # Multiple patterns: /proc/mounts (symlink), /proc/self/mounts,
+        # /proc/<pid>/mounts (resolved symlink)
+        PathRule("/proc/mounts", NotifAction.VIRTUALIZE, virtual_content=b""),
+        PathRule("/proc/mountinfo", NotifAction.VIRTUALIZE, virtual_content=b""),
+        PathRule("/proc/*/mounts", NotifAction.VIRTUALIZE, virtual_content=b""),
+        PathRule("/proc/*/mountinfo", NotifAction.VIRTUALIZE, virtual_content=b""),
         # Allow everything else
         PathRule("*", NotifAction.ALLOW),
     )
