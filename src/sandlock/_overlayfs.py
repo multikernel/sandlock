@@ -28,9 +28,6 @@ from .exceptions import BranchError, SandboxError
 
 _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
 
-CLONE_NEWNS = 0x00020000
-MS_PRIVATE = 1 << 18  # 0x40000
-
 
 class OverlayBranch:
     """Manages an overlayfs branch for a single sandbox.
@@ -184,17 +181,13 @@ class OverlayBranch:
 def mount_overlay(branch: OverlayBranch) -> None:
     """Mount overlayfs for a branch.
 
-    Must be called inside a user + mount namespace (child process).
+    Must be called inside a user namespace (child process).
     Requires Linux 5.11+ for unprivileged overlayfs.
+    No mount namespace needed — user namespace restricts mount visibility.
     """
     merged = str(branch.path)
     opts = branch.mount_options()
 
-    # Make mount namespace private so our mounts don't propagate
-    ret = _libc.mount(b"none", b"/", None, MS_PRIVATE, None)
-    # Ignore errors — may already be private
-
-    # Mount overlayfs
     ret = _libc.mount(
         b"overlay",
         merged.encode(),
@@ -208,6 +201,20 @@ def mount_overlay(branch: OverlayBranch) -> None:
             f"overlayfs mount failed: {os.strerror(err)} "
             f"(requires Linux 5.11+ with user namespace)"
         )
+
+
+def dir_size(path: Path) -> int:
+    """Calculate total size of files in a directory tree (bytes)."""
+    total = 0
+    try:
+        for entry in os.scandir(path):
+            if entry.is_file(follow_symlinks=False):
+                total += entry.stat(follow_symlinks=False).st_size
+            elif entry.is_dir(follow_symlinks=False):
+                total += dir_size(Path(entry.path))
+    except OSError:
+        pass
+    return total
 
 
 def _is_whiteout(path: Path) -> bool:

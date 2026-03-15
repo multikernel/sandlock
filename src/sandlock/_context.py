@@ -180,6 +180,8 @@ class SandboxContext:
         self._supervisor = None  # NotifSupervisor | None (lazy import)
         self._throttle_stop = None  # threading.Event | None
         self._throttle_thread = None  # threading.Thread | None
+        self._disk_quota_stop = None  # threading.Event | None
+        self._disk_quota_thread = None  # threading.Thread | None
         self._control_fd: int = -1  # Parent's end of control socket
         self._exited = False
 
@@ -257,10 +259,9 @@ class SandboxContext:
         if self._supervisor is not None:
             tracked = self._supervisor.tracked_pids
 
-        # Stop throttle first — ensure child is resumed for clean exit
+        # Stop threads
         self._stop_throttle()
-
-        # Stop supervisor — it reads from child memory
+        self._stop_disk_quota()
         self._stop_supervisor()
 
         # SIGTERM the process group
@@ -290,6 +291,42 @@ class SandboxContext:
 
         self._reap()
         self._exited = True
+
+    def _start_disk_quota(self, pgid: int) -> None:
+        """Start a daemon thread that checks overlay disk usage periodically."""
+        import threading
+        import time
+        from .policy import parse_memory_size
+        from ._overlayfs import dir_size
+        from pathlib import Path
+
+        upper = Path(str(self._overlay_branch.upper_dir))
+        quota = parse_memory_size(self._policy.max_disk)
+        stop_event = threading.Event()
+        self._disk_quota_stop = stop_event
+
+        def _loop():
+            while not stop_event.wait(1.0):
+                try:
+                    used = dir_size(upper)
+                    if used > quota:
+                        # Graceful: SIGTERM, then SIGKILL after 3s
+                        try:
+                            os.killpg(pgid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            return
+                        if not stop_event.wait(3.0):
+                            try:
+                                os.killpg(pgid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                        return
+                except (OSError, ProcessLookupError):
+                    return
+
+        t = threading.Thread(target=_loop, daemon=True)
+        t.start()
+        self._disk_quota_thread = t
 
     def _stop_supervisor(self) -> None:
         """Stop the notification supervisor if running."""
@@ -340,6 +377,15 @@ class SandboxContext:
             self._throttle_thread.join(timeout=1.0)
             self._throttle_thread = None
             self._throttle_stop = None
+
+    def _stop_disk_quota(self) -> None:
+        """Stop the disk quota thread."""
+        if self._disk_quota_stop is not None:
+            self._disk_quota_stop.set()
+        if self._disk_quota_thread is not None:
+            self._disk_quota_thread.join(timeout=2.0)
+            self._disk_quota_thread = None
+            self._disk_quota_stop = None
 
     def _reap(self) -> None:
         """Reap the child process (non-blocking, best-effort)."""
@@ -485,7 +531,8 @@ class SandboxContext:
 
                 # 1b. Mount namespace + overlayfs (if needed)
                 if needs_overlay and self._overlay_branch is not None:
-                    from ._overlayfs import mount_overlay, CLONE_NEWNS
+                    from ._overlayfs import mount_overlay
+                    CLONE_NEWNS = 0x00020000
                     ret = _libc.unshare(ctypes.c_int(CLONE_NEWNS))
                     if ret < 0:
                         err = ctypes.get_errno()
@@ -671,10 +718,19 @@ class SandboxContext:
                     parent_sock.close()
                     pids_fn = lambda pgid=pid: _pids_by_pgid(pgid)  # noqa: E731
                     bind_ports = self._policy.bind_ports() or None
+                    # Disk quota for overlayfs upper dir
+                    dq_path = None
+                    dq_bytes = 0
+                    if self._overlay_branch is not None and self._policy.max_disk:
+                        from .policy import parse_memory_size
+                        dq_path = str(self._overlay_branch.upper_dir)
+                        dq_bytes = parse_memory_size(self._policy.max_disk)
                     self._supervisor = NotifSupervisor(
                         notify_fd, pid, self._notif_policy,
                         pids_fn=pids_fn,
                         bind_ports=bind_ports,
+                        disk_quota_path=dq_path,
+                        disk_quota_bytes=dq_bytes,
                     )
                     self._supervisor.start()
                 except Exception:
@@ -682,6 +738,10 @@ class SandboxContext:
                         parent_sock.close()
                     except OSError:
                         pass
+
+            # Start disk quota thread if overlayfs + max_disk
+            if self._overlay_branch is not None and self._policy.max_disk:
+                self._start_disk_quota(pid)
 
             # Start CPU throttle thread if max_cpu is set
             cpu_pct = self._policy.cpu_pct()

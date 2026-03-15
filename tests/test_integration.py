@@ -859,3 +859,156 @@ class TestStrictMode:
         policy = Policy(fs_readable=["/tmp"], strict=True)
         result = Sandbox(policy).run(["echo", "hello"])
         assert not result.success
+
+
+# --- OverlayFS COW isolation ---
+
+class TestOverlayFS:
+    def test_workdir_enables_cow(self):
+        """Setting workdir auto-enables overlayfs COW."""
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(f"{td}/project")
+            with open(f"{td}/project/orig.txt", "w") as f:
+                f.write("original")
+
+            from sandlock.policy import BranchAction
+            policy = Policy(
+                workdir=f"{td}/project",
+                fs_readable=[*_PYTHON_READABLE, td, "/tmp"],
+                fs_writable=[td, "/tmp"],
+                on_exit=BranchAction.ABORT,
+            )
+            result = Sandbox(policy).run(
+                ["python3", "-c",
+                 "open('new.txt','w').write('created'); "
+                 "print(open('orig.txt').read())"]
+            )
+            assert result.success
+            assert b"original" in result.stdout
+            # After abort, new file should not exist in original dir
+            assert not os.path.exists(f"{td}/project/new.txt")
+            # Original untouched
+            assert open(f"{td}/project/orig.txt").read() == "original"
+
+    def test_cow_commit_on_success(self):
+        """Default on_exit=COMMIT merges writes back."""
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(f"{td}/project")
+
+            policy = Policy(
+                workdir=f"{td}/project",
+                fs_readable=[*_PYTHON_READABLE, td, "/tmp"],
+                fs_writable=[td, "/tmp"],
+            )
+            result = Sandbox(policy).run(
+                ["python3", "-c", "open('committed.txt','w').write('yes')"]
+            )
+            assert result.success
+            assert open(f"{td}/project/committed.txt").read() == "yes"
+
+    def test_cow_abort_on_error(self):
+        """Default on_error=ABORT discards writes on failure."""
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(f"{td}/project")
+
+            policy = Policy(
+                workdir=f"{td}/project",
+                fs_readable=[*_PYTHON_READABLE, td, "/tmp"],
+                fs_writable=[td, "/tmp"],
+            )
+            result = Sandbox(policy).run(
+                ["python3", "-c",
+                 "open('should_vanish.txt','w').write('gone'); "
+                 "raise SystemExit(1)"]
+            )
+            assert not result.success
+            assert not os.path.exists(f"{td}/project/should_vanish.txt")
+
+    def test_cow_original_unmodified(self):
+        """Modifying an existing file via COW doesn't change the original."""
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(f"{td}/project")
+            with open(f"{td}/project/data.txt", "w") as f:
+                f.write("before")
+
+            from sandlock.policy import BranchAction
+            policy = Policy(
+                workdir=f"{td}/project",
+                fs_readable=[*_PYTHON_READABLE, td, "/tmp"],
+                fs_writable=[td, "/tmp"],
+                on_exit=BranchAction.ABORT,
+            )
+            result = Sandbox(policy).run(
+                ["python3", "-c",
+                 "open('data.txt','w').write('after'); "
+                 "print(open('data.txt').read())"]
+            )
+            assert result.success
+            assert b"after" in result.stdout
+            # Original unchanged after abort
+            assert open(f"{td}/project/data.txt").read() == "before"
+
+    def test_disk_quota_kills_on_overage(self):
+        """max_disk enforces quota on overlay writes."""
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(f"{td}/project")
+
+            policy = Policy(
+                workdir=f"{td}/project",
+                max_disk="10K",
+                fs_readable=[*_PYTHON_READABLE, td, "/tmp"],
+                fs_writable=[td, "/tmp"],
+            )
+            # Write 100K — exceeds 10K quota, should be killed
+            result = Sandbox(policy).run(
+                ["python3", "-c",
+                 "import time\n"
+                 "open('big.bin','wb').write(b'x'*102400)\n"
+                 "time.sleep(5)\n"
+                 "print('survived')"]
+            )
+            assert not result.success
+            assert b"survived" not in result.stdout
+
+    def test_disk_quota_allows_under_limit(self):
+        """Writes under max_disk quota succeed."""
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(f"{td}/project")
+
+            policy = Policy(
+                workdir=f"{td}/project",
+                max_disk="1M",
+                fs_readable=[*_PYTHON_READABLE, td, "/tmp"],
+                fs_writable=[td, "/tmp"],
+            )
+            result = Sandbox(policy).run(
+                ["python3", "-c",
+                 "open('small.bin','wb').write(b'x'*1024)\n"
+                 "print('ok')"]
+            )
+            assert result.success
+            assert b"ok" in result.stdout
+
+    def test_disk_quota_only_counts_delta(self):
+        """Existing files in workdir don't count toward quota."""
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(f"{td}/project")
+            # 50K original file — should NOT count
+            with open(f"{td}/project/existing.bin", "wb") as f:
+                f.write(b"x" * 51200)
+
+            policy = Policy(
+                workdir=f"{td}/project",
+                max_disk="10K",
+                fs_readable=[*_PYTHON_READABLE, td, "/tmp"],
+                fs_writable=[td, "/tmp"],
+            )
+            # Write 5K — under 10K quota despite 50K original
+            result = Sandbox(policy).run(
+                ["python3", "-c",
+                 "open('small.bin','wb').write(b'y'*5120)\n"
+                 "size = __import__('os').path.getsize('existing.bin')\n"
+                 "print(f'orig={size}')"]
+            )
+            assert result.success
+            assert b"orig=51200" in result.stdout

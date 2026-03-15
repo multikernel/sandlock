@@ -534,7 +534,13 @@ class Sandbox:
             from ._overlayfs import OverlayBranch
 
             lower = Path(workdir)
-            storage = Path(self._policy.fs_storage) if self._policy.fs_storage else lower / ".sandlock_overlay"
+            if self._policy.fs_storage:
+                storage = Path(self._policy.fs_storage)
+            else:
+                # Storage must be outside the lowerdir so the parent
+                # can see upper dir writes (same pattern as podman).
+                import tempfile
+                storage = Path(tempfile.mkdtemp(prefix="sandlock-overlay-"))
 
             parent_branch = None
             if hasattr(self, '_parent_overlay_branch'):

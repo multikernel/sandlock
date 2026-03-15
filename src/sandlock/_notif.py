@@ -17,6 +17,7 @@ import ctypes.util
 import errno
 import os
 import select
+import signal
 import socket
 import struct
 import threading
@@ -439,12 +440,16 @@ class NotifSupervisor:
         *,
         pids_fn: Optional[callable] = None,
         bind_ports: list[int] | None = None,
+        disk_quota_path: str | None = None,
+        disk_quota_bytes: int = 0,
     ):
         self._notify_fd = notify_fd
         self._child_pid = child_pid
         self._policy = policy
         self._pids_fn = pids_fn
         self._bind_ports = bind_ports
+        self._disk_quota_path = disk_quota_path
+        self._disk_quota_bytes = disk_quota_bytes
         self._thread: Optional[threading.Thread] = None
         self._stop_r, self._stop_w = os.pipe()
         # Resource tracking state
@@ -520,6 +525,19 @@ class NotifSupervisor:
         self._stop_r = -1
         self._stop_w = -1
 
+    def _check_disk_quota(self) -> None:
+        """Check if overlay upper dir exceeds disk quota."""
+        if not self._disk_quota_path:
+            return
+        try:
+            from ._overlayfs import dir_size
+            from pathlib import Path
+            used = dir_size(Path(self._disk_quota_path))
+            if used > self._disk_quota_bytes:
+                os.killpg(self._child_pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+
     @property
     def port_map(self):
         """PortMap for this sandbox, or None if port_remap is disabled."""
@@ -527,15 +545,23 @@ class NotifSupervisor:
 
     def _run(self) -> None:
         """Supervisor event loop."""
+        import time
         poller = select.poll()
         poller.register(self._notify_fd, select.POLLIN)
         poller.register(self._stop_r, select.POLLIN)
+        last_quota_check = 0.0
 
         while True:
             try:
                 events = poller.poll(1000)
             except OSError:
                 break
+
+            if self._disk_quota_bytes > 0:
+                now = time.monotonic()
+                if now - last_quota_check >= 1.0:
+                    self._check_disk_quota()
+                    last_quota_check = now
 
             for fd, event in events:
                 if fd == self._stop_r:
