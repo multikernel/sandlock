@@ -294,6 +294,43 @@ class TestPortRemap:
         assert result.success
         assert result.value == 3000  # getsockname returns virtual port
 
+    def test_ipv6_bind_remapped(self):
+        """IPv6 bind is remapped the same as IPv4."""
+        import socket as sock_mod
+
+        def bind_ipv6():
+            s = sock_mod.socket(sock_mod.AF_INET6, sock_mod.SOCK_STREAM)
+            s.setsockopt(sock_mod.SOL_SOCKET, sock_mod.SO_REUSEADDR, 1)
+            s.bind(("::1", 5000))
+            port = s.getsockname()[1]
+            s.close()
+            return port
+
+        policy = Policy(net_bind=["36000-36099"], port_remap=True)
+        result = Sandbox(policy).call(bind_ipv6)
+
+        assert result.success
+        assert result.value == 5000  # getsockname returns virtual port
+
+    def test_ipv6_two_sandboxes_no_conflict(self):
+        """Two sandboxes bind the same IPv6 virtual port without conflict."""
+        import socket as sock_mod
+
+        def bind_ipv6():
+            s = sock_mod.socket(sock_mod.AF_INET6, sock_mod.SOCK_STREAM)
+            s.setsockopt(sock_mod.SOL_SOCKET, sock_mod.SO_REUSEADDR, 1)
+            s.bind(("::1", 8080))
+            s.close()
+            return True
+
+        policy = Policy(net_bind=["37000-37999"], port_remap=True)
+
+        r1 = Sandbox(policy).call(bind_ipv6)
+        r2 = Sandbox(policy).call(bind_ipv6)
+
+        assert r1.success and r1.value is True
+        assert r2.success and r2.value is True
+
 
 class TestCpuThrottle:
     """Test SIGSTOP/SIGCONT CPU throttling."""
