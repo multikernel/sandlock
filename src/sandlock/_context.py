@@ -4,7 +4,7 @@
 Each child is confined via Landlock (filesystem + network), seccomp
 (syscall blocklist + allowlist), and a seccomp user-notification
 supervisor for resource limits, /proc virtualization, and network
-enforcement.  No root or cgroups required.
+enforcement.  No root required.
 
 With the default ``policy.strict=True``, confinement failures (Landlock
 unavailable, seccomp installation failure) abort the child process.
@@ -129,11 +129,11 @@ class SandboxContext:
     """Fork-based sandbox context.
 
     Forks a child process and applies confinement (Landlock, seccomp,
-    cgroup v2) according to the given Policy.
+    seccomp) according to the given Policy.
 
     The child confinement sequence:
         1. setpgid(0, 0)                  — new process group
-        2. Add self to cgroup              — resource limits apply immediately
+        2. Apply resource limits            — RLIMIT_CPU, seccomp notif
         3. chroot(path) if policy.chroot   — optional path illusion
         4. confine(writable, readable)     — Landlock (irreversible)
         5. install notif filter + send fd  — seccomp user notification (optional)
@@ -325,7 +325,7 @@ class SandboxContext:
         # User namespace is only needed for privileged mode (UID 0 mapping)
         needs_userns = self._policy.privileged
         if needs_userns:
-            from ._userns import unshare_user_cgroup, setup_userns_in_parent, userns_available  # noqa: F811
+            from ._userns import unshare_user, setup_userns_in_parent, userns_available  # noqa: F811
 
         # Sync pipes for user namespace setup:
         #   child_to_parent: child signals "I've unshared"
@@ -374,12 +374,12 @@ class SandboxContext:
             try:
                 os.setpgid(0, 0)
 
-                # 1. User namespace for cgroup delegation (if needed)
+                # 1. User namespace for privileged mode (if needed)
                 if needs_userns and userns_c2p_w >= 0:
                     os.close(userns_c2p_r)
                     os.close(userns_p2c_w)
                     try:
-                        unshare_user_cgroup()
+                        unshare_user()
                         os.write(userns_c2p_w, b"1")  # Tell parent: unshared
                         os.close(userns_c2p_w)
                         os.read(userns_p2c_r, 1)       # Wait: maps written

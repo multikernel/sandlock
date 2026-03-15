@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Sandlock: Lightweight process sandbox.
 
-Uses Landlock, seccomp, and cgroup v2 for process confinement
+Uses Landlock and seccomp for process confinement
 without root or namespaces.
 """
 
@@ -21,7 +21,6 @@ from .exceptions import (
     ConfinementError,
     LandlockUnavailableError,
     SeccompError,
-    CgroupError,
     ChildError,
     MemoryProtectError,
     NotifError,

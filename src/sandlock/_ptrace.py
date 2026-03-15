@@ -11,7 +11,7 @@ by a user-provided save_fn via the control socket.
 
 Requires:
 - The target process must be a direct child (or ptrace-attachable).
-- The process should be frozen (cgroup.freeze) before dumping to
+- The process should be stopped (SIGSTOP) before dumping to
   guarantee a consistent snapshot.
 """
 
@@ -239,7 +239,7 @@ _SKIP_REGIONS = {"[vvar]", "[vdso]", "[vsyscall]"}
 def dump_process_state(pid: int) -> ProcessState:
     """Capture the full OS-level state of a frozen process.
 
-    The process must be stopped (cgroup.freeze or ptrace-stopped)
+    The process must be stopped (SIGSTOP or ptrace-stopped)
     before calling this.  Does NOT freeze/unfreeze — caller manages that.
 
     Steps:

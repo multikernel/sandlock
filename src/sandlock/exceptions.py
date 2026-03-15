@@ -50,11 +50,6 @@ class NotifError(SeccompError):
     pass
 
 
-class CgroupError(SandboxError):
-    """cgroup creation/configuration failed."""
-
-    pass
-
 
 
 class ChildError(SandboxError):

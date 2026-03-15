@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Sandbox class: main user-facing API for Sandlock.
 
-Wraps SandboxContext, cgroup v2 management, and result passing
-into a clean interface for one-shot and long-lived sandboxing.
+Wraps SandboxContext and result passing into a clean interface
+for one-shot and long-lived sandboxing.
 """
 
 from __future__ import annotations
@@ -23,9 +23,8 @@ from ._runner import Result, call_in_sandbox, run_command_in_sandbox, run_intera
 class Sandbox:
     """Lightweight process sandbox.
 
-    Uses Landlock (filesystem), seccomp (syscall filter), and
-    cgroup v2 (resource limits + freeze/resume) for confinement.
-    No root or namespaces required.
+    Uses Landlock (filesystem) and seccomp (syscall filter) for
+    confinement.  No root or namespaces required.
 
     Usage::
 
@@ -78,10 +77,18 @@ class Sandbox:
         return self._ctx is not None and self._ctx.alive
 
     @property
-    def is_frozen(self) -> bool:
-        """Whether the sandbox is frozen (paused)."""
-        if self._cgroup is not None:
-            return self._cgroup.is_frozen()
+    def is_paused(self) -> bool:
+        """Whether the sandbox is paused (SIGSTOP'd)."""
+        pid = self.pid
+        if pid is None:
+            return False
+        try:
+            with open(f"/proc/{pid}/status") as f:
+                for line in f:
+                    if line.startswith("State:"):
+                        return "T" in line or "t" in line
+        except OSError:
+            pass
         return False
 
     # --- One-shot API ---

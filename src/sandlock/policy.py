@@ -2,7 +2,7 @@
 """Policy dataclasses for Sandlock sandbox configuration.
 
 A Policy is frozen after creation — live updates go through
-BPF maps + cgroup writes, not Policy mutation.
+BPF maps + seccomp notif, not Policy mutation.
 """
 
 from __future__ import annotations
@@ -140,7 +140,7 @@ class Policy:
     """TCP ports the sandbox may connect to.  Empty = unrestricted.
     Each entry is a port number or a ``"lo-hi"`` range string."""
 
-    # Resource limits (cgroup v2)
+    # Resource limits
     max_memory: str | int | None = None
     """Memory limit. String like '512M' or int bytes."""
 

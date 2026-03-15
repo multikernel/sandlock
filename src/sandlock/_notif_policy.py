@@ -92,7 +92,7 @@ class NotifPolicy:
         Args:
             path: Resolved absolute path from the intercepted syscall.
             sandbox_pids: Set of PIDs belonging to this sandbox (from
-                cgroup).  Only used when ``isolate_pids`` is True.
+                the sandbox).  Only used when ``isolate_pids`` is True.
 
         Returns:
             (action, errno_code, virtual_content) tuple.

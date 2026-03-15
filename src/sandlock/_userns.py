@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""User namespace helpers for unprivileged cgroup creation.
+"""User namespace helpers for privileged mode.
 
-When cgroup v2 delegation is not available (stock Ubuntu), sandlock
-uses CLONE_NEWUSER + CLONE_NEWCGROUP to create a new cgroup namespace.
-Inside the namespace the process has CAP_SYS_ADMIN and can create
-sub-cgroups with resource limits.
+Sandlock uses CLONE_NEWUSER to create a new user namespace for
+privileged mode (UID 0 mapping inside the sandbox).
 
-This module only creates user + cgroup namespaces — no PID, network,
-or mount namespaces are created.
+This module only creates user namespaces — no PID, network, or mount
+namespaces are created.
 """
 
 from __future__ import annotations
@@ -19,7 +17,6 @@ import os
 _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
 
 CLONE_NEWUSER = 0x10000000
-CLONE_NEWCGROUP = 0x02000000
 
 
 def setup_userns_in_parent(child_pid: int, privileged: bool = False) -> None:
@@ -42,20 +39,19 @@ def setup_userns_in_parent(child_pid: int, privileged: bool = False) -> None:
     _write_id_map(f"/proc/{child_pid}/gid_map", inner_gid, gid, 1)
 
 
-def unshare_user_cgroup() -> None:
-    """Create new user + cgroup namespaces via unshare(2).
+def unshare_user() -> None:
+    """Create a new user namespace via unshare(2).
 
     After this call (and after the parent writes uid/gid maps),
-    the process has CAP_SYS_ADMIN in the new user namespace and
-    can create cgroup sub-trees freely.
+    the process has CAP_SYS_ADMIN in the new user namespace.
 
     Raises:
         OSError: If unshare fails (e.g. kernel.unprivileged_userns_clone=0).
     """
-    ret = _libc.unshare(ctypes.c_int(CLONE_NEWUSER | CLONE_NEWCGROUP))
+    ret = _libc.unshare(ctypes.c_int(CLONE_NEWUSER))
     if ret < 0:
         err = ctypes.get_errno()
-        raise OSError(err, f"unshare(NEWUSER|NEWCGROUP): {os.strerror(err)}")
+        raise OSError(err, f"unshare(NEWUSER): {os.strerror(err)}")
 
 
 def userns_available() -> bool:

@@ -12,7 +12,7 @@ Two layers of state capture:
    socket.  The child runs save_fn and sends raw bytes back.
    This covers state that ptrace can't see (open sockets, epoll, etc.).
 
-Combined with BranchFS (O(1) filesystem snapshot) and cgroup freeze,
+Combined with BranchFS (O(1) filesystem snapshot) and SIGSTOP,
 this provides full checkpoint/restore without CRIU or root.
 
 Control socket protocol (for app-level state only):

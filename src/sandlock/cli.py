@@ -172,14 +172,6 @@ def cmd_check(args: argparse.Namespace) -> int:
     except Exception as e:
         print(f"  seccomp:   error ({e})")
 
-    # cgroup v2
-    try:
-        from ._cgroup import _find_user_cgroup
-        cg = _find_user_cgroup()
-        print(f"  cgroup v2: available ({cg})")
-    except Exception as e:
-        print(f"  cgroup v2: not available ({e})")
-
     print()
     return 0
 
