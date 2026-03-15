@@ -9,6 +9,7 @@ never system paths like /home.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import tempfile
 
@@ -49,6 +50,33 @@ class TestRunIntegration:
         result = Sandbox(Policy()).run(["sleep", "60"], timeout=0.5)
         assert not result.success
         assert "timed out" in result.error.lower()
+
+    def test_shell_command_flag(self):
+        """sandlock run -e 'cmd' should execute via /bin/sh -c."""
+        r = subprocess.run(
+            [sys.executable, "-m", "sandlock", "run", "-e", "echo hello world"],
+            capture_output=True,
+        )
+        assert r.returncode == 0
+        assert b"hello world" in r.stdout
+
+    def test_shell_command_with_shell_features(self):
+        """sandlock run -e should support pipes and redirects."""
+        r = subprocess.run(
+            [sys.executable, "-m", "sandlock", "run", "-e", "echo foo | tr f b"],
+            capture_output=True,
+        )
+        assert r.returncode == 0
+        assert b"boo" in r.stdout
+
+    def test_shell_command_and_positional_are_exclusive(self):
+        """Providing both -e and positional command should still work (positional ignored)."""
+        r = subprocess.run(
+            [sys.executable, "-m", "sandlock", "run", "-e", "echo from-flag", "echo", "from-positional"],
+            capture_output=True,
+        )
+        assert r.returncode == 0
+        assert b"from-flag" in r.stdout
 
 
 class TestCallIntegration:

@@ -94,15 +94,17 @@ def cmd_run(args: argparse.Namespace) -> int:
     else:
         policy = Policy(**cli_kwargs)
 
-    # Resolve command: explicit args, or image default, or error
-    command = args.command
-    if not command:
-        if args.image:
-            from ._image import get_default_cmd
-            command = get_default_cmd(args.image)
-        else:
-            print("error: no command specified", file=sys.stderr)
-            return 1
+    # Resolve command: -e string, explicit args, image default, or error
+    if args.shell_command:
+        command = ["/bin/sh", "-c", args.shell_command]
+    elif args.command:
+        command = args.command
+    elif args.image:
+        from ._image import get_default_cmd
+        command = get_default_cmd(args.image)
+    else:
+        print("error: no command specified", file=sys.stderr)
+        return 1
 
     sb = Sandbox(policy)
 
@@ -192,6 +194,8 @@ def main() -> None:
                        help="Interactive mode: inherit stdin/stdout/stderr")
     run_p.add_argument("-p", "--profile", metavar="NAME",
                        help="Use a named profile from ~/.config/sandlock/profiles/")
+    run_p.add_argument("-e", "--shell-command", metavar="CMD",
+                       help="Run CMD via /bin/sh -c (e.g. for SSH ForceCommand)")
     run_p.add_argument("command", nargs="*", help="Command to run")
     run_p.add_argument("-w", "--writable", action="append", help="Writable path")
     run_p.add_argument("-r", "--readable", action="append", help="Readable path")
