@@ -137,6 +137,7 @@ class CowBranch(CowBranchBase):
                 dest.unlink()
 
         # Copy files from upper to target
+        synced_dirs = set()
         for root, dirs, files in os.walk(upper):
             rel = os.path.relpath(root, upper)
             for d in dirs:
@@ -147,6 +148,17 @@ class CowBranch(CowBranchBase):
                 dest = target / rel / f
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(str(src), str(dest))
+                synced_dirs.add(str(dest.parent))
+
+        # fsync all modified directories to ensure data is on disk
+        # before removing the upper dir
+        for d in synced_dirs:
+            try:
+                fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+                os.fsync(fd)
+                os.close(fd)
+            except OSError:
+                pass
 
         cleanup_branch_dir(self._storage, self._branch_id)
         self._finished = True
