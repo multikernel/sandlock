@@ -861,14 +861,18 @@ class TestStrictMode:
         assert not result.success
 
 
-# --- OverlayFS COW isolation ---
+# --- COW filesystem isolation (parametrized over all backends) ---
 
-def _overlayfs_available() -> bool:
-    """Check if unprivileged overlayfs (user+mount namespace) works."""
+from sandlock.policy import FsIsolation, BranchAction
+
+
+def _cow_backend_available(isolation: FsIsolation) -> bool:
+    """Check if a COW backend works on this system."""
     td = tempfile.mkdtemp()
     try:
         policy = Policy(
             workdir=td,
+            fs_isolation=isolation,
             fs_readable=["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev", "/tmp"],
             fs_writable=["/tmp", td],
         )
@@ -881,23 +885,36 @@ def _overlayfs_available() -> bool:
         shutil.rmtree(td, ignore_errors=True)
 
 
-@pytest.mark.skipif(
-    not _overlayfs_available(),
-    reason="Unprivileged overlayfs not available (needs kernel 5.11+ with user namespaces)",
-)
-class TestOverlayFS:
-    def test_workdir_enables_cow(self):
-        """Setting workdir auto-enables overlayfs COW."""
+# Collect available backends
+_COW_BACKENDS = [FsIsolation.NONE]  # seccomp COW — always available
+if _cow_backend_available(FsIsolation.OVERLAYFS):
+    _COW_BACKENDS.append(FsIsolation.OVERLAYFS)
+# BranchFS requires external binary — skip in CI
+
+
+def _make_cow_policy(workdir, td, isolation, **kwargs):
+    """Build a Policy for COW testing with a given backend."""
+    return Policy(
+        workdir=workdir,
+        fs_isolation=isolation,
+        fs_readable=[*_PYTHON_READABLE, td, "/tmp"],
+        fs_writable=[td, "/tmp"],
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize("isolation", _COW_BACKENDS,
+                         ids=[i.value for i in _COW_BACKENDS])
+class TestCOW:
+    def test_abort_discards_new_file(self, isolation):
+        """New files are discarded on abort."""
         with tempfile.TemporaryDirectory() as td:
             os.makedirs(f"{td}/project")
             with open(f"{td}/project/orig.txt", "w") as f:
                 f.write("original")
 
-            from sandlock.policy import BranchAction
-            policy = Policy(
-                workdir=f"{td}/project",
-                fs_readable=[*_PYTHON_READABLE, td, "/tmp"],
-                fs_writable=[td, "/tmp"],
+            policy = _make_cow_policy(
+                f"{td}/project", td, isolation,
                 on_exit=BranchAction.ABORT,
             )
             result = Sandbox(policy).run(
@@ -907,37 +924,27 @@ class TestOverlayFS:
             )
             assert result.success
             assert b"original" in result.stdout
-            # After abort, new file should not exist in original dir
             assert not os.path.exists(f"{td}/project/new.txt")
-            # Original untouched
             assert open(f"{td}/project/orig.txt").read() == "original"
 
-    def test_cow_commit_on_success(self):
+    def test_commit_on_success(self, isolation):
         """Default on_exit=COMMIT merges writes back."""
         with tempfile.TemporaryDirectory() as td:
             os.makedirs(f"{td}/project")
 
-            policy = Policy(
-                workdir=f"{td}/project",
-                fs_readable=[*_PYTHON_READABLE, td, "/tmp"],
-                fs_writable=[td, "/tmp"],
-            )
+            policy = _make_cow_policy(f"{td}/project", td, isolation)
             result = Sandbox(policy).run(
                 ["python3", "-c", "open('committed.txt','w').write('yes')"]
             )
             assert result.success
             assert open(f"{td}/project/committed.txt").read() == "yes"
 
-    def test_cow_abort_on_error(self):
+    def test_abort_on_error(self, isolation):
         """Default on_error=ABORT discards writes on failure."""
         with tempfile.TemporaryDirectory() as td:
             os.makedirs(f"{td}/project")
 
-            policy = Policy(
-                workdir=f"{td}/project",
-                fs_readable=[*_PYTHON_READABLE, td, "/tmp"],
-                fs_writable=[td, "/tmp"],
-            )
+            policy = _make_cow_policy(f"{td}/project", td, isolation)
             result = Sandbox(policy).run(
                 ["python3", "-c",
                  "open('should_vanish.txt','w').write('gone'); "
@@ -946,18 +953,15 @@ class TestOverlayFS:
             assert not result.success
             assert not os.path.exists(f"{td}/project/should_vanish.txt")
 
-    def test_cow_original_unmodified(self):
+    def test_original_unmodified(self, isolation):
         """Modifying an existing file via COW doesn't change the original."""
         with tempfile.TemporaryDirectory() as td:
             os.makedirs(f"{td}/project")
             with open(f"{td}/project/data.txt", "w") as f:
                 f.write("before")
 
-            from sandlock.policy import BranchAction
-            policy = Policy(
-                workdir=f"{td}/project",
-                fs_readable=[*_PYTHON_READABLE, td, "/tmp"],
-                fs_writable=[td, "/tmp"],
+            policy = _make_cow_policy(
+                f"{td}/project", td, isolation,
                 on_exit=BranchAction.ABORT,
             )
             result = Sandbox(policy).run(
@@ -967,21 +971,17 @@ class TestOverlayFS:
             )
             assert result.success
             assert b"after" in result.stdout
-            # Original unchanged after abort
             assert open(f"{td}/project/data.txt").read() == "before"
 
-    def test_disk_quota_kills_on_overage(self):
-        """max_disk enforces quota on overlay writes."""
+    def test_disk_quota_kills_on_overage(self, isolation):
+        """max_disk enforces quota on writes."""
         with tempfile.TemporaryDirectory() as td:
             os.makedirs(f"{td}/project")
 
-            policy = Policy(
-                workdir=f"{td}/project",
+            policy = _make_cow_policy(
+                f"{td}/project", td, isolation,
                 max_disk="10K",
-                fs_readable=[*_PYTHON_READABLE, td, "/tmp"],
-                fs_writable=[td, "/tmp"],
             )
-            # Write 100K — exceeds 10K quota, should be killed
             result = Sandbox(policy).run(
                 ["python3", "-c",
                  "import time\n"
@@ -992,16 +992,14 @@ class TestOverlayFS:
             assert not result.success
             assert b"survived" not in result.stdout
 
-    def test_disk_quota_allows_under_limit(self):
+    def test_disk_quota_allows_under_limit(self, isolation):
         """Writes under max_disk quota succeed."""
         with tempfile.TemporaryDirectory() as td:
             os.makedirs(f"{td}/project")
 
-            policy = Policy(
-                workdir=f"{td}/project",
+            policy = _make_cow_policy(
+                f"{td}/project", td, isolation,
                 max_disk="1M",
-                fs_readable=[*_PYTHON_READABLE, td, "/tmp"],
-                fs_writable=[td, "/tmp"],
             )
             result = Sandbox(policy).run(
                 ["python3", "-c",
@@ -1011,21 +1009,17 @@ class TestOverlayFS:
             assert result.success
             assert b"ok" in result.stdout
 
-    def test_disk_quota_only_counts_delta(self):
+    def test_disk_quota_only_counts_delta(self, isolation):
         """Existing files in workdir don't count toward quota."""
         with tempfile.TemporaryDirectory() as td:
             os.makedirs(f"{td}/project")
-            # 50K original file — should NOT count
             with open(f"{td}/project/existing.bin", "wb") as f:
                 f.write(b"x" * 51200)
 
-            policy = Policy(
-                workdir=f"{td}/project",
+            policy = _make_cow_policy(
+                f"{td}/project", td, isolation,
                 max_disk="10K",
-                fs_readable=[*_PYTHON_READABLE, td, "/tmp"],
-                fs_writable=[td, "/tmp"],
             )
-            # Write 5K — under 10K quota despite 50K original
             result = Sandbox(policy).run(
                 ["python3", "-c",
                  "open('small.bin','wb').write(b'y'*5120)\n"
