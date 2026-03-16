@@ -452,17 +452,13 @@ class NotifSupervisor:
         self._cow_handler = None  # CowHandler | None
         self._thread: Optional[threading.Thread] = None
         self._stop_r, self._stop_w = os.pipe()
-        # Resource tracking state
-        self._mem_used: int = 0       # Total mapped bytes
-        self._brk_base: dict[int, int] = {}  # pid → last known brk
-        self._proc_count: int = 1     # Start at 1 (the initial child)
-        self._proc_pids: set[int] = {child_pid}  # All known sandbox PIDs
+        # Resource state (memory, process count, fork-hold)
+        from ._resource import ResourceState
+        self._res = ResourceState(child_pid)
+        # Aliases for backward compatibility
+        self._proc_pids = self._res.proc_pids
         # getdents /proc filtering: fd → list of remaining dirent entries
         self._proc_dir_cache: dict[int, list[bytes]] = {}
-        # Fork-hold state for checkpoint freeze
-        self._hold_forks: bool = False
-        self._hold_lock = threading.Lock()
-        self._held_notif_ids: list[int] = []
         # Port virtualization (on-demand allocation from kernel)
         self._port_map = None  # PortMap | None
         if policy.port_remap:
@@ -485,24 +481,20 @@ class NotifSupervisor:
         self._thread.start()
 
     def hold_forks(self) -> None:
-        """Enter hold mode: fork/clone notifications are not responded to.
-
-        The kernel keeps the calling process blocked until we respond.
-        This creates a clean freeze barrier for checkpoint.
-        """
-        with self._hold_lock:
-            self._hold_forks = True
+        """Enter hold mode: fork/clone notifications are not responded to."""
+        with self._res.hold_lock:
+            self._res.hold_forks = True
 
     def release_forks(self) -> None:
         """Exit hold mode: respond CONTINUE to all held fork notifications."""
-        with self._hold_lock:
-            self._hold_forks = False
-            for notif_id in self._held_notif_ids:
+        with self._res.hold_lock:
+            self._res.hold_forks = False
+            for notif_id in self._res.held_notif_ids:
                 try:
                     self._respond_continue(notif_id)
                 except OSError:
-                    pass  # Process may have died while waiting
-            self._held_notif_ids.clear()
+                    pass
+            self._res.held_notif_ids.clear()
 
     def stop(self) -> None:
         """Signal the supervisor to stop and wait for it."""
@@ -603,23 +595,20 @@ class NotifSupervisor:
         self._proc_pids.add(pid)
         nr = notif.data.nr
 
-        # --- Resource: memory tracking ---
-        nr_mmap = _SYSCALL_NR.get("mmap")
-        nr_munmap = _SYSCALL_NR.get("munmap")
-        nr_brk = _SYSCALL_NR.get("brk")
-        nr_mremap = _SYSCALL_NR.get("mremap")
+        # --- Resource: memory + process limits ---
+        from ._resource import MEMORY_NRS, FORK_NRS, handle_memory, handle_fork
 
-        if nr in (nr_mmap, nr_munmap, nr_brk, nr_mremap) and self._policy.max_memory_bytes > 0:
-            self._handle_memory(notif, nr)
+        if nr in MEMORY_NRS and self._policy.max_memory_bytes > 0:
+            handle_memory(notif, nr, self._res,
+                          self._policy.max_memory_bytes,
+                          self._respond_continue, self._respond_errno)
             return
 
-        # --- Resource: process count ---
-        nr_clone = _SYSCALL_NR.get("clone")
-        nr_fork = _SYSCALL_NR.get("fork")
-        nr_vfork = _SYSCALL_NR.get("vfork")
-
-        if nr in (nr_clone, nr_fork, nr_vfork) and self._policy.max_processes > 0:
-            self._handle_fork(notif, nr)
+        if nr in FORK_NRS and self._policy.max_processes > 0:
+            handle_fork(notif, nr, self._res,
+                        self._policy.max_processes,
+                        self._respond_continue, self._respond_errno,
+                        self._proc_dir_cache.clear)
             return
 
         # --- Port remapping: bind / connect / getsockname ---
@@ -1040,96 +1029,7 @@ class NotifSupervisor:
         else:
             self._respond_errno(notif.id, errno.ECONNREFUSED)
 
-    def _handle_memory(self, notif: SeccompNotif, nr: int) -> None:
-        """Handle mmap/munmap/brk/mremap — enforce memory budget."""
-        nr_mmap = _SYSCALL_NR.get("mmap")
-        nr_munmap = _SYSCALL_NR.get("munmap")
-        nr_brk = _SYSCALL_NR.get("brk")
-        nr_mremap = _SYSCALL_NR.get("mremap")
-        limit = self._policy.max_memory_bytes
-
-        if nr == nr_mmap:
-            # mmap(addr, length, prot, flags, fd, offset): length=arg1
-            length = notif.data.args[1]
-            if self._mem_used + length > limit:
-                self._respond_errno(notif.id, errno.ENOMEM)
-                return
-            self._mem_used += length
-            self._respond_continue(notif.id)
-
-        elif nr == nr_munmap:
-            # munmap(addr, length): length=arg1
-            length = notif.data.args[1]
-            self._mem_used = max(0, self._mem_used - length)
-            self._respond_continue(notif.id)
-
-        elif nr == nr_brk:
-            # brk(addr): if addr==0, query; else set new brk
-            pid = notif.pid
-            new_brk = notif.data.args[0]
-            if new_brk == 0:
-                # Query — just allow
-                self._respond_continue(notif.id)
-                return
-            old_brk = self._brk_base.get(pid, new_brk)
-            delta = new_brk - old_brk
-            if delta > 0 and self._mem_used + delta > limit:
-                self._respond_errno(notif.id, errno.ENOMEM)
-                return
-            self._mem_used = max(0, self._mem_used + delta)
-            self._brk_base[pid] = new_brk
-            self._respond_continue(notif.id)
-
-        elif nr == nr_mremap:
-            # mremap(old_addr, old_size, new_size, flags, ...):
-            # old_size=arg1, new_size=arg2
-            old_size = notif.data.args[1]
-            new_size = notif.data.args[2]
-            delta = new_size - old_size
-            if delta > 0 and self._mem_used + delta > limit:
-                self._respond_errno(notif.id, errno.ENOMEM)
-                return
-            self._mem_used += delta
-            self._respond_continue(notif.id)
-
-        else:
-            self._respond_continue(notif.id)
-
-    def _handle_fork(self, notif: SeccompNotif, nr: int) -> None:
-        """Handle clone/fork/vfork — enforce process count limit.
-
-        Only counts process-creating clones.  Thread-creating clones
-        (CLONE_THREAD) are always allowed — they share the parent's
-        address space and don't increase the sandbox's resource footprint.
-        """
-        nr_clone = _SYSCALL_NR.get("clone")
-        CLONE_THREAD = 0x00010000
-
-        # clone with CLONE_THREAD = new thread, not new process — allow
-        if nr == nr_clone:
-            flags = notif.data.args[0] & 0xFFFFFFFF
-            if flags & CLONE_THREAD:
-                self._respond_continue(notif.id)
-                return
-
-        if self._proc_count >= self._policy.max_processes:
-            self._respond_errno(notif.id, errno.EAGAIN)
-            return
-
-        # In hold mode, don't respond — process stays blocked in kernel
-        with self._hold_lock:
-            if self._hold_forks:
-                self._held_notif_ids.append(notif.id)
-                return
-
-        self._proc_count += 1
-        # Record the calling PID (the parent doing the fork).
-        # The new child's PID is unknown until it makes its first
-        # intercepted syscall — tracked lazily via _record_pid.
-        self._proc_pids.add(notif.pid)
-        # Invalidate /proc readdir cache so new PIDs appear
-        self._proc_dir_cache.clear()
-        self._respond_continue(notif.id)
+    # Memory and fork handlers moved to _resource.py
 
     def _handle_port_remap(self, notif: SeccompNotif, nr: int) -> None:
         """Handle bind/connect — rewrite port in child's sockaddr.
