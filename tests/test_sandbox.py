@@ -412,10 +412,12 @@ class TestPortRemap:
         result = Sandbox(policy).call(read_proc)
 
         assert result.success
-        # No ports bound, so should see nothing
-        assert result.value == []
-        # Specifically, host port 22 (sshd) should NOT be visible
+        # Host ports (e.g. sshd on 22) should NOT be visible
         assert 22 not in result.value
+        # Only ports in the sandbox's net_bind range may appear
+        # (from previous tests' sockets in TIME_WAIT)
+        for p in result.value:
+            assert 39100 <= p <= 39199
 
     def test_proc_net_tcp6_filtered(self):
         """/proc/net/tcp6 is filtered the same way."""
@@ -445,8 +447,9 @@ class TestPortRemap:
         result = Sandbox(policy).call(bind_ipv6_and_read)
 
         assert result.success
-        assert len(result.value) == 1
-        assert 39200 <= result.value[0] <= 39299
+        # At least our bound port should be visible in the remapped range
+        in_range = [p for p in result.value if 39200 <= p <= 39299]
+        assert len(in_range) >= 1
 
 
 class TestCpuThrottle:
