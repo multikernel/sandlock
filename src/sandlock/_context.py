@@ -169,12 +169,14 @@ class SandboxContext:
         *,
         save_fn: Callable[[], bytes] | None = None,
         overlay_branch: "object | None" = None,
+        cow_branch: "object | None" = None,
     ):
         self._target = target
         self._policy = policy
         self._sandbox_id = sandbox_id
         self._save_fn = save_fn
         self._overlay_branch = overlay_branch or getattr(policy, '_overlay_branch', None)
+        self._cow_branch = cow_branch or getattr(policy, '_cow_branch', None)
         self._pid: Optional[int] = None
         self._pidfd: int = -1
         self._supervisor = None  # NotifSupervisor | None (lazy import)
@@ -300,7 +302,8 @@ class SandboxContext:
         from ._overlayfs import dir_size
         from pathlib import Path
 
-        upper = Path(str(self._overlay_branch.upper_dir))
+        branch = self._overlay_branch or self._cow_branch
+        upper = Path(str(branch.upper_dir))
         quota = parse_memory_size(self._policy.max_disk)
         stop_event = threading.Event()
         self._disk_quota_stop = stop_event
@@ -732,6 +735,10 @@ class SandboxContext:
                         disk_quota_path=dq_path,
                         disk_quota_bytes=dq_bytes,
                     )
+                    # Attach COW handler for seccomp-based COW
+                    if self._cow_branch is not None:
+                        from ._cow import CowHandler
+                        self._supervisor._cow_handler = CowHandler(self._cow_branch)
                     self._supervisor.start()
                 except Exception:
                     try:
@@ -739,8 +746,8 @@ class SandboxContext:
                     except OSError:
                         pass
 
-            # Start disk quota thread if overlayfs + max_disk
-            if self._overlay_branch is not None and self._policy.max_disk:
+            # Start disk quota thread if COW + max_disk
+            if (self._overlay_branch or self._cow_branch) and self._policy.max_disk:
                 self._start_disk_quota(pid)
 
             # Start CPU throttle thread if max_cpu is set

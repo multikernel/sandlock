@@ -450,6 +450,7 @@ class NotifSupervisor:
         self._bind_ports = bind_ports
         self._disk_quota_path = disk_quota_path
         self._disk_quota_bytes = disk_quota_bytes
+        self._cow_handler = None  # CowHandler | None
         self._thread: Optional[threading.Thread] = None
         self._stop_r, self._stop_w = os.pipe()
         # Resource tracking state
@@ -653,7 +654,7 @@ class NotifSupervisor:
             self._handle_getdents(notif)
             return
 
-        # --- Filesystem: open / openat virtualization ---
+        # --- Filesystem: open / openat virtualization + COW ---
         nr_openat = _SYSCALL_NR.get("openat")
         nr_open = _SYSCALL_NR.get("open")
 
@@ -661,9 +662,11 @@ class NotifSupervisor:
             if nr == nr_openat:
                 dirfd = ctypes.c_int32(notif.data.args[0] & 0xFFFFFFFF).value
                 pathname_addr = notif.data.args[1]
+                flags = notif.data.args[2]
                 path = resolve_openat_path(pid, dirfd, pathname_addr)
             elif nr == nr_open:
                 pathname_addr = notif.data.args[0]
+                flags = notif.data.args[1]
                 path = resolve_openat_path(pid, -100, pathname_addr)  # AT_FDCWD
             else:
                 self._respond_continue(notif.id)
@@ -674,6 +677,11 @@ class NotifSupervisor:
 
         # TOCTTOU check: verify notification is still valid
         if not self._id_valid(notif.id):
+            return
+
+        # --- COW: redirect opens under workdir to upper dir ---
+        if self._cow_handler is not None and self._cow_handler.matches(path):
+            self._handle_cow_open(notif, path, flags)
             return
 
         # Virtualize /proc/net/* to hide host and other sandboxes' info
@@ -707,6 +715,55 @@ class NotifSupervisor:
             self._respond_errno(notif.id, errno_code)
         elif action == NotifAction.VIRTUALIZE:
             self._respond_virtualize(notif.id, virtual_content)
+
+    def _handle_cow_open(self, notif: SeccompNotif, path: str, flags: int) -> None:
+        """Handle openat under workdir: redirect to COW upper dir."""
+        real_path = self._cow_handler.handle_open(path, flags)
+        if real_path is None:
+            self._respond_continue(notif.id)
+            return
+
+        # Open the file in the supervisor and inject fd into child
+        try:
+            fd = os.open(real_path, flags, 0o666)
+        except OSError:
+            self._respond_continue(notif.id)
+            return
+
+        try:
+            self._respond_addfd(notif.id, fd)
+        finally:
+            os.close(fd)
+
+    def _respond_addfd(self, notif_id: int, src_fd: int) -> None:
+        """Inject an open fd into the child and return it as the syscall result."""
+        addfd = SeccompNotifAddfd()
+        addfd.id = notif_id
+        addfd.flags = 0
+        addfd.srcfd = src_fd
+        addfd.newfd = 0
+        addfd.newfd_flags = 0
+
+        ret = _libc.ioctl(
+            ctypes.c_int(self._notify_fd),
+            ctypes.c_ulong(SECCOMP_IOCTL_NOTIF_ADDFD),
+            ctypes.byref(addfd),
+        )
+        if ret < 0:
+            self._respond_continue(notif_id)
+            return
+
+        child_fd = ret
+        resp = SeccompNotifResp()
+        resp.id = notif_id
+        resp.val = child_fd
+        resp.error = 0
+        resp.flags = 0
+        _libc.ioctl(
+            ctypes.c_int(self._notify_fd),
+            ctypes.c_ulong(SECCOMP_IOCTL_NOTIF_SEND),
+            ctypes.byref(resp),
+        )
 
     def _handle_net(self, notif: SeccompNotif, nr: int) -> None:
         """Handle connect/sendto/sendmsg — check destination IP against allowlist."""

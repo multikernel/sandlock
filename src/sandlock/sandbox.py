@@ -492,12 +492,16 @@ class Sandbox:
         Returns:
             SandboxBranch, OverlayBranch, or None.
         """
-        # workdir implies COW
+        # workdir with fs_isolation=NONE → seccomp-based COW (no namespaces)
         if self._policy.workdir and self._policy.fs_isolation == FsIsolation.NONE:
-            import dataclasses
-            self._policy = dataclasses.replace(
-                self._policy, fs_isolation=FsIsolation.OVERLAYFS,
-            )
+            if self._branch is not None:
+                return self._branch
+            from ._cow import CowBranch
+            from pathlib import Path
+            storage = Path(self._policy.fs_storage) if self._policy.fs_storage else None
+            self._branch = CowBranch(Path(self._policy.workdir), storage)
+            self._branch.create()
+            return self._branch
 
         if self._policy.fs_isolation == FsIsolation.NONE:
             return None
@@ -628,6 +632,13 @@ class Sandbox:
                     port_remap=port_remap,
                 )
 
+        # --- CowBranch: ensure notif policy exists so supervisor starts ---
+        from ._cow import CowBranch
+        if isinstance(self._branch, CowBranch):
+            if "notif_policy" not in overrides and policy.notif_policy is None:
+                from ._notif_policy import NotifPolicy, default_proc_rules
+                overrides["notif_policy"] = NotifPolicy(rules=default_proc_rules())
+
         if not overrides:
             result = policy
         else:
@@ -637,6 +648,10 @@ class Sandbox:
         from ._overlayfs import OverlayBranch
         if isinstance(self._branch, OverlayBranch):
             object.__setattr__(result, '_overlay_branch', self._branch)
+
+        # Attach cow branch for supervisor-side COW (not a Policy field)
+        if isinstance(self._branch, CowBranch):
+            object.__setattr__(result, '_cow_branch', self._branch)
 
         return result
 
