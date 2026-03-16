@@ -36,15 +36,13 @@ Usage::
 
 from __future__ import annotations
 
-import ctypes
-import ctypes.util
-import errno
 import os
 import shutil
 import uuid
 from pathlib import Path
 
 from .exceptions import BranchError
+from ._cow_base import CowBranchBase, merge_upper_to_target, cleanup_branch_dir
 
 # O_* flags for detecting writes
 O_WRONLY = 0o1
@@ -56,12 +54,8 @@ O_APPEND = 0o2000
 _WRITE_FLAGS = O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND
 
 
-class CowBranch:
-    """Manages a COW upper directory for seccomp-based isolation.
-
-    Same lifecycle interface as OverlayBranch / SandboxBranch:
-    create(), commit(), abort(), path, upper_dir, finished.
-    """
+class CowBranch(CowBranchBase):
+    """Seccomp notif-based COW. No namespaces, no dependencies."""
 
     def __init__(self, workdir: Path, storage: Path | None = None):
         self._workdir = Path(workdir)
@@ -132,22 +126,8 @@ class CowBranch:
             return
         if self._branch_id is None:
             raise BranchError("Branch not created yet")
-
-        upper = self.upper_dir
-        target = self._workdir
-
-        for root, dirs, files in os.walk(upper):
-            rel = os.path.relpath(root, upper)
-            for d in dirs:
-                dest = target / rel / d
-                dest.mkdir(parents=True, exist_ok=True)
-            for f in files:
-                src = Path(root) / f
-                dest = target / rel / f
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(str(src), str(dest))
-
-        self._cleanup()
+        merge_upper_to_target(self.upper_dir, self._workdir)
+        cleanup_branch_dir(self._storage, self._branch_id)
         self._finished = True
 
     def abort(self) -> None:
@@ -156,14 +136,8 @@ class CowBranch:
             return
         if self._branch_id is None:
             raise BranchError("Branch not created yet")
-        self._cleanup()
+        cleanup_branch_dir(self._storage, self._branch_id)
         self._finished = True
-
-    def _cleanup(self) -> None:
-        if self._branch_id is None:
-            return
-        branch_dir = self._storage / self._branch_id
-        shutil.rmtree(str(branch_dir), ignore_errors=True)
 
 
 class CowHandler:

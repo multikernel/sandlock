@@ -299,7 +299,7 @@ class SandboxContext:
         import threading
         import time
         from .policy import parse_memory_size
-        from ._overlayfs import dir_size
+        from ._cow_base import dir_size
         from pathlib import Path
 
         branch = self._overlay_branch or self._cow_branch

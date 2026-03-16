@@ -20,6 +20,7 @@ import subprocess
 from pathlib import Path
 
 from .exceptions import BranchError, BranchConflictError
+from ._cow_base import CowBranchBase
 
 # ioctl numbers — must match branchfs daemon (fs.rs)
 FS_IOC_BRANCH_CREATE = 0x8080_6200  # _IOR('b', 0, [u8; 128])
@@ -141,16 +142,8 @@ def unmount(mount_point: Path) -> None:
     )
 
 
-class SandboxBranch:
-    """Manages a BranchFS branch for a single sandbox.
-
-    Created by Sandbox when ``policy.fs_isolation == FsIsolation.BRANCHFS``.
-    The branch is created under the parent's ctl (mount root for top-level,
-    or parent branch's ``@path`` for nested sandboxes).
-
-    Attributes:
-        path: The ``@{uuid}`` virtual path where this branch is accessible.
-    """
+class SandboxBranch(CowBranchBase):
+    """BranchFS FUSE-based COW. No namespaces, requires branchfs binary."""
 
     def __init__(
         self,
@@ -178,6 +171,11 @@ class SandboxBranch:
     @property
     def mount_root(self) -> Path:
         return self._mount_root
+
+    @property
+    def upper_dir(self) -> Path:
+        """BranchFS manages storage opaquely; the branch path contains writes."""
+        return self.path
 
     def create(self) -> Path:
         """Create the branch via CREATE ioctl on parent's ctl file.

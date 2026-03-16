@@ -20,20 +20,17 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import os
-import shutil
 import uuid
 from pathlib import Path
 
 from .exceptions import BranchError, SandboxError
+from ._cow_base import CowBranchBase, merge_upper_to_target, cleanup_branch_dir
 
 _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
 
 
-class OverlayBranch:
-    """Manages an overlayfs branch for a single sandbox.
-
-    Same interface as SandboxBranch for API compatibility.
-    """
+class OverlayBranch(CowBranchBase):
+    """Kernel overlayfs COW. Requires user+mount namespace, no dependencies."""
 
     def __init__(
         self,
@@ -132,32 +129,20 @@ class OverlayBranch:
         if self._branch_id is None:
             raise BranchError("Branch not created yet")
 
-        upper = self.upper_dir
-        target = self._lower
-
-        # Copy files from upper to lower, overwriting
-        for root, dirs, files in os.walk(upper):
-            rel = os.path.relpath(root, upper)
-            for d in dirs:
-                dest = target / rel / d
-                dest.mkdir(parents=True, exist_ok=True)
-            for f in files:
-                src = Path(root) / f
-                dest = target / rel / f
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(str(src), str(dest))
+        merge_upper_to_target(self.upper_dir, self._lower)
 
         # Handle whiteouts (overlayfs marks deletions as char devices)
+        upper = self.upper_dir
         for root, dirs, files in os.walk(upper):
             rel = os.path.relpath(root, upper)
             for f in files:
                 src = Path(root) / f
                 if _is_whiteout(src):
-                    dest = target / rel / f
+                    dest = self._lower / rel / f
                     if dest.exists():
                         dest.unlink()
 
-        self._cleanup()
+        cleanup_branch_dir(self._storage, self._branch_id)
         self._finished = True
 
     def abort(self) -> None:
@@ -166,24 +151,15 @@ class OverlayBranch:
             return
         if self._branch_id is None:
             raise BranchError("Branch not created yet")
-
-        self._cleanup()
+        cleanup_branch_dir(self._storage, self._branch_id)
         self._finished = True
-
-    def _cleanup(self) -> None:
-        """Remove the branch directory."""
-        if self._branch_id is None:
-            return
-        branch_dir = self._storage / self._branch_id
-        shutil.rmtree(str(branch_dir), ignore_errors=True)
 
 
 def mount_overlay(branch: OverlayBranch) -> None:
     """Mount overlayfs for a branch.
 
-    Must be called inside a user namespace (child process).
+    Must be called inside a user + mount namespace (child process).
     Requires Linux 5.11+ for unprivileged overlayfs.
-    No mount namespace needed — user namespace restricts mount visibility.
     """
     merged = str(branch.path)
     opts = branch.mount_options()
@@ -201,20 +177,6 @@ def mount_overlay(branch: OverlayBranch) -> None:
             f"overlayfs mount failed: {os.strerror(err)} "
             f"(requires Linux 5.11+ with user namespace)"
         )
-
-
-def dir_size(path: Path) -> int:
-    """Calculate total size of files in a directory tree (bytes)."""
-    total = 0
-    try:
-        for entry in os.scandir(path):
-            if entry.is_file(follow_symlinks=False):
-                total += entry.stat(follow_symlinks=False).st_size
-            elif entry.is_dir(follow_symlinks=False):
-                total += dir_size(Path(entry.path))
-    except OSError:
-        pass
-    return total
 
 
 def _is_whiteout(path: Path) -> bool:

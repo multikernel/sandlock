@@ -531,7 +531,7 @@ class NotifSupervisor:
         if not self._disk_quota_path:
             return
         try:
-            from ._overlayfs import dir_size
+            from ._cow_base import dir_size
             from pathlib import Path
             used = dir_size(Path(self._disk_quota_path))
             if used > self._disk_quota_bytes:
