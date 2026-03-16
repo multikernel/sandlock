@@ -24,6 +24,7 @@ class CowBranch(CowBranchBase):
         self._branch_id: str | None = None
         self._finished = False
         self._deleted: set[str] = set()  # relative paths deleted by sandbox
+        self._has_changes = False  # True after first write or delete
 
     @property
     def workdir(self) -> Path:
@@ -60,9 +61,15 @@ class CowBranch(CowBranchBase):
         """Check if a path has been deleted in this branch."""
         return rel_path in self._deleted
 
+    @property
+    def has_changes(self) -> bool:
+        """True after any write, delete, or metadata change."""
+        return self._has_changes
+
     def mark_deleted(self, rel_path: str) -> None:
         """Mark a path as deleted."""
         self._deleted.add(rel_path)
+        self._has_changes = True
 
     def ensure_cow_copy(self, rel_path: str) -> Path:
         """Ensure a COW copy exists in upper. Returns the upper path.
@@ -72,6 +79,7 @@ class CowBranch(CowBranchBase):
         Clears any deletion mark for this path.
         """
         self._deleted.discard(rel_path)
+        self._has_changes = True
 
         upper_file = self.upper_dir / rel_path
         lower_file = self._workdir / rel_path

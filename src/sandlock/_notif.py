@@ -652,6 +652,10 @@ class NotifSupervisor:
         nr_getdents = _SYSCALL_NR.get("getdents")
 
         if nr in (nr_getdents64, nr_getdents) and self._cow_handler is not None:
+            # Fast path: no changes yet → kernel handles readdir correctly
+            if not self._cow_handler._branch.has_changes:
+                self._respond_continue(notif.id)
+                return
             child_fd_num = notif.data.args[0] & 0xFFFFFFFF
             try:
                 target = os.readlink(f"/proc/{pid}/fd/{child_fd_num}")
@@ -701,6 +705,15 @@ class NotifSupervisor:
             # Special arg layouts
             cow_special_nrs = {nr_symlinkat, nr_symlink,
                                nr_linkat, nr_link} - {None}
+            # Read-only COW syscalls — can skip when no changes yet
+            cow_readonly_nrs = {nr_newfstatat, nr_statx, nr_faccessat,
+                                nr_stat, nr_lstat, nr_access,
+                                nr_readlinkat, nr_readlink} - {None}
+
+            # Fast path: read-only COW syscalls with no changes → let kernel handle
+            if nr in cow_readonly_nrs and not self._cow_handler._branch.has_changes:
+                self._respond_continue(notif.id)
+                return
 
             # symlink/link have special arg layouts — handle separately
             if nr in cow_special_nrs:
@@ -900,6 +913,12 @@ class NotifSupervisor:
 
         # --- COW: redirect opens under workdir to upper dir ---
         if self._cow_handler is not None and self._cow_handler.matches(path):
+            # Fast path: read-only open with no changes → kernel handles it
+            from .cowfs._handler import _WRITE_FLAGS, O_DIRECTORY
+            is_read_only = not (flags & (_WRITE_FLAGS | O_DIRECTORY))
+            if is_read_only and not self._cow_handler._branch.has_changes:
+                self._respond_continue(notif.id)
+                return
             self._handle_cow_open(notif, path, flags)
             return
 
