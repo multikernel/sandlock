@@ -736,7 +736,6 @@ class SandboxContext:
                     notify_fd = recv_fd(parent_sock)
                     parent_sock.close()
                     pids_fn = lambda pgid=pid: _pids_by_pgid(pgid)  # noqa: E731
-                    bind_ports = self._policy.bind_ports() or None
                     # Disk quota for overlayfs upper dir
                     dq_path = None
                     dq_bytes = 0
@@ -747,7 +746,6 @@ class SandboxContext:
                     self._supervisor = NotifSupervisor(
                         notify_fd, pid, self._notif_policy,
                         pids_fn=pids_fn,
-                        bind_ports=bind_ports,
                         disk_quota_path=dq_path,
                         disk_quota_bytes=dq_bytes,
                     )

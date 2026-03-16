@@ -1,15 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Transparent TCP port remapping via seccomp user notification.
+"""Transparent TCP port virtualization via seccomp user notification.
 
-Each sandbox gets a slice of the ``net_bind`` port range.  When the
-app calls bind() on a virtual port, the supervisor rewrites the
-sockaddr in the child's memory to use the next available real port
-from its slice, then lets the syscall proceed.  connect() is remapped
-the same way so sandbox-to-sandbox traffic works transparently.
+Each sandbox gets a full virtual port space (0-65535).  When the app
+calls bind() on a virtual port, the supervisor allocates a free real
+port from the kernel (bind(0)) and rewrites the sockaddr in the
+child's memory.  The app thinks it bound the virtual port.
 
-The ``net_bind`` range serves double duty: Landlock restricts binding
-to only those ports (security), and the PortAllocator slices them
-across sandboxes (isolation).
+No port ranges to configure.  The kernel handles real port allocation.
 
 Requires Linux 5.9+ (SECCOMP_USER_NOTIF_FLAG_CONTINUE + /proc/pid/mem
 write access).
@@ -19,6 +16,8 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import os
+import socket
 import struct
 import threading
 from dataclasses import dataclass, field
@@ -37,93 +36,172 @@ _PORT_OFFSET = 2  # sin_port / sin6_port at byte offset 2
 class PortMap:
     """Bidirectional mapping between virtual and real ports.
 
-    The pool is a slice of real ports assigned by the PortAllocator.
+    Allocates real ports on demand from the kernel via bind(0).
+    Optionally proxies inbound traffic from virtual port to real port.
     Thread-safe.
     """
 
-    pool: list[int]
-    """Slice of real ports assigned to this sandbox."""
+    proxy: bool = False
+    """If True, listen on virtual ports and forward to real ports."""
 
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
-    _pool_set: set[int] = field(default_factory=set, init=False, repr=False)
     _virtual_to_real: dict[int, int] = field(default_factory=dict, repr=False)
     _real_to_virtual: dict[int, int] = field(default_factory=dict, repr=False)
-    _next_index: int = field(default=0, repr=False)
+    # Sockets held open to keep real ports reserved
+    _held_sockets: list[socket.socket] = field(default_factory=list, repr=False)
+    # Proxy state
+    _proxy_threads: list[threading.Thread] = field(default_factory=list, repr=False)
+    _proxy_sockets: list[socket.socket] = field(default_factory=list, repr=False)
+    _proxy_stop: threading.Event = field(default_factory=threading.Event, repr=False)
 
-    def __post_init__(self):
-        self._pool_set = set(self.pool)
-
-    def real_port(self, virtual: int) -> int | None:
+    def real_port(self, virtual: int, family: int = _AF_INET) -> int | None:
         """Get or allocate the real port for a virtual port.
 
-        If the virtual port is already in the pool (it's a real port),
-        returns it unchanged -- no remapping needed.
-        Returns None if the pool is exhausted.
+        Allocates a free real port from the kernel on first use.
+        If proxy=True, also starts listening on the virtual port.
+        Returns None if allocation fails.
         """
         with self._lock:
-            if virtual in self._pool_set:
-                return virtual  # Already a real port, pass through
             if virtual in self._virtual_to_real:
                 return self._virtual_to_real[virtual]
-            if self._next_index >= len(self.pool):
+
+            # Ask the kernel for a free port
+            real = self._allocate_real_port(family)
+            if real is None:
                 return None
-            real = self.pool[self._next_index]
-            self._next_index += 1
+
             self._virtual_to_real[virtual] = real
             self._real_to_virtual[real] = virtual
-            return real
+
+        # Start proxy outside the lock (may block briefly)
+        if self.proxy:
+            self._start_proxy(virtual, real, family)
+
+        return real
 
     def virtual_port(self, real: int) -> int | None:
         """Look up the virtual port for a real port, or None."""
         with self._lock:
             return self._real_to_virtual.get(real)
 
-
-class PortAllocator:
-    """Slices a port pool across sandboxes.
-
-    Given the full ``net_bind`` port list, each call to ``allocate()``
-    returns a non-overlapping slice.  Thread-safe.
-    """
-
-    def __init__(self, ports: list[int], per_sandbox: int = 100):
-        self._ports = ports
-        self._per_sandbox = per_sandbox
-        self._next = 0
-        self._lock = threading.Lock()
-
-    def allocate(self) -> PortMap:
-        """Return a PortMap backed by the next available slice."""
+    def close(self) -> None:
+        """Release all held sockets, stop proxies."""
+        self._proxy_stop.set()
+        for s in self._proxy_sockets:
+            try:
+                s.close()
+            except OSError:
+                pass
+        for t in self._proxy_threads:
+            t.join(timeout=2.0)
         with self._lock:
-            start = self._next
-            end = min(start + self._per_sandbox, len(self._ports))
-            self._next = end
-        return PortMap(pool=self._ports[start:end])
+            for s in self._held_sockets:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+            self._held_sockets.clear()
+            self._virtual_to_real.clear()
+            self._real_to_virtual.clear()
+            self._proxy_sockets.clear()
+            self._proxy_threads.clear()
+
+    def _allocate_real_port(self, family: int) -> int | None:
+        """Bind a socket to port 0 to get a free port from the kernel."""
+        try:
+            af = socket.AF_INET6 if family == _AF_INET6 else socket.AF_INET
+            s = socket.socket(af, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            addr = "::1" if af == socket.AF_INET6 else "127.0.0.1"
+            s.bind((addr, 0))
+            real_port = s.getsockname()[1]
+            self._held_sockets.append(s)
+            return real_port
+        except OSError:
+            return None
+
+    def _start_proxy(self, virtual: int, real: int, family: int) -> None:
+        """Start a TCP proxy: listen on virtual port, forward to real port."""
+        af = socket.AF_INET6 if family == _AF_INET6 else socket.AF_INET
+        try:
+            listener = socket.socket(af, socket.SOCK_STREAM)
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            addr = "" if af == socket.AF_INET6 else "0.0.0.0"
+            listener.bind((addr, virtual))
+            listener.listen(128)
+            listener.settimeout(1.0)
+        except OSError:
+            return  # Can't bind virtual port (maybe already in use)
+
+        self._proxy_sockets.append(listener)
+
+        def _proxy_loop():
+            while not self._proxy_stop.is_set():
+                try:
+                    client, _ = listener.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                # Connect to the sandbox's real port
+                try:
+                    backend = socket.socket(af, socket.SOCK_STREAM)
+                    backend_addr = "::1" if af == socket.AF_INET6 else "127.0.0.1"
+                    backend.connect((backend_addr, real))
+                except OSError:
+                    client.close()
+                    continue
+                # Bidirectional forwarding in threads
+                t1 = threading.Thread(
+                    target=_forward, args=(client, backend, self._proxy_stop),
+                    daemon=True,
+                )
+                t2 = threading.Thread(
+                    target=_forward, args=(backend, client, self._proxy_stop),
+                    daemon=True,
+                )
+                t1.start()
+                t2.start()
+
+            listener.close()
+
+        t = threading.Thread(target=_proxy_loop, daemon=True)
+        t.start()
+        self._proxy_threads.append(t)
 
 
-# Cache allocators by the frozenset of ports so all sandboxes with
-# the same net_bind share one allocator.
-_allocators: dict[frozenset[int], PortAllocator] = {}
-_allocators_lock = threading.Lock()
+def _forward(src: socket.socket, dst: socket.socket,
+             stop: threading.Event) -> None:
+    """Forward data from src to dst until EOF or stop."""
+    try:
+        while not stop.is_set():
+            data = src.recv(65536)
+            if not data:
+                break
+            dst.sendall(data)
+    except OSError:
+        pass
+    finally:
+        try:
+            dst.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
 
 
-def get_port_map(bind_ports: list[int]) -> PortMap:
-    """Get a PortMap slice for a sandbox from the shared allocator.
+def get_port_map(proxy: bool = False) -> PortMap:
+    """Get a new PortMap for a sandbox.
 
-    All sandboxes with the same ``net_bind`` range share one allocator,
-    ensuring non-overlapping slices.
+    Args:
+        proxy: If True, listen on virtual ports and forward inbound
+            traffic to the sandbox's real ports.
     """
-    key = frozenset(bind_ports)
-    with _allocators_lock:
-        if key not in _allocators:
-            _allocators[key] = PortAllocator(sorted(bind_ports))
-        return _allocators[key].allocate()
+    return PortMap(proxy=proxy)
 
 
-def _read_port(pid: int, sockaddr_addr: int, addrlen: int) -> int | None:
-    """Read the port from a sockaddr in child memory.
+def _read_port(pid: int, sockaddr_addr: int, addrlen: int) -> tuple[int, int] | None:
+    """Read the port and address family from a sockaddr in child memory.
 
-    Returns the port number, or None if not AF_INET/AF_INET6.
+    Returns (port, family) or None if not AF_INET/AF_INET6.
     """
     from ._procfs import read_bytes
 
@@ -136,35 +214,31 @@ def _read_port(pid: int, sockaddr_addr: int, addrlen: int) -> int | None:
     if family not in (_AF_INET, _AF_INET6):
         return None
 
-    return struct.unpack_from("!H", data, _PORT_OFFSET)[0]
+    port = struct.unpack_from("!H", data, _PORT_OFFSET)[0]
+    return (port, family)
 
 
 def _remap_sockaddr(pid: int, sockaddr_addr: int, addrlen: int,
                     port_map: PortMap) -> bool:
-    """Rewrite the port in a sockaddr to a real port from the pool.
+    """Rewrite the port in a sockaddr to a real port.
 
     Returns True if remapped, False if not applicable.
     """
     from ._procfs import read_bytes, write_bytes
 
-    if addrlen < 4:
+    info = _read_port(pid, sockaddr_addr, addrlen)
+    if info is None:
         return False
 
-    data = read_bytes(pid, sockaddr_addr, min(addrlen, 28))
-    family = struct.unpack_from("H", data, 0)[0]
-
-    if family not in (_AF_INET, _AF_INET6):
-        return False
-
-    virtual_port = struct.unpack_from("!H", data, _PORT_OFFSET)[0]
+    virtual_port, family = info
     if virtual_port == 0:
-        return False  # Ephemeral port
+        return False  # Ephemeral port — let kernel pick
 
-    real = port_map.real_port(virtual_port)
+    real = port_map.real_port(virtual_port, family)
     if real is None:
-        return False  # Pool exhausted
+        return False  # Allocation failed
     if real == virtual_port:
-        return False  # Already a real port, no rewrite needed
+        return False  # Same port, no rewrite needed
 
     write_bytes(pid, sockaddr_addr + _PORT_OFFSET, struct.pack("!H", real))
     return True
@@ -182,8 +256,6 @@ def fixup_getsockname(pid: int, sockaddr_addr: int, addrlen_addr: int,
 
     Returns True if handled, False if not applicable.
     """
-    import os
-    import socket as sock_mod
     from ._procfs import write_bytes
 
     # Duplicate the child's socket fd via pidfd_getfd syscall
@@ -205,7 +277,7 @@ def fixup_getsockname(pid: int, sockaddr_addr: int, addrlen_addr: int,
         os.close(pidfd)
 
     try:
-        s = sock_mod.socket(fileno=local_fd)
+        s = socket.socket(fileno=local_fd)
         try:
             addr = s.getsockname()
             family = s.family
@@ -215,7 +287,7 @@ def fixup_getsockname(pid: int, sockaddr_addr: int, addrlen_addr: int,
         os.close(local_fd)
         return False
 
-    if family not in (sock_mod.AF_INET, sock_mod.AF_INET6):
+    if family not in (socket.AF_INET, socket.AF_INET6):
         return False
 
     real_port = addr[1]
@@ -224,16 +296,15 @@ def fixup_getsockname(pid: int, sockaddr_addr: int, addrlen_addr: int,
         virtual = real_port  # Not remapped, use as-is
 
     # Build the sockaddr to write back
-    # sa_family is host byte order (H), sin_port is network byte order (!H)
-    if family == sock_mod.AF_INET:
-        ip_bytes = sock_mod.inet_aton(addr[0])
+    if family == socket.AF_INET:
+        ip_bytes = socket.inet_aton(addr[0])
         sockaddr = struct.pack("H", family)
         sockaddr += struct.pack("!H", virtual)
         sockaddr += ip_bytes
         sockaddr += b"\x00" * 8  # sin_zero
         written_len = 16
     else:
-        ip_bytes = sock_mod.inet_pton(sock_mod.AF_INET6, addr[0])
+        ip_bytes = socket.inet_pton(socket.AF_INET6, addr[0])
         flowinfo = addr[2] if len(addr) > 2 else 0
         scope_id = addr[3] if len(addr) > 3 else 0
         sockaddr = struct.pack("H", family)

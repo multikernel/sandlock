@@ -157,10 +157,10 @@ class Policy:
     group — applies to all processes in the sandbox collectively."""
 
     port_remap: bool = False
-    """Enable transparent TCP port remapping.  Each sandbox gets a
-    virtual port space — bind(3000) is silently remapped to a unique
-    real port.  Allows multiple sandboxes to bind the same port
-    without conflicts.  No network namespaces or root required."""
+    """Enable transparent TCP port virtualization.  Each sandbox gets a
+    full virtual port space — bind(3000) is silently remapped to a unique
+    real port.  Inbound traffic to the virtual port is proxied to the
+    real port automatically.  No network namespaces or root required."""
 
     # Optional chroot
     chroot: str | None = None

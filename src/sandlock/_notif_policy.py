@@ -83,7 +83,7 @@ class NotifPolicy:
     """If > 0, clone/fork is denied when process count reaches this limit."""
 
     port_remap: bool = False
-    """If True, bind/connect ports are transparently remapped."""
+    """If True, bind/connect ports are remapped and inbound traffic is proxied."""
 
     cow_enabled: bool = False
     """If True, filesystem COW syscalls (unlinkat, mkdirat, etc.) are intercepted."""

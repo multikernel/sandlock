@@ -186,7 +186,7 @@ class TestPortRemap:
             s.close()
             return name[1]
 
-        policy = Policy(net_bind=["30000-30999"], port_remap=True)
+        policy = Policy(port_remap=True)
 
         r1 = Sandbox(policy).call(bind_port)
         r2 = Sandbox(policy).call(bind_port)
@@ -211,7 +211,7 @@ class TestPortRemap:
                 s.close()
             return ports
 
-        policy = Policy(net_bind=["31000-31099"], port_remap=True)
+        policy = Policy(port_remap=True)
         result = Sandbox(policy).call(bind_three)
 
         assert result.success
@@ -232,30 +232,30 @@ class TestPortRemap:
                 s.close()
             return results
 
-        policy = Policy(net_bind=["32000-32099"], port_remap=True)
+        policy = Policy(port_remap=True)
         result = Sandbox(policy).call(bind_twice)
 
         assert result.success
         # Same virtual port should map to the same real port
         assert result.value[0] == result.value[1]
 
-    def test_port_in_range_not_remapped(self):
-        """A port already in the net_bind range is passed through unchanged."""
+    def test_ephemeral_port_not_remapped(self):
+        """Binding port 0 (ephemeral) is not remapped — kernel picks."""
         import socket as sock_mod
 
-        def bind_real():
+        def bind_ephemeral():
             s = sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM)
             s.setsockopt(sock_mod.SOL_SOCKET, sock_mod.SO_REUSEADDR, 1)
-            s.bind(("127.0.0.1", 33050))  # Within net_bind range
-            real = s.getsockname()[1]
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
             s.close()
-            return real
+            return port
 
-        policy = Policy(net_bind=["33000-33099"], port_remap=True)
-        result = Sandbox(policy).call(bind_real)
+        policy = Policy(port_remap=True)
+        result = Sandbox(policy).call(bind_ephemeral)
 
         assert result.success
-        assert result.value == 33050  # Not remapped
+        assert result.value > 0
 
     def test_getsockname_returns_virtual_port(self):
         """getsockname() should return the virtual port, not the real one."""
@@ -269,15 +269,15 @@ class TestPortRemap:
             s.close()
             return {"ip": name[0], "port": name[1]}
 
-        policy = Policy(net_bind=["35000-35099"], port_remap=True)
+        policy = Policy(port_remap=True)
         result = Sandbox(policy).call(bind_and_check)
 
         assert result.success
         assert result.value["port"] == 4000  # Virtual, not real
         assert result.value["ip"] == "127.0.0.1"
 
-    def test_port_outside_range_remapped(self):
-        """A virtual port outside net_bind binds successfully and getsockname shows virtual."""
+    def test_virtual_port_remapped(self):
+        """A virtual port is remapped and getsockname shows virtual port."""
         import socket as sock_mod
 
         def bind_virtual():
@@ -288,7 +288,7 @@ class TestPortRemap:
             s.close()
             return port
 
-        policy = Policy(net_bind=["34000-34099"], port_remap=True)
+        policy = Policy(port_remap=True)
         result = Sandbox(policy).call(bind_virtual)
 
         assert result.success
@@ -306,7 +306,7 @@ class TestPortRemap:
             s.close()
             return port
 
-        policy = Policy(net_bind=["36000-36099"], port_remap=True)
+        policy = Policy(port_remap=True)
         result = Sandbox(policy).call(bind_ipv6)
 
         assert result.success
@@ -323,7 +323,7 @@ class TestPortRemap:
             s.close()
             return True
 
-        policy = Policy(net_bind=["37000-37999"], port_remap=True)
+        policy = Policy(port_remap=True)
 
         r1 = Sandbox(policy).call(bind_ipv6)
         r2 = Sandbox(policy).call(bind_ipv6)
@@ -331,34 +331,8 @@ class TestPortRemap:
         assert r1.success and r1.value is True
         assert r2.success and r2.value is True
 
-    def test_cross_sandbox_port_scan_blocked(self):
-        """A sandbox cannot connect to another sandbox's real port."""
-        import socket as sock_mod
-
-        def try_connect_to_other():
-            s = sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM)
-            try:
-                # 38000 is in the full net_bind range but belongs
-                # to another sandbox's slice
-                s.connect(("127.0.0.1", 38000))
-                s.close()
-                return "CONNECTED"
-            except ConnectionRefusedError:
-                return "BLOCKED"
-            except OSError:
-                return "BLOCKED"
-
-        # Use range 38000-38199, each sandbox gets 100 ports.
-        # First sandbox takes 38000-38099, second gets 38100-38199.
-        policy = Policy(net_bind=["38000-38199"], port_remap=True)
-        _r1 = Sandbox(policy).call(lambda: True)  # Consume first slice
-
-        r2 = Sandbox(policy).call(try_connect_to_other)
-        assert r2.success
-        assert r2.value == "BLOCKED"
-
     def test_proc_net_tcp_shows_own_port_only(self):
-        """/proc/net/tcp shows only the sandbox's own ports."""
+        """/proc/net/tcp shows only the sandbox's own remapped port."""
         import socket as sock_mod
 
         def bind_and_read_proc():
@@ -369,7 +343,6 @@ class TestPortRemap:
             with open("/proc/net/tcp") as f:
                 lines = f.readlines()
             s.close()
-            # Parse ports from /proc/net/tcp (skip header)
             ports = []
             for line in lines[1:]:
                 parts = line.split()
@@ -379,16 +352,14 @@ class TestPortRemap:
             return ports
 
         policy = Policy(
-            net_bind=["39000-39099"],
             port_remap=True,
             fs_readable=["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev"],
         )
         result = Sandbox(policy).call(bind_and_read_proc)
 
         assert result.success
-        # Should see exactly one port: our remapped real port
-        assert len(result.value) == 1
-        assert 39000 <= result.value[0] <= 39099
+        # Should see at least our remapped port
+        assert len(result.value) >= 1
 
     def test_proc_net_tcp_hides_host_ports(self):
         """/proc/net/tcp hides host ports (e.g. sshd on port 22)."""
@@ -405,7 +376,6 @@ class TestPortRemap:
             return ports
 
         policy = Policy(
-            net_bind=["39100-39199"],
             port_remap=True,
             fs_readable=["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev"],
         )
@@ -414,10 +384,6 @@ class TestPortRemap:
         assert result.success
         # Host ports (e.g. sshd on 22) should NOT be visible
         assert 22 not in result.value
-        # Only ports in the sandbox's net_bind range may appear
-        # (from previous tests' sockets in TIME_WAIT)
-        for p in result.value:
-            assert 39100 <= p <= 39199
 
     def test_proc_net_tcp6_filtered(self):
         """/proc/net/tcp6 is filtered the same way."""
@@ -440,16 +406,14 @@ class TestPortRemap:
             return ports
 
         policy = Policy(
-            net_bind=["39200-39299"],
             port_remap=True,
             fs_readable=["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev"],
         )
         result = Sandbox(policy).call(bind_ipv6_and_read)
 
         assert result.success
-        # At least our bound port should be visible in the remapped range
-        in_range = [p for p in result.value if 39200 <= p <= 39299]
-        assert len(in_range) >= 1
+        # At least our bound port should be visible
+        assert len(result.value) >= 1
 
 
 class TestCpuThrottle:

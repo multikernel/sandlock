@@ -440,7 +440,6 @@ class NotifSupervisor:
         policy: NotifPolicy,
         *,
         pids_fn: Optional[callable] = None,
-        bind_ports: list[int] | None = None,
         disk_quota_path: str | None = None,
         disk_quota_bytes: int = 0,
     ):
@@ -448,7 +447,6 @@ class NotifSupervisor:
         self._child_pid = child_pid
         self._policy = policy
         self._pids_fn = pids_fn
-        self._bind_ports = bind_ports
         self._disk_quota_path = disk_quota_path
         self._disk_quota_bytes = disk_quota_bytes
         self._cow_handler = None  # CowHandler | None
@@ -465,13 +463,11 @@ class NotifSupervisor:
         self._hold_forks: bool = False
         self._hold_lock = threading.Lock()
         self._held_notif_ids: list[int] = []
-        # Port remapping (sliced from net_bind via PortAllocator)
+        # Port virtualization (on-demand allocation from kernel)
         self._port_map = None  # PortMap | None
-        self._full_port_set = None  # set[int] | None — all net_bind ports
-        if policy.port_remap and self._bind_ports:
+        if policy.port_remap:
             from ._port_remap import get_port_map
-            self._port_map = get_port_map(self._bind_ports)
-            self._full_port_set = set(self._bind_ports)
+            self._port_map = get_port_map(proxy=True)
 
     def start(self) -> None:
         """Start the supervisor thread."""
@@ -1142,26 +1138,11 @@ class NotifSupervisor:
         For connect: remaps virtual port, and blocks connections to
         other sandboxes' ports (prevents port scanning).
         """
-        from ._port_remap import _remap_sockaddr, _read_port
+        from ._port_remap import _remap_sockaddr
         from ._seccomp import _SYSCALL_NR
 
         sockaddr_addr = notif.data.args[1]
         addrlen = notif.data.args[2] & 0xFFFFFFFF
-
-        nr_connect = _SYSCALL_NR.get("connect")
-        if nr == nr_connect and self._full_port_set is not None:
-            # Block connections to other sandboxes' real ports.
-            # If target port is in the full net_bind range but not
-            # in our slice, it belongs to another sandbox.
-            try:
-                target_port = _read_port(notif.pid, sockaddr_addr, addrlen)
-                if target_port is not None:
-                    if (target_port in self._full_port_set
-                            and target_port not in self._port_map._pool_set):
-                        self._respond_errno(notif.id, errno.ECONNREFUSED)
-                        return
-            except OSError:
-                pass
 
         try:
             _remap_sockaddr(notif.pid, sockaddr_addr, addrlen, self._port_map)
@@ -1188,7 +1169,7 @@ class NotifSupervisor:
         if not lines:
             return b""
 
-        our_ports = self._port_map._pool_set
+        our_ports = set(self._port_map._real_to_virtual.keys())
         result = [lines[0]]  # Header
 
         for line in lines[1:]:

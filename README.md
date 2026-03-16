@@ -200,31 +200,25 @@ thread cycles SIGSTOP/SIGCONT on the sandbox process group every 100ms.
 `max_cpu=50` means ~50ms running, ~50ms stopped per cycle, roughly 50% of
 one core.  Applies collectively to all processes in the sandbox.
 
-### Port Isolation and Virtualization
+### Port Virtualization
 
-Two layers, complementary:
-
-**Port isolation** (`net_bind`/`net_connect`): Landlock restricts which ports the
-sandbox may bind or connect to.  Security boundary.
-
-**Port virtualization** (`port_remap=True`): Transparent remapping so multiple
-sandboxes can use the same virtual ports without conflicts.  The app thinks it
-binds port 3000, but the real port is different.  Ports already in the
-`net_bind` range are passed through unchanged; only external virtual ports
-are remapped.
+Each sandbox gets a full virtual port space.  Multiple sandboxes can bind the
+same port without conflicts — no configuration needed.
 
 ```python
-policy = Policy(net_bind=["20000-20999"], port_remap=True)
+policy = Policy(port_remap=True)
 
-Sandbox(policy).call(start_web_server)   # bind(3000) -> real port 20000
-Sandbox(policy).call(start_web_server)   # bind(3000) -> real port 20100
+Sandbox(policy).call(start_web_server)   # bind(3000) -> kernel picks a free real port
+Sandbox(policy).call(start_web_server)   # bind(3000) -> different real port, no conflict
 ```
 
-The `net_bind` range provides the pool of real ports.  Landlock enforces the
-range (security), and the internal allocator slices it across sandboxes
-(isolation).  The supervisor intercepts `bind()`/`connect()` via seccomp notif,
-rewrites the port in the child's sockaddr, and lets the syscall proceed.
-No network namespaces or root required.
+The supervisor intercepts `bind()`/`connect()` via seccomp notif, allocates a
+free real port from the kernel on demand, and rewrites the sockaddr in child
+memory.  `getsockname()` returns the virtual port.  No port ranges to configure,
+no network namespaces, no root required.
+
+Optionally, `net_bind`/`net_connect` restrict which virtual ports the sandbox
+may use (Landlock enforcement, defense-in-depth).
 
 ### Network: Domain-Based Access Control
 
@@ -328,7 +322,7 @@ class Policy:
     max_memory: str | int | None = None  # '512M'
     max_processes: int = 64              # per-sandbox fork count
     max_cpu: int | None = None            # 50 = 50% of one core (SIGSTOP/SIGCONT)
-    port_remap: bool = False             # Transparent TCP port remapping
+    port_remap: bool = False             # Full virtual port space per sandbox
 
     # Environment
     clean_env: bool = False              # Minimal env (PATH, HOME, TERM, LANG, USER, SHELL)
