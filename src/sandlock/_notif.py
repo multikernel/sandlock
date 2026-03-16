@@ -740,9 +740,27 @@ class NotifSupervisor:
                             self._respond_continue(notif.id)
                         return
 
-                    # stat / lstat / newfstatat / statx / access / faccessat
-                    if nr in (nr_newfstatat, nr_statx, nr_faccessat,
-                              nr_stat, nr_lstat, nr_access):
+                    # access / faccessat — just check existence
+                    if nr in (nr_faccessat, nr_access):
+                        real_path = self._cow_handler.handle_stat(path)
+                        if real_path is None:
+                            self._respond_errno(notif.id, errno.ENOENT)
+                        else:
+                            self._respond_continue(notif.id)
+                        return
+
+                    # stat / lstat / newfstatat — do stat ourselves,
+                    # write result to child's buffer
+                    if nr in (nr_newfstatat, nr_stat, nr_lstat):
+                        real_path = self._cow_handler.handle_stat(path)
+                        if real_path is None:
+                            self._respond_errno(notif.id, errno.ENOENT)
+                        else:
+                            self._handle_cow_stat(notif, nr, real_path)
+                        return
+
+                    # statx — complex struct, let kernel handle if possible
+                    if nr == nr_statx:
                         real_path = self._cow_handler.handle_stat(path)
                         if real_path is None:
                             self._respond_errno(notif.id, errno.ENOENT)
@@ -1101,6 +1119,66 @@ class NotifSupervisor:
 
         # Fallback: let the syscall proceed normally
         self._respond_continue(notif.id)
+
+    def _handle_cow_stat(self, notif: SeccompNotif, nr: int, real_path: str) -> None:
+        """Do stat on the resolved COW path, write result to child's buffer."""
+        from ._procfs import write_bytes
+
+        nr_newfstatat = _SYSCALL_NR.get("newfstatat")
+        nr_stat = _SYSCALL_NR.get("stat")
+        nr_lstat = _SYSCALL_NR.get("lstat")
+
+        # Get the statbuf pointer from syscall args
+        if nr == nr_newfstatat:
+            # newfstatat(dirfd, pathname, statbuf, flags)
+            statbuf_addr = notif.data.args[2]
+            use_lstat = bool(notif.data.args[3] & 0x100)  # AT_SYMLINK_NOFOLLOW
+        elif nr == nr_stat:
+            # stat(pathname, statbuf)
+            statbuf_addr = notif.data.args[1]
+            use_lstat = False
+        elif nr == nr_lstat:
+            # lstat(pathname, statbuf)
+            statbuf_addr = notif.data.args[1]
+            use_lstat = True
+        else:
+            self._respond_continue(notif.id)
+            return
+
+        try:
+            if use_lstat:
+                st = os.lstat(real_path)
+            else:
+                st = os.stat(real_path)
+        except OSError:
+            self._respond_errno(notif.id, errno.ENOENT)
+            return
+
+        # Pack struct stat (x86_64: 144 bytes)
+        # dev(Q) ino(Q) nlink(Q) mode(I) uid(I) gid(I) pad(I) rdev(Q)
+        # size(q) blksize(q) blocks(q)
+        # atime_sec(Q) atime_ns(Q) mtime_sec(Q) mtime_ns(Q)
+        # ctime_sec(Q) ctime_ns(Q) unused(qqq)
+        packed = struct.pack(
+            "QQQIIIIQqqqQQQQQQqqq",
+            st.st_dev, st.st_ino, st.st_nlink,
+            st.st_mode, st.st_uid, st.st_gid, 0,  # pad
+            st.st_rdev,
+            st.st_size, st.st_blksize, st.st_blocks,
+            int(st.st_atime), int(st.st_atime_ns % 1_000_000_000),
+            int(st.st_mtime), int(st.st_mtime_ns % 1_000_000_000),
+            int(st.st_ctime), int(st.st_ctime_ns % 1_000_000_000),
+            0, 0, 0,  # unused
+        )
+
+        if not self._id_valid(notif.id):
+            return
+
+        try:
+            write_bytes(notif.pid, statbuf_addr, packed)
+            self._respond_val(notif.id, 0)
+        except OSError:
+            self._respond_continue(notif.id)
 
     def _handle_cow_getdents(self, notif: SeccompNotif, dir_path: str) -> None:
         """Handle getdents64 for COW directories — merge upper + lower entries."""
