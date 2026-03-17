@@ -88,22 +88,25 @@ def _pidfd_poll(pidfd: int, timeout_s: float) -> bool:
 def _notif_syscall_names(notif: "NotifPolicy") -> list[str]:
     """Return the list of syscalls to intercept via user notification.
 
-    openat is always intercepted.  open is added on x86_64 (not
-    present on aarch64).  connect and sendto are added when
-    allowed_ips is set for network enforcement.
+    openat and clone/fork/vfork/clone3 are always intercepted.
+    open is added on x86_64 (not present on aarch64).  connect
+    and sendto are added when allowed_ips is set for network
+    enforcement.
     """
     from ._seccomp import _SYSCALL_NR
     names = ["openat"]
     if "open" in _SYSCALL_NR:
         names.append("open")
+    # Always intercept clone/fork/vfork/clone3 — the supervisor checks
+    # namespace flags (which BPF can't inspect for clone3) and tracks
+    # process creation.
+    names.extend(["clone", "clone3", "fork", "vfork"])
     if notif is not None and notif.allowed_ips:
         names.extend(["connect", "sendto"])
     if notif is not None and notif.port_remap:
         names.extend(["bind", "connect", "getsockname"])
     if notif is not None and notif.max_memory_bytes > 0:
         names.extend(["mmap", "munmap", "brk", "mremap"])
-    if notif is not None and notif.max_processes > 0:
-        names.extend(["clone", "fork", "vfork"])
     if notif is not None and notif.isolate_pids:
         names.append("getdents64")
         if "getdents" in _SYSCALL_NR:

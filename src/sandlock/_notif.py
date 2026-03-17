@@ -584,7 +584,7 @@ class NotifSupervisor:
                           self._respond_continue, self._respond_errno)
             return
 
-        if nr in FORK_NRS and self._policy.max_processes > 0:
+        if nr in FORK_NRS:
             handle_fork(notif, nr, self._res,
                         self._policy.max_processes,
                         self._respond_continue, self._respond_errno,

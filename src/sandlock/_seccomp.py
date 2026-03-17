@@ -285,30 +285,16 @@ def _build_arg_filters() -> bytes:
     These filters check specific arguments rather than blocking the
     syscall entirely:
 
-    - clone(2): Block if any namespace flags (CLONE_NEWUSER, etc.) are
-      set in the flags argument (arg0).  Normal fork/pthread_create
-      still works.
     - ioctl(2): Block TIOCSTI (terminal input injection).  Normal
       terminal I/O and isatty() still work.
+
+    Note: clone/clone3 namespace flag checks are handled in the
+    supervisor via USER_NOTIF, not here.
     """
     insns = bytearray()
 
-    # --- clone: block namespace flags in arg0 (low 32 bits) ---
-    # Load syscall number
-    insns += _bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR)
-    # if nr != clone, skip ahead (3 instructions: load arg0, test flags, deny)
-    insns += _bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, _SYSCALL_NR["clone"], 0, 3)
-    # Load clone flags (arg0, low 32 bits — all NS flags fit in low 32)
-    insns += _bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARGS0_LO)
-    # Test if any namespace flag is set
-    insns += _bpf_jump(BPF_JMP | BPF_JSET | BPF_K, _CLONE_NS_FLAGS, 0, 1)
-    # Namespace flag set → deny
-    insns += _bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ERRNO_EPERM)
-
-    # --- clone3: block entirely (flags are in a struct, not inspectable) ---
-    insns += _bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR)
-    insns += _bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, _SYSCALL_NR["clone3"], 0, 1)
-    insns += _bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ERRNO_EPERM)
+    # --- clone/clone3: handled via USER_NOTIF (namespace flag checks
+    #     and process tracking done in supervisor) ---
 
     # --- ioctl: block TIOCSTI (terminal input injection) ---
     # Load syscall number

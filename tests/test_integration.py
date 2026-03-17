@@ -243,6 +243,42 @@ print("BLOCKED" if err == errno.EPERM else f"UNEXPECTED {err}")
         assert result.success
         assert b"BLOCKED" in result.stdout
 
+    def test_clone3_threading_works(self):
+        """Python threading (clone3 on modern glibc) should work in sandbox."""
+        policy = Policy(fs_readable=_PYTHON_READABLE)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import threading
+results = []
+def worker(n):
+    results.append(n)
+threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+print(f'THREADS_OK {len(results)}')
+"""]
+        )
+        assert result.success
+        assert b"THREADS_OK 4" in result.stdout
+
+    def test_clone3_namespace_flags_blocked(self):
+        """clone3 with namespace flags should be denied."""
+        policy = Policy(fs_readable=_PYTHON_READABLE)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import ctypes, os, errno
+libc = ctypes.CDLL(None, use_errno=True)
+CLONE_NEWUSER = 0x10000000
+ret = libc.unshare(CLONE_NEWUSER)
+err = ctypes.get_errno()
+print("BLOCKED" if err == errno.EPERM else f"UNEXPECTED {err}")
+"""]
+        )
+        assert result.success
+        assert b"BLOCKED" in result.stdout
+
     def test_allowlist_allows_normal_operations(self):
         """Allowlist mode should still allow basic Python operations."""
         from sandlock import DEFAULT_ALLOW_SYSCALLS

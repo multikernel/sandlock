@@ -2,16 +2,18 @@
 """Resource enforcement — memory limits and process count.
 
 Handles mmap/munmap/brk/mremap for memory tracking and
-clone/fork/vfork for process count limits. Called by the
-seccomp notif supervisor.
+clone/fork/vfork/clone3 for namespace flag enforcement and
+process count limits. Called by the seccomp notif supervisor.
 """
 
 from __future__ import annotations
 
 import errno
+import struct
 import threading
 
-from ._seccomp import _SYSCALL_NR
+from ._procfs import read_bytes
+from ._seccomp import _SYSCALL_NR, _CLONE_NS_FLAGS
 
 # Syscall numbers (cached at import time)
 NR_MMAP = _SYSCALL_NR.get("mmap")
@@ -19,11 +21,12 @@ NR_MUNMAP = _SYSCALL_NR.get("munmap")
 NR_BRK = _SYSCALL_NR.get("brk")
 NR_MREMAP = _SYSCALL_NR.get("mremap")
 NR_CLONE = _SYSCALL_NR.get("clone")
+NR_CLONE3 = _SYSCALL_NR.get("clone3")
 NR_FORK = _SYSCALL_NR.get("fork")
 NR_VFORK = _SYSCALL_NR.get("vfork")
 
 MEMORY_NRS = {NR_MMAP, NR_MUNMAP, NR_BRK, NR_MREMAP} - {None}
-FORK_NRS = {NR_CLONE, NR_FORK, NR_VFORK} - {None}
+FORK_NRS = {NR_CLONE, NR_CLONE3, NR_FORK, NR_VFORK} - {None}
 
 CLONE_THREAD = 0x00010000
 
@@ -86,28 +89,64 @@ def handle_memory(notif, nr: int, state: ResourceState,
         respond_continue(notif.id)
 
 
+def _clone3_flags(pid: int, args_addr: int) -> int:
+    """Read the flags field from a clone3 clone_args struct in child memory.
+
+    struct clone_args { u64 flags; ... };  — flags is the first field.
+    """
+    data = read_bytes(pid, args_addr, 8)
+    return struct.unpack_from("<Q", data, 0)[0]
+
+
 def handle_fork(notif, nr: int, state: ResourceState,
                 max_processes: int, respond_continue, respond_errno,
                 clear_dir_cache) -> None:
-    """Handle clone/fork/vfork — enforce process count limit."""
-    # clone with CLONE_THREAD = new thread, not new process — allow
+    """Handle clone/fork/vfork/clone3 — enforce namespace flags and process limit.
+
+    Namespace flags are always checked (regardless of max_processes).
+    Process counting is only enforced when max_processes > 0.
+    """
+    is_thread = False
+
     if nr == NR_CLONE:
         flags = notif.data.args[0] & 0xFFFFFFFF
-        if flags & CLONE_THREAD:
-            respond_continue(notif.id)
+        if flags & _CLONE_NS_FLAGS:
+            respond_errno(notif.id, errno.EPERM)
             return
+        if flags & CLONE_THREAD:
+            is_thread = True
 
-    if state.proc_count >= max_processes:
-        respond_errno(notif.id, errno.EAGAIN)
+    elif nr == NR_CLONE3:
+        try:
+            flags = _clone3_flags(notif.pid, notif.data.args[0])
+        except OSError:
+            respond_errno(notif.id, errno.EPERM)
+            return
+        if flags & _CLONE_NS_FLAGS:
+            respond_errno(notif.id, errno.EPERM)
+            return
+        if flags & CLONE_THREAD:
+            is_thread = True
+
+    # Threads don't count toward process limit
+    if is_thread:
+        respond_continue(notif.id)
         return
 
-    # In hold mode, don't respond — process stays blocked in kernel
-    with state.hold_lock:
-        if state.hold_forks:
-            state.held_notif_ids.append(notif.id)
+    # Process counting only when limit is set
+    if max_processes > 0:
+        if state.proc_count >= max_processes:
+            respond_errno(notif.id, errno.EAGAIN)
             return
 
-    state.proc_count += 1
-    state.proc_pids.add(notif.pid)
-    clear_dir_cache()
+        # In hold mode, don't respond — process stays blocked in kernel
+        with state.hold_lock:
+            if state.hold_forks:
+                state.held_notif_ids.append(notif.id)
+                return
+
+        state.proc_count += 1
+        state.proc_pids.add(notif.pid)
+        clear_dir_cache()
+
     respond_continue(notif.id)
