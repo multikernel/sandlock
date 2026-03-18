@@ -1448,6 +1448,49 @@ class TestDeterministicTime:
         uptime_val = float(result.stdout.strip().split()[0])
         assert uptime_val < 5.0, f"/proc/uptime too high: {uptime_val}"
 
+    def test_timerfd_abstime_works(self):
+        """timerfd_settime with TFD_TIMER_ABSTIME fires correctly."""
+        def check_timerfd():
+            import ctypes, ctypes.util, struct, os, time
+
+            libc = ctypes.CDLL(ctypes.util.find_library("c"))
+            CLOCK_MONOTONIC = 1
+            TFD_TIMER_ABSTIME = 1
+
+            # Create timerfd
+            fd = libc.timerfd_create(CLOCK_MONOTONIC, 0)
+            if fd < 0:
+                return "timerfd_create failed"
+
+            # Get current monotonic time, set timer 0.1s in the future
+            now = time.monotonic()
+            deadline = now + 0.1
+            sec = int(deadline)
+            nsec = int((deadline - sec) * 1_000_000_000)
+
+            # struct itimerspec: it_interval (16 bytes) + it_value (16 bytes)
+            itimerspec = struct.pack("<qQqQ", 0, 0, sec, nsec)
+            buf = ctypes.create_string_buffer(itimerspec)
+
+            ret = libc.timerfd_settime(fd, TFD_TIMER_ABSTIME,
+                                       buf, None)
+            if ret < 0:
+                os.close(fd)
+                return "timerfd_settime failed"
+
+            # Read from timerfd (blocks until timer fires)
+            data = os.read(fd, 8)
+            os.close(fd)
+
+            elapsed = time.monotonic() - now
+            return elapsed
+
+        policy = Policy(time_start="2000-01-01T00:00:00Z")
+        result = Sandbox(policy).call(check_timerfd)
+        assert result.success, f"Failed: {result.error}"
+        # Timer should fire after ~0.1s, not instantly
+        assert 0.05 < result.value < 1.0, f"timerfd elapsed: {result.value}"
+
     def test_time_start_none_is_real_time(self):
         """Without time_start, time is real."""
         def check_year():

@@ -18,6 +18,8 @@ NR_CLOCK_GETTIME = _SYSCALL_NR.get("clock_gettime")
 NR_GETTIMEOFDAY = _SYSCALL_NR.get("gettimeofday")
 NR_TIME = _SYSCALL_NR.get("time")
 NR_CLOCK_NANOSLEEP = _SYSCALL_NR.get("clock_nanosleep")
+NR_TIMERFD_SETTIME = _SYSCALL_NR.get("timerfd_settime")
+NR_TIMER_SETTIME = _SYSCALL_NR.get("timer_settime")
 
 # Clocks that should be shifted (wall time only).
 _SHIFTED_CLOCKS = {
@@ -37,7 +39,8 @@ _MONO_SHIFTED_CLOCKS = {
 TIMER_ABSTIME = 1
 
 TIME_NRS = {NR_CLOCK_GETTIME, NR_GETTIMEOFDAY, NR_TIME,
-            NR_CLOCK_NANOSLEEP} - {None}
+            NR_CLOCK_NANOSLEEP, NR_TIMERFD_SETTIME,
+            NR_TIMER_SETTIME} - {None}
 
 
 class TimeOffset:
@@ -149,6 +152,52 @@ def handle_time(notif, nr: int, offset: TimeOffset,
             sec, nsec = struct.unpack("<qQ", data)
             sec -= mono_offset_s
             write_bytes(notif.pid, req_addr, struct.pack("<qQ", sec, nsec))
+        except OSError:
+            pass
+
+        respond_continue(notif.id)
+
+    elif nr == NR_TIMERFD_SETTIME:
+        # timerfd_settime(fd, flags, new_value, old_value)
+        # new_value is struct itimerspec: {it_interval(16), it_value(16)}
+        # When TFD_TIMER_ABSTIME (1) is set, un-shift it_value.
+        flags = notif.data.args[1]
+        new_value_addr = notif.data.args[2]
+
+        if not (flags & TIMER_ABSTIME):
+            respond_continue(notif.id)
+            return
+
+        from ._procfs import read_bytes as _read_bytes
+        try:
+            # it_value starts at offset 16 in itimerspec
+            val_addr = new_value_addr + 16
+            data = _read_bytes(notif.pid, val_addr, 16)
+            sec, nsec = struct.unpack("<qQ", data)
+            sec -= mono_offset_s
+            write_bytes(notif.pid, val_addr, struct.pack("<qQ", sec, nsec))
+        except OSError:
+            pass
+
+        respond_continue(notif.id)
+
+    elif nr == NR_TIMER_SETTIME:
+        # timer_settime(timerid, flags, new_value, old_value)
+        # Same itimerspec layout as timerfd_settime.
+        flags = notif.data.args[1]
+        new_value_addr = notif.data.args[2]
+
+        if not (flags & TIMER_ABSTIME):
+            respond_continue(notif.id)
+            return
+
+        from ._procfs import read_bytes as _read_bytes
+        try:
+            val_addr = new_value_addr + 16
+            data = _read_bytes(notif.pid, val_addr, 16)
+            sec, nsec = struct.unpack("<qQ", data)
+            sec -= mono_offset_s
+            write_bytes(notif.pid, val_addr, struct.pack("<qQ", sec, nsec))
         except OSError:
             pass
 
