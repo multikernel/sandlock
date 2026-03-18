@@ -1412,6 +1412,20 @@ class TestDeterministicTime:
         mono = float(result.stdout.strip())
         assert mono < 5.0, f"Monotonic too high: {mono}"
 
+    def test_proc_uptime_virtualized(self):
+        """With time_start, /proc/uptime shows near-zero uptime."""
+        policy = Policy(
+            time_start="2000-01-01T00:00:00Z",
+            fs_readable=_PYTHON_READABLE,
+        )
+        result = Sandbox(policy).run(
+            ["python3", "-c",
+             "f=open('/proc/uptime');print(f.read().strip());f.close()"]
+        )
+        assert result.success, f"Failed: {result.stderr}"
+        uptime_val = float(result.stdout.strip().split()[0])
+        assert uptime_val < 5.0, f"/proc/uptime too high: {uptime_val}"
+
     def test_time_start_none_is_real_time(self):
         """Without time_start, time is real."""
         def check_year():

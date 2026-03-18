@@ -1105,6 +1105,22 @@ class NotifSupervisor:
                 os.close(fd)
             return
 
+        # --- Virtualize /proc/uptime for time virtualization ---
+        if self._mono_offset_s != 0 and path == "/proc/uptime":
+            import time as _time
+            uptime = _time.monotonic() + self._mono_offset_s
+            if uptime < 0:
+                uptime = 0.0
+            content = f"{uptime:.2f} 0.00\n".encode()
+            r, w = os.pipe()
+            os.write(w, content)
+            os.close(w)
+            try:
+                self._respond_addfd(notif.id, r)
+            finally:
+                os.close(r)
+            return
+
         # --- COW: redirect opens under workdir to upper dir ---
         if self._cow_handler is not None and self._cow_handler.matches(path):
             # Fast path: read-only open with no changes → kernel handles it
