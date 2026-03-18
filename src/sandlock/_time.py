@@ -17,14 +17,14 @@ from ._procfs import write_bytes
 NR_CLOCK_GETTIME = _SYSCALL_NR.get("clock_gettime")
 NR_GETTIMEOFDAY = _SYSCALL_NR.get("gettimeofday")
 
-# Clocks that should be shifted (wall time and monotonic)
+# Clocks that should be shifted (wall time only).
+# Monotonic clocks are NOT shifted — they measure elapsed time since boot
+# and are used for relative timing (sleep, timeouts).  Shifting them by a
+# large negative offset can make them negative, which breaks
+# clock_nanosleep(TIMER_ABSTIME) on short-uptime machines (CI VMs).
 _SHIFTED_CLOCKS = {
     0,   # CLOCK_REALTIME
-    1,   # CLOCK_MONOTONIC
-    4,   # CLOCK_MONOTONIC_RAW
     5,   # CLOCK_REALTIME_COARSE
-    6,   # CLOCK_MONOTONIC_COARSE
-    7,   # CLOCK_BOOTTIME
 }
 
 TIME_NRS = {NR_CLOCK_GETTIME, NR_GETTIMEOFDAY} - {None}
@@ -54,11 +54,8 @@ def handle_time(notif, nr: int, offset: TimeOffset,
             respond_continue(notif.id)
             return
 
-        # Get real time from the appropriate clock
-        if clockid in (0, 5):  # CLOCK_REALTIME variants
-            now = time.time()
-        else:
-            now = time.monotonic()
+        # Get real wall time (only REALTIME clocks reach here)
+        now = time.time()
 
         fake = now + offset._offset_s
         sec = int(fake)
