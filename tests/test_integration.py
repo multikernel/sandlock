@@ -1475,16 +1475,22 @@ class TestNoRandomizeMemory:
         assert r1.stdout.strip() == r2.stdout.strip()
 
     def test_no_randomize_memory_call(self):
-        """no_randomize_memory works with Sandbox.call."""
-        def get_addr():
-            import ctypes
-            return ctypes.addressof(ctypes.c_int())
+        """no_randomize_memory sets personality in Sandbox.call.
+
+        personality(ADDR_NO_RANDOMIZE) takes effect at exec, not fork.
+        Sandbox.call has no exec, so we verify the flag is set rather
+        than comparing addresses.
+        """
+        def check_personality():
+            import ctypes, ctypes.util
+            libc = ctypes.CDLL(ctypes.util.find_library("c"))
+            ADDR_NO_RANDOMIZE = 0x0040000
+            return bool(libc.personality(0xffffffff) & ADDR_NO_RANDOMIZE)
 
         policy = Policy(no_randomize_memory=True)
-        r1 = Sandbox(policy).call(get_addr)
-        r2 = Sandbox(policy).call(get_addr)
-        assert r1.success and r2.success
-        assert r1.value == r2.value
+        result = Sandbox(policy).call(check_personality)
+        assert result.success, f"Failed: {result.error}"
+        assert result.value is True
 
     def test_default_has_randomized_addresses(self):
         """Without no_randomize_memory, ASLR is active (addresses vary)."""
