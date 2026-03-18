@@ -74,6 +74,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         cli_kwargs["time_start"] = args.time_start
     if args.no_randomize_memory:
         cli_kwargs["no_randomize_memory"] = True
+    if args.no_huge_pages:
+        cli_kwargs["no_huge_pages"] = True
     if args.no_coredump:
         cli_kwargs["no_coredump"] = True
     if args.clean_env:
@@ -393,6 +395,8 @@ def main() -> None:
                        help="Time virtualization start (ISO 8601 or Unix timestamp)")
     run_p.add_argument("--no-randomize-memory", action="store_true",
                        help="Disable ASLR for deterministic memory layout")
+    run_p.add_argument("--no-huge-pages", action="store_true",
+                       help="Disable Transparent Huge Pages for deterministic page sizes")
     run_p.add_argument("--no-coredump", action="store_true",
                        help="Disable core dumps and restrict /proc/pid access")
     run_p.add_argument("--clean-env", action="store_true",

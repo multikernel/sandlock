@@ -1382,6 +1382,58 @@ class TestNoRandomizeMemory:
         assert len(addrs) > 1, "ASLR seems inactive — all addresses identical"
 
 
+# --- Transparent Huge Pages ---
+
+class TestNoHugePages:
+    def test_no_huge_pages_disables_thp(self):
+        """no_huge_pages disables THP even when parent has it enabled."""
+        # Spawn a subprocess that enables THP, then runs sandlock
+        script = textwrap.dedent("""\
+            import ctypes, ctypes.util
+            libc = ctypes.CDLL(ctypes.util.find_library("c"))
+            # Enable THP in this process (inherited by fork)
+            libc.prctl(41, 0, 0, 0, 0)
+            assert libc.prctl(42, 0, 0, 0, 0) == 0, "failed to enable THP"
+
+            from sandlock import Sandbox, Policy
+
+            def check_thp():
+                import ctypes, ctypes.util
+                libc = ctypes.CDLL(ctypes.util.find_library("c"))
+                return libc.prctl(42, 0, 0, 0, 0)
+
+            result = Sandbox(Policy(no_huge_pages=True)).call(check_thp)
+            assert result.success, f"Failed: {result.error}"
+            assert result.value == 1, f"THP not disabled: {result.value}"
+        """)
+        r = subprocess.run(["python3", "-c", script],
+                           capture_output=True, text=True)
+        assert r.returncode == 0, f"stderr: {r.stderr}"
+
+    def test_no_huge_pages_run(self):
+        """no_huge_pages disables THP in exec'd process."""
+        # Spawn a subprocess with THP enabled, then use sandlock run
+        script = textwrap.dedent("""\
+            import ctypes, ctypes.util
+            libc = ctypes.CDLL(ctypes.util.find_library("c"))
+            libc.prctl(41, 0, 0, 0, 0)
+            assert libc.prctl(42, 0, 0, 0, 0) == 0, "failed to enable THP"
+
+            from sandlock import Sandbox, Policy
+            result = Sandbox(Policy(no_huge_pages=True)).run(
+                ["python3", "-c",
+                 "import ctypes,ctypes.util;"
+                 "libc=ctypes.CDLL(ctypes.util.find_library('c'));"
+                 "print(libc.prctl(42,0,0,0,0))"]
+            )
+            assert result.success
+            assert result.stdout.strip() == b"1", f"THP not disabled: {result.stdout}"
+        """)
+        r = subprocess.run(["python3", "-c", script],
+                           capture_output=True, text=True)
+        assert r.returncode == 0, f"stderr: {r.stderr}"
+
+
 # --- Deterministic randomness ---
 
 class TestDeterministicRandom:

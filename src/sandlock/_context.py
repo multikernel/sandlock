@@ -594,6 +594,14 @@ class SandboxContext:
                     ADDR_NO_RANDOMIZE = 0x0040000
                     _libc.personality(ctypes.c_ulong(ADDR_NO_RANDOMIZE))
 
+                # 3a. Disable THP for deterministic page sizes
+                if self._policy.no_huge_pages:
+                    _PR_SET_THP_DISABLE = 41
+                    _libc.prctl(ctypes.c_int(_PR_SET_THP_DISABLE),
+                                ctypes.c_ulong(1),
+                                ctypes.c_ulong(0), ctypes.c_ulong(0),
+                                ctypes.c_ulong(0))
+
                 # 3b. Disable core dumps and /proc/pid access
                 if self._policy.no_coredump:
                     import resource

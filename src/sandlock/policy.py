@@ -184,6 +184,12 @@ class Policy:
     deterministic across runs.  Useful for reproducible builds and tests.
     Applied via personality(ADDR_NO_RANDOMIZE) — per-process, no root."""
 
+    no_huge_pages: bool = False
+    """Disable Transparent Huge Pages (THP) inside the sandbox.
+    Prevents the kernel from silently promoting 4KB pages to 2MB huge
+    pages, which causes nondeterministic memory layout, RSS measurements,
+    and page fault timing.  Applied via prctl(PR_SET_THP_DISABLE)."""
+
     # Optional chroot
     chroot: str | None = None
     """Path to chroot into before applying other confinement."""
