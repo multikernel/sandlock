@@ -424,6 +424,7 @@ class NotifSupervisor:
         # Deterministic time
         self._time_offset = None  # TimeOffset | None
         self._vdso_patched_pids: set[int] = set()
+        self._vdso_patch_remaining: int = 0
         if policy.time_start is not None:
             from ._time import TimeOffset
             self._time_offset = TimeOffset(policy.time_start)
@@ -561,19 +562,21 @@ class NotifSupervisor:
                 pass
 
         # Post-dispatch: patch vDSO for new PIDs (after exec).
-        # /proc/pid/mem writes to vDSO only stick when the child is
-        # running (not in seccomp-stop).  A background thread retries
-        # the write while the notification loop keeps responding to
-        # syscalls, giving the child running windows between stops.
+        # /proc/pid/mem writes to vDSO only take effect when the child
+        # is running (not in seccomp-stop).  Each dispatch responds to
+        # a notification, briefly unfreezing the child.  The write in
+        # the NEXT iteration catches the child during that window.
+        # We repeat for several notifications to ensure one sticks.
         if self._time_offset is not None:
             pid = notif.pid
             if pid not in self._vdso_patched_pids:
                 self._vdso_patched_pids.add(pid)
-                import threading
-                def _patch(p=pid):
-                    from ._vdso import disable_vdso_remote
-                    disable_vdso_remote(p)
-                threading.Thread(target=_patch, daemon=True).start()
+                self._vdso_patch_remaining = 10
+
+        if self._vdso_patch_remaining > 0:
+            from ._vdso import _write_vdso_stubs
+            _write_vdso_stubs(notif.pid)
+            self._vdso_patch_remaining -= 1
 
     @property
     def tracked_pids(self) -> set[int]:
