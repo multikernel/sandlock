@@ -12,6 +12,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import textwrap
+import time
 
 import pytest
 
@@ -77,6 +79,55 @@ class TestRunIntegration:
         )
         assert r.returncode == 0
         assert b"from-flag" in r.stdout
+
+
+class TestPdeathsig:
+    def test_child_dies_when_parent_killed(self):
+        """Sandboxed child is killed when its parent/supervisor dies."""
+        # Fork a wrapper process that spawns a sandbox, then we kill the wrapper.
+        # The sandboxed grandchild should die automatically via PR_SET_PDEATHSIG.
+        script = textwrap.dedent("""\
+            import os, time, sys
+            from sandlock import Sandbox, Policy
+            policy = Policy()
+            result = Sandbox(policy).run(["sleep", "300"])
+        """)
+        proc = subprocess.Popen(
+            ["python3", "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        # Give the sandbox time to start the sleeping child
+        time.sleep(0.3)
+        # Find grandchild (the sleep process)
+        try:
+            children = subprocess.check_output(
+                ["pgrep", "-P", str(proc.pid)], text=True
+            ).strip().split()
+        except subprocess.CalledProcessError:
+            children = []
+        grandchildren = []
+        for cpid in children:
+            try:
+                gc = subprocess.check_output(
+                    ["pgrep", "-P", cpid], text=True
+                ).strip().split()
+                grandchildren.extend(gc)
+            except subprocess.CalledProcessError:
+                pass
+
+        # Kill the wrapper (supervisor's parent)
+        proc.kill()
+        proc.wait()
+
+        # Grandchildren should die shortly
+        time.sleep(0.5)
+        for gpid in grandchildren:
+            try:
+                os.kill(int(gpid), 0)  # Check if still alive
+                pytest.fail(f"Grandchild {gpid} survived parent death")
+            except ProcessLookupError:
+                pass  # Expected — process is gone
 
 
 class TestCallIntegration:

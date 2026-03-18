@@ -538,6 +538,13 @@ class SandboxContext:
                             ctypes.c_ulong(0), ctypes.c_ulong(0),
                             ctypes.c_ulong(0))
 
+                # Kill this child if the supervisor/parent dies
+                _PR_SET_PDEATHSIG = 1
+                _libc.prctl(ctypes.c_int(_PR_SET_PDEATHSIG),
+                            ctypes.c_ulong(signal.SIGKILL),
+                            ctypes.c_ulong(0), ctypes.c_ulong(0),
+                            ctypes.c_ulong(0))
+
                 # 1. User namespace for privileged mode (if needed)
                 if needs_userns and userns_c2p_w >= 0:
                     os.close(userns_c2p_r)
