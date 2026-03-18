@@ -1448,6 +1448,14 @@ class TestDeterministicTime:
         uptime_val = float(result.stdout.strip().split()[0])
         assert uptime_val < 5.0, f"/proc/uptime too high: {uptime_val}"
 
+    def test_proc_stat_btime_virtualized(self):
+        """With time_start, /proc/stat btime matches time_start."""
+        policy = Policy(time_start="2000-01-01T00:00:00Z")
+        result = Sandbox(policy).run(["grep", "btime", "/proc/stat"])
+        assert result.success, f"Failed: {result.stderr}"
+        btime = int(result.stdout.strip().split()[1])
+        assert btime == 946684800, f"btime not virtualized: {btime}"
+
     def test_timerfd_abstime_works(self):
         """timerfd_settime with TFD_TIMER_ABSTIME fires correctly."""
         def check_timerfd():

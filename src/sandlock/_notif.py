@@ -426,11 +426,13 @@ class NotifSupervisor:
         self._mono_offset_s: int = 0  # monotonic offset for vDSO stubs
         self._vdso_patch_fd: int = -1   # pre-opened /proc/pid/mem
         self._vdso_patch_writes: list[tuple[int, bytes]] = []  # (offset, stub)
+        self._virtual_btime: int = 0  # virtual boot time for /proc/stat
         if policy.time_start is not None:
             import time as _time
             from ._time import TimeOffset
             self._time_offset = TimeOffset(policy.time_start)
             self._mono_offset_s = -int(_time.monotonic())
+            self._virtual_btime = int(policy.time_start)
         self._thread: Optional[threading.Thread] = None
         self._stop_r, self._stop_w = os.pipe()
         # Resource state (memory, process count, fork-hold)
@@ -1121,6 +1123,30 @@ class NotifSupervisor:
             finally:
                 os.close(r)
             return
+
+        # --- Virtualize /proc/stat btime for time virtualization ---
+        if self._time_offset is not None and path == "/proc/stat":
+            virtual_btime = self._virtual_btime
+            try:
+                with open("/proc/stat", "rb") as f:
+                    lines = f.readlines()
+                out = []
+                for line in lines:
+                    if line.startswith(b"btime "):
+                        out.append(f"btime {virtual_btime}\n".encode())
+                    else:
+                        out.append(line)
+                content = b"".join(out)
+                r, w = os.pipe()
+                os.write(w, content)
+                os.close(w)
+                try:
+                    self._respond_addfd(notif.id, r)
+                finally:
+                    os.close(r)
+                return
+            except OSError:
+                pass
 
         # --- COW: redirect opens under workdir to upper dir ---
         if self._cow_handler is not None and self._cow_handler.matches(path):
