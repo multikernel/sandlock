@@ -634,7 +634,8 @@ class NotifSupervisor:
             if nr in TIME_NRS:
                 handle_time(notif, nr, self._time_offset,
                             self._id_valid, self._respond_val,
-                            self._respond_continue)
+                            self._respond_continue,
+                            mono_offset_s=self._mono_offset_s)
                 return
 
         # --- Resource: memory + process limits ---

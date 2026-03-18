@@ -17,18 +17,27 @@ from ._procfs import write_bytes
 NR_CLOCK_GETTIME = _SYSCALL_NR.get("clock_gettime")
 NR_GETTIMEOFDAY = _SYSCALL_NR.get("gettimeofday")
 NR_TIME = _SYSCALL_NR.get("time")
+NR_CLOCK_NANOSLEEP = _SYSCALL_NR.get("clock_nanosleep")
 
 # Clocks that should be shifted (wall time only).
-# Monotonic clocks are NOT shifted — they measure elapsed time since boot
-# and are used for relative timing (sleep, timeouts).  Shifting them by a
-# large negative offset can make them negative, which breaks
-# clock_nanosleep(TIMER_ABSTIME) on short-uptime machines (CI VMs).
 _SHIFTED_CLOCKS = {
     0,   # CLOCK_REALTIME
     5,   # CLOCK_REALTIME_COARSE
 }
 
-TIME_NRS = {NR_CLOCK_GETTIME, NR_GETTIMEOFDAY, NR_TIME} - {None}
+# Clocks whose monotonic offset is applied in the vDSO stub.
+# clock_nanosleep with TIMER_ABSTIME needs the deadline un-shifted.
+_MONO_SHIFTED_CLOCKS = {
+    1,   # CLOCK_MONOTONIC
+    4,   # CLOCK_MONOTONIC_RAW
+    6,   # CLOCK_MONOTONIC_COARSE
+    7,   # CLOCK_BOOTTIME
+}
+
+TIMER_ABSTIME = 1
+
+TIME_NRS = {NR_CLOCK_GETTIME, NR_GETTIMEOFDAY, NR_TIME,
+            NR_CLOCK_NANOSLEEP} - {None}
 
 
 class TimeOffset:
@@ -45,8 +54,9 @@ class TimeOffset:
 
 
 def handle_time(notif, nr: int, offset: TimeOffset,
-                id_valid, respond_val, respond_continue) -> None:
-    """Handle clock_gettime/gettimeofday — shift time by fixed offset."""
+                id_valid, respond_val, respond_continue,
+                mono_offset_s: int = 0) -> None:
+    """Handle clock_gettime/gettimeofday/time/clock_nanosleep."""
     if nr == NR_CLOCK_GETTIME:
         clockid = notif.data.args[0] & 0xFFFFFFFF
         tp_addr = notif.data.args[1]
@@ -118,6 +128,31 @@ def handle_time(notif, nr: int, offset: TimeOffset,
                 return
 
         respond_val(notif.id, fake)
+
+    elif nr == NR_CLOCK_NANOSLEEP:
+        # clock_nanosleep(clockid, flags, request, remain)
+        # When TIMER_ABSTIME is set and clockid is a vDSO-shifted
+        # monotonic clock, the process computed the deadline using
+        # the shifted clock.  Un-shift it before the kernel sees it.
+        clockid = notif.data.args[0] & 0xFFFFFFFF
+        flags = notif.data.args[1]
+        req_addr = notif.data.args[2]
+
+        if not (flags & TIMER_ABSTIME) or clockid not in _MONO_SHIFTED_CLOCKS:
+            respond_continue(notif.id)
+            return
+
+        # Read the shifted deadline, un-shift, write back
+        from ._procfs import read_bytes as _read_bytes
+        try:
+            data = _read_bytes(notif.pid, req_addr, 16)
+            sec, nsec = struct.unpack("<qQ", data)
+            sec -= mono_offset_s
+            write_bytes(notif.pid, req_addr, struct.pack("<qQ", sec, nsec))
+        except OSError:
+            pass
+
+        respond_continue(notif.id)
 
     else:
         respond_continue(notif.id)

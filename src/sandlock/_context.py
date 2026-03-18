@@ -132,7 +132,8 @@ def _notif_syscall_names(notif: "NotifPolicy") -> list[str]:
     if notif is not None and notif.random_seed is not None:
         names.append("getrandom")
     if notif is not None and notif.time_start is not None:
-        names.extend(["clock_gettime", "gettimeofday", "time"])
+        names.extend(["clock_gettime", "gettimeofday", "time",
+                       "clock_nanosleep"])
     # Deduplicate (clone/open may already be in the list)
     return list(dict.fromkeys(names))
 
