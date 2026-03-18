@@ -111,14 +111,18 @@ def _build_stubs(mono_offset_s: int = 0) -> dict[bytes, bytes] | None:
     if arch == "x86_64":
         cgt = _clock_gettime_stub_x86_64(mono_offset_s)
         gtod = b"\xb8\x60\x00\x00\x00\x0f\x05\xc3"  # nr=96 simple stub
+        tm = b"\xb8\xc9\x00\x00\x00\x0f\x05\xc3"     # nr=201 simple stub
         return {
             b"clock_gettime": cgt,
             b"__vdso_clock_gettime": cgt,
             b"gettimeofday": gtod,
             b"__vdso_gettimeofday": gtod,
+            b"time": tm,
+            b"__vdso_time": tm,
         }
     elif arch == "aarch64":
         cgt = _clock_gettime_stub_aarch64(mono_offset_s)
+        # aarch64 has no time() in vDSO
         return {
             b"clock_gettime": cgt,
             b"__kernel_clock_gettime": cgt,
@@ -206,6 +210,7 @@ def _parse_vdso_symbols(data: bytes) -> list[tuple[bytes, int]]:
         b"__kernel_clock_gettime",
         b"gettimeofday", b"__vdso_gettimeofday",
         b"__kernel_gettimeofday",
+        b"time", b"__vdso_time",
     }
 
     results = []

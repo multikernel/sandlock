@@ -16,6 +16,7 @@ from ._procfs import write_bytes
 
 NR_CLOCK_GETTIME = _SYSCALL_NR.get("clock_gettime")
 NR_GETTIMEOFDAY = _SYSCALL_NR.get("gettimeofday")
+NR_TIME = _SYSCALL_NR.get("time")
 
 # Clocks that should be shifted (wall time only).
 # Monotonic clocks are NOT shifted — they measure elapsed time since boot
@@ -27,7 +28,7 @@ _SHIFTED_CLOCKS = {
     5,   # CLOCK_REALTIME_COARSE
 }
 
-TIME_NRS = {NR_CLOCK_GETTIME, NR_GETTIMEOFDAY} - {None}
+TIME_NRS = {NR_CLOCK_GETTIME, NR_GETTIMEOFDAY, NR_TIME} - {None}
 
 
 class TimeOffset:
@@ -100,6 +101,23 @@ def handle_time(notif, nr: int, offset: TimeOffset,
             respond_val(notif.id, 0)
         except OSError:
             respond_continue(notif.id)
+
+    elif nr == NR_TIME:
+        tloc_addr = notif.data.args[0]
+        now = time.time()
+        fake = int(now + offset._offset_s)
+
+        if not id_valid(notif.id):
+            return
+
+        if tloc_addr != 0:
+            try:
+                write_bytes(notif.pid, tloc_addr, struct.pack("<q", fake))
+            except OSError:
+                respond_continue(notif.id)
+                return
+
+        respond_val(notif.id, fake)
 
     else:
         respond_continue(notif.id)

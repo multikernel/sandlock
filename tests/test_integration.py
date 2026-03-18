@@ -1412,6 +1412,28 @@ class TestDeterministicTime:
         mono = float(result.stdout.strip())
         assert mono < 5.0, f"Monotonic too high: {mono}"
 
+    def test_time_syscall_shifted_call(self):
+        """time() syscall is shifted (used by uptime, w, etc.)."""
+        def check_time():
+            import ctypes, ctypes.util
+            libc = ctypes.CDLL(ctypes.util.find_library("c"))
+            libc.time.restype = ctypes.c_long
+            return libc.time(0)
+
+        policy = Policy(time_start="2000-01-01T00:00:00Z")
+        result = Sandbox(policy).call(check_time)
+        assert result.success, f"Failed: {result.error}"
+        # 946684800 = 2000-01-01T00:00:00Z, allow a few seconds
+        assert 946684800 <= result.value < 946684900, f"time() not shifted: {result.value}"
+
+    def test_time_syscall_shifted_run(self):
+        """time() syscall is shifted in Sandbox.run."""
+        policy = Policy(time_start="2000-01-01T00:00:00Z")
+        result = Sandbox(policy).run(["date", "+%s"])
+        assert result.success, f"Failed: {result.stderr}"
+        t = int(result.stdout.strip())
+        assert 946684800 <= t < 946684900, f"time() not shifted: {t}"
+
     def test_proc_uptime_virtualized(self):
         """With time_start, /proc/uptime shows near-zero uptime."""
         policy = Policy(
