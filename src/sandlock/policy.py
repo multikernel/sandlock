@@ -167,6 +167,12 @@ class Policy:
     """Seed for deterministic randomness. When set, getrandom() returns
     deterministic bytes from a seeded PRNG. Same seed = same output."""
 
+    time_start: float | str | None = None
+    """Start timestamp for time virtualization. When set, clock_gettime()
+    and gettimeofday() return shifted time starting from this epoch.
+    Accepts a Unix timestamp (float) or ISO 8601 string.
+    Time ticks at real speed from the given start point."""
+
     # Optional chroot
     chroot: str | None = None
     """Path to chroot into before applying other confinement."""
@@ -239,6 +245,21 @@ class Policy:
         if isinstance(self.max_memory, int):
             return self.max_memory
         return parse_memory_size(self.max_memory)
+
+    def time_start_timestamp(self) -> float | None:
+        """Return time_start as a Unix timestamp float, or None if unset."""
+        if self.time_start is None:
+            return None
+        if isinstance(self.time_start, (int, float)):
+            return float(self.time_start)
+        from datetime import datetime, timezone
+        s = self.time_start
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
 
     def cpu_pct(self) -> int | None:
         """Return max_cpu as a clamped percentage (1–100), or None."""

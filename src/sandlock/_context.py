@@ -131,6 +131,8 @@ def _notif_syscall_names(notif: "NotifPolicy") -> list[str]:
             names.append("getdents")
     if notif is not None and notif.random_seed is not None:
         names.append("getrandom")
+    if notif is not None and notif.time_start is not None:
+        names.extend(["clock_gettime", "gettimeofday"])
     # Deduplicate (clone/open may already be in the list)
     return list(dict.fromkeys(names))
 
@@ -695,6 +697,12 @@ class SandboxContext:
                     os.environ.update(keep)
                 if self._policy.env:
                     os.environ.update(self._policy.env)
+
+                # 9b. Disable vDSO for time virtualization
+                if (self._notif_policy is not None
+                        and self._notif_policy.time_start is not None):
+                    from ._vdso import disable_vdso_local
+                    disable_vdso_local()
 
                 # 10. Run target
                 self._target()

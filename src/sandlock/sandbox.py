@@ -614,7 +614,9 @@ class Sandbox:
         max_procs = policy.max_processes or 0
         port_remap = policy.port_remap
         random_seed = policy.random_seed
-        if mem_bytes > 0 or max_procs > 0 or port_remap or random_seed is not None:
+        time_start = policy.time_start_timestamp()
+        if (mem_bytes > 0 or max_procs > 0 or port_remap
+                or random_seed is not None or time_start is not None):
             from ._notif_policy import NotifPolicy, default_proc_rules
 
             existing = overrides.get("notif_policy", policy.notif_policy)
@@ -625,6 +627,7 @@ class Sandbox:
                     max_processes=max_procs,
                     port_remap=port_remap,
                     random_seed=random_seed,
+                    time_start=time_start,
                 )
             else:
                 overrides["notif_policy"] = NotifPolicy(
@@ -633,6 +636,7 @@ class Sandbox:
                     max_processes=max_procs,
                     port_remap=port_remap,
                     random_seed=random_seed,
+                    time_start=time_start,
                 )
 
         # --- CowBranch: ensure notif policy with cow_enabled ---

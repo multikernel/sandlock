@@ -421,6 +421,11 @@ class NotifSupervisor:
         if policy.random_seed is not None:
             from ._random import DeterministicRandom
             self._det_random = DeterministicRandom(policy.random_seed)
+        # Deterministic time
+        self._time_offset = None  # TimeOffset | None
+        if policy.time_start is not None:
+            from ._time import TimeOffset
+            self._time_offset = TimeOffset(policy.time_start)
         self._thread: Optional[threading.Thread] = None
         self._stop_r, self._stop_w = os.pipe()
         # Resource state (memory, process count, fork-hold)
@@ -554,6 +559,7 @@ class NotifSupervisor:
             except Exception:
                 pass
 
+
     @property
     def tracked_pids(self) -> set[int]:
         """All PIDs known to belong to this sandbox."""
@@ -566,6 +572,7 @@ class NotifSupervisor:
         self._proc_pids.add(pid)
         nr = notif.data.nr
 
+
         # --- Deterministic randomness ---
         if self._det_random is not None:
             from ._random import NR_GETRANDOM, handle_getrandom
@@ -573,6 +580,15 @@ class NotifSupervisor:
                 handle_getrandom(notif, self._det_random,
                                  self._id_valid, self._respond_val,
                                  self._respond_continue)
+                return
+
+        # --- Deterministic time ---
+        if self._time_offset is not None:
+            from ._time import TIME_NRS, handle_time
+            if nr in TIME_NRS:
+                handle_time(notif, nr, self._time_offset,
+                            self._id_valid, self._respond_val,
+                            self._respond_continue)
                 return
 
         # --- Resource: memory + process limits ---

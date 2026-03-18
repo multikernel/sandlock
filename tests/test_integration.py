@@ -1183,6 +1183,64 @@ print('OK')
             assert int(os.stat(f"{td}/project/file.txt").st_mtime) == 2000000
 
 
+# --- Deterministic time ---
+
+class TestDeterministicTime:
+    def test_time_start_shifts_clock_in_call(self):
+        """Sandbox.call with time_start sees shifted time (vDSO patched)."""
+        def check_year():
+            import time, datetime
+            t = time.time()
+            return datetime.datetime.fromtimestamp(
+                t, tz=datetime.timezone.utc).year
+
+        policy = Policy(time_start="2000-01-01T00:00:00Z")
+        result = Sandbox(policy).call(check_year)
+        assert result.success, f"Failed: {result.error}"
+        assert result.value == 2000
+
+    def test_time_start_accepts_unix_timestamp(self):
+        """time_start accepts a numeric Unix timestamp."""
+        def check_year():
+            import time, datetime
+            t = time.time()
+            return datetime.datetime.fromtimestamp(
+                t, tz=datetime.timezone.utc).year
+
+        # 946684800 = 2000-01-01T00:00:00Z
+        policy = Policy(time_start=946684800)
+        result = Sandbox(policy).call(check_year)
+        assert result.success
+        assert result.value == 2000
+
+    def test_time_start_monotonic_advances(self):
+        """Time advances at real speed from the start point."""
+        def check_elapsed():
+            import time
+            t1 = time.time()
+            time.sleep(0.1)
+            t2 = time.time()
+            return t2 - t1
+
+        policy = Policy(time_start="2000-01-01T00:00:00Z")
+        result = Sandbox(policy).call(check_elapsed)
+        assert result.success
+        # Should have elapsed ~0.1 seconds
+        assert 0.05 < result.value < 0.5
+
+    def test_time_start_none_is_real_time(self):
+        """Without time_start, time is real."""
+        def check_year():
+            import time, datetime
+            t = time.time()
+            return datetime.datetime.fromtimestamp(
+                t, tz=datetime.timezone.utc).year
+
+        result = Sandbox(Policy()).call(check_year)
+        assert result.success
+        assert result.value >= 2026
+
+
 # --- Deterministic randomness ---
 
 class TestDeterministicRandom:

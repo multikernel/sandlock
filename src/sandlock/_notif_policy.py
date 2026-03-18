@@ -91,6 +91,9 @@ class NotifPolicy:
     random_seed: int | None = None
     """If set, getrandom() returns deterministic PRNG output."""
 
+    time_start: float | None = None
+    """If set, clock_gettime/gettimeofday are shifted to start from this epoch."""
+
     def decide(
         self,
         path: str,
