@@ -423,8 +423,8 @@ class NotifSupervisor:
             self._det_random = DeterministicRandom(policy.random_seed)
         # Deterministic time
         self._time_offset = None  # TimeOffset | None
-        self._vdso_patched_pids: set[int] = set()
-        self._vdso_patch_remaining: int = 0
+        self._vdso_patch_fd: int = -1   # pre-opened /proc/pid/mem
+        self._vdso_patch_writes: list[tuple[int, bytes]] = []  # (offset, stub)
         if policy.time_start is not None:
             from ._time import TimeOffset
             self._time_offset = TimeOffset(policy.time_start)
@@ -562,21 +562,46 @@ class NotifSupervisor:
                 pass
 
         # Post-dispatch: patch vDSO for new PIDs (after exec).
-        # /proc/pid/mem writes to vDSO only take effect when the child
-        # is running (not in seccomp-stop).  Each dispatch responds to
-        # a notification, briefly unfreezing the child.  The write in
-        # the NEXT iteration catches the child during that window.
-        # We repeat for several notifications to ensure one sticks.
-        if self._time_offset is not None:
+        # Two-phase approach:
+        #   Phase 1 (this notification): pre-compute — open fd, parse
+        #     vDSO ELF, compute offsets.  This is slow but the child
+        #     will be unfrozen when dispatch responds above.
+        #   Phase 2 (next notification): minimal lseek+write using the
+        #     pre-computed fd and offsets.  Fast enough to land while
+        #     the child is briefly running after the previous response.
+        if self._vdso_patch_writes:
+            # Phase 2: fast write (child briefly running after respond)
+            fd = self._vdso_patch_fd
+            for off, stub in self._vdso_patch_writes:
+                os.lseek(fd, off, os.SEEK_SET)
+                os.write(fd, stub)
+            os.close(fd)
+            self._vdso_patch_fd = -1
+            self._vdso_patch_writes = []
+        elif self._time_offset is not None and self._vdso_patch_fd == -1:
+            # Phase 1: pre-compute (first notification from new PID)
             pid = notif.pid
-            if pid not in self._vdso_patched_pids:
-                self._vdso_patched_pids.add(pid)
-                self._vdso_patch_remaining = 10
-
-        if self._vdso_patch_remaining > 0:
-            from ._vdso import _write_vdso_stubs
-            _write_vdso_stubs(notif.pid)
-            self._vdso_patch_remaining -= 1
+            from ._vdso import _find_vdso, _parse_vdso_symbols, _get_stubs
+            info = _find_vdso(pid)
+            stubs = _get_stubs()
+            if info and stubs:
+                addr, size = info
+                try:
+                    fd = os.open(f"/proc/{pid}/mem", os.O_RDWR)
+                    os.lseek(fd, addr, os.SEEK_SET)
+                    data = os.read(fd, size)
+                    writes = []
+                    for name, off in _parse_vdso_symbols(data):
+                        stub = stubs.get(name)
+                        if stub:
+                            writes.append((addr + off, stub))
+                    if writes:
+                        self._vdso_patch_fd = fd
+                        self._vdso_patch_writes = writes
+                    else:
+                        os.close(fd)
+                except OSError:
+                    pass
 
     @property
     def tracked_pids(self) -> set[int]:
