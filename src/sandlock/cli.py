@@ -26,6 +26,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         cli_kwargs["max_processes"] = args.processes
     if args.cpu:
         cli_kwargs["max_cpu"] = args.cpu
+    if args.max_open_files:
+        cli_kwargs["max_open_files"] = args.max_open_files
     if args.strict:
         from ._seccomp import DEFAULT_ALLOW_SYSCALLS
         cli_kwargs["allow_syscalls"] = DEFAULT_ALLOW_SYSCALLS
@@ -360,6 +362,8 @@ def main() -> None:
     run_p.add_argument("-m", "--memory", help="Memory limit (e.g. 512M)")
     run_p.add_argument("-P", "--processes", type=int, help="Max processes")
     run_p.add_argument("-c", "--cpu", type=int, help="CPU throttle percent (1-100)")
+    run_p.add_argument("--max-open-files", type=int, metavar="N",
+                       help="Max open file descriptors (RLIMIT_NOFILE)")
     run_p.add_argument("-t", "--timeout", type=float, help="Timeout in seconds")
     run_p.add_argument("--strict", action="store_true",
                        help="Allowlist mode: only permit known-safe syscalls")

@@ -965,6 +965,60 @@ for p in pids:
         assert b"FORK_LIMITED" in result.stdout
 
 
+# --- File descriptor limits ---
+
+class TestMaxOpenFiles:
+    def test_max_open_files_enforced(self):
+        """max_open_files prevents opening too many fds."""
+        def open_many():
+            fds = []
+            try:
+                for _ in range(200):
+                    fds.append(os.open("/dev/null", os.O_RDONLY))
+            except OSError:
+                return len(fds)
+            finally:
+                for fd in fds:
+                    os.close(fd)
+            return len(fds)
+
+        policy = Policy(max_open_files=16)
+        result = Sandbox(policy).call(open_many)
+        assert result.success, f"Failed: {result.error}"
+        # Can't open 200 fds with a 16 limit (minus stdin/out/err/internal fds)
+        assert result.value < 16
+
+    def test_max_open_files_run(self):
+        """max_open_files survives exec."""
+        policy = Policy(max_open_files=16)
+        result = Sandbox(policy).run(
+            ["python3", "-c",
+             "import resource;"
+             "print(resource.getrlimit(resource.RLIMIT_NOFILE))"]
+        )
+        assert result.success
+        assert result.stdout.strip() == b"(16, 16)"
+
+    def test_default_no_fd_limit(self):
+        """Without max_open_files, system default applies."""
+        def open_many():
+            fds = []
+            try:
+                for _ in range(200):
+                    fds.append(os.open("/dev/null", os.O_RDONLY))
+            except OSError:
+                return len(fds)
+            finally:
+                for fd in fds:
+                    os.close(fd)
+            return len(fds)
+
+        policy = Policy()
+        result = Sandbox(policy).call(open_many)
+        assert result.success
+        assert result.value == 200
+
+
 # --- Strict mode ---
 
 class TestStrictMode:

@@ -155,6 +155,11 @@ class Policy:
     not concurrent).  Enforced by the seccomp notif supervisor.
     Also enables fork interception needed for checkpoint freeze."""
 
+    max_open_files: int | None = None
+    """Maximum number of open file descriptors.  Enforced via
+    RLIMIT_NOFILE — kernel-enforced, survives exec.  Prevents fd
+    exhaustion attacks.  None = inherit system default."""
+
     max_cpu: int | None = None
     """CPU throttle as a percentage of one core (1–100).  E.g. ``50``
     means the sandbox process group gets at most 50% of one core.

@@ -738,6 +738,12 @@ class SandboxContext:
                     from ._vdso import disable_vdso_local
                     disable_vdso_local()
 
+                # 9c. Limit open file descriptors (after all setup fds are closed)
+                if self._policy.max_open_files is not None:
+                    import resource
+                    n = self._policy.max_open_files
+                    resource.setrlimit(resource.RLIMIT_NOFILE, (n, n))
+
                 # 10. Run target
                 self._target()
                 os._exit(0)
