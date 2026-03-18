@@ -173,6 +173,12 @@ class Policy:
     Accepts a Unix timestamp (float) or ISO 8601 string.
     Time ticks at real speed from the given start point."""
 
+    no_randomize_memory: bool = False
+    """Disable Address Space Layout Randomization (ASLR) inside the sandbox.
+    When set, stack, heap, mmap, and shared library addresses are
+    deterministic across runs.  Useful for reproducible builds and tests.
+    Applied via personality(ADDR_NO_RANDOMIZE) — per-process, no root."""
+
     # Optional chroot
     chroot: str | None = None
     """Path to chroot into before applying other confinement."""

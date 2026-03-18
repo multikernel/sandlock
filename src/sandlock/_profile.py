@@ -48,6 +48,7 @@ _SIMPLE_FIELDS: dict[str, type] = {
     "env": dict,
     # Deterministic
     "random_seed": int,
+    "no_randomize_memory": bool,
     # Misc
     "port_remap": bool,
     "close_fds": bool,

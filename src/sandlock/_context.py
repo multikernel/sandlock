@@ -582,6 +582,11 @@ class SandboxContext:
                     else:
                         os.chdir(self._policy.workdir)
 
+                # 3. Disable ASLR for deterministic memory layout
+                if self._policy.no_randomize_memory:
+                    ADDR_NO_RANDOMIZE = 0x0040000
+                    _libc.personality(ctypes.c_ulong(ADDR_NO_RANDOMIZE))
+
                 # 4. Landlock confinement (filesystem + network, irreversible)
                 writable = list(self._policy.fs_writable)
                 readable = list(self._policy.fs_readable)

@@ -1256,6 +1256,42 @@ class TestDeterministicTime:
         assert result.value >= 2026
 
 
+# --- Deterministic memory layout (ASLR) ---
+
+class TestNoRandomizeMemory:
+    def test_no_randomize_memory_deterministic_addresses(self):
+        """no_randomize_memory produces identical mmap addresses across runs."""
+        policy = Policy(no_randomize_memory=True)
+        cmd = ["python3", "-c",
+               "import ctypes; print(ctypes.addressof(ctypes.c_int()))"]
+        r1 = Sandbox(policy).run(cmd)
+        r2 = Sandbox(policy).run(cmd)
+        assert r1.success and r2.success
+        assert r1.stdout.strip() == r2.stdout.strip()
+
+    def test_no_randomize_memory_call(self):
+        """no_randomize_memory works with Sandbox.call."""
+        def get_addr():
+            import ctypes
+            return ctypes.addressof(ctypes.c_int())
+
+        policy = Policy(no_randomize_memory=True)
+        r1 = Sandbox(policy).call(get_addr)
+        r2 = Sandbox(policy).call(get_addr)
+        assert r1.success and r2.success
+        assert r1.value == r2.value
+
+    def test_default_has_randomized_addresses(self):
+        """Without no_randomize_memory, ASLR is active (addresses vary)."""
+        policy = Policy()
+        cmd = ["python3", "-c",
+               "import ctypes; print(ctypes.addressof(ctypes.c_int()))"]
+        results = [Sandbox(policy).run(cmd) for _ in range(5)]
+        addrs = {r.stdout.strip() for r in results if r.success}
+        # With ASLR, at least some runs should produce different addresses
+        assert len(addrs) > 1, "ASLR seems inactive — all addresses identical"
+
+
 # --- Deterministic randomness ---
 
 class TestDeterministicRandom:

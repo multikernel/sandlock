@@ -72,6 +72,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         cli_kwargs["random_seed"] = args.random_seed
     if args.time_start is not None:
         cli_kwargs["time_start"] = args.time_start
+    if args.no_randomize_memory:
+        cli_kwargs["no_randomize_memory"] = True
     if args.clean_env:
         cli_kwargs["clean_env"] = True
     if args.env:
@@ -387,6 +389,8 @@ def main() -> None:
                        help="Deterministic randomness (getrandom returns seeded PRNG)")
     run_p.add_argument("--time-start", metavar="TIME",
                        help="Time virtualization start (ISO 8601 or Unix timestamp)")
+    run_p.add_argument("--no-randomize-memory", action="store_true",
+                       help="Disable ASLR for deterministic memory layout")
     run_p.add_argument("--clean-env", action="store_true",
                        help="Start with minimal environment (PATH, HOME, USER, TERM, LANG)")
     run_p.add_argument("--env", action="append", metavar="KEY=VALUE",
