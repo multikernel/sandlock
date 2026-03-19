@@ -25,7 +25,7 @@ protects your working directory automatically.
 | Network isolation | Landlock port range + seccomp notif port virtualization | Network namespace | TAP device | Sentry kernel |
 | Syscall filtering | seccomp-bpf | seccomp | N/A (full kernel) | Sentry kernel |
 | Resource limits | seccomp notif + SIGSTOP/SIGCONT | cgroup v2 | VM config | cgroup v2 |
-| Memory sharing | COW (fork), zero-copy | Bind-mount + re-init | Shared mem (explicit) | N/A |
+| Memory sharing | COW fork (`sb.fork()`), zero-copy | Bind-mount + re-init | Shared mem (explicit) | N/A |
 | Nesting | Native (fork) | Complex (DinD/DooD) | Not supported | Supported |
 | COW filesystem | OverlayFS (kernel) / BranchFS | Overlay | Block-level | N/A |
 | Checkpoint/restore | ptrace + BranchFS | CRIU | VM snapshot | N/A |
@@ -138,6 +138,22 @@ with Sandbox(policy) as sb:
 # Nested: child inherits parent's constraints
 with Sandbox(parent_policy) as parent:
     result = parent.sandbox(child_policy).run(["python3", "untrusted.py"])
+```
+
+COW fork — init once, fork many (for AI agents, RL rollouts):
+
+```python
+def init():
+    global model
+    model = load_model()       # expensive, done once
+
+def work():
+    seed = int(os.environ["SEED"])
+    rollout(model, seed)       # reads COW-shared model
+
+with Sandbox(policy, init, work) as sb:
+    for seed in range(1000):
+        sb.fork(env={"SEED": str(seed)}).wait()
 ```
 
 ## Architecture
@@ -316,6 +332,40 @@ with Sandbox(policy) as sb:
 cp = Checkpoint.load("my-env")
 Sandbox.from_checkpoint(cp, restore_fn=lambda state: load_state(state))
 ```
+
+### COW Fork
+
+Initialize expensive state once, then fork COW clones that share memory.
+Each `fork()` is an `os.fork()` — the kernel shares all pages copy-on-write.
+1000 clones of a 50 MB Python process use ~50 MB total, not 50 GB.
+
+```python
+def init():
+    global model, data
+    model = load_model()          # 2 GB, loaded once
+    data = preprocess_dataset()   # stored in globals
+
+def work():
+    seed = int(os.environ["SEED"])
+    result = rollout(model, data, seed)   # reads COW-shared globals
+    save_result(result)
+
+with Sandbox(policy, init, work) as sb:
+    for seed in range(1000):
+        sb.fork(env={"SEED": str(seed)}).wait()
+```
+
+How it works:
+1. `Sandbox(policy, init, work)` forks a child, runs `init()`, then the
+   child's main thread enters a fork-ready loop on the control socket
+2. `sb.fork(env=...)` sends a command — the main thread calls `os.fork()`,
+   the clone applies env overrides and runs `work()`
+3. No signals, no ptrace — the main thread is in a blocking `os.read()`
+   (GIL released), so it forks itself cleanly
+4. Each clone inherits Landlock + seccomp confinement via `fork()`
+
+Designed for AI agent sandboxing and RL rollouts where setup is expensive
+but each run needs different parameters.
 
 ### Privileged Mode
 
