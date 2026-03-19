@@ -407,6 +407,100 @@ def start_child_listener(
     _CheckpointListener(control_fd, save_fn).start()
 
 
+# --- Clone-ready loop (runs on main thread after init_fn returns) ---
+
+TRIGGER_FORK = b"\x03"
+
+
+def clone_ready_loop(control_fd: int, work_fn: "Callable") -> None:
+    """Main-thread loop: wait for fork commands, fork and run work_fn.
+
+    After init_fn returns, the main thread enters this loop.  It blocks
+    on ``os.read()`` (GIL released), so no CPU is wasted.  When the
+    parent sends TRIGGER_FORK, the main thread calls ``os.fork()`` —
+    giving the clone a full COW copy of all memory (including
+    everything init_fn set up in globals/heap).
+
+    Args:
+        control_fd: Child's end of the control socket.
+        work_fn: Function to run in each clone.
+    """
+    import sys
+
+    while True:
+        try:
+            trigger = os.read(control_fd, 1)
+        except OSError:
+            break
+        if not trigger:
+            break
+
+        if trigger == TRIGGER_FORK:
+            try:
+                env_json = _recv_bytes(control_fd)
+            except (EOFError, OSError):
+                break
+
+            env = json.loads(env_json) if env_json else {}
+
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+            except Exception:
+                pass
+
+            try:
+                pid = os.fork()
+            except OSError:
+                os.write(control_fd, struct.pack(">I", 0))
+                continue
+
+            if pid == 0:
+                # === Clone child ===
+                try:
+                    os.close(control_fd)
+                    os.setpgid(0, 0)
+                    os.environ.update(env)
+                    work_fn()
+                except SystemExit as e:
+                    os._exit(e.code if isinstance(e.code, int) else 1)
+                except BaseException:
+                    os._exit(1)
+                os._exit(0)
+            else:
+                # === Template: send clone PID back ===
+                os.write(control_fd, struct.pack(">I", pid))
+
+
+def request_fork(
+    control_fd: int,
+    env: dict[str, str] | None = None,
+) -> int:
+    """Send a fork command to the template's clone-ready loop.
+
+    Args:
+        control_fd: Parent's end of the control socket.
+        env: Environment variable overrides for the clone.
+
+    Returns:
+        PID of the clone child.
+
+    Raises:
+        RuntimeError: If fork failed in the child.
+    """
+    env_json = json.dumps(env or {}).encode()
+    os.write(control_fd, TRIGGER_FORK)
+    _send_bytes(control_fd, env_json)
+
+    raw = os.read(control_fd, 4)
+    if len(raw) < 4:
+        raise RuntimeError("Fork: no response from child")
+    pid = struct.unpack(">I", raw)[0]
+    if pid == 0:
+        raise RuntimeError("Fork: fork() failed in child")
+    return pid
+
+
 # --- Parent side ---
 
 def request_app_state(control_fd: int) -> bytes:

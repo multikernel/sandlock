@@ -197,11 +197,13 @@ class SandboxContext:
         save_fn: Callable[[], bytes] | None = None,
         overlay_branch: "object | None" = None,
         cow_branch: "object | None" = None,
+        clone_loop_fn: "Callable[[int], None] | None" = None,
     ):
         self._target = target
         self._policy = policy
         self._sandbox_id = sandbox_id
         self._save_fn = save_fn
+        self._clone_loop_fn = clone_loop_fn
         self._overlay_branch = overlay_branch or getattr(policy, '_overlay_branch', None)
         self._cow_branch = cow_branch or getattr(policy, '_cow_branch', None)
         self._pid: Optional[int] = None
@@ -650,10 +652,12 @@ class SandboxContext:
                         if self._policy.strict:
                             raise
 
-                # 5. Start checkpoint listener thread (if save_fn provided)
+                # 5. Start checkpoint/clone listener thread (if save_fn provided)
                 #    Must happen BEFORE seccomp — seccomp blocks clone3
                 #    which Python's threading module uses.
-                if self._save_fn is not None:
+                if self._clone_loop_fn is not None:
+                    pass  # Keep ctrl_child_fd open for clone_ready_loop
+                elif self._save_fn is not None:
                     try:
                         start_child_listener(ctrl_child_fd, self._save_fn)
                     except RuntimeError:
@@ -752,8 +756,11 @@ class SandboxContext:
                     n = self._policy.max_open_files
                     resource.setrlimit(resource.RLIMIT_NOFILE, (n, n))
 
-                # 10. Run target
-                self._target()
+                # 10. Run target (or clone-ready loop)
+                if self._clone_loop_fn is not None:
+                    self._clone_loop_fn(ctrl_child_fd)
+                else:
+                    self._target()
                 os._exit(0)
             except SystemExit as e:
                 os._exit(e.code if isinstance(e.code, int) else 1)

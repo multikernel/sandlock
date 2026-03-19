@@ -38,7 +38,7 @@ class Sandbox:
             sb.resume()
     """
 
-    def __new__(cls, policy: "Policy | str", *, host: str | None = None, **kwargs):
+    def __new__(cls, policy: "Policy | str", init_fn=None, work_fn=None, *, host: str | None = None, **kwargs):
         if host is not None:
             try:
                 from .deploy._sandbox import RemoteSandbox
@@ -50,19 +50,31 @@ class Sandbox:
             return RemoteSandbox(policy, host=host, **kwargs)
         return super().__new__(cls)
 
-    def __init__(self, policy: Policy | str, *, host: str | None = None, sandbox_id: str | None = None, **kwargs):
+    def __init__(
+        self,
+        policy: Policy | str,
+        init_fn: Optional[Callable] = None,
+        work_fn: Optional[Callable] = None,
+        *,
+        host: str | None = None,
+        sandbox_id: str | None = None,
+        **kwargs,
+    ):
         if host is not None:
             return  # RemoteSandbox already initialized via __new__
         if isinstance(policy, str):
             from ._profile import load_profile
             policy = load_profile(policy)
         self._policy = policy
+        self._init_fn = init_fn
+        self._work_fn = work_fn
         self._id = sandbox_id or uuid.uuid4().hex[:12]
         self._ctx: SandboxContext | None = None
         self._branch = None  # SandboxBranch | None (lazy import)
         self._parent_branch_path = None  # Path | None (for nested sandboxes)
         self._owns_mount = False  # True if we auto-mounted BranchFS
         self._entered = False
+        self._clone_pid = None  # int | None (PID for COW clones)
 
     @property
     def id(self) -> str:
@@ -75,6 +87,8 @@ class Sandbox:
     @property
     def pid(self) -> int | None:
         """PID of the sandboxed process, or None if not running."""
+        if hasattr(self, '_clone_pid') and self._clone_pid is not None:
+            return self._clone_pid
         if self._ctx is not None:
             try:
                 return self._ctx.pid
@@ -85,6 +99,13 @@ class Sandbox:
     @property
     def alive(self) -> bool:
         """Whether the sandboxed process is still running."""
+        clone_pid = getattr(self, '_clone_pid', None)
+        if clone_pid is not None:
+            try:
+                os.kill(clone_pid, 0)
+                return True
+            except ProcessLookupError:
+                return False
         return self._ctx is not None and self._ctx.alive
 
     @property
@@ -165,6 +186,11 @@ class Sandbox:
     def __enter__(self) -> "Sandbox":
         self._setup_branch()
         self._entered = True
+
+        # If init_fn + work_fn were provided, start the clone-ready loop
+        if self._init_fn is not None and self._work_fn is not None:
+            self._start_clone_loop()
+
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
@@ -225,6 +251,22 @@ class Sandbox:
         Returns:
             Exit code.
         """
+        clone_pid = getattr(self, '_clone_pid', None)
+        if clone_pid is not None:
+            # Clone is not our direct child (it's the template's child),
+            # so we can't use waitpid.  Use pidfd to wait for exit.
+            from ._context import _pidfd_open, _pidfd_poll
+            pidfd = _pidfd_open(clone_pid)
+            try:
+                wait_time = timeout if timeout is not None else 3600.0
+                if not _pidfd_poll(pidfd, wait_time):
+                    raise TimeoutError(
+                        f"Process {clone_pid} did not exit within {timeout}s"
+                    )
+            finally:
+                os.close(pidfd)
+            self._clone_pid = None
+            return 0  # pidfd only tells us it exited, not the code
         if self._ctx is None:
             raise SandboxError("No process running")
         return self._ctx.wait(timeout=timeout)
@@ -233,15 +275,29 @@ class Sandbox:
 
     def pause(self) -> None:
         """Pause the sandbox by sending SIGSTOP to the process group."""
-        if self._ctx is None or not self._ctx.alive:
+        p = self.pid
+        if p is None or not self.alive:
             raise SandboxError("No running process to pause")
-        os.killpg(self._ctx.pid, signal.SIGSTOP)
+        if self._clone_pid is not None:
+            os.kill(p, signal.SIGSTOP)
+        else:
+            os.killpg(p, signal.SIGSTOP)
 
     def resume(self) -> None:
-        """Resume the sandbox by sending SIGCONT to the process group."""
-        if self._ctx is None or not self._ctx.alive:
+        """Resume the sandbox by sending SIGCONT to the process group.
+
+        For COW clones, this is a no-op — clones start running
+        immediately after creation.
+        """
+        if self._clone_pid is not None:
+            return  # Clone is already running
+        p = self.pid
+        if p is None:
             raise SandboxError("No running process to resume")
-        os.killpg(self._ctx.pid, signal.SIGCONT)
+        try:
+            os.killpg(p, signal.SIGCONT)
+        except ProcessLookupError:
+            raise SandboxError("Process no longer exists")
 
     # --- Checkpoint/Restore ---
 
@@ -316,7 +372,7 @@ class Sandbox:
                 os.kill(pid, signal.SIGCONT)
                 try:
                     app_state = request_app_state(control_fd)
-                except (EOFError, RuntimeError):
+                except (EOFError, RuntimeError, OSError):
                     pass
                 os.kill(pid, signal.SIGSTOP)
 
@@ -343,6 +399,60 @@ class Sandbox:
             policy_data=pickle.dumps(self._policy),
             sandbox_id=self._id,
         )
+
+    def _start_clone_loop(self) -> None:
+        """Start the clone-ready loop in the sandbox child."""
+        _init = self._init_fn
+        _work = self._work_fn
+
+        def _clone_loop(ctrl_fd: int) -> None:
+            from ._checkpoint import clone_ready_loop
+            _init()
+            clone_ready_loop(ctrl_fd, _work)
+
+        ctx = SandboxContext(
+            lambda: None, self._effective_policy(), self._id,
+            clone_loop_fn=_clone_loop,
+        )
+        try:
+            ctx.__enter__()
+        except BaseException:
+            ctx.__exit__(None, None, None)
+            raise
+        self._ctx = ctx
+
+    def fork(self, *, env: dict[str, str] | None = None) -> "Sandbox":
+        """Create a COW clone of this sandbox.
+
+        Each clone is an ``os.fork()`` of the template — full COW of
+        the entire address space.  The clone runs ``work_fn()`` with
+        environment overrides applied.
+
+        Args:
+            env: Environment variable overrides for the clone.
+
+        Returns:
+            A Sandbox handle.  The clone is already running.
+            Call ``.wait()`` for its exit code.
+        """
+        if self._ctx is None or not self._ctx.alive:
+            raise SandboxError(
+                "No running template — pass init_fn and work_fn "
+                "to Sandbox()"
+            )
+
+        control_fd = self._ctx.control_fd
+        if control_fd < 0:
+            raise SandboxError("No control socket")
+
+        from ._checkpoint import request_fork
+        clone_pid = request_fork(control_fd, env)
+
+        clone_sb = Sandbox(self._policy, sandbox_id=None)
+        clone_sb._clone_pid = clone_pid
+        clone_sb._entered = True
+
+        return clone_sb
 
     @classmethod
     def from_checkpoint(
