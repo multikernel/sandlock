@@ -57,15 +57,26 @@ class PortMap:
     def real_port(self, virtual: int, family: int = _AF_INET) -> int | None:
         """Get or allocate the real port for a virtual port.
 
-        Allocates a free real port from the kernel on first use.
-        If proxy=True, also starts listening on the virtual port.
+        If the virtual port is free, reserves it and returns it unchanged
+        (no rewrite, no proxy — the sandbox binds the port directly).
+        Only allocates a different real port + proxy when the virtual port
+        is already taken by another sandbox.
         Returns None if allocation fails.
         """
         with self._lock:
             if virtual in self._virtual_to_real:
                 return self._virtual_to_real[virtual]
 
-            # Ask the kernel for a free port
+            # Fast path: try to reserve the virtual port itself.
+            # If successful, the sandbox binds directly — no proxy needed.
+            real = self._try_reserve_port(virtual, family)
+            if real is not None:
+                # virtual == real: _remap_sockaddr sees no change, skips rewrite
+                self._virtual_to_real[virtual] = real
+                self._real_to_virtual[real] = virtual
+                return real
+
+            # Slow path: virtual port taken, allocate a different real port
             real = self._allocate_real_port(family)
             if real is None:
                 return None
@@ -105,6 +116,25 @@ class PortMap:
             self._real_to_virtual.clear()
             self._proxy_sockets.clear()
             self._proxy_threads.clear()
+
+    def _try_reserve_port(self, port: int, family: int) -> int | None:
+        """Check if a port is available by probe-and-close.
+
+        Returns the port if free, None if already in use.
+        No holder socket is kept — the sandbox binds the port directly.
+        There is a tiny race window between the probe and the sandbox's
+        bind(); if another process grabs the port, the sandbox gets
+        EADDRINUSE, which is a normal error applications already handle.
+        """
+        af = socket.AF_INET6 if family == _AF_INET6 else socket.AF_INET
+        s = socket.socket(af, socket.SOCK_STREAM)
+        try:
+            s.bind(("::1" if af == socket.AF_INET6 else "127.0.0.1", port))
+            return port
+        except OSError:
+            return None
+        finally:
+            s.close()
 
     def _allocate_real_port(self, family: int) -> int | None:
         """Bind a socket to port 0 to get a free port from the kernel."""
