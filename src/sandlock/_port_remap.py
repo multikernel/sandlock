@@ -135,57 +135,131 @@ class PortMap:
 
         self._proxy_sockets.append(listener)
 
-        def _proxy_loop():
-            while not self._proxy_stop.is_set():
-                try:
-                    client, _ = listener.accept()
-                except socket.timeout:
-                    continue
-                except OSError:
-                    break
-                # Connect to the sandbox's real port
-                try:
-                    backend = socket.socket(af, socket.SOCK_STREAM)
-                    backend_addr = "::1" if af == socket.AF_INET6 else "127.0.0.1"
-                    backend.connect((backend_addr, real))
-                except OSError:
-                    client.close()
-                    continue
-                # Bidirectional forwarding in threads
-                t1 = threading.Thread(
-                    target=_forward, args=(client, backend, self._proxy_stop),
-                    daemon=True,
-                )
-                t2 = threading.Thread(
-                    target=_forward, args=(backend, client, self._proxy_stop),
-                    daemon=True,
-                )
-                t1.start()
-                t2.start()
-
-            listener.close()
-
-        t = threading.Thread(target=_proxy_loop, daemon=True)
+        t = threading.Thread(
+            target=_proxy_event_loop,
+            args=(listener, real, af, self._proxy_stop),
+            daemon=True,
+        )
         t.start()
         self._proxy_threads.append(t)
 
 
-def _forward(src: socket.socket, dst: socket.socket,
-             stop: threading.Event) -> None:
-    """Forward data from src to dst until EOF or stop."""
+def _proxy_event_loop(listener: socket.socket, real_port: int,
+                      af: int, stop: threading.Event) -> None:
+    """Single-thread event loop: accept connections, splice data.
+
+    Uses poll + splice so one thread handles all connections with
+    zero-copy forwarding.  No per-connection threads needed.
+    """
+    import select
+
+    poller = select.poll()
+    listener_fd = listener.fileno()
+    poller.register(listener_fd, select.POLLIN)
+
+    # Per-fd state: fd → (peer_fd, pipe_r, pipe_w)
+    pipes: dict[int, tuple[int, int, int]] = {}
+    # Track socket objects to prevent GC
+    sockets: dict[int, socket.socket] = {}
+
+    def _add_pair(client: socket.socket, backend: socket.socket) -> None:
+        client.setblocking(False)
+        backend.setblocking(False)
+        client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        backend.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        c_fd = client.fileno()
+        b_fd = backend.fileno()
+        c2b_r, c2b_w = os.pipe()
+        b2c_r, b2c_w = os.pipe()
+        pipes[c_fd] = (b_fd, c2b_r, c2b_w)
+        pipes[b_fd] = (c_fd, b2c_r, b2c_w)
+        sockets[c_fd] = client
+        sockets[b_fd] = backend
+        poller.register(c_fd, select.POLLIN)
+        poller.register(b_fd, select.POLLIN)
+
+    def _remove_fd(fd: int) -> None:
+        if fd not in pipes:
+            return
+        peer_fd, pipe_r, pipe_w = pipes.pop(fd)
+        os.close(pipe_r)
+        os.close(pipe_w)
+        try:
+            poller.unregister(fd)
+        except (KeyError, OSError):
+            pass
+        s = sockets.pop(fd, None)
+        if s:
+            try:
+                s.close()
+            except OSError:
+                pass
+        # Also remove peer
+        if peer_fd in pipes:
+            p_peer, p_r, p_w = pipes.pop(peer_fd)
+            os.close(p_r)
+            os.close(p_w)
+            try:
+                poller.unregister(peer_fd)
+            except (KeyError, OSError):
+                pass
+            ps = sockets.pop(peer_fd, None)
+            if ps:
+                try:
+                    ps.close()
+                except OSError:
+                    pass
+
+    backend_addr = "::1" if af == socket.AF_INET6 else "127.0.0.1"
+    _SPLICE_F_NONBLOCK = 0x02
+
     try:
         while not stop.is_set():
-            data = src.recv(65536)
-            if not data:
+            try:
+                events = poller.poll(500)
+            except OSError:
                 break
-            dst.sendall(data)
-    except OSError:
-        pass
+            for fd, event in events:
+                if fd == listener_fd:
+                    # Accept new connection
+                    try:
+                        client, _ = listener.accept()
+                    except OSError:
+                        continue
+                    try:
+                        backend = socket.socket(af, socket.SOCK_STREAM)
+                        backend.connect((backend_addr, real_port))
+                    except OSError:
+                        client.close()
+                        continue
+                    _add_pair(client, backend)
+                    continue
+
+                if fd not in pipes:
+                    continue
+
+                if event & (select.POLLERR | select.POLLNVAL):
+                    _remove_fd(fd)
+                    continue
+
+                if event & (select.POLLIN | select.POLLHUP):
+                    peer_fd, pipe_r, pipe_w = pipes[fd]
+                    try:
+                        n = os.splice(fd, pipe_w, 65536,
+                                      flags=_SPLICE_F_NONBLOCK)
+                        if n == 0:
+                            _remove_fd(fd)
+                            continue
+                        while n > 0:
+                            n -= os.splice(pipe_r, peer_fd, n)
+                    except BlockingIOError:
+                        pass
+                    except OSError:
+                        _remove_fd(fd)
     finally:
-        try:
-            dst.shutdown(socket.SHUT_WR)
-        except OSError:
-            pass
+        for fd in list(pipes):
+            _remove_fd(fd)
+        listener.close()
 
 
 def get_port_map(proxy: bool = False) -> PortMap:
