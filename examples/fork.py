@@ -48,7 +48,7 @@ def work():
     """Read the buffer. Proves COW — data is from init()'s process."""
     import struct
 
-    seed = int(os.environ.get("SEED", "0"))
+    seed = int(os.environ.get("CLONE_ID", "0"))
     my_pid = os.getpid()
 
     # Read token from first page
@@ -95,10 +95,7 @@ def main():
 
     with Sandbox(policy, init, work) as sb:
         # Fork 3 clones, keep them alive briefly to check smaps
-        clones = []
-        for seed in range(3):
-            clone = sb.fork(env={"SEED": str(seed)})
-            clones.append((seed, clone))
+        clones = list(enumerate(sb.fork(3)))
 
         # Give clones time to run
         time.sleep(1)
