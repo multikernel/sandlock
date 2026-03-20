@@ -284,18 +284,19 @@ class Sandbox:
             os.killpg(p, signal.SIGSTOP)
 
     def resume(self) -> None:
-        """Resume the sandbox by sending SIGCONT to the process group.
+        """Resume the sandbox by sending SIGCONT.
 
-        For COW clones, this is a no-op — clones start running
-        immediately after creation.
+        Uses ``kill`` for COW clones (single process) and ``killpg``
+        for regular sandboxes (entire process group).
         """
-        if self._clone_pid is not None:
-            return  # Clone is already running
         p = self.pid
-        if p is None:
+        if p is None or not self.alive:
             raise SandboxError("No running process to resume")
         try:
-            os.killpg(p, signal.SIGCONT)
+            if self._clone_pid is not None:
+                os.kill(p, signal.SIGCONT)
+            else:
+                os.killpg(p, signal.SIGCONT)
         except ProcessLookupError:
             raise SandboxError("Process no longer exists")
 

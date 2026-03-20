@@ -184,5 +184,74 @@ class TestForkEnvAndCloneId(unittest.TestCase):
             os.unlink(path)
 
 
+class TestClonePauseResume(unittest.TestCase):
+    """Verify that pause()/resume() works on COW clones."""
+
+    def test_pause_resume_clone(self):
+        """A paused clone resumes and completes after SIGCONT."""
+        import sys
+        import tempfile
+        import time
+
+        marker = tempfile.mktemp(prefix="sandlock_test_pause_")
+
+        def init():
+            pass
+
+        def work():
+            # Write marker after a brief moment to prove we ran
+            with open(marker, "w") as f:
+                f.write("done")
+
+        policy = Policy(
+            fs_writable=["/tmp"],
+            fs_readable=[sys.prefix, "/usr", "/lib", "/etc", "/proc", "/dev"],
+        )
+
+        with Sandbox(policy, init, work) as sb:
+            clones = sb.fork(1)
+            clone = clones[0]
+            # Give the clone a moment to start
+            time.sleep(0.1)
+            clone.pause()
+            self.assertTrue(clone.is_paused)
+            # Resume and wait for completion
+            clone.resume()
+            clone.wait(timeout=10)
+
+        self.assertTrue(os.path.exists(marker))
+        self.assertEqual(open(marker).read(), "done")
+        os.unlink(marker)
+
+    def test_resume_without_pause_is_harmless(self):
+        """Calling resume() on a running clone should not error."""
+        import sys
+        import tempfile
+
+        marker = tempfile.mktemp(prefix="sandlock_test_resume_noop_")
+
+        def init():
+            pass
+
+        def work():
+            with open(marker, "w") as f:
+                f.write("ok")
+
+        policy = Policy(
+            fs_writable=["/tmp"],
+            fs_readable=[sys.prefix, "/usr", "/lib", "/etc", "/proc", "/dev"],
+        )
+
+        with Sandbox(policy, init, work) as sb:
+            clones = sb.fork(1)
+            clone = clones[0]
+            # resume a non-paused clone — should be harmless
+            clone.resume()
+            clone.wait(timeout=10)
+
+        self.assertTrue(os.path.exists(marker))
+        os.unlink(marker)
+
+
 if __name__ == "__main__":
     unittest.main()
