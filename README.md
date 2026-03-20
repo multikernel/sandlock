@@ -34,7 +34,7 @@ protects your working directory automatically.
 
 ## Requirements
 
-- **Linux 5.13+** (Landlock ABI v1), **Python 3.10+**
+- **Linux 5.13+** (Landlock ABI v1), **Python 3.8+**
 - No root, no cgroups, no C compiler (all kernel interfaces via ctypes)
 
 | Feature | Minimum kernel |

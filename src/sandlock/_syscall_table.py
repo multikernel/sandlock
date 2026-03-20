@@ -8,6 +8,7 @@ by sandlock's deny list, allow list, or notif filters are included.
 To regenerate from headers:
     grep -oP '#define __NR_(\w+)\s+(\d+)' /usr/include/.../unistd_64.h
 """
+from __future__ import annotations
 
 # fmt: off
 
