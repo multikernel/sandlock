@@ -231,8 +231,8 @@ class TestSandboxCheckpointIntegration(unittest.TestCase):
         with self.assertRaises(SandboxError):
             sb.checkpoint()
 
-    def test_from_checkpoint_restores_policy(self):
-        """from_checkpoint deserializes and applies the checkpointed policy."""
+    def test_restore_restores_policy(self):
+        """restore deserializes and applies the checkpointed policy."""
         import sys
         import tempfile
         from sandlock.sandbox import Sandbox
@@ -255,14 +255,14 @@ class TestSandboxCheckpointIntegration(unittest.TestCase):
             with open(marker, "wb") as f:
                 f.write(state)
 
-        result = Sandbox.from_checkpoint(cp, restore_fn, timeout=10)
+        result = Sandbox.restore(cp, restore_fn, timeout=10)
         self.assertTrue(result.success, f"restore failed: {result.error}")
         self.assertTrue(os.path.exists(marker))
         self.assertEqual(open(marker, "rb").read(), b"test_state")
         os.unlink(marker)
 
-    def test_from_checkpoint_passes_app_state(self):
-        """from_checkpoint passes app_state bytes to restore_fn."""
+    def test_restore_passes_app_state(self):
+        """restore passes app_state bytes to restore_fn."""
         from sandlock.sandbox import Sandbox
         import tempfile
 
@@ -283,14 +283,14 @@ class TestSandboxCheckpointIntegration(unittest.TestCase):
             with open(marker, "wb") as f:
                 f.write(state)
 
-        result = Sandbox.from_checkpoint(cp, restore_fn, timeout=10)
+        result = Sandbox.restore(cp, restore_fn, timeout=10)
         self.assertTrue(result.success, f"restore failed: {result.error}")
         self.assertTrue(os.path.exists(marker))
         self.assertEqual(open(marker, "rb").read(), app_data)
         os.unlink(marker)
 
-    def test_from_checkpoint_without_app_state(self):
-        """from_checkpoint works when app_state is None."""
+    def test_restore_without_app_state(self):
+        """restore works when app_state is None."""
         import sys
         import tempfile
         from sandlock.sandbox import Sandbox
@@ -310,14 +310,14 @@ class TestSandboxCheckpointIntegration(unittest.TestCase):
             with open(marker, "w") as f:
                 f.write(f"state_is_none={state is None}")
 
-        result = Sandbox.from_checkpoint(cp, restore_fn, timeout=10)
+        result = Sandbox.restore(cp, restore_fn, timeout=10)
         self.assertTrue(result.success, f"restore failed: {result.error}")
         self.assertTrue(os.path.exists(marker))
         self.assertEqual(open(marker).read(), "state_is_none=True")
         os.unlink(marker)
 
-    def test_from_checkpoint_restore_failure(self):
-        """from_checkpoint returns failure when restore_fn raises."""
+    def test_restore_restore_failure(self):
+        """restore returns failure when restore_fn raises."""
         from sandlock.sandbox import Sandbox
 
         policy = Policy()
@@ -329,7 +329,7 @@ class TestSandboxCheckpointIntegration(unittest.TestCase):
         def bad_restore(state):
             raise RuntimeError("restore exploded")
 
-        result = Sandbox.from_checkpoint(cp, bad_restore, timeout=10)
+        result = Sandbox.restore(cp, bad_restore, timeout=10)
         self.assertFalse(result.success)
 
 
@@ -550,6 +550,194 @@ class TestNamedCheckpoints(unittest.TestCase):
         self.assertEqual(names, ["real"])
 
 
+class TestRestoreProcessEnv(unittest.TestCase):
+    """Test that Sandbox.restore() restores cwd and fds from ProcessState."""
+
+    def _make_process_state(self, cwd="", fds=None):
+        from sandlock._ptrace import ProcessState, FileDescriptor
+        return ProcessState(
+            pid=1,
+            fds=fds or [],
+            cwd=cwd,
+            exe="",
+        )
+
+    def test_restore_cwd(self):
+        """restore() changes cwd to the checkpointed value."""
+        import sys
+        import tempfile
+        from sandlock.sandbox import Sandbox
+        from sandlock._ptrace import FileDescriptor
+
+        marker = tempfile.mktemp(prefix="sandlock_ckpt_cwd_")
+        ps = self._make_process_state(cwd="/tmp")
+
+        policy = Policy(
+            fs_writable=["/tmp"],
+            fs_readable=["/usr", "/lib", "/etc", "/proc", "/dev", sys.prefix],
+        )
+        cp = Checkpoint(
+            policy_data=pickle.dumps(policy),
+            process_state=ps,
+            app_state=b"",
+        )
+
+        def restore_fn(state):
+            with open(marker, "w") as f:
+                f.write(os.getcwd())
+
+        result = Sandbox.restore(cp, restore_fn, timeout=10)
+        self.assertTrue(result.success, f"restore failed: {result.error}")
+        self.assertEqual(open(marker).read(), "/tmp")
+        os.unlink(marker)
+
+    def test_restore_restorable_fd(self):
+        """restore() reopens a file at the correct fd number and offset."""
+        import sys
+        import tempfile
+        from sandlock.sandbox import Sandbox
+        from sandlock._ptrace import FileDescriptor
+
+        # Create a real file with known content
+        data_file = tempfile.mktemp(prefix="sandlock_ckpt_fd_data_")
+        with open(data_file, "w") as f:
+            f.write("hello world")
+
+        marker = tempfile.mktemp(prefix="sandlock_ckpt_fd_result_")
+
+        ps = self._make_process_state(fds=[
+            FileDescriptor(
+                fd=10, path=data_file, flags=os.O_RDONLY,
+                offset=6, restorable=True,
+            ),
+        ])
+
+        policy = Policy(
+            fs_writable=["/tmp"],
+            fs_readable=["/usr", "/lib", "/etc", "/proc", "/dev",
+                         sys.prefix, "/tmp"],
+        )
+        cp = Checkpoint(
+            policy_data=pickle.dumps(policy),
+            process_state=ps,
+            app_state=b"",
+        )
+
+        def restore_fn(state):
+            # fd 10 should be open, seeked to offset 6 ("world")
+            data = os.read(10, 100)
+            with open(marker, "wb") as f:
+                f.write(data)
+
+        result = Sandbox.restore(cp, restore_fn, timeout=10)
+        self.assertTrue(result.success, f"restore failed: {result.error}")
+        self.assertEqual(open(marker, "rb").read(), b"world")
+        os.unlink(marker)
+        os.unlink(data_file)
+
+    def test_restore_skips_non_restorable_fd(self):
+        """restore() skips pipes/sockets without crashing."""
+        import sys
+        import tempfile
+        from sandlock.sandbox import Sandbox
+        from sandlock._ptrace import FileDescriptor
+
+        marker = tempfile.mktemp(prefix="sandlock_ckpt_fd_skip_")
+
+        # Use a high fd number unlikely to be inherited
+        ps = self._make_process_state(fds=[
+            FileDescriptor(
+                fd=200, path="pipe:[99999]", flags=0,
+                offset=0, restorable=False,
+            ),
+        ])
+
+        policy = Policy(
+            fs_writable=["/tmp"],
+            fs_readable=["/usr", "/lib", "/etc", "/proc", "/dev", sys.prefix],
+        )
+        cp = Checkpoint(
+            policy_data=pickle.dumps(policy),
+            process_state=ps,
+            app_state=b"",
+        )
+
+        def restore_fn(state):
+            # fd 200 should NOT be open — it was non-restorable
+            try:
+                os.fstat(200)
+                is_open = True
+            except OSError:
+                is_open = False
+            with open(marker, "w") as f:
+                f.write(f"fd200_open={is_open}")
+
+        result = Sandbox.restore(cp, restore_fn, timeout=10)
+        self.assertTrue(result.success, f"restore failed: {result.error}")
+        self.assertEqual(open(marker).read(), "fd200_open=False")
+        os.unlink(marker)
+
+    def test_restore_missing_file_continues(self):
+        """restore() warns but doesn't crash when a file doesn't exist."""
+        import sys
+        import tempfile
+        from sandlock.sandbox import Sandbox
+        from sandlock._ptrace import FileDescriptor
+
+        marker = tempfile.mktemp(prefix="sandlock_ckpt_fd_missing_")
+
+        ps = self._make_process_state(fds=[
+            FileDescriptor(
+                fd=7, path="/nonexistent/file/abc123",
+                flags=os.O_RDONLY, offset=0, restorable=True,
+            ),
+        ])
+
+        policy = Policy(
+            fs_writable=["/tmp"],
+            fs_readable=["/usr", "/lib", "/etc", "/proc", "/dev", sys.prefix],
+        )
+        cp = Checkpoint(
+            policy_data=pickle.dumps(policy),
+            process_state=ps,
+            app_state=b"",
+        )
+
+        def restore_fn(state):
+            with open(marker, "w") as f:
+                f.write("ok")
+
+        result = Sandbox.restore(cp, restore_fn, timeout=10)
+        self.assertTrue(result.success, f"restore failed: {result.error}")
+        self.assertEqual(open(marker).read(), "ok")
+        os.unlink(marker)
+
+    def test_restore_without_process_state(self):
+        """restore() with process_state=None behaves like old from_checkpoint."""
+        import sys
+        import tempfile
+        from sandlock.sandbox import Sandbox
+
+        marker = tempfile.mktemp(prefix="sandlock_ckpt_noproc_")
+        policy = Policy(
+            fs_writable=["/tmp"],
+            fs_readable=["/usr", "/lib", "/etc", "/proc", "/dev", sys.prefix],
+        )
+        cp = Checkpoint(
+            policy_data=pickle.dumps(policy),
+            app_state=b"hello",
+        )
+
+        def restore_fn(state):
+            with open(marker, "wb") as f:
+                f.write(state)
+
+        result = Sandbox.restore(cp, restore_fn, timeout=10)
+        self.assertTrue(result.success, f"restore failed: {result.error}")
+        self.assertEqual(open(marker, "rb").read(), b"hello")
+        os.unlink(marker)
+
+
 class TestEndToEndCheckpoint(unittest.TestCase):
     """End-to-end checkpoint: start sandbox, checkpoint, restore, verify."""
 
@@ -610,7 +798,7 @@ class TestEndToEndCheckpoint(unittest.TestCase):
             def restore_fn(state):
                 assert state == b"counter=42"
 
-            result = Sandbox.from_checkpoint(
+            result = Sandbox.restore(
                 loaded, restore_fn, timeout=5,
             )
             self.assertTrue(result.success, f"restore failed: {result.error}")
@@ -643,7 +831,7 @@ class TestEndToEndCheckpoint(unittest.TestCase):
             def restore_fn(state):
                 assert state == b"state:hello", f"got {state!r}"
 
-            result = Sandbox.from_checkpoint(
+            result = Sandbox.restore(
                 loaded, restore_fn, timeout=5,
             )
             self.assertTrue(result.success, f"restore failed: {result.error}")

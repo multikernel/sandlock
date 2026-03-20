@@ -11,6 +11,7 @@ import os
 import signal
 import time
 import uuid
+import warnings
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -18,6 +19,50 @@ from .exceptions import SandboxError, BranchError
 from .policy import BranchAction, FsIsolation, Policy
 from ._context import SandboxContext
 from ._runner import Result, run_command_in_sandbox, run_interactive_in_sandbox
+
+# Flags to strip when reopening files — creation-time flags that would
+# fail or cause side effects on an existing file.
+_FD_STRIP_FLAGS = os.O_CREAT | os.O_EXCL | os.O_TRUNC
+
+
+def _restore_process_env(process_state) -> None:
+    """Restore working directory and file descriptors from ProcessState.
+
+    Called inside the forked child before restore_fn runs.  Skips
+    non-restorable fds (pipes, sockets) and fds 0-2 (stdio).
+    Errors on individual fds are warned, not fatal.
+    """
+    # Restore cwd
+    if process_state.cwd:
+        try:
+            os.chdir(process_state.cwd)
+        except OSError:
+            warnings.warn(
+                f"Could not restore cwd {process_state.cwd!r}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+    # Restore file descriptors (sorted by fd number to minimise dup2 conflicts)
+    for fd in sorted(process_state.fds, key=lambda f: f.fd):
+        if fd.fd <= 2:
+            continue  # Skip stdio
+        if not fd.restorable:
+            continue  # Skip pipes, sockets, anon_inode, etc.
+        try:
+            open_flags = fd.flags & ~_FD_STRIP_FLAGS
+            opened = os.open(fd.path, open_flags)
+            if opened != fd.fd:
+                os.dup2(opened, fd.fd)
+                os.close(opened)
+            if fd.offset > 0 and not (fd.flags & os.O_APPEND):
+                os.lseek(fd.fd, fd.offset, os.SEEK_SET)
+        except OSError:
+            warnings.warn(
+                f"Could not restore fd {fd.fd} ({fd.path!r})",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
 
 class Sandbox:
@@ -472,18 +517,20 @@ class Sandbox:
         return clones
 
     @classmethod
-    def from_checkpoint(
+    def restore(
         cls,
         checkpoint: "Checkpoint",
         restore_fn: Callable[[bytes], None],
         *,
         timeout: float | None = None,
     ) -> Result:
-        """Restore a sandbox from a checkpoint and run restore_fn.
+        """Restore a sandbox from a checkpoint.
 
-        Creates a new sandbox with the checkpointed policy. If BranchFS
-        was used, creates a new branch forked from the checkpoint's
-        snapshot.  Then runs restore_fn(app_state) in the sandbox.
+        Creates a new sandbox with the checkpointed policy.  If the
+        checkpoint contains OS-level process state, file descriptors
+        and the working directory are restored before ``restore_fn``
+        runs.  If BranchFS was used, creates a new branch forked from
+        the checkpoint's snapshot.
 
         Args:
             checkpoint: Checkpoint to restore from.
@@ -512,12 +559,13 @@ class Sandbox:
         else:
             sb = cls(policy)
 
-        # The restore target: run restore_fn with the saved state
-        # Uses internal fork-based execution (not the public run() API)
-        # because restore_fn may be a closure that can't be serialized.
+        # The restore target: restore OS environment then run restore_fn.
         app_state = checkpoint.app_state
+        process_state = checkpoint.process_state
 
         def _restore_target():
+            if process_state is not None:
+                _restore_process_env(process_state)
             restore_fn(app_state)
 
         branch = sb._setup_branch()
@@ -560,6 +608,7 @@ class Sandbox:
             raise
         finally:
             sb._cleanup_mount()
+
 
     # --- Nested sandbox ---
 

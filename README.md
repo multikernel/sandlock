@@ -314,7 +314,7 @@ with Sandbox(policy) as sb:
 
 # Later: restore
 cp = Checkpoint.load("my-env")
-Sandbox.from_checkpoint(cp, restore_fn=lambda state: load_state(state))
+Sandbox.restore(cp, restore_fn=lambda state: load_state(state))
 ```
 
 ### COW Fork
