@@ -33,6 +33,15 @@ from ._seccomp import apply_seccomp_filter
 from ._chroot import setup_chroot
 from .policy import Policy
 
+
+def _waitstatus_to_exitcode(status: int) -> int:
+    """Convert a waitpid status to an exit code."""
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        return -os.WTERMSIG(status)
+    return -1
+
 # Set after seccomp confinement in the child.  Any subsequent
 # SandboxContext in this process is nested and must skip the
 # notif filter (can't install two).
@@ -263,7 +272,7 @@ class SandboxContext:
             # Blocking wait — pidfd not needed
             _, status = os.waitpid(self._pid, 0)
             self._exited = True
-            return os.waitstatus_to_exitcode(status)
+            return _waitstatus_to_exitcode(status)
 
         # Event-driven: pidfd becomes readable when child exits
         if not _pidfd_poll(self._pidfd, timeout):
@@ -274,7 +283,7 @@ class SandboxContext:
         try:
             _, status = os.waitpid(self._pid, os.WNOHANG)
             self._exited = True
-            return os.waitstatus_to_exitcode(status)
+            return _waitstatus_to_exitcode(status)
         except ChildProcessError:
             self._exited = True
             return -1
