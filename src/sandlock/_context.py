@@ -633,6 +633,25 @@ class SandboxContext:
                 writable = list(self._policy.fs_writable)
                 readable = list(self._policy.fs_readable)
                 denied = list(self._policy.fs_denied)
+
+                # GPU device access
+                if self._policy.gpu_devices is not None:
+                    _gpu_rw = [
+                        "/dev/nvidia*", "/dev/nvidiactl",
+                        "/dev/nvidia-uvm", "/dev/nvidia-uvm-tools",
+                        "/dev/dri",
+                    ]
+                    _gpu_ro = [
+                        "/proc/driver/nvidia",
+                        "/sys/bus/pci/devices",
+                        "/sys/module/nvidia",
+                    ]
+                    for p in _gpu_rw:
+                        if p not in writable:
+                            writable.append(p)
+                    for p in _gpu_ro:
+                        if p not in readable:
+                            readable.append(p)
                 bind_ports = self._policy.bind_ports() or None
                 connect_ports = self._policy.connect_ports() or None
                 if (writable or readable or bind_ports or connect_ports
@@ -746,6 +765,14 @@ class SandboxContext:
                     os.environ.update(keep)
                 if self._policy.env:
                     os.environ.update(self._policy.env)
+
+                # 8b. GPU device visibility
+                if self._policy.gpu_devices is not None:
+                    devs = self._policy.gpu_devices
+                    if len(devs) > 0:
+                        vis = ",".join(str(d) for d in devs)
+                        os.environ["CUDA_VISIBLE_DEVICES"] = vis
+                        os.environ["ROCR_VISIBLE_DEVICES"] = vis
 
                 # 9b. Disable vDSO for time virtualization
                 if (self._notif_policy is not None

@@ -195,6 +195,14 @@ class Policy:
     pages, which causes nondeterministic memory layout, RSS measurements,
     and page fault timing.  Applied via prctl(PR_SET_THP_DISABLE)."""
 
+    # GPU access
+    gpu_devices: Sequence[int] | None = None
+    """GPU device indices visible to the sandbox.  When set, Landlock
+    rules are added for GPU device files (/dev/nvidia*, /dev/dri/*) and
+    driver paths (/proc/driver/nvidia, /sys/bus/pci/devices), and
+    ``CUDA_VISIBLE_DEVICES`` / ``ROCR_VISIBLE_DEVICES`` are set.
+    ``None`` = no GPU access.  ``[]`` (empty list) = all GPUs visible."""
+
     # Optional chroot
     chroot: str | None = None
     """Path to chroot into before applying other confinement."""

@@ -482,3 +482,53 @@ class TestCpuThrottle:
         result = Sandbox(Policy(max_cpu=50)).run(["python3", "-c", self._BURN_CODE])
         assert result.success
         assert result.stdout.strip() == b"20000000"
+
+
+class TestGpuDevices:
+    """Test GPU device isolation via CUDA_VISIBLE_DEVICES."""
+
+    _GPU_POLICY_READABLE = _PYTHON_READABLE
+
+    def test_gpu_devices_sets_env(self):
+        """gpu_devices=[0,2] sets CUDA_VISIBLE_DEVICES=0,2."""
+        code = (
+            "import os; "
+            "print(os.environ.get('CUDA_VISIBLE_DEVICES', 'UNSET'))"
+        )
+        policy = Policy(gpu_devices=[0, 2], fs_readable=self._GPU_POLICY_READABLE)
+        result = Sandbox(policy).run(["python3", "-c", code])
+        assert result.success, f"failed: {result.stderr}"
+        assert result.stdout.strip() == b"0,2"
+
+    def test_gpu_devices_sets_rocr(self):
+        """gpu_devices also sets ROCR_VISIBLE_DEVICES for AMD GPUs."""
+        code = (
+            "import os; "
+            "print(os.environ.get('ROCR_VISIBLE_DEVICES', 'UNSET'))"
+        )
+        policy = Policy(gpu_devices=[1], fs_readable=self._GPU_POLICY_READABLE)
+        result = Sandbox(policy).run(["python3", "-c", code])
+        assert result.success, f"failed: {result.stderr}"
+        assert result.stdout.strip() == b"1"
+
+    def test_gpu_devices_empty_no_env(self):
+        """gpu_devices=[] (all GPUs) does not set CUDA_VISIBLE_DEVICES."""
+        code = (
+            "import os; "
+            "print(os.environ.get('CUDA_VISIBLE_DEVICES', 'UNSET'))"
+        )
+        policy = Policy(gpu_devices=[], fs_readable=self._GPU_POLICY_READABLE)
+        result = Sandbox(policy).run(["python3", "-c", code])
+        assert result.success, f"failed: {result.stderr}"
+        assert result.stdout.strip() == b"UNSET"
+
+    def test_no_gpu_no_env(self):
+        """gpu_devices=None (default) does not set CUDA_VISIBLE_DEVICES."""
+        code = (
+            "import os; "
+            "print(os.environ.get('CUDA_VISIBLE_DEVICES', 'UNSET'))"
+        )
+        policy = Policy()
+        result = Sandbox(policy).run(["python3", "-c", code])
+        assert result.success
+        assert result.stdout.strip() == b"UNSET"

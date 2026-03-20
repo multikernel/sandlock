@@ -153,6 +153,20 @@ class TestEnvControl:
         assert p.env == {"FOO": "bar", "BAZ": "qux"}
 
 
+class TestGpuDevices:
+    def test_default_none(self):
+        p = Policy()
+        assert p.gpu_devices is None
+
+    def test_specific_devices(self):
+        p = Policy(gpu_devices=[0, 2])
+        assert p.gpu_devices == [0, 2]
+
+    def test_all_gpus(self):
+        p = Policy(gpu_devices=[])
+        assert p.gpu_devices == []
+
+
 class TestIpcScoping:
     def test_defaults_to_off(self):
         p = Policy()
