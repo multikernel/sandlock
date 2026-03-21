@@ -296,6 +296,98 @@ class TestSandboxBranchIntegration(unittest.TestCase):
         )
 
 
+class TestCowHandlerPathTraversal(unittest.TestCase):
+    """Verify that COW handler rejects path traversal attacks."""
+
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.mkdtemp(prefix="sandlock_cow_test_")
+        self._workdir = Path(self._tmpdir) / "workdir"
+        self._workdir.mkdir()
+        # Create a file in the workdir
+        (self._workdir / "hello.txt").write_text("hello")
+
+        from sandlock.cowfs._branch import CowBranch
+        from sandlock.cowfs._handler import CowHandler
+        self._branch = CowBranch(self._workdir)
+        self._branch.create()
+        self._handler = CowHandler(self._branch)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_open_traversal_rejected(self):
+        result = self._handler.handle_open(
+            str(self._workdir) + "/../../../etc/passwd", 0)
+        self.assertIsNone(result)
+
+    def test_stat_traversal_rejected(self):
+        result = self._handler.handle_stat(
+            str(self._workdir) + "/../../../etc/passwd")
+        self.assertIsNone(result)
+
+    def test_unlink_traversal_rejected(self):
+        result = self._handler.handle_unlink(
+            str(self._workdir) + "/../../../etc/passwd")
+        self.assertFalse(result)
+
+    def test_mkdir_traversal_rejected(self):
+        result = self._handler.handle_mkdir(
+            str(self._workdir) + "/../../../tmp/evil", 0o755)
+        self.assertFalse(result)
+
+    def test_rename_traversal_rejected(self):
+        result = self._handler.handle_rename(
+            str(self._workdir) + "/hello.txt",
+            str(self._workdir) + "/../../../tmp/stolen")
+        self.assertFalse(result)
+
+    def test_symlink_absolute_target_rejected(self):
+        result = self._handler.handle_symlink(
+            "/etc/shadow",
+            str(self._workdir) + "/evil_link")
+        self.assertFalse(result)
+
+    def test_symlink_traversal_target_rejected(self):
+        result = self._handler.handle_symlink(
+            "../../../etc/shadow",
+            str(self._workdir) + "/evil_link")
+        self.assertFalse(result)
+
+    def test_symlink_safe_target_allowed(self):
+        result = self._handler.handle_symlink(
+            "hello.txt",
+            str(self._workdir) + "/good_link")
+        self.assertTrue(result)
+
+    def test_link_traversal_rejected(self):
+        result = self._handler.handle_link(
+            str(self._workdir) + "/../../../etc/passwd",
+            str(self._workdir) + "/stolen")
+        self.assertFalse(result)
+
+    def test_chmod_traversal_rejected(self):
+        result = self._handler.handle_chmod(
+            str(self._workdir) + "/../../../etc/passwd", 0o777)
+        self.assertFalse(result)
+
+    def test_readlink_traversal_rejected(self):
+        result = self._handler.handle_readlink(
+            str(self._workdir) + "/../../../etc/passwd")
+        self.assertIsNone(result)
+
+    def test_truncate_traversal_rejected(self):
+        result = self._handler.handle_truncate(
+            str(self._workdir) + "/../../../etc/passwd", 0)
+        self.assertFalse(result)
+
+    def test_legitimate_path_works(self):
+        result = self._handler.handle_open(
+            str(self._workdir) + "/hello.txt", 0)
+        self.assertIsNotNone(result)
+
+
 class TestExports(unittest.TestCase):
     def test_enums_importable(self):
         from sandlock import FsIsolation, BranchAction

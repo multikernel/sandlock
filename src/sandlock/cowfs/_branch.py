@@ -106,8 +106,13 @@ class CowBranch(CowBranchBase):
 
         upper_file.parent.mkdir(parents=True, exist_ok=True)
 
-        if lower_file.exists():
-            shutil.copy2(str(lower_file), str(upper_file))
+        if lower_file.exists() and not lower_file.is_symlink():
+            shutil.copy2(str(lower_file), str(upper_file),
+                         follow_symlinks=False)
+        elif lower_file.is_symlink():
+            # Copy symlink itself, not its target
+            link_target = os.readlink(str(lower_file))
+            os.symlink(link_target, str(upper_file))
 
         return upper_file
 

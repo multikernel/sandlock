@@ -44,6 +44,16 @@ class CowHandler:
         """Check if a path is under the COW workdir."""
         return path.startswith(self._workdir_str + "/") or path == self._workdir_str
 
+    def _safe_rel(self, path: str) -> str | None:
+        """Compute relative path and reject traversal escapes.
+
+        Returns the relative path, or None if it escapes the workdir.
+        """
+        rel = os.path.relpath(path, self._workdir_str)
+        if rel == ".." or rel.startswith("../"):
+            return None
+        return rel
+
     def handle_open(self, path: str, flags: int) -> str | None:
         """Determine the real path to open for a COW-intercepted openat.
 
@@ -52,7 +62,9 @@ class CowHandler:
         if flags & O_DIRECTORY:
             return None
 
-        rel_path = os.path.relpath(path, self._workdir_str)
+        rel_path = self._safe_rel(path)
+        if rel_path is None:
+            return None
 
         # Deleted file — new create or ENOENT
         if self._branch.is_deleted(rel_path):
@@ -78,7 +90,9 @@ class CowHandler:
 
         Returns True if handled, False to let kernel handle.
         """
-        rel_path = os.path.relpath(path, self._workdir_str)
+        rel_path = self._safe_rel(path)
+        if rel_path is None:
+            return False
         upper_file = self._branch.upper_dir / rel_path
         lower_file = Path(self._workdir_str) / rel_path
 
@@ -102,7 +116,9 @@ class CowHandler:
 
     def handle_mkdir(self, path: str, mode: int) -> bool:
         """Handle mkdirat: create directory in upper."""
-        rel_path = os.path.relpath(path, self._workdir_str)
+        rel_path = self._safe_rel(path)
+        if rel_path is None:
+            return False
         self._branch._deleted.discard(rel_path)
         upper_dir = self._branch.upper_dir / rel_path
         upper_dir.mkdir(parents=True, exist_ok=True)
@@ -113,7 +129,9 @@ class CowHandler:
 
         Returns the real path to stat, or None if deleted/nonexistent.
         """
-        rel_path = os.path.relpath(path, self._workdir_str)
+        rel_path = self._safe_rel(path)
+        if rel_path is None:
+            return None
 
         if self._branch.is_deleted(rel_path):
             return None
@@ -125,8 +143,10 @@ class CowHandler:
 
     def handle_rename(self, old_path: str, new_path: str) -> bool:
         """Handle rename: rename in upper dir."""
-        old_rel = os.path.relpath(old_path, self._workdir_str)
-        new_rel = os.path.relpath(new_path, self._workdir_str)
+        old_rel = self._safe_rel(old_path)
+        new_rel = self._safe_rel(new_path)
+        if old_rel is None or new_rel is None:
+            return False
 
         old_upper = self._branch.ensure_cow_copy(old_rel)
         new_upper = self._branch.upper_dir / new_rel
@@ -162,8 +182,17 @@ class CowHandler:
         return sorted(entries)
 
     def handle_symlink(self, target: str, linkpath: str) -> bool:
-        """Handle symlink: create symlink in upper."""
-        rel_path = os.path.relpath(linkpath, self._workdir_str)
+        """Handle symlink: create symlink in upper.
+
+        Rejects absolute or traversal symlink targets to prevent
+        escaping the COW layer on commit.
+        """
+        rel_path = self._safe_rel(linkpath)
+        if rel_path is None:
+            return False
+        # Reject symlink targets that escape the workdir
+        if os.path.isabs(target) or ".." in target.split("/"):
+            return False
         self._branch._deleted.discard(rel_path)
         upper_link = self._branch.upper_dir / rel_path
         upper_link.parent.mkdir(parents=True, exist_ok=True)
@@ -172,8 +201,10 @@ class CowHandler:
 
     def handle_link(self, oldpath: str, newpath: str) -> bool:
         """Handle link: create hard link in upper."""
-        old_rel = os.path.relpath(oldpath, self._workdir_str)
-        new_rel = os.path.relpath(newpath, self._workdir_str)
+        old_rel = self._safe_rel(oldpath)
+        new_rel = self._safe_rel(newpath)
+        if old_rel is None or new_rel is None:
+            return False
         old_upper = self._branch.ensure_cow_copy(old_rel)
         new_upper = self._branch.upper_dir / new_rel
         new_upper.parent.mkdir(parents=True, exist_ok=True)
@@ -182,14 +213,18 @@ class CowHandler:
 
     def handle_chmod(self, path: str, mode: int) -> bool:
         """Handle chmod: chmod in upper (COW copy if needed)."""
-        rel_path = os.path.relpath(path, self._workdir_str)
+        rel_path = self._safe_rel(path)
+        if rel_path is None:
+            return False
         upper_file = self._branch.ensure_cow_copy(rel_path)
         os.chmod(str(upper_file), mode)
         return True
 
     def handle_readlink(self, path: str) -> str | None:
         """Handle readlink: resolve symlink from upper or lower."""
-        rel_path = os.path.relpath(path, self._workdir_str)
+        rel_path = self._safe_rel(path)
+        if rel_path is None:
+            return None
 
         if self._branch.is_deleted(rel_path):
             return None
@@ -205,7 +240,9 @@ class CowHandler:
 
     def handle_truncate(self, path: str, length: int) -> bool:
         """Handle truncate: truncate in upper (COW copy if needed)."""
-        rel_path = os.path.relpath(path, self._workdir_str)
+        rel_path = self._safe_rel(path)
+        if rel_path is None:
+            return False
         upper_file = self._branch.ensure_cow_copy(rel_path)
         os.truncate(str(upper_file), length)
         return True
@@ -213,7 +250,9 @@ class CowHandler:
     def handle_chown(self, path: str, uid: int, gid: int,
                      follow_symlinks: bool = True) -> bool:
         """Handle chown/fchownat: chown in upper (COW copy if needed)."""
-        rel_path = os.path.relpath(path, self._workdir_str)
+        rel_path = self._safe_rel(path)
+        if rel_path is None:
+            return False
         upper_file = self._branch.ensure_cow_copy(rel_path)
         os.chown(str(upper_file), uid, gid,
                  follow_symlinks=follow_symlinks)
@@ -226,7 +265,9 @@ class CowHandler:
 
         times is (atime, mtime) as floats, or None for current time.
         """
-        rel_path = os.path.relpath(path, self._workdir_str)
+        rel_path = self._safe_rel(path)
+        if rel_path is None:
+            return False
         upper_file = self._branch.ensure_cow_copy(rel_path)
         os.utime(str(upper_file), times=times,
                  follow_symlinks=follow_symlinks)
