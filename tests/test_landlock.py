@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for sandlock._landlock."""
 
+from unittest import mock
+
 import pytest
 
 from sandlock._landlock import (
@@ -13,8 +15,10 @@ from sandlock._landlock import (
     _FULL_ACCESS,
     _READ_ACCESS,
     _WRITE_ACCESS,
+    confine,
     landlock_abi_version,
 )
+from sandlock.exceptions import ConfinementError
 
 
 class TestAccessFlags:
@@ -47,6 +51,30 @@ class TestScopeFlags:
 
     def test_scope_flags_no_overlap(self):
         assert LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET & LANDLOCK_SCOPE_SIGNAL == 0
+
+
+class TestAbiVersionGuards:
+    """confine() must error when features need a newer ABI than available."""
+
+    @mock.patch("sandlock._landlock.landlock_abi_version", return_value=3)
+    def test_bind_ports_requires_abi4(self, _mock_abi):
+        with pytest.raises(ConfinementError, match="ABI >= 4"):
+            confine(readable=["/tmp"], bind_ports=[80])
+
+    @mock.patch("sandlock._landlock.landlock_abi_version", return_value=3)
+    def test_connect_ports_requires_abi4(self, _mock_abi):
+        with pytest.raises(ConfinementError, match="ABI >= 4"):
+            confine(readable=["/tmp"], connect_ports=[443])
+
+    @mock.patch("sandlock._landlock.landlock_abi_version", return_value=5)
+    def test_isolate_ipc_requires_abi6(self, _mock_abi):
+        with pytest.raises(ConfinementError, match="ABI >= 6"):
+            confine(readable=["/tmp"], isolate_ipc=True)
+
+    @mock.patch("sandlock._landlock.landlock_abi_version", return_value=5)
+    def test_isolate_signals_requires_abi6(self, _mock_abi):
+        with pytest.raises(ConfinementError, match="ABI >= 6"):
+            confine(readable=["/tmp"], isolate_signals=True)
 
 
 class TestLandlockAbiVersion:

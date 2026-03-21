@@ -250,7 +250,8 @@ def confine(
 
     Raises:
         LandlockUnavailableError: If Landlock is not supported.
-        ConfinementError: If confinement setup fails.
+        ConfinementError: If confinement setup fails, or if network/IPC
+            features are requested but the kernel's Landlock ABI is too old.
     """
     abi = landlock_abi_version()
     if abi < 1:
@@ -272,7 +273,12 @@ def confine(
 
     # Network handled mask (ABI v4+)
     handled_net = 0
-    if abi >= 4:
+    if bind_ports is not None or connect_ports is not None:
+        if abi < 4:
+            raise ConfinementError(
+                f"Network port restrictions require Landlock ABI >= 4 "
+                f"(Linux >= 6.7), but this kernel only supports ABI v{abi}"
+            )
         if bind_ports is not None:
             handled_net |= LANDLOCK_ACCESS_NET_BIND_TCP
         if connect_ports is not None:
@@ -280,7 +286,12 @@ def confine(
 
     # IPC scoping mask (ABI v6+)
     scoped = 0
-    if abi >= 6:
+    if isolate_ipc or isolate_signals:
+        if abi < 6:
+            raise ConfinementError(
+                f"IPC/signal isolation requires Landlock ABI >= 6 "
+                f"(Linux >= 6.12), but this kernel only supports ABI v{abi}"
+            )
         if isolate_ipc:
             scoped |= LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET
         if isolate_signals:
