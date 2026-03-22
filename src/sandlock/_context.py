@@ -97,15 +97,29 @@ def _pidfd_poll(pidfd: int, timeout_s: float) -> bool:
 def _notif_syscall_names(notif: "NotifPolicy") -> list[str]:
     """Return the list of syscalls to intercept via user notification.
 
-    openat and clone/fork/vfork/clone3 are always intercepted.
-    open is added on x86_64 (not present on aarch64).  connect
-    and sendto are added when allowed_ips is set for network
-    enforcement.
+    clone/fork/vfork/clone3 are always intercepted for namespace flag
+    checks and process counting.  openat/open are only intercepted when
+    features that need path inspection are enabled (COW, random seed,
+    time virtualization, port remap, hosts virtualization, PID isolation).
     """
     from ._seccomp import _SYSCALL_NR
-    names = ["openat"]
-    if "open" in _SYSCALL_NR:
-        names.append("open")
+    names = []
+
+    # openat/open needed when features require path inspection.
+    needs_openat = (
+        notif is not None and (
+            notif.rules                   # path-based virtualization (e.g. /etc/hosts)
+            or notif.isolate_pids         # block /proc/<foreign_pid> access
+            or notif.cow_enabled          # COW filesystem redirects
+            or notif.random_seed is not None  # deterministic /dev/urandom
+            or notif.time_start is not None   # /proc/uptime, /proc/stat virtualization
+            or notif.port_remap           # /proc/net/* filtering
+        )
+    )
+    if needs_openat:
+        names.append("openat")
+        if "open" in _SYSCALL_NR:
+            names.append("open")
     # Intercept clone/clone3/vfork via USER_NOTIF for namespace flag
     # checks and process counting.  Clone namespace flags are also
     # blocked by a BPF arg filter as defense in depth.
@@ -462,15 +476,29 @@ class SandboxContext:
                 pass
             self._control_fd = -1
 
+    # Sensitive /proc and /sys paths blocked via Landlock fs_denied when
+    # /proc is readable.  Only includes paths that Landlock can actually
+    # enforce on procfs (some procfs entries ignore Landlock).
+    _PROC_DENY_PATHS = [
+        "/proc/kcore", "/proc/config.gz",
+        "/proc/sched_debug", "/proc/timer_list",
+        "/sys/kernel", "/sys/firmware", "/sys/fs/cgroup",
+    ]
+
     def __enter__(self) -> "SandboxContext":
         global _confined
-        # Auto-enable /proc PID isolation when /proc is readable
         self._notif_policy = self._policy.notif_policy
-        has_proc = any(
+        self._has_proc = any(
             p == "/proc" or p.rstrip("/") == "/proc"
             for p in self._policy.fs_readable
         )
-        if has_proc:
+        # Auto-enable /proc hardening when /proc is readable:
+        # - PID isolation (hide foreign PIDs via getdents64 + openat)
+        # - Sensitive file blocking (/proc/kallsyms, /proc/modules, etc.)
+        # - Mount info virtualization (/proc/mounts → empty)
+        # The openat handler uses a fast prefix check to skip non-/proc
+        # paths with minimal overhead (single pread on cached fd).
+        if self._has_proc:
             from ._notif_policy import NotifPolicy, default_proc_rules
             import dataclasses
             if self._notif_policy is None:
@@ -478,11 +506,16 @@ class SandboxContext:
                     rules=default_proc_rules(),
                     isolate_pids=True,
                 )
-            elif not self._notif_policy.isolate_pids:
-                self._notif_policy = dataclasses.replace(
-                    self._notif_policy,
-                    isolate_pids=True,
-                )
+            else:
+                updates = {}
+                if not self._notif_policy.isolate_pids:
+                    updates["isolate_pids"] = True
+                if not self._notif_policy.rules:
+                    updates["rules"] = default_proc_rules()
+                if updates:
+                    self._notif_policy = dataclasses.replace(
+                        self._notif_policy, **updates,
+                    )
         use_notif = self._notif_policy is not None
 
         # Pre-import modules used in the child BEFORE fork — the child's
@@ -642,6 +675,12 @@ class SandboxContext:
                 writable = list(self._policy.fs_writable)
                 readable = list(self._policy.fs_readable)
                 denied = list(self._policy.fs_denied)
+
+                # Auto-deny sensitive /proc paths when /proc is readable
+                if self._has_proc:
+                    for p in self._PROC_DENY_PATHS:
+                        if p not in denied:
+                            denied.append(p)
 
                 # GPU device access
                 if self._policy.gpu_devices is not None:

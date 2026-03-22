@@ -37,6 +37,7 @@ _SIMPLE_FIELDS: dict[str, type] = {
     # IPC scoping
     "isolate_ipc": bool,
     "isolate_signals": bool,
+    "isolate_pids": bool,
     # Resources
     "max_memory": str,
     "max_processes": int,

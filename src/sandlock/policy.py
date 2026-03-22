@@ -132,6 +132,12 @@ class Policy:
     isolate_signals: bool = False
     """Block sending signals to processes outside the sandbox."""
 
+    isolate_pids: bool = False
+    """Hide foreign process entries in /proc.  When enabled, directory
+    listings of /proc only show the sandbox's own PIDs, and direct
+    access to /proc/<foreign_pid>/... is denied.  Requires seccomp
+    user notification (adds per-openat overhead)."""
+
     no_coredump: bool = False
     """Disable core dumps and restrict /proc/pid access from other
     processes.  Applied via prctl(PR_SET_DUMPABLE, 0).  Prevents

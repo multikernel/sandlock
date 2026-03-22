@@ -837,15 +837,10 @@ finally:
 class TestProcIsolation:
     @pytest.mark.skip(reason="pid isolation via pgid scan needs investigation")
     def test_proc_auto_isolation_blocks_foreign_pid(self):
-        """-r /proc auto-enables pid isolation; foreign PIDs are hidden."""
-        from sandlock._notif_policy import NotifPolicy, default_proc_rules
-
+        """isolate_pids=True hides foreign PIDs."""
         policy = Policy(
             fs_readable=_PYTHON_READABLE,
-            notif_policy=NotifPolicy(
-                rules=default_proc_rules(),
-                isolate_pids=True,
-            ),
+            isolate_pids=True,
         )
         result = Sandbox(policy).run(
             ["python3", "-c", """
@@ -863,14 +858,9 @@ except (PermissionError, FileNotFoundError, OSError):
 
     def test_getdents_hides_foreign_pids(self):
         """readdir(/proc) should only show sandbox PIDs when isolate_pids=True."""
-        from sandlock._notif_policy import NotifPolicy, default_proc_rules
-
         policy = Policy(
             fs_readable=_PYTHON_READABLE,
-            notif_policy=NotifPolicy(
-                rules=default_proc_rules(),
-                isolate_pids=True,
-            ),
+            isolate_pids=True,
         )
         result = Sandbox(policy).run(
             ["python3", "-c", """
@@ -885,20 +875,30 @@ print('OK')
         )
         assert result.success
 
-    def test_always_isolates_when_proc_readable(self):
-        """PID isolation is always on when /proc is in fs_readable."""
+    def test_proc_sensitive_files_denied_by_default(self):
+        """Sensitive /proc files are denied when /proc is readable."""
         policy = Policy(
             fs_readable=_PYTHON_READABLE,
         )
         result = Sandbox(policy).run(
             ["python3", "-c", """
-import os
-pids = [e for e in os.listdir('/proc') if e.isdigit()]
-assert '1' not in pids, 'PID 1 should be hidden'
-print('OK')
+import os, errno
+sensitive = ["/proc/kcore", "/proc/kallsyms", "/proc/modules",
+             "/proc/keys", "/proc/key-users"]
+for f in sensitive:
+    try:
+        open(f, "rb")
+        print(f"FAIL: {f} was accessible")
+        raise SystemExit(1)
+    except (PermissionError, OSError):
+        pass
+# Normal /proc access should work
+assert os.path.exists("/proc/cpuinfo"), "cpuinfo missing"
+assert os.path.exists("/proc/self/status"), "self/status missing"
+print("OK")
 """]
         )
-        assert result.success
+        assert result.success, f"Failed: {result.stderr}"
 
     def test_proc_mounts_virtualized(self):
         """/proc/mounts is virtualized to empty."""

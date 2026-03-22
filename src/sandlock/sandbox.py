@@ -810,7 +810,6 @@ class Sandbox:
                 )
             else:
                 overrides["notif_policy"] = NotifPolicy(
-                    rules=default_proc_rules(),
                     max_memory_bytes=mem_bytes,
                     max_processes=max_procs,
                     port_remap=port_remap,

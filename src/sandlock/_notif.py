@@ -446,6 +446,20 @@ class NotifSupervisor:
         if policy.port_remap:
             from ._port_remap import get_port_map
             self._port_map = get_port_map(proxy=True)
+        # Fast-path flag: when only /proc hardening needs openat (no COW,
+        # no time/random virtualization, no port remap), skip full path
+        # resolution for non-/proc paths using a cheap prefix read.
+        self._openat_fast_proc = (
+            (policy.isolate_pids or policy.rules)
+            and not policy.cow_enabled
+            and policy.random_seed is None
+            and policy.time_start is None
+            and not policy.port_remap
+            and not policy.allowed_ips
+        )
+        # Cached fd for fast /proc/pid/mem prefix reads
+        self._mem_fd: int = -1
+        self._mem_fd_pid: int = -1
 
     def start(self) -> None:
         """Start the supervisor thread."""
@@ -496,6 +510,13 @@ class NotifSupervisor:
         self._notify_fd = -1
         self._stop_r = -1
         self._stop_w = -1
+        if self._mem_fd >= 0:
+            try:
+                os.close(self._mem_fd)
+            except OSError:
+                pass
+            self._mem_fd = -1
+            self._mem_fd_pid = -1
 
     def _check_disk_quota(self) -> None:
         """Check if overlay upper dir exceeds disk quota."""
@@ -1079,10 +1100,50 @@ class NotifSupervisor:
                 dirfd = ctypes.c_int32(notif.data.args[0] & 0xFFFFFFFF).value
                 pathname_addr = notif.data.args[1]
                 flags = notif.data.args[2]
+                # Fast path: when only /proc hardening needs openat,
+                # read a 6-byte prefix to skip non-/proc paths without
+                # full path resolution.  Uses a cached fd to avoid
+                # open/close overhead per call.
+                if self._openat_fast_proc:
+                    AT_FDCWD = -100
+                    if dirfd == AT_FDCWD or dirfd == AT_FDCWD & 0xFFFFFFFF:
+                        try:
+                            if self._mem_fd_pid != pid:
+                                if self._mem_fd >= 0:
+                                    os.close(self._mem_fd)
+                                self._mem_fd = os.open(
+                                    f"/proc/{pid}/mem", os.O_RDONLY)
+                                self._mem_fd_pid = pid
+                            prefix = os.pread(self._mem_fd, 6, pathname_addr)
+                        except OSError:
+                            self._mem_fd = -1
+                            self._mem_fd_pid = -1
+                            self._respond_continue(notif.id)
+                            return
+                        if prefix != b"/proc/" and prefix[:5] != b"/proc":
+                            self._respond_continue(notif.id)
+                            return
                 path = resolve_openat_path(pid, dirfd, pathname_addr)
             elif nr == nr_open:
                 pathname_addr = notif.data.args[0]
                 flags = notif.data.args[1]
+                if self._openat_fast_proc:
+                    try:
+                        if self._mem_fd_pid != pid:
+                            if self._mem_fd >= 0:
+                                os.close(self._mem_fd)
+                            self._mem_fd = os.open(
+                                f"/proc/{pid}/mem", os.O_RDONLY)
+                            self._mem_fd_pid = pid
+                        prefix = os.pread(self._mem_fd, 6, pathname_addr)
+                    except OSError:
+                        self._mem_fd = -1
+                        self._mem_fd_pid = -1
+                        self._respond_continue(notif.id)
+                        return
+                    if prefix != b"/proc/" and prefix[:5] != b"/proc":
+                        self._respond_continue(notif.id)
+                        return
                 path = resolve_openat_path(pid, -100, pathname_addr)  # AT_FDCWD
             else:
                 self._respond_continue(notif.id)
