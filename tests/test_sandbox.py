@@ -322,7 +322,7 @@ class TestPortRemap:
         result = Sandbox(policy).run(["python3", "-c", code])
 
         assert result.success
-        assert int(result.stdout.strip()) >= 1
+        assert int(result.stdout.strip()) == 1
 
     def test_proc_net_tcp_hides_host_ports(self):
         """/proc/net/tcp hides host ports (e.g. sshd on port 22)."""
@@ -372,7 +372,7 @@ class TestPortRemap:
         result = Sandbox(policy).run(["python3", "-c", code])
 
         assert result.success
-        assert int(result.stdout.strip()) >= 1
+        assert int(result.stdout.strip()) == 1
 
     def test_tcp_sendmsg_2mb_with_port_remap(self):
         """TCP sendmsg() with 2 MB payload works correctly under port remap."""
@@ -442,6 +442,68 @@ class TestPortRemap:
         assert data["sent"] == data["received"]
         assert data["data_ok"] is True
 
+
+    def test_slow_path_host_holds_virtual_port(self):
+        """Slow path: host process holds TCP virtual port, sandbox must remap."""
+        import socket as _socket
+        code = (
+            "import socket; "
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); "
+            "s.bind(('127.0.0.1', 8080)); "
+            "print(s.getsockname()[1]); "
+            "s.close()"
+        )
+        policy = Policy(port_remap=True)
+
+        holder = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        holder.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        holder.bind(("127.0.0.1", 8080))
+        try:
+            result = Sandbox(policy).run(["python3", "-c", code])
+        finally:
+            holder.close()
+
+        assert result.success, f"Sandbox failed: {result.stderr}"
+        assert result.stdout.strip() == b"8080"
+
+    def test_slow_path_two_concurrent_sandboxes(self):
+        """Slow path: two concurrent sandboxes both bind the same virtual TCP port."""
+        import threading
+        code_hold = (
+            "import socket, time; "
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); "
+            "s.bind(('127.0.0.1', 8080)); "
+            "print(s.getsockname()[1], flush=True); "
+            "time.sleep(3); "
+            "s.close()"
+        )
+        code_fast = (
+            "import socket; "
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); "
+            "s.bind(('127.0.0.1', 8080)); "
+            "print(s.getsockname()[1]); "
+            "s.close()"
+        )
+        policy = Policy(port_remap=True)
+        results = [None, None]
+
+        def run(i, code):
+            results[i] = Sandbox(policy).run(["python3", "-c", code])
+
+        t1 = threading.Thread(target=run, args=(0, code_hold))
+        t1.start()
+        import time
+        time.sleep(1)
+        t2 = threading.Thread(target=run, args=(1, code_fast))
+        t2.start()
+        t1.join()
+        t2.join()
+
+        r1, r2 = results
+        assert r1.success, f"Sandbox 1 failed: {r1.stderr}"
+        assert r2.success, f"Sandbox 2 failed: {r2.stderr}"
+        assert r1.stdout.strip() == b"8080"
+        assert r2.stdout.strip() == b"8080"
 
 class TestCpuThrottle:
     """Test SIGSTOP/SIGCONT CPU throttling."""
