@@ -24,8 +24,26 @@ from dataclasses import dataclass, field
 
 _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
 
-# pidfd_getfd(2) syscall number
+# pidfd_open(2) / pidfd_getfd(2) syscall numbers
+_NR_PIDFD_OPEN  = 434  # x86_64 and aarch64 (asm-generic)
 _NR_PIDFD_GETFD = 438  # x86_64 and aarch64 (asm-generic)
+
+
+def _pidfd_open(pid: int) -> int:
+    """Open a pidfd for the given process.
+
+    Raises:
+        OSError: If pidfd_open fails.
+    """
+    fd = _libc.syscall(
+        ctypes.c_long(_NR_PIDFD_OPEN),
+        ctypes.c_int(pid),
+        ctypes.c_uint(0),
+    )
+    if fd < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, f"pidfd_open({pid}): {os.strerror(err)}")
+    return fd
 
 _AF_INET = 2
 _AF_INET6 = 10
@@ -138,17 +156,16 @@ class PortMap:
 
     def _allocate_real_port(self, family: int) -> int | None:
         """Bind a socket to port 0 to get a free port from the kernel."""
+        af = socket.AF_INET6 if family == _AF_INET6 else socket.AF_INET
+        addr = "::1" if af == socket.AF_INET6 else "127.0.0.1"
+        s = socket.socket(af, socket.SOCK_STREAM)
         try:
-            af = socket.AF_INET6 if family == _AF_INET6 else socket.AF_INET
-            s = socket.socket(af, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            addr = "::1" if af == socket.AF_INET6 else "127.0.0.1"
             s.bind((addr, 0))
-            real_port = s.getsockname()[1]
-            self._held_sockets.append(s)
-            return real_port
+            return s.getsockname()[1]
         except OSError:
             return None
+        finally:
+            s.close()
 
     def _start_proxy(self, virtual: int, real: int, family: int) -> None:
         """Start a TCP proxy: listen on virtual port, forward to real port."""
@@ -363,8 +380,9 @@ def fixup_getsockname(pid: int, sockaddr_addr: int, addrlen_addr: int,
     from ._procfs import write_bytes
 
     # Duplicate the child's socket fd via pidfd_getfd syscall
+    from ._context import _pidfd_open
     try:
-        pidfd = os.pidfd_open(pid)
+        pidfd = _pidfd_open(pid)
     except OSError:
         return False
 
@@ -387,8 +405,8 @@ def fixup_getsockname(pid: int, sockaddr_addr: int, addrlen_addr: int,
             family = s.family
         finally:
             s.detach()
+            os.close(local_fd)
     except OSError:
-        os.close(local_fd)
         return False
 
     if family not in (socket.AF_INET, socket.AF_INET6):
