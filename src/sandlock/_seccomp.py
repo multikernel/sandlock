@@ -87,6 +87,13 @@ TIOCSTI = 0x5412
 TIOCLINUX = 0x541C
 _DANGEROUS_IOCTLS = (TIOCSTI, TIOCLINUX)
 
+# Socket type constants for arg-level filtering
+_AF_INET = 2
+_AF_INET6 = 10
+_SOCK_DGRAM = 2
+_SOCK_RAW = 3
+_SOCK_TYPE_MASK = 0xFF  # strips SOCK_NONBLOCK (0x800) and SOCK_CLOEXEC (0x80000)
+
 # Dangerous prctl(2) options — these allow a sandboxed process to
 # weaken its own confinement.
 PR_SET_DUMPABLE = 4          # re-enable /proc/pid/mem writes
@@ -300,7 +307,11 @@ DEFAULT_ALLOW_SYSCALLS = [
 ]
 
 
-def _build_arg_filters() -> bytes:
+def _build_arg_filters(
+    *,
+    no_raw_sockets: bool = True,
+    no_udp: bool = False,
+) -> bytes:
     """Build cBPF instructions for arg-level syscall filtering.
 
     These filters check specific arguments rather than blocking the
@@ -312,6 +323,8 @@ def _build_arg_filters() -> bytes:
     - ioctl(2): Block TIOCSTI and TIOCLINUX (terminal attacks).
     - prctl(2): Block dangerous options (PR_SET_DUMPABLE,
       PR_SET_SECUREBITS, PR_SET_PTRACER).
+    - socket(2): Block NETLINK_SOCK_DIAG. Optionally block SOCK_RAW
+      and/or SOCK_DGRAM on AF_INET/AF_INET6.
     """
     insns = bytearray()
 
@@ -369,10 +382,67 @@ def _build_arg_filters() -> bytes:
     insns += _bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, _NETLINK_SOCK_DIAG, 0, 1)
     insns += _bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ERRNO_EPERM)
 
+    # --- socket: block SOCK_RAW and/or SOCK_DGRAM on AF_INET/AF_INET6 ---
+    blocked_types = []
+    if no_raw_sockets:
+        blocked_types.append(_SOCK_RAW)
+    if no_udp:
+        blocked_types.append(_SOCK_DGRAM)
+
+    if blocked_types:
+        # Shared structure: check socket NR, check domain, then check types.
+        #
+        # Layout (N = len(blocked_types)):
+        #   LOAD NR
+        #   JEQ socket → +0, skip_all
+        #   LOAD arg0 (domain)
+        #   JEQ AF_INET → type_check, +0
+        #   JEQ AF_INET6 → type_check, skip_rest
+        #   LOAD arg1 (type)
+        #   ALU AND 0xFF           (strip SOCK_NONBLOCK|SOCK_CLOEXEC)
+        #   [for each blocked type i:]
+        #     JEQ type → deny (jt=remaining), no match → next or skip_past (jf)
+        #   RET ERRNO(EPERM)       ← deny return
+        #
+        # After all JEQs, non-matching falls through past the RET ERRNO.
+        n = len(blocked_types)
+        # Instructions after domain checks: 2 (load+AND) + N (JEQs) + 1 (RET)
+        after_domain = 2 + n + 1
+        # Total after NR check: 3 (load domain + 2 JEQs) + after_domain
+        skip_all = 3 + after_domain
+
+        insns += _bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR)
+        insns += _bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, _SYSCALL_NR["socket"], 0, skip_all)
+        # Load domain (arg0)
+        insns += _bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARGS0_LO)
+        # AF_INET → skip to type check (jump over AF_INET6 check)
+        insns += _bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, _AF_INET, 1, 0)
+        # AF_INET6 → type check; else skip everything remaining
+        # Skip: 2 (load+AND) + N (JEQs) + 1 (RET) = after_domain
+        insns += _bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, _AF_INET6, 0, after_domain)
+        # Load type (arg1) and mask off SOCK_NONBLOCK|SOCK_CLOEXEC
+        insns += _bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARGS1_LO)
+        insns += _bpf_stmt(BPF_ALU | BPF_AND | BPF_K, _SOCK_TYPE_MASK)
+        # Check each blocked type
+        for i, sock_type in enumerate(blocked_types):
+            remaining = n - i - 1
+            # Match → jump to RET ERRNO (skip 'remaining' JEQs ahead)
+            # No match on last type → skip past RET ERRNO (jf=1)
+            # No match on non-last → check next type (jf=0)
+            jf = 1 if remaining == 0 else 0
+            insns += _bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, sock_type, remaining, jf)
+        # Deny return (reached by any matching JEQ)
+        insns += _bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ERRNO_EPERM)
+
     return bytes(insns)
 
 
-def _build_deny_filter(deny_nrs: list[int]) -> bytes:
+def _build_deny_filter(
+    deny_nrs: list[int],
+    *,
+    no_raw_sockets: bool = True,
+    no_udp: bool = False,
+) -> bytes:
     """Build a cBPF filter that blocks the given syscall numbers.
 
     Filter logic:
@@ -383,7 +453,7 @@ def _build_deny_filter(deny_nrs: list[int]) -> bytes:
     """
     insns = bytearray()
     insns += _build_arch_check()
-    insns += _build_arg_filters()
+    insns += _build_arg_filters(no_raw_sockets=no_raw_sockets, no_udp=no_udp)
     insns += _bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR)
 
     for i, nr in enumerate(deny_nrs):
@@ -398,7 +468,12 @@ def _build_deny_filter(deny_nrs: list[int]) -> bytes:
     return bytes(insns)
 
 
-def _build_allow_filter(allow_nrs: list[int]) -> bytes:
+def _build_allow_filter(
+    allow_nrs: list[int],
+    *,
+    no_raw_sockets: bool = True,
+    no_udp: bool = False,
+) -> bytes:
     """Build a cBPF filter that only allows the given syscall numbers.
 
     Filter logic:
@@ -409,7 +484,7 @@ def _build_allow_filter(allow_nrs: list[int]) -> bytes:
     """
     insns = bytearray()
     insns += _build_arch_check()
-    insns += _build_arg_filters()
+    insns += _build_arg_filters(no_raw_sockets=no_raw_sockets, no_udp=no_udp)
     insns += _bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR)
 
     for i, nr in enumerate(allow_nrs):
@@ -444,6 +519,9 @@ def syscall_number(name: str) -> int | None:
 def apply_seccomp_filter(
     deny_syscalls: list[str] | None = None,
     allow_syscalls: list[str] | None = None,
+    *,
+    no_raw_sockets: bool = True,
+    no_udp: bool = False,
 ) -> None:
     """Install a seccomp-bpf filter.
 
@@ -458,6 +536,8 @@ def apply_seccomp_filter(
     Args:
         deny_syscalls: Syscall names to block (blocklist mode).
         allow_syscalls: Syscall names to allow (allowlist mode).
+        no_raw_sockets: Block SOCK_RAW on AF_INET/AF_INET6 (default True).
+        no_udp: Block SOCK_DGRAM on AF_INET/AF_INET6 (default False).
 
     Raises:
         SeccompError: If filter installation fails.
@@ -466,12 +546,14 @@ def apply_seccomp_filter(
     if deny_syscalls is not None and allow_syscalls is not None:
         raise ValueError("Cannot set both deny_syscalls and allow_syscalls")
 
+    sock_kw = dict(no_raw_sockets=no_raw_sockets, no_udp=no_udp)
+
     if allow_syscalls is not None:
         allow_nrs = [nr for name in allow_syscalls
                      if (nr := _SYSCALL_NR.get(name)) is not None]
         if not allow_nrs:
             return
-        filter_bytes = _build_allow_filter(allow_nrs)
+        filter_bytes = _build_allow_filter(allow_nrs, **sock_kw)
     else:
         if deny_syscalls is None:
             deny_syscalls = DEFAULT_DENY_SYSCALLS
@@ -479,7 +561,7 @@ def apply_seccomp_filter(
                     if (nr := _SYSCALL_NR.get(name)) is not None]
         if not deny_nrs:
             return
-        filter_bytes = _build_deny_filter(deny_nrs)
+        filter_bytes = _build_deny_filter(deny_nrs, **sock_kw)
     n_insns = len(filter_bytes) // 8  # Each instruction is 8 bytes
 
     # Create filter buffer

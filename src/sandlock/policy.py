@@ -152,6 +152,17 @@ class Policy:
     """TCP ports the sandbox may connect to.  Empty = unrestricted.
     Each entry is a port number or a ``"lo-hi"`` range string."""
 
+    # Socket type restrictions (seccomp-enforced)
+    no_raw_sockets: bool = True
+    """Block raw IP sockets (SOCK_RAW on AF_INET/AF_INET6).  Raw sockets
+    allow packet sniffing and ICMP crafting — almost never needed by
+    sandboxed programs.  Enforced via seccomp BPF."""
+
+    no_udp: bool = False
+    """Block UDP sockets (SOCK_DGRAM on AF_INET/AF_INET6).  Only affects
+    IP-family sockets — AF_UNIX datagrams are unaffected.  Useful when
+    only TCP connectivity is desired.  Enforced via seccomp BPF."""
+
     # Resource limits
     max_memory: str | int | None = None
     """Memory limit. String like '512M' or int bytes."""

@@ -38,6 +38,8 @@ _SIMPLE_FIELDS: dict[str, type] = {
     "isolate_ipc": bool,
     "isolate_signals": bool,
     "isolate_pids": bool,
+    "no_raw_sockets": bool,
+    "no_udp": bool,
     # Resources
     "max_memory": str,
     "max_processes": int,

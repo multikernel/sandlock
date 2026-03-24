@@ -137,6 +137,9 @@ class SeccompNotifAddfd(ctypes.Structure):
 def _build_combined_filter(
     notify_nrs: list[int],
     deny_nrs: list[int],
+    *,
+    no_raw_sockets: bool = True,
+    no_udp: bool = False,
 ) -> bytes:
     """Build a single cBPF filter that handles notif + deny + arg checks.
 
@@ -155,8 +158,8 @@ def _build_combined_filter(
     # 1. Arch check
     insns += _build_arch_check()
 
-    # 2. Arg-level filters (clone namespace flags, ioctl TIOCSTI)
-    insns += _build_arg_filters()
+    # 2. Arg-level filters (clone namespace flags, ioctl TIOCSTI, socket types)
+    insns += _build_arg_filters(no_raw_sockets=no_raw_sockets, no_udp=no_udp)
 
     # 3. Load syscall number
     insns += _bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR)
@@ -190,6 +193,9 @@ def install_notif_filter(
     syscall_names: list[str],
     deny_syscalls: list[str] | None = None,
     allow_syscalls: list[str] | None = None,
+    *,
+    no_raw_sockets: bool = True,
+    no_udp: bool = False,
 ) -> int:
     """Install a combined seccomp filter with notif + deny in one program.
 
@@ -202,6 +208,8 @@ def install_notif_filter(
             DEFAULT_DENY_SYSCALLS.
         allow_syscalls: If set, only these syscalls are allowed (allowlist
             mode).  Mutually exclusive with deny_syscalls.
+        no_raw_sockets: Block SOCK_RAW on AF_INET/AF_INET6 (default True).
+        no_udp: Block SOCK_DGRAM on AF_INET/AF_INET6 (default False).
 
     Returns:
         The notification file descriptor.
@@ -239,7 +247,10 @@ def install_notif_filter(
                      if (nr := _SYSCALL_NR.get(name)) is not None
                      and nr not in notify_nr_set]
 
-    filter_bytes = _build_combined_filter(notify_nrs, deny_nrs)
+    filter_bytes = _build_combined_filter(
+        notify_nrs, deny_nrs,
+        no_raw_sockets=no_raw_sockets, no_udp=no_udp,
+    )
     n_insns = len(filter_bytes) // 8
 
     buf = ctypes.create_string_buffer(filter_bytes)

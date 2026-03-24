@@ -33,6 +33,10 @@ def _policy_to_cli_flags(policy: Policy) -> list[str]:
         flags.append("--isolate-ipc")
     if policy.isolate_signals:
         flags.append("--isolate-signals")
+    if not policy.no_raw_sockets:
+        flags += ["--net-allow", "icmp"]
+    if policy.no_udp:
+        flags += ["--net-deny", "udp"]
     if policy.net_bind:
         for port in policy.net_bind:
             flags += ["--net-bind", port]

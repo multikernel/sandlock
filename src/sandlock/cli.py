@@ -68,6 +68,20 @@ def cmd_run(args: argparse.Namespace) -> int:
         cli_kwargs["isolate_ipc"] = True
     if args.isolate_signals:
         cli_kwargs["isolate_signals"] = True
+    if args.net_allow:
+        for proto in args.net_allow:
+            if proto == "icmp":
+                cli_kwargs["no_raw_sockets"] = False
+            else:
+                raise SystemExit(f"sandlock: unknown --net-allow protocol: {proto}")
+    if args.net_deny:
+        for proto in args.net_deny:
+            if proto == "raw":
+                cli_kwargs["no_raw_sockets"] = True
+            elif proto == "udp":
+                cli_kwargs["no_udp"] = True
+            else:
+                raise SystemExit(f"sandlock: unknown --net-deny protocol: {proto}")
     if args.port_remap:
         cli_kwargs["port_remap"] = True
     if args.random_seed is not None:
@@ -391,6 +405,10 @@ def main() -> None:
                        help="Block abstract UNIX sockets outside sandbox (Landlock ABI v6+)")
     run_p.add_argument("--isolate-signals", action="store_true",
                        help="Block signals to processes outside sandbox (Landlock ABI v6+)")
+    run_p.add_argument("--net-allow", action="append", metavar="PROTO",
+                       help="Allow a blocked protocol (icmp)")
+    run_p.add_argument("--net-deny", action="append", metavar="PROTO",
+                       help="Block a protocol (raw, udp)")
     run_p.add_argument("--port-remap", action="store_true",
                        help="Transparent TCP port remapping (no port conflicts between sandboxes)")
     run_p.add_argument("--random-seed", type=int, metavar="SEED",

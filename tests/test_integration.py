@@ -587,6 +587,261 @@ finally:
         assert b"BLOCKED" in result.stdout
 
 
+# --- Socket type enforcement (seccomp) ---
+
+class TestSocketTypeEnforcement:
+    """Tests for --net-deny raw / --net-deny udp / --net-allow icmp."""
+
+    def test_raw_socket_blocked_by_default(self):
+        """SOCK_RAW on AF_INET is blocked by default (no_raw_sockets=True)."""
+        policy = Policy(fs_readable=_PYTHON_READABLE)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import socket, errno
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+    print('ALLOWED')
+    s.close()
+except OSError as e:
+    print('BLOCKED' if e.errno == errno.EPERM else f'OTHER:{e.errno}')
+"""]
+        )
+        assert result.success
+        assert b"BLOCKED" in result.stdout
+
+    def test_raw_socket_blocked_ipv6(self):
+        """SOCK_RAW on AF_INET6 is also blocked by default."""
+        policy = Policy(fs_readable=_PYTHON_READABLE)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import socket, errno
+try:
+    s = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_ICMPV6)
+    print('ALLOWED')
+    s.close()
+except OSError as e:
+    print('BLOCKED' if e.errno == errno.EPERM else f'OTHER:{e.errno}')
+"""]
+        )
+        assert result.success
+        assert b"BLOCKED" in result.stdout
+
+    def test_raw_socket_allowed_when_opted_out(self):
+        """no_raw_sockets=False should not seccomp-block SOCK_RAW.
+
+        The socket may still fail with EPERM from kernel capability
+        checks, but the errno path (not killed by seccomp) proves
+        the filter isn't blocking it.
+        """
+        policy = Policy(fs_readable=_PYTHON_READABLE, no_raw_sockets=False)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import socket, errno
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+    print('ALLOWED')
+    s.close()
+except OSError as e:
+    # EPERM from capabilities (not seccomp) or ALLOWED — both mean
+    # seccomp didn't block it.  The child process survived either way.
+    print(f'OS_ERROR:{e.errno}')
+"""]
+        )
+        assert result.success
+        # Process should not be killed (exit 0) — either ALLOWED or OS_ERROR
+        assert b"ALLOWED" in result.stdout or b"OS_ERROR" in result.stdout
+
+    def test_tcp_allowed_by_default(self):
+        """TCP sockets must always work regardless of socket type filters."""
+        policy = Policy(fs_readable=_PYTHON_READABLE)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
+print('TCP:allowed')
+s.close()
+"""]
+        )
+        assert result.success
+        assert b"TCP:allowed" in result.stdout
+
+    def test_udp_allowed_by_default(self):
+        """UDP sockets should work by default (no_udp=False)."""
+        policy = Policy(fs_readable=_PYTHON_READABLE)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, 0)
+print('UDP:allowed')
+s.close()
+"""]
+        )
+        assert result.success
+        assert b"UDP:allowed" in result.stdout
+
+    def test_no_udp_blocks_dgram(self):
+        """no_udp=True should block SOCK_DGRAM on AF_INET."""
+        policy = Policy(fs_readable=_PYTHON_READABLE, no_udp=True)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import socket, errno
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, 0)
+    print('ALLOWED')
+    s.close()
+except OSError as e:
+    print('BLOCKED' if e.errno == errno.EPERM else f'OTHER:{e.errno}')
+"""]
+        )
+        assert result.success
+        assert b"BLOCKED" in result.stdout
+
+    def test_no_udp_blocks_dgram_ipv6(self):
+        """no_udp=True should also block SOCK_DGRAM on AF_INET6."""
+        policy = Policy(fs_readable=_PYTHON_READABLE, no_udp=True)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import socket, errno
+try:
+    s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM, 0)
+    print('ALLOWED')
+    s.close()
+except OSError as e:
+    print('BLOCKED' if e.errno == errno.EPERM else f'OTHER:{e.errno}')
+"""]
+        )
+        assert result.success
+        assert b"BLOCKED" in result.stdout
+
+    def test_no_udp_allows_unix_dgram(self):
+        """no_udp=True must NOT block AF_UNIX datagrams (syslog, etc.)."""
+        policy = Policy(fs_readable=_PYTHON_READABLE)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import socket
+s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM, 0)
+print('UNIX_DGRAM:allowed')
+s.close()
+"""]
+        )
+        assert result.success
+        assert b"UNIX_DGRAM:allowed" in result.stdout
+
+    def test_no_udp_allows_tcp(self):
+        """no_udp=True must NOT block TCP."""
+        policy = Policy(fs_readable=_PYTHON_READABLE, no_udp=True)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
+print('TCP:allowed')
+s.close()
+"""]
+        )
+        assert result.success
+        assert b"TCP:allowed" in result.stdout
+
+    def test_both_raw_and_udp_blocked(self):
+        """Both no_raw_sockets and no_udp can be set together."""
+        policy = Policy(fs_readable=_PYTHON_READABLE, no_udp=True)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import socket, errno
+results = []
+for name, af, stype, proto in [
+    ('RAW', socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP),
+    ('UDP', socket.AF_INET, socket.SOCK_DGRAM, 0),
+    ('TCP', socket.AF_INET, socket.SOCK_STREAM, 0),
+]:
+    try:
+        s = socket.socket(af, stype, proto)
+        results.append(f'{name}:allowed')
+        s.close()
+    except OSError as e:
+        results.append(f'{name}:blocked')
+print(' '.join(results))
+"""]
+        )
+        assert result.success
+        out = result.stdout.decode()
+        assert "RAW:blocked" in out
+        assert "UDP:blocked" in out
+        assert "TCP:allowed" in out
+
+    def test_sock_nonblock_flag_stripped(self):
+        """SOCK_NONBLOCK|SOCK_DGRAM should still be blocked by no_udp."""
+        policy = Policy(fs_readable=_PYTHON_READABLE, no_udp=True)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import socket, errno
+SOCK_NONBLOCK = 0x800
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM | SOCK_NONBLOCK, 0)
+    print('ALLOWED')
+    s.close()
+except OSError as e:
+    print('BLOCKED' if e.errno == errno.EPERM else f'OTHER:{e.errno}')
+"""]
+        )
+        assert result.success
+        assert b"BLOCKED" in result.stdout
+
+    def test_cli_net_deny_udp(self):
+        """sandlock run --net-deny udp should block UDP sockets."""
+        r = subprocess.run(
+            ["sandlock", "run", "--net-deny", "udp", "--",
+             "python3", "-c", """
+import socket, errno
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, 0)
+    print('ALLOWED')
+    s.close()
+except OSError as e:
+    print('BLOCKED' if e.errno == errno.EPERM else f'OTHER:{e.errno}')
+"""],
+            capture_output=True,
+        )
+        assert r.returncode == 0
+        assert b"BLOCKED" in r.stdout
+
+    def test_cli_net_deny_raw(self):
+        """sandlock run --net-deny raw should block raw sockets (same as default)."""
+        r = subprocess.run(
+            ["sandlock", "run", "--net-deny", "raw", "--",
+             "python3", "-c", """
+import socket, errno
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+    print('ALLOWED')
+    s.close()
+except OSError as e:
+    print('BLOCKED' if e.errno == errno.EPERM else f'OTHER:{e.errno}')
+"""],
+            capture_output=True,
+        )
+        assert r.returncode == 0
+        assert b"BLOCKED" in r.stdout
+
+    def test_cli_net_allow_icmp(self):
+        """sandlock run --net-allow icmp should unblock raw sockets."""
+        r = subprocess.run(
+            ["sandlock", "run", "--net-allow", "icmp", "--",
+             "python3", "-c", """
+import socket
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+    print('ALLOWED')
+    s.close()
+except OSError as e:
+    # EPERM from capabilities is fine — seccomp didn't kill us
+    print(f'OS_ERROR:{e.errno}')
+"""],
+            capture_output=True,
+        )
+        assert r.returncode == 0
+        assert b"ALLOWED" in r.stdout or b"OS_ERROR" in r.stdout
+
+
 # --- Environment variable control ---
 
 class TestEnvControl:

@@ -750,6 +750,9 @@ class SandboxContext:
                     else None
                 )
 
+                _no_raw = self._policy.no_raw_sockets
+                _no_udp = self._policy.no_udp
+
                 if use_notif and child_sock is not None and not _confined:
                     # First-level sandbox: install combined notif + BPF filter
                     try:
@@ -759,6 +762,8 @@ class SandboxContext:
                             _notif_syscall_names(self._notif_policy),
                             deny_syscalls=deny,
                             allow_syscalls=allow,
+                            no_raw_sockets=_no_raw,
+                            no_udp=_no_udp,
                         )
                         send_fd(child_sock, notify_fd)
                         os.close(notify_fd)
@@ -771,7 +776,11 @@ class SandboxContext:
                         child_sock.close()
                     if allow is not None:
                         try:
-                            apply_seccomp_filter(allow_syscalls=allow)
+                            apply_seccomp_filter(
+                                allow_syscalls=allow,
+                                no_raw_sockets=_no_raw,
+                                no_udp=_no_udp,
+                            )
                         except Exception:
                             if self._policy.strict:
                                 raise ConfinementError(
@@ -784,7 +793,11 @@ class SandboxContext:
                     if child_sock is not None:
                         child_sock.close()
                     try:
-                        apply_seccomp_filter(deny, allow)
+                        apply_seccomp_filter(
+                            deny, allow,
+                            no_raw_sockets=_no_raw,
+                            no_udp=_no_udp,
+                        )
                     except Exception:
                         if self._policy.strict:
                             raise ConfinementError(
