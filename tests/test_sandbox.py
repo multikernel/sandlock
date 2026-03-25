@@ -2,6 +2,7 @@
 """Tests for sandlock.sandbox.Sandbox."""
 
 import os
+import socket
 import sys
 from unittest.mock import patch, MagicMock
 
@@ -493,7 +494,14 @@ class TestPortRemap:
         t1 = threading.Thread(target=run, args=(0, code_hold))
         t1.start()
         import time
-        time.sleep(1)
+        for _ in range(50): # wait for sandbox 1 to bind port 8080
+            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                probe.bind(("127.0.0.1", 8080))
+                probe.close()
+                time.sleep(0.1)
+            except OSError:
+                break  # sandbox 1 is ready
         t2 = threading.Thread(target=run, args=(1, code_fast))
         t2.start()
         t1.join()
