@@ -528,6 +528,9 @@ class NotifSupervisor:
                 pass
             self._mem_fd = -1
             self._mem_fd_pid = -1
+        if self._port_map is not None:
+            self._port_map.close()
+            self._port_map = None
 
     def _check_disk_quota(self) -> None:
         """Check if overlay upper dir exceeds disk quota."""

@@ -125,15 +125,15 @@ def _notif_syscall_names(notif: "NotifPolicy") -> list[str]:
     from ._seccomp import _SYSCALL_NR
     names = []
 
-    # openat/open needed when features require path inspection.
+    # openat/open only needed when features require path inspection
     needs_openat = (
         notif is not None and (
             notif.rules                   # path-based virtualization (e.g. /etc/hosts)
-            or notif.isolate_pids         # block /proc/<foreign_pid> access
             or notif.cow_enabled          # COW filesystem redirects
             or notif.random_seed is not None  # deterministic /dev/urandom
             or notif.time_start is not None   # /proc/uptime, /proc/stat virtualization
             or notif.port_remap           # /proc/net/* filtering
+            or notif.isolate_pids         # /proc/<pid> access control
         )
     )
     if needs_openat:
