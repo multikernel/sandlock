@@ -16,10 +16,17 @@ Example::
 
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import fields
 from typing import Any, Mapping, Sequence
 
 from ..policy import Policy
+
+# Resolve the Python interpreter's installation prefix so that sandboxed
+# processes can always exec the current interpreter, even when it lives
+# outside the standard system paths (e.g. /opt on CI, virtualenvs, etc.).
+_PYTHON_PREFIX = os.path.dirname(os.path.dirname(os.path.realpath(sys.executable)))
 
 
 _POLICY_FIELDS = frozenset(f.name for f in fields(Policy))
@@ -58,7 +65,10 @@ def policy_for_tool(
 
     kwargs: dict[str, Any] = {
         "fs_writable": [],
-        "fs_readable": [workspace, "/usr", "/lib", "/etc", "/bin", "/sbin"],
+        "fs_readable": list(dict.fromkeys([
+            workspace, "/usr", "/lib", "/lib64", "/etc", "/bin", "/sbin",
+            _PYTHON_PREFIX,
+        ])),
         "net_connect": [],
         "isolate_pids": True,
         "isolate_ipc": True,

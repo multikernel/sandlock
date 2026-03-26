@@ -12,10 +12,15 @@ from sandlock import Sandbox, Policy, Stage, Pipeline
 
 # --- Helpers ---
 
+_PYTHON_PREFIX = os.path.dirname(os.path.dirname(os.path.realpath(sys.executable)))
+
 def _policy(**overrides):
     """Minimal policy for testing."""
     defaults = {
-        "fs_readable": ["/usr", "/lib", "/lib64", "/etc", "/bin", "/sbin"],
+        "fs_readable": list(dict.fromkeys([
+            "/usr", "/lib", "/lib64", "/etc", "/bin", "/sbin",
+            _PYTHON_PREFIX,
+        ])),
         "clean_env": True,
     }
     defaults.update(overrides)
