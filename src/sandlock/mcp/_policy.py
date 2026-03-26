@@ -36,18 +36,26 @@ def policy_for_tool(
     **Deny by default**: no capabilities = read-only access to system
     paths and the workspace.  Every permission must be granted.
 
+    Environment is always cleared.  Use ``env`` capability to pass
+    specific variables::
+
+        capabilities={"env": {"API_KEY": "..."}}
+
     Args:
         workspace: Filesystem path the sandbox can read.
         capabilities: Grants keyed by Policy field name.  Common keys:
 
             - ``fs_writable: ["/tmp/workspace"]``
-            - ``net_connect: [443]``
             - ``net_allow_hosts: ["api.example.com"]``
+            - ``env: {"KEY": "value"}``
             - ``max_memory: "256M"``
 
     Returns:
         A frozen :class:`Policy` instance.
     """
+    # Fields that users cannot override — always enforced.
+    _ENFORCED = {"clean_env"}
+
     kwargs: dict[str, Any] = {
         "fs_writable": [],
         "fs_readable": [workspace, "/usr", "/lib", "/etc", "/bin", "/sbin"],
@@ -55,11 +63,12 @@ def policy_for_tool(
         "isolate_pids": True,
         "isolate_ipc": True,
         "no_raw_sockets": True,
+        "clean_env": True,
     }
 
     if capabilities:
         for key, value in capabilities.items():
-            if key in _POLICY_FIELDS:
+            if key in _POLICY_FIELDS and key not in _ENFORCED:
                 kwargs[key] = value
 
         # net_allow_hosts implies net_connect: [80, 443] unless explicit

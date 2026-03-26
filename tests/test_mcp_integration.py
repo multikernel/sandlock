@@ -133,7 +133,6 @@ class TestMcpSandboxLocalTools:
 
     def test_read_only_by_default(self, tmp_path):
         workspace = str(tmp_path)
-        os.environ["SANDLOCK_WORKSPACE"] = workspace
 
         mcp = McpSandbox(workspace=workspace)
         mcp.add_tool("run_python", _run_python_tool)
@@ -141,12 +140,40 @@ class TestMcpSandboxLocalTools:
         result = self._run(mcp.call_tool("run_python", {"code": "print(42)"}))
         assert "42" in result
 
-    def test_write_requires_capability(self, tmp_path):
+    def test_clean_env_by_default(self, tmp_path):
+        """Tools get clean env — can't see agent's env vars."""
         workspace = str(tmp_path)
-        os.environ["SANDLOCK_WORKSPACE"] = workspace
+        os.environ["SECRET_API_KEY"] = "should-not-leak"
 
         mcp = McpSandbox(workspace=workspace)
-        mcp.add_tool("write_file", _write_file_tool)  # no capabilities
+        mcp.add_tool("run_python", _run_python_tool)
+
+        result = self._run(mcp.call_tool("run_python", {
+            "code": "import os; print(os.environ.get('SECRET_API_KEY', 'HIDDEN'))",
+        }))
+        assert "HIDDEN" in result
+        assert "should-not-leak" not in result
+
+    def test_env_capability_passes_vars(self, tmp_path):
+        """Only explicitly granted env vars are visible."""
+        workspace = str(tmp_path)
+        ws_env = {"SANDLOCK_WORKSPACE": workspace}
+
+        mcp = McpSandbox(workspace=workspace)
+        mcp.add_tool("read_file", _read_file_tool,
+                      capabilities={"env": ws_env})
+
+        (tmp_path / "test.txt").write_text("hello")
+        result = self._run(mcp.call_tool("read_file", {"path": "test.txt"}))
+        assert "hello" in result
+
+    def test_write_requires_capability(self, tmp_path):
+        workspace = str(tmp_path)
+        ws_env = {"SANDLOCK_WORKSPACE": workspace}
+
+        mcp = McpSandbox(workspace=workspace)
+        mcp.add_tool("write_file", _write_file_tool,
+                      capabilities={"env": ws_env})  # env but no fs_writable
 
         with pytest.raises(RuntimeError, match="failed"):
             self._run(mcp.call_tool(
@@ -155,12 +182,13 @@ class TestMcpSandboxLocalTools:
 
     def test_write_with_capability(self, tmp_path):
         workspace = str(tmp_path)
-        os.environ["SANDLOCK_WORKSPACE"] = workspace
+        ws_env = {"SANDLOCK_WORKSPACE": workspace}
 
         mcp = McpSandbox(workspace=workspace)
         mcp.add_tool("write_file", _write_file_tool,
-                      capabilities={"fs_writable": [workspace]})
-        mcp.add_tool("read_file", _read_file_tool)
+                      capabilities={"fs_writable": [workspace], "env": ws_env})
+        mcp.add_tool("read_file", _read_file_tool,
+                      capabilities={"env": ws_env})
 
         self._run(mcp.call_tool(
             "write_file", {"path": "test.txt", "content": "hello"},
@@ -176,6 +204,7 @@ class TestMcpSandboxLocalTools:
                       capabilities={"fs_writable": [workspace]})
 
         assert mcp.get_policy("reader").fs_writable == []
+        assert mcp.get_policy("reader").clean_env is True
         assert workspace in mcp.get_policy("writer").fs_writable
 
     def test_unknown_tool_raises(self, tmp_path):
@@ -194,14 +223,16 @@ class TestMcpSandboxLocalTools:
 
     def test_full_workflow(self, tmp_path):
         workspace = str(tmp_path)
-        os.environ["SANDLOCK_WORKSPACE"] = workspace
+        ws_env = {"SANDLOCK_WORKSPACE": workspace}
 
         mcp = McpSandbox(workspace=workspace)
         mcp.add_tool("write_file", _write_file_tool,
-                      capabilities={"fs_writable": [workspace]})
-        mcp.add_tool("read_file", _read_file_tool)
+                      capabilities={"fs_writable": [workspace], "env": ws_env})
+        mcp.add_tool("read_file", _read_file_tool,
+                      capabilities={"env": ws_env})
         mcp.add_tool("run_python", _run_python_tool)
-        mcp.add_tool("list_files", _list_files_tool)
+        mcp.add_tool("list_files", _list_files_tool,
+                      capabilities={"env": ws_env})
 
         async def workflow():
             await mcp.call_tool("write_file",

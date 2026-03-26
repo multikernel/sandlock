@@ -106,19 +106,17 @@ def web_fetch(url: str) -> str:
 async def run_agent(user_prompt: str, workspace: str):
     """Run the agent loop: OpenAI reasoning + sandboxed local tool execution."""
 
-    # Set workspace as env var so tool functions can find it inside the sandbox
-    os.environ["SANDLOCK_WORKSPACE"] = workspace
-
     # -- Set up McpSandbox with local tools --
     mcp = McpSandbox(workspace=workspace)
 
-    # Deny by default — each tool explicitly declares what it needs.
-    # No capabilities = read-only system paths + workspace, no network.
+    # Deny by default: clean env, no writes, no network.
+    # Each tool gets only the env vars and permissions it needs.
+    ws_env = {"SANDLOCK_WORKSPACE": workspace}
 
     mcp.add_tool(
         "read_file", read_file,
         description="Read a file from the workspace. Path is relative to workspace root.",
-        # No capabilities needed — default read-only is sufficient
+        capabilities={"env": ws_env},
         input_schema={
             "type": "object",
             "properties": {"path": {"type": "string", "description": "Relative file path"}},
@@ -128,7 +126,7 @@ async def run_agent(user_prompt: str, workspace: str):
     mcp.add_tool(
         "write_file", write_file,
         description="Write content to a file in the workspace. Creates parent directories.",
-        capabilities={"fs_writable": [workspace]},  # only grant: write to workspace
+        capabilities={"fs_writable": [workspace], "env": ws_env},
         input_schema={
             "type": "object",
             "properties": {
@@ -141,7 +139,7 @@ async def run_agent(user_prompt: str, workspace: str):
     mcp.add_tool(
         "run_python", run_python,
         description="Run Python code and return stdout. No filesystem or network access.",
-        capabilities={"max_memory": "128M"},  # only grant: memory limit
+        capabilities={"max_memory": "128M"},
         input_schema={
             "type": "object",
             "properties": {"code": {"type": "string", "description": "Python code to execute"}},
@@ -151,7 +149,7 @@ async def run_agent(user_prompt: str, workspace: str):
     mcp.add_tool(
         "list_files", list_files,
         description="List files in the workspace directory.",
-        # No capabilities needed — default read-only is sufficient
+        capabilities={"env": ws_env},
         input_schema={"type": "object", "properties": {}},
     )
     mcp.add_tool(
