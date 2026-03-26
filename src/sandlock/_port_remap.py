@@ -24,26 +24,8 @@ from dataclasses import dataclass, field
 
 _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
 
-# pidfd_open(2) / pidfd_getfd(2) syscall numbers
-_NR_PIDFD_OPEN  = 434  # x86_64 and aarch64 (asm-generic)
+# pidfd_getfd(2) syscall number
 _NR_PIDFD_GETFD = 438  # x86_64 and aarch64 (asm-generic)
-
-
-def _pidfd_open(pid: int) -> int:
-    """Open a pidfd for the given process.
-
-    Raises:
-        OSError: If pidfd_open fails.
-    """
-    fd = _libc.syscall(
-        ctypes.c_long(_NR_PIDFD_OPEN),
-        ctypes.c_int(pid),
-        ctypes.c_uint(0),
-    )
-    if fd < 0:
-        err = ctypes.get_errno()
-        raise OSError(err, f"pidfd_open({pid}): {os.strerror(err)}")
-    return fd
 
 _AF_INET = 2
 _AF_INET6 = 10
