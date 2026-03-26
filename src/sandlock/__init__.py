@@ -8,7 +8,7 @@ without root or namespaces.
 from ._version import __version__
 from .policy import Policy, FsIsolation, BranchAction, parse_ports
 from .sandbox import Sandbox
-from ._runner import Result
+from ._runner import Result, Stage, Pipeline
 from ._checkpoint import Checkpoint
 from ._notif_policy import NotifPolicy, NotifAction, PathRule
 from ._profile import load_profile, list_profiles
@@ -32,6 +32,8 @@ __all__ = [
     "__version__",
     # Core API
     "Sandbox",
+    "Stage",
+    "Pipeline",
     "Policy",
     "FsIsolation",
     "BranchAction",

@@ -18,7 +18,7 @@ from typing import Any, Callable, Optional
 from .exceptions import SandboxError, BranchError
 from .policy import BranchAction, FsIsolation, Policy
 from ._context import SandboxContext
-from ._runner import Result, run_command_in_sandbox, run_interactive_in_sandbox
+from ._runner import Result, Stage, Pipeline, run_command_in_sandbox, run_interactive_in_sandbox
 
 # Flags to strip when reopening files — creation-time flags that would
 # fail or cause side effects on an existing file.
@@ -169,6 +169,25 @@ class Sandbox:
         return False
 
     # --- One-shot API ---
+
+    def cmd(self, args: list[str]) -> Stage:
+        """Bind a command to this sandbox, returning a lazy stage.
+
+        The stage is not executed until ``.run()`` is called.
+        Stages can be chained into a pipeline with ``|``::
+
+            result = (
+                Sandbox(policy_a).cmd(["producer"])
+                | Sandbox(policy_b).cmd(["consumer"])
+            ).run()
+
+        Args:
+            args: Command and arguments to execute.
+
+        Returns:
+            A :class:`Stage` that can be run or piped.
+        """
+        return Stage(self, args)
 
     def run(self, cmd: list[str], *, timeout: float | None = None) -> Result:
         """Run a command in a sandbox and return the result.
