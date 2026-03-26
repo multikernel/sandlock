@@ -92,6 +92,13 @@ def list_files() -> str:
     return "\n".join(lines) if lines else "(empty)"
 
 
+def web_fetch(url: str) -> str:
+    """Fetch a URL and return the response body (first 4KB)."""
+    from urllib.request import urlopen
+    resp = urlopen(url, timeout=10)
+    return resp.read(4096).decode("utf-8", errors="replace")
+
+
 # ---------------------------------------------------------------------------
 # Agent loop
 # ---------------------------------------------------------------------------
@@ -147,6 +154,19 @@ async def run_agent(user_prompt: str, workspace: str):
         # No capabilities needed — default read-only is sufficient
         input_schema={"type": "object", "properties": {}},
     )
+    mcp.add_tool(
+        "web_fetch", web_fetch,
+        description="Fetch a URL and return the response body. Only httpbin.org is allowed.",
+        capabilities={
+            "net_connect": [443],
+            "net_allow_hosts": ["httpbin.org"],  # DNS restricted to this host
+        },
+        input_schema={
+            "type": "object",
+            "properties": {"url": {"type": "string", "description": "URL to fetch"}},
+            "required": ["url"],
+        },
+    )
 
     # -- Show per-tool policies --
     print(f"Workspace: {workspace}")
@@ -155,7 +175,8 @@ async def run_agent(user_prompt: str, workspace: str):
         p = mcp.get_policy(name)
         rw = "read-only" if not p.fs_writable else "read-write"
         net = f"ports {list(p.net_connect)}" if p.net_connect else "none"
-        print(f"  {name:15s}  fs={rw:10s}  net={net}")
+        hosts = f"  hosts={list(p.net_allow_hosts)}" if p.net_allow_hosts else ""
+        print(f"  {name:15s}  fs={rw:10s}  net={net}{hosts}")
     print()
 
     # -- OpenAI agent loop --
