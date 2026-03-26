@@ -15,9 +15,14 @@ Deny by default.  Each tool declares capabilities explicitly.
 
 from ._policy import policy_for_tool, capabilities_from_mcp_tool
 from ._sandbox import McpSandbox
+try:
+    from .server import create_server
+except ImportError:
+    pass  # mcp not installed
 
 __all__ = [
     "McpSandbox",
+    "create_server",
     "policy_for_tool",
     "capabilities_from_mcp_tool",
 ]

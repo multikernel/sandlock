@@ -27,6 +27,7 @@ Homepage = "https://github.com/multikernel/sandlock"
 
 [project.scripts]
 sandlock = "sandlock.cli:main"
+sandlock-mcp = "sandlock.mcp.server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
