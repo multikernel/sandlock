@@ -186,9 +186,10 @@ class TestXOA:
 
             # Executor: can read workspace, no network
             executor_policy = _policy(
-                fs_readable=[
+                fs_readable=list(dict.fromkeys([
                     workspace, "/usr", "/lib", "/lib64", "/etc", "/bin", "/sbin",
-                ],
+                    _PYTHON_PREFIX,
+                ])),
                 net_connect=[],
             )
 
