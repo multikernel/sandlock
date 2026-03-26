@@ -4,17 +4,33 @@
 Provides shell, Python, and file tools — each running in a per-call
 Landlock + seccomp sandbox.  No Docker required.
 
-Usage::
+Local (stdio) usage::
 
-    python -m sandlock.mcp.server --workspace /tmp/sandbox
+    sandlock-mcp --workspace /tmp/sandbox
 
-Configure in Claude Desktop / Cursor::
+Remote (SSE) usage::
+
+    sandlock-mcp --transport sse --host 0.0.0.0 --port 8080 --workspace /tmp/sandbox
+
+Configure in Claude Desktop / Cursor:
+
+Local::
 
     {
       "mcpServers": {
         "sandlock": {
-          "command": "python",
-          "args": ["-m", "sandlock.mcp.server", "--workspace", "/tmp/sandbox"]
+          "command": "sandlock-mcp",
+          "args": ["--workspace", "/tmp/sandbox"]
+        }
+      }
+    }
+
+Remote::
+
+    {
+      "mcpServers": {
+        "sandlock": {
+          "url": "http://remote-host:8080/sse"
         }
       }
     }
@@ -290,6 +306,41 @@ async def _run_stdio(server: Server) -> None:
         )
 
 
+def _run_sse(server: Server, host: str, port: int) -> None:
+    """Run the server over SSE transport (HTTP)."""
+    try:
+        from starlette.applications import Starlette
+        from starlette.routing import Mount, Route
+        import uvicorn
+    except ImportError:
+        raise SystemExit(
+            "SSE transport requires extra dependencies.\n"
+            "Install them with:  pip install 'sandlock[mcp-remote]'"
+        )
+
+    from mcp.server.sse import SseServerTransport
+
+    sse = SseServerTransport("/messages/")
+
+    async def handle_sse(request):
+        async with sse.connect_sse(
+            request.scope, request.receive, request._send,
+        ) as (read_stream, write_stream):
+            await server.run(
+                read_stream, write_stream,
+                server.create_initialization_options(),
+            )
+
+    app = Starlette(
+        routes=[
+            Route("/sse", endpoint=handle_sse),
+            Mount("/messages/", app=sse.handle_post_message),
+        ],
+    )
+
+    uvicorn.run(app, host=host, port=port)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Sandlock MCP server — sandboxed tool execution",
@@ -301,20 +352,35 @@ def main() -> None:
     )
     parser.add_argument(
         "--transport",
-        choices=["stdio"],
+        choices=["stdio", "sse"],
         default="stdio",
         help="MCP transport (default: stdio)",
     )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host to bind to for SSE transport (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8080,
+        help="Port to bind to for SSE transport (default: 8080)",
+    )
     args = parser.parse_args()
 
-    if args.workspace:
-        workspace = os.path.abspath(args.workspace)
+    def run_with_workspace(workspace: str) -> None:
         server, _ = create_server(workspace)
-        asyncio.run(_run_stdio(server))
+        if args.transport == "sse":
+            _run_sse(server, args.host, args.port)
+        else:
+            asyncio.run(_run_stdio(server))
+
+    if args.workspace:
+        run_with_workspace(os.path.abspath(args.workspace))
     else:
         with tempfile.TemporaryDirectory(prefix="sandlock-mcp-") as workspace:
-            server, _ = create_server(workspace)
-            asyncio.run(_run_stdio(server))
+            run_with_workspace(workspace)
 
 
 if __name__ == "__main__":
