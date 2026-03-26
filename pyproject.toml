@@ -20,6 +20,7 @@ classifiers = [
 
 [project.optional-dependencies]
 deploy = ["paramiko>=3.0"]
+mcp = ["mcp>=1.0"]
 
 [project.urls]
 Homepage = "https://github.com/multikernel/sandlock"
