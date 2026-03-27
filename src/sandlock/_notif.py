@@ -422,6 +422,8 @@ class NotifSupervisor:
         self._event_queue = None  # SimpleQueue | None — set externally
         self._pid_policies: dict[int, "NotifPolicy"] = {}  # per-PID overrides
         self._policy_fn_done = False  # set when policy_fn returns
+        # /proc/cpuinfo virtualization
+        self._num_cpus = policy.num_cpus
         # Deterministic randomness
         self._det_random = None  # DeterministicRandom | None
         if policy.random_seed is not None:
@@ -832,6 +834,16 @@ class NotifSupervisor:
                                     self._proc_dir_cache, self._id_valid,
                                     self._respond_val, self._respond_continue,
                                     _build_dirent64)
+                return
+
+        if nr in (nr_getdents64, nr_getdents) and self._num_cpus > 0:
+            child_fd_num = notif.data.args[0] & 0xFFFFFFFF
+            try:
+                target = os.readlink(f"/proc/{pid}/fd/{child_fd_num}")
+            except OSError:
+                target = ""
+            if target == "/sys/devices/system/cpu":
+                self._handle_getdents_cpu(notif)
                 return
 
         if nr in (nr_getdents64, nr_getdents) and self._policy.isolate_pids:
@@ -1267,8 +1279,10 @@ class NotifSupervisor:
                             self._respond_continue(notif.id)
                             return
                         if prefix != b"/proc/" and prefix[:5] != b"/proc":
-                            self._respond_continue(notif.id)
-                            return
+                            if not (self._num_cpus > 0
+                                    and prefix[:5] == b"/sys/"):
+                                self._respond_continue(notif.id)
+                                return
                 path = resolve_openat_path(pid, dirfd, pathname_addr)
             elif nr == nr_open:
                 pathname_addr = notif.data.args[0]
@@ -1288,8 +1302,10 @@ class NotifSupervisor:
                         self._respond_continue(notif.id)
                         return
                     if prefix != b"/proc/" and prefix[:5] != b"/proc":
-                        self._respond_continue(notif.id)
-                        return
+                        if not (self._num_cpus > 0
+                                and prefix[:5] == b"/sys/"):
+                            self._respond_continue(notif.id)
+                            return
                 path = resolve_openat_path(pid, -100, pathname_addr)  # AT_FDCWD
             else:
                 self._respond_continue(notif.id)
@@ -1351,6 +1367,30 @@ class NotifSupervisor:
                 return
             except OSError:
                 pass
+
+        # --- Virtualize /proc/cpuinfo (LXCFS-style) ---
+        if self._num_cpus > 0 and path == "/proc/cpuinfo":
+            content = self._build_virtual_cpuinfo()
+            if content is not None:
+                self._respond_virtualize(notif.id, content)
+                return
+
+        # --- Virtualize /sys/devices/system/cpu/{online,possible,present} ---
+        if self._num_cpus > 0 and path in (
+            "/sys/devices/system/cpu/online",
+            "/sys/devices/system/cpu/possible",
+            "/sys/devices/system/cpu/present",
+        ):
+            cpu_range = f"0-{self._num_cpus - 1}" if self._num_cpus > 1 else "0"
+            self._respond_virtualize(notif.id, (cpu_range + "\n").encode())
+            return
+
+        # --- Virtualize /proc/meminfo (LXCFS-style) ---
+        if self._policy.max_memory_bytes > 0 and path == "/proc/meminfo":
+            content = self._build_virtual_meminfo()
+            if content is not None:
+                self._respond_virtualize(notif.id, content)
+                return
 
         # --- COW: redirect opens under workdir to upper dir ---
         if self._cow_handler is not None and self._cow_handler.matches(path):
@@ -1520,6 +1560,124 @@ class NotifSupervisor:
         except OSError:
             return b""
 
+    def _build_virtual_cpuinfo(self) -> bytes | None:
+        """Build synthetic /proc/cpuinfo with at most num_cpus entries.
+
+        Reads real /proc/cpuinfo, keeps the first num_cpus processor
+        blocks, renumbers them 0..N-1.  All other fields (model name,
+        MHz, cache, flags, etc.) are passed through from the real CPU.
+        """
+        try:
+            with open("/proc/cpuinfo") as f:
+                real = f.read()
+        except OSError:
+            return None
+
+        blocks: list[list[str]] = []
+        current: list[str] = []
+        for line in real.splitlines(keepends=True):
+            if line.strip() == "":
+                if current:
+                    blocks.append(current)
+                    current = []
+            else:
+                current.append(line)
+        if current:
+            blocks.append(current)
+
+        out: list[str] = []
+        seq = 0
+        for block in blocks:
+            if seq >= self._num_cpus:
+                break
+            renumbered: list[str] = []
+            for line in block:
+                if line.startswith("processor"):
+                    # "processor\t: N\n" → renumber
+                    renumbered.append(f"processor\t: {seq}\n")
+                else:
+                    renumbered.append(line)
+            out.extend(renumbered)
+            out.append("\n")
+            seq += 1
+
+        return "".join(out).encode()
+
+    def _build_virtual_meminfo(self) -> bytes | None:
+        """Build synthetic /proc/meminfo reflecting the sandbox memory limit.
+
+        Follows the LXCFS approach: replace memory fields with values
+        derived from the sandbox's memory limit and tracked usage.
+        Fields that cannot be meaningfully virtualized are zeroed to
+        avoid leaking host information.
+        """
+        limit = self._policy.max_memory_bytes
+        if limit <= 0:
+            return None
+
+        used = self._res.mem_used
+        free = max(0, limit - used)
+        limit_kb = limit // 1024
+        free_kb = free // 1024
+        used_kb = used // 1024
+
+        try:
+            with open("/proc/meminfo") as f:
+                lines = f.readlines()
+        except OSError:
+            return None
+
+        # Fields replaced with sandbox-aware values
+        _REPLACE = {
+            "MemTotal": limit_kb,
+            "MemFree": free_kb,
+            "MemAvailable": free_kb,
+            "Buffers": 0,
+            "Cached": 0,
+            "SwapCached": 0,
+            "Active": used_kb,
+            "Inactive": 0,
+            "Active(anon)": used_kb,
+            "Inactive(anon)": 0,
+            "Active(file)": 0,
+            "Inactive(file)": 0,
+            "Unevictable": 0,
+            "Mlocked": 0,
+            "SwapTotal": 0,
+            "SwapFree": 0,
+            "Dirty": 0,
+            "Writeback": 0,
+            "AnonPages": used_kb,
+            "Mapped": 0,
+            "Shmem": 0,
+            "KReclaimable": 0,
+            "Slab": 0,
+            "SReclaimable": 0,
+            "SUnreclaim": 0,
+            "CommitLimit": limit_kb,
+            "Committed_AS": used_kb,
+            "VmallocTotal": limit_kb,
+            "VmallocUsed": 0,
+            "VmallocChunk": 0,
+            "AnonHugePages": 0,
+            "ShmemHugePages": 0,
+            "ShmemPmdMapped": 0,
+        }
+
+        out: list[str] = []
+        for line in lines:
+            field = line.split(":")[0].strip() if ":" in line else ""
+            if field in _REPLACE:
+                # Match kernel's fixed-width format (values right-aligned
+                # to column 25 from the start of the line)
+                label = field + ":"
+                val_width = max(8, 25 - len(label))
+                out.append(f"{label}{_REPLACE[field]:>{val_width}} kB\n")
+            else:
+                out.append(line)
+
+        return "".join(out).encode()
+
     def _handle_getsockname(self, notif: SeccompNotif) -> None:
         """Handle getsockname — do it in supervisor and rewrite real port to virtual.
 
@@ -1606,6 +1764,80 @@ class NotifSupervisor:
             del self._proc_dir_cache[cache_key]
 
         # Write to child memory and return byte count
+        try:
+            if result:
+                write_bytes(pid, buf_addr, bytes(result))
+            self._respond_val(notif.id, len(result))
+        except OSError:
+            self._proc_dir_cache.pop(cache_key, None)
+            self._respond_continue(notif.id)
+
+    def _handle_getdents_cpu(self, notif: SeccompNotif) -> None:
+        """Handle getdents on /sys/devices/system/cpu — hide CPUs beyond num_cpus.
+
+        Reads the real directory, filters out cpu<N> entries where N >= num_cpus,
+        and returns synthetic dirent64 entries for the rest.
+        """
+        pid = notif.pid
+        child_fd_num = notif.data.args[0] & 0xFFFFFFFF
+        buf_addr = notif.data.args[1]
+        buf_size = notif.data.args[2] & 0xFFFFFFFF
+
+        cache_key = (pid, child_fd_num)
+        if cache_key not in self._proc_dir_cache:
+            import re
+            cpu_re = re.compile(r"^cpu(\d+)$")
+            DT_DIR = 4
+            DT_REG = 8
+            DT_LNK = 10
+            entries = []
+            d_off = 0
+            try:
+                with os.scandir("/sys/devices/system/cpu") as it:
+                    for entry in it:
+                        name = entry.name
+                        m = cpu_re.match(name)
+                        if m and int(m.group(1)) >= self._num_cpus:
+                            continue
+                        d_off += 1
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                d_type = DT_DIR
+                            elif entry.is_symlink():
+                                d_type = DT_LNK
+                            else:
+                                d_type = DT_REG
+                        except OSError:
+                            d_type = DT_REG
+                        try:
+                            d_ino = entry.inode()
+                        except OSError:
+                            d_ino = 0
+                        entries.append(
+                            _build_dirent64(d_ino, d_off, d_type, name))
+            except OSError:
+                self._respond_continue(notif.id)
+                return
+            self._proc_dir_cache[cache_key] = entries
+
+        entries = self._proc_dir_cache[cache_key]
+
+        if not self._id_valid(notif.id):
+            return
+
+        result = bytearray()
+        consumed = 0
+        for entry in entries:
+            if len(result) + len(entry) > buf_size:
+                break
+            result.extend(entry)
+            consumed += 1
+
+        if consumed > 0:
+            self._proc_dir_cache[cache_key] = entries[consumed:]
+        elif not entries:
+            del self._proc_dir_cache[cache_key]
+
         try:
             if result:
                 write_bytes(pid, buf_addr, bytes(result))

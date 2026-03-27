@@ -155,6 +155,8 @@ def _notif_syscall_names(notif: "NotifPolicy") -> list[str]:
             or notif.port_remap           # /proc/net/* filtering
             or notif.isolate_pids         # /proc/<pid> access control
             or notif.policy_fn_active     # policy coroutine needs filesystem events
+            or notif.num_cpus > 0         # /proc/cpuinfo virtualization
+            or notif.max_memory_bytes > 0 # /proc/meminfo virtualization
         )
     )
     if needs_openat:
@@ -176,7 +178,7 @@ def _notif_syscall_names(notif: "NotifPolicy") -> list[str]:
         names.extend(["bind", "connect", "getsockname"])
     if notif is not None and notif.max_memory_bytes > 0:
         names.extend(["mmap", "munmap", "brk", "mremap"])
-    if notif is not None and notif.isolate_pids:
+    if notif is not None and (notif.isolate_pids or notif.num_cpus > 0):
         names.append("getdents64")
         if "getdents" in _SYSCALL_NR:
             names.append("getdents")

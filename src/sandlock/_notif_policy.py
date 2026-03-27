@@ -94,6 +94,9 @@ class NotifPolicy:
     time_start: float | None = None
     """If set, clock_gettime/gettimeofday are shifted to start from this epoch."""
 
+    num_cpus: int = 0
+    """If > 0, /proc/cpuinfo is virtualized to show only this many CPUs."""
+
     policy_fn_active: bool = False
     """If True, intercept openat/connect/execve for the policy coroutine event stream."""
 

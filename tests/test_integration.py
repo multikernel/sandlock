@@ -1941,3 +1941,292 @@ class TestDeterministicRandom:
         parts = result.stdout.decode().strip().split()
         assert len(parts) == 2
         assert parts[0] != parts[1]  # different streams
+
+
+# --- /proc/cpuinfo and /proc/meminfo virtualization ---
+
+
+class TestCpuinfoVirtualization:
+    """Tests for /proc/cpuinfo and sysfs CPU virtualization via num_cpus."""
+
+    def test_cpuinfo_limits_processor_count(self):
+        """num_cpus=2 shows exactly 2 processor entries in /proc/cpuinfo."""
+        policy = Policy(fs_readable=_PYTHON_READABLE, num_cpus=2)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+with open('/proc/cpuinfo') as f:
+    lines = f.readlines()
+procs = [l for l in lines if l.startswith('processor')]
+print(len(procs))
+"""]
+        )
+        assert result.success, result.error
+        assert result.stdout.strip() == b"2"
+
+    def test_cpuinfo_renumbers_sequentially(self):
+        """Processor entries are renumbered 0..N-1."""
+        policy = Policy(fs_readable=_PYTHON_READABLE, num_cpus=3)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+with open('/proc/cpuinfo') as f:
+    lines = f.readlines()
+nums = []
+for l in lines:
+    if l.startswith('processor'):
+        nums.append(int(l.split(':')[1].strip()))
+print(','.join(str(n) for n in nums))
+"""]
+        )
+        assert result.success, result.error
+        assert result.stdout.strip() == b"0,1,2"
+
+    def test_cpuinfo_preserves_real_fields(self):
+        """Non-processor fields (model name, flags, etc.) are real values."""
+        policy = Policy(fs_readable=_PYTHON_READABLE, num_cpus=1)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+with open('/proc/cpuinfo') as f:
+    data = f.read()
+# Should contain real CPU information
+assert 'model name' in data, 'model name missing'
+assert 'flags' in data or 'Features' in data, 'flags missing'
+assert 'cpu' in data.lower(), 'no cpu info'
+print('OK')
+"""]
+        )
+        assert result.success, result.error
+
+    def test_cpuinfo_single_cpu(self):
+        """num_cpus=1 shows exactly one processor block."""
+        policy = Policy(fs_readable=_PYTHON_READABLE, num_cpus=1)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+with open('/proc/cpuinfo') as f:
+    lines = f.readlines()
+procs = [l for l in lines if l.startswith('processor')]
+assert len(procs) == 1
+assert '0' in procs[0]
+print('OK')
+"""]
+        )
+        assert result.success, result.error
+
+    def test_sysfs_cpu_online(self):
+        """/sys/devices/system/cpu/online reflects num_cpus."""
+        policy = Policy(fs_readable=_PYTHON_READABLE + ["/sys"], num_cpus=4)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+with open('/sys/devices/system/cpu/online') as f:
+    print(f.read().strip())
+"""]
+        )
+        assert result.success, result.error
+        assert result.stdout.strip() == b"0-3"
+
+    def test_sysfs_cpu_present(self):
+        """/sys/devices/system/cpu/present reflects num_cpus."""
+        policy = Policy(fs_readable=_PYTHON_READABLE + ["/sys"], num_cpus=2)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+with open('/sys/devices/system/cpu/present') as f:
+    print(f.read().strip())
+"""]
+        )
+        assert result.success, result.error
+        assert result.stdout.strip() == b"0-1"
+
+    def test_sysfs_cpu_possible(self):
+        """/sys/devices/system/cpu/possible reflects num_cpus."""
+        policy = Policy(fs_readable=_PYTHON_READABLE + ["/sys"], num_cpus=1)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+with open('/sys/devices/system/cpu/possible') as f:
+    print(f.read().strip())
+"""]
+        )
+        assert result.success, result.error
+        assert result.stdout.strip() == b"0"
+
+    def test_sysconf_nprocessors(self):
+        """sysconf(_SC_NPROCESSORS_ONLN) reflects num_cpus."""
+        policy = Policy(fs_readable=_PYTHON_READABLE + ["/sys"], num_cpus=3)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import os
+conf = os.sysconf('SC_NPROCESSORS_CONF')
+onln = os.sysconf('SC_NPROCESSORS_ONLN')
+print(f'{conf},{onln}')
+"""]
+        )
+        assert result.success, result.error
+        assert result.stdout.strip() == b"3,3"
+
+    def test_sysfs_cpu_directory_filtered(self):
+        """readdir(/sys/devices/system/cpu) hides cpu<N> for N >= num_cpus."""
+        policy = Policy(fs_readable=_PYTHON_READABLE + ["/sys"], num_cpus=2)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import os, re
+entries = os.listdir('/sys/devices/system/cpu')
+cpu_entries = sorted(
+    [e for e in entries if re.match(r'^cpu\\d+$', e)],
+    key=lambda x: int(x[3:])
+)
+print(','.join(cpu_entries))
+"""]
+        )
+        assert result.success, result.error
+        assert result.stdout.strip() == b"cpu0,cpu1"
+
+    def test_no_num_cpus_shows_all(self):
+        """Without num_cpus, /proc/cpuinfo shows all real CPUs."""
+        policy = Policy(fs_readable=_PYTHON_READABLE)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+import os
+with open('/proc/cpuinfo') as f:
+    procs = [l for l in f if l.startswith('processor')]
+real = os.cpu_count()
+print(f'{len(procs)},{real}')
+"""]
+        )
+        assert result.success, result.error
+        parts = result.stdout.decode().strip().split(",")
+        assert parts[0] == parts[1]
+
+
+class TestMeminfoVirtualization:
+    """Tests for /proc/meminfo virtualization via max_memory."""
+
+    def test_memtotal_reflects_limit(self):
+        """MemTotal matches max_memory policy."""
+        policy = Policy(fs_readable=_PYTHON_READABLE, max_memory="128M")
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+with open('/proc/meminfo') as f:
+    for line in f:
+        if line.startswith('MemTotal:'):
+            kb = int(line.split()[1])
+            print(kb)
+            break
+"""]
+        )
+        assert result.success, result.error
+        assert result.stdout.strip() == b"131072"  # 128 * 1024
+
+    def test_memfree_within_limit(self):
+        """MemFree is between 0 and MemTotal."""
+        policy = Policy(fs_readable=_PYTHON_READABLE, max_memory="256M")
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+with open('/proc/meminfo') as f:
+    vals = {}
+    for line in f:
+        parts = line.split()
+        if parts[0].rstrip(':') in ('MemTotal', 'MemFree', 'MemAvailable'):
+            vals[parts[0].rstrip(':')] = int(parts[1])
+total = vals['MemTotal']
+free = vals['MemFree']
+avail = vals['MemAvailable']
+assert 0 <= free <= total, f'MemFree {free} not in [0, {total}]'
+assert 0 <= avail <= total, f'MemAvailable {avail} not in [0, {total}]'
+assert total == 262144, f'MemTotal {total} != 262144'
+print('OK')
+"""]
+        )
+        assert result.success, result.error
+
+    def test_swap_zeroed(self):
+        """SwapTotal and SwapFree are zero inside sandbox."""
+        policy = Policy(fs_readable=_PYTHON_READABLE, max_memory="64M")
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+with open('/proc/meminfo') as f:
+    for line in f:
+        field = line.split(':')[0]
+        if field in ('SwapTotal', 'SwapFree'):
+            val = int(line.split()[1])
+            assert val == 0, f'{field} = {val}, expected 0'
+print('OK')
+"""]
+        )
+        assert result.success, result.error
+
+    def test_buffers_cached_zeroed(self):
+        """Buffers and Cached are zero (no host info leakage)."""
+        policy = Policy(fs_readable=_PYTHON_READABLE, max_memory="64M")
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+with open('/proc/meminfo') as f:
+    for line in f:
+        field = line.split(':')[0]
+        if field in ('Buffers', 'Cached', 'SwapCached'):
+            val = int(line.split()[1])
+            assert val == 0, f'{field} = {val}, expected 0'
+print('OK')
+"""]
+        )
+        assert result.success, result.error
+
+    def test_committed_as_reflects_usage(self):
+        """Committed_AS and AnonPages reflect tracked memory usage."""
+        policy = Policy(fs_readable=_PYTHON_READABLE, max_memory="256M")
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+with open('/proc/meminfo') as f:
+    vals = {}
+    for line in f:
+        parts = line.split()
+        key = parts[0].rstrip(':')
+        if key in ('MemTotal', 'Active', 'AnonPages', 'Committed_AS'):
+            vals[key] = int(parts[1])
+total = vals['MemTotal']
+active = vals['Active']
+anon = vals['AnonPages']
+committed = vals['Committed_AS']
+# All usage fields should be consistent and <= total
+assert active <= total, f'Active {active} > MemTotal {total}'
+assert anon <= total, f'AnonPages {anon} > MemTotal {total}'
+assert committed <= total, f'Committed_AS {committed} > MemTotal {total}'
+# Active and AnonPages should match (both derived from mem_used)
+assert active == anon, f'Active {active} != AnonPages {anon}'
+print('OK')
+"""]
+        )
+        assert result.success, result.error
+
+    def test_no_max_memory_shows_real(self):
+        """Without max_memory, /proc/meminfo shows real host values."""
+        policy = Policy(fs_readable=_PYTHON_READABLE)
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+with open('/proc/meminfo') as f:
+    for line in f:
+        if line.startswith('MemTotal:'):
+            kb = int(line.split()[1])
+            # Real host memory should be > 1GB
+            assert kb > 1048576, f'MemTotal {kb} too small for real host'
+            print('OK')
+            break
+"""]
+        )
+        assert result.success, result.error
+
+    def test_commit_limit_matches_total(self):
+        """CommitLimit equals MemTotal (sandbox limit)."""
+        policy = Policy(fs_readable=_PYTHON_READABLE, max_memory="512M")
+        result = Sandbox(policy).run(
+            ["python3", "-c", """
+with open('/proc/meminfo') as f:
+    vals = {}
+    for line in f:
+        parts = line.split()
+        key = parts[0].rstrip(':')
+        if key in ('MemTotal', 'CommitLimit', 'VmallocTotal'):
+            vals[key] = int(parts[1])
+assert vals['CommitLimit'] == vals['MemTotal']
+assert vals['VmallocTotal'] == vals['MemTotal']
+print('OK')
+"""]
+        )
+        assert result.success, result.error
