@@ -103,6 +103,7 @@ class Sandbox:
         *,
         host: str | None = None,
         sandbox_id: str | None = None,
+        policy_fn: Optional[Callable] = None,
         **kwargs,
     ):
         if host is not None:
@@ -113,6 +114,7 @@ class Sandbox:
         self._policy = policy
         self._init_fn = init_fn
         self._work_fn = work_fn
+        self._policy_fn = policy_fn
         self._id = sandbox_id or uuid.uuid4().hex[:12]
         self._ctx: SandboxContext | None = None
         self._branch = None  # SandboxBranch | None (lazy import)
@@ -301,6 +303,7 @@ class Sandbox:
         ctx = SandboxContext(
             _target, self._effective_policy(), self._id,
             save_fn=save_fn,
+            policy_fn=self._policy_fn,
         )
         try:
             ctx.__enter__()

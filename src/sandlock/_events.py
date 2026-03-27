@@ -1,34 +1,52 @@
 # SPDX-License-Identifier: Apache-2.0
-"""BPF ring buffer reader (Phase 4+).
+"""Syscall events emitted by the seccomp notification supervisor.
 
-Placeholder for BPF event stream.
+When a policy coroutine (``policy_fn``) is attached to a sandbox, the
+supervisor pushes a :class:`SyscallEvent` for every intercepted syscall.
+The coroutine consumes these events and calls ``ctx.grant()`` /
+``ctx.restrict()`` to adjust the live policy.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
 
 
-class EventType(Enum):
-    """Types of sandbox events."""
+@dataclass(frozen=True)
+class SyscallEvent:
+    """An intercepted syscall observed by the notification supervisor.
 
-    PROCESS_FORK = "process_fork"
-    PROCESS_EXIT = "process_exit"
-    SIGNAL_BLOCKED = "signal_blocked"
-    PTRACE_BLOCKED = "ptrace_blocked"
-    SOCKET_BLOCKED = "socket_blocked"
-    CAPABILITY_BLOCKED = "capability_blocked"
-    MEMORY_EXCEEDED = "memory_exceeded"
-    CPU_EXCEEDED = "cpu_exceeded"
-    PIDS_EXCEEDED = "pids_exceeded"
+    Fields are populated based on the syscall type — irrelevant fields
+    are ``None``.  Events are immutable facts, never modified after
+    creation.
+    """
 
+    syscall: str
+    """Syscall name (e.g. ``"connect"``, ``"openat"``, ``"clone"``)."""
 
-@dataclass
-class Event:
-    """A sandbox event."""
-
-    type: EventType
-    sandbox_id: str
     pid: int
-    detail: str = ""
+    """PID of the process that made the syscall."""
+
+    timestamp: float
+    """Monotonic timestamp (``time.monotonic()``) when the event was created."""
+
+    path: str | None = None
+    """Resolved filesystem path (for ``openat``, ``execve``, etc.)."""
+
+    host: str | None = None
+    """Destination IP address (for ``connect``, ``sendto``, ``sendmsg``)."""
+
+    port: int | None = None
+    """Destination port (for ``connect``, ``bind``)."""
+
+    size: int | None = None
+    """Size argument (for ``mmap``, ``write``, etc.)."""
+
+    argv: tuple[str, ...] | None = None
+    """Command arguments (for ``execve`` / ``execveat``)."""
+
+    flags: int = 0
+    """Raw syscall flags (e.g. ``O_WRONLY`` for ``openat``)."""
+
+    denied: bool = False
+    """Whether the supervisor denied this syscall."""

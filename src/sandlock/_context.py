@@ -74,6 +74,8 @@ _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
 
 # pidfd_open(2) — asm-generic syscall number, same on all architectures
 _NR_PIDFD_OPEN = 434
+# pidfd_getfd(2) — Linux 5.6+, copy an fd from another process
+_NR_PIDFD_GETFD = 438
 
 
 def _pidfd_open(pid: int) -> int:
@@ -90,6 +92,24 @@ def _pidfd_open(pid: int) -> int:
     if fd < 0:
         err = ctypes.get_errno()
         raise OSError(err, f"pidfd_open({pid}): {os.strerror(err)}")
+    return fd
+
+
+def _pidfd_getfd(pidfd: int, target_fd: int) -> int:
+    """Copy a file descriptor from another process via pidfd_getfd(2).
+
+    Returns:
+        A new fd in this process referring to the same file description.
+    """
+    fd = _libc.syscall(
+        ctypes.c_long(_NR_PIDFD_GETFD),
+        ctypes.c_int(pidfd),
+        ctypes.c_int(target_fd),
+        ctypes.c_uint(0),
+    )
+    if fd < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, f"pidfd_getfd({pidfd}, {target_fd}): {os.strerror(err)}")
     return fd
 
 
@@ -134,6 +154,7 @@ def _notif_syscall_names(notif: "NotifPolicy") -> list[str]:
             or notif.time_start is not None   # /proc/uptime, /proc/stat virtualization
             or notif.port_remap           # /proc/net/* filtering
             or notif.isolate_pids         # /proc/<pid> access control
+            or notif.policy_fn_active     # policy coroutine needs filesystem events
         )
     )
     if needs_openat:
@@ -183,6 +204,10 @@ def _notif_syscall_names(notif: "NotifPolicy") -> list[str]:
         names.extend(["clock_gettime", "gettimeofday", "time",
                        "clock_nanosleep", "timerfd_settime",
                        "timer_settime"])
+    # Policy coroutine needs network + execve events
+    if notif is not None and notif.policy_fn_active:
+        names.extend(["connect", "sendto", "sendmsg",
+                       "execve", "execveat"])
     # Deduplicate (clone/open may already be in the list)
     return list(dict.fromkeys(names))
 
@@ -246,12 +271,14 @@ class SandboxContext:
         overlay_branch: "object | None" = None,
         cow_branch: "object | None" = None,
         clone_loop_fn: "Callable[[int], None] | None" = None,
+        policy_fn: "Callable | None" = None,
     ):
         self._target = target
         self._policy = policy
         self._sandbox_id = sandbox_id
         self._save_fn = save_fn
         self._clone_loop_fn = clone_loop_fn
+        self._policy_fn = policy_fn
         self._overlay_branch = overlay_branch or getattr(policy, '_overlay_branch', None)
         self._cow_branch = cow_branch or getattr(policy, '_cow_branch', None)
         self._pid: Optional[int] = None
@@ -261,6 +288,7 @@ class SandboxContext:
         self._throttle_thread = None  # threading.Thread | None
         self._disk_quota_stop = None  # threading.Event | None
         self._disk_quota_thread = None  # threading.Thread | None
+        self._policy_thread = None  # threading.Thread | None
         self._control_fd: int = -1  # Parent's end of control socket
         self._exited = False
 
@@ -409,10 +437,13 @@ class SandboxContext:
         self._disk_quota_thread = t
 
     def _stop_supervisor(self) -> None:
-        """Stop the notification supervisor if running."""
+        """Stop the notification supervisor and policy thread if running."""
         if self._supervisor is not None:
             self._supervisor.stop()
             self._supervisor = None
+        if self._policy_thread is not None:
+            self._policy_thread.join(timeout=2.0)
+            self._policy_thread = None
 
     def _start_throttle(self, pgid: int, pct: int) -> None:
         """Start a daemon thread that throttles CPU via SIGSTOP/SIGCONT."""
@@ -534,6 +565,15 @@ class SandboxContext:
                     rules=merged_rules,
                     isolate_pids=isolate or self._notif_policy.isolate_pids,
                 )
+        # Force notif supervisor when policy_fn is attached (needs event stream)
+        if self._policy_fn is not None:
+            from ._notif_policy import NotifPolicy
+            import dataclasses
+            if self._notif_policy is None:
+                self._notif_policy = NotifPolicy(policy_fn_active=True)
+            else:
+                self._notif_policy = dataclasses.replace(
+                    self._notif_policy, policy_fn_active=True)
         use_notif = self._notif_policy is not None
 
         # Pre-import modules used in the child BEFORE fork — the child's
@@ -541,7 +581,7 @@ class SandboxContext:
         # lazy imports after confinement would fail.  After fork these are
         # just sys.modules lookups.
         if use_notif:
-            from ._notif import install_notif_filter, send_fd  # noqa: F811
+            from ._notif import install_notif_filter  # noqa: F811
         if (self._notif_policy is not None
                 and self._notif_policy.time_start is not None):
             import time as _time  # noqa: F811
@@ -569,14 +609,19 @@ class SandboxContext:
         _libc.prctl(ctypes.c_int(36), ctypes.c_ulong(1),  # PR_SET_CHILD_SUBREAPER
                      ctypes.c_ulong(0), ctypes.c_ulong(0), ctypes.c_ulong(0))
 
-        # Create socket pair for passing the notify fd from child to parent.
+        # Create pipes for passing the notify fd from child to parent.
+        # Instead of SCM_RIGHTS (sendmsg), the child writes the raw fd
+        # number to a pipe after installing the notif filter.  The parent
+        # reads it and uses pidfd_getfd() to copy the fd.  A second pipe
+        # synchronises: the parent signals "supervisor ready" so the child
+        # doesn't exec() before the supervisor can handle syscalls.
         # Skip in nested sandboxes — notif filter can't be stacked.
         if use_notif and not _is_already_confined():
-            parent_sock, child_sock = socket.socketpair(
-                socket.AF_UNIX, socket.SOCK_STREAM,
-            )
+            notif_fd_r, notif_fd_w = os.pipe()      # child → parent: fd number
+            notif_ready_r, notif_ready_w = os.pipe() # parent → child: "go ahead"
         else:
-            parent_sock = child_sock = None
+            notif_fd_r = notif_fd_w = -1
+            notif_ready_r = notif_ready_w = -1
 
         # Create control socket pair for checkpoint commands (bidirectional)
         ctrl_parent, ctrl_child = socket.socketpair(
@@ -590,16 +635,19 @@ class SandboxContext:
         except OSError as e:
             ctrl_parent.close()
             ctrl_child.close()
-            if parent_sock is not None:
-                parent_sock.close()
-                child_sock.close()
+            for fd in (notif_fd_r, notif_fd_w, notif_ready_r, notif_ready_w):
+                if fd >= 0:
+                    os.close(fd)
             raise ForkError(f"fork() failed: {e}") from e
 
         if pid == 0:
             # === Child process ===
             ctrl_parent.close()
-            if parent_sock is not None:
-                parent_sock.close()
+            # Close parent ends of notif pipes
+            if notif_fd_r >= 0:
+                os.close(notif_fd_r)
+            if notif_ready_w >= 0:
+                os.close(notif_ready_w)
             try:
                 os.setpgid(0, 0)
 
@@ -773,8 +821,12 @@ class SandboxContext:
                 _no_raw = self._policy.no_raw_sockets
                 _no_udp = self._policy.no_udp
 
-                if use_notif and child_sock is not None and not _is_already_confined():
-                    # First-level sandbox: install combined notif + BPF filter
+                if use_notif and notif_fd_w >= 0 and not _is_already_confined():
+                    # First-level sandbox: install combined notif + BPF filter.
+                    # Write the notif fd number to a pipe (not sendmsg) so it
+                    # works even when sendmsg is intercepted by the filter.
+                    # Then wait for the parent to signal "supervisor ready"
+                    # before proceeding to exec().
                     try:
                         from ._landlock import _set_no_new_privs
                         _set_no_new_privs()
@@ -785,15 +837,25 @@ class SandboxContext:
                             no_raw_sockets=_no_raw,
                             no_udp=_no_udp,
                         )
-                        send_fd(child_sock, notify_fd)
-                        os.close(notify_fd)
+                        # Tell parent our notif fd number via pipe (safe —
+                        # write() on a pipe is not intercepted by seccomp)
+                        os.write(notif_fd_w, str(notify_fd).encode())
+                        os.close(notif_fd_w)
+                        notif_fd_w = -1
+                        # Wait for parent: supervisor is ready, safe to exec
+                        os.read(notif_ready_r, 1)
+                        os.close(notif_ready_r)
+                        notif_ready_r = -1
                     except Exception as e:
                         if self._policy.strict:
                             raise ConfinementError(
                                 f"seccomp notif filter failed: {e}"
                             )
                     finally:
-                        child_sock.close()
+                        if notif_fd_w >= 0:
+                            os.close(notif_fd_w)
+                        if notif_ready_r >= 0:
+                            os.close(notif_ready_r)
                     if allow is not None:
                         try:
                             apply_seccomp_filter(
@@ -810,8 +872,9 @@ class SandboxContext:
                     # Nested sandbox or no notif: stack a BPF deny/allow
                     # filter.  BPF filters are ANDed by the kernel, so
                     # each nesting level can only tighten.
-                    if child_sock is not None:
-                        child_sock.close()
+                    for fd in (notif_fd_w, notif_ready_r):
+                        if fd >= 0:
+                            os.close(fd)
                     try:
                         apply_seccomp_filter(
                             deny, allow,
@@ -898,8 +961,11 @@ class SandboxContext:
                 os.write(userns_p2c_w, b"1")  # Signal: maps written, proceed
                 os.close(userns_p2c_w)
 
-            if child_sock is not None:
-                child_sock.close()
+            # Close child ends of notif pipes
+            if notif_fd_w >= 0:
+                os.close(notif_fd_w)
+            if notif_ready_r >= 0:
+                os.close(notif_ready_r)
 
             self._pid = pid
             self._pidfd = _pidfd_open(pid)
@@ -910,12 +976,21 @@ class SandboxContext:
             except OSError:
                 pass  # Child may have already set it
 
-            # Receive notify fd and start supervisor
-            if use_notif and parent_sock is not None:
+            # Receive notify fd and start supervisor.
+            # The child wrote its notif fd number to the pipe.  We use
+            # pidfd_getfd() to copy it into our process, then signal the
+            # child that the supervisor is ready (so exec() won't race).
+            if use_notif and notif_fd_r >= 0:
                 try:
-                    from ._notif import recv_fd, NotifSupervisor
-                    notify_fd = recv_fd(parent_sock)
-                    parent_sock.close()
+                    from ._notif import NotifSupervisor
+                    # Read the child's notif fd number from the pipe
+                    child_notif_fd_str = os.read(notif_fd_r, 32)
+                    os.close(notif_fd_r)
+                    notif_fd_r = -1
+                    child_notif_fd = int(child_notif_fd_str.strip())
+                    # Copy the fd from the child's fd table into ours
+                    notify_fd = _pidfd_getfd(self._pidfd, child_notif_fd)
+
                     pids_fn = lambda pgid=pid: _pids_by_pgid(pgid)  # noqa: E731
                     # Disk quota for overlayfs upper dir
                     dq_path = None
@@ -935,11 +1010,34 @@ class SandboxContext:
                         from .cowfs._handler import CowHandler
                         self._supervisor._cow_handler = CowHandler(self._cow_branch)
                     self._supervisor.start()
+                    # Start policy coroutine runner if policy_fn is set
+                    if self._policy_fn is not None:
+                        from queue import SimpleQueue
+                        from ._policy_ctx import PolicyContext
+                        from ._policy_runner import run_policy_fn
+                        import threading
+                        event_queue = SimpleQueue()
+                        self._supervisor._event_queue = event_queue
+                        ctx = PolicyContext(self._supervisor, self._notif_policy)
+                        self._policy_thread = threading.Thread(
+                            target=run_policy_fn,
+                            args=(self._policy_fn, event_queue, ctx),
+                            name="sandlock-policy",
+                            daemon=True,
+                        )
+                        self._policy_thread.start()
+                    # Signal child: supervisor is ready, safe to exec
+                    os.write(notif_ready_w, b"1")
+                    os.close(notif_ready_w)
+                    notif_ready_w = -1
                 except Exception:
-                    try:
-                        parent_sock.close()
-                    except OSError:
-                        pass
+                    # Clean up pipes on failure
+                    for fd in (notif_fd_r, notif_ready_w):
+                        if fd >= 0:
+                            try:
+                                os.close(fd)
+                            except OSError:
+                                pass
 
             # Start disk quota thread if COW + max_disk
             if (self._overlay_branch or self._cow_branch) and self._policy.max_disk:

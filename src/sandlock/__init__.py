@@ -11,6 +11,8 @@ from .sandbox import Sandbox
 from ._runner import Result, Stage, Pipeline
 from ._checkpoint import Checkpoint
 from ._notif_policy import NotifPolicy, NotifAction, PathRule
+from ._events import SyscallEvent
+from ._policy_ctx import PolicyContext
 from ._profile import load_profile, list_profiles
 from ._seccomp import DEFAULT_ALLOW_SYSCALLS, DEFAULT_DENY_SYSCALLS
 from .exceptions import (
@@ -50,6 +52,9 @@ __all__ = [
     "NotifPolicy",
     "NotifAction",
     "PathRule",
+    # Policy coroutine
+    "SyscallEvent",
+    "PolicyContext",
     # Exceptions
     "SandlockError",
     "PolicyError",

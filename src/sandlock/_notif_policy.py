@@ -94,6 +94,9 @@ class NotifPolicy:
     time_start: float | None = None
     """If set, clock_gettime/gettimeofday are shifted to start from this epoch."""
 
+    policy_fn_active: bool = False
+    """If True, intercept openat/connect/execve for the policy coroutine event stream."""
+
     def decide(
         self,
         path: str,

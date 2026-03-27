@@ -18,7 +18,6 @@ import errno
 import os
 import select
 import signal
-import socket
 from pathlib import Path
 import struct
 import threading
@@ -56,6 +55,17 @@ from ._seccomp import (
 
 
 _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+
+# Reverse map: syscall number → name (built lazily)
+_NR_TO_NAME: dict[int, str] | None = None
+
+
+def _get_nr_to_name() -> dict[int, str]:
+    global _NR_TO_NAME
+    if _NR_TO_NAME is None:
+        _NR_TO_NAME = {v: k for k, v in _SYSCALL_NR.items()}
+    return _NR_TO_NAME
+
 
 # ioctl commands for seccomp user notification.
 # Computed from _IOC(dir, type=0x21, nr, size):
@@ -286,25 +296,6 @@ def install_notif_filter(
 
 # --- SCM_RIGHTS fd passing ---
 
-def send_fd(sock: socket.socket, fd: int) -> None:
-    """Send a file descriptor over a Unix socket via SCM_RIGHTS."""
-    sock.sendmsg(
-        [b"\x00"],
-        [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack("i", fd))],
-    )
-
-
-def recv_fd(sock: socket.socket) -> int:
-    """Receive a file descriptor from a Unix socket via SCM_RIGHTS."""
-    msg, ancdata, flags, addr = sock.recvmsg(
-        1, socket.CMSG_SPACE(struct.calcsize("i"))
-    )
-    for cmsg_level, cmsg_type, cmsg_data in ancdata:
-        if cmsg_level == socket.SOL_SOCKET and cmsg_type == socket.SCM_RIGHTS:
-            return struct.unpack("i", cmsg_data[:struct.calcsize("i")])[0]
-    raise NotifError("No fd received via SCM_RIGHTS")
-
-
 # --- memfd helper ---
 
 _NR_MEMFD_CREATE = _SYSCALL_NR.get("memfd_create", 319)
@@ -427,6 +418,10 @@ class NotifSupervisor:
         self._disk_quota_path = disk_quota_path
         self._disk_quota_bytes = disk_quota_bytes
         self._cow_handler = None  # CowHandler | None
+        # Policy coroutine support
+        self._event_queue = None  # SimpleQueue | None — set externally
+        self._pid_policies: dict[int, "NotifPolicy"] = {}  # per-PID overrides
+        self._policy_fn_done = False  # set when policy_fn returns
         # Deterministic randomness
         self._det_random = None  # DeterministicRandom | None
         if policy.random_seed is not None:
@@ -457,9 +452,9 @@ class NotifSupervisor:
         if policy.port_remap:
             from ._port_remap import get_port_map
             self._port_map = get_port_map(proxy=True)
-        # Fast-path flag: when only /proc hardening needs openat (no COW,
-        # no time/random virtualization, no port remap), skip full path
-        # resolution for non-/proc paths using a cheap prefix read.
+        # Fast-path flag: skip full path resolution for non-/proc openat
+        # calls when only /proc hardening is active.  Disabled at runtime
+        # when _event_queue is attached (policy coroutine needs all events).
         self._openat_fast_proc = (
             (policy.isolate_pids or policy.rules)
             and not policy.cow_enabled
@@ -510,6 +505,9 @@ class NotifSupervisor:
             os.write(self._stop_w, b"x")
         except OSError:
             pass
+        # Poison pill: unblock the policy runner immediately
+        if self._event_queue is not None:
+            self._event_queue.put_nowait(None)
         if self._thread is not None:
             self._thread.join(timeout=5.0)
             self._thread = None
@@ -607,9 +605,65 @@ class NotifSupervisor:
                 pass
 
     @property
+    def alive(self) -> bool:
+        """Whether the supervisor thread is still running."""
+        return self._thread is not None and self._thread.is_alive()
+
+    @property
     def tracked_pids(self) -> set[int]:
         """All PIDs known to belong to this sandbox."""
         return set(self._proc_pids)
+
+    # Syscalls where the supervisor holds the notification (child frozen
+    # in kernel) until the policy_fn has processed the event.  This lets
+    # the policy_fn restrict permissions *before* the child proceeds —
+    # e.g. restrict network after seeing execve("setup.py"), so that
+    # the subsequent connect() from setup.py is already blocked.
+    _HOLD_SYSCALLS = frozenset({"execve", "execveat"})
+
+    def _emit_event(
+        self,
+        nr: int,
+        pid: int,
+        *,
+        denied: bool = False,
+        path: str | None = None,
+        host: str | None = None,
+        port: int | None = None,
+        size: int | None = None,
+        argv: tuple[str, ...] | None = None,
+        flags: int = 0,
+    ) -> None:
+        """Push a SyscallEvent to the policy coroutine queue (if attached).
+
+        For syscalls in ``_HOLD_SYSCALLS``, blocks until the policy_fn
+        has processed the event (up to 5s), so that any ``grant()`` /
+        ``restrict()`` call takes effect before the child resumes.
+        """
+        if self._event_queue is None:
+            return
+        import time as _time
+        from ._events import SyscallEvent
+        nr_name = _get_nr_to_name()
+        syscall_name = nr_name.get(nr, str(nr))
+        event = SyscallEvent(
+            syscall=syscall_name,
+            pid=pid,
+            timestamp=_time.monotonic(),
+            path=path,
+            host=host,
+            port=port,
+            size=size,
+            argv=argv,
+            flags=flags,
+            denied=denied,
+        )
+        if syscall_name in self._HOLD_SYSCALLS and not self._policy_fn_done:
+            gate = threading.Event()
+            self._event_queue.put_nowait((event, gate))
+            gate.wait(timeout=5.0)
+        else:
+            self._event_queue.put_nowait((event, None))
 
     def _maybe_patch_vdso(self, pid: int) -> None:
         """Patch the child's vDSO to force real syscalls, if needed.
@@ -682,10 +736,15 @@ class NotifSupervisor:
             return
 
         if nr in FORK_NRS:
+            _count_before = self._res.proc_count
             handle_fork(notif, nr, self._res,
                         self._policy.max_processes,
                         self._respond_continue, self._respond_errno,
                         self._proc_dir_cache.clear)
+            self._emit_event(nr, pid,
+                             denied=(self._res.proc_count == _count_before
+                                     and self._policy.max_processes > 0
+                                     and _count_before >= self._policy.max_processes))
             return
 
         # --- Port remapping: bind / connect / getsockname ---
@@ -702,13 +761,36 @@ class NotifSupervisor:
             return
 
         # --- Network: connect / sendto / sendmsg IP enforcement ---
-        from ._network import NET_NRS, handle_net
+        from ._network import NET_NRS, handle_net, extract_dest_ip
 
-        if nr in NET_NRS and self._policy.allowed_ips:
-            handle_net(notif, nr, self._policy.allowed_ips,
-                       self._id_valid, self._respond_continue,
-                       self._respond_errno)
-            return
+        if nr in NET_NRS:
+            # Per-PID override takes precedence.  A per-PID policy with an
+            # empty allowed_ips means "block all" for that PID — distinct
+            # from the global policy where empty means "no restriction."
+            pid_policy = self._pid_policies.get(pid)
+            has_filter = (
+                pid_policy is not None  # per-PID always enforced
+                or bool(self._policy.allowed_ips)  # global only if non-empty
+            )
+            if has_filter:
+                effective_ips = (
+                    pid_policy.allowed_ips if pid_policy is not None
+                    else self._policy.allowed_ips
+                )
+                dest_ip = extract_dest_ip(notif, nr)
+                denied = dest_ip is not None and dest_ip not in effective_ips
+                handle_net(notif, nr, effective_ips,
+                           self._id_valid, self._respond_continue,
+                           self._respond_errno)
+                self._emit_event(nr, pid, denied=denied, host=dest_ip)
+                return
+
+            # No filter active — emit event if policy_fn is watching
+            if self._event_queue is not None:
+                dest_ip = extract_dest_ip(notif, nr)
+                self._emit_event(nr, pid, denied=False, host=dest_ip)
+                self._respond_continue(notif.id)
+                return
 
         # --- /proc readdir PID filtering + COW dir merging ---
         nr_getdents64 = _SYSCALL_NR.get("getdents64")
@@ -1059,6 +1141,9 @@ class NotifSupervisor:
                     self._respond_continue(notif.id)
                     return
 
+                # Emit execve event for policy coroutine
+                self._emit_event(nr, pid, path=path)
+
                 if not self._id_valid(notif.id):
                     return
 
@@ -1105,6 +1190,33 @@ class NotifSupervisor:
                 self._respond_continue(notif.id)
                 return
 
+        # --- execve/execveat: emit event + continue (non-COW path) ---
+        if self._cow_handler is None and self._event_queue is not None:
+            nr_execve = _SYSCALL_NR.get("execve")
+            nr_execveat = _SYSCALL_NR.get("execveat")
+            if nr in (nr_execve, nr_execveat):
+                try:
+                    if nr == nr_execve:
+                        pathname_addr = notif.data.args[0]
+                        argv_addr = notif.data.args[1]
+                        exec_path = resolve_openat_path(pid, -100, pathname_addr)
+                    else:
+                        dirfd = ctypes.c_int32(notif.data.args[0] & 0xFFFFFFFF).value
+                        pathname_addr = notif.data.args[1]
+                        argv_addr = notif.data.args[2]
+                        exec_path = resolve_openat_path(pid, dirfd, pathname_addr)
+                    exec_argv = None
+                    try:
+                        from ._procfs import read_argv
+                        exec_argv = read_argv(pid, argv_addr)
+                    except OSError:
+                        pass
+                    self._emit_event(nr, pid, path=exec_path, argv=exec_argv)
+                except OSError:
+                    pass
+                self._respond_continue(notif.id)
+                return
+
         # --- Filesystem: open / openat virtualization + COW ---
         nr_openat = _SYSCALL_NR.get("openat")
         nr_open = _SYSCALL_NR.get("open")
@@ -1118,7 +1230,7 @@ class NotifSupervisor:
                 # read a 6-byte prefix to skip non-/proc paths without
                 # full path resolution.  Uses a cached fd to avoid
                 # open/close overhead per call.
-                if self._openat_fast_proc:
+                if self._openat_fast_proc and self._event_queue is None:
                     AT_FDCWD = -100
                     if dirfd == AT_FDCWD or dirfd == AT_FDCWD & 0xFFFFFFFF:
                         try:
@@ -1141,7 +1253,7 @@ class NotifSupervisor:
             elif nr == nr_open:
                 pathname_addr = notif.data.args[0]
                 flags = notif.data.args[1]
-                if self._openat_fast_proc:
+                if self._openat_fast_proc and self._event_queue is None:
                     try:
                         if self._mem_fd_pid != pid:
                             if self._mem_fd >= 0:
@@ -1264,6 +1376,9 @@ class NotifSupervisor:
             self._respond_errno(notif.id, errno_code)
         elif action == NotifAction.VIRTUALIZE:
             self._respond_virtualize(notif.id, virtual_content)
+
+        self._emit_event(nr, pid, path=path, flags=flags,
+                         denied=(action == NotifAction.DENY))
 
     # COW handlers moved to cowfs/_notif_handler.py
 

@@ -35,6 +35,38 @@ def read_cstring(pid: int, addr: int, max_len: int = 4096) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+def read_argv(pid: int, argv_addr: int, max_args: int = 32) -> tuple[str, ...]:
+    """Read a NULL-terminated argv array from a child process's memory.
+
+    Args:
+        pid: Target process ID.
+        argv_addr: Virtual address of the char** argv pointer array.
+        max_args: Maximum number of arguments to read.
+
+    Returns:
+        Tuple of decoded argument strings.
+    """
+    import struct
+    fd = os.open(f"/proc/{pid}/mem", os.O_RDONLY)
+    try:
+        args = []
+        for i in range(max_args):
+            ptr_bytes = os.pread(fd, 8, argv_addr + i * 8)
+            if len(ptr_bytes) < 8:
+                break
+            ptr = struct.unpack("Q", ptr_bytes)[0]
+            if ptr == 0:
+                break
+            data = os.pread(fd, 4096, ptr)
+            nul = data.find(b"\0")
+            if nul >= 0:
+                data = data[:nul]
+            args.append(data.decode("utf-8", errors="replace"))
+        return tuple(args)
+    finally:
+        os.close(fd)
+
+
 def read_bytes(pid: int, addr: int, length: int) -> bytes:
     """Read raw bytes from a child process's memory.
 
