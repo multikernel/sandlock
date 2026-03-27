@@ -92,17 +92,22 @@ print("[agent] done")
         received.clear()
 
         async def install_guard(events, ctx):
-            """Detect 'python3 setup.py' in execve argv, revoke network."""
+            """Detect 'python3 setup.py' in execve argv, restrict that PID.
+
+            Uses restrict_pid() so only the setup.py process and its
+            children (e.g. nc, curl) lose network access.  The parent
+            agent keeps full permissions.
+            """
             async for e in events:
                 if e.syscall == "execve" and e.argv:
-                    # Check if any argv element is a setup.py path
                     for arg in e.argv:
                         if arg.endswith("setup.py"):
-                            print(f"[policy_fn] argv={list(e.argv)}"
-                                  " — revoking network", flush=True)
-                            ctx.restrict(
-                                allowed_ips=frozenset({"0.0.0.0"}))
-                            return
+                            print(f"[policy_fn] PID {e.pid} "
+                                  f"argv={list(e.argv)}"
+                                  " — restricting", flush=True)
+                            ctx.restrict_pid(e.pid,
+                                             allowed_ips=frozenset())
+                            break
 
         with Sandbox(policy, policy_fn=install_guard) as sb:
             sb.exec(["python3", agent_py])

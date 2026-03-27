@@ -230,3 +230,80 @@ class TestPolicyFnIntegration:
 
         # policy_fn should have been invoked
         assert called.is_set()
+
+    def test_restrict_pid_propagates_to_children(self):
+        """restrict_pid on a parent propagates to its child processes."""
+        import os
+        import socket
+        import tempfile
+
+        # Start a local TCP server
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        received = []
+
+        def serve():
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                    received.append(conn.recv(4096))
+                    conn.close()
+                except OSError:
+                    break
+
+        srv_thread = threading.Thread(target=serve, daemon=True)
+        srv_thread.start()
+
+        with tempfile.TemporaryDirectory() as workspace:
+            # Script that spawns a child which connects to our server
+            parent_py = os.path.join(workspace, "parent.py")
+            child_py = os.path.join(workspace, "child.py")
+
+            with open(child_py, "w") as f:
+                f.write(f"""\
+import socket
+try:
+    s = socket.create_connection(("127.0.0.1", {port}), timeout=2)
+    s.sendall(b"leaked")
+    s.close()
+except OSError:
+    pass
+""")
+
+            with open(parent_py, "w") as f:
+                f.write(f"""\
+import subprocess, sys
+subprocess.run([sys.executable, "{child_py}"])
+""")
+
+            import sys
+            python_paths = [p for p in sys.path if p and os.path.isdir(p)]
+            policy = Policy(
+                fs_readable=["/usr", "/lib", "/lib64", "/bin",
+                             "/etc", "/dev", "/tmp", workspace] + python_paths,
+                fs_writable=[workspace, "/tmp"],
+            )
+
+            # Restrict the parent.py process — child.py should inherit
+            async def guard(events, ctx):
+                async for e in events:
+                    if (e.syscall == "execve" and e.argv
+                            and any("parent.py" in a for a in e.argv)):
+                        ctx.restrict_pid(e.pid, allowed_ips=frozenset())
+                        break
+
+            received.clear()
+            with Sandbox(policy, policy_fn=guard) as sb:
+                sb.exec(["python3", parent_py])
+                sb.wait(timeout=15)
+
+            # child.py's connect should have been blocked
+            assert not received, (
+                f"Child process leaked data despite parent restrict_pid: "
+                f"{received}"
+            )
+
+        srv.close()

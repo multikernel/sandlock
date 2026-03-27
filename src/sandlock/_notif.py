@@ -699,11 +699,31 @@ class NotifSupervisor:
         except OSError:
             pass
 
+    def _inherit_pid_policy(self, pid: int) -> None:
+        """If this PID's parent has a per-PID policy, inherit it."""
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                # Field 4 (0-indexed 3) is ppid.  The comm field (2) may
+                # contain spaces/parens, so split from the right of ')'.
+                data = f.read()
+                ppid = int(data[data.rfind(")") + 2:].split()[1])
+        except (OSError, ValueError, IndexError):
+            return
+        parent_policy = self._pid_policies.get(ppid)
+        if parent_policy is not None:
+            self._pid_policies[pid] = parent_policy
+
     def _dispatch(self, notif: SeccompNotif) -> None:
         """Route a notification to the appropriate handler."""
-        # Lazily track every PID that makes an intercepted syscall
+        # Lazily track every PID that makes an intercepted syscall.
+        # If this PID is new and its parent has a per-PID policy,
+        # inherit that policy (child processes of restricted PIDs
+        # are also restricted).
         pid = notif.pid
-        self._proc_pids.add(pid)
+        if pid not in self._proc_pids:
+            self._proc_pids.add(pid)
+            if self._pid_policies:
+                self._inherit_pid_policy(pid)
         nr = notif.data.nr
 
 
