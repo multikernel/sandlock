@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import os
+import signal
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -142,6 +143,21 @@ _lib.sandlock_run.argtypes = [_c_policy_p, ctypes.POINTER(ctypes.c_char_p), ctyp
 
 _lib.sandlock_run_interactive.restype = ctypes.c_int
 _lib.sandlock_run_interactive.argtypes = [_c_policy_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
+
+# Spawn handle
+_c_handle_p = ctypes.c_void_p
+
+_lib.sandlock_spawn.restype = _c_handle_p
+_lib.sandlock_spawn.argtypes = [_c_policy_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
+
+_lib.sandlock_handle_pid.restype = ctypes.c_int
+_lib.sandlock_handle_pid.argtypes = [_c_handle_p]
+
+_lib.sandlock_handle_wait.restype = _c_result_p
+_lib.sandlock_handle_wait.argtypes = [_c_handle_p]
+
+_lib.sandlock_handle_free.restype = None
+_lib.sandlock_handle_free.argtypes = [_c_handle_p]
 
 # Result
 _lib.sandlock_result_exit_code.restype = ctypes.c_int
@@ -470,13 +486,46 @@ class Sandbox:
         self._init_fn = init_fn
         self._work_fn = work_fn
         self._native = _NativePolicy.from_dataclass(policy, policy_fn=policy_fn)
+        self._handle = None  # live sandbox handle during run()
+
+    @property
+    def pid(self) -> int | None:
+        """Child PID while running, None otherwise."""
+        if self._handle is None:
+            return None
+        return _lib.sandlock_handle_pid(self._handle) or None
+
+    def pause(self) -> None:
+        """Send SIGSTOP to the sandbox process group."""
+        pid = self.pid
+        if pid is None:
+            raise RuntimeError("sandbox is not running")
+        os.killpg(pid, signal.SIGSTOP)
+
+    def resume(self) -> None:
+        """Send SIGCONT to the sandbox process group."""
+        pid = self.pid
+        if pid is None:
+            raise RuntimeError("sandbox is not running")
+        os.killpg(pid, signal.SIGCONT)
 
     def run(self, cmd: list[str]) -> Result:
         """Run a command in the sandbox, capturing stdout and stderr."""
         argv, argc = _make_argv(cmd)
-        result_p = _lib.sandlock_run(self._native.ptr, argv, argc)
+
+        # Spawn (non-blocking) so PID is available for pause/resume
+        self._handle = _lib.sandlock_spawn(self._native.ptr, argv, argc)
+        if not self._handle:
+            return Result(success=False, exit_code=-1, error="sandlock_spawn failed")
+
+        try:
+            result_p = _lib.sandlock_handle_wait(self._handle)
+        finally:
+            _lib.sandlock_handle_free(self._handle)
+            self._handle = None
+
         if not result_p:
-            return Result(success=False, exit_code=-1, error="sandlock_run failed")
+            return Result(success=False, exit_code=-1, error="sandlock_handle_wait failed")
 
         exit_code = _lib.sandlock_result_exit_code(result_p)
         success = _lib.sandlock_result_success(result_p)

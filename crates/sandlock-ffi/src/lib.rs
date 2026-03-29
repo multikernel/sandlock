@@ -363,6 +363,87 @@ pub unsafe extern "C" fn sandlock_run(
     }
 }
 
+// ----------------------------------------------------------------
+// Sandbox handle (spawn / wait — for pause/resume via PID)
+// ----------------------------------------------------------------
+
+/// Opaque handle for a live (spawned) sandbox.
+/// Owns both the Sandbox and the tokio Runtime that drives its supervisor.
+pub struct sandlock_handle_t {
+    sandbox: Sandbox,
+    runtime: tokio::runtime::Runtime,
+}
+
+/// Spawn a sandboxed process without waiting. Returns a live handle.
+/// Use `sandlock_handle_pid` to get the PID, then `sandlock_handle_wait`
+/// to collect the result when done.
+///
+/// # Safety
+/// `policy` must be a valid policy pointer. `argv` must point to `argc` C strings.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_spawn(
+    policy: *const sandlock_policy_t,
+    argv: *const *const c_char,
+    argc: c_uint,
+) -> *mut sandlock_handle_t {
+    if policy.is_null() || argv.is_null() { return ptr::null_mut(); }
+    let policy = &(*policy)._private;
+    let args = read_argv(argv, argc);
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    let mut sb = match Sandbox::new(policy) {
+        Ok(sb) => sb,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    if rt.block_on(sb.spawn_captured(&arg_refs)).is_err() {
+        return ptr::null_mut();
+    }
+
+    Box::into_raw(Box::new(sandlock_handle_t { sandbox: sb, runtime: rt }))
+}
+
+/// Get the child PID. Returns 0 if not available.
+///
+/// # Safety
+/// `h` must be a valid handle from `sandlock_spawn`.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_handle_pid(h: *const sandlock_handle_t) -> i32 {
+    if h.is_null() { return 0; }
+    (*h).sandbox.pid().unwrap_or(0)
+}
+
+/// Wait for the sandbox to exit. Returns a result handle with stdout/stderr.
+///
+/// # Safety
+/// `h` must be a valid handle from `sandlock_spawn`.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_handle_wait(h: *mut sandlock_handle_t) -> *mut sandlock_result_t {
+    if h.is_null() { return ptr::null_mut(); }
+    let h = &mut *h;
+    match h.runtime.block_on(h.sandbox.wait()) {
+        Ok(result) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Free a sandbox handle. Kills the process if still running.
+///
+/// # Safety
+/// `h` must be null or a valid handle from `sandlock_spawn`.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_handle_free(h: *mut sandlock_handle_t) {
+    if !h.is_null() {
+        let mut handle = *Box::from_raw(h);
+        let _ = handle.sandbox.kill();
+    }
+}
+
 /// Run a command with inherited stdio (interactive). Returns exit code.
 ///
 /// # Safety

@@ -503,6 +503,11 @@ impl Sandbox {
         self.do_spawn(cmd, false).await
     }
 
+    /// Like `spawn` but captures stdout and stderr (available via `wait()`).
+    pub async fn spawn_captured(&mut self, cmd: &[&str]) -> Result<(), SandlockError> {
+        self.do_spawn(cmd, true).await
+    }
+
     /// Spawn with explicit stdin/stdout/stderr fd redirection.
     ///
     /// Each `Option<RawFd>` overrides the corresponding fd in the child:
