@@ -441,6 +441,7 @@ impl Sandbox {
     }
 
     /// Return whether the child is currently running.
+    #[doc(hidden)]
     pub fn is_running(&self) -> bool {
         matches!(self.state, SandboxState::Running | SandboxState::Paused)
     }
@@ -451,6 +452,7 @@ impl Sandbox {
     }
 
     /// Commit COW writes to the original directory.
+    #[doc(hidden)]
     pub async fn commit(&mut self) -> Result<(), SandlockError> {
         if let Some(branch) = self.cow_branch.take() {
             branch.commit().map_err(|e| SandlockError::Sandbox(SandboxError::Branch(e)))?;
@@ -459,6 +461,7 @@ impl Sandbox {
     }
 
     /// Discard COW writes.
+    #[doc(hidden)]
     pub async fn abort_branch(&mut self) -> Result<(), SandlockError> {
         if let Some(branch) = self.cow_branch.take() {
             branch.abort().map_err(|e| SandlockError::Sandbox(SandboxError::Branch(e)))?;
@@ -499,11 +502,14 @@ impl Sandbox {
 
     /// Spawn a sandboxed process without waiting for it to exit.
     /// Use `wait()` to collect the exit status when done.
+    #[doc(hidden)]
     pub async fn spawn(&mut self, cmd: &[&str]) -> Result<(), SandlockError> {
         self.do_spawn(cmd, false).await
     }
 
     /// Like `spawn` but captures stdout and stderr (available via `wait()`).
+    /// Not part of the public API — used by the FFI crate.
+    #[doc(hidden)]
     pub async fn spawn_captured(&mut self, cmd: &[&str]) -> Result<(), SandlockError> {
         self.do_spawn(cmd, true).await
     }
@@ -516,6 +522,7 @@ impl Sandbox {
     /// - `stderr_fd`: dup2'd to fd 2
     ///
     /// The caller is responsible for closing the fds after this call.
+    #[doc(hidden)]
     pub async fn spawn_with_io(
         &mut self,
         cmd: &[&str],
