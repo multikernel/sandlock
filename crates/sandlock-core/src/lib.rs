@@ -19,6 +19,7 @@ pub(crate) mod port_remap;
 pub mod pipeline;
 pub mod policy_fn;
 pub mod image;
+pub mod fork;
 
 pub use error::SandlockError;
 pub use checkpoint::Checkpoint;

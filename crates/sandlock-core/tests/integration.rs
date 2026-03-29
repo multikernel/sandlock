@@ -36,3 +36,6 @@ mod test_network;
 
 #[path = "integration/test_policy_fn.rs"]
 mod test_policy_fn;
+
+#[path = "integration/test_fork.rs"]
+mod test_fork;

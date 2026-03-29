@@ -177,6 +177,38 @@ _lib.sandlock_pipeline_free.argtypes = [_c_pipeline_p]
 _lib.sandlock_string_free.restype = None
 _lib.sandlock_string_free.argtypes = [ctypes.c_char_p]
 
+# Fork
+_INIT_FN_TYPE = ctypes.CFUNCTYPE(None)
+_WORK_FN_TYPE = ctypes.CFUNCTYPE(None, ctypes.c_uint32)
+
+_c_sandbox_p = ctypes.c_void_p
+
+_lib.sandlock_new_with_fns.restype = _c_sandbox_p
+_lib.sandlock_new_with_fns.argtypes = [_c_policy_p, _INIT_FN_TYPE, _WORK_FN_TYPE]
+
+_c_fork_result_p = ctypes.c_void_p
+
+_lib.sandlock_fork.restype = _c_fork_result_p
+_lib.sandlock_fork.argtypes = [_c_sandbox_p, ctypes.c_uint32]
+
+_lib.sandlock_fork_result_count.restype = ctypes.c_uint32
+_lib.sandlock_fork_result_count.argtypes = [_c_fork_result_p]
+
+_lib.sandlock_fork_result_pid.restype = ctypes.c_int32
+_lib.sandlock_fork_result_pid.argtypes = [_c_fork_result_p, ctypes.c_uint32]
+
+_lib.sandlock_reduce.restype = _c_result_p
+_lib.sandlock_reduce.argtypes = [_c_fork_result_p, _c_policy_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
+
+_lib.sandlock_fork_result_free.restype = None
+_lib.sandlock_fork_result_free.argtypes = [_c_fork_result_p]
+
+_lib.sandlock_wait.restype = ctypes.c_int
+_lib.sandlock_wait.argtypes = [_c_sandbox_p]
+
+_lib.sandlock_sandbox_free.restype = None
+_lib.sandlock_sandbox_free.argtypes = [_c_sandbox_p]
+
 
 # ----------------------------------------------------------------
 # SyscallEvent & PolicyContext (Python wrappers for policy_fn)
@@ -431,9 +463,12 @@ class Sandbox:
         assert b"hello" in result.stdout
     """
 
-    def __init__(self, policy: PolicyDataclass, policy_fn=None):
+    def __init__(self, policy: PolicyDataclass, policy_fn=None,
+                 init_fn=None, work_fn=None):
         self._policy_dc = policy
         self._policy_fn = policy_fn
+        self._init_fn = init_fn
+        self._work_fn = work_fn
         self._native = _NativePolicy.from_dataclass(policy, policy_fn=policy_fn)
 
     def run(self, cmd: list[str]) -> Result:
@@ -464,6 +499,124 @@ class Sandbox:
     def cmd(self, args: list[str]) -> Stage:
         """Bind a command to this sandbox, returning a lazy Stage."""
         return Stage(self, args)
+
+    def fork(self, n: int) -> list[int]:
+        """Create N COW clones. init_fn runs once, work_fn in each clone.
+
+        Requires init_fn and work_fn passed to Sandbox().
+
+        Returns list of clone PIDs.
+
+        Example::
+
+            sb = Sandbox(policy,
+                init_fn=lambda: load_model(),
+                work_fn=lambda clone_id: rollout(clone_id),
+            )
+            pids = sb.fork(1000)
+        """
+        if self._init_fn is None or self._work_fn is None:
+            raise RuntimeError("fork() requires init_fn and work_fn in Sandbox()")
+
+        c_init = _INIT_FN_TYPE(self._init_fn)
+        _user_work = self._work_fn
+        def _flushing_work(clone_id):
+            import sys, os, io
+            # After dup2, Python's sys.stdout still points to old fd.
+            # Replace it with a fresh wrapper on fd 1.
+            sys.stdout = io.TextIOWrapper(io.FileIO(1, 'w', closefd=False), line_buffering=True)
+            _user_work(clone_id)
+            sys.stdout.flush()
+        c_work = _WORK_FN_TYPE(_flushing_work)
+        self._c_init = c_init  # prevent GC
+        self._c_work = c_work
+
+        sb_ptr = _lib.sandlock_new_with_fns(self._native.ptr, c_init, c_work)
+        if not sb_ptr:
+            raise RuntimeError("sandlock_new_with_fns failed")
+
+        # Fork N clones — returns opaque handle with pipes
+        fork_result = _lib.sandlock_fork(sb_ptr, n)
+
+        # Wait for template
+        _lib.sandlock_wait(sb_ptr)
+        _lib.sandlock_sandbox_free(sb_ptr)
+
+        if not fork_result:
+            return ForkResult(None, [], self._native)
+
+        count = _lib.sandlock_fork_result_count(fork_result)
+        pids = [_lib.sandlock_fork_result_pid(fork_result, i) for i in range(count)]
+
+        return ForkResult(fork_result, pids, self._native)
+
+    def reduce(self, cmd: list[str], fork_result: "ForkResult") -> Result:
+        """Reduce: read clone stdout pipes, feed to reducer stdin.
+
+        Args:
+            cmd: Reducer command (receives combined clone output on stdin).
+            fork_result: ForkResult from fork().
+
+        Returns:
+            Result with reducer's stdout/stderr.
+
+        Example::
+
+            clones = mapper.fork(4)
+            result = reducer.reduce(["python3", "sum.py"], clones)
+        """
+        if fork_result._ptr is None:
+            return Result(success=False, exit_code=-1, error="no fork result")
+
+        argv, argc = _make_argv(cmd)
+        result_p = _lib.sandlock_reduce(
+            fork_result._ptr, self._native.ptr, argv, argc,
+        )
+        fork_result._ptr = None  # consumed by reduce
+
+        if not result_p:
+            return Result(success=False, exit_code=-1, error="reduce failed")
+
+        exit_code = _lib.sandlock_result_exit_code(result_p)
+        success = _lib.sandlock_result_success(result_p)
+        stdout = _read_result_bytes(result_p, _lib.sandlock_result_stdout_bytes)
+        stderr = _read_result_bytes(result_p, _lib.sandlock_result_stderr_bytes)
+        _lib.sandlock_result_free(result_p)
+
+        return Result(
+            success=bool(success),
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+
+# ----------------------------------------------------------------
+# ForkResult (holds clone handles with pipes for reduce)
+# ----------------------------------------------------------------
+
+class ForkResult:
+    """Result of fork() — holds clone handles and stdout pipes.
+
+    Pass to reducer.reduce() to pipe clone output to the reducer.
+    Can also iterate clones via indexing or len().
+    """
+
+    def __init__(self, ptr, pids: list[int], native_policy):
+        self._ptr = ptr  # sandlock_fork_result_t (owns pipes)
+        self.pids = pids
+        self._native_policy = native_policy
+
+    def __len__(self):
+        return len(self.pids)
+
+    def __getitem__(self, i):
+        return self.pids[i]
+
+    def __del__(self):
+        if self._ptr is not None:
+            _lib.sandlock_fork_result_free(self._ptr)
+            self._ptr = None
 
 
 # ----------------------------------------------------------------

@@ -81,6 +81,14 @@ pub struct Sandbox {
     cow_branch: Option<Box<dyn CowBranch>>,
     /// Shared supervisor state for freeze/thaw support.
     supervisor_state: Option<Arc<Mutex<SupervisorState>>>,
+    /// Control pipe for fork commands (parent end).
+    ctrl_fd: Option<OwnedFd>,
+    /// Stdout pipe read end (for fork clones — used by reduce).
+    stdout_pipe: Option<OwnedFd>,
+    /// Init function (runs once in child before fork).
+    init_fn: Option<Box<dyn FnOnce() + Send + 'static>>,
+    /// Work function (runs in each fork clone).
+    work_fn: Option<Arc<dyn Fn(u32) + Send + Sync + 'static>>,
     /// Optional fd overrides for stdin/stdout/stderr (used by Pipeline).
     io_overrides: Option<(Option<i32>, Option<i32>, Option<i32>)>,
 }
@@ -88,7 +96,34 @@ pub struct Sandbox {
 impl Sandbox {
     /// Create a new sandbox in the `Created` state.
     pub fn new(policy: &Policy) -> Result<Self, SandlockError> {
-        Ok(Self {
+        Ok(Self::create(policy))
+    }
+
+    /// Create a sandbox with init and work functions for COW forking.
+    ///
+    /// `init_fn` runs once in the child to load expensive state.
+    /// `work_fn` runs in each COW clone created by `fork(N)`.
+    ///
+    /// ```ignore
+    /// let mut sb = Sandbox::new_with_fns(&policy,
+    ///     || { load_model(); },
+    ///     |clone_id| { rollout(clone_id); },
+    /// )?;
+    /// let clones = sb.fork(1000).await?;
+    /// ```
+    pub fn new_with_fns(
+        policy: &Policy,
+        init_fn: impl FnOnce() + Send + 'static,
+        work_fn: impl Fn(u32) + Send + Sync + 'static,
+    ) -> Result<Self, SandlockError> {
+        let mut sb = Self::create(policy);
+        sb.init_fn = Some(Box::new(init_fn));
+        sb.work_fn = Some(Arc::new(work_fn));
+        Ok(sb)
+    }
+
+    fn create(policy: &Policy) -> Self {
+        Self {
             policy: policy.clone(),
             state: SandboxState::Created,
             child_pid: None,
@@ -99,8 +134,12 @@ impl Sandbox {
             _stderr_read: None,
             cow_branch: None,
             supervisor_state: None,
+            ctrl_fd: None,
+            stdout_pipe: None,
+            init_fn: None,
+            work_fn: None,
             io_overrides: None,
-        })
+        }
     }
 
     /// One-shot: spawn a sandboxed process, wait for it to exit, and return
@@ -116,6 +155,195 @@ impl Sandbox {
         let mut sb = Self::new(policy)?;
         sb.do_spawn(cmd, false).await?;
         sb.wait().await
+    }
+
+    /// Create N COW clones of this sandbox.
+    ///
+    /// Requires `new_with_fns()`. Forks a confined child, runs `init_fn`,
+    /// then forks N times using raw `fork()` (bypasses seccomp). Each
+    /// clone gets `CLONE_ID=0..N-1` and runs `work_fn(clone_id)`.
+    ///
+    /// Memory pages from `init_fn` are shared copy-on-write across all
+    /// clones — 1000 clones of a 50MB process use ~50MB total.
+    ///
+    /// Returns PIDs of all clones. Use `waitpid` to collect them.
+    /// Create N COW clones, each runs `work_fn(clone_id)`.
+    ///
+    /// Returns a Vec of Sandbox handles — one per clone. Each clone is
+    /// a live process that can be waited on, killed, or paused.
+    ///
+    /// ```ignore
+    /// let clones = sb.fork(4).await?;
+    /// for mut c in clones { c.wait().await?; }
+    /// ```
+    pub async fn fork(&mut self, n: u32) -> Result<Vec<Sandbox>, SandlockError> {
+        let init_fn = self.init_fn.take()
+            .ok_or_else(|| SandboxError::Child("fork() requires new_with_fns()".into()))?;
+        let work_fn = self.work_fn.take()
+            .ok_or_else(|| SandboxError::Child("fork() requires new_with_fns()".into()))?;
+
+        let policy = self.policy.clone();
+
+
+        // Create control pipe
+        let mut ctrl_fds = [0i32; 2];
+        if unsafe { libc::pipe2(ctrl_fds.as_mut_ptr(), 0) } < 0 {
+            return Err(SandboxError::Io(std::io::Error::last_os_error()).into());
+        }
+        let ctrl_parent = unsafe { OwnedFd::from_raw_fd(ctrl_fds[0]) };
+        let ctrl_child_fd = ctrl_fds[1];
+
+        // Create per-clone stdout pipes (parent keeps read ends)
+        let mut pipe_read_ends: Vec<OwnedFd> = Vec::with_capacity(n as usize);
+        let mut pipe_write_fds: Vec<i32> = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            let mut pfds = [0i32; 2];
+            if unsafe { libc::pipe(pfds.as_mut_ptr()) } >= 0 {
+                pipe_read_ends.push(unsafe { OwnedFd::from_raw_fd(pfds[0]) });
+                pipe_write_fds.push(pfds[1]);
+            } else {
+                pipe_write_fds.push(-1);
+            }
+        }
+
+        // Fork the template child
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            unsafe { libc::close(ctrl_child_fd) };
+            return Err(SandboxError::Fork(std::io::Error::last_os_error()).into());
+        }
+
+        if pid == 0 {
+            // ===== CHILD (template) =====
+            drop(ctrl_parent);
+
+            unsafe { libc::setpgid(0, 0) };
+            unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
+            unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+
+            let _ = crate::landlock::confine(&policy);
+
+            let deny = crate::context::deny_syscall_numbers(&policy);
+            let args = crate::context::arg_filters(&policy);
+            let filter = crate::seccomp::bpf::assemble_filter(&[], &deny, &args);
+            let _ = crate::seccomp::bpf::install_deny_filter(&filter);
+
+            CONFINED.store(true, std::sync::atomic::Ordering::Relaxed);
+
+            // Run init (loads expensive state, shared via COW)
+            init_fn();
+
+            // Close read ends in template (parent owns them)
+            drop(pipe_read_ends);
+
+            // Fork N clones, send PIDs, wait for all
+            crate::fork::fork_ready_loop_fn(ctrl_child_fd, n, &*work_fn, &pipe_write_fds);
+            unsafe { libc::_exit(0) };
+        }
+
+        // ===== PARENT =====
+        unsafe { libc::close(ctrl_child_fd) };
+        // Close write ends in parent (template/clones own them)
+        for wfd in &pipe_write_fds {
+            if *wfd >= 0 { unsafe { libc::close(*wfd) }; }
+        }
+        self.child_pid = Some(pid);
+        self.state = SandboxState::Running;
+
+        // Read N clone PIDs
+        let ctrl_fd = ctrl_parent.as_raw_fd();
+        let mut pid_buf = vec![0u8; n as usize * 4];
+        read_exact(ctrl_fd, &mut pid_buf);
+
+        let clone_pids: Vec<i32> = pid_buf.chunks(4)
+            .map(|c| u32::from_be_bytes(c.try_into().unwrap_or([0; 4])) as i32)
+            .collect();
+        let live_count = clone_pids.iter().filter(|&&p| p > 0).count();
+
+        // Read exit codes (template waits for all clones first)
+        let mut code_buf = vec![0u8; live_count * 4];
+        read_exact(ctrl_fd, &mut code_buf);
+        self.ctrl_fd = Some(ctrl_parent);
+
+        // Wait for template to exit
+        let mut status = 0i32;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+
+        // Create clone handles with stdout pipe read ends
+        let mut code_idx = 0;
+        let mut clones = Vec::with_capacity(live_count);
+        let mut pipe_iter = pipe_read_ends.into_iter();
+
+        for &clone_pid in &clone_pids {
+            let pipe = pipe_iter.next();
+            if clone_pid <= 0 { continue; }
+
+            let code = i32::from_be_bytes(
+                code_buf[code_idx * 4..(code_idx + 1) * 4].try_into().unwrap_or([0; 4])
+            );
+            code_idx += 1;
+
+            let mut sb = Sandbox::create(&policy);
+            sb.child_pid = Some(clone_pid);
+            sb.state = SandboxState::Stopped(if code == 0 {
+                ExitStatus::Code(0)
+            } else if code > 0 {
+                ExitStatus::Code(code)
+            } else {
+                ExitStatus::Killed
+            });
+            sb.stdout_pipe = pipe;
+            clones.push(sb);
+        }
+
+        Ok(clones)
+    }
+
+    /// Reduce: wait for all clones, then run a reducer command.
+    ///
+    /// Waits for every clone to finish, then runs `cmd` in this sandbox.
+    /// The reducer can read clone results from shared files, tmpdir, etc.
+    ///
+    /// ```ignore
+    /// let clones = mapper.fork(4).await?;
+    /// let result = reducer.reduce(&["python3", "sum.py"], &mut clones).await?;
+    /// ```
+    pub async fn reduce(
+        &self,
+        cmd: &[&str],
+        clones: &mut [Sandbox],
+    ) -> Result<RunResult, SandlockError> {
+        // Read each clone's stdout pipe and concatenate
+        let mut combined = Vec::new();
+        for clone in clones.iter_mut() {
+            if let Some(pipe) = clone.stdout_pipe.take() {
+                combined.extend_from_slice(&read_fd_to_end(pipe));
+            }
+        }
+
+        // Create a pipe to feed combined data to reducer's stdin
+        let mut stdin_fds = [0i32; 2];
+        if unsafe { libc::pipe2(stdin_fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+            return Err(SandboxError::Io(std::io::Error::last_os_error()).into());
+        }
+
+        // Write combined data in a blocking thread (avoid deadlock with large data)
+        let write_fd = stdin_fds[1];
+        let write_handle = tokio::task::spawn_blocking(move || {
+            unsafe {
+                libc::write(write_fd, combined.as_ptr() as *const _, combined.len());
+                libc::close(write_fd);
+            }
+        });
+
+        // Spawn reducer with stdin from pipe, capture stdout
+        let mut reducer = Sandbox::new(&self.policy)?;
+        reducer.io_overrides = Some((Some(stdin_fds[0]), None, None));
+        reducer.do_spawn(cmd, true).await?;
+        unsafe { libc::close(stdin_fds[0]) };
+
+        let _ = write_handle.await;
+        reducer.wait().await
     }
 
     /// Wait for the child process to exit.
@@ -722,6 +950,16 @@ async fn throttle_cpu(pid: i32, cpu_pct: u8) {
 
 /// Convert a raw waitpid status to our ExitStatus enum.
 /// Read all bytes from a file descriptor until EOF.
+/// Read exactly `buf.len()` bytes from a raw fd.
+fn read_exact(fd: i32, buf: &mut [u8]) {
+    let mut off = 0;
+    while off < buf.len() {
+        let r = unsafe { libc::read(fd, buf[off..].as_mut_ptr() as *mut _, buf.len() - off) };
+        if r <= 0 { break; }
+        off += r as usize;
+    }
+}
+
 fn read_fd_to_end(fd: OwnedFd) -> Vec<u8> {
     use std::io::Read;
     let mut file = unsafe { std::fs::File::from_raw_fd(fd.into_raw_fd()) };

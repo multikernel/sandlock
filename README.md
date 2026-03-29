@@ -338,6 +338,39 @@ on exit, aborted on error.
 **OverlayFS COW**: Uses kernel OverlayFS in a user namespace. Requires
 unprivileged user namespaces to be enabled.
 
+### COW Fork
+
+Initialize expensive state once, then fork COW clones that share memory.
+Each fork uses raw `fork(2)` (bypasses seccomp notification) for minimal
+overhead. 1000 clones in ~530ms, ~1,900 forks/sec.
+
+```python
+from sandlock import Sandbox, Policy
+
+def init():
+    global model, data
+    model = load_model()          # 2 GB, loaded once
+    data = preprocess_dataset()
+
+def work(clone_id):
+    result = rollout(model, data, clone_id)  # reads COW-shared globals
+    save_result(result)
+
+sb = Sandbox(policy, init_fn=init, work_fn=work)
+pids = sb.fork(1000)  # 1000 clones, ~50 MB shared (not 50 GB)
+```
+
+```rust
+let mut sb = Sandbox::new_with_fns(&policy,
+    || { load_model(); },
+    |clone_id| { rollout(clone_id); },
+)?;
+let pids = sb.fork(1000).await?;
+```
+
+Each clone inherits Landlock + seccomp confinement via `fork()`.
+`CLONE_ID` environment variable is set to 0..N-1.
+
 ### Port Virtualization
 
 Each sandbox gets a full virtual port space. Multiple sandboxes can bind
@@ -356,6 +389,7 @@ Benchmarked on a typical Linux workstation:
 | Redis SET (100K ops) | 82K rps | 80K rps | 52K rps | 97.1% of bare metal |
 | Redis GET (100K ops) | 79K rps | 77K rps | 53K rps | 97.1% of bare metal |
 | Redis p99 latency | 0.5 ms | 0.6 ms | 1.5 ms | ~2.5x lower than Docker |
+| COW fork ×1000 | — | 530 ms | — | 530μs/fork, ~1,900 forks/sec |
 
 ## Testing
 

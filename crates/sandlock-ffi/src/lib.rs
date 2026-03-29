@@ -793,6 +793,148 @@ pub unsafe extern "C" fn sandlock_ctx_allow_path(
 }
 
 // ----------------------------------------------------------------
+// COW Fork
+// ----------------------------------------------------------------
+
+/// C callback types for fork init and work functions.
+pub type sandlock_init_fn_t = unsafe extern "C" fn();
+pub type sandlock_work_fn_t = unsafe extern "C" fn(clone_id: u32);
+
+/// Create a sandbox with init/work functions for COW forking.
+///
+/// # Safety
+/// `policy` must be valid. `init_fn` and `work_fn` must be valid function pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_new_with_fns(
+    policy: *const sandlock_policy_t,
+    init_fn: sandlock_init_fn_t,
+    work_fn: sandlock_work_fn_t,
+) -> *mut Sandbox {
+    if policy.is_null() { return ptr::null_mut(); }
+    let policy = &(*policy)._private;
+
+    let init = move || { unsafe { init_fn() } };
+    let work = move |id: u32| { unsafe { work_fn(id) } };
+
+    match Sandbox::new_with_fns(policy, init, work) {
+        Ok(sb) => Box::into_raw(Box::new(sb)),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Opaque handle for fork result (holds clone handles with pipes).
+pub struct sandlock_fork_result_t {
+    clones: Vec<Sandbox>,
+}
+
+/// Fork N COW clones. Returns a fork result handle (NULL on error).
+///
+/// # Safety
+/// `sb` must be a valid sandbox pointer from `sandlock_new_with_fns`.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_fork(
+    sb: *mut Sandbox,
+    n: u32,
+) -> *mut sandlock_fork_result_t {
+    if sb.is_null() { return ptr::null_mut(); }
+    let sb = &mut *sb;
+
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    match rt.block_on(sb.fork(n)) {
+        Ok(clones) => Box::into_raw(Box::new(sandlock_fork_result_t { clones })),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Get the number of clones.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_fork_result_count(r: *const sandlock_fork_result_t) -> u32 {
+    if r.is_null() { return 0; }
+    (*r).clones.len() as u32
+}
+
+/// Get a clone's PID.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_fork_result_pid(r: *const sandlock_fork_result_t, index: u32) -> i32 {
+    if r.is_null() { return 0; }
+    (&(*r).clones).get(index as usize).and_then(|c| c.pid()).unwrap_or(0)
+}
+
+/// Reduce: read all clone stdout pipes, feed to reducer stdin, return result.
+///
+/// # Safety
+/// `fork_result` is consumed. `policy` and `argv` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_reduce(
+    fork_result: *mut sandlock_fork_result_t,
+    policy: *const sandlock_policy_t,
+    argv: *const *const c_char,
+    argc: c_uint,
+) -> *mut sandlock_result_t {
+    if fork_result.is_null() || policy.is_null() || argv.is_null() {
+        return ptr::null_mut();
+    }
+    let mut fr = *Box::from_raw(fork_result);
+    let policy = &(*policy)._private;
+    let args = read_argv(argv, argc);
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    let reducer = match Sandbox::new(policy) {
+        Ok(r) => r,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    match rt.block_on(reducer.reduce(&arg_refs, &mut fr.clones)) {
+        Ok(result) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Free a fork result without reducing.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_fork_result_free(r: *mut sandlock_fork_result_t) {
+    if !r.is_null() { drop(Box::from_raw(r)); }
+}
+
+/// Wait for the sandbox template to exit. Returns exit code.
+///
+/// # Safety
+/// `sb` must be a valid sandbox pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_wait(sb: *mut Sandbox) -> c_int {
+    if sb.is_null() { return -1; }
+    let sb = &mut *sb;
+
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(_) => return -1,
+    };
+
+    match rt.block_on(sb.wait()) {
+        Ok(r) => r.code().unwrap_or(-1),
+        Err(_) => -1,
+    }
+}
+
+/// Free a sandbox handle.
+///
+/// # Safety
+/// `sb` must be null or a valid sandbox pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_free(sb: *mut Sandbox) {
+    if !sb.is_null() { drop(Box::from_raw(sb)); }
+}
+
+// ----------------------------------------------------------------
 // Helpers
 // ----------------------------------------------------------------
 
