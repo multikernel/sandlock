@@ -1,8 +1,41 @@
 use sandlock_core::{Policy, Sandbox};
 
+/// Check if user namespaces with uid mapping actually work in this environment.
+/// Some CI environments (containers, restricted kernels) allow unshare but block
+/// writing to /proc/self/uid_map.
+fn userns_available() -> bool {
+    // Fork a child that tries unshare(CLONE_NEWUSER) + uid_map write.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return false;
+    }
+    if pid == 0 {
+        // Child: try unshare + write uid_map
+        if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
+            unsafe { libc::_exit(1) };
+        }
+        let uid = unsafe { libc::getuid() };
+        let map = format!("0 {} 1\n", uid);
+        let ok = std::fs::write("/proc/self/setgroups", "deny\n").is_ok()
+            && std::fs::write("/proc/self/uid_map", &map).is_ok()
+            && std::fs::write("/proc/self/gid_map", &map).is_ok()
+            && unsafe { libc::getuid() } == 0;
+        unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+    }
+    // Parent: wait and check exit status
+    let mut status: i32 = 0;
+    unsafe { libc::waitpid(pid, &mut status, 0) };
+    libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+}
+
 /// Test that privileged mode makes the child appear as uid 0.
 #[tokio::test]
 async fn test_privileged_uid_zero() {
+    if !userns_available() {
+        eprintln!("Skipping: user namespaces not available in this environment");
+        return;
+    }
+
     let policy = Policy::builder()
         .fs_read("/usr")
         .fs_read("/lib")
@@ -23,6 +56,11 @@ async fn test_privileged_uid_zero() {
 /// Test that privileged mode makes the child appear as gid 0.
 #[tokio::test]
 async fn test_privileged_gid_zero() {
+    if !userns_available() {
+        eprintln!("Skipping: user namespaces not available in this environment");
+        return;
+    }
+
     let policy = Policy::builder()
         .fs_read("/usr")
         .fs_read("/lib")
