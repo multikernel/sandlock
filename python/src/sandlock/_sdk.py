@@ -464,6 +464,42 @@ class Checkpoint:
         return cls(ptr)
 
     @classmethod
+    def restore(
+        cls,
+        name: str,
+        restore_fn: "Callable[[bytes], None]",
+        *,
+        store: "Path | str | None" = None,
+    ) -> "Checkpoint":
+        """Load a checkpoint and pass its app state to restore_fn.
+
+        Convenience for ``load()`` + calling ``restore_fn(cp.app_state)``.
+
+        Args:
+            name: Checkpoint name.
+            restore_fn: Callback that receives the saved application-level
+                state bytes. Use this to rebuild state that ptrace can't
+                capture (caches, session data, etc.).
+            store: Storage root. Defaults to ``~/.sandlock/checkpoints/``.
+
+        Returns:
+            The loaded Checkpoint.
+
+        Raises:
+            FileNotFoundError: If the checkpoint does not exist.
+            ValueError: If the checkpoint has no app_state.
+        """
+        cp = cls.load(name, store=store)
+        state = cp.app_state
+        if state is None:
+            raise ValueError(
+                f"Checkpoint {name!r} has no app_state — "
+                "was it created with save_fn?"
+            )
+        restore_fn(state)
+        return cp
+
+    @classmethod
     def list(cls, *, store: Path | str | None = None) -> list[str]:
         """List all named checkpoints.
 
@@ -694,14 +730,23 @@ class Sandbox:
             raise RuntimeError("sandbox is not running")
         os.killpg(pid, signal.SIGCONT)
 
-    def checkpoint(self) -> Checkpoint:
+    def checkpoint(
+        self,
+        save_fn: "Callable[[], bytes] | None" = None,
+    ) -> Checkpoint:
         """Capture a checkpoint of the running sandbox.
 
         The sandbox is frozen (SIGSTOP + fork-hold), state is captured
         via ptrace + /proc, then thawed.
 
+        Args:
+            save_fn: Optional callback that returns application-level
+                state bytes. Called after OS-level capture; the result
+                is stored in ``checkpoint.app_state``. Use this for
+                state that ptrace can't see (caches, session data, etc.).
+
         Returns:
-            Checkpoint with process state, memory, fds.
+            Checkpoint with process state, memory, fds, and optional app state.
 
         Raises:
             RuntimeError: If the sandbox is not running or capture fails.
@@ -711,7 +756,10 @@ class Sandbox:
         ptr = _lib.sandlock_handle_checkpoint(self._handle)
         if not ptr:
             raise RuntimeError("checkpoint capture failed")
-        return Checkpoint(ptr)
+        cp = Checkpoint(ptr)
+        if save_fn is not None:
+            cp.app_state = save_fn()
+        return cp
 
     def run(self, cmd: list[str]) -> Result:
         """Run a command in the sandbox, capturing stdout and stderr."""
