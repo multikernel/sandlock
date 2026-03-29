@@ -42,14 +42,6 @@ pub unsafe fn syscall2(nr: i64, a1: u64, a2: u64) -> io::Result<i64> {
     syscall3(nr, a1, a2, 0)
 }
 
-/// Raw 1-argument syscall.
-///
-/// # Safety
-/// Caller must ensure arguments are valid for the given syscall number.
-pub unsafe fn syscall1(nr: i64, a1: u64) -> io::Result<i64> {
-    syscall3(nr, a1, 0, 0)
-}
-
 // ============================================================
 // Landlock wrappers
 // ============================================================

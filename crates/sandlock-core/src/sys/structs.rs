@@ -193,9 +193,7 @@ pub const BPF_AND: u16 = 0x50;
 pub const OFFSET_NR: u32 = 0;
 pub const OFFSET_ARCH: u32 = 4;
 pub const OFFSET_ARGS0_LO: u32 = 16;
-pub const OFFSET_ARGS0_HI: u32 = 20;
 pub const OFFSET_ARGS1_LO: u32 = 24;
-pub const OFFSET_ARGS1_HI: u32 = 28;
 pub const OFFSET_ARGS2_LO: u32 = 32;
 
 // ============================================================

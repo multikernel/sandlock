@@ -12,7 +12,6 @@ const FS_IOC_BRANCH_ABORT: libc::c_ulong = 0x00006202;
 pub(crate) struct BranchFsBranch {
     ctl_path: PathBuf,
     branch_path: PathBuf,
-    uuid: String,
 }
 
 impl BranchFsBranch {
@@ -44,7 +43,6 @@ impl BranchFsBranch {
         Ok(Self {
             ctl_path: branch_ctl,
             branch_path,
-            uuid,
         })
     }
 
@@ -75,23 +73,6 @@ impl CowBranch for BranchFsBranch {
 
     fn abort(&self) -> Result<(), BranchError> {
         self.ctl_ioctl(FS_IOC_BRANCH_ABORT)
-    }
-
-    fn create_child(&self) -> Result<Box<dyn CowBranch>, BranchError> {
-        Ok(Box::new(Self::create(&self.branch_path)?))
-    }
-
-    fn disk_usage(&self) -> Result<u64, BranchError> {
-        // Walk the branch path
-        let mut total = 0u64;
-        if let Ok(entries) = std::fs::read_dir(&self.branch_path) {
-            for entry in entries.flatten() {
-                if let Ok(meta) = entry.metadata() {
-                    total += meta.len();
-                }
-            }
-        }
-        Ok(total)
     }
 
     fn cleanup(&self) -> Result<(), BranchError> {

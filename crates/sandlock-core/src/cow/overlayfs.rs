@@ -6,13 +6,10 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 pub(crate) struct OverlayBranch {
-    id: String,
     base_dir: PathBuf,
     storage: PathBuf,
     upper: PathBuf,
-    work: PathBuf,
     merged: PathBuf,
-    lowers: Vec<PathBuf>,
 }
 
 impl OverlayBranch {
@@ -29,49 +26,11 @@ impl OverlayBranch {
         fs::create_dir_all(&merged).map_err(|e| BranchError::Operation(format!("create merged: {}", e)))?;
 
         Ok(Self {
-            id,
             base_dir: base.to_path_buf(),
             storage: branch_dir,
             upper,
-            work,
             merged,
-            lowers: vec![base.to_path_buf()],
         })
-    }
-
-    /// Mount the overlay filesystem. Requires user+mount namespace.
-    pub fn mount(&self) -> Result<(), BranchError> {
-        let lowerdir = self.lowers.iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(":");
-        let opts = format!(
-            "lowerdir={},upperdir={},workdir={}",
-            lowerdir,
-            self.upper.display(),
-            self.work.display(),
-        );
-
-        let merged_cstr = std::ffi::CString::new(self.merged.to_str().unwrap()).unwrap();
-        let overlay_cstr = std::ffi::CString::new("overlay").unwrap();
-        let opts_cstr = std::ffi::CString::new(opts).unwrap();
-
-        let ret = unsafe {
-            libc::mount(
-                overlay_cstr.as_ptr(),
-                merged_cstr.as_ptr(),
-                overlay_cstr.as_ptr(),
-                0,
-                opts_cstr.as_ptr() as *const libc::c_void,
-            )
-        };
-        if ret != 0 {
-            Err(BranchError::Operation(format!(
-                "mount overlay: {}", std::io::Error::last_os_error()
-            )))
-        } else {
-            Ok(())
-        }
     }
 }
 
@@ -109,20 +68,6 @@ impl CowBranch for OverlayBranch {
         self.cleanup()
     }
 
-    fn create_child(&self) -> Result<Box<dyn CowBranch>, BranchError> {
-        let storage_parent = self.storage.parent()
-            .ok_or_else(|| BranchError::Operation("no parent for storage".into()))?;
-        let mut child = OverlayBranch::create(&self.merged, storage_parent)?;
-        // Chain: child's lower = [self.upper, self.lowers...]
-        child.lowers = vec![self.upper.clone()];
-        child.lowers.extend(self.lowers.iter().cloned());
-        Ok(Box::new(child))
-    }
-
-    fn disk_usage(&self) -> Result<u64, BranchError> {
-        dir_size(&self.upper)
-    }
-
     fn cleanup(&self) -> Result<(), BranchError> {
         // Try unmount (may fail if not mounted)
         let merged_cstr = std::ffi::CString::new(self.merged.to_str().unwrap_or("")).unwrap();
@@ -144,17 +89,3 @@ fn is_whiteout(path: &Path) -> Result<bool, BranchError> {
     Ok(meta.file_type().is_char_device() && meta.rdev() == 0)
 }
 
-/// Calculate recursive directory size.
-fn dir_size(path: &Path) -> Result<u64, BranchError> {
-    let mut total = 0u64;
-    for entry in WalkDir::new(path) {
-        if let Ok(entry) = entry {
-            if entry.file_type().is_file() {
-                if let Ok(meta) = entry.metadata() {
-                    total += meta.len();
-                }
-            }
-        }
-    }
-    Ok(total)
-}

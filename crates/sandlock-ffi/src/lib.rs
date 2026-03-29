@@ -8,7 +8,7 @@ use std::ffi::{c_char, c_int, c_uint, CStr, CString};
 use std::ptr;
 use std::time::Duration;
 
-use sandlock_core::pipeline::{Pipeline, Stage};
+use sandlock_core::pipeline::Stage;
 use sandlock_core::policy::{ByteSize, PolicyBuilder};
 use sandlock_core::{Policy, RunResult, Sandbox};
 
@@ -29,6 +29,7 @@ pub struct sandlock_result_t {
 }
 
 /// Opaque handle wrapping a [`Pipeline`].
+#[allow(non_camel_case_types)]
 pub struct sandlock_pipeline_t {
     stages: Vec<(Policy, Vec<String>)>,
 }
@@ -369,6 +370,7 @@ pub unsafe extern "C" fn sandlock_run(
 
 /// Opaque handle for a live (spawned) sandbox.
 /// Owns both the Sandbox and the tokio Runtime that drives its supervisor.
+#[allow(non_camel_case_types)]
 pub struct sandlock_handle_t {
     sandbox: Sandbox,
     runtime: tokio::runtime::Runtime,
@@ -678,6 +680,7 @@ pub struct sandlock_event_t {
 }
 
 /// C-compatible policy context handle.
+#[allow(non_camel_case_types)]
 pub struct sandlock_ctx_t {
     ctx: *mut sandlock_core::policy_fn::PolicyContext,
 }
@@ -685,6 +688,7 @@ pub struct sandlock_ctx_t {
 /// C callback type for policy_fn.
 /// Return value: 0 = allow, -1 = deny (EPERM), -2 = audit (allow + flag),
 /// positive = deny with that errno (e.g. 13 = EACCES).
+#[allow(non_camel_case_types)]
 pub type sandlock_policy_fn_t = unsafe extern "C" fn(
     event: *const sandlock_event_t,
     ctx: *mut sandlock_ctx_t,
@@ -878,7 +882,9 @@ pub unsafe extern "C" fn sandlock_ctx_allow_path(
 // ----------------------------------------------------------------
 
 /// C callback types for fork init and work functions.
+#[allow(non_camel_case_types)]
 pub type sandlock_init_fn_t = unsafe extern "C" fn();
+#[allow(non_camel_case_types)]
 pub type sandlock_work_fn_t = unsafe extern "C" fn(clone_id: u32);
 
 /// Create a sandbox with init/work functions for COW forking.
@@ -904,6 +910,7 @@ pub unsafe extern "C" fn sandlock_new_with_fns(
 }
 
 /// Opaque handle for fork result (holds clone handles with pipes).
+#[allow(non_camel_case_types)]
 pub struct sandlock_fork_result_t {
     clones: Vec<Sandbox>,
 }
@@ -1020,6 +1027,7 @@ pub unsafe extern "C" fn sandlock_sandbox_free(sb: *mut Sandbox) {
 // ----------------------------------------------------------------
 
 /// Opaque handle wrapping a [`Checkpoint`].
+#[allow(non_camel_case_types)]
 pub struct sandlock_checkpoint_t {
     _private: sandlock_core::Checkpoint,
 }

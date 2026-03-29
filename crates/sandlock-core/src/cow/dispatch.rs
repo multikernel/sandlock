@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use super::seccomp::SeccompCowBranch;
 use crate::procfs::{build_dirent64, DT_DIR, DT_LNK, DT_REG};
 use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction, SupervisorState};
 use crate::sys::structs::SeccompNotif;
@@ -351,6 +350,7 @@ pub(crate) async fn handle_cow_stat(
     pack_u64!(meta.mtime_nsec() as u64);
     pack_u64!(meta.ctime() as u64);
     pack_u64!(meta.ctime_nsec() as u64);
+    let _ = off;
 
     if write_child_mem(notif_fd, notif.id, notif.pid, statbuf_addr, &buf).is_err() {
         return NotifAction::Continue;

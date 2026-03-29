@@ -6,7 +6,6 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::error::BranchError;

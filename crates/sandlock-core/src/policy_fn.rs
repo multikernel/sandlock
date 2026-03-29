@@ -279,7 +279,7 @@ pub type PolicyCallback = Arc<dyn Fn(SyscallEvent, &mut PolicyContext) -> Verdic
 // ============================================================
 
 /// An event sent from the supervisor to the policy callback thread.
-pub(crate) struct PolicyEvent {
+pub struct PolicyEvent {
     pub event: SyscallEvent,
     /// If Some, the supervisor blocks until this is signaled.
     /// Used for execve to allow pre-execution policy changes.
