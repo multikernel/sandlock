@@ -1,0 +1,562 @@
+"""Python SDK for sandlock — ctypes bindings to libsandlock_ffi.so."""
+
+from __future__ import annotations
+
+import ctypes
+import ctypes.util
+import os
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Sequence, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .policy import Policy as PolicyDataclass
+
+# ----------------------------------------------------------------
+# Load the shared library
+# ----------------------------------------------------------------
+
+def _find_lib() -> str:
+    """Find libsandlock_ffi.so."""
+    # 1. Next to this file (installed via pip/maturin)
+    pkg_dir = Path(__file__).parent
+    for candidate in [
+        pkg_dir / "libsandlock_ffi.so",
+        pkg_dir / ".." / ".." / ".." / "target" / "release" / "libsandlock_ffi.so",
+    ]:
+        if candidate.exists():
+            return str(candidate.resolve())
+
+    # 2. System library path
+    found = ctypes.util.find_library("sandlock_ffi")
+    if found:
+        return found
+
+    # 3. LD_LIBRARY_PATH
+    for d in os.environ.get("LD_LIBRARY_PATH", "").split(":"):
+        p = os.path.join(d, "libsandlock_ffi.so")
+        if os.path.isfile(p):
+            return p
+
+    raise RuntimeError(
+        "libsandlock_ffi.so not found. Build with: "
+        "cd sandlock-rs && cargo build --release"
+    )
+
+_lib = ctypes.CDLL(_find_lib())
+
+# ----------------------------------------------------------------
+# C function signatures
+# ----------------------------------------------------------------
+
+# Types
+_c_policy_p = ctypes.c_void_p
+_c_builder_p = ctypes.c_void_p
+_c_result_p = ctypes.c_void_p
+_c_pipeline_p = ctypes.c_void_p
+
+# Policy builder
+_lib.sandlock_policy_builder_new.restype = _c_builder_p
+_lib.sandlock_policy_builder_new.argtypes = []
+
+def _builder_fn(name, *extra_args):
+    fn = getattr(_lib, name)
+    fn.restype = _c_builder_p
+    fn.argtypes = [_c_builder_p] + list(extra_args)
+    return fn
+
+_b_fs_read = _builder_fn("sandlock_policy_builder_fs_read", ctypes.c_char_p)
+_b_fs_write = _builder_fn("sandlock_policy_builder_fs_write", ctypes.c_char_p)
+_b_fs_deny = _builder_fn("sandlock_policy_builder_fs_deny", ctypes.c_char_p)
+_b_workdir = _builder_fn("sandlock_policy_builder_workdir", ctypes.c_char_p)
+_b_max_memory = _builder_fn("sandlock_policy_builder_max_memory", ctypes.c_uint64)
+_b_max_processes = _builder_fn("sandlock_policy_builder_max_processes", ctypes.c_uint32)
+_b_max_cpu = _builder_fn("sandlock_policy_builder_max_cpu", ctypes.c_uint8)
+_b_num_cpus = _builder_fn("sandlock_policy_builder_num_cpus", ctypes.c_uint32)
+_b_net_allow_host = _builder_fn("sandlock_policy_builder_net_allow_host", ctypes.c_char_p)
+_b_net_bind_port = _builder_fn("sandlock_policy_builder_net_bind_port", ctypes.c_uint16)
+_b_net_connect_port = _builder_fn("sandlock_policy_builder_net_connect_port", ctypes.c_uint16)
+_b_port_remap = _builder_fn("sandlock_policy_builder_port_remap", ctypes.c_bool)
+_b_no_raw_sockets = _builder_fn("sandlock_policy_builder_no_raw_sockets", ctypes.c_bool)
+_b_no_udp = _builder_fn("sandlock_policy_builder_no_udp", ctypes.c_bool)
+_b_isolate_ipc = _builder_fn("sandlock_policy_builder_isolate_ipc", ctypes.c_bool)
+_b_isolate_signals = _builder_fn("sandlock_policy_builder_isolate_signals", ctypes.c_bool)
+_b_random_seed = _builder_fn("sandlock_policy_builder_random_seed", ctypes.c_uint64)
+_b_clean_env = _builder_fn("sandlock_policy_builder_clean_env", ctypes.c_bool)
+_b_env_var = _builder_fn("sandlock_policy_builder_env_var", ctypes.c_char_p, ctypes.c_char_p)
+_b_no_randomize_memory = _builder_fn("sandlock_policy_builder_no_randomize_memory", ctypes.c_bool)
+_b_no_huge_pages = _builder_fn("sandlock_policy_builder_no_huge_pages", ctypes.c_bool)
+
+# Policy callback (policy_fn)
+class _CEvent(ctypes.Structure):
+    _fields_ = [
+        ("syscall", ctypes.c_char_p),
+        ("category", ctypes.c_uint8),
+        ("pid", ctypes.c_uint32),
+        ("parent_pid", ctypes.c_uint32),
+        ("path", ctypes.c_char_p),
+        ("host", ctypes.c_char_p),
+        ("port", ctypes.c_uint16),
+        ("denied", ctypes.c_bool),
+        ("argv", ctypes.POINTER(ctypes.c_char_p)),
+        ("argc", ctypes.c_uint32),
+    ]
+
+_c_ctx_p = ctypes.c_void_p
+_POLICY_FN_TYPE = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.POINTER(_CEvent), _c_ctx_p)
+
+_lib.sandlock_policy_builder_policy_fn.restype = _c_builder_p
+_lib.sandlock_policy_builder_policy_fn.argtypes = [_c_builder_p, _POLICY_FN_TYPE]
+
+_lib.sandlock_ctx_restrict_network.restype = None
+_lib.sandlock_ctx_restrict_network.argtypes = [_c_ctx_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint32]
+
+_lib.sandlock_ctx_grant_network.restype = None
+_lib.sandlock_ctx_grant_network.argtypes = [_c_ctx_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint32]
+
+_lib.sandlock_ctx_restrict_max_memory.restype = None
+_lib.sandlock_ctx_restrict_max_memory.argtypes = [_c_ctx_p, ctypes.c_uint64]
+
+_lib.sandlock_ctx_restrict_max_processes.restype = None
+_lib.sandlock_ctx_restrict_max_processes.argtypes = [_c_ctx_p, ctypes.c_uint32]
+
+_lib.sandlock_ctx_restrict_pid_network.restype = None
+_lib.sandlock_ctx_restrict_pid_network.argtypes = [_c_ctx_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint32]
+
+_lib.sandlock_ctx_deny_path.restype = None
+_lib.sandlock_ctx_deny_path.argtypes = [_c_ctx_p, ctypes.c_char_p]
+
+_lib.sandlock_ctx_allow_path.restype = None
+_lib.sandlock_ctx_allow_path.argtypes = [_c_ctx_p, ctypes.c_char_p]
+
+_lib.sandlock_policy_build.restype = _c_policy_p
+_lib.sandlock_policy_build.argtypes = [_c_builder_p, ctypes.POINTER(ctypes.c_int)]
+
+_lib.sandlock_policy_free.restype = None
+_lib.sandlock_policy_free.argtypes = [_c_policy_p]
+
+# Run
+_lib.sandlock_run.restype = _c_result_p
+_lib.sandlock_run.argtypes = [_c_policy_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
+
+_lib.sandlock_run_interactive.restype = ctypes.c_int
+_lib.sandlock_run_interactive.argtypes = [_c_policy_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
+
+# Result
+_lib.sandlock_result_exit_code.restype = ctypes.c_int
+_lib.sandlock_result_exit_code.argtypes = [_c_result_p]
+
+_lib.sandlock_result_success.restype = ctypes.c_bool
+_lib.sandlock_result_success.argtypes = [_c_result_p]
+
+_lib.sandlock_result_stdout_bytes.restype = ctypes.c_void_p
+_lib.sandlock_result_stdout_bytes.argtypes = [_c_result_p, ctypes.POINTER(ctypes.c_size_t)]
+
+_lib.sandlock_result_stderr_bytes.restype = ctypes.c_void_p
+_lib.sandlock_result_stderr_bytes.argtypes = [_c_result_p, ctypes.POINTER(ctypes.c_size_t)]
+
+_lib.sandlock_result_free.restype = None
+_lib.sandlock_result_free.argtypes = [_c_result_p]
+
+# Pipeline
+_lib.sandlock_pipeline_new.restype = _c_pipeline_p
+_lib.sandlock_pipeline_new.argtypes = []
+
+_lib.sandlock_pipeline_add_stage.restype = None
+_lib.sandlock_pipeline_add_stage.argtypes = [
+    _c_pipeline_p, _c_policy_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint,
+]
+
+_lib.sandlock_pipeline_run.restype = _c_result_p
+_lib.sandlock_pipeline_run.argtypes = [_c_pipeline_p, ctypes.c_uint64]
+
+_lib.sandlock_pipeline_free.restype = None
+_lib.sandlock_pipeline_free.argtypes = [_c_pipeline_p]
+
+_lib.sandlock_string_free.restype = None
+_lib.sandlock_string_free.argtypes = [ctypes.c_char_p]
+
+
+# ----------------------------------------------------------------
+# SyscallEvent & PolicyContext (Python wrappers for policy_fn)
+# ----------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SyscallEvent:
+    """An intercepted syscall event."""
+    syscall: str
+    category: str  # "file", "network", "process", "memory"
+    pid: int
+    parent_pid: int = 0
+    path: str | None = None
+    host: str | None = None
+    port: int = 0
+    argv: tuple[str, ...] | None = None
+    denied: bool = False
+
+    def path_contains(self, s: str) -> bool:
+        return self.path is not None and s in self.path
+
+    def argv_contains(self, s: str) -> bool:
+        return self.argv is not None and any(s in a for a in self.argv)
+
+
+class PolicyContext:
+    """Context for modifying sandbox policy from a callback."""
+
+    def __init__(self, ctx_ptr):
+        self._ptr = ctx_ptr
+
+    def restrict_network(self, ips: list[str]) -> None:
+        arr = (ctypes.c_char_p * len(ips))(*[_encode(ip) for ip in ips])
+        _lib.sandlock_ctx_restrict_network(self._ptr, arr, len(ips))
+
+    def grant_network(self, ips: list[str]) -> None:
+        arr = (ctypes.c_char_p * len(ips))(*[_encode(ip) for ip in ips])
+        _lib.sandlock_ctx_grant_network(self._ptr, arr, len(ips))
+
+    def restrict_max_memory(self, bytes: int) -> None:
+        _lib.sandlock_ctx_restrict_max_memory(self._ptr, bytes)
+
+    def restrict_max_processes(self, n: int) -> None:
+        _lib.sandlock_ctx_restrict_max_processes(self._ptr, n)
+
+    def restrict_pid_network(self, pid: int, ips: list[str]) -> None:
+        arr = (ctypes.c_char_p * len(ips))(*[_encode(ip) for ip in ips])
+        _lib.sandlock_ctx_restrict_pid_network(self._ptr, pid, arr, len(ips))
+
+    def deny_path(self, path: str) -> None:
+        """Deny access to a path (checked on openat)."""
+        _lib.sandlock_ctx_deny_path(self._ptr, _encode(path))
+
+    def allow_path(self, path: str) -> None:
+        """Remove a previously denied path."""
+        _lib.sandlock_ctx_allow_path(self._ptr, _encode(path))
+
+
+# ----------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------
+
+def _encode(s: str) -> bytes:
+    return s.encode("utf-8") if isinstance(s, str) else s
+
+def _make_argv(cmd: Sequence[str]):
+    """Create a (c_char_p array, argc) pair from a list of strings."""
+    argc = len(cmd)
+    argv_type = ctypes.c_char_p * argc
+    argv = argv_type(*[_encode(a) for a in cmd])
+    return argv, ctypes.c_uint(argc)
+
+def _read_result_bytes(result_p, fn) -> bytes:
+    """Read stdout or stderr bytes from a result pointer."""
+    length = ctypes.c_size_t(0)
+    ptr = fn(result_p, ctypes.byref(length))
+    if not ptr or length.value == 0:
+        return b""
+    return ctypes.string_at(ptr, length.value)
+
+
+# ----------------------------------------------------------------
+# Result
+# ----------------------------------------------------------------
+
+@dataclass
+class Result:
+    """Result of a sandboxed command."""
+    success: bool
+    exit_code: int = 0
+    stdout: bytes = field(default=b"", repr=False)
+    stderr: bytes = field(default=b"", repr=False)
+    error: str | None = None
+
+
+# ----------------------------------------------------------------
+# Policy (native handle)
+# ----------------------------------------------------------------
+
+class _NativePolicy:
+    """Wraps a native sandlock_policy_t pointer."""
+
+    def __init__(self, ptr: int):
+        self._ptr = ptr
+
+    @property
+    def ptr(self):
+        return self._ptr
+
+    def __del__(self):
+        if self._ptr:
+            _lib.sandlock_policy_free(self._ptr)
+            self._ptr = None
+
+    @staticmethod
+    def _build_from_policy(policy: PolicyDataclass):
+        """Build a native builder from a Python Policy dataclass. Returns builder pointer."""
+        from .policy import parse_memory_size, parse_ports
+
+        b = _lib.sandlock_policy_builder_new()
+
+        for p in (policy.fs_readable or []):
+            b = _b_fs_read(b, _encode(str(p)))
+        for p in (policy.fs_writable or []):
+            b = _b_fs_write(b, _encode(str(p)))
+        for p in (policy.fs_denied or []):
+            b = _b_fs_deny(b, _encode(str(p)))
+
+        if policy.workdir:
+            b = _b_workdir(b, _encode(str(policy.workdir)))
+
+        if policy.max_memory is not None:
+            if isinstance(policy.max_memory, str):
+                mem_bytes = parse_memory_size(policy.max_memory)
+            else:
+                mem_bytes = int(policy.max_memory)
+            b = _b_max_memory(b, mem_bytes)
+
+        if policy.max_processes != 64:
+            b = _b_max_processes(b, policy.max_processes)
+        if policy.max_cpu is not None:
+            b = _b_max_cpu(b, policy.max_cpu)
+        if policy.num_cpus is not None:
+            b = _b_num_cpus(b, policy.num_cpus)
+
+        for host in (policy.net_allow_hosts or []):
+            b = _b_net_allow_host(b, _encode(str(host)))
+        for port in parse_ports(policy.net_bind) if policy.net_bind else []:
+            b = _b_net_bind_port(b, port)
+        for port in parse_ports(policy.net_connect) if policy.net_connect else []:
+            b = _b_net_connect_port(b, port)
+
+        if policy.port_remap:
+            b = _b_port_remap(b, True)
+        if not policy.no_raw_sockets:
+            b = _b_no_raw_sockets(b, False)
+        if policy.no_udp:
+            b = _b_no_udp(b, True)
+
+        if policy.isolate_ipc:
+            b = _b_isolate_ipc(b, True)
+        if policy.isolate_signals:
+            b = _b_isolate_signals(b, True)
+
+        if policy.random_seed is not None:
+            b = _b_random_seed(b, policy.random_seed)
+        if policy.clean_env:
+            b = _b_clean_env(b, True)
+        for k, v in (policy.env or {}).items():
+            b = _b_env_var(b, _encode(k), _encode(v))
+
+        if policy.no_randomize_memory:
+            b = _b_no_randomize_memory(b, True)
+        if policy.no_huge_pages:
+            b = _b_no_huge_pages(b, True)
+
+        return b
+
+    @staticmethod
+    def from_dataclass(policy: PolicyDataclass, policy_fn=None) -> _NativePolicy:
+        """Build a native policy from a Python Policy dataclass."""
+        b = _NativePolicy._build_from_policy(policy)
+
+        # Store callback reference to prevent GC
+        c_callback = None
+        if policy_fn is not None:
+            def _c_callback(event_p, ctx_p):
+                ev = event_p.contents
+                # Extract argv
+                py_argv = None
+                if ev.argv and ev.argc > 0:
+                    py_argv = tuple(
+                        ev.argv[i].decode("utf-8", errors="replace")
+                        for i in range(ev.argc)
+                        if ev.argv[i]
+                    )
+                _CATEGORIES = {0: "file", 1: "network", 2: "process", 3: "memory"}
+                py_event = SyscallEvent(
+                    syscall=ev.syscall.decode("utf-8") if ev.syscall else "",
+                    category=_CATEGORIES.get(ev.category, "file"),
+                    pid=ev.pid,
+                    parent_pid=ev.parent_pid,
+                    path=ev.path.decode("utf-8") if ev.path else None,
+                    host=ev.host.decode("utf-8") if ev.host else None,
+                    port=ev.port,
+                    argv=py_argv,
+                    denied=ev.denied,
+                )
+                py_ctx = PolicyContext(ctx_p)
+                result = policy_fn(py_event, py_ctx)
+                # Return: 0=allow, -1=deny, -2=audit, positive=deny with errno
+                # Python callback can return:
+                #   None/False/0  → allow
+                #   True/-1       → deny (EPERM)
+                #   positive int  → deny with that errno
+                #   "audit"/-2    → audit (allow + flag)
+                if result is None or result is False or result == 0:
+                    return 0
+                if result is True or result == -1:
+                    return -1
+                if result == "audit" or result == -2:
+                    return -2
+                if isinstance(result, int) and result > 0:
+                    return result
+                return 0
+
+            c_callback = _POLICY_FN_TYPE(_c_callback)
+            b = _lib.sandlock_policy_builder_policy_fn(b, c_callback)
+
+        err = ctypes.c_int(0)
+        ptr = _lib.sandlock_policy_build(b, ctypes.byref(err))
+        if not ptr or err.value != 0:
+            raise RuntimeError("Failed to build policy")
+        native = _NativePolicy(ptr)
+        native._c_callback = c_callback  # prevent GC
+        return native
+
+
+# ----------------------------------------------------------------
+# Sandbox
+# ----------------------------------------------------------------
+
+class Sandbox:
+    """Run commands in a sandlock sandbox.
+
+    Usage::
+
+        from sandlock import Sandbox, Policy
+        sb = Sandbox(Policy(fs_readable=["/usr", "/lib"], fs_writable=["/tmp"]))
+        result = sb.run(["echo", "hello"])
+        assert result.success
+        assert b"hello" in result.stdout
+    """
+
+    def __init__(self, policy: PolicyDataclass, policy_fn=None):
+        self._policy_dc = policy
+        self._policy_fn = policy_fn
+        self._native = _NativePolicy.from_dataclass(policy, policy_fn=policy_fn)
+
+    def run(self, cmd: list[str]) -> Result:
+        """Run a command in the sandbox, capturing stdout and stderr."""
+        argv, argc = _make_argv(cmd)
+        result_p = _lib.sandlock_run(self._native.ptr, argv, argc)
+        if not result_p:
+            return Result(success=False, exit_code=-1, error="sandlock_run failed")
+
+        exit_code = _lib.sandlock_result_exit_code(result_p)
+        success = _lib.sandlock_result_success(result_p)
+        stdout = _read_result_bytes(result_p, _lib.sandlock_result_stdout_bytes)
+        stderr = _read_result_bytes(result_p, _lib.sandlock_result_stderr_bytes)
+        _lib.sandlock_result_free(result_p)
+
+        return Result(
+            success=bool(success),
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+    def run_interactive(self, cmd: list[str]) -> int:
+        """Run with inherited stdio. Returns exit code."""
+        argv, argc = _make_argv(cmd)
+        return _lib.sandlock_run_interactive(self._native.ptr, argv, argc)
+
+    def cmd(self, args: list[str]) -> Stage:
+        """Bind a command to this sandbox, returning a lazy Stage."""
+        return Stage(self, args)
+
+
+# ----------------------------------------------------------------
+# Stage & Pipeline
+# ----------------------------------------------------------------
+
+class Stage:
+    """A lazy command bound to a Sandbox. Not executed until .run()."""
+
+    def __init__(self, sandbox: Sandbox, args: list[str]):
+        self.sandbox = sandbox
+        self.args = args
+
+    def run(self, timeout: float | None = None) -> Result:
+        """Run this single stage."""
+        return self.sandbox.run(self.args)
+
+    def __or__(self, other: Stage | Pipeline) -> Pipeline:
+        if isinstance(other, Pipeline):
+            return Pipeline([self] + other.stages)
+        return Pipeline([self, other])
+
+
+class Pipeline:
+    """A chain of stages connected by pipes.
+
+    Usage::
+
+        result = (
+            Sandbox(policy_a).cmd(["echo", "hello"])
+            | Sandbox(policy_b).cmd(["tr", "a-z", "A-Z"])
+        ).run()
+        assert b"HELLO" in result.stdout
+    """
+
+    def __init__(self, stages: list[Stage]):
+        if len(stages) < 2:
+            raise ValueError("Pipeline requires at least 2 stages")
+        self.stages = stages
+
+    def __or__(self, other: Stage | Pipeline) -> Pipeline:
+        if isinstance(other, Pipeline):
+            return Pipeline(self.stages + other.stages)
+        return Pipeline(self.stages + [other])
+
+    def run(
+        self,
+        stdout: int | None = None,
+        timeout: float | None = None,
+    ) -> Result:
+        """Run the pipeline. Returns the last stage's result.
+
+        If ``stdout`` is a file descriptor, the last stage's stdout is
+        redirected there and ``result.stdout`` will be empty.
+        """
+        pipe_p = _lib.sandlock_pipeline_new()
+
+        for stage in self.stages:
+            argv, argc = _make_argv(stage.args)
+            _lib.sandlock_pipeline_add_stage(
+                pipe_p, stage.sandbox._native.ptr, argv, argc,
+            )
+
+        timeout_ms = int(timeout * 1000) if timeout else 0
+        # pipeline_run consumes pipe_p
+        result_p = _lib.sandlock_pipeline_run(pipe_p, timeout_ms)
+
+        if not result_p:
+            error = "Pipeline timed out" if timeout else "Pipeline failed"
+            return Result(success=False, exit_code=-1, error=error)
+
+        exit_code = _lib.sandlock_result_exit_code(result_p)
+        success = _lib.sandlock_result_success(result_p)
+        out_bytes = _read_result_bytes(result_p, _lib.sandlock_result_stdout_bytes)
+        stderr = _read_result_bytes(result_p, _lib.sandlock_result_stderr_bytes)
+        _lib.sandlock_result_free(result_p)
+
+        # Handle stdout fd redirection
+        if stdout is not None and out_bytes:
+            os.write(stdout, out_bytes)
+            out_bytes = b""
+
+        # Detect timeout (exit_code == -1 from ExitStatus::Timeout)
+        error = None
+        if exit_code == -1 and not success and timeout:
+            error = "Pipeline timed out"
+
+        return Result(
+            success=bool(success),
+            exit_code=exit_code,
+            stdout=out_bytes,
+            stderr=stderr,
+            error=error,
+        )
+
+

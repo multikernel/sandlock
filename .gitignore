@@ -1,3 +1,5 @@
+/target/
+crates/sandlock-ffi/include/
 __pycache__/
 *.pyc
 *.pyo
@@ -7,3 +9,4 @@ build/
 .pytest_cache/
 .eggs/
 *.so
+.venv/

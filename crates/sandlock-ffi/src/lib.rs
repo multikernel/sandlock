@@ -1,0 +1,806 @@
+//! C ABI bindings for sandlock-core.
+//!
+//! This crate exposes sandlock functionality through a C-compatible interface
+//! using opaque handle patterns.  Each `*mut` / `*const` pointer returned by
+//! these functions must be freed with its corresponding `_free` function.
+
+use std::ffi::{c_char, c_int, c_uint, CStr, CString};
+use std::ptr;
+use std::time::Duration;
+
+use sandlock_core::pipeline::{Pipeline, Stage};
+use sandlock_core::policy::{ByteSize, PolicyBuilder};
+use sandlock_core::{Policy, RunResult, Sandbox};
+
+// ----------------------------------------------------------------
+// Opaque wrapper types
+// ----------------------------------------------------------------
+
+/// Opaque handle wrapping a [`Policy`].
+#[repr(C)]
+pub struct sandlock_policy_t {
+    _private: Policy,
+}
+
+/// Opaque handle wrapping a [`RunResult`].
+#[repr(C)]
+pub struct sandlock_result_t {
+    _private: RunResult,
+}
+
+/// Opaque handle wrapping a [`Pipeline`].
+pub struct sandlock_pipeline_t {
+    stages: Vec<(Policy, Vec<String>)>,
+}
+
+// ----------------------------------------------------------------
+// Policy Builder — filesystem
+// ----------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn sandlock_policy_builder_new() -> *mut PolicyBuilder {
+    Box::into_raw(Box::new(Policy::builder()))
+}
+
+/// # Safety
+/// `b` and `path` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_fs_read(
+    b: *mut PolicyBuilder,
+    path: *const c_char,
+) -> *mut PolicyBuilder {
+    if b.is_null() || path.is_null() { return b; }
+    let path = CStr::from_ptr(path).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.fs_read(path)))
+}
+
+/// # Safety
+/// `b` and `path` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_fs_write(
+    b: *mut PolicyBuilder,
+    path: *const c_char,
+) -> *mut PolicyBuilder {
+    if b.is_null() || path.is_null() { return b; }
+    let path = CStr::from_ptr(path).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.fs_write(path)))
+}
+
+/// # Safety
+/// `b` and `path` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_fs_deny(
+    b: *mut PolicyBuilder,
+    path: *const c_char,
+) -> *mut PolicyBuilder {
+    if b.is_null() || path.is_null() { return b; }
+    let path = CStr::from_ptr(path).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.fs_deny(path)))
+}
+
+/// # Safety
+/// `b` and `path` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_workdir(
+    b: *mut PolicyBuilder,
+    path: *const c_char,
+) -> *mut PolicyBuilder {
+    if b.is_null() || path.is_null() { return b; }
+    let path = CStr::from_ptr(path).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.workdir(path)))
+}
+
+// ----------------------------------------------------------------
+// Policy Builder — resource limits
+// ----------------------------------------------------------------
+
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_max_memory(
+    b: *mut PolicyBuilder, bytes: u64,
+) -> *mut PolicyBuilder {
+    if b.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.max_memory(ByteSize(bytes))))
+}
+
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_max_processes(
+    b: *mut PolicyBuilder, n: u32,
+) -> *mut PolicyBuilder {
+    if b.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.max_processes(n)))
+}
+
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_max_cpu(
+    b: *mut PolicyBuilder, pct: u8,
+) -> *mut PolicyBuilder {
+    if b.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.max_cpu(pct)))
+}
+
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_num_cpus(
+    b: *mut PolicyBuilder, n: u32,
+) -> *mut PolicyBuilder {
+    if b.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.num_cpus(n)))
+}
+
+// ----------------------------------------------------------------
+// Policy Builder — network
+// ----------------------------------------------------------------
+
+/// # Safety
+/// `b` and `host` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_net_allow_host(
+    b: *mut PolicyBuilder, host: *const c_char,
+) -> *mut PolicyBuilder {
+    if b.is_null() || host.is_null() { return b; }
+    let host = CStr::from_ptr(host).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.net_allow_host(host)))
+}
+
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_net_bind_port(
+    b: *mut PolicyBuilder, port: u16,
+) -> *mut PolicyBuilder {
+    if b.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.net_bind_port(port)))
+}
+
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_net_connect_port(
+    b: *mut PolicyBuilder, port: u16,
+) -> *mut PolicyBuilder {
+    if b.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.net_connect_port(port)))
+}
+
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_port_remap(
+    b: *mut PolicyBuilder, v: bool,
+) -> *mut PolicyBuilder {
+    if b.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.port_remap(v)))
+}
+
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_no_raw_sockets(
+    b: *mut PolicyBuilder, v: bool,
+) -> *mut PolicyBuilder {
+    if b.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.no_raw_sockets(v)))
+}
+
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_no_udp(
+    b: *mut PolicyBuilder, v: bool,
+) -> *mut PolicyBuilder {
+    if b.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.no_udp(v)))
+}
+
+// ----------------------------------------------------------------
+// Policy Builder — isolation & determinism
+// ----------------------------------------------------------------
+
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_isolate_ipc(
+    b: *mut PolicyBuilder, v: bool,
+) -> *mut PolicyBuilder {
+    if b.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.isolate_ipc(v)))
+}
+
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_isolate_signals(
+    b: *mut PolicyBuilder, v: bool,
+) -> *mut PolicyBuilder {
+    if b.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.isolate_signals(v)))
+}
+
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_random_seed(
+    b: *mut PolicyBuilder, seed: u64,
+) -> *mut PolicyBuilder {
+    if b.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.random_seed(seed)))
+}
+
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_clean_env(
+    b: *mut PolicyBuilder, v: bool,
+) -> *mut PolicyBuilder {
+    if b.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.clean_env(v)))
+}
+
+/// # Safety
+/// `b`, `key`, and `value` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_env_var(
+    b: *mut PolicyBuilder, key: *const c_char, value: *const c_char,
+) -> *mut PolicyBuilder {
+    if b.is_null() || key.is_null() || value.is_null() { return b; }
+    let key = CStr::from_ptr(key).to_str().unwrap_or("");
+    let value = CStr::from_ptr(value).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.env_var(key, value)))
+}
+
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_no_randomize_memory(
+    b: *mut PolicyBuilder, v: bool,
+) -> *mut PolicyBuilder {
+    if b.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.no_randomize_memory(v)))
+}
+
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_no_huge_pages(
+    b: *mut PolicyBuilder, v: bool,
+) -> *mut PolicyBuilder {
+    if b.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.no_huge_pages(v)))
+}
+
+// ----------------------------------------------------------------
+// Policy Builder — build & free
+// ----------------------------------------------------------------
+
+/// Consume the builder and produce a policy.
+/// On success, `*err` is 0 and a non-null policy pointer is returned.
+/// On failure, `*err` is -1 and null is returned.
+///
+/// # Safety
+/// `b` must be a valid builder pointer. `err` may be null.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_build(
+    b: *mut PolicyBuilder, err: *mut c_int,
+) -> *mut sandlock_policy_t {
+    if b.is_null() {
+        if !err.is_null() { *err = -1; }
+        return ptr::null_mut();
+    }
+    let builder = *Box::from_raw(b);
+    match builder.build() {
+        Ok(policy) => {
+            if !err.is_null() { *err = 0; }
+            Box::into_raw(Box::new(sandlock_policy_t { _private: policy }))
+        }
+        Err(_) => {
+            if !err.is_null() { *err = -1; }
+            ptr::null_mut()
+        }
+    }
+}
+
+/// # Safety
+/// `p` must be null or a valid pointer from `sandlock_policy_build`.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_free(p: *mut sandlock_policy_t) {
+    if !p.is_null() { drop(Box::from_raw(p)); }
+}
+
+// ----------------------------------------------------------------
+// Run
+// ----------------------------------------------------------------
+
+/// Run a command with captured stdout/stderr. Returns a result handle.
+///
+/// # Safety
+/// `policy` must be a valid policy pointer. `argv` must point to `argc` C strings.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_run(
+    policy: *const sandlock_policy_t,
+    argv: *const *const c_char,
+    argc: c_uint,
+) -> *mut sandlock_result_t {
+    if policy.is_null() || argv.is_null() { return ptr::null_mut(); }
+    let policy = &(*policy)._private;
+    let args = read_argv(argv, argc);
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(_) => return ptr::null_mut(),
+    };
+    match rt.block_on(Sandbox::run(policy, &arg_refs)) {
+        Ok(result) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Run a command with inherited stdio (interactive). Returns exit code.
+///
+/// # Safety
+/// `policy` must be a valid policy pointer. `argv` must point to `argc` C strings.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_run_interactive(
+    policy: *const sandlock_policy_t,
+    argv: *const *const c_char,
+    argc: c_uint,
+) -> c_int {
+    if policy.is_null() || argv.is_null() { return -1; }
+    let policy = &(*policy)._private;
+    let args = read_argv(argv, argc);
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(_) => return -1,
+    };
+    match rt.block_on(Sandbox::run_interactive(policy, &arg_refs)) {
+        Ok(result) => result.code().unwrap_or(-1),
+        Err(_) => -1,
+    }
+}
+
+// ----------------------------------------------------------------
+// Result accessors
+// ----------------------------------------------------------------
+
+/// # Safety
+/// `r` must be null or a valid result pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_result_exit_code(r: *const sandlock_result_t) -> c_int {
+    if r.is_null() { return -1; }
+    (*r)._private.code().unwrap_or(-1)
+}
+
+/// # Safety
+/// `r` must be null or a valid result pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_result_success(r: *const sandlock_result_t) -> bool {
+    if r.is_null() { return false; }
+    (*r)._private.success()
+}
+
+/// Get captured stdout. Returns a malloc'd NUL-terminated string.
+/// Caller must free with `sandlock_string_free`. Returns null if no capture.
+///
+/// # Safety
+/// `r` must be null or a valid result pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_result_stdout(r: *const sandlock_result_t) -> *mut c_char {
+    if r.is_null() { return ptr::null_mut(); }
+    match (*r)._private.stdout.as_ref() {
+        Some(bytes) => {
+            let s = String::from_utf8_lossy(bytes);
+            match CString::new(s.as_ref()) {
+                Ok(cs) => cs.into_raw(),
+                Err(_) => ptr::null_mut(),
+            }
+        }
+        None => ptr::null_mut(),
+    }
+}
+
+/// Get captured stderr. Same semantics as `sandlock_result_stdout`.
+///
+/// # Safety
+/// `r` must be null or a valid result pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_result_stderr(r: *const sandlock_result_t) -> *mut c_char {
+    if r.is_null() { return ptr::null_mut(); }
+    match (*r)._private.stderr.as_ref() {
+        Some(bytes) => {
+            let s = String::from_utf8_lossy(bytes);
+            match CString::new(s.as_ref()) {
+                Ok(cs) => cs.into_raw(),
+                Err(_) => ptr::null_mut(),
+            }
+        }
+        None => ptr::null_mut(),
+    }
+}
+
+/// Get captured stdout as raw bytes. Writes length to `*len`.
+/// Returns pointer to internal buffer (valid until result is freed). Null if no capture.
+///
+/// # Safety
+/// `r` must be a valid result pointer. `len` must be a valid pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_result_stdout_bytes(
+    r: *const sandlock_result_t, len: *mut usize,
+) -> *const u8 {
+    if r.is_null() || len.is_null() { return ptr::null(); }
+    match (*r)._private.stdout.as_ref() {
+        Some(bytes) => { *len = bytes.len(); bytes.as_ptr() }
+        None => { *len = 0; ptr::null() }
+    }
+}
+
+/// Get captured stderr as raw bytes.
+///
+/// # Safety
+/// `r` must be a valid result pointer. `len` must be a valid pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_result_stderr_bytes(
+    r: *const sandlock_result_t, len: *mut usize,
+) -> *const u8 {
+    if r.is_null() || len.is_null() { return ptr::null(); }
+    match (*r)._private.stderr.as_ref() {
+        Some(bytes) => { *len = bytes.len(); bytes.as_ptr() }
+        None => { *len = 0; ptr::null() }
+    }
+}
+
+/// # Safety
+/// `r` must be null or a valid pointer from `sandlock_run`.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_result_free(r: *mut sandlock_result_t) {
+    if !r.is_null() { drop(Box::from_raw(r)); }
+}
+
+/// Free a string returned by `sandlock_result_stdout` or `sandlock_result_stderr`.
+///
+/// # Safety
+/// `s` must be null or a pointer from a `sandlock_result_std*` function.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_string_free(s: *mut c_char) {
+    if !s.is_null() { drop(CString::from_raw(s)); }
+}
+
+// ----------------------------------------------------------------
+// Pipeline
+// ----------------------------------------------------------------
+
+/// Create a new empty pipeline.
+#[no_mangle]
+pub extern "C" fn sandlock_pipeline_new() -> *mut sandlock_pipeline_t {
+    Box::into_raw(Box::new(sandlock_pipeline_t { stages: Vec::new() }))
+}
+
+/// Add a stage to the pipeline. The policy is cloned; the caller retains ownership.
+///
+/// # Safety
+/// `pipe` must be a valid pipeline pointer. `policy` must be a valid policy pointer.
+/// `argv` must point to `argc` C strings.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_pipeline_add_stage(
+    pipe: *mut sandlock_pipeline_t,
+    policy: *const sandlock_policy_t,
+    argv: *const *const c_char,
+    argc: c_uint,
+) {
+    if pipe.is_null() || policy.is_null() || argv.is_null() { return; }
+    let policy = (*policy)._private.clone();
+    let args = read_argv(argv, argc);
+    (*pipe).stages.push((policy, args));
+}
+
+/// Run the pipeline. Returns a result handle (last stage's output).
+/// `timeout_ms` is the total timeout in milliseconds (0 = no timeout).
+///
+/// # Safety
+/// `pipe` is consumed and freed by this call. Do not use it after.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_pipeline_run(
+    pipe: *mut sandlock_pipeline_t,
+    timeout_ms: u64,
+) -> *mut sandlock_result_t {
+    if pipe.is_null() { return ptr::null_mut(); }
+    let pipe = *Box::from_raw(pipe);
+
+    if pipe.stages.len() < 2 { return ptr::null_mut(); }
+
+    let mut stages: Vec<Stage> = pipe.stages.into_iter().map(|(policy, args)| {
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        Stage::new(&policy, &arg_refs)
+    }).collect();
+
+    // Build pipeline using BitOr
+    let first = stages.remove(0);
+    let second = stages.remove(0);
+    let mut pipeline = first | second;
+    for stage in stages {
+        pipeline = pipeline | stage;
+    }
+
+    let timeout = if timeout_ms > 0 {
+        Some(Duration::from_millis(timeout_ms))
+    } else {
+        None
+    };
+
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    match rt.block_on(pipeline.run(timeout)) {
+        Ok(result) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Free a pipeline without running it.
+///
+/// # Safety
+/// `pipe` must be null or a valid pipeline pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_pipeline_free(pipe: *mut sandlock_pipeline_t) {
+    if !pipe.is_null() { drop(Box::from_raw(pipe)); }
+}
+
+// ----------------------------------------------------------------
+// Policy callback (policy_fn)
+// ----------------------------------------------------------------
+
+/// C-compatible syscall event passed to the policy callback.
+#[repr(C)]
+pub struct sandlock_event_t {
+    pub syscall: *const c_char,
+    /// Category: 0=File, 1=Network, 2=Process, 3=Memory
+    pub category: u8,
+    pub pid: u32,
+    pub parent_pid: u32, // 0 if unknown
+    pub path: *const c_char,   // NULL if not applicable
+    pub host: *const c_char,   // NULL if not applicable
+    pub port: u16,
+    pub denied: bool,
+    pub argv: *const *const c_char, // NULL-terminated array, or NULL
+    pub argc: u32,
+}
+
+/// C-compatible policy context handle.
+pub struct sandlock_ctx_t {
+    ctx: *mut sandlock_core::policy_fn::PolicyContext,
+}
+
+/// C callback type for policy_fn.
+/// Return value: 0 = allow, -1 = deny (EPERM), -2 = audit (allow + flag),
+/// positive = deny with that errno (e.g. 13 = EACCES).
+pub type sandlock_policy_fn_t = unsafe extern "C" fn(
+    event: *const sandlock_event_t,
+    ctx: *mut sandlock_ctx_t,
+) -> i32;
+
+/// Set a policy callback on the builder.
+///
+/// # Safety
+/// `b` must be a valid builder pointer. `cb` must be a valid function pointer
+/// that remains valid for the lifetime of the sandbox.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_policy_fn(
+    b: *mut PolicyBuilder,
+    cb: sandlock_policy_fn_t,
+) -> *mut PolicyBuilder {
+    if b.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+
+    // Wrap the C callback in a Rust closure
+    let cb_fn = move |event: sandlock_core::policy_fn::SyscallEvent,
+                      ctx: &mut sandlock_core::policy_fn::PolicyContext| {
+        let syscall_c = CString::new(event.syscall.as_str()).unwrap_or_default();
+        let path_c = event.path.as_deref().and_then(|s| CString::new(s).ok());
+        let host_c = event.host.map(|ip| CString::new(ip.to_string()).unwrap_or_default());
+
+        // Convert argv to C string array
+        let argv_c: Vec<CString> = event.argv.as_ref()
+            .map(|args| args.iter().filter_map(|s| CString::new(s.as_str()).ok()).collect())
+            .unwrap_or_default();
+        let argv_ptrs: Vec<*const c_char> = argv_c.iter().map(|c| c.as_ptr()).collect();
+        let argc = argv_ptrs.len() as u32;
+
+        let category = match event.category {
+            sandlock_core::policy_fn::SyscallCategory::File => 0u8,
+            sandlock_core::policy_fn::SyscallCategory::Network => 1,
+            sandlock_core::policy_fn::SyscallCategory::Process => 2,
+            sandlock_core::policy_fn::SyscallCategory::Memory => 3,
+        };
+
+        let c_event = sandlock_event_t {
+            syscall: syscall_c.as_ptr(),
+            category,
+            pid: event.pid,
+            parent_pid: event.parent_pid.unwrap_or(0),
+            path: path_c.as_ref().map_or(ptr::null(), |c| c.as_ptr()),
+            host: host_c.as_ref().map_or(ptr::null(), |c| c.as_ptr()),
+            port: event.port.unwrap_or(0),
+            denied: event.denied,
+            argv: if argv_ptrs.is_empty() { ptr::null() } else { argv_ptrs.as_ptr() },
+            argc,
+        };
+
+        let mut c_ctx = sandlock_ctx_t {
+            ctx: ctx as *mut _,
+        };
+
+        let ret = unsafe { cb(&c_event, &mut c_ctx) };
+        match ret {
+            0 => sandlock_core::policy_fn::Verdict::Allow,
+            -1 => sandlock_core::policy_fn::Verdict::Deny,
+            -2 => sandlock_core::policy_fn::Verdict::Audit,
+            errno if errno > 0 => sandlock_core::policy_fn::Verdict::DenyWith(errno),
+            _ => sandlock_core::policy_fn::Verdict::Allow,
+        }
+    };
+
+    Box::into_raw(Box::new(builder.policy_fn(cb_fn)))
+}
+
+/// Restrict network to the given IPs. Permanent — cannot grant back.
+///
+/// # Safety
+/// `ctx` must be a valid context pointer from inside a policy callback.
+/// `ips` must point to `count` valid C strings.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_ctx_restrict_network(
+    ctx: *mut sandlock_ctx_t,
+    ips: *const *const c_char,
+    count: u32,
+) {
+    if ctx.is_null() { return; }
+    let ctx = &mut *(*ctx).ctx;
+    let parsed: Vec<std::net::IpAddr> = (0..count as usize)
+        .filter_map(|i| {
+            let s = CStr::from_ptr(*ips.add(i)).to_str().ok()?;
+            s.parse().ok()
+        })
+        .collect();
+    ctx.restrict_network(&parsed);
+}
+
+/// Grant network IPs (within ceiling). Fails silently if restricted.
+///
+/// # Safety
+/// Same as `sandlock_ctx_restrict_network`.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_ctx_grant_network(
+    ctx: *mut sandlock_ctx_t,
+    ips: *const *const c_char,
+    count: u32,
+) {
+    if ctx.is_null() { return; }
+    let ctx = &mut *(*ctx).ctx;
+    let parsed: Vec<std::net::IpAddr> = (0..count as usize)
+        .filter_map(|i| {
+            let s = CStr::from_ptr(*ips.add(i)).to_str().ok()?;
+            s.parse().ok()
+        })
+        .collect();
+    let _ = ctx.grant_network(&parsed);
+}
+
+/// Restrict max memory. Permanent.
+///
+/// # Safety
+/// `ctx` must be a valid context pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_ctx_restrict_max_memory(
+    ctx: *mut sandlock_ctx_t, bytes: u64,
+) {
+    if ctx.is_null() { return; }
+    let ctx = &mut *(*ctx).ctx;
+    ctx.restrict_max_memory(bytes);
+}
+
+/// Restrict max processes. Permanent.
+///
+/// # Safety
+/// `ctx` must be a valid context pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_ctx_restrict_max_processes(
+    ctx: *mut sandlock_ctx_t, n: u32,
+) {
+    if ctx.is_null() { return; }
+    let ctx = &mut *(*ctx).ctx;
+    ctx.restrict_max_processes(n);
+}
+
+/// Restrict network for a specific PID.
+///
+/// # Safety
+/// `ctx` must be a valid context pointer. `ips` must point to `count` C strings.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_ctx_restrict_pid_network(
+    ctx: *mut sandlock_ctx_t,
+    pid: u32,
+    ips: *const *const c_char,
+    count: u32,
+) {
+    if ctx.is_null() { return; }
+    let ctx = &mut *(*ctx).ctx;
+    let parsed: Vec<std::net::IpAddr> = (0..count as usize)
+        .filter_map(|i| {
+            let s = CStr::from_ptr(*ips.add(i)).to_str().ok()?;
+            s.parse().ok()
+        })
+        .collect();
+    ctx.restrict_pid_network(pid, &parsed);
+}
+
+/// Deny access to a path dynamically (checked on openat).
+///
+/// # Safety
+/// `ctx` must be a valid context pointer. `path` must be a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_ctx_deny_path(
+    ctx: *mut sandlock_ctx_t, path: *const c_char,
+) {
+    if ctx.is_null() || path.is_null() { return; }
+    let ctx = &*(*ctx).ctx;
+    let path = CStr::from_ptr(path).to_str().unwrap_or("");
+    ctx.deny_path(path);
+}
+
+/// Remove a previously denied path.
+///
+/// # Safety
+/// `ctx` must be a valid context pointer. `path` must be a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_ctx_allow_path(
+    ctx: *mut sandlock_ctx_t, path: *const c_char,
+) {
+    if ctx.is_null() || path.is_null() { return; }
+    let ctx = &*(*ctx).ctx;
+    let path = CStr::from_ptr(path).to_str().unwrap_or("");
+    ctx.allow_path(path);
+}
+
+// ----------------------------------------------------------------
+// Helpers
+// ----------------------------------------------------------------
+
+unsafe fn read_argv(argv: *const *const c_char, argc: c_uint) -> Vec<String> {
+    let mut args = Vec::new();
+    for i in 0..argc as usize {
+        let arg = CStr::from_ptr(*argv.add(i)).to_str().unwrap_or("").to_string();
+        args.push(arg);
+    }
+    args
+}
