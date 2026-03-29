@@ -338,11 +338,15 @@ on exit, aborted on error.
 **OverlayFS COW**: Uses kernel OverlayFS in a user namespace. Requires
 unprivileged user namespaces to be enabled.
 
-### COW Fork
+### COW Fork & Map-Reduce
 
 Initialize expensive state once, then fork COW clones that share memory.
 Each fork uses raw `fork(2)` (bypasses seccomp notification) for minimal
 overhead. 1000 clones in ~530ms, ~1,900 forks/sec.
+
+Each clone's stdout is captured via its own pipe. `reduce()` reads all
+pipes and feeds combined output to a reducer's stdin — fully pipe-based
+data flow with no temp files.
 
 ```python
 from sandlock import Sandbox, Policy
@@ -353,23 +357,38 @@ def init():
     data = preprocess_dataset()
 
 def work(clone_id):
-    result = rollout(model, data, clone_id)  # reads COW-shared globals
-    save_result(result)
+    shard = data[clone_id::4]
+    print(sum(shard))             # stdout → per-clone pipe
 
-sb = Sandbox(policy, init_fn=init, work_fn=work)
-pids = sb.fork(1000)  # 1000 clones, ~50 MB shared (not 50 GB)
+# Map: fork 4 clones with separate policies
+mapper = Sandbox(data_policy, init_fn=init, work_fn=work)
+clones = mapper.fork(4)
+
+# Reduce: pipe clone outputs to reducer stdin
+result = Sandbox(reduce_policy).reduce(
+    ["python3", "-c", "import sys; print(sum(int(l) for l in sys.stdin))"],
+    clones,
+)
+print(result.stdout)  # b"total\n"
 ```
 
 ```rust
-let mut sb = Sandbox::new_with_fns(&policy,
-    || { load_model(); },
-    |clone_id| { rollout(clone_id); },
+let mut mapper = Sandbox::new_with_fns(&map_policy,
+    || { load_data(); },
+    |id| { println!("{}", compute(id)); },
 )?;
-let pids = sb.fork(1000).await?;
+let mut clones = mapper.fork(4).await?;
+
+let reducer = Sandbox::new(&reduce_policy)?;
+let result = reducer.reduce(
+    &["python3", "-c", "import sys; print(sum(int(l) for l in sys.stdin))"],
+    &mut clones,
+).await?;
 ```
 
-Each clone inherits Landlock + seccomp confinement via `fork()`.
-`CLONE_ID` environment variable is set to 0..N-1.
+Map and reduce run in separate sandboxes with independent policies —
+the mapper has data access, the reducer doesn't. Each clone inherits
+Landlock + seccomp confinement. `CLONE_ID=0..N-1` is set automatically.
 
 ### Port Virtualization
 
