@@ -542,6 +542,18 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
         fail!("setpgid");
     }
 
+    // 1b. If stdin is a terminal, become the foreground process group
+    //     so interactive shells can read from the TTY.
+    //     Must ignore SIGTTOU first — a background pgrp calling tcsetpgrp
+    //     gets stopped by SIGTTOU otherwise.
+    if unsafe { libc::isatty(0) } == 1 {
+        unsafe {
+            libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+            libc::tcsetpgrp(0, libc::getpgrp());
+            libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+        }
+    }
+
     // 2. Die if parent exits
     if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
         fail!("prctl(PR_SET_PDEATHSIG)");
