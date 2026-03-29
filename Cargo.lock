@@ -475,6 +475,7 @@ dependencies = [
  "rand",
  "rand_chacha",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",

@@ -23,20 +23,30 @@ async fn test_checkpoint_save_load() {
     assert!(!cp.process_state.regs.is_empty(), "Should capture registers");
     assert!(!cp.fd_table.is_empty(), "Should capture file descriptors");
 
-    // Save to temp file
+    // Save to temp directory
     let tmp = std::env::temp_dir().join(format!("sandlock-cp-test-{}", std::process::id()));
     cp.save(&tmp).unwrap();
+
+    // Verify directory structure
+    assert!(tmp.join("meta.json").exists());
+    assert!(tmp.join("policy.dat").exists());
+    assert!(tmp.join("process/info.json").exists());
+    assert!(tmp.join("process/fds.json").exists());
+    assert!(tmp.join("process/memory_map.json").exists());
+    assert!(tmp.join("process/threads/0.bin").exists());
 
     // Load back
     let loaded = Checkpoint::load(&tmp).unwrap();
     assert_eq!(loaded.process_state.regs.len(), cp.process_state.regs.len());
-    assert_eq!(loaded.process_state.memory_maps.len(), cp.process_state.memory_maps.len());
+    assert_eq!(loaded.process_state.memory_data.len(), cp.process_state.memory_data.len());
     assert_eq!(loaded.fd_table.len(), cp.fd_table.len());
+    assert_eq!(loaded.process_state.pid, cp.process_state.pid);
+    assert!(!loaded.process_state.exe.is_empty());
 
     // Cleanup
     sb.kill().unwrap();
     let _ = sb.wait().await;
-    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 /// Test that checkpoint captures memory maps correctly.

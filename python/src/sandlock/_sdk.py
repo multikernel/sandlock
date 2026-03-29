@@ -225,6 +225,33 @@ _lib.sandlock_wait.argtypes = [_c_sandbox_p]
 _lib.sandlock_sandbox_free.restype = None
 _lib.sandlock_sandbox_free.argtypes = [_c_sandbox_p]
 
+# Checkpoint
+_c_checkpoint_p = ctypes.c_void_p
+
+_lib.sandlock_handle_checkpoint.restype = _c_checkpoint_p
+_lib.sandlock_handle_checkpoint.argtypes = [_c_handle_p]
+
+_lib.sandlock_checkpoint_save.restype = ctypes.c_int
+_lib.sandlock_checkpoint_save.argtypes = [_c_checkpoint_p, ctypes.c_char_p]
+
+_lib.sandlock_checkpoint_load.restype = _c_checkpoint_p
+_lib.sandlock_checkpoint_load.argtypes = [ctypes.c_char_p]
+
+_lib.sandlock_checkpoint_set_name.restype = None
+_lib.sandlock_checkpoint_set_name.argtypes = [_c_checkpoint_p, ctypes.c_char_p]
+
+_lib.sandlock_checkpoint_name.restype = ctypes.c_void_p
+_lib.sandlock_checkpoint_name.argtypes = [_c_checkpoint_p]
+
+_lib.sandlock_checkpoint_set_app_state.restype = None
+_lib.sandlock_checkpoint_set_app_state.argtypes = [_c_checkpoint_p, ctypes.c_void_p, ctypes.c_size_t]
+
+_lib.sandlock_checkpoint_app_state.restype = ctypes.c_void_p
+_lib.sandlock_checkpoint_app_state.argtypes = [_c_checkpoint_p, ctypes.POINTER(ctypes.c_size_t)]
+
+_lib.sandlock_checkpoint_free.restype = None
+_lib.sandlock_checkpoint_free.argtypes = [_c_checkpoint_p]
+
 
 # ----------------------------------------------------------------
 # SyscallEvent & PolicyContext (Python wrappers for policy_fn)
@@ -318,6 +345,164 @@ class Result:
     stdout: bytes = field(default=b"", repr=False)
     stderr: bytes = field(default=b"", repr=False)
     error: str | None = None
+
+
+# ----------------------------------------------------------------
+# Checkpoint
+# ----------------------------------------------------------------
+
+_DEFAULT_STORE = Path.home() / ".sandlock" / "checkpoints"
+
+
+class Checkpoint:
+    """A frozen snapshot of sandbox state (registers, memory, fds).
+
+    Wraps a native checkpoint captured via ptrace + /proc.
+
+    Usage::
+
+        sb = Sandbox(policy)
+        sb.run_bg(["sleep", "60"])  # or use spawn via handle
+        cp = sb.checkpoint()
+        cp.save("my-checkpoint")
+
+        # Later:
+        cp2 = Checkpoint.load("my-checkpoint")
+    """
+
+    def __init__(self, ptr: int):
+        self._ptr = ptr
+
+    @property
+    def name(self) -> str:
+        """Checkpoint name."""
+        raw = _lib.sandlock_checkpoint_name(self._ptr)
+        if not raw:
+            return ""
+        # raw is a void pointer to a malloc'd C string
+        c_str = ctypes.cast(raw, ctypes.c_char_p)
+        name = c_str.value.decode("utf-8", errors="replace") if c_str.value else ""
+        _lib.sandlock_string_free(c_str)
+        return name
+
+    @name.setter
+    def name(self, value: str) -> None:
+        _lib.sandlock_checkpoint_set_name(self._ptr, _encode(value))
+
+    @property
+    def app_state(self) -> bytes | None:
+        """Optional application-level state bytes."""
+        length = ctypes.c_size_t(0)
+        ptr = _lib.sandlock_checkpoint_app_state(self._ptr, ctypes.byref(length))
+        if not ptr or length.value == 0:
+            return None
+        return ctypes.string_at(ptr, length.value)
+
+    @app_state.setter
+    def app_state(self, data: bytes | None) -> None:
+        if data is None:
+            _lib.sandlock_checkpoint_set_app_state(self._ptr, None, 0)
+        else:
+            buf = ctypes.create_string_buffer(data)
+            _lib.sandlock_checkpoint_set_app_state(
+                self._ptr, ctypes.cast(buf, ctypes.c_void_p), len(data),
+            )
+
+    def save(self, name: str, *, store: Path | str | None = None) -> Path:
+        """Persist this checkpoint under a named store.
+
+        Storage layout::
+
+            <store>/<name>/
+            ├── meta.json
+            ├── policy.dat
+            ├── app_state.bin      (optional)
+            └── process/
+                ├── info.json
+                ├── fds.json
+                ├── memory_map.json
+                ├── threads/0.bin
+                └── memory/<i>.bin
+
+        Args:
+            name: Checkpoint name (used as directory name).
+            store: Storage root. Defaults to ``~/.sandlock/checkpoints/``.
+
+        Returns:
+            Path to the checkpoint directory.
+        """
+        root = Path(store) if store is not None else _DEFAULT_STORE
+        root.mkdir(parents=True, exist_ok=True)
+        cp_dir = root / name
+        self.name = name
+        rc = _lib.sandlock_checkpoint_save(self._ptr, _encode(str(cp_dir)))
+        if rc != 0:
+            raise RuntimeError(f"Failed to save checkpoint to {cp_dir}")
+        return cp_dir
+
+    @classmethod
+    def load(cls, name: str, *, store: Path | str | None = None) -> "Checkpoint":
+        """Load a named checkpoint from disk.
+
+        Args:
+            name: Checkpoint name.
+            store: Storage root. Defaults to ``~/.sandlock/checkpoints/``.
+
+        Returns:
+            Checkpoint with all state restored.
+
+        Raises:
+            FileNotFoundError: If the checkpoint does not exist.
+        """
+        root = Path(store) if store is not None else _DEFAULT_STORE
+        cp_dir = root / name
+        if not cp_dir.is_dir():
+            raise FileNotFoundError(f"Checkpoint not found: {cp_dir}")
+        ptr = _lib.sandlock_checkpoint_load(_encode(str(cp_dir)))
+        if not ptr:
+            raise RuntimeError(f"Failed to load checkpoint from {cp_dir}")
+        return cls(ptr)
+
+    @classmethod
+    def list(cls, *, store: Path | str | None = None) -> list[str]:
+        """List all named checkpoints.
+
+        Args:
+            store: Storage root. Defaults to ``~/.sandlock/checkpoints/``.
+
+        Returns:
+            Sorted list of checkpoint names.
+        """
+        root = Path(store) if store is not None else _DEFAULT_STORE
+        if not root.is_dir():
+            return []
+        return sorted(
+            d.name for d in root.iterdir()
+            if d.is_dir() and (d / "meta.json").exists()
+        )
+
+    @classmethod
+    def delete(cls, name: str, *, store: Path | str | None = None) -> None:
+        """Delete a named checkpoint.
+
+        Args:
+            name: Checkpoint name.
+            store: Storage root. Defaults to ``~/.sandlock/checkpoints/``.
+
+        Raises:
+            FileNotFoundError: If the checkpoint does not exist.
+        """
+        import shutil
+        root = Path(store) if store is not None else _DEFAULT_STORE
+        cp_dir = root / name
+        if not cp_dir.is_dir():
+            raise FileNotFoundError(f"Checkpoint not found: {cp_dir}")
+        shutil.rmtree(cp_dir)
+
+    def __del__(self):
+        if getattr(self, "_ptr", None):
+            _lib.sandlock_checkpoint_free(self._ptr)
+            self._ptr = None
 
 
 # ----------------------------------------------------------------
@@ -508,6 +693,25 @@ class Sandbox:
         if pid is None:
             raise RuntimeError("sandbox is not running")
         os.killpg(pid, signal.SIGCONT)
+
+    def checkpoint(self) -> Checkpoint:
+        """Capture a checkpoint of the running sandbox.
+
+        The sandbox is frozen (SIGSTOP + fork-hold), state is captured
+        via ptrace + /proc, then thawed.
+
+        Returns:
+            Checkpoint with process state, memory, fds.
+
+        Raises:
+            RuntimeError: If the sandbox is not running or capture fails.
+        """
+        if self._handle is None:
+            raise RuntimeError("sandbox is not running (use spawn first)")
+        ptr = _lib.sandlock_handle_checkpoint(self._handle)
+        if not ptr:
+            raise RuntimeError("checkpoint capture failed")
+        return Checkpoint(ptr)
 
     def run(self, cmd: list[str]) -> Result:
         """Run a command in the sandbox, capturing stdout and stderr."""

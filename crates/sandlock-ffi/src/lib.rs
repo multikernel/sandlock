@@ -1016,6 +1016,140 @@ pub unsafe extern "C" fn sandlock_sandbox_free(sb: *mut Sandbox) {
 }
 
 // ----------------------------------------------------------------
+// Checkpoint
+// ----------------------------------------------------------------
+
+/// Opaque handle wrapping a [`Checkpoint`].
+pub struct sandlock_checkpoint_t {
+    _private: sandlock_core::Checkpoint,
+}
+
+/// Capture a checkpoint from a live sandbox handle.
+/// The sandbox is frozen (SIGSTOP + fork-hold), state is captured via ptrace,
+/// then thawed. Returns NULL on error.
+///
+/// # Safety
+/// `h` must be a valid handle from `sandlock_spawn`.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_handle_checkpoint(
+    h: *mut sandlock_handle_t,
+) -> *mut sandlock_checkpoint_t {
+    if h.is_null() { return ptr::null_mut(); }
+    let h = &mut *h;
+    match h.runtime.block_on(h.sandbox.checkpoint()) {
+        Ok(cp) => Box::into_raw(Box::new(sandlock_checkpoint_t { _private: cp })),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Save a checkpoint to a directory (human-readable JSON + binary layout).
+/// Returns 0 on success, -1 on error.
+///
+/// # Safety
+/// `cp` must be a valid checkpoint pointer. `dir` must be a valid C string path.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_checkpoint_save(
+    cp: *const sandlock_checkpoint_t,
+    dir: *const c_char,
+) -> c_int {
+    if cp.is_null() || dir.is_null() { return -1; }
+    let dir = CStr::from_ptr(dir).to_str().unwrap_or("");
+    match (*cp)._private.save(std::path::Path::new(dir)) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// Load a checkpoint from a directory.
+/// Returns NULL on error.
+///
+/// # Safety
+/// `dir` must be a valid C string path to a checkpoint directory.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_checkpoint_load(
+    dir: *const c_char,
+) -> *mut sandlock_checkpoint_t {
+    if dir.is_null() { return ptr::null_mut(); }
+    let dir = CStr::from_ptr(dir).to_str().unwrap_or("");
+    match sandlock_core::Checkpoint::load(std::path::Path::new(dir)) {
+        Ok(cp) => Box::into_raw(Box::new(sandlock_checkpoint_t { _private: cp })),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Set the checkpoint name.
+///
+/// # Safety
+/// `cp` must be a valid checkpoint pointer. `name` must be a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_checkpoint_set_name(
+    cp: *mut sandlock_checkpoint_t,
+    name: *const c_char,
+) {
+    if cp.is_null() || name.is_null() { return; }
+    (*cp)._private.name = CStr::from_ptr(name).to_str().unwrap_or("").to_string();
+}
+
+/// Get the checkpoint name. Returns a malloc'd C string; free with `sandlock_string_free`.
+///
+/// # Safety
+/// `cp` must be a valid checkpoint pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_checkpoint_name(
+    cp: *const sandlock_checkpoint_t,
+) -> *mut c_char {
+    if cp.is_null() { return ptr::null_mut(); }
+    match CString::new((*cp)._private.name.as_str()) {
+        Ok(cs) => cs.into_raw(),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Set optional app-level state bytes on the checkpoint.
+///
+/// # Safety
+/// `cp` must be valid. `data` must point to `len` bytes, or be NULL to clear.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_checkpoint_set_app_state(
+    cp: *mut sandlock_checkpoint_t,
+    data: *const u8,
+    len: usize,
+) {
+    if cp.is_null() { return; }
+    if data.is_null() || len == 0 {
+        (*cp)._private.app_state = None;
+    } else {
+        (*cp)._private.app_state = Some(std::slice::from_raw_parts(data, len).to_vec());
+    }
+}
+
+/// Get app-level state bytes. Returns pointer to internal buffer (valid until
+/// checkpoint is freed). Writes length to `*len`. Returns NULL if no app state.
+///
+/// # Safety
+/// `cp` must be a valid checkpoint pointer. `len` must be a valid pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_checkpoint_app_state(
+    cp: *const sandlock_checkpoint_t,
+    len: *mut usize,
+) -> *const u8 {
+    if cp.is_null() || len.is_null() { return ptr::null(); }
+    match (*cp)._private.app_state.as_ref() {
+        Some(data) => { *len = data.len(); data.as_ptr() }
+        None => { *len = 0; ptr::null() }
+    }
+}
+
+/// Free a checkpoint handle.
+///
+/// # Safety
+/// `cp` must be null or a valid checkpoint pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_checkpoint_free(cp: *mut sandlock_checkpoint_t) {
+    if !cp.is_null() { drop(Box::from_raw(cp)); }
+}
+
+// ----------------------------------------------------------------
 // Helpers
 // ----------------------------------------------------------------
 

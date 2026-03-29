@@ -6,7 +6,7 @@ without root or namespaces.
 """
 
 from ._version import __version__
-from ._sdk import Sandbox, Stage, Pipeline, Result, SyscallEvent, PolicyContext
+from ._sdk import Sandbox, Stage, Pipeline, Result, SyscallEvent, PolicyContext, Checkpoint
 from .policy import Policy, FsIsolation, BranchAction, parse_ports
 from ._profile import load_profile, list_profiles
 from .exceptions import (
@@ -24,6 +24,7 @@ __all__ = [
     "Result",
     "SyscallEvent",
     "PolicyContext",
+    "Checkpoint",
     "Policy",
     "FsIsolation",
     "BranchAction",
