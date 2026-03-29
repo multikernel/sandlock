@@ -242,7 +242,7 @@ pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
         nrs.push(libc::SYS_mremap as u32);
     }
 
-    if !policy.net_allow_hosts.is_empty() {
+    if !policy.net_allow_hosts.is_empty() || policy.policy_fn.is_some() {
         nrs.push(libc::SYS_connect as u32);
         nrs.push(libc::SYS_sendto as u32);
         nrs.push(libc::SYS_sendmsg as u32);

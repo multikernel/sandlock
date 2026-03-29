@@ -47,6 +47,15 @@ pub enum NotifAction {
 // SupervisorState — runtime state shared across handlers
 // ============================================================
 
+/// Global network policy for the sandbox.
+#[derive(Debug, Clone)]
+pub enum NetworkPolicy {
+    /// All IPs allowed (no net_allow_hosts configured).
+    Unrestricted,
+    /// Only these IPs are allowed (from resolved net_allow_hosts).
+    AllowList(HashSet<IpAddr>),
+}
+
 /// Runtime state shared across notification handlers.
 pub struct SupervisorState {
     pub mem_used: u64,
@@ -55,7 +64,8 @@ pub struct SupervisorState {
     pub proc_pids: HashSet<i32>,
     pub hold_forks: bool,
     pub held_notif_ids: Vec<u64>,
-    pub allowed_ips: HashSet<IpAddr>,
+    /// Global network policy: unrestricted or limited to a set of IPs.
+    pub network_policy: NetworkPolicy,
     pub max_memory_bytes: u64,
     pub max_processes: u32,
     pub time_offset: Option<i64>,
@@ -97,7 +107,7 @@ impl SupervisorState {
             proc_pids: HashSet::new(),
             hold_forks: false,
             held_notif_ids: Vec::new(),
-            allowed_ips: HashSet::new(),
+            network_policy: NetworkPolicy::Unrestricted,
             max_memory_bytes,
             max_processes,
             time_offset,
@@ -117,23 +127,27 @@ impl SupervisorState {
 }
 
 impl SupervisorState {
-    /// Get the effective allowed IPs, checking per-PID overrides first,
-    /// then live policy, then static allowed_ips.
-    pub fn effective_allowed_ips(&self, pid: u32) -> HashSet<IpAddr> {
+    /// Get the effective network policy for a PID.
+    ///
+    /// Priority: per-PID override > live policy > global network_policy.
+    /// Returns `NetworkPolicy::Unrestricted` if no restrictions apply.
+    pub fn effective_network_policy(&self, pid: u32) -> NetworkPolicy {
         // Per-PID override takes priority
         if let Ok(overrides) = self.pid_ip_overrides.read() {
             if let Some(ips) = overrides.get(&pid) {
-                return ips.clone();
+                return NetworkPolicy::AllowList(ips.clone());
             }
         }
         // Live policy (dynamic updates from policy_fn)
         if let Some(ref lp) = self.live_policy {
             if let Ok(live) = lp.read() {
-                return live.allowed_ips.clone();
+                if !live.allowed_ips.is_empty() {
+                    return NetworkPolicy::AllowList(live.allowed_ips.clone());
+                }
             }
         }
-        // Static policy
-        self.allowed_ips.clone()
+        // Global policy
+        self.network_policy.clone()
     }
 
     /// Check if a path is dynamically denied.

@@ -79,8 +79,12 @@ async fn connect_on_behalf(
     // 2. Check IP against allowlist
     if let Some(ip) = parse_ip_from_sockaddr(&addr_bytes) {
         let st = state.lock().await;
-        if !st.effective_allowed_ips(notif.pid).contains(&ip) {
-            return NotifAction::Errno(ECONNREFUSED);
+        if let crate::seccomp::notif::NetworkPolicy::AllowList(ref allowed) =
+            st.effective_network_policy(notif.pid)
+        {
+            if !allowed.contains(&ip) {
+                return NotifAction::Errno(ECONNREFUSED);
+            }
         }
         let child_pidfd = match st.child_pidfd {
             Some(fd) => fd,
@@ -148,8 +152,12 @@ async fn sendto_validate_overwrite(
     // 2. Check IP
     if let Some(ip) = parse_ip_from_sockaddr(&addr_bytes) {
         let st = state.lock().await;
-        if !st.effective_allowed_ips(notif.pid).contains(&ip) {
-            return NotifAction::Errno(ECONNREFUSED);
+        if let crate::seccomp::notif::NetworkPolicy::AllowList(ref allowed) =
+            st.effective_network_policy(notif.pid)
+        {
+            if !allowed.contains(&ip) {
+                return NotifAction::Errno(ECONNREFUSED);
+            }
         }
         drop(st);
 
@@ -201,8 +209,12 @@ async fn sendmsg_validate_overwrite(
     // 2. Check IP
     if let Some(ip) = parse_ip_from_sockaddr(&addr_bytes) {
         let st = state.lock().await;
-        if !st.effective_allowed_ips(notif.pid).contains(&ip) {
-            return NotifAction::Errno(ECONNREFUSED);
+        if let crate::seccomp::notif::NetworkPolicy::AllowList(ref allowed) =
+            st.effective_network_policy(notif.pid)
+        {
+            if !allowed.contains(&ip) {
+                return NotifAction::Errno(ECONNREFUSED);
+            }
         }
         drop(st);
 

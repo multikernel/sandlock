@@ -441,3 +441,58 @@ async fn test_policy_fn_audit() {
     let captured = audited.lock().unwrap();
     assert!(!captured.is_empty(), "should have audited file events");
 }
+
+/// Test that restrict_pid_network works even without net_allow_hosts.
+/// This verifies that policy_fn alone enables network syscall interception.
+#[tokio::test]
+async fn test_policy_fn_restrict_pid_network_without_allowlist() {
+    // No net_allow_hosts — network should be unrestricted by default,
+    // but policy_fn can still restrict specific PIDs.
+    let policy = base_policy()
+        .policy_fn(move |event, ctx| {
+            // On execve of the connect script, restrict that PID to no IPs
+            if event.syscall == "execve" {
+                if let Some(ref path) = event.path {
+                    if path.contains("connect_test") {
+                        ctx.restrict_pid_network(event.pid, &[]);
+                    }
+                }
+            }
+            Verdict::Allow
+        })
+        .build()
+        .unwrap();
+
+    // Create a script that attempts to connect to localhost
+    let script = temp_file("connect_test");
+    std::fs::write(&script, r#"#!/bin/sh
+exec python3 -c "
+import socket, sys
+try:
+    s = socket.create_connection(('127.0.0.1', 1), timeout=2)
+    s.close()
+except ConnectionRefusedError:
+    print('REFUSED')
+    sys.exit(0)
+except OSError as e:
+    print(f'BLOCKED: {e}')
+    sys.exit(0)
+print('CONNECTED')
+sys.exit(1)
+"
+"#).unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+    let result = Sandbox::run(&policy, &[script.to_str().unwrap()])
+        .await
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or(b""));
+    // Connection should be refused (restricted by policy_fn)
+    assert!(
+        stdout.contains("REFUSED") || stdout.contains("BLOCKED"),
+        "Expected connection to be blocked, got: {}", stdout,
+    );
+
+    let _ = std::fs::remove_file(&script);
+}

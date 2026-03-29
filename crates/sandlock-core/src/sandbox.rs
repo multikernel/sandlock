@@ -782,7 +782,8 @@ impl Sandbox {
                 max_memory_bytes: self.policy.max_memory.map(|m| m.0).unwrap_or(0),
                 max_processes: self.policy.max_processes,
                 has_memory_limit: self.policy.max_memory.is_some(),
-                has_net_allowlist: !self.policy.net_allow_hosts.is_empty(),
+                has_net_allowlist: !self.policy.net_allow_hosts.is_empty()
+                    || self.policy.policy_fn.is_some(),
                 has_random_seed: self.policy.random_seed.is_some(),
                 has_time_start: self.policy.time_start.is_some(),
                 time_offset: time_offset_val,
@@ -806,7 +807,11 @@ impl Sandbox {
                 time_offset,
                 random_state,
             );
-            sup_state.allowed_ips = resolved_ips;
+            sup_state.network_policy = if self.policy.net_allow_hosts.is_empty() {
+                crate::seccomp::notif::NetworkPolicy::Unrestricted
+            } else {
+                crate::seccomp::notif::NetworkPolicy::AllowList(resolved_ips)
+            };
 
             if let Some(ref pfd) = pidfd {
                 use std::os::unix::io::AsRawFd;
@@ -826,7 +831,10 @@ impl Sandbox {
             // Policy callback thread
             if let Some(ref callback) = self.policy.policy_fn {
                 let live = crate::policy_fn::LivePolicy {
-                    allowed_ips: sup_state.allowed_ips.clone(),
+                    allowed_ips: match &sup_state.network_policy {
+                        crate::seccomp::notif::NetworkPolicy::AllowList(ips) => ips.clone(),
+                        crate::seccomp::notif::NetworkPolicy::Unrestricted => std::collections::HashSet::new(),
+                    },
                     max_memory_bytes: notif_policy.max_memory_bytes,
                     max_processes: notif_policy.max_processes,
                 };
