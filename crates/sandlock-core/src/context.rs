@@ -829,7 +829,7 @@ mod tests {
     #[test]
     fn test_arg_filters_has_clone_ioctl_prctl_socket() {
         use crate::sys::structs::{
-            BPF_ABS, BPF_JEQ, BPF_JSET, BPF_JMP, BPF_K, BPF_LD, BPF_W,
+            BPF_JEQ, BPF_JSET, BPF_JMP, BPF_K,
         };
         let policy = Policy::builder().build().unwrap();
         let filters = arg_filters(&policy);

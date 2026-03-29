@@ -901,7 +901,7 @@ mod tests {
         assert!(state.proc_pids.is_empty());
         assert!(!state.hold_forks);
         assert!(state.held_notif_ids.is_empty());
-        assert!(state.allowed_ips.is_empty());
+        assert!(matches!(state.network_policy, NetworkPolicy::Unrestricted));
         assert!(state.time_offset.is_none());
         assert!(state.random_state.is_none());
     }
