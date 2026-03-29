@@ -183,6 +183,11 @@ class Policy:
     Enforced by the parent via SIGSTOP/SIGCONT cycling on the process
     group — applies to all processes in the sandbox collectively."""
 
+    cpu_cores: Sequence[int] | None = None
+    """CPU cores to pin the sandbox to.  When set, sched_setaffinity()
+    is called in the child to restrict it to the specified cores.
+    None = inherit parent affinity (unrestricted)."""
+
     num_cpus: int | None = None
     """Visible CPU count in /proc/cpuinfo.  When set, the sandbox sees
     a synthetic /proc/cpuinfo with only this many processor entries

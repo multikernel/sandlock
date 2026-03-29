@@ -67,6 +67,16 @@ fn test_no_args_shows_help() {
 }
 
 #[test]
+fn test_cpu_cores_flag_accepted() {
+    let output = sandlock_bin()
+        .args(["run", "--help"])
+        .output()
+        .expect("failed to run sandlock");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--cpu-cores"), "help should mention --cpu-cores");
+}
+
+#[test]
 fn test_status_fd_flag_accepted() {
     // Just verify the flag is accepted without error
     let bin = env!("CARGO_BIN_EXE_sandlock");

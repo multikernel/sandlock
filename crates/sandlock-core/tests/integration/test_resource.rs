@@ -223,6 +223,30 @@ async fn test_spawn_and_kill() {
 }
 
 #[tokio::test]
+async fn test_cpu_cores_affinity() {
+    let out = temp_path("cpu-cores");
+
+    // Bind to CPU 0 only
+    let script = format!(concat!(
+        "import os\n",
+        "mask = os.sched_getaffinity(0)\n",
+        "open('{}', 'w').write(','.join(str(c) for c in sorted(mask)))\n",
+    ), out.display());
+
+    let policy = base_policy()
+        .cpu_cores(vec![0])
+        .build()
+        .unwrap();
+    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script]).await.unwrap();
+    assert_eq!(result.code(), Some(0));
+
+    let content = std::fs::read_to_string(&out).expect("temp file should exist");
+    assert_eq!(content.trim(), "0", "sandbox should be pinned to CPU 0 only");
+
+    let _ = std::fs::remove_file(&out);
+}
+
+#[tokio::test]
 async fn test_pause_resume() {
     let policy = base_policy().build().unwrap();
     let mut sb = Sandbox::new(&policy).unwrap();

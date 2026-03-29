@@ -161,3 +161,18 @@ fn test_fs_deny() {
         .unwrap();
     assert_eq!(p.fs_denied.len(), 2);
 }
+
+#[test]
+fn test_cpu_cores_default_none() {
+    let p = Policy::builder().build().unwrap();
+    assert!(p.cpu_cores.is_none());
+}
+
+#[test]
+fn test_cpu_cores_builder() {
+    let p = Policy::builder()
+        .cpu_cores(vec![0, 2, 3])
+        .build()
+        .unwrap();
+    assert_eq!(p.cpu_cores, Some(vec![0, 2, 3]));
+}

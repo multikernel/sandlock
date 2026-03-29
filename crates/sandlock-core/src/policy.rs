@@ -128,6 +128,7 @@ pub struct Policy {
     pub gpu_devices: Option<Vec<u32>>,
 
     // CPU
+    pub cpu_cores: Option<Vec<u32>>,
     pub num_cpus: Option<u32>,
     pub port_remap: bool,
 
@@ -202,6 +203,7 @@ pub struct PolicyBuilder {
 
     gpu_devices: Option<Vec<u32>>,
 
+    cpu_cores: Option<Vec<u32>>,
     num_cpus: Option<u32>,
     port_remap: bool,
 
@@ -371,6 +373,11 @@ impl PolicyBuilder {
         self
     }
 
+    pub fn cpu_cores(mut self, cores: Vec<u32>) -> Self {
+        self.cpu_cores = Some(cores);
+        self
+    }
+
     pub fn num_cpus(mut self, n: u32) -> Self {
         self.num_cpus = Some(n);
         self
@@ -451,6 +458,7 @@ impl PolicyBuilder {
             env: self.env,
             close_fds: self.close_fds.unwrap_or(true),
             gpu_devices: self.gpu_devices,
+            cpu_cores: self.cpu_cores,
             num_cpus: self.num_cpus,
             port_remap: self.port_remap,
             strict: self.strict.unwrap_or(true),

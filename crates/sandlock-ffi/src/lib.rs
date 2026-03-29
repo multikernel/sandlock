@@ -143,6 +143,22 @@ pub unsafe extern "C" fn sandlock_policy_builder_num_cpus(
     Box::into_raw(Box::new(builder.num_cpus(n)))
 }
 
+/// # Safety
+/// `b` must be a valid builder pointer.  `cores` must point to `len` u32 values.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_cpu_cores(
+    b: *mut PolicyBuilder, cores: *const u32, len: u32,
+) -> *mut PolicyBuilder {
+    if b.is_null() || (len > 0 && cores.is_null()) { return b; }
+    let slice = if len > 0 {
+        std::slice::from_raw_parts(cores, len as usize)
+    } else {
+        &[]
+    };
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.cpu_cores(slice.to_vec())))
+}
+
 // ----------------------------------------------------------------
 // Policy Builder — network
 // ----------------------------------------------------------------

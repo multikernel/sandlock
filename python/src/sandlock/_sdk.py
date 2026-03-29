@@ -89,6 +89,7 @@ _b_clean_env = _builder_fn("sandlock_policy_builder_clean_env", ctypes.c_bool)
 _b_env_var = _builder_fn("sandlock_policy_builder_env_var", ctypes.c_char_p, ctypes.c_char_p)
 _b_no_randomize_memory = _builder_fn("sandlock_policy_builder_no_randomize_memory", ctypes.c_bool)
 _b_no_huge_pages = _builder_fn("sandlock_policy_builder_no_huge_pages", ctypes.c_bool)
+_b_cpu_cores = _builder_fn("sandlock_policy_builder_cpu_cores", ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32)
 
 # Policy callback (policy_fn)
 class _CEvent(ctypes.Structure):
@@ -591,6 +592,9 @@ class _NativePolicy:
             b = _b_max_cpu(b, policy.max_cpu)
         if policy.num_cpus is not None:
             b = _b_num_cpus(b, policy.num_cpus)
+        if policy.cpu_cores is not None:
+            arr = (ctypes.c_uint32 * len(policy.cpu_cores))(*policy.cpu_cores)
+            b = _b_cpu_cores(b, arr, len(policy.cpu_cores))
 
         for host in (policy.net_allow_hosts or []):
             b = _b_net_allow_host(b, _encode(str(host)))

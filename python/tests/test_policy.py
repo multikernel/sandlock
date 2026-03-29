@@ -167,6 +167,16 @@ class TestGpuDevices:
         assert p.gpu_devices == []
 
 
+class TestCpuCores:
+    def test_default_none(self):
+        p = Policy()
+        assert p.cpu_cores is None
+
+    def test_specific_cores(self):
+        p = Policy(cpu_cores=[0, 2, 3])
+        assert p.cpu_cores == [0, 2, 3]
+
+
 class TestIpcScoping:
     def test_defaults_to_off(self):
         p = Policy()

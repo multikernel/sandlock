@@ -46,6 +46,7 @@ _SIMPLE_FIELDS: dict[str, type] = {
     "max_open_files": int,
     "max_cpu": int,
     "num_cpus": int,
+    "cpu_cores": list,
     # Chroot
     "chroot": str,
     # Environment

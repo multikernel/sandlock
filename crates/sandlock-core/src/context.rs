@@ -572,6 +572,27 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
         }
     }
 
+    // 4b. Optional: CPU core binding
+    if let Some(ref cores) = policy.cpu_cores {
+        if !cores.is_empty() {
+            let mut set = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+            unsafe { libc::CPU_ZERO(&mut set) };
+            for &core in cores {
+                unsafe { libc::CPU_SET(core as usize, &mut set) };
+            }
+            if unsafe {
+                libc::sched_setaffinity(
+                    0,
+                    std::mem::size_of::<libc::cpu_set_t>(),
+                    &set,
+                )
+            } != 0
+            {
+                fail!(format!("sched_setaffinity: {}", std::io::Error::last_os_error()));
+            }
+        }
+    }
+
     // 5. Optional: disable THP
     if policy.no_huge_pages {
         if unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0) } != 0 {

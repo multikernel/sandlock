@@ -86,6 +86,9 @@ enum Command {
         interactive: bool,
         #[arg(long = "fs-deny", value_name = "PATH")]
         fs_deny: Vec<String>,
+        /// CPU cores to pin the sandbox to (e.g. --cpu-cores 0,2,3)
+        #[arg(long = "cpu-cores", value_delimiter = ',')]
+        cpu_cores: Vec<u32>,
         /// GPU device indices visible to the sandbox (e.g. --gpu 0,2)
         #[arg(long = "gpu", value_delimiter = ',')]
         gpu_devices: Vec<u32>,
@@ -132,7 +135,7 @@ async fn main() -> Result<()> {
             max_cpu, max_open_files, strict, chroot, privileged, workdir,
             fs_isolation, fs_storage, max_disk, net_allow, net_deny,
             port_remap, no_randomize_memory, no_huge_pages, no_coredump,
-            env_vars, exec_shell, interactive: _, fs_deny, gpu_devices, image, cmd } =>
+            env_vars, exec_shell, interactive: _, fs_deny, cpu_cores, gpu_devices, image, cmd } =>
         {
             // Start from profile or default
             let mut builder = if let Some(ref name) = profile_name {
@@ -211,6 +214,7 @@ async fn main() -> Result<()> {
                 }
             }
             if port_remap { builder = builder.port_remap(true); }
+            if !cpu_cores.is_empty() { builder = builder.cpu_cores(cpu_cores); }
             if !gpu_devices.is_empty() { builder = builder.gpu_devices(gpu_devices); }
             if no_randomize_memory { builder = builder.no_randomize_memory(true); }
             if no_huge_pages { builder = builder.no_huge_pages(true); }
