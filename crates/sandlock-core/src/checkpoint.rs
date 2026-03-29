@@ -15,7 +15,7 @@ pub struct Checkpoint {
     pub app_state: Option<Vec<u8>>,
 }
 
-/// Captured process state via ptrace + /proc.
+/// Captured process state via ptrace (registers) + process_vm_readv (memory) + /proc (metadata).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ProcessState {
     pub pid: i32,
@@ -66,15 +66,24 @@ pub struct FdInfo {
 }
 
 // ---------------------------------------------------------------------------
-// ptrace helpers
+// ptrace helpers — PTRACE_SEIZE (doesn't auto-SIGSTOP like ATTACH)
 // ---------------------------------------------------------------------------
 
-fn ptrace_attach(pid: i32) -> io::Result<()> {
-    let ret = unsafe { libc::ptrace(libc::PTRACE_ATTACH, pid, 0, 0) };
+fn ptrace_seize(pid: i32) -> io::Result<()> {
+    let ret = unsafe {
+        libc::ptrace(libc::PTRACE_SEIZE as libc::c_uint, pid, 0, 0)
+    };
     if ret < 0 {
         return Err(io::Error::last_os_error());
     }
-    // Wait for the process to stop
+    // PTRACE_INTERRUPT stops the tracee without SIGSTOP side effects
+    let ret = unsafe {
+        libc::ptrace(libc::PTRACE_INTERRUPT as libc::c_uint, pid, 0, 0)
+    };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Wait for the ptrace-stop
     let mut status: i32 = 0;
     unsafe {
         libc::waitpid(pid, &mut status, 0);
@@ -143,16 +152,13 @@ fn parse_proc_maps(pid: i32) -> io::Result<Vec<MemoryMap>> {
 }
 
 // ---------------------------------------------------------------------------
-// Memory capture
+// Memory capture — process_vm_readv (scatter-gather, no file I/O)
 // ---------------------------------------------------------------------------
 
 fn capture_memory(pid: i32, maps: &[MemoryMap]) -> io::Result<Vec<MemorySegment>> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut mem_file = std::fs::File::open(format!("/proc/{}/mem", pid))?;
     let mut segments = Vec::new();
 
     for map in maps {
-        // Only capture writable, private, non-special segments
         if !map.writable() || !map.private() || map.is_special() {
             continue;
         }
@@ -162,14 +168,34 @@ fn capture_memory(pid: i32, maps: &[MemoryMap]) -> io::Result<Vec<MemorySegment>
         }
 
         let mut data = vec![0u8; size];
-        if mem_file.seek(SeekFrom::Start(map.start)).is_ok()
-            && mem_file.read_exact(&mut data).is_ok()
-        {
+
+        let local_iov = libc::iovec {
+            iov_base: data.as_mut_ptr() as *mut libc::c_void,
+            iov_len: size,
+        };
+        let remote_iov = libc::iovec {
+            iov_base: map.start as *mut libc::c_void,
+            iov_len: size,
+        };
+
+        let ret = unsafe {
+            libc::process_vm_readv(
+                pid as libc::pid_t,
+                &local_iov as *const libc::iovec,
+                1,
+                &remote_iov as *const libc::iovec,
+                1,
+                0,
+            )
+        };
+
+        if ret == size as isize {
             segments.push(MemorySegment {
                 start: map.start,
                 data,
             });
         }
+        // Skip unreadable segments silently (same as old behavior)
     }
     Ok(segments)
 }
@@ -231,9 +257,9 @@ fn parse_fdinfo(pid: i32, fd: i32) -> io::Result<(i32, u64)> {
 /// Capture a checkpoint from a running, stopped sandbox.
 /// The sandbox must already be frozen (SIGSTOP'd and fork-held).
 pub(crate) fn capture(pid: i32, policy: &Policy) -> Result<Checkpoint, SandlockError> {
-    // Attach via ptrace
-    ptrace_attach(pid).map_err(|e| {
-        SandlockError::Sandbox(SandboxError::Child(format!("ptrace attach: {}", e)))
+    // Seize via ptrace (PTRACE_SEIZE + PTRACE_INTERRUPT — doesn't auto-SIGSTOP)
+    ptrace_seize(pid).map_err(|e| {
+        SandlockError::Sandbox(SandboxError::Child(format!("ptrace seize: {}", e)))
     })?;
 
     // Capture registers
