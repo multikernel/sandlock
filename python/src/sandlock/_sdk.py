@@ -81,6 +81,7 @@ _b_net_connect_port = _builder_fn("sandlock_policy_builder_net_connect_port", ct
 _b_port_remap = _builder_fn("sandlock_policy_builder_port_remap", ctypes.c_bool)
 _b_no_raw_sockets = _builder_fn("sandlock_policy_builder_no_raw_sockets", ctypes.c_bool)
 _b_no_udp = _builder_fn("sandlock_policy_builder_no_udp", ctypes.c_bool)
+_b_privileged = _builder_fn("sandlock_policy_builder_privileged", ctypes.c_bool)
 _b_isolate_ipc = _builder_fn("sandlock_policy_builder_isolate_ipc", ctypes.c_bool)
 _b_isolate_signals = _builder_fn("sandlock_policy_builder_isolate_signals", ctypes.c_bool)
 _b_random_seed = _builder_fn("sandlock_policy_builder_random_seed", ctypes.c_uint64)
@@ -604,6 +605,9 @@ class _NativePolicy:
             b = _b_no_raw_sockets(b, False)
         if policy.no_udp:
             b = _b_no_udp(b, True)
+
+        if policy.privileged:
+            b = _b_privileged(b, True)
 
         if policy.isolate_ipc:
             b = _b_isolate_ipc(b, True)

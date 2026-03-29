@@ -502,12 +502,20 @@ pub(crate) struct CowConfig {
 }
 
 /// Write uid/gid maps for an unprivileged user namespace.
-fn write_id_maps() {
+/// `real_uid`/`real_gid` must be captured *before* unshare(CLONE_NEWUSER),
+/// since getuid()/getgid() return the overflow id (65534) after unshare.
+fn write_id_maps(real_uid: u32, real_gid: u32) {
+    let _ = std::fs::write("/proc/self/uid_map", format!("0 {} 1\n", real_uid));
+    let _ = std::fs::write("/proc/self/setgroups", "deny\n");
+    let _ = std::fs::write("/proc/self/gid_map", format!("0 {} 1\n", real_gid));
+}
+
+/// Write uid/gid maps using the post-unshare overflow uid (65534).
+/// Used by the OverlayFS COW path which relies on this specific mapping.
+fn write_id_maps_overflow() {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
-    let _ = std::fs::write("/proc/self/uid_map", format!("0 {} 1\n", uid));
-    let _ = std::fs::write("/proc/self/setgroups", "deny\n");
-    let _ = std::fs::write("/proc/self/gid_map", format!("0 {} 1\n", gid));
+    write_id_maps(uid, gid);
 }
 
 // ============================================================
@@ -559,15 +567,27 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
         }
     }
 
-    // 5b. User + mount namespace for OverlayFS COW
+    // Capture real uid/gid before any unshare (after unshare they become 65534)
+    let real_uid = unsafe { libc::getuid() };
+    let real_gid = unsafe { libc::getgid() };
+
+    // 5b. User namespace for privileged mode (fake root) or OverlayFS COW
+    if policy.privileged && cow_config.is_none() {
+        if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
+            fail!("unshare(CLONE_NEWUSER)");
+        }
+        write_id_maps(real_uid, real_gid);
+    }
+
+    // 5c. User + mount namespace for OverlayFS COW (includes CLONE_NEWUSER)
     if let Some(ref cow) = cow_config {
         // unshare user + mount namespaces (unprivileged)
         if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) } != 0 {
             fail!("unshare(CLONE_NEWUSER | CLONE_NEWNS)");
         }
 
-        // Write uid/gid maps so we have root inside the namespace
-        write_id_maps();
+        // Write uid/gid maps using overflow uid (preserves existing COW behavior)
+        write_id_maps_overflow();
 
         // Mount the overlay filesystem
         let lowerdir = cow.lowers.iter()

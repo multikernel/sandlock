@@ -39,3 +39,6 @@ mod test_policy_fn;
 
 #[path = "integration/test_fork.rs"]
 mod test_fork;
+
+#[path = "integration/test_privileged.rs"]
+mod test_privileged;
