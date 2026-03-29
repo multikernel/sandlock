@@ -6,7 +6,7 @@
 3. Parent checks /proc/pid/smaps — proves pages are physically shared
 
 Usage:
-    python3 examples/try_clone.py
+    python3 examples/fork.py
 """
 
 import os
@@ -44,11 +44,10 @@ def init():
         struct.pack_into("<Q", buf, offset, _TOKEN)
 
 
-def work():
+def work(clone_id):
     """Read the buffer. Proves COW — data is from init()'s process."""
     import struct
 
-    seed = int(os.environ.get("CLONE_ID", "0"))
     my_pid = os.getpid()
 
     # Read token from first page
@@ -64,7 +63,7 @@ def work():
             all_match = False
             break
 
-    with open(f"/tmp/sandlock_cow_{seed}", "w") as f:
+    with open(f"/tmp/sandlock_cow_{clone_id}", "w") as f:
         f.write(f"clone_pid={my_pid} init_pid={token} "
                 f"pages_ok={all_match} buf_addr=0x{_BUF_ADDR:x}")
 
@@ -93,25 +92,20 @@ def main():
 
     print("=== COW Clone Proof ===\n", flush=True)
 
-    with Sandbox(policy, init, work) as sb:
-        # Fork 3 clones, keep them alive briefly to check smaps
-        clones = list(enumerate(sb.fork(3)))
+    with Sandbox(policy, init_fn=init, work_fn=work) as sb:
+        # Fork 3 clones
+        fork_result = sb.fork(3)
 
         # Give clones time to run
         time.sleep(1)
 
         # Check shared pages for each clone
-        for seed, clone in clones:
-            pid = clone._clone_pid
+        for i, pid in enumerate(fork_result.pids):
             if pid:
                 shared_kb, private_kb = get_shared_pages(pid)
-                print(f"  Clone {seed} (PID {pid}): "
+                print(f"  Clone {i} (PID {pid}): "
                       f"shared={shared_kb} KB, private={private_kb} KB",
                       flush=True)
-
-        # Wait for all clones
-        for seed, clone in clones:
-            clone.wait(timeout=5)
 
     # Read results
     print(flush=True)

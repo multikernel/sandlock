@@ -19,14 +19,13 @@ def example_nested():
         fs_writable=[],
     )
 
-    sb = Sandbox(outer_policy)
-
     # Outer sandbox can write to /tmp
+    sb = Sandbox(outer_policy)
     result = sb.run(["python3", "-c", "print('outer ok')"])
     print(f"  outer: {result.success} — {result.stdout.decode().strip()}")
 
-    # Inner sandbox: more restrictive
-    inner = sb.sandbox(inner_policy)
+    # Inner sandbox: more restrictive (independent sandbox with tighter policy)
+    inner = Sandbox(inner_policy)
     result = inner.run(["echo", "inner ok"])
     print(f"  inner: {result.success} — {result.stdout.decode().strip()}")
     print()

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Supply chain attack defense with policy coroutines.
+"""Supply chain attack defense with policy callbacks.
 
 Simulates a real supply chain attack: an AI agent runs ``pip install``
 which executes a malicious ``setup.py``.  The policy_fn detects the
@@ -83,35 +83,28 @@ print("[agent] done")
         print("=== Without policy_fn ===", flush=True)
         received.clear()
         with Sandbox(policy) as sb:
-            sb.exec(["python3", agent_py])
-            sb.wait(timeout=10)
+            result = sb.run(["python3", agent_py])
+            print(result.stdout.decode(), end="", flush=True)
         print(f"Secret leaked: {bool(received)}\n", flush=True)
 
         # --- Run 2: policy_fn detects setup.py in argv ---
         print("=== With policy_fn ===", flush=True)
         received.clear()
 
-        async def install_guard(events, ctx):
-            """Detect 'python3 setup.py' in execve argv, restrict that PID.
-
-            Uses restrict_pid() so only the setup.py process and its
-            children (e.g. nc, curl) lose network access.  The parent
-            agent keeps full permissions.
-            """
-            async for e in events:
-                if e.syscall == "execve" and e.argv:
-                    for arg in e.argv:
-                        if arg.endswith("setup.py"):
-                            print(f"[policy_fn] PID {e.pid} "
-                                  f"argv={list(e.argv)}"
-                                  " — restricting", flush=True)
-                            ctx.restrict_pid(e.pid,
-                                             allowed_ips=frozenset())
-                            break
+        def install_guard(event, ctx):
+            """Detect 'python3 setup.py' in execve argv, restrict that PID."""
+            if event.syscall == "execve" and event.argv:
+                for arg in event.argv:
+                    if arg.endswith("setup.py"):
+                        print(f"[policy_fn] PID {event.pid} "
+                              f"argv={list(event.argv)}"
+                              " — restricting", flush=True)
+                        ctx.restrict_pid_network(event.pid, [])
+                        break
 
         with Sandbox(policy, policy_fn=install_guard) as sb:
-            sb.exec(["python3", agent_py])
-            sb.wait(timeout=10)
+            result = sb.run(["python3", agent_py])
+            print(result.stdout.decode(), end="", flush=True)
         print(f"Secret leaked: {bool(received)}", flush=True)
 
     srv.close()

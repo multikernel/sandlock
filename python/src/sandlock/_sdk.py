@@ -709,6 +709,15 @@ class Sandbox:
         self._native = _NativePolicy.from_dataclass(policy, policy_fn=policy_fn)
         self._handle = None  # live sandbox handle during run()
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._handle is not None:
+            _lib.sandlock_handle_free(self._handle)
+            self._handle = None
+        return False
+
     @property
     def pid(self) -> int | None:
         """Child PID while running, None otherwise."""
