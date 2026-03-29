@@ -79,7 +79,6 @@ fn test_status_fd_flag_accepted() {
 }
 
 #[test]
-#[ignore = "vDSO patching not effective in all test environments"]
 fn test_time_start_fakes_year() {
     let output = sandlock_bin()
         .args([
@@ -89,7 +88,7 @@ fn test_time_start_fakes_year() {
             "-r", "/lib64",
             "-r", "/bin",
             "-r", "/etc",
-            "--time-start", "2024-01-01T00:00:00",
+            "--time-start", "2000-06-15T00:00:00",
             "--",
             "date", "+%Y",
         ])
@@ -102,8 +101,8 @@ fn test_time_start_fakes_year() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.trim() == "2024",
-        "Expected year 2024, got: {:?}",
+        stdout.trim() == "2000",
+        "Expected year 2000, got: {:?}",
         stdout.trim()
     );
 }

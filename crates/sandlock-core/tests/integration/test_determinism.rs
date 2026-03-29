@@ -63,8 +63,8 @@ async fn test_random_seed_different_seeds() {
 /// The date command should show a year matching the frozen time.
 #[tokio::test]
 async fn test_time_start_frozen() {
-    // Freeze to 2000-01-01T00:00:00Z
-    let y2k = SystemTime::UNIX_EPOCH + Duration::from_secs(946684800);
+    // Freeze to 2000-06-15T00:00:00Z (mid-year avoids timezone boundary issues)
+    let y2k = SystemTime::UNIX_EPOCH + Duration::from_secs(961027200);
     let policy = Policy::builder()
         .fs_read("/usr")
         .fs_read("/lib")
@@ -78,8 +78,8 @@ async fn test_time_start_frozen() {
 
     let result = Sandbox::run(&policy, &["date", "+%Y"]).await.unwrap();
     assert!(result.success(), "date command failed");
-    // Note: Without stdout capture, we can't verify the year is 2000.
-    // But the command should at least succeed with vDSO patching active.
+    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
+    assert_eq!(stdout.trim(), "2000", "Expected year 2000, got: {:?}", stdout.trim());
 }
 
 /// Test that time_start doesn't break basic command execution.
