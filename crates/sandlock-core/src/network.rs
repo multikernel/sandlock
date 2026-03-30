@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 
 use std::os::unix::io::AsRawFd;
 
-use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction, SupervisorState};
+use crate::seccomp::notif::{read_child_mem, NotifAction, SupervisorState};
 use crate::sys::structs::{SeccompNotif, AF_INET, AF_INET6, ECONNREFUSED};
 
 // ============================================================
@@ -122,34 +122,45 @@ async fn connect_on_behalf(
 }
 
 // ============================================================
-// sendto_validate_overwrite / sendmsg_validate_overwrite — validate-and-overwrite
+// sendto_on_behalf / sendmsg_on_behalf — on-behalf (TOCTOU-safe)
 // ============================================================
 
-/// Validate sendto's sockaddr and overwrite in child memory (near-zero TOCTOU).
+/// Perform sendto() on behalf of the child process (TOCTOU-safe).
 ///
-/// 1. Copy sockaddr from child memory (our copy)
+/// 1. Copy sockaddr from child memory (our copy — immune to TOCTOU)
 /// 2. Check IP against allowlist on our copy
-/// 3. Write our validated copy back to child memory
-/// 4. CONTINUE (kernel sends with child's data buffer + our validated sockaddr)
-async fn sendto_validate_overwrite(
+/// 3. Copy data buffer from child memory
+/// 4. Duplicate child's socket fd via pidfd_getfd
+/// 5. sendto() in supervisor with validated sockaddr + copied data
+/// 6. Return byte count or errno
+///
+/// Only triggers for unconnected sends (addr_ptr != NULL), which is
+/// primarily UDP. Connected sockets (addr_ptr == NULL) use CONTINUE.
+async fn sendto_on_behalf(
     notif: &SeccompNotif,
     state: &Arc<Mutex<SupervisorState>>,
     notif_fd: RawFd,
 ) -> NotifAction {
-    let addr_ptr = notif.data.args[4];
+    let args = &notif.data.args;
+    let sockfd = args[0] as i32;
+    let buf_ptr = args[1];
+    let buf_len = args[2] as usize;
+    let flags = args[3] as i32;
+    let addr_ptr = args[4];
+    let addr_len = args[5] as u32;
+
     if addr_ptr == 0 {
         return NotifAction::Continue; // connected socket, no addr to check
     }
-    let addr_len = notif.data.args[5] as u32;
 
-    // 1. Copy sockaddr
+    // 1. Copy sockaddr from child memory (small: 16-28 bytes)
     let addr_bytes =
         match read_child_mem(notif_fd, notif.id, notif.pid, addr_ptr, addr_len as usize) {
             Ok(b) => b,
             Err(_) => return NotifAction::Errno(libc::EIO),
         };
 
-    // 2. Check IP
+    // 2. Check IP against allowlist
     if let Some(ip) = parse_ip_from_sockaddr(&addr_bytes) {
         let st = state.lock().await;
         if let crate::seccomp::notif::NetworkPolicy::AllowList(ref allowed) =
@@ -159,71 +170,188 @@ async fn sendto_validate_overwrite(
                 return NotifAction::Errno(ECONNREFUSED);
             }
         }
+        let child_pidfd = match st.child_pidfd {
+            Some(fd) => fd,
+            None => return NotifAction::Errno(libc::ENOSYS),
+        };
         drop(st);
 
-        // 3. Write validated copy back (shrinks TOCTOU window to nanoseconds)
-        let _ = write_child_mem(notif_fd, notif.id, notif.pid, addr_ptr, &addr_bytes);
-    }
+        // 3. Copy data buffer from child memory
+        let data = match read_child_mem(notif_fd, notif.id, notif.pid, buf_ptr, buf_len) {
+            Ok(b) => b,
+            Err(_) => return NotifAction::Errno(libc::EIO),
+        };
 
-    // 4. CONTINUE — kernel uses child's data buffer with our validated sockaddr
-    NotifAction::Continue
+        // 4. Duplicate child's socket into supervisor
+        let dup_fd = match crate::seccomp::notif::dup_child_fd(child_pidfd, sockfd) {
+            Ok(fd) => fd,
+            Err(_) => return NotifAction::Errno(libc::ENOSYS),
+        };
+
+        // 5. Perform sendto in supervisor with validated sockaddr + copied data
+        let ret = unsafe {
+            libc::sendto(
+                dup_fd.as_raw_fd(),
+                data.as_ptr() as *const libc::c_void,
+                data.len(),
+                flags,
+                addr_bytes.as_ptr() as *const libc::sockaddr,
+                addr_len as libc::socklen_t,
+            )
+        };
+
+        // 6. Return result
+        if ret >= 0 {
+            NotifAction::ReturnValue(ret as i64)
+        } else {
+            let errno = unsafe { *libc::__errno_location() };
+            NotifAction::Errno(errno)
+        }
+    } else {
+        // Non-IP family (AF_UNIX etc.) — allow through
+        NotifAction::Continue
+    }
 }
 
-/// Validate sendmsg's sockaddr and overwrite in child memory (near-zero TOCTOU).
+/// Perform sendmsg() on behalf of the child process (TOCTOU-safe).
 ///
-/// 1. Copy sockaddr from msg_name in msghdr
-/// 2. Check IP against allowlist on our copy
-/// 3. Write our validated copy back to child memory
-/// 4. CONTINUE
-async fn sendmsg_validate_overwrite(
+/// 1. Copy full msghdr from child memory
+/// 2. Copy sockaddr from msg_name (our copy — immune to TOCTOU)
+/// 3. Check IP against allowlist on our copy
+/// 4. Copy iovec data buffers from child memory
+/// 5. Copy control message buffer from child memory
+/// 6. Duplicate child's socket fd via pidfd_getfd
+/// 7. sendmsg() in supervisor with validated sockaddr + copied data
+/// 8. Return byte count or errno
+async fn sendmsg_on_behalf(
     notif: &SeccompNotif,
     state: &Arc<Mutex<SupervisorState>>,
     notif_fd: RawFd,
 ) -> NotifAction {
-    let msghdr_ptr = notif.data.args[1];
+    let args = &notif.data.args;
+    let sockfd = args[0] as i32;
+    let msghdr_ptr = args[1];
+    let flags = args[2] as i32;
 
-    // Read msghdr: msg_name(8) + msg_namelen(4)
-    let msghdr_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, msghdr_ptr, 16) {
-        Ok(b) if b.len() >= 12 => b,
+    // 1. Read full msghdr struct (56 bytes on x86_64):
+    //   msg_name(8) + msg_namelen(4) + pad(4) + msg_iov(8) + msg_iovlen(8)
+    //   + msg_control(8) + msg_controllen(8) + msg_flags(4) + pad(4)
+    let msghdr_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, msghdr_ptr, 56) {
+        Ok(b) if b.len() >= 56 => b,
         _ => return NotifAction::Continue,
     };
 
     let msg_name_ptr = u64::from_ne_bytes(msghdr_bytes[0..8].try_into().unwrap());
+    let msg_namelen = u32::from_ne_bytes(msghdr_bytes[8..12].try_into().unwrap());
+    let msg_iov_ptr = u64::from_ne_bytes(msghdr_bytes[16..24].try_into().unwrap());
+    let msg_iovlen = u64::from_ne_bytes(msghdr_bytes[24..32].try_into().unwrap());
+    let msg_control_ptr = u64::from_ne_bytes(msghdr_bytes[32..40].try_into().unwrap());
+    let msg_controllen = u64::from_ne_bytes(msghdr_bytes[40..48].try_into().unwrap());
+
     if msg_name_ptr == 0 {
         return NotifAction::Continue; // no address — connected socket
     }
-    let msg_namelen = u32::from_ne_bytes(msghdr_bytes[8..12].try_into().unwrap());
 
-    // 1. Copy sockaddr from msg_name
+    // 2. Copy sockaddr from msg_name
     let addr_bytes = match read_child_mem(
-        notif_fd,
-        notif.id,
-        notif.pid,
-        msg_name_ptr,
-        msg_namelen as usize,
+        notif_fd, notif.id, notif.pid, msg_name_ptr, msg_namelen as usize,
     ) {
         Ok(b) => b,
         Err(_) => return NotifAction::Errno(libc::EIO),
     };
 
-    // 2. Check IP
-    if let Some(ip) = parse_ip_from_sockaddr(&addr_bytes) {
-        let st = state.lock().await;
-        if let crate::seccomp::notif::NetworkPolicy::AllowList(ref allowed) =
-            st.effective_network_policy(notif.pid)
-        {
-            if !allowed.contains(&ip) {
-                return NotifAction::Errno(ECONNREFUSED);
-            }
-        }
-        drop(st);
+    // 3. Check IP against allowlist
+    let ip = match parse_ip_from_sockaddr(&addr_bytes) {
+        Some(ip) => ip,
+        None => return NotifAction::Continue, // Non-IP family — allow through
+    };
 
-        // 3. Write validated copy back
-        let _ = write_child_mem(notif_fd, notif.id, notif.pid, msg_name_ptr, &addr_bytes);
+    let st = state.lock().await;
+    if let crate::seccomp::notif::NetworkPolicy::AllowList(ref allowed) =
+        st.effective_network_policy(notif.pid)
+    {
+        if !allowed.contains(&ip) {
+            return NotifAction::Errno(ECONNREFUSED);
+        }
+    }
+    let child_pidfd = match st.child_pidfd {
+        Some(fd) => fd,
+        None => return NotifAction::Errno(libc::ENOSYS),
+    };
+    drop(st);
+
+    // 4. Copy iovec entries and their data buffers from child memory
+    // Safety: cap iovlen to prevent excessive allocation
+    let iovlen = (msg_iovlen as usize).min(1024);
+    let iov_size = iovlen * 16; // each iovec is 16 bytes (ptr + len)
+    let iov_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, msg_iov_ptr, iov_size) {
+        Ok(b) => b,
+        Err(_) => return NotifAction::Errno(libc::EIO),
+    };
+
+    let mut data_bufs: Vec<Vec<u8>> = Vec::with_capacity(iovlen);
+    let mut local_iovs: Vec<libc::iovec> = Vec::with_capacity(iovlen);
+
+    for i in 0..iovlen {
+        let off = i * 16;
+        if off + 16 > iov_bytes.len() { break; }
+        let iov_base = u64::from_ne_bytes(iov_bytes[off..off + 8].try_into().unwrap());
+        let iov_len = u64::from_ne_bytes(iov_bytes[off + 8..off + 16].try_into().unwrap()) as usize;
+
+        if iov_base == 0 || iov_len == 0 {
+            data_bufs.push(Vec::new());
+            continue;
+        }
+
+        let buf = match read_child_mem(notif_fd, notif.id, notif.pid, iov_base, iov_len) {
+            Ok(b) => b,
+            Err(_) => return NotifAction::Errno(libc::EIO),
+        };
+        data_bufs.push(buf);
     }
 
-    // 4. CONTINUE
-    NotifAction::Continue
+    // Build local iovec array pointing to our copied data
+    for buf in &data_bufs {
+        local_iovs.push(libc::iovec {
+            iov_base: buf.as_ptr() as *mut libc::c_void,
+            iov_len: buf.len(),
+        });
+    }
+
+    // 5. Copy control message buffer (ancillary data)
+    let control_buf = if msg_control_ptr != 0 && msg_controllen > 0 {
+        let len = (msg_controllen as usize).min(4096);
+        read_child_mem(notif_fd, notif.id, notif.pid, msg_control_ptr, len).ok()
+    } else {
+        None
+    };
+
+    // 6. Duplicate child's socket into supervisor
+    let dup_fd = match crate::seccomp::notif::dup_child_fd(child_pidfd, sockfd) {
+        Ok(fd) => fd,
+        Err(_) => return NotifAction::Errno(libc::ENOSYS),
+    };
+
+    // 7. Build msghdr and perform sendmsg in supervisor
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_name = addr_bytes.as_ptr() as *mut libc::c_void;
+    msg.msg_namelen = addr_bytes.len() as u32;
+    msg.msg_iov = local_iovs.as_mut_ptr();
+    msg.msg_iovlen = local_iovs.len();
+    if let Some(ref ctrl) = control_buf {
+        msg.msg_control = ctrl.as_ptr() as *mut libc::c_void;
+        msg.msg_controllen = ctrl.len();
+    }
+
+    let ret = unsafe { libc::sendmsg(dup_fd.as_raw_fd(), &msg, flags) };
+
+    // 8. Return result
+    if ret >= 0 {
+        NotifAction::ReturnValue(ret as i64)
+    } else {
+        let errno = unsafe { *libc::__errno_location() };
+        NotifAction::Errno(errno)
+    }
 }
 
 // ============================================================
@@ -232,8 +360,10 @@ async fn sendmsg_validate_overwrite(
 
 /// Handle network-related notifications (connect, sendto, sendmsg).
 ///
-/// connect is handled on-behalf (TOCTOU-safe). sendto/sendmsg use
-/// validate-and-overwrite to shrink the TOCTOU window to nanoseconds.
+/// All three are handled on-behalf (TOCTOU-safe): the supervisor copies data
+/// from child memory, validates the destination, duplicates the socket via
+/// pidfd_getfd, and performs the syscall itself. The child's memory is never
+/// re-read by the kernel after validation.
 pub(crate) async fn handle_net(
     notif: &SeccompNotif,
     state: &Arc<Mutex<SupervisorState>>,
@@ -244,9 +374,9 @@ pub(crate) async fn handle_net(
     if nr == libc::SYS_connect {
         connect_on_behalf(notif, state, notif_fd).await
     } else if nr == libc::SYS_sendto {
-        sendto_validate_overwrite(notif, state, notif_fd).await
+        sendto_on_behalf(notif, state, notif_fd).await
     } else if nr == libc::SYS_sendmsg {
-        sendmsg_validate_overwrite(notif, state, notif_fd).await
+        sendmsg_on_behalf(notif, state, notif_fd).await
     } else {
         NotifAction::Continue
     }
