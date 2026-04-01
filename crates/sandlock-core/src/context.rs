@@ -559,10 +559,11 @@ fn write_id_maps_overflow() {
 /// This function **never returns**: it calls `execvp` on success or
 /// `_exit(127)` on any error.
 pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, cow_config: Option<&CowConfig>, nested: bool) -> ! {
-    // Helper: abort child on error.
+    // Helper: abort child on error. Includes the OS error automatically.
     macro_rules! fail {
         ($msg:expr) => {{
-            let _ = write!(std::io::stderr(), "sandlock child: {}\n", $msg);
+            let err = std::io::Error::last_os_error();
+            let _ = write!(std::io::stderr(), "sandlock child: {}: {}\n", $msg, err);
             unsafe { libc::_exit(127) };
         }};
     }
@@ -620,7 +621,7 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
                 )
             } != 0
             {
-                fail!(format!("sched_setaffinity: {}", std::io::Error::last_os_error()));
+                fail!("sched_setaffinity");
             }
         }
     }
@@ -686,7 +687,7 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
             )
         };
         if ret != 0 {
-            fail!(format!("mount overlay: {}", std::io::Error::last_os_error()));
+            fail!("mount overlay");
         }
     }
 
@@ -807,7 +808,7 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
     unsafe { libc::execvp(argv_ptrs[0], argv_ptrs.as_ptr()) };
 
     // If we get here, exec failed
-    fail!("execvp");
+    fail!(format!("execvp '{}'", cmd[0].to_string_lossy()));
 }
 
 // ============================================================
