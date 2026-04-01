@@ -3,7 +3,7 @@ use sandlock_core::{Policy, Sandbox};
 use sandlock_core::policy::ByteSize;
 use sandlock_core::profile;
 use anyhow::{Result, anyhow};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 #[derive(Parser)]
 #[command(name = "sandlock", about = "Lightweight process sandbox")]
@@ -374,48 +374,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Days since Unix epoch (1970-01-01) for a given civil date.
-/// Uses Hinnant's algorithm.
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as u32;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe as i64 - 719468
-}
-
-/// Parse an ISO 8601 datetime string "YYYY-MM-DDTHH:MM:SS" (UTC) into a SystemTime.
+/// Parse an ISO 8601 timestamp (e.g. "2000-01-01T00:00:00Z") into a SystemTime.
 fn parse_time_start(s: &str) -> Result<SystemTime> {
-    let (date_part, time_part) = s.split_once('T')
-        .ok_or_else(|| anyhow!("--time-start must be in YYYY-MM-DDTHH:MM:SS format, got: {}", s))?;
-
-    let date_parts: Vec<&str> = date_part.splitn(3, '-').collect();
-    if date_parts.len() != 3 {
-        return Err(anyhow!("invalid date in --time-start: {}", date_part));
-    }
-    let year: i64 = date_parts[0].parse()
-        .map_err(|_| anyhow!("invalid year in --time-start: {}", date_parts[0]))?;
-    let month: u32 = date_parts[1].parse()
-        .map_err(|_| anyhow!("invalid month in --time-start: {}", date_parts[1]))?;
-    let day: u32 = date_parts[2].parse()
-        .map_err(|_| anyhow!("invalid day in --time-start: {}", date_parts[2]))?;
-
-    let time_parts: Vec<&str> = time_part.splitn(3, ':').collect();
-    if time_parts.len() != 3 {
-        return Err(anyhow!("invalid time in --time-start: {}", time_part));
-    }
-    let hour: u64 = time_parts[0].parse()
-        .map_err(|_| anyhow!("invalid hour in --time-start: {}", time_parts[0]))?;
-    let minute: u64 = time_parts[1].parse()
-        .map_err(|_| anyhow!("invalid minute in --time-start: {}", time_parts[1]))?;
-    let second: u64 = time_parts[2].parse()
-        .map_err(|_| anyhow!("invalid second in --time-start: {}", time_parts[2]))?;
-
-    let days = days_from_civil(year, month, day);
-    if days < 0 {
-        return Err(anyhow!("--time-start date is before Unix epoch: {}", s));
-    }
-    let total_secs = days as u64 * 86400 + hour * 3600 + minute * 60 + second;
-    Ok(UNIX_EPOCH + Duration::from_secs(total_secs))
+    let ts: jiff::Timestamp = s.parse()
+        .map_err(|e| anyhow!("invalid --time-start '{}': {}", s, e))?;
+    Ok(ts.into())
 }

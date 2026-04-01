@@ -98,7 +98,7 @@ fn test_time_start_fakes_year() {
             "-r", "/lib64",
             "-r", "/bin",
             "-r", "/etc",
-            "--time-start", "2000-06-15T00:00:00",
+            "--time-start", "2000-06-15T00:00:00Z",
             "--",
             "date", "+%Y",
         ])

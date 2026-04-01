@@ -110,7 +110,7 @@ sandlock run --isolate-ipc --isolate-signals --clean-env --env CC=gcc \
   -r /usr -r /lib -w /tmp -- make
 
 # Deterministic execution (frozen time + seeded randomness)
-sandlock run --time-start "2000-01-01T00:00:00" --random-seed 42 -- ./build.sh
+sandlock run --time-start "2000-01-01T00:00:00Z" --random-seed 42 -- ./build.sh
 
 # Port virtualization (multiple sandboxes can bind the same port)
 sandlock run --port-remap --net-bind 6379 -r /usr -r /lib -r /etc -- redis-server --port 6379
