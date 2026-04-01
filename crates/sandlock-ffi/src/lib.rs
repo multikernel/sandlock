@@ -348,6 +348,18 @@ pub unsafe extern "C" fn sandlock_policy_builder_deterministic_dirs(
     Box::into_raw(Box::new(builder.deterministic_dirs(v)))
 }
 
+/// # Safety
+/// `b` must be a valid builder pointer. `name` must be a valid NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_hostname(
+    b: *mut PolicyBuilder, name: *const std::os::raw::c_char,
+) -> *mut PolicyBuilder {
+    if b.is_null() || name.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    let s = std::ffi::CStr::from_ptr(name).to_string_lossy().into_owned();
+    Box::into_raw(Box::new(builder.hostname(s)))
+}
+
 // ----------------------------------------------------------------
 // Policy Builder — build & free
 // ----------------------------------------------------------------

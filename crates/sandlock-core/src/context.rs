@@ -281,6 +281,10 @@ pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
             libc::SYS_getdents as u32,
         ]);
     }
+    if policy.hostname.is_some() {
+        nrs.push(libc::SYS_uname as u32);
+        nrs.push(libc::SYS_openat as u32);
+    }
 
     // COW filesystem interception (seccomp-based, unprivileged)
     if policy.workdir.is_some() && policy.fs_isolation == FsIsolation::None {

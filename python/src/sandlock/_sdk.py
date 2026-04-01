@@ -91,6 +91,7 @@ _b_env_var = _builder_fn("sandlock_policy_builder_env_var", ctypes.c_char_p, cty
 _b_no_randomize_memory = _builder_fn("sandlock_policy_builder_no_randomize_memory", ctypes.c_bool)
 _b_no_huge_pages = _builder_fn("sandlock_policy_builder_no_huge_pages", ctypes.c_bool)
 _b_deterministic_dirs = _builder_fn("sandlock_policy_builder_deterministic_dirs", ctypes.c_bool)
+_b_hostname = _builder_fn("sandlock_policy_builder_hostname", ctypes.c_char_p)
 _b_cpu_cores = _builder_fn("sandlock_policy_builder_cpu_cores", ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32)
 
 # Policy callback (policy_fn)
@@ -659,6 +660,8 @@ class _NativePolicy:
             b = _b_no_huge_pages(b, True)
         if policy.deterministic_dirs:
             b = _b_deterministic_dirs(b, True)
+        if policy.hostname is not None:
+            b = _b_hostname(b, policy.hostname.encode())
 
         return b
 

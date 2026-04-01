@@ -93,6 +93,9 @@ pub fn parse_profile(content: &str) -> Result<Policy, SandlockError> {
     if let Some(v) = sandbox.get("deterministic_dirs").and_then(|v| v.as_bool()) {
         builder = builder.deterministic_dirs(v);
     }
+    if let Some(v) = sandbox.get("hostname").and_then(|v| v.as_str()) {
+        builder = builder.hostname(v);
+    }
     // Parse port arrays
     if let Some(ports) = sandbox.get("net_bind").and_then(|v| v.as_array()) {
         for p in ports { if let Some(n) = p.as_integer() { builder = builder.net_bind_port(n as u16); } }

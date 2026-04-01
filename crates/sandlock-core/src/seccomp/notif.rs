@@ -216,6 +216,7 @@ pub struct NotifPolicy {
     /// Virtual paths allowed for writing under chroot (original user-specified paths).
     pub chroot_writable: Vec<std::path::PathBuf>,
     pub deterministic_dirs: bool,
+    pub hostname: Option<String>,
 }
 
 // ============================================================
@@ -629,6 +630,18 @@ async fn dispatch(
     if let Some(n) = policy.num_cpus {
         if nr == libc::SYS_sched_getaffinity as i64 {
             return crate::procfs::handle_sched_getaffinity(notif, n, notif_fd);
+        }
+    }
+
+    // Hostname virtualization — fake uname() nodename and /etc/hostname
+    if let Some(ref hostname) = policy.hostname {
+        if nr == libc::SYS_uname as i64 {
+            return crate::procfs::handle_uname(notif, hostname, notif_fd);
+        }
+        if nr == libc::SYS_openat as i64 {
+            if let Some(action) = crate::procfs::handle_hostname_open(notif, hostname, notif_fd) {
+                return action;
+            }
         }
     }
 

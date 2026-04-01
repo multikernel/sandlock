@@ -57,6 +57,7 @@ _SIMPLE_FIELDS: dict[str, type] = {
     "no_randomize_memory": bool,
     "no_huge_pages": bool,
     "deterministic_dirs": bool,
+    "hostname": str,
     "no_coredump": bool,
     # Misc
     "port_remap": bool,

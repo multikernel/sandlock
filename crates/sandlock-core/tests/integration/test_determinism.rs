@@ -185,3 +185,29 @@ async fn test_deterministic_dirs() {
     sorted.sort();
     assert_eq!(lines, sorted, "getdents output should be lexicographically sorted");
 }
+
+/// Test that hostname virtualizes both uname() and /etc/hostname.
+#[tokio::test]
+async fn test_hostname_virtualization() {
+    let policy = Policy::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .hostname("mybox")
+        .build()
+        .unwrap();
+
+    // Verify uname() returns the virtual hostname.
+    let result = Sandbox::run(&policy, &["hostname"]).await.unwrap();
+    assert!(result.success(), "hostname command failed");
+    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
+    assert_eq!(stdout.trim(), "mybox", "Expected hostname 'mybox', got: {:?}", stdout.trim());
+
+    // Verify /etc/hostname also returns the virtual hostname.
+    let result = Sandbox::run(&policy, &["cat", "/etc/hostname"]).await.unwrap();
+    assert!(result.success(), "cat /etc/hostname failed");
+    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
+    assert_eq!(stdout.trim(), "mybox", "Expected /etc/hostname 'mybox', got: {:?}", stdout.trim());
+}

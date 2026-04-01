@@ -228,6 +228,9 @@ class Policy:
     Ensures ls, glob, os.listdir etc. return the same order regardless of
     filesystem internals."""
 
+    hostname: str | None = None
+    """Override the hostname visible inside the sandbox via uname()."""
+
     # GPU access
     gpu_devices: Sequence[int] | None = None
     """GPU device indices visible to the sandbox.  When set, Landlock

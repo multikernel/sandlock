@@ -282,6 +282,70 @@ pub(crate) fn handle_sched_getaffinity(
 }
 
 // ============================================================
+// uname virtualization
+// ============================================================
+
+/// Handle uname() — override the nodename (hostname) field.
+///
+/// uname(buf) writes a `struct utsname` to buf. We call the real uname()
+/// in the supervisor, patch the nodename field, and write the result to
+/// the child's buffer.
+pub(crate) fn handle_uname(
+    notif: &SeccompNotif,
+    hostname: &str,
+    notif_fd: RawFd,
+) -> NotifAction {
+    let buf_addr = notif.data.args[0];
+    if buf_addr == 0 {
+        return NotifAction::Continue;
+    }
+
+    // Call real uname() in the supervisor to get current kernel info.
+    let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
+    if unsafe { libc::uname(&mut uts) } != 0 {
+        return NotifAction::Continue;
+    }
+
+    // Overwrite nodename with the virtual hostname.
+    let name_bytes = hostname.as_bytes();
+    let len = name_bytes.len().min(uts.nodename.len() - 1);
+    for (i, &b) in name_bytes[..len].iter().enumerate() {
+        uts.nodename[i] = b as libc::c_char;
+    }
+    uts.nodename[len] = 0;
+
+    // Write the patched utsname to child memory.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            &uts as *const _ as *const u8,
+            std::mem::size_of::<libc::utsname>(),
+        )
+    };
+
+    match write_child_mem(notif_fd, notif.id, notif.pid, buf_addr, bytes) {
+        Ok(()) => NotifAction::ReturnValue(0),
+        Err(_) => NotifAction::Continue,
+    }
+}
+
+/// Handle openat targeting /etc/hostname — return a memfd with the virtual hostname.
+pub(crate) fn handle_hostname_open(
+    notif: &SeccompNotif,
+    hostname: &str,
+    notif_fd: RawFd,
+) -> Option<NotifAction> {
+    let path_ptr = notif.data.args[1];
+    let path = read_path(notif, path_ptr, notif_fd)?;
+
+    if path != "/etc/hostname" {
+        return None;
+    }
+
+    let content = format!("{}\n", hostname);
+    Some(inject_memfd(content.as_bytes()))
+}
+
+// ============================================================
 // Deterministic directory listing
 // ============================================================
 
