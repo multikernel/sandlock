@@ -92,6 +92,25 @@ jobs:
           pip install -e .
           pytest tests/ -v
 
+  # Publish Rust crates to crates.io
+  publish-crates:
+    name: Publish to crates.io
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          cargo publish -p sandlock-core
+          cargo publish -p sandlock-ffi
+          cargo publish -p sandlock-cli
+
   # Publish Python package to PyPI
   publish-pypi:
     name: Publish to PyPI
