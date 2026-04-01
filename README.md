@@ -118,6 +118,9 @@ sandlock run --port-remap --net-bind 6379 -r /usr -r /lib -r /etc -- redis-serve
 # COW filesystem (writes captured, committed on success)
 sandlock run --workdir /opt/project -r /usr -r /lib -- python3 task.py
 
+# Dry-run (show what files would change, then discard)
+sandlock run --dry-run --workdir . -w . -r /usr -r /lib -r /bin -r /etc -- make build
+
 # Use a saved profile
 sandlock run -p build -- make -j4
 ```
@@ -140,6 +143,12 @@ policy = Policy(
 result = Sandbox(policy).run(["python3", "-c", "print('hello')"])
 assert result.success
 assert b"hello" in result.stdout
+
+# Dry-run: see what files would change, then discard
+policy = Policy(fs_writable=["."], workdir=".", fs_readable=["/usr", "/lib", "/bin", "/etc"])
+result = Sandbox(policy).dry_run(["make", "build"])
+for c in result.changes:
+    print(f"{c.kind}  {c.path}")  # A=added, M=modified, D=deleted
 ```
 
 ### Pipeline
@@ -337,6 +346,11 @@ on exit, aborted on error.
 
 **OverlayFS COW**: Uses kernel OverlayFS in a user namespace. Requires
 unprivileged user namespaces to be enabled.
+
+**Dry-run mode**: `--dry-run` runs the command, inspects the COW layer
+for changes (added/modified/deleted files), prints a summary, then
+aborts — leaving the workdir completely untouched. Useful for previewing
+what a command would do before committing.
 
 ### COW Fork & Map-Reduce
 
