@@ -1,8 +1,8 @@
 use sandlock_core::{Policy, Sandbox};
 use std::time::{Duration, SystemTime};
 
-/// Test that random_seed produces deterministic output.
-/// Run the same command twice with the same seed — getrandom results should match.
+/// Test that random_seed produces deterministic output from /dev/urandom.
+/// Run the same command twice with the same seed — reads should match.
 #[tokio::test]
 async fn test_random_seed_deterministic() {
     let policy = Policy::builder()
@@ -17,7 +17,7 @@ async fn test_random_seed_deterministic() {
         .build()
         .unwrap();
 
-    // Use sh + od on /dev/urandom to exercise getrandom syscall path
+    // Read 16 bytes from /dev/urandom via od — exercises the openat interception path.
     let r1 = Sandbox::run(&policy, &["sh", "-c", "od -A n -N 16 -t x1 /dev/urandom"])
         .await
         .unwrap();
@@ -27,11 +27,21 @@ async fn test_random_seed_deterministic() {
 
     assert!(r1.success(), "First run failed");
     assert!(r2.success(), "Second run failed");
-    // Note: stdout capture isn't implemented yet, so we can't compare outputs.
-    // For now, just verify both runs succeed with the random_seed policy.
+
+    let out1 = String::from_utf8_lossy(r1.stdout.as_deref().unwrap_or_default());
+    let out2 = String::from_utf8_lossy(r2.stdout.as_deref().unwrap_or_default());
+    assert!(
+        !out1.trim().is_empty(),
+        "Expected non-empty output from /dev/urandom read"
+    );
+    assert_eq!(
+        out1.trim(),
+        out2.trim(),
+        "Two runs with same seed should produce identical /dev/urandom output"
+    );
 }
 
-/// Test that different seeds produce different processes (both succeed).
+/// Test that different seeds produce different /dev/urandom output.
 #[tokio::test]
 async fn test_random_seed_different_seeds() {
     let p1 = Policy::builder()
@@ -40,6 +50,7 @@ async fn test_random_seed_different_seeds() {
         .fs_read("/lib64")
         .fs_read("/bin")
         .fs_read("/etc")
+        .fs_read("/dev")
         .random_seed(1)
         .build()
         .unwrap();
@@ -49,14 +60,28 @@ async fn test_random_seed_different_seeds() {
         .fs_read("/lib64")
         .fs_read("/bin")
         .fs_read("/etc")
+        .fs_read("/dev")
         .random_seed(999)
         .build()
         .unwrap();
 
-    let r1 = Sandbox::run(&p1, &["true"]).await.unwrap();
-    let r2 = Sandbox::run(&p2, &["true"]).await.unwrap();
+    let cmd = &["sh", "-c", "od -A n -N 16 -t x1 /dev/urandom"];
+    let r1 = Sandbox::run(&p1, cmd).await.unwrap();
+    let r2 = Sandbox::run(&p2, cmd).await.unwrap();
     assert!(r1.success());
     assert!(r2.success());
+
+    let out1 = String::from_utf8_lossy(r1.stdout.as_deref().unwrap_or_default());
+    let out2 = String::from_utf8_lossy(r2.stdout.as_deref().unwrap_or_default());
+    assert!(
+        !out1.trim().is_empty(),
+        "Expected non-empty output"
+    );
+    assert_ne!(
+        out1.trim(),
+        out2.trim(),
+        "Different seeds should produce different /dev/urandom output"
+    );
 }
 
 /// Test that time_start sets frozen time.

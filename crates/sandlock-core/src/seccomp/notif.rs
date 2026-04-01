@@ -493,11 +493,21 @@ async fn dispatch(
         return crate::network::handle_net(notif, state, notif_fd).await;
     }
 
-    // Deterministic random
+    // Deterministic random — getrandom() syscall
     if policy.has_random_seed && nr == libc::SYS_getrandom as i64 {
         let mut st = state.lock().await;
         if let Some(ref mut rng) = st.random_state {
             return crate::random::handle_getrandom(notif, rng, notif_fd);
+        }
+    }
+
+    // Deterministic random — /dev/urandom and /dev/random opens
+    if policy.has_random_seed && nr == libc::SYS_openat as i64 {
+        let mut st = state.lock().await;
+        if let Some(ref mut rng) = st.random_state {
+            if let Some(action) = crate::random::handle_random_open(notif, rng, notif_fd) {
+                return action;
+            }
         }
     }
 
