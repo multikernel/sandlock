@@ -480,7 +480,8 @@ async fn dispatch(
         && (nr == libc::SYS_mmap
             || nr == libc::SYS_munmap
             || nr == libc::SYS_brk
-            || nr == libc::SYS_mremap)
+            || nr == libc::SYS_mremap
+            || nr == libc::SYS_shmget)
     {
         return crate::resource::handle_memory(notif, state, policy).await;
     }

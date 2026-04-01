@@ -56,7 +56,7 @@ pub(crate) async fn handle_fork(
     NotifAction::Continue
 }
 
-/// Handle memory-related notifications (mmap, munmap, brk, mremap).
+/// Handle memory-related notifications (mmap, munmap, brk, mremap, shmget).
 ///
 /// Tracks anonymous memory usage and enforces the configured memory limit.
 pub(crate) async fn handle_memory(
@@ -125,6 +125,13 @@ pub(crate) async fn handle_memory(
             let shrink = old_len - new_len;
             st.mem_used = st.mem_used.saturating_sub(shrink);
         }
+    } else if nr == libc::SYS_shmget {
+        // shmget(key, size, shmflg) — args[1] = size
+        let size = args[1];
+        if size > 0 && st.mem_used.saturating_add(size) > limit {
+            return kill;
+        }
+        st.mem_used += size;
     }
 
     NotifAction::Continue

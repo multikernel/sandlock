@@ -240,6 +240,7 @@ pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
         nrs.push(libc::SYS_munmap as u32);
         nrs.push(libc::SYS_brk as u32);
         nrs.push(libc::SYS_mremap as u32);
+        nrs.push(libc::SYS_shmget as u32);
     }
 
     if !policy.net_allow_hosts.is_empty() || policy.policy_fn.is_some() {
@@ -873,6 +874,7 @@ mod tests {
         assert!(nrs.contains(&(libc::SYS_munmap as u32)));
         assert!(nrs.contains(&(libc::SYS_brk as u32)));
         assert!(nrs.contains(&(libc::SYS_mremap as u32)));
+        assert!(nrs.contains(&(libc::SYS_shmget as u32)));
     }
 
     #[test]
