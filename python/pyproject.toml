@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sandlock"
-version = "0.3.0"
+dynamic = ["version"]
 description = "Lightweight process sandbox using Landlock, seccomp, and seccomp user notification"
 requires-python = ">=3.8"
 dependencies = ["tomli>=1.0; python_version < '3.11'"]
@@ -27,6 +27,9 @@ Homepage = "https://github.com/multikernel/sandlock"
 
 [project.scripts]
 sandlock-mcp = "sandlock.mcp.server:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "sandlock._version.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
