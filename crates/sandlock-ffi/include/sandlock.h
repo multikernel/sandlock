@@ -32,6 +32,7 @@ sandlock_builder_t *sandlock_policy_builder_fs_read(sandlock_builder_t *b, const
 sandlock_builder_t *sandlock_policy_builder_fs_write(sandlock_builder_t *b, const char *path);
 sandlock_builder_t *sandlock_policy_builder_fs_deny(sandlock_builder_t *b, const char *path);
 sandlock_builder_t *sandlock_policy_builder_workdir(sandlock_builder_t *b, const char *path);
+sandlock_builder_t *sandlock_policy_builder_chroot(sandlock_builder_t *b, const char *path);
 
 /* Resource limits */
 sandlock_builder_t *sandlock_policy_builder_max_memory(sandlock_builder_t *b, uint64_t bytes);

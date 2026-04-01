@@ -792,6 +792,9 @@ impl Sandbox {
                 isolate_pids: self.policy.isolate_pids,
                 port_remap: self.policy.port_remap,
                 cow_enabled: self.policy.workdir.is_some() && self.policy.fs_isolation == FsIsolation::None,
+                chroot_root: self.policy.chroot.clone(),
+                chroot_readable: self.policy.fs_readable.clone(),
+                chroot_writable: self.policy.fs_writable.clone(),
             };
 
             // Create SupervisorState

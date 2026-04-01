@@ -232,15 +232,35 @@ pub fn confine(policy: &Policy) -> Result<(), SandlockError> {
         })?;
 
     // Step 4 — add filesystem path rules.
+    // When chroot is active, translate virtual paths (inside chroot) to host
+    // paths by prepending the chroot root.  Skip paths that don't exist in
+    // the rootfs.
+    let chroot_root = policy.chroot.as_deref();
     let fs_write_mask = write_access(abi);
     for path in &policy.fs_writable {
-        add_path_rule(&ruleset_fd, path, fs_write_mask).map_err(|e| {
+        let host;
+        let rule_path = if let Some(root) = chroot_root {
+            host = root.join(path.strip_prefix("/").unwrap_or(path));
+            if !host.exists() { continue; }
+            host.as_path()
+        } else {
+            path.as_path()
+        };
+        add_path_rule(&ruleset_fd, rule_path, fs_write_mask).map_err(|e| {
             SandlockError::Sandbox(crate::error::SandboxError::Confinement(e))
         })?;
     }
 
     for path in &policy.fs_readable {
-        add_path_rule(&ruleset_fd, path, READ_ACCESS).map_err(|e| {
+        let host;
+        let rule_path = if let Some(root) = chroot_root {
+            host = root.join(path.strip_prefix("/").unwrap_or(path));
+            if !host.exists() { continue; }
+            host.as_path()
+        } else {
+            path.as_path()
+        };
+        add_path_rule(&ruleset_fd, rule_path, READ_ACCESS).map_err(|e| {
             SandlockError::Sandbox(crate::error::SandboxError::Confinement(e))
         })?;
     }

@@ -80,6 +80,8 @@ pub struct SupervisorState {
     pub cow_branch: Option<crate::cow::seccomp::SeccompCowBranch>,
     /// Getdents cache for COW directories.
     pub cow_dir_cache: HashMap<(i32, u32), Vec<Vec<u8>>>,
+    /// Getdents cache for chroot directories.
+    pub chroot_dir_cache: HashMap<(i32, u32), Vec<Vec<u8>>>,
     /// pidfd for the child process (for pidfd_getfd on-behalf syscalls).
     pub child_pidfd: Option<RawFd>,
     /// Event sender for dynamic policy callback (None if no policy_fn).
@@ -117,6 +119,7 @@ impl SupervisorState {
             vdso_patched_addr: 0,
             cow_branch: None,
             cow_dir_cache: HashMap::new(),
+            chroot_dir_cache: HashMap::new(),
             child_pidfd: None,
             policy_event_tx: None,
             pid_ip_overrides: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -203,6 +206,11 @@ pub struct NotifPolicy {
     pub isolate_pids: bool,
     pub port_remap: bool,
     pub cow_enabled: bool,
+    pub chroot_root: Option<std::path::PathBuf>,
+    /// Virtual paths allowed for reading under chroot (original user-specified paths).
+    pub chroot_readable: Vec<std::path::PathBuf>,
+    /// Virtual paths allowed for writing under chroot (original user-specified paths).
+    pub chroot_writable: Vec<std::path::PathBuf>,
 }
 
 // ============================================================
@@ -489,6 +497,58 @@ async fn dispatch(
             || nr == libc::SYS_timer_settime as i64
         {
             return crate::time::handle_timer(notif, policy.time_offset, notif_fd);
+        }
+    }
+
+    // Chroot path interception (runs before COW)
+    if let Some(ref chroot_root) = policy.chroot_root {
+        use crate::chroot::dispatch::ChrootCtx;
+        let ctx = ChrootCtx {
+            root: chroot_root,
+            readable: &policy.chroot_readable,
+            writable: &policy.chroot_writable,
+        };
+        if nr == libc::SYS_openat {
+            let action = crate::chroot::dispatch::handle_chroot_open(notif, state, notif_fd, &ctx).await;
+            if !matches!(action, NotifAction::Continue) {
+                return action;
+            }
+        }
+        if nr == libc::SYS_execve || nr == libc::SYS_execveat {
+            return crate::chroot::dispatch::handle_chroot_exec(notif, state, notif_fd, &ctx).await;
+        }
+        if nr == libc::SYS_unlinkat || nr == libc::SYS_mkdirat
+            || nr == libc::SYS_renameat2 || nr == libc::SYS_symlinkat
+            || nr == libc::SYS_linkat || nr == libc::SYS_fchmodat
+            || nr == libc::SYS_fchownat || nr == libc::SYS_truncate
+        {
+            return crate::chroot::dispatch::handle_chroot_write(notif, state, notif_fd, &ctx).await;
+        }
+        if nr == libc::SYS_newfstatat || nr == libc::SYS_faccessat
+            || nr == crate::chroot::dispatch::SYS_FACCESSAT2
+        {
+            return crate::chroot::dispatch::handle_chroot_stat(notif, state, notif_fd, &ctx).await;
+        }
+        if nr == libc::SYS_statx {
+            return crate::chroot::dispatch::handle_chroot_statx(notif, state, notif_fd, &ctx).await;
+        }
+        if nr == libc::SYS_readlinkat {
+            return crate::chroot::dispatch::handle_chroot_readlink(notif, state, notif_fd, &ctx).await;
+        }
+        if nr == libc::SYS_getdents64 as i64 || nr == libc::SYS_getdents as i64 {
+            return crate::chroot::dispatch::handle_chroot_getdents(notif, state, notif_fd, &ctx).await;
+        }
+        if nr == libc::SYS_chdir as i64 {
+            return crate::chroot::dispatch::handle_chroot_chdir(notif, state, notif_fd, &ctx).await;
+        }
+        if nr == libc::SYS_getcwd as i64 {
+            return crate::chroot::dispatch::handle_chroot_getcwd(notif, state, notif_fd, &ctx).await;
+        }
+        if nr == libc::SYS_statfs as i64 {
+            return crate::chroot::dispatch::handle_chroot_statfs(notif, state, notif_fd, &ctx).await;
+        }
+        if nr == libc::SYS_utimensat as i64 {
+            return crate::chroot::dispatch::handle_chroot_utimensat(notif, state, notif_fd, &ctx).await;
         }
     }
 

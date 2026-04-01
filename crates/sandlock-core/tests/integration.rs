@@ -42,3 +42,6 @@ mod test_fork;
 
 #[path = "integration/test_privileged.rs"]
 mod test_privileged;
+
+#[path = "integration/test_chroot.rs"]
+mod test_chroot;

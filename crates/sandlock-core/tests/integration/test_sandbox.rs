@@ -222,10 +222,7 @@ async fn test_chroot() {
 
     let policy = Policy::builder()
         .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin")
-        .fs_read("/etc").fs_read("/proc").fs_read("/dev")
-        .fs_read(&chroot_dir)
-        .fs_write("/tmp")
-        .fs_write(&chroot_dir)
+        .fs_read("/tmp").fs_read("/")
         .chroot(&chroot_dir)
         .build()
         .unwrap();

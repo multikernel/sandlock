@@ -298,6 +298,33 @@ pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
         ]);
     }
 
+    // Chroot path interception
+    if policy.chroot.is_some() {
+        nrs.extend_from_slice(&[
+            libc::SYS_openat as u32,
+            libc::SYS_execve as u32,
+            libc::SYS_execveat as u32,
+            libc::SYS_unlinkat as u32,
+            libc::SYS_mkdirat as u32,
+            libc::SYS_renameat2 as u32,
+            libc::SYS_symlinkat as u32,
+            libc::SYS_linkat as u32,
+            libc::SYS_fchmodat as u32,
+            libc::SYS_fchownat as u32,
+            libc::SYS_truncate as u32,
+            libc::SYS_newfstatat as u32,
+            libc::SYS_statx as u32,
+            libc::SYS_faccessat as u32,
+            libc::SYS_readlinkat as u32,
+            libc::SYS_getdents64 as u32,
+            libc::SYS_getdents as u32,
+            libc::SYS_chdir as u32,
+            libc::SYS_getcwd as u32,
+            libc::SYS_statfs as u32,
+            libc::SYS_utimensat as u32,
+        ]);
+    }
+
     // Dynamic policy callback — intercept key syscalls for event emission
     if policy.policy_fn.is_some() {
         nrs.extend_from_slice(&[
@@ -659,7 +686,22 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
     }
 
     // 6. Optional: change working directory
-    if let Some(ref workdir) = policy.workdir {
+    // When chroot is set, default to the chroot root if no workdir specified
+    let effective_workdir = if let Some(ref workdir) = policy.workdir {
+        if let Some(ref chroot_root) = policy.chroot {
+            // Workdir is virtual (child-visible), translate to host path
+            Some(chroot_root.join(workdir.strip_prefix("/").unwrap_or(workdir)))
+        } else {
+            Some(workdir.clone())
+        }
+    } else if let Some(ref chroot_root) = policy.chroot {
+        // Default to chroot root
+        Some(chroot_root.clone())
+    } else {
+        None
+    };
+
+    if let Some(ref workdir) = effective_workdir {
         let c_path = match CString::new(workdir.as_os_str().as_encoded_bytes()) {
             Ok(p) => p,
             Err(_) => fail!("invalid workdir path"),

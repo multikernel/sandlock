@@ -95,6 +95,19 @@ pub unsafe extern "C" fn sandlock_policy_builder_workdir(
     Box::into_raw(Box::new(builder.workdir(path)))
 }
 
+/// # Safety
+/// `b` and `path` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_chroot(
+    b: *mut PolicyBuilder,
+    path: *const c_char,
+) -> *mut PolicyBuilder {
+    if b.is_null() || path.is_null() { return b; }
+    let path = CStr::from_ptr(path).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.chroot(path)))
+}
+
 // ----------------------------------------------------------------
 // Policy Builder — resource limits
 // ----------------------------------------------------------------
