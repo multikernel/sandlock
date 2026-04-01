@@ -15,11 +15,11 @@ async fn test_num_cpus_virtualization() {
         .build()
         .unwrap();
 
-    // nproc reads /proc/cpuinfo or sysconf to get CPU count
-    let result = Sandbox::run(&policy, &["nproc"]).await.unwrap();
-    assert!(result.success(), "nproc should succeed");
-    // Note: without stdout capture, can't verify the output is "2"
-    // But the command should work with /proc virtualization active
+    // nproc uses sched_getaffinity, not /proc/cpuinfo, so verify cpuinfo directly.
+    let result = Sandbox::run(&policy, &["sh", "-c", "grep -c ^processor /proc/cpuinfo"]).await.unwrap();
+    assert!(result.success(), "grep /proc/cpuinfo should succeed");
+    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
+    assert_eq!(stdout.trim(), "2", "/proc/cpuinfo should show 2 processors, got: {:?}", stdout.trim());
 }
 
 /// Test that max_memory virtualizes /proc/meminfo.
@@ -36,9 +36,15 @@ async fn test_meminfo_virtualization() {
         .build()
         .unwrap();
 
-    // Read meminfo — should succeed
+    // Read meminfo — should show virtualized values
     let result = Sandbox::run(&policy, &["cat", "/proc/meminfo"]).await.unwrap();
     assert!(result.success(), "cat /proc/meminfo should succeed");
+    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
+    // 256 MiB = 262144 kB
+    assert!(
+        stdout.contains("MemTotal:       262144 kB"),
+        "Expected MemTotal of 262144 kB (256 MiB), got: {:?}", stdout
+    );
 }
 
 /// Test that sensitive /proc paths are blocked.
