@@ -6,7 +6,10 @@ without root or namespaces.
 """
 
 from ._version import __version__
-from ._sdk import Sandbox, Stage, Pipeline, Result, SyscallEvent, PolicyContext, Checkpoint
+from ._sdk import (
+    Sandbox, Stage, Pipeline, Result, SyscallEvent, PolicyContext, Checkpoint,
+    landlock_abi_version, min_landlock_abi,
+)
 from .policy import Policy, FsIsolation, BranchAction, parse_ports
 from ._profile import load_profile, list_profiles
 from .exceptions import (
@@ -29,6 +32,9 @@ __all__ = [
     "FsIsolation",
     "BranchAction",
     "parse_ports",
+    # Platform
+    "landlock_abi_version",
+    "min_landlock_abi",
     # Profiles
     "load_profile",
     "list_profiles",

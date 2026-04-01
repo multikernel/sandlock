@@ -134,6 +134,27 @@ _lib.sandlock_ctx_deny_path.argtypes = [_c_ctx_p, ctypes.c_char_p]
 _lib.sandlock_ctx_allow_path.restype = None
 _lib.sandlock_ctx_allow_path.argtypes = [_c_ctx_p, ctypes.c_char_p]
 
+# Platform query
+_lib.sandlock_landlock_abi_version.restype = ctypes.c_int
+_lib.sandlock_landlock_abi_version.argtypes = []
+
+_lib.sandlock_min_landlock_abi.restype = ctypes.c_int
+_lib.sandlock_min_landlock_abi.argtypes = []
+
+
+def landlock_abi_version() -> int:
+    """Return the Landlock ABI version supported by the running kernel.
+
+    Returns -1 if Landlock is unavailable.
+    """
+    return _lib.sandlock_landlock_abi_version()
+
+
+def min_landlock_abi() -> int:
+    """Return the minimum Landlock ABI version required by sandlock."""
+    return _lib.sandlock_min_landlock_abi()
+
+
 _lib.sandlock_policy_build.restype = _c_policy_p
 _lib.sandlock_policy_build.argtypes = [_c_builder_p, ctypes.POINTER(ctypes.c_int)]
 

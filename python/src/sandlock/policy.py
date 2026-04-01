@@ -247,10 +247,6 @@ class Policy:
     close_fds: bool = True
     """Close inherited file descriptors (3+) in the child."""
 
-    strict: bool = True
-    """If True (default), confinement failures abort the child process.
-    If False, degrade gracefully when Landlock or seccomp is unavailable."""
-
     privileged: bool = False
     """If True, map UID 0 (root) inside a user namespace.  The child
     appears as root inside the namespace but has no real host privileges.

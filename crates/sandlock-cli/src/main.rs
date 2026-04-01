@@ -53,8 +53,6 @@ enum Command {
         #[arg(long)]
         max_open_files: Option<u32>,
         #[arg(long)]
-        strict: bool,
-        #[arg(long)]
         chroot: Option<String>,
         #[arg(long)]
         privileged: bool,
@@ -132,7 +130,7 @@ async fn main() -> Result<()> {
         Command::Run { fs_read, fs_write, max_memory, max_processes, timeout,
             net_allow_host, net_bind, net_connect, time_start, random_seed,
             isolate_ipc, isolate_signals, clean_env, num_cpus, profile: profile_name, status_fd,
-            max_cpu, max_open_files, strict, chroot, privileged, workdir,
+            max_cpu, max_open_files, chroot, privileged, workdir,
             fs_isolation, fs_storage, max_disk, net_allow, net_deny,
             port_remap, no_randomize_memory, no_huge_pages, no_coredump,
             env_vars, exec_shell, interactive: _, fs_deny, cpu_cores, gpu_devices, image, cmd } =>
@@ -158,7 +156,6 @@ async fn main() -> Result<()> {
                 b = b.isolate_ipc(base.isolate_ipc);
                 b = b.isolate_signals(base.isolate_signals);
                 b = b.clean_env(base.clean_env);
-                b = b.strict(base.strict);
                 b
             } else {
                 Policy::builder()
@@ -183,7 +180,6 @@ async fn main() -> Result<()> {
             }
             if let Some(cpu) = max_cpu { builder = builder.max_cpu(cpu); }
             if let Some(n) = max_open_files { builder = builder.max_open_files(n); }
-            if strict { builder = builder.strict(true); }
             for p in &fs_deny { builder = builder.fs_deny(p); }
             if let Some(ref path) = chroot { builder = builder.chroot(path); }
             if privileged { builder = builder.privileged(true); }
@@ -294,8 +290,25 @@ async fn main() -> Result<()> {
         Command::Check => {
             println!("Kernel feature support:");
             match sandlock_core::landlock_abi_version() {
-                Ok(v) => println!("  Landlock: ABI v{}", v),
-                Err(e) => println!("  Landlock: unavailable ({})", e),
+                Ok(v) => {
+                    println!("  Landlock:       ABI v{}", v);
+                    println!("  Minimum required: ABI v{}", sandlock_core::MIN_LANDLOCK_ABI);
+                    if v < sandlock_core::MIN_LANDLOCK_ABI {
+                        println!("  Status:         UNSUPPORTED (upgrade kernel)");
+                    } else {
+                        println!("  Status:         OK");
+                    }
+                    println!("  Filesystem:     supported (ABI v1+)");
+                    println!("  File truncate:  {}", if v >= 3 { "supported (ABI v3+)" } else { "not supported" });
+                    println!("  TCP ports:      {}", if v >= 4 { "supported (ABI v4+)" } else { "not supported" });
+                    println!("  Device ioctl:   {}", if v >= 5 { "supported (ABI v5+)" } else { "not supported" });
+                    println!("  IPC scoping:    {}", if v >= 6 { "supported (ABI v6+)" } else { "not supported" });
+                    println!("  Signal scoping: {}", if v >= 6 { "supported (ABI v6+)" } else { "not supported" });
+                }
+                Err(e) => {
+                    println!("  Landlock: unavailable ({})", e);
+                    println!("  Status:   UNSUPPORTED");
+                }
             }
             println!("  Platform: {}", std::env::consts::ARCH);
         }

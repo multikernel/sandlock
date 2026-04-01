@@ -33,3 +33,6 @@ pub use pipeline::{Stage, Pipeline};
 pub fn landlock_abi_version() -> Result<u32, error::ConfinementError> {
     landlock::abi_version()
 }
+
+/// Minimum Landlock ABI version required by sandlock.
+pub const MIN_LANDLOCK_ABI: u32 = landlock::MIN_ABI;

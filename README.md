@@ -56,7 +56,7 @@ Sandlock is implemented in **Rust** for performance and safety:
 
 ## Requirements
 
-- **Linux 5.13+** (Landlock ABI v1), **Rust 1.70+** (to build)
+- **Linux 6.12+** (Landlock ABI v6), **Rust 1.70+** (to build)
 - **Python 3.8+** (optional, for Python SDK)
 - No root, no cgroups
 
@@ -473,7 +473,6 @@ Policy(
     # Misc
     chroot=None,
     close_fds=True,
-    strict=True,                   # Abort on confinement failure
     privileged=False,              # UID 0 in user namespace
 )
 ```

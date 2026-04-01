@@ -54,6 +54,13 @@ pub enum ConfinementError {
     #[error("landlock unavailable: {0}")]
     LandlockUnavailable(String),
 
+    #[error("landlock ABI v{required} required (kernel has v{actual}): {feature}")]
+    InsufficientAbi {
+        required: u32,
+        actual: u32,
+        feature: String,
+    },
+
     #[error("landlock error: {0}")]
     Landlock(String),
 

@@ -167,44 +167,42 @@ fn add_net_rule(ruleset_fd: &OwnedFd, port: u16, access: u64) -> Result<(), Conf
 // Main entry point
 // ============================================================
 
+/// Minimum Landlock ABI version required by sandlock.
+pub const MIN_ABI: u32 = 6;
+
 /// Apply Landlock confinement based on the given `Policy`.
 ///
-/// If Landlock is unavailable and `policy.strict` is `false` the function
-/// returns `Ok(())` silently. When `strict` is `true` the unavailability
-/// error is propagated.
+/// Requires Landlock ABI v6 or later. Returns an error if the kernel does
+/// not meet this requirement.
 pub fn confine(policy: &Policy) -> Result<(), SandlockError> {
-    // Step 1 — detect ABI version.
-    let abi = match abi_version() {
-        Ok(v) => v,
-        Err(ConfinementError::LandlockUnavailable(msg)) => {
-            if policy.strict {
-                return Err(SandlockError::Sandbox(
-                    crate::error::SandboxError::Confinement(
-                        ConfinementError::LandlockUnavailable(msg),
-                    ),
-                ));
-            } else {
-                return Ok(());
-            }
-        }
-        Err(e) => {
-            return Err(SandlockError::Sandbox(
-                crate::error::SandboxError::Confinement(e),
-            ))
-        }
-    };
+    // Step 1 -- detect and validate ABI version.
+    let abi = abi_version().map_err(|e| {
+        SandlockError::Sandbox(crate::error::SandboxError::Confinement(e))
+    })?;
 
-    // Step 2 — build handled_access_fs / handled_access_net / scoped.
+    if abi < MIN_ABI {
+        return Err(SandlockError::Sandbox(
+            crate::error::SandboxError::Confinement(
+                ConfinementError::InsufficientAbi {
+                    required: MIN_ABI,
+                    actual: abi,
+                    feature: "full sandlock support".into(),
+                },
+            ),
+        ));
+    }
+
+    // Step 2 -- build handled_access_fs / handled_access_net / scoped.
     let handled_access_fs = base_fs_access(abi);
 
     let has_net = !policy.net_bind.is_empty() || !policy.net_connect.is_empty();
-    let handled_access_net = if abi >= 4 && has_net {
+    let handled_access_net = if has_net {
         LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP
     } else {
         0
     };
 
-    let scoped = if abi >= 6 {
+    let scoped = {
         let mut s: u64 = 0;
         if policy.isolate_ipc {
             s |= LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET;
@@ -213,8 +211,6 @@ pub fn confine(policy: &Policy) -> Result<(), SandlockError> {
             s |= LANDLOCK_SCOPE_SIGNAL;
         }
         s
-    } else {
-        0
     };
 
     // Step 3 — create ruleset.
@@ -286,18 +282,16 @@ pub fn confine(policy: &Policy) -> Result<(), SandlockError> {
         }
     }
 
-    // Step 5 — add network port rules (ABI v4+).
-    if abi >= 4 {
-        for &port in &policy.net_bind {
-            add_net_rule(&ruleset_fd, port, LANDLOCK_ACCESS_NET_BIND_TCP).map_err(|e| {
-                SandlockError::Sandbox(crate::error::SandboxError::Confinement(e))
-            })?;
-        }
-        for &port in &policy.net_connect {
-            add_net_rule(&ruleset_fd, port, LANDLOCK_ACCESS_NET_CONNECT_TCP).map_err(|e| {
-                SandlockError::Sandbox(crate::error::SandboxError::Confinement(e))
-            })?;
-        }
+    // Step 5 -- add network port rules.
+    for &port in &policy.net_bind {
+        add_net_rule(&ruleset_fd, port, LANDLOCK_ACCESS_NET_BIND_TCP).map_err(|e| {
+            SandlockError::Sandbox(crate::error::SandboxError::Confinement(e))
+        })?;
+    }
+    for &port in &policy.net_connect {
+        add_net_rule(&ruleset_fd, port, LANDLOCK_ACCESS_NET_CONNECT_TCP).map_err(|e| {
+            SandlockError::Sandbox(crate::error::SandboxError::Confinement(e))
+        })?;
     }
 
     // Step 6 — enforce (irreversible).

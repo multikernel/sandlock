@@ -60,7 +60,6 @@ _SIMPLE_FIELDS: dict[str, type] = {
     # Misc
     "port_remap": bool,
     "close_fds": bool,
-    "strict": bool,
     "privileged": bool,
     # Workdir
     "workdir": str,

@@ -1198,6 +1198,26 @@ pub unsafe extern "C" fn sandlock_checkpoint_free(cp: *mut sandlock_checkpoint_t
 }
 
 // ----------------------------------------------------------------
+// Platform query
+// ----------------------------------------------------------------
+
+/// Query the Landlock ABI version supported by the running kernel.
+/// Returns the ABI version (>= 1), or -1 if Landlock is unavailable.
+#[no_mangle]
+pub extern "C" fn sandlock_landlock_abi_version() -> c_int {
+    match sandlock_core::landlock_abi_version() {
+        Ok(v) => v as c_int,
+        Err(_) => -1,
+    }
+}
+
+/// Return the minimum Landlock ABI version required by this build of sandlock.
+#[no_mangle]
+pub extern "C" fn sandlock_min_landlock_abi() -> c_int {
+    sandlock_core::MIN_LANDLOCK_ABI as c_int
+}
+
+// ----------------------------------------------------------------
 // Helpers
 // ----------------------------------------------------------------
 

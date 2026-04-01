@@ -133,7 +133,6 @@ pub struct Policy {
     pub port_remap: bool,
 
     // Mode flags
-    pub strict: bool,
     pub privileged: bool,
 
     // Dynamic policy callback
@@ -207,7 +206,6 @@ pub struct PolicyBuilder {
     num_cpus: Option<u32>,
     port_remap: bool,
 
-    strict: Option<bool>,
     privileged: bool,
     policy_fn: Option<crate::policy_fn::PolicyCallback>,
 }
@@ -396,11 +394,6 @@ impl PolicyBuilder {
         self
     }
 
-    pub fn strict(mut self, v: bool) -> Self {
-        self.strict = Some(v);
-        self
-    }
-
     pub fn privileged(mut self, v: bool) -> Self {
         self.privileged = v;
         self
@@ -461,7 +454,6 @@ impl PolicyBuilder {
             cpu_cores: self.cpu_cores,
             num_cpus: self.num_cpus,
             port_remap: self.port_remap,
-            strict: self.strict.unwrap_or(true),
             privileged: self.privileged,
             policy_fn: self.policy_fn,
         })
