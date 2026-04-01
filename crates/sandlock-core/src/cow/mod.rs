@@ -3,6 +3,7 @@ pub(crate) mod branchfs;
 pub(crate) mod seccomp;
 pub(crate) mod dispatch;
 
+use crate::dry_run::Change;
 use crate::error::BranchError;
 use std::path::Path;
 
@@ -19,4 +20,7 @@ pub(crate) trait CowBranch: Send + Sync {
 
     /// Clean up (unmount, remove dirs). Called on drop.
     fn cleanup(&self) -> Result<(), BranchError>;
+
+    /// List filesystem changes in the COW layer (for dry-run).
+    fn changes(&self) -> Result<Vec<Change>, BranchError>;
 }

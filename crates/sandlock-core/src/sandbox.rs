@@ -157,6 +157,69 @@ impl Sandbox {
         sb.wait().await
     }
 
+    /// Dry-run: spawn, wait, collect filesystem changes, then abort.
+    /// Returns the run result plus a list of changes that would have been
+    /// committed. The workdir is left unchanged.
+    pub async fn dry_run(policy: &Policy, cmd: &[&str]) -> Result<crate::dry_run::DryRunResult, SandlockError> {
+        let mut policy = policy.clone();
+        policy.on_exit = BranchAction::Keep;
+        policy.on_error = BranchAction::Keep;
+
+        let mut sb = Self::new(&policy)?;
+        sb.do_spawn(cmd, true).await?;
+        let run_result = sb.wait().await?;
+        let changes = sb.collect_changes().await;
+        sb.do_abort().await;
+        Ok(crate::dry_run::DryRunResult { run_result, changes })
+    }
+
+    /// Dry-run with inherited stdio (interactive mode).
+    pub async fn dry_run_interactive(policy: &Policy, cmd: &[&str]) -> Result<crate::dry_run::DryRunResult, SandlockError> {
+        let mut policy = policy.clone();
+        policy.on_exit = BranchAction::Keep;
+        policy.on_error = BranchAction::Keep;
+
+        let mut sb = Self::new(&policy)?;
+        sb.do_spawn(cmd, false).await?;
+        let run_result = sb.wait().await?;
+        let changes = sb.collect_changes().await;
+        sb.do_abort().await;
+        Ok(crate::dry_run::DryRunResult { run_result, changes })
+    }
+
+    /// Collect changes from whichever COW branch exists.
+    async fn collect_changes(&self) -> Vec<crate::dry_run::Change> {
+        // Check OverlayFS/BranchFS COW branch
+        if let Some(ref branch) = self.cow_branch {
+            return branch.changes().unwrap_or_default();
+        }
+
+        // Check seccomp-based COW branch
+        if let Some(ref state) = self.supervisor_state {
+            if let Ok(st) = state.try_lock() {
+                if let Some(ref cow) = st.cow_branch {
+                    return cow.changes().unwrap_or_default();
+                }
+            }
+        }
+
+        Vec::new()
+    }
+
+    /// Abort both COW branch types (used by dry_run to discard changes).
+    async fn do_abort(&mut self) {
+        if let Some(branch) = self.cow_branch.take() {
+            let _ = branch.abort();
+        }
+        if let Some(ref state) = self.supervisor_state {
+            if let Ok(mut st) = state.try_lock() {
+                if let Some(ref mut cow) = st.cow_branch {
+                    let _ = cow.abort();
+                }
+            }
+        }
+    }
+
     /// Create N COW clones of this sandbox.
     ///
     /// Requires `new_with_fns()`. Forks a confined child, runs `init_fn`,

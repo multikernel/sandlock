@@ -45,3 +45,6 @@ mod test_privileged;
 
 #[path = "integration/test_chroot.rs"]
 mod test_chroot;
+
+#[path = "integration/test_dry_run.rs"]
+mod test_dry_run;

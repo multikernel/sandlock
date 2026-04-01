@@ -94,6 +94,29 @@ class BranchAction(Enum):
 
 
 @dataclass(frozen=True)
+class Change:
+    """A single filesystem change detected by dry-run."""
+
+    kind: str
+    """Change kind: A=added, M=modified, D=deleted."""
+
+    path: str
+    """Path relative to workdir."""
+
+
+@dataclass
+class DryRunResult:
+    """Result of a dry-run execution."""
+
+    success: bool
+    exit_code: int = 0
+    stdout: bytes = field(default=b"", repr=False)
+    stderr: bytes = field(default=b"", repr=False)
+    changes: list = field(default_factory=list)
+    error: str | None = None
+
+
+@dataclass(frozen=True)
 class Policy:
     """Immutable sandbox policy.
 

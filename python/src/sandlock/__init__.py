@@ -10,7 +10,7 @@ from ._sdk import (
     Sandbox, Stage, Pipeline, Result, SyscallEvent, PolicyContext, Checkpoint,
     landlock_abi_version, min_landlock_abi,
 )
-from .policy import Policy, FsIsolation, BranchAction, parse_ports
+from .policy import Policy, FsIsolation, BranchAction, parse_ports, Change, DryRunResult
 from ._profile import load_profile, list_profiles
 from .exceptions import (
     SandlockError,
@@ -32,6 +32,8 @@ __all__ = [
     "FsIsolation",
     "BranchAction",
     "parse_ports",
+    "Change",
+    "DryRunResult",
     # Platform
     "landlock_abi_version",
     "min_landlock_abi",

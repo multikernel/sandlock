@@ -210,6 +210,36 @@ _lib.sandlock_result_stderr_bytes.argtypes = [_c_result_p, ctypes.POINTER(ctypes
 _lib.sandlock_result_free.restype = None
 _lib.sandlock_result_free.argtypes = [_c_result_p]
 
+# Dry-run
+_c_dry_run_p = ctypes.c_void_p
+
+_lib.sandlock_dry_run.restype = _c_dry_run_p
+_lib.sandlock_dry_run.argtypes = [_c_policy_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
+
+_lib.sandlock_dry_run_result_exit_code.restype = ctypes.c_int
+_lib.sandlock_dry_run_result_exit_code.argtypes = [_c_dry_run_p]
+
+_lib.sandlock_dry_run_result_success.restype = ctypes.c_bool
+_lib.sandlock_dry_run_result_success.argtypes = [_c_dry_run_p]
+
+_lib.sandlock_dry_run_result_stdout_bytes.restype = ctypes.c_void_p
+_lib.sandlock_dry_run_result_stdout_bytes.argtypes = [_c_dry_run_p, ctypes.POINTER(ctypes.c_size_t)]
+
+_lib.sandlock_dry_run_result_stderr_bytes.restype = ctypes.c_void_p
+_lib.sandlock_dry_run_result_stderr_bytes.argtypes = [_c_dry_run_p, ctypes.POINTER(ctypes.c_size_t)]
+
+_lib.sandlock_dry_run_result_changes_len.restype = ctypes.c_size_t
+_lib.sandlock_dry_run_result_changes_len.argtypes = [_c_dry_run_p]
+
+_lib.sandlock_dry_run_result_change_kind.restype = ctypes.c_char
+_lib.sandlock_dry_run_result_change_kind.argtypes = [_c_dry_run_p, ctypes.c_size_t]
+
+_lib.sandlock_dry_run_result_change_path.restype = ctypes.c_void_p
+_lib.sandlock_dry_run_result_change_path.argtypes = [_c_dry_run_p, ctypes.c_size_t]
+
+_lib.sandlock_dry_run_result_free.restype = None
+_lib.sandlock_dry_run_result_free.argtypes = [_c_dry_run_p]
+
 # Pipeline
 _lib.sandlock_pipeline_new.restype = _c_pipeline_p
 _lib.sandlock_pipeline_new.argtypes = []
@@ -868,6 +898,53 @@ class Sandbox:
             exit_code=exit_code,
             stdout=stdout,
             stderr=stderr,
+        )
+
+    def dry_run(self, cmd: list[str], timeout: float | None = None) -> "DryRunResult":
+        """Dry-run: run a command, collect filesystem changes, then discard.
+
+        Args:
+            cmd: Command and arguments to execute.
+            timeout: Maximum execution time in seconds. None means no timeout.
+
+        Returns:
+            DryRunResult with exit info and list of filesystem changes.
+        """
+        from .policy import Change, DryRunResult
+
+        argv, argc = _make_argv(cmd)
+        result_p = _lib.sandlock_dry_run(self._native.ptr, argv, argc)
+
+        if not result_p:
+            return DryRunResult(success=False, exit_code=-1, error="sandlock_dry_run failed")
+
+        try:
+            exit_code = _lib.sandlock_dry_run_result_exit_code(result_p)
+            success = _lib.sandlock_dry_run_result_success(result_p)
+            stdout = _read_result_bytes(result_p, _lib.sandlock_dry_run_result_stdout_bytes)
+            stderr = _read_result_bytes(result_p, _lib.sandlock_dry_run_result_stderr_bytes)
+
+            n = _lib.sandlock_dry_run_result_changes_len(result_p)
+            changes = []
+            for i in range(n):
+                kind_byte = _lib.sandlock_dry_run_result_change_kind(result_p, i)
+                kind = kind_byte.decode("ascii")
+                path_p = _lib.sandlock_dry_run_result_change_path(result_p, i)
+                if path_p:
+                    path = ctypes.c_char_p(path_p).value.decode("utf-8")
+                    _lib.sandlock_string_free(ctypes.cast(path_p, ctypes.c_char_p))
+                else:
+                    path = ""
+                changes.append(Change(kind=kind, path=path))
+        finally:
+            _lib.sandlock_dry_run_result_free(result_p)
+
+        return DryRunResult(
+            success=bool(success),
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            changes=changes,
         )
 
     def run_interactive(self, cmd: list[str]) -> int:

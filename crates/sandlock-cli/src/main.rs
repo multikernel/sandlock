@@ -97,6 +97,9 @@ enum Command {
         /// Use a local Docker image as chroot rootfs
         #[arg(long)]
         image: Option<String>,
+        /// Dry-run: run the command, show filesystem changes, then discard
+        #[arg(long)]
+        dry_run: bool,
         #[arg(last = true)]
         cmd: Vec<String>,
     },
@@ -137,7 +140,7 @@ async fn main() -> Result<()> {
             max_cpu, max_open_files, chroot, privileged, workdir,
             fs_isolation, fs_storage, max_disk, net_allow, net_deny,
             port_remap, no_randomize_memory, no_huge_pages, deterministic_dirs, hostname, no_coredump,
-            env_vars, exec_shell, interactive: _, fs_deny, cpu_cores, gpu_devices, image, cmd } =>
+            env_vars, exec_shell, interactive: _, fs_deny, cpu_cores, gpu_devices, image, dry_run, cmd } =>
         {
             // Start from profile or default
             let mut builder = if let Some(ref name) = profile_name {
@@ -260,7 +263,32 @@ async fn main() -> Result<()> {
                 cmd.iter().map(|s| s.as_str()).collect()
             };
 
-            let result = if let Some(secs) = timeout {
+            let result = if dry_run {
+                if policy.workdir.is_none() {
+                    return Err(anyhow!("--dry-run requires --workdir"));
+                }
+                let dr = if let Some(secs) = timeout {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(secs),
+                        Sandbox::dry_run_interactive(&policy, &cmd_strs)
+                    ).await.unwrap_or_else(|_| {
+                        eprintln!("sandlock: timeout after {}s", secs);
+                        std::process::exit(124);
+                    })?
+                } else {
+                    Sandbox::dry_run_interactive(&policy, &cmd_strs).await?
+                };
+
+                if dr.changes.is_empty() {
+                    eprintln!("sandlock: dry-run: no filesystem changes");
+                } else {
+                    eprintln!("sandlock: dry-run: filesystem changes:");
+                    for change in &dr.changes {
+                        eprintln!("{}", change);
+                    }
+                }
+                dr.run_result
+            } else if let Some(secs) = timeout {
                 tokio::time::timeout(
                     std::time::Duration::from_secs(secs),
                     Sandbox::run_interactive(&policy, &cmd_strs)

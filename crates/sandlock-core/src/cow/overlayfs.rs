@@ -76,6 +76,34 @@ impl CowBranch for OverlayBranch {
         let _ = fs::remove_dir_all(&self.storage);
         Ok(())
     }
+
+    fn changes(&self) -> Result<Vec<crate::dry_run::Change>, BranchError> {
+        use crate::dry_run::{Change, ChangeKind};
+
+        let mut result = Vec::new();
+
+        for entry in WalkDir::new(&self.upper).min_depth(1) {
+            let entry = entry.map_err(|e| BranchError::Operation(format!("walk: {}", e)))?;
+            let rel = entry.path().strip_prefix(&self.upper).unwrap();
+            let target = self.base_dir.join(rel);
+
+            if is_whiteout(entry.path())? {
+                result.push(Change {
+                    kind: ChangeKind::Deleted,
+                    path: rel.to_path_buf(),
+                });
+            } else if !entry.file_type().is_dir() {
+                let kind = if target.exists() {
+                    ChangeKind::Modified
+                } else {
+                    ChangeKind::Added
+                };
+                result.push(Change { kind, path: rel.to_path_buf() });
+            }
+        }
+
+        Ok(result)
+    }
 }
 
 /// Check if a path is an overlayfs whiteout (char device 0:0).

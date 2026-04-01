@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from sandlock import Sandbox, Policy
+from sandlock import Sandbox, Policy, Change, DryRunResult
 
 
 _PYTHON_READABLE = list(dict.fromkeys([
@@ -298,6 +298,77 @@ class TestPauseResume:
         sb = Sandbox(_policy())
         with pytest.raises(RuntimeError):
             sb.resume()
+
+
+class TestDryRun:
+    """Tests for Sandbox.dry_run()."""
+
+    def test_dry_run_reports_added_file(self, tmp_path):
+        workdir = tmp_path / "add"
+        workdir.mkdir()
+        (workdir / "existing.txt").write_text("hello")
+
+        p = _policy(fs_writable=[str(workdir)], workdir=str(workdir))
+        result = Sandbox(p).dry_run(
+            ["sh", "-c", f"touch {workdir}/new.txt"]
+        )
+        assert result.success
+        assert not (workdir / "new.txt").exists(), "new.txt should not exist after dry-run"
+        kinds = [c.kind for c in result.changes]
+        assert "A" in kinds
+
+    def test_dry_run_reports_modified_file(self, tmp_path):
+        workdir = tmp_path / "mod"
+        workdir.mkdir()
+        (workdir / "data.txt").write_text("original")
+
+        p = _policy(fs_writable=[str(workdir)], workdir=str(workdir))
+        result = Sandbox(p).dry_run(
+            ["sh", "-c", f"echo changed > {workdir}/data.txt"]
+        )
+        assert result.success
+        assert (workdir / "data.txt").read_text() == "original"
+        kinds = [c.kind for c in result.changes]
+        assert "M" in kinds
+
+    def test_dry_run_reports_deleted_file(self, tmp_path):
+        workdir = tmp_path / "del"
+        workdir.mkdir()
+        (workdir / "victim.txt").write_text("delete me")
+
+        p = _policy(fs_writable=[str(workdir)], workdir=str(workdir))
+        result = Sandbox(p).dry_run(
+            ["sh", "-c", f"rm {workdir}/victim.txt"]
+        )
+        assert result.success
+        assert (workdir / "victim.txt").exists(), "file should still exist after dry-run"
+        kinds = [c.kind for c in result.changes]
+        assert "D" in kinds
+
+    def test_dry_run_no_changes(self, tmp_path):
+        workdir = tmp_path / "noop"
+        workdir.mkdir()
+
+        p = _policy(fs_writable=[str(workdir)], workdir=str(workdir))
+        result = Sandbox(p).dry_run(["echo", "hello"])
+        assert result.success
+        assert result.changes == []
+
+    def test_dry_run_returns_structured_result(self, tmp_path):
+        workdir = tmp_path / "struct"
+        workdir.mkdir()
+        (workdir / "f.txt").write_text("x")
+
+        p = _policy(fs_writable=[str(workdir)], workdir=str(workdir))
+        result = Sandbox(p).dry_run(
+            ["sh", "-c", f"echo y > {workdir}/f.txt; touch {workdir}/new.txt"]
+        )
+        assert isinstance(result, DryRunResult)
+        assert isinstance(result.changes, list)
+        for c in result.changes:
+            assert isinstance(c, Change)
+            assert c.kind in ("A", "M", "D")
+            assert isinstance(c.path, str)
 
 
 class TestNewPolicyFields:

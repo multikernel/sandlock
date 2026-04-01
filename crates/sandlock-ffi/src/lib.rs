@@ -749,6 +749,136 @@ pub unsafe extern "C" fn sandlock_string_free(s: *mut c_char) {
 }
 
 // ----------------------------------------------------------------
+// Dry-run
+// ----------------------------------------------------------------
+
+/// Opaque dry-run result.
+#[allow(non_camel_case_types)]
+pub struct sandlock_dry_run_result_t {
+    _private: sandlock_core::DryRunResult,
+}
+
+/// Run a command in dry-run mode with captured stdout/stderr.
+///
+/// # Safety
+/// `policy` must be a valid policy pointer. `argv` must point to `argc` C strings.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_dry_run(
+    policy: *const sandlock_policy_t,
+    argv: *const *const c_char,
+    argc: c_uint,
+) -> *mut sandlock_dry_run_result_t {
+    if policy.is_null() || argv.is_null() { return ptr::null_mut(); }
+    let policy = &(*policy)._private;
+    let args = read_argv(argv, argc);
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(_) => return ptr::null_mut(),
+    };
+    match rt.block_on(Sandbox::dry_run(policy, &arg_refs)) {
+        Ok(result) => Box::into_raw(Box::new(sandlock_dry_run_result_t { _private: result })),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Get the exit code from a dry-run result.
+///
+/// # Safety
+/// `r` must be a valid dry-run result pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_dry_run_result_exit_code(r: *const sandlock_dry_run_result_t) -> c_int {
+    (*r)._private.run_result.code().unwrap_or(-1) as c_int
+}
+
+/// Check if the dry-run result indicates success.
+///
+/// # Safety
+/// `r` must be a valid dry-run result pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_dry_run_result_success(r: *const sandlock_dry_run_result_t) -> bool {
+    (*r)._private.run_result.success()
+}
+
+/// Get captured stdout bytes from a dry-run result.
+///
+/// # Safety
+/// `r` must be a valid dry-run result pointer. `len` must be a valid pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_dry_run_result_stdout_bytes(
+    r: *const sandlock_dry_run_result_t, len: *mut usize,
+) -> *const u8 {
+    match &(*r)._private.run_result.stdout {
+        Some(v) => { *len = v.len(); v.as_ptr() }
+        None => { *len = 0; ptr::null() }
+    }
+}
+
+/// Get captured stderr bytes from a dry-run result.
+///
+/// # Safety
+/// `r` must be a valid dry-run result pointer. `len` must be a valid pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_dry_run_result_stderr_bytes(
+    r: *const sandlock_dry_run_result_t, len: *mut usize,
+) -> *const u8 {
+    match &(*r)._private.run_result.stderr {
+        Some(v) => { *len = v.len(); v.as_ptr() }
+        None => { *len = 0; ptr::null() }
+    }
+}
+
+/// Get the number of filesystem changes in a dry-run result.
+///
+/// # Safety
+/// `r` must be a valid dry-run result pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_dry_run_result_changes_len(r: *const sandlock_dry_run_result_t) -> usize {
+    (*r)._private.changes.len()
+}
+
+/// Get the kind of the i-th change: 'A' (added), 'M' (modified), 'D' (deleted).
+///
+/// # Safety
+/// `r` must be a valid dry-run result pointer. `i` must be < changes_len.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_dry_run_result_change_kind(
+    r: *const sandlock_dry_run_result_t, i: usize,
+) -> c_char {
+    use sandlock_core::ChangeKind;
+    match (&(*r)._private.changes)[i].kind {
+        ChangeKind::Added => b'A' as c_char,
+        ChangeKind::Modified => b'M' as c_char,
+        ChangeKind::Deleted => b'D' as c_char,
+    }
+}
+
+/// Get the path of the i-th change as a C string. Caller must free with `sandlock_string_free`.
+///
+/// # Safety
+/// `r` must be a valid dry-run result pointer. `i` must be < changes_len.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_dry_run_result_change_path(
+    r: *const sandlock_dry_run_result_t, i: usize,
+) -> *mut c_char {
+    let path = (&(*r)._private.changes)[i].path.to_string_lossy();
+    match CString::new(path.as_bytes()) {
+        Ok(cs) => cs.into_raw(),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Free a dry-run result.
+///
+/// # Safety
+/// `r` must be null or a valid dry-run result pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_dry_run_result_free(r: *mut sandlock_dry_run_result_t) {
+    if !r.is_null() { drop(Box::from_raw(r)); }
+}
+
+// ----------------------------------------------------------------
 // Pipeline
 // ----------------------------------------------------------------
 

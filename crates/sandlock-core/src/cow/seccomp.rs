@@ -357,6 +357,39 @@ impl SeccompCowBranch {
         }
     }
 
+    /// List all filesystem changes in the COW layer.
+    pub fn changes(&self) -> Result<Vec<crate::dry_run::Change>, BranchError> {
+        use crate::dry_run::{Change, ChangeKind};
+
+        let mut result = Vec::new();
+
+        // Walk upper directory for added/modified files
+        for entry in walkdir::WalkDir::new(&self.upper).min_depth(1) {
+            let entry = entry.map_err(|e| BranchError::Operation(format!("walk: {}", e)))?;
+            if entry.file_type().is_dir() {
+                continue;
+            }
+            let rel = entry.path().strip_prefix(&self.upper).unwrap();
+            let lower = self.workdir.join(rel);
+            let kind = if lower.exists() {
+                ChangeKind::Modified
+            } else {
+                ChangeKind::Added
+            };
+            result.push(Change { kind, path: rel.to_path_buf() });
+        }
+
+        // Deletions from tracked set
+        for rel_path in &self.deleted {
+            result.push(Change {
+                kind: ChangeKind::Deleted,
+                path: std::path::PathBuf::from(rel_path),
+            });
+        }
+
+        Ok(result)
+    }
+
     /// List merged directory entries (upper + lower - deleted).
     pub fn list_merged_dir(&self, rel_path: &str) -> Vec<String> {
         let lower_dir = self.workdir.join(rel_path);
@@ -533,5 +566,69 @@ mod tests {
         fs::write(&upper, "should be discarded").unwrap();
         branch.abort().unwrap();
         assert!(!workdir.path().join("new.txt").exists());
+    }
+
+    #[test]
+    fn test_changes_added_file() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path())).unwrap();
+        let upper = branch.ensure_cow_copy("brand_new.txt").unwrap();
+        fs::write(&upper, "new content").unwrap();
+        let changes = branch.changes().unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].kind, crate::dry_run::ChangeKind::Added);
+        assert_eq!(changes[0].path, std::path::PathBuf::from("brand_new.txt"));
+    }
+
+    #[test]
+    fn test_changes_modified_file() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path())).unwrap();
+        let upper = branch.ensure_cow_copy("existing.txt").unwrap();
+        fs::write(&upper, "modified content").unwrap();
+        let changes = branch.changes().unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].kind, crate::dry_run::ChangeKind::Modified);
+        assert_eq!(changes[0].path, std::path::PathBuf::from("existing.txt"));
+    }
+
+    #[test]
+    fn test_changes_deleted_file() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path())).unwrap();
+        branch.mark_deleted("existing.txt");
+        let changes = branch.changes().unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].kind, crate::dry_run::ChangeKind::Deleted);
+        assert_eq!(changes[0].path, std::path::PathBuf::from("existing.txt"));
+    }
+
+    #[test]
+    fn test_changes_no_changes() {
+        let (workdir, storage) = setup_workdir();
+        let branch = SeccompCowBranch::create(workdir.path(), Some(storage.path())).unwrap();
+        let changes = branch.changes().unwrap();
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn test_changes_mixed() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path())).unwrap();
+        let upper = branch.ensure_cow_copy("new.txt").unwrap();
+        fs::write(&upper, "new").unwrap();
+        let upper2 = branch.ensure_cow_copy("existing.txt").unwrap();
+        fs::write(&upper2, "changed").unwrap();
+        branch.mark_deleted("subdir/nested.txt");
+
+        let mut changes = branch.changes().unwrap();
+        changes.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(changes.len(), 3);
+        assert_eq!(changes[0].kind, crate::dry_run::ChangeKind::Modified);
+        assert_eq!(changes[0].path, std::path::PathBuf::from("existing.txt"));
+        assert_eq!(changes[1].kind, crate::dry_run::ChangeKind::Added);
+        assert_eq!(changes[1].path, std::path::PathBuf::from("new.txt"));
+        assert_eq!(changes[2].kind, crate::dry_run::ChangeKind::Deleted);
+        assert_eq!(changes[2].path, std::path::PathBuf::from("subdir/nested.txt"));
     }
 }
