@@ -282,6 +282,109 @@ pub(crate) fn handle_sched_getaffinity(
 }
 
 // ============================================================
+// Deterministic directory listing
+// ============================================================
+
+/// Handle getdents64/getdents for deterministic directory listing.
+///
+/// Reads the directory entries via `/proc/{pid}/fd/{fd}`, sorts them
+/// lexicographically by name, and returns them to the child in sorted order.
+/// This ensures `readdir()`, `ls`, `glob()` etc. produce the same order
+/// regardless of filesystem internals.
+pub(crate) async fn handle_sorted_getdents(
+    notif: &SeccompNotif,
+    state: &Arc<Mutex<SupervisorState>>,
+    notif_fd: RawFd,
+) -> NotifAction {
+    let pid = notif.pid;
+    let child_fd = (notif.data.args[0] & 0xFFFF_FFFF) as u32;
+    let buf_addr = notif.data.args[1];
+    let buf_size = (notif.data.args[2] & 0xFFFF_FFFF) as usize;
+
+    let cache_key = (pid as i32, child_fd);
+    let mut st = state.lock().await;
+
+    // Build and cache sorted entries on first call for this (pid, fd) pair.
+    // An empty Vec means "already fully consumed" — return 0 (EOF).
+    if !st.getdents_cache.contains_key(&cache_key) {
+        let link_path = format!("/proc/{}/fd/{}", pid, child_fd);
+        let dir_path = match std::fs::read_link(&link_path) {
+            Ok(t) => t,
+            Err(_) => return NotifAction::Continue,
+        };
+
+        let dir = match std::fs::read_dir(&dir_path) {
+            Ok(d) => d,
+            Err(_) => return NotifAction::Continue,
+        };
+
+        let mut names: Vec<_> = dir
+            .filter_map(|e| e.ok())
+            .map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let d_type = match e.file_type() {
+                    Ok(ft) if ft.is_dir() => DT_DIR,
+                    Ok(ft) if ft.is_symlink() => DT_LNK,
+                    _ => DT_REG,
+                };
+                let d_ino = {
+                    use std::os::linux::fs::MetadataExt;
+                    e.metadata().map(|m| m.st_ino()).unwrap_or(0)
+                };
+                (name, d_type, d_ino)
+            })
+            .collect();
+
+        names.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let entries: Vec<Vec<u8>> = names
+            .iter()
+            .enumerate()
+            .map(|(i, (name, d_type, d_ino))| {
+                build_dirent64(*d_ino, (i + 1) as i64, *d_type, name)
+            })
+            .collect();
+
+        st.getdents_cache.insert(cache_key, entries);
+    }
+
+    let entries = match st.getdents_cache.get_mut(&cache_key) {
+        Some(e) => e,
+        None => return NotifAction::Continue,
+    };
+
+    // Empty cache = already fully drained on a prior call → return 0 (EOF).
+    if entries.is_empty() {
+        return NotifAction::ReturnValue(0);
+    }
+
+    // Pack as many entries as fit into the child's buffer.
+    let mut result = Vec::new();
+    let mut consumed = 0;
+    for entry in entries.iter() {
+        if result.len() + entry.len() > buf_size {
+            break;
+        }
+        result.extend_from_slice(entry);
+        consumed += 1;
+    }
+
+    if consumed > 0 {
+        entries.drain(..consumed);
+    }
+
+    drop(st);
+
+    if !result.is_empty() {
+        if write_child_mem(notif_fd, notif.id, pid, buf_addr, &result).is_err() {
+            return NotifAction::Continue;
+        }
+    }
+
+    NotifAction::ReturnValue(result.len() as i64)
+}
+
+// ============================================================
 // dirent64 construction helpers
 // ============================================================
 

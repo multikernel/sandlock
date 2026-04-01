@@ -75,6 +75,8 @@ enum Command {
         #[arg(long)]
         no_huge_pages: bool,
         #[arg(long)]
+        deterministic_dirs: bool,
+        #[arg(long)]
         no_coredump: bool,
         #[arg(long = "env", value_name = "KEY=VALUE")]
         env_vars: Vec<String>,
@@ -132,7 +134,7 @@ async fn main() -> Result<()> {
             isolate_ipc, isolate_signals, clean_env, num_cpus, profile: profile_name, status_fd,
             max_cpu, max_open_files, chroot, privileged, workdir,
             fs_isolation, fs_storage, max_disk, net_allow, net_deny,
-            port_remap, no_randomize_memory, no_huge_pages, no_coredump,
+            port_remap, no_randomize_memory, no_huge_pages, deterministic_dirs, no_coredump,
             env_vars, exec_shell, interactive: _, fs_deny, cpu_cores, gpu_devices, image, cmd } =>
         {
             // Start from profile or default
@@ -214,6 +216,7 @@ async fn main() -> Result<()> {
             if !gpu_devices.is_empty() { builder = builder.gpu_devices(gpu_devices); }
             if no_randomize_memory { builder = builder.no_randomize_memory(true); }
             if no_huge_pages { builder = builder.no_huge_pages(true); }
+            if deterministic_dirs { builder = builder.deterministic_dirs(true); }
             if no_coredump { builder = builder.close_fds(true); }
             for spec in &env_vars {
                 if let Some((k, v)) = spec.split_once('=') {

@@ -275,7 +275,7 @@ pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
     if policy.num_cpus.is_some() {
         nrs.push(libc::SYS_sched_getaffinity as u32);
     }
-    if policy.isolate_pids {
+    if policy.isolate_pids || policy.deterministic_dirs {
         nrs.extend_from_slice(&[
             libc::SYS_getdents64 as u32,
             libc::SYS_getdents as u32,

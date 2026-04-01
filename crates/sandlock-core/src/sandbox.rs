@@ -795,6 +795,7 @@ impl Sandbox {
                 chroot_root: self.policy.chroot.clone(),
                 chroot_readable: self.policy.fs_readable.clone(),
                 chroot_writable: self.policy.fs_writable.clone(),
+                deterministic_dirs: self.policy.deterministic_dirs,
             };
 
             // Create SupervisorState

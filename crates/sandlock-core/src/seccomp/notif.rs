@@ -215,6 +215,7 @@ pub struct NotifPolicy {
     pub chroot_readable: Vec<std::path::PathBuf>,
     /// Virtual paths allowed for writing under chroot (original user-specified paths).
     pub chroot_writable: Vec<std::path::PathBuf>,
+    pub deterministic_dirs: bool,
 }
 
 // ============================================================
@@ -629,6 +630,12 @@ async fn dispatch(
         if nr == libc::SYS_sched_getaffinity as i64 {
             return crate::procfs::handle_sched_getaffinity(notif, n, notif_fd);
         }
+    }
+
+    // Deterministic directory listing — sort getdents entries
+    // Placed after chroot/COW/procfs handlers so those take priority for their own dirs.
+    if policy.deterministic_dirs && (nr == libc::SYS_getdents64 as i64 || nr == libc::SYS_getdents as i64) {
+        return crate::procfs::handle_sorted_getdents(notif, state, notif_fd).await;
     }
 
     // Bind — on-behalf (for TOCTOU safety when port_remap or net allowlist active)

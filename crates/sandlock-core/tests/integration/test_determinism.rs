@@ -144,3 +144,44 @@ async fn test_combined_determinism() {
     let result = Sandbox::run(&policy, &["echo", "deterministic"]).await.unwrap();
     assert!(result.success());
 }
+
+/// Test that deterministic_dirs produces sorted directory listings.
+/// Run ls twice — output should match and be sorted.
+#[tokio::test]
+async fn test_deterministic_dirs() {
+    let policy = Policy::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .deterministic_dirs(true)
+        .build()
+        .unwrap();
+
+    // Use ls -f -1 to preserve raw getdents order (no re-sorting by ls).
+    let r1 = Sandbox::run(&policy, &["ls", "-f", "-1", "/etc"]).await.unwrap();
+    let r2 = Sandbox::run(&policy, &["ls", "-f", "-1", "/etc"]).await.unwrap();
+    assert!(r1.success(), "First ls failed");
+    assert!(r2.success(), "Second ls failed");
+
+    let out1 = String::from_utf8_lossy(r1.stdout.as_deref().unwrap_or_default());
+    let out2 = String::from_utf8_lossy(r2.stdout.as_deref().unwrap_or_default());
+    assert!(
+        !out1.trim().is_empty(),
+        "Expected non-empty ls output"
+    );
+    assert_eq!(
+        out1, out2,
+        "Two ls -f runs should produce identical output with deterministic_dirs"
+    );
+
+    // Verify the output is actually sorted (skip . and .. entries from ls -f).
+    let lines: Vec<&str> = out1.lines()
+        .filter(|l| *l != "." && *l != "..")
+        .collect();
+    let mut sorted = lines.clone();
+    sorted.sort();
+    assert_eq!(lines, sorted, "getdents output should be lexicographically sorted");
+}

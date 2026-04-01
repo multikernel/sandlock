@@ -223,6 +223,11 @@ class Policy:
     pages, which causes nondeterministic memory layout, RSS measurements,
     and page fault timing.  Applied via prctl(PR_SET_THP_DISABLE)."""
 
+    deterministic_dirs: bool = False
+    """Sort directory entries lexicographically for deterministic readdir().
+    Ensures ls, glob, os.listdir etc. return the same order regardless of
+    filesystem internals."""
+
     # GPU access
     gpu_devices: Sequence[int] | None = None
     """GPU device indices visible to the sandbox.  When set, Landlock

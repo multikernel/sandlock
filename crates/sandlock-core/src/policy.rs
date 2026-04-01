@@ -109,6 +109,7 @@ pub struct Policy {
     pub time_start: Option<SystemTime>,
     pub no_randomize_memory: bool,
     pub no_huge_pages: bool,
+    pub deterministic_dirs: bool,
 
     // Filesystem branch
     pub fs_isolation: FsIsolation,
@@ -187,6 +188,7 @@ pub struct PolicyBuilder {
     time_start: Option<SystemTime>,
     no_randomize_memory: bool,
     no_huge_pages: bool,
+    deterministic_dirs: bool,
 
     fs_isolation: Option<FsIsolation>,
     workdir: Option<PathBuf>,
@@ -316,6 +318,11 @@ impl PolicyBuilder {
         self
     }
 
+    pub fn deterministic_dirs(mut self, v: bool) -> Self {
+        self.deterministic_dirs = v;
+        self
+    }
+
     pub fn fs_isolation(mut self, iso: FsIsolation) -> Self {
         self.fs_isolation = Some(iso);
         self
@@ -440,6 +447,7 @@ impl PolicyBuilder {
             time_start: self.time_start,
             no_randomize_memory: self.no_randomize_memory,
             no_huge_pages: self.no_huge_pages,
+            deterministic_dirs: self.deterministic_dirs,
             fs_isolation,
             workdir: self.workdir,
             fs_storage: self.fs_storage,
