@@ -1,9 +1,7 @@
 """Build sandlock: compile Rust FFI library and install Python package."""
 
-import os
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 from setuptools import setup
@@ -13,12 +11,24 @@ from setuptools.command.develop import develop
 
 RUST_DIR = Path(__file__).parent.parent  # project root (contains Cargo.toml)
 LIB_NAME = "libsandlock_ffi.so"
+BUNDLED_LIB = Path(__file__).parent / "src" / "sandlock" / LIB_NAME
 
 
 def build_rust():
-    """Build the Rust FFI shared library in release mode."""
-    if not RUST_DIR.exists():
-        raise RuntimeError(f"Rust source not found at {RUST_DIR}")
+    """Build the Rust FFI shared library in release mode.
+
+    Returns the path to the built library, or None if the Rust source
+    is not available (e.g. installing from sdist on PyPI).
+    """
+    cargo_toml = RUST_DIR / "Cargo.toml"
+    if not cargo_toml.exists():
+        # No Rust source — use the pre-bundled .so from the sdist.
+        if BUNDLED_LIB.exists():
+            return None
+        raise RuntimeError(
+            "Rust source not found and no pre-built libsandlock_ffi.so bundled. "
+            "Install from a wheel or build from the full source tree."
+        )
 
     subprocess.check_call(
         ["cargo", "build", "--release", "-p", "sandlock-ffi"],
@@ -33,7 +43,7 @@ def build_rust():
 
 def copy_lib_to_package(lib_path: Path):
     """Copy the shared library into the Python package directory."""
-    dest = Path(__file__).parent / "src" / "sandlock" / LIB_NAME
+    dest = BUNDLED_LIB
     shutil.copy2(lib_path, dest)
     return dest
 
@@ -43,7 +53,8 @@ class BuildPyWithRust(build_py):
 
     def run(self):
         lib_path = build_rust()
-        copy_lib_to_package(lib_path)
+        if lib_path is not None:
+            copy_lib_to_package(lib_path)
         super().run()
 
 
@@ -52,7 +63,8 @@ class DevelopWithRust(develop):
 
     def run(self):
         lib_path = build_rust()
-        copy_lib_to_package(lib_path)
+        if lib_path is not None:
+            copy_lib_to_package(lib_path)
         super().run()
 
 
