@@ -474,6 +474,43 @@ pub unsafe extern "C" fn sandlock_handle_wait(h: *mut sandlock_handle_t) -> *mut
     }
 }
 
+/// Wait for the sandbox to exit with a timeout in milliseconds.
+/// Returns a result handle, or null on error. On timeout the sandbox is
+/// killed and a result with `ExitStatus::Timeout` is returned.
+///
+/// # Safety
+/// `h` must be a valid handle from `sandlock_spawn`.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_handle_wait_timeout(
+    h: *mut sandlock_handle_t,
+    timeout_ms: u64,
+) -> *mut sandlock_result_t {
+    if h.is_null() { return ptr::null_mut(); }
+    let h = &mut *h;
+
+    if timeout_ms == 0 {
+        // No timeout -- same as sandlock_handle_wait.
+        return match h.runtime.block_on(h.sandbox.wait()) {
+            Ok(result) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
+            Err(_) => ptr::null_mut(),
+        };
+    }
+
+    let dur = Duration::from_millis(timeout_ms);
+    match h.runtime.block_on(async {
+        tokio::time::timeout(dur, h.sandbox.wait()).await
+    }) {
+        Ok(Ok(result)) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
+        Ok(Err(_)) => ptr::null_mut(),
+        Err(_) => {
+            // Timeout -- kill the process and return a timeout result.
+            let _ = h.sandbox.kill();
+            let result = RunResult::timeout();
+            Box::into_raw(Box::new(sandlock_result_t { _private: result }))
+        }
+    }
+}
+
 /// Free a sandbox handle. Kills the process if still running.
 ///
 /// # Safety

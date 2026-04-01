@@ -24,6 +24,14 @@ impl RunResult {
             .and_then(|b| std::str::from_utf8(b).ok().map(|s| s.trim_end_matches('\n')))
     }
 
+    pub fn timeout() -> Self {
+        RunResult {
+            exit_status: ExitStatus::Timeout,
+            stdout: None,
+            stderr: None,
+        }
+    }
+
     pub fn stderr_str(&self) -> Option<&str> {
         self.stderr
             .as_ref()

@@ -180,6 +180,9 @@ _lib.sandlock_handle_pid.argtypes = [_c_handle_p]
 _lib.sandlock_handle_wait.restype = _c_result_p
 _lib.sandlock_handle_wait.argtypes = [_c_handle_p]
 
+_lib.sandlock_handle_wait_timeout.restype = _c_result_p
+_lib.sandlock_handle_wait_timeout.argtypes = [_c_handle_p, ctypes.c_uint64]
+
 _lib.sandlock_handle_free.restype = None
 _lib.sandlock_handle_free.argtypes = [_c_handle_p]
 
@@ -802,8 +805,15 @@ class Sandbox:
             cp.app_state = save_fn()
         return cp
 
-    def run(self, cmd: list[str]) -> Result:
-        """Run a command in the sandbox, capturing stdout and stderr."""
+    def run(self, cmd: list[str], timeout: float | None = None) -> Result:
+        """Run a command in the sandbox, capturing stdout and stderr.
+
+        Args:
+            cmd: Command and arguments to execute.
+            timeout: Maximum execution time in seconds. The process is
+                killed and a timeout result is returned if exceeded.
+                None means no timeout.
+        """
         argv, argc = _make_argv(cmd)
 
         # Spawn (non-blocking) so PID is available for pause/resume
@@ -812,7 +822,8 @@ class Sandbox:
             return Result(success=False, exit_code=-1, error="sandlock_spawn failed")
 
         try:
-            result_p = _lib.sandlock_handle_wait(self._handle)
+            timeout_ms = int(timeout * 1000) if timeout else 0
+            result_p = _lib.sandlock_handle_wait_timeout(self._handle, timeout_ms)
         finally:
             _lib.sandlock_handle_free(self._handle)
             self._handle = None
