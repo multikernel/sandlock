@@ -88,6 +88,12 @@ _b_isolate_signals = _builder_fn("sandlock_policy_builder_isolate_signals", ctyp
 _b_random_seed = _builder_fn("sandlock_policy_builder_random_seed", ctypes.c_uint64)
 _b_clean_env = _builder_fn("sandlock_policy_builder_clean_env", ctypes.c_bool)
 _b_env_var = _builder_fn("sandlock_policy_builder_env_var", ctypes.c_char_p, ctypes.c_char_p)
+_b_time_start = _builder_fn("sandlock_policy_builder_time_start", ctypes.c_uint64)
+_b_deny_syscalls = _builder_fn("sandlock_policy_builder_deny_syscalls", ctypes.c_char_p)
+_b_allow_syscalls = _builder_fn("sandlock_policy_builder_allow_syscalls", ctypes.c_char_p)
+_b_isolate_pids = _builder_fn("sandlock_policy_builder_isolate_pids", ctypes.c_bool)
+_b_max_open_files = _builder_fn("sandlock_policy_builder_max_open_files", ctypes.c_uint32)
+_b_close_fds = _builder_fn("sandlock_policy_builder_close_fds", ctypes.c_bool)
 _b_no_randomize_memory = _builder_fn("sandlock_policy_builder_no_randomize_memory", ctypes.c_bool)
 _b_no_huge_pages = _builder_fn("sandlock_policy_builder_no_huge_pages", ctypes.c_bool)
 _b_deterministic_dirs = _builder_fn("sandlock_policy_builder_deterministic_dirs", ctypes.c_bool)
@@ -649,10 +655,24 @@ class _NativePolicy:
 
         if policy.random_seed is not None:
             b = _b_random_seed(b, policy.random_seed)
+        if policy.time_start is not None:
+            epoch_secs = int(policy.time_start.timestamp()) if hasattr(policy.time_start, 'timestamp') else int(policy.time_start)
+            b = _b_time_start(b, epoch_secs)
         if policy.clean_env:
             b = _b_clean_env(b, True)
+        if policy.close_fds:
+            b = _b_close_fds(b, True)
         for k, v in (policy.env or {}).items():
             b = _b_env_var(b, _encode(k), _encode(v))
+
+        if policy.deny_syscalls:
+            b = _b_deny_syscalls(b, _encode(",".join(policy.deny_syscalls)))
+        if policy.allow_syscalls:
+            b = _b_allow_syscalls(b, _encode(",".join(policy.allow_syscalls)))
+        if policy.isolate_pids:
+            b = _b_isolate_pids(b, True)
+        if policy.max_open_files is not None:
+            b = _b_max_open_files(b, policy.max_open_files)
 
         if policy.no_randomize_memory:
             b = _b_no_randomize_memory(b, True)

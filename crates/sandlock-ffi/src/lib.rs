@@ -316,6 +316,77 @@ pub unsafe extern "C" fn sandlock_policy_builder_env_var(
 }
 
 /// # Safety
+/// `b` must be a valid builder pointer. `epoch_secs` is seconds since UNIX epoch.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_time_start(
+    b: *mut PolicyBuilder, epoch_secs: u64,
+) -> *mut PolicyBuilder {
+    if b.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    let t = std::time::UNIX_EPOCH + Duration::from_secs(epoch_secs);
+    Box::into_raw(Box::new(builder.time_start(t)))
+}
+
+/// # Safety
+/// `b` must be a valid builder pointer. `names` is a comma-separated NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_deny_syscalls(
+    b: *mut PolicyBuilder, names: *const c_char,
+) -> *mut PolicyBuilder {
+    if b.is_null() || names.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    let s = CStr::from_ptr(names).to_str().unwrap_or("");
+    let calls: Vec<String> = s.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    Box::into_raw(Box::new(builder.deny_syscalls(calls)))
+}
+
+/// # Safety
+/// `b` must be a valid builder pointer. `names` is a comma-separated NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_allow_syscalls(
+    b: *mut PolicyBuilder, names: *const c_char,
+) -> *mut PolicyBuilder {
+    if b.is_null() || names.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    let s = CStr::from_ptr(names).to_str().unwrap_or("");
+    let calls: Vec<String> = s.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    Box::into_raw(Box::new(builder.allow_syscalls(calls)))
+}
+
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_isolate_pids(
+    b: *mut PolicyBuilder, v: bool,
+) -> *mut PolicyBuilder {
+    if b.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.isolate_pids(v)))
+}
+
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_max_open_files(
+    b: *mut PolicyBuilder, n: c_uint,
+) -> *mut PolicyBuilder {
+    if b.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.max_open_files(n)))
+}
+
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_close_fds(
+    b: *mut PolicyBuilder, v: bool,
+) -> *mut PolicyBuilder {
+    if b.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.close_fds(v)))
+}
+
+/// # Safety
 /// `b` must be a valid builder pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_policy_builder_no_randomize_memory(

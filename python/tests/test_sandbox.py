@@ -298,3 +298,41 @@ class TestPauseResume:
         sb = Sandbox(_policy())
         with pytest.raises(RuntimeError):
             sb.resume()
+
+
+class TestNewPolicyFields:
+    """Tests for newly wired FFI policy fields."""
+
+    def test_time_start(self):
+        from datetime import datetime, timezone
+        # Freeze time to 2000-06-15
+        t = datetime(2000, 6, 15, tzinfo=timezone.utc)
+        p = _policy(time_start=t)
+        result = Sandbox(p).run(["date", "+%Y"])
+        assert result.success
+        assert result.stdout.strip() == b"2000"
+
+    def test_deny_syscalls(self):
+        p = _policy(deny_syscalls=["mount"])
+        result = Sandbox(p).run(["echo", "ok"])
+        assert result.success
+        assert result.stdout.strip() == b"ok"
+
+    def test_isolate_pids(self):
+        p = _policy(isolate_pids=True)
+        result = Sandbox(p).run(["echo", "isolated"])
+        assert result.success
+        assert result.stdout.strip() == b"isolated"
+
+    def test_max_open_files(self):
+        # max_open_files is accepted by the policy but not yet enforced
+        # in the sandbox — just verify it doesn't crash.
+        p = _policy(max_open_files=64)
+        result = Sandbox(p).run(["echo", "ok"])
+        assert result.success
+
+    def test_close_fds(self):
+        p = _policy(close_fds=True)
+        result = Sandbox(p).run(["echo", "closed"])
+        assert result.success
+        assert result.stdout.strip() == b"closed"
