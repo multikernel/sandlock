@@ -7,9 +7,10 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/multikernel/sandlock"
 homepage = "https://github.com/multikernel/sandlock"
 description = "Lightweight process sandbox using Landlock, seccomp, and seccomp user notification"
+readme = "README.md"

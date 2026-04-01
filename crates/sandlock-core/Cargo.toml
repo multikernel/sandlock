@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "../../README.md"
 description = "Lightweight process sandbox using Landlock, seccomp-bpf, and seccomp user notification"
 
 [dependencies]
