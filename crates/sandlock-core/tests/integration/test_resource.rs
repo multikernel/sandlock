@@ -3,6 +3,8 @@ use std::time::{Duration, Instant};
 use sandlock_core::policy::ByteSize;
 use sandlock_core::{ExitStatus, Policy, Sandbox};
 
+use libc;
+
 /// Helper: build a base policy that allows Python3 and basic filesystem access.
 fn base_policy() -> sandlock_core::policy::PolicyBuilder {
     Policy::builder()
@@ -185,22 +187,16 @@ async fn test_memory_limit_enforced() {
 
     let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script]).await;
 
-    // Either the process was killed (OOM killer) or it caught MemoryError
-    match result {
-        Ok(_run_result) => {
-            // Process completed — check if it hit MemoryError
-            if let Ok(content) = std::fs::read_to_string(&out) {
-                assert_ne!(
-                    content.trim(),
-                    "allocated",
-                    "should not have been able to allocate 200MB under 64MB limit",
-                );
-            }
-            // If no output file, process was likely killed before writing
-        }
-        Err(_) => {
-            // Process was killed by OOM — that's the expected outcome
-        }
+    // Process must be killed with SIGKILL when exceeding memory limit
+    let run_result = result.expect("sandbox should return a result");
+    assert!(
+        matches!(run_result.exit_status, ExitStatus::Signal(libc::SIGKILL) | ExitStatus::Killed),
+        "expected SIGKILL, got {:?}",
+        run_result.exit_status,
+    );
+    // The output file should not exist — process was killed before writing
+    if let Ok(content) = std::fs::read_to_string(&out) {
+        assert_ne!(content.trim(), "allocated", "should not have allocated 200MB under 64MB limit");
     }
 
     let _ = std::fs::remove_file(&out);

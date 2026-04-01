@@ -5,7 +5,7 @@ use tokio::sync::Mutex;
 
 use crate::seccomp::notif::{NotifAction, NotifPolicy, SupervisorState};
 use crate::sys::structs::{
-    SeccompNotif, CLONE_NS_FLAGS, EAGAIN, ENOMEM, EPERM,
+    SeccompNotif, CLONE_NS_FLAGS, EAGAIN, EPERM,
 };
 
 /// CLONE_THREAD flag — threads don't count toward process limit.
@@ -70,13 +70,15 @@ pub(crate) async fn handle_memory(
 
     let mut st = state.lock().await;
 
+    let kill = NotifAction::Kill { sig: libc::SIGKILL, pgid: notif.pid as i32 };
+
     if nr == libc::SYS_mmap {
         // args[1] = len, args[3] = flags
         let len = args[1];
         let flags = args[3];
         if (flags & MAP_ANONYMOUS) != 0 {
             if st.mem_used.saturating_add(len) > limit {
-                return NotifAction::Errno(ENOMEM);
+                return kill;
             }
             st.mem_used += len;
         }
@@ -99,7 +101,7 @@ pub(crate) async fn handle_memory(
         if new_brk > base {
             let delta = new_brk - base;
             if st.mem_used.saturating_add(delta) > limit {
-                return NotifAction::Errno(ENOMEM);
+                return kill;
             }
             st.mem_used += delta;
             st.brk_bases.insert(pid, new_brk);
@@ -116,7 +118,7 @@ pub(crate) async fn handle_memory(
         if new_len > old_len {
             let growth = new_len - old_len;
             if st.mem_used.saturating_add(growth) > limit {
-                return NotifAction::Errno(ENOMEM);
+                return kill;
             }
             st.mem_used += growth;
         } else if new_len < old_len {

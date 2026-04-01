@@ -19,6 +19,7 @@ use crate::sys::structs::{
     SECCOMP_ADDFD_FLAG_SEND, SECCOMP_IOCTL_NOTIF_ADDFD, SECCOMP_IOCTL_NOTIF_ID_VALID, SECCOMP_IOCTL_NOTIF_RECV,
     SECCOMP_IOCTL_NOTIF_SEND, SECCOMP_IOCTL_NOTIF_SET_FLAGS,
     SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP, SECCOMP_USER_NOTIF_FLAG_CONTINUE,
+    ENOMEM,
 };
 
 // ============================================================
@@ -41,6 +42,9 @@ pub enum NotifAction {
     ReturnValue(i64),
     /// Don't respond — used for checkpoint/freeze.
     Hold,
+    /// Kill the child process group (OOM-kill semantics).
+    /// Fields: signal, process group leader pid.
+    Kill { sig: i32, pgid: i32 },
 }
 
 // ============================================================
@@ -444,6 +448,12 @@ fn send_response(fd: RawFd, id: u64, action: NotifAction) -> io::Result<()> {
         }
         NotifAction::ReturnValue(val) => respond_value(fd, id, val),
         NotifAction::Hold => Ok(()), // Don't send a response.
+        NotifAction::Kill { sig, pgid } => {
+            // Kill the entire process group, then return ENOMEM so the
+            // seccomp notification is resolved (avoids a kernel warning).
+            unsafe { libc::killpg(pgid, sig) };
+            respond_errno(fd, id, ENOMEM)
+        }
     }
 }
 
@@ -948,6 +958,7 @@ mod tests {
         let _ = format!("{:?}", NotifAction::InjectFdSend { srcfd: 5 });
         let _ = format!("{:?}", NotifAction::ReturnValue(42));
         let _ = format!("{:?}", NotifAction::Hold);
+        let _ = format!("{:?}", NotifAction::Kill { sig: 9, pgid: 1 });
     }
 
     #[test]
