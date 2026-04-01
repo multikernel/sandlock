@@ -3,6 +3,8 @@ name = "sandlock-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Lightweight process sandbox using Landlock, seccomp-bpf, and seccomp user notification"
 
 [dependencies]
