@@ -56,9 +56,15 @@ class DevelopWithRust(develop):
         super().run()
 
 
+# Read README from project root for PyPI description.
+readme_path = RUST_DIR / "README.md"
+long_description = readme_path.read_text(encoding="utf-8") if readme_path.exists() else ""
+
 setup(
     cmdclass={
         "build_py": BuildPyWithRust,
         "develop": DevelopWithRust,
     },
+    long_description=long_description,
+    long_description_content_type="text/markdown",
 )

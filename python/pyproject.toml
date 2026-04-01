@@ -4,12 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sandlock"
-dynamic = ["version"]
+dynamic = ["version", "readme"]
 description = "Lightweight process sandbox using Landlock, seccomp, and seccomp user notification"
 requires-python = ">=3.8"
 dependencies = ["tomli>=1.0; python_version < '3.11'"]
 license = {text = "Apache-2.0"}
-readme = "README.md"
 authors = [
     { name = "Cong Wang", email = "cwang@multikernel.io" },
 ]
