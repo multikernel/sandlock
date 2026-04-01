@@ -271,6 +271,10 @@ pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
     if policy.num_cpus.is_some() || policy.max_memory.is_some() || policy.isolate_pids || policy.port_remap {
         nrs.push(libc::SYS_openat as u32);
     }
+    // Virtualize sched_getaffinity so nproc/sysconf agree with /proc/cpuinfo
+    if policy.num_cpus.is_some() {
+        nrs.push(libc::SYS_sched_getaffinity as u32);
+    }
     if policy.isolate_pids {
         nrs.extend_from_slice(&[
             libc::SYS_getdents64 as u32,

@@ -247,6 +247,41 @@ pub(crate) async fn handle_proc_open(
 }
 
 // ============================================================
+// sched_getaffinity virtualization
+// ============================================================
+
+/// Handle sched_getaffinity(pid, cpusetsize, mask) — return a fake mask
+/// with only `num_cpus` bits set, so nproc/sysconf report the virtual count
+/// without actually pinning the process to specific cores.
+pub(crate) fn handle_sched_getaffinity(
+    notif: &SeccompNotif,
+    num_cpus: u32,
+    notif_fd: RawFd,
+) -> NotifAction {
+    let cpusetsize = notif.data.args[1] as usize;
+    let mask_addr = notif.data.args[2];
+
+    if mask_addr == 0 || cpusetsize == 0 {
+        return NotifAction::Continue;
+    }
+
+    // Build a cpu_set with the first N bits set.
+    let mut mask = vec![0u8; cpusetsize];
+    for i in 0..num_cpus as usize {
+        let byte_idx = i / 8;
+        let bit_idx = i % 8;
+        if byte_idx < mask.len() {
+            mask[byte_idx] |= 1 << bit_idx;
+        }
+    }
+
+    match write_child_mem(notif_fd, notif.id, notif.pid, mask_addr, &mask) {
+        Ok(()) => NotifAction::ReturnValue(cpusetsize as i64),
+        Err(_) => NotifAction::Continue,
+    }
+}
+
+// ============================================================
 // dirent64 construction helpers
 // ============================================================
 

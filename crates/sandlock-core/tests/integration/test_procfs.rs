@@ -1,7 +1,7 @@
 use sandlock_core::policy::ByteSize;
 use sandlock_core::{Policy, Sandbox};
 
-/// Test that num_cpus virtualizes /proc/cpuinfo.
+/// Test that num_cpus virtualizes both /proc/cpuinfo and sched_getaffinity.
 #[tokio::test]
 async fn test_num_cpus_virtualization() {
     let policy = Policy::builder()
@@ -15,11 +15,17 @@ async fn test_num_cpus_virtualization() {
         .build()
         .unwrap();
 
-    // nproc uses sched_getaffinity, not /proc/cpuinfo, so verify cpuinfo directly.
+    // Verify /proc/cpuinfo shows 2 processors.
     let result = Sandbox::run(&policy, &["sh", "-c", "grep -c ^processor /proc/cpuinfo"]).await.unwrap();
     assert!(result.success(), "grep /proc/cpuinfo should succeed");
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     assert_eq!(stdout.trim(), "2", "/proc/cpuinfo should show 2 processors, got: {:?}", stdout.trim());
+
+    // Verify nproc (sched_getaffinity) also reports 2.
+    let result = Sandbox::run(&policy, &["nproc"]).await.unwrap();
+    assert!(result.success(), "nproc should succeed");
+    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
+    assert_eq!(stdout.trim(), "2", "nproc should report 2 CPUs, got: {:?}", stdout.trim());
 }
 
 /// Test that max_memory virtualizes /proc/meminfo.

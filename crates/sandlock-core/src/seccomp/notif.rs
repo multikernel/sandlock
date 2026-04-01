@@ -624,6 +624,13 @@ async fn dispatch(
         }
     }
 
+    // Virtual CPU count — fake sched_getaffinity result
+    if let Some(n) = policy.num_cpus {
+        if nr == libc::SYS_sched_getaffinity as i64 {
+            return crate::procfs::handle_sched_getaffinity(notif, n, notif_fd);
+        }
+    }
+
     // Bind — on-behalf (for TOCTOU safety when port_remap or net allowlist active)
     if (policy.port_remap || policy.has_net_allowlist) && nr == libc::SYS_bind as i64 {
         return crate::port_remap::handle_bind(notif, state, notif_fd).await;
