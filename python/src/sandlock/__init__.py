@@ -16,6 +16,15 @@ from .exceptions import (
     SandlockError,
     PolicyError,
     SandboxError,
+    ForkError,
+    ConfinementError,
+    LandlockUnavailableError,
+    SeccompError,
+    ChildError,
+    MemoryProtectError,
+    NotifError,
+    BranchError,
+    BranchConflictError,
 )
 
 __all__ = [
@@ -44,4 +53,13 @@ __all__ = [
     "SandlockError",
     "PolicyError",
     "SandboxError",
+    "ForkError",
+    "ConfinementError",
+    "LandlockUnavailableError",
+    "SeccompError",
+    "ChildError",
+    "MemoryProtectError",
+    "NotifError",
+    "BranchError",
+    "BranchConflictError",
 ]
