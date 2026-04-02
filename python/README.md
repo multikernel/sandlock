@@ -401,6 +401,120 @@ from sandlock import SandlockError, SandboxError, PolicyError
 - `BranchAction.ABORT` -- discard writes
 - `BranchAction.KEEP` -- leave branch as-is
 
+### MCP integration
+
+Sandboxed tool execution for AI agents. Each tool runs in a per-call
+sandbox with deny-by-default permissions.
+
+```
+pip install 'sandlock[mcp]'
+```
+
+#### McpSandbox
+
+```python
+from sandlock.mcp import McpSandbox
+
+mcp = McpSandbox(workspace="/tmp/agent", timeout=30.0)
+```
+
+- `workspace` -- directory the sandbox can read (default: `"/tmp/sandlock"`).
+- `timeout` -- default timeout in seconds per tool call (default: `30.0`).
+
+#### `mcp.add_tool(name, func, *, description="", capabilities=None, input_schema=None)`
+
+Register a local tool. The function must be self-contained (imports inside
+the body) -- it is serialized and executed in a fresh sandbox process.
+
+```python
+def read_file(path: str) -> str:
+    import os
+    workspace = os.environ["SANDLOCK_WORKSPACE"]
+    with open(os.path.join(workspace, path)) as f:
+        return f.read()
+
+mcp.add_tool("read_file", read_file,
+    description="Read a file from the workspace",
+    capabilities={"env": {"SANDLOCK_WORKSPACE": "/tmp/agent"}},
+)
+```
+
+No capabilities = read-only, clean environment, no network. Grant
+permissions explicitly:
+
+| Capability | Example | Description |
+|------------|---------|-------------|
+| `fs_writable` | `["/tmp/agent"]` | Paths the tool can write to |
+| `net_connect` | `[443]` | TCP ports the tool can connect to |
+| `net_allow_hosts` | `["api.example.com"]` | Allowed domains (implies ports 80, 443) |
+| `env` | `{"KEY": "val"}` | Environment variables to pass |
+| `max_memory` | `"256M"` | Memory limit |
+
+Any `Policy` field name is accepted as a capability key.
+
+#### `await mcp.add_mcp_session(session)`
+
+Discover tools from a remote MCP server. Capabilities are read from
+`sandlock:*` keys in the tool's annotations or meta dict.
+
+#### `await mcp.call_tool(name, arguments=None, *, timeout=None) -> str`
+
+Call a tool by name. Local tools run in a per-call sandbox. MCP tools
+are forwarded to their server session.
+
+```python
+result = await mcp.call_tool("read_file", {"path": "data.txt"})
+```
+
+#### `mcp.get_policy(tool_name) -> Policy`
+
+Return the computed `Policy` for a registered tool.
+
+#### `mcp.tool_definitions_openai() -> list[dict]`
+
+Tool definitions in OpenAI function-calling format, for use with
+chat completion APIs.
+
+#### `mcp.tools -> dict[str, Any]`
+
+All registered tools (local and MCP).
+
+#### MCP server
+
+A standalone MCP server with built-in sandboxed tools (shell, python,
+read_file, write_file, list_files):
+
+```bash
+# stdio (for Claude Desktop / Cursor)
+sandlock-mcp --workspace /tmp/sandbox
+
+# SSE (remote)
+pip install 'sandlock[mcp-remote]'
+sandlock-mcp --transport sse --host 0.0.0.0 --port 8080 --workspace /tmp/sandbox
+```
+
+Claude Desktop configuration:
+
+```json
+{
+  "mcpServers": {
+    "sandlock": {
+      "command": "sandlock-mcp",
+      "args": ["--workspace", "/tmp/sandbox"]
+    }
+  }
+}
+```
+
+#### `policy_for_tool(*, workspace, capabilities=None) -> Policy`
+
+Build a deny-by-default `Policy` from explicit capabilities. Used
+internally by `McpSandbox` but available for direct use.
+
+#### `capabilities_from_mcp_tool(tool) -> dict`
+
+Extract `sandlock:*` capabilities from an MCP tool's annotations/meta.
+
 ## License
 
 Apache-2.0

@@ -25,7 +25,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Mapping
 
 from ..policy import Policy
-from ..sandbox import Sandbox
+from .._sdk import Sandbox
 from ._policy import policy_for_tool, capabilities_from_mcp_tool
 
 
