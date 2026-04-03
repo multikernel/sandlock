@@ -97,11 +97,16 @@ async fn test_proc_net_tcp_filtered() {
         std::process::id()
     ));
 
+    // Pick a free port to avoid conflicts with parallel tests.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
     let policy = Policy::builder()
         .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin")
         .fs_read("/etc").fs_read("/proc").fs_read("/dev")
         .fs_write("/tmp")
-        .net_bind_port(5555)
+        .net_bind_port(port)
         .port_remap(true)
         .build()
         .unwrap();
@@ -110,7 +115,7 @@ async fn test_proc_net_tcp_filtered() {
         "import socket\n",
         "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
         "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
-        "s.bind(('127.0.0.1', 5555))\n",
+        "s.bind(('127.0.0.1', {port}))\n",
         "s.listen(1)\n",
         "with open('/proc/net/tcp') as f:\n",
         "  lines = f.readlines()\n",
@@ -122,7 +127,7 @@ async fn test_proc_net_tcp_filtered() {
         "    port_hex = parts[1].split(':')[1]\n",
         "    ports.append(int(port_hex, 16))\n",
         "open('{out}', 'w').write(str(len(ports)))\n",
-    ), out = out.display());
+    ), port = port, out = out.display());
 
     let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
