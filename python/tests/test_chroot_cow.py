@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from sandlock import Policy, Sandbox
+from sandlock.policy import FsIsolation
 
 
 _HELPER_BIN = Path(__file__).resolve().parent.parent.parent / "tests" / "rootfs-helper"
@@ -35,7 +36,7 @@ def _overlayfs_available():
             cwd="/tmp",
             fs_readable=["/"],
             fs_writable=["/tmp"],
-            fs_isolation="overlayfs",
+            fs_isolation=FsIsolation.OVERLAYFS,
             on_exit="abort",
             clean_env=True,
             env={"PATH": "/bin:/usr/bin"},
@@ -92,9 +93,9 @@ def rootfs(tmp_path):
 
 def _cow_policy(rootfs, on_exit="abort", fs_storage=None, backend="seccomp"):
     """Build a COW policy for the given backend."""
-    # seccomp backend: fs_isolation left as default (None) -- workdir triggers
+    # seccomp backend: fs_isolation left as NONE -- workdir triggers
     # the seccomp COW path.  overlayfs: explicit.
-    fs_isolation = "overlayfs" if backend == "overlayfs" else None
+    fs_isolation = FsIsolation.OVERLAYFS if backend == "overlayfs" else FsIsolation.NONE
     return Policy(
         chroot=str(rootfs),
         workdir=str(rootfs),
