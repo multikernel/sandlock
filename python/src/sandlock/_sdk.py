@@ -75,6 +75,8 @@ _b_fs_read = _builder_fn("sandlock_policy_builder_fs_read", ctypes.c_char_p)
 _b_fs_write = _builder_fn("sandlock_policy_builder_fs_write", ctypes.c_char_p)
 _b_fs_deny = _builder_fn("sandlock_policy_builder_fs_deny", ctypes.c_char_p)
 _b_fs_storage = _builder_fn("sandlock_policy_builder_fs_storage", ctypes.c_char_p)
+_b_fs_isolation = _builder_fn("sandlock_policy_builder_fs_isolation", ctypes.c_uint8)
+_b_gpu_devices = _builder_fn("sandlock_policy_builder_gpu_devices", ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32)
 _b_workdir = _builder_fn("sandlock_policy_builder_workdir", ctypes.c_char_p)
 _b_cwd = _builder_fn("sandlock_policy_builder_cwd", ctypes.c_char_p)
 _b_chroot = _builder_fn("sandlock_policy_builder_chroot", ctypes.c_char_p)
@@ -662,6 +664,24 @@ class _NativePolicy:
             _lib.sandlock_policy_free(self._ptr)
             self._ptr = None
 
+    # Fields handled by _build_from_policy (sent to FFI) or intentionally
+    # managed outside it (policy_fn is wired in from_dataclass; notif_policy
+    # is Python-side only; no_coredump is a Python convenience alias).
+    _HANDLED_FIELDS: set[str] = {
+        "fs_writable", "fs_readable", "fs_denied", "fs_storage", "fs_isolation",
+        "workdir", "cwd", "chroot", "on_exit", "on_error",
+        "max_memory", "max_disk", "max_processes", "max_cpu", "num_cpus",
+        "cpu_cores", "gpu_devices",
+        "net_allow_hosts", "net_bind", "net_connect",
+        "port_remap", "no_raw_sockets", "no_udp",
+        "privileged", "isolate_ipc", "isolate_signals",
+        "random_seed", "time_start", "clean_env", "close_fds", "env",
+        "deny_syscalls", "allow_syscalls", "isolate_pids", "max_open_files",
+        "no_randomize_memory", "no_huge_pages", "deterministic_dirs", "hostname",
+        # Managed outside _build_from_policy or Python-only:
+        "notif_policy", "no_coredump",
+    }
+
     @staticmethod
     def _build_from_policy(policy: PolicyDataclass):
         """Build a native builder from a Python Policy dataclass. Returns builder pointer."""
@@ -678,6 +698,20 @@ class _NativePolicy:
 
         if policy.fs_storage:
             b = _b_fs_storage(b, _encode(str(policy.fs_storage)))
+
+        from .policy import FsIsolation
+        _iso_map = {
+            FsIsolation.NONE: 0,
+            FsIsolation.OVERLAYFS: 1,
+            FsIsolation.BRANCHFS: 2,
+        }
+        if policy.fs_isolation != FsIsolation.NONE:
+            b = _b_fs_isolation(b, _iso_map[policy.fs_isolation])
+
+        if policy.gpu_devices is not None:
+            arr = (ctypes.c_uint32 * len(policy.gpu_devices))(*policy.gpu_devices)
+            b = _b_gpu_devices(b, arr, len(policy.gpu_devices))
+
         if policy.workdir:
             b = _b_workdir(b, _encode(str(policy.workdir)))
         if policy.cwd:
@@ -767,6 +801,24 @@ class _NativePolicy:
             b = _b_deterministic_dirs(b, True)
         if policy.hostname is not None:
             b = _b_hostname(b, policy.hostname.encode())
+
+        # Guard: warn if any dataclass field was set to a non-default value
+        # but is not in _HANDLED_FIELDS (i.e. silently dropped).
+        import dataclasses as _dc
+        import warnings as _w
+        from .policy import Policy as _Policy
+        _defaults = _Policy()
+        for f in _dc.fields(policy):
+            if f.name in _NativePolicy._HANDLED_FIELDS:
+                continue
+            val = getattr(policy, f.name)
+            default_val = getattr(_defaults, f.name)
+            if val != default_val:
+                _w.warn(
+                    f"Policy field {f.name!r} is set but not wired through "
+                    f"FFI — it will have no effect (value: {val!r})",
+                    stacklevel=3,
+                )
 
         return b
 

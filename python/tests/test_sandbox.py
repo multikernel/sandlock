@@ -409,6 +409,79 @@ class TestNewPolicyFields:
         assert result.stdout.strip() == b"closed"
 
 
+class TestFsIsolation:
+    """Tests for fs_isolation FFI wiring."""
+
+    def test_fs_isolation_none_runs(self):
+        """Default FsIsolation.NONE should work normally."""
+        from sandlock.policy import FsIsolation
+        p = _policy()
+        assert p.fs_isolation == FsIsolation.NONE
+        result = Sandbox(p).run(["echo", "ok"])
+        assert result.success
+
+    def test_fs_isolation_value_roundtrips(self):
+        """Non-default values are accepted by the FFI builder without error."""
+        from sandlock.policy import FsIsolation
+        import warnings
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            p = _policy(fs_isolation=FsIsolation.BRANCHFS)
+            # Building the native policy should succeed (the mode itself
+            # may fail at sandbox.run time without branchfs, but FFI wiring
+            # should not warn or crash).
+            from sandlock._sdk import _NativePolicy
+            _NativePolicy._build_from_policy(p)
+        unwired = [x for x in w if "fs_isolation" in str(x.message)]
+        assert unwired == [], "fs_isolation should be wired, not warned about"
+
+
+class TestGpuDevices:
+    """Tests for gpu_devices FFI wiring."""
+
+    def test_gpu_devices_accepted(self):
+        p = _policy(gpu_devices=[0])
+        result = Sandbox(p).run(["echo", "ok"])
+        assert result.success
+
+    def test_gpu_devices_empty_list(self):
+        p = _policy(gpu_devices=[])
+        result = Sandbox(p).run(["echo", "ok"])
+        assert result.success
+
+
+class TestUnwiredFieldWarning:
+    """Test that setting an unknown/unwired Policy field raises a warning."""
+
+    def test_warns_on_unwired_field(self):
+        import warnings
+        from sandlock._sdk import _NativePolicy
+
+        # Temporarily remove 'hostname' from the handled set to simulate
+        # a field that exists on the dataclass but was forgotten in FFI.
+        _NativePolicy._HANDLED_FIELDS.discard("hostname")
+        try:
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                p = _policy(hostname="test-host")
+                Sandbox(p).run(["echo", "ok"])
+
+            matched = [x for x in w if "hostname" in str(x.message)]
+            assert len(matched) == 1
+            assert "not wired through FFI" in str(matched[0].message)
+        finally:
+            _NativePolicy._HANDLED_FIELDS.add("hostname")
+
+    def test_no_warning_on_default_values(self):
+        import warnings
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            Sandbox(_policy()).run(["echo", "ok"])
+
+        unwired = [x for x in w if "not wired through FFI" in str(x.message)]
+        assert unwired == []
+
+
 class TestDiskQuota:
     """Tests for max_disk quota enforcement via seccomp COW.
 

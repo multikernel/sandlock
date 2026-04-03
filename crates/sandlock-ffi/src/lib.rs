@@ -95,6 +95,42 @@ pub unsafe extern "C" fn sandlock_policy_builder_fs_storage(
     Box::into_raw(Box::new(builder.fs_storage(path)))
 }
 
+/// Set filesystem isolation mode.
+/// `mode`: 0 = None, 1 = OverlayFs, 2 = BranchFs.
+///
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_fs_isolation(
+    b: *mut PolicyBuilder,
+    mode: u8,
+) -> *mut PolicyBuilder {
+    if b.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    let iso = match mode {
+        1 => sandlock_core::policy::FsIsolation::OverlayFs,
+        2 => sandlock_core::policy::FsIsolation::BranchFs,
+        _ => sandlock_core::policy::FsIsolation::None,
+    };
+    Box::into_raw(Box::new(builder.fs_isolation(iso)))
+}
+
+/// # Safety
+/// `b` must be a valid pointer. `devices` must point to `len` u32 values (or be null when len == 0).
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_gpu_devices(
+    b: *mut PolicyBuilder, devices: *const u32, len: u32,
+) -> *mut PolicyBuilder {
+    if b.is_null() || (len > 0 && devices.is_null()) { return b; }
+    let slice = if len > 0 {
+        std::slice::from_raw_parts(devices, len as usize)
+    } else {
+        &[]
+    };
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.gpu_devices(slice.to_vec())))
+}
+
 /// # Safety
 /// `b` and `path` must be valid pointers.
 #[no_mangle]
