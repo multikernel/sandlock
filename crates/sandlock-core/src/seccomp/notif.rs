@@ -448,10 +448,12 @@ fn send_response(fd: RawFd, id: u64, action: NotifAction) -> io::Result<()> {
             // SECCOMP_ADDFD_FLAG_SEND atomically injects the fd and responds.
             // No separate NOTIF_SEND needed after this.
             // Fall back to Continue if ADDFD_SEND fails (e.g., old kernel).
-            match inject_fd_and_send(fd, id, srcfd) {
+            let result = match inject_fd_and_send(fd, id, srcfd) {
                 Ok(_new_fd) => Ok(()),
                 Err(_) => respond_continue(fd, id),
-            }
+            };
+            unsafe { libc::close(srcfd) };
+            result
         }
         NotifAction::ReturnValue(val) => respond_value(fd, id, val),
         NotifAction::Hold => Ok(()), // Don't send a response.
