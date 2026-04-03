@@ -508,22 +508,13 @@ fn validate_fs_only(
 }
 
 /// Execute a command with Landlock-only confinement (no seccomp/supervisor).
-/// Sets PR_SET_NO_NEW_PRIVS, applies Landlock rules, handles env, then execs.
+/// Applies filesystem confinement via confine_current_process, handles env, then execs.
 fn fs_only_exec(policy: &Policy, cmd: &[&str]) -> Result<()> {
     use std::ffi::CString;
 
-    // 1. Set PR_SET_NO_NEW_PRIVS so Landlock can be enforced
-    let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
-    if ret != 0 {
-        return Err(anyhow!(
-            "prctl(PR_SET_NO_NEW_PRIVS) failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-
-    // 2. Apply Landlock confinement
-    sandlock_core::landlock::confine(policy)
-        .map_err(|e| anyhow!("landlock confinement failed: {}", e))?;
+    // 1. Apply Landlock confinement (sets NO_NEW_PRIVS + Landlock rules)
+    sandlock_core::confine_current_process(policy)
+        .map_err(|e| anyhow!("filesystem confinement failed: {}", e))?;
 
     // 3. Apply environment settings
     if policy.clean_env {

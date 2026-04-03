@@ -470,6 +470,27 @@ pub unsafe extern "C" fn sandlock_policy_free(p: *mut sandlock_policy_t) {
 }
 
 // ----------------------------------------------------------------
+// Confine current process
+// ----------------------------------------------------------------
+
+/// Confine the calling process with Landlock filesystem rules.
+/// This is irreversible. Returns 0 on success, -1 on error.
+///
+/// # Safety
+/// `policy` must be a valid policy pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_confine(
+    policy: *const sandlock_policy_t,
+) -> c_int {
+    if policy.is_null() { return -1; }
+    let policy = &(*policy)._private;
+    match sandlock_core::confine_current_process(policy) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+// ----------------------------------------------------------------
 // Run
 // ----------------------------------------------------------------
 

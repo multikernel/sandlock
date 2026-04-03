@@ -150,6 +150,10 @@ _lib.sandlock_landlock_abi_version.argtypes = []
 _lib.sandlock_min_landlock_abi.restype = ctypes.c_int
 _lib.sandlock_min_landlock_abi.argtypes = []
 
+# Confine current process
+_lib.sandlock_confine.restype = ctypes.c_int
+_lib.sandlock_confine.argtypes = [ctypes.c_void_p]
+
 
 def landlock_abi_version() -> int:
     """Return the Landlock ABI version supported by the running kernel.
@@ -162,6 +166,30 @@ def landlock_abi_version() -> int:
 def min_landlock_abi() -> int:
     """Return the minimum Landlock ABI version required by sandlock."""
     return _lib.sandlock_min_landlock_abi()
+
+
+def confine(policy: "PolicyDataclass") -> None:
+    """Confine the calling process with Landlock filesystem restrictions.
+
+    Applies PR_SET_NO_NEW_PRIVS and Landlock rules from the policy's
+    fs_readable, fs_writable, and fs_denied fields. The confinement is
+    **irreversible**.
+
+    Only filesystem rules are used. All other policy fields are ignored.
+
+    This does NOT fork or exec — it confines the current process in-place.
+
+    Args:
+        policy: Policy with filesystem rules to apply.
+
+    Raises:
+        SandlockError: If confinement fails.
+    """
+    native = _NativePolicy.from_dataclass(policy)
+    ret = _lib.sandlock_confine(native.ptr)
+    if ret != 0:
+        from .exceptions import ConfinementError
+        raise ConfinementError("confine_current_process failed")
 
 
 _lib.sandlock_policy_build.restype = _c_policy_p

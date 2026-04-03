@@ -8,7 +8,7 @@ without root or namespaces.
 from ._version import __version__
 from ._sdk import (
     Sandbox, Stage, Pipeline, Result, SyscallEvent, PolicyContext, Checkpoint,
-    landlock_abi_version, min_landlock_abi,
+    landlock_abi_version, min_landlock_abi, confine,
 )
 from .policy import Policy, FsIsolation, BranchAction, parse_ports, Change, DryRunResult
 from ._profile import load_profile, list_profiles
@@ -46,6 +46,7 @@ __all__ = [
     # Platform
     "landlock_abi_version",
     "min_landlock_abi",
+    "confine",
     # Profiles
     "load_profile",
     "list_profiles",
