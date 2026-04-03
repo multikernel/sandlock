@@ -123,12 +123,19 @@ sandlock run --dry-run --workdir . -w . -r /usr -r /lib -r /bin -r /etc -- make 
 
 # Use a saved profile
 sandlock run -p build -- make -j4
+
+# Filesystem-only confinement (Landlock only, no seccomp/supervisor)
+sandlock run --fs-only -r /usr -r /lib -r /lib64 -r /bin -w /tmp -- ./script.sh
+
+# Nested sandboxing: confine sandlock's own supervisor
+sandlock run --fs-only -r /proc -r /usr -r /lib -r /lib64 -r /bin -r /etc -w /tmp -- \
+  sandlock run -r /usr -w /tmp -- untrusted-command
 ```
 
 ### Python API
 
 ```python
-from sandlock import Sandbox, Policy
+from sandlock import Sandbox, Policy, confine
 
 policy = Policy(
     fs_writable=["/tmp/sandbox"],
@@ -143,6 +150,9 @@ policy = Policy(
 result = Sandbox(policy).run(["python3", "-c", "print('hello')"])
 assert result.success
 assert b"hello" in result.stdout
+
+# Confine the current process (Landlock filesystem only, irreversible)
+confine(Policy(fs_readable=["/usr", "/lib"], fs_writable=["/tmp"]))
 
 # Dry-run: see what files would change, then discard
 policy = Policy(fs_writable=["."], workdir=".", fs_readable=["/usr", "/lib", "/bin", "/etc"])
@@ -238,7 +248,7 @@ positive int = deny with errno, `"audit"`/`-2` = allow + flag.
 ### Rust API
 
 ```rust
-use sandlock_core::{Policy, Sandbox, Pipeline, Stage};
+use sandlock_core::{Policy, Sandbox, Pipeline, Stage, confine_current_process};
 
 // Basic run
 let policy = Policy::builder()
@@ -248,6 +258,13 @@ let policy = Policy::builder()
     .build()?;
 let result = Sandbox::run(&policy, &["echo", "hello"]).await?;
 assert!(result.success());
+
+// Confine the current process (Landlock filesystem only, irreversible)
+let policy = Policy::builder()
+    .fs_read("/usr").fs_read("/lib")
+    .fs_write("/tmp")
+    .build()?;
+confine_current_process(&policy)?;
 
 // Pipeline
 let result = (
@@ -305,7 +322,7 @@ Parent                              Child
   │  fork()                           │
   │──────────────────────────────────>│
   │                                   ├─ 1. setpgid(0,0)
-  │                                   ├─ 2. Optional: chdir(workdir)
+  │                                   ├─ 2. Optional: chdir(cwd)
   │                                   ├─ 3. NO_NEW_PRIVS
   │                                   ├─ 4. Landlock (fs + net + IPC)
   │                                   ├─ 5. seccomp filter (deny + notif)
@@ -479,7 +496,8 @@ Policy(
     env={"KEY": "value"},          # Override env vars
 
     # COW isolation
-    workdir=None,                  # Working directory + COW
+    workdir=None,                  # COW root directory
+    cwd=None,                      # Child working directory
     fs_isolation=FsIsolation.NONE, # NONE | OVERLAYFS | BRANCHFS
     on_exit=BranchAction.COMMIT,   # COMMIT | ABORT | KEEP
     on_error=BranchAction.ABORT,
