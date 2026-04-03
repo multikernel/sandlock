@@ -20,22 +20,24 @@ if TYPE_CHECKING:
 
 def _find_lib() -> str:
     """Find libsandlock_ffi.so."""
-    # 1. Next to this file (installed via pip/setuptools-rust)
     pkg_dir = Path(__file__).parent
-    # Check for cpython-tagged .so first (setuptools-rust), then plain name
-    for candidate in sorted(pkg_dir.glob("libsandlock_ffi*.so"), reverse=True):
-        return str(candidate.resolve())
-    # Dev build location
+
+    # 1. Dev build from cargo — preferred during development so
+    #    `cargo build --release` is all that's needed (no manual copy).
     dev_lib = pkg_dir / ".." / ".." / ".." / "target" / "release" / "libsandlock_ffi.so"
     if dev_lib.exists():
         return str(dev_lib.resolve())
 
-    # 2. System library path
+    # 2. Next to this file (installed via pip/setuptools-rust)
+    for candidate in sorted(pkg_dir.glob("libsandlock_ffi*.so"), reverse=True):
+        return str(candidate.resolve())
+
+    # 3. System library path
     found = ctypes.util.find_library("sandlock_ffi")
     if found:
         return found
 
-    # 3. LD_LIBRARY_PATH
+    # 4. LD_LIBRARY_PATH
     for d in os.environ.get("LD_LIBRARY_PATH", "").split(":"):
         p = os.path.join(d, "libsandlock_ffi.so")
         if os.path.isfile(p):
