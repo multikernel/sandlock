@@ -5,7 +5,7 @@ pub(crate) mod dispatch;
 
 use crate::dry_run::Change;
 use crate::error::BranchError;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Mount configuration that the child process needs to set up its COW view.
 /// Backends that don't need a mount in the child (e.g. seccomp, branchfs)
@@ -24,9 +24,6 @@ pub(crate) struct ChildMountConfig {
 
 /// Common interface for COW filesystem backends.
 pub(crate) trait CowBranch: Send + Sync {
-    /// Path to the branch's working directory (what the sandbox sees).
-    fn branch_path(&self) -> &Path;
-
     /// Returns the mount configuration the child process needs, if any.
     /// `None` means no mount setup is needed (the backend handles isolation
     /// via other mechanisms like seccomp interception or kernel ioctls).

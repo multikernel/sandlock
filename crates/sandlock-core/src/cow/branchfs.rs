@@ -11,7 +11,6 @@ const FS_IOC_BRANCH_ABORT: libc::c_ulong = 0x00006202;
 
 pub(crate) struct BranchFsBranch {
     ctl_path: PathBuf,
-    branch_path: PathBuf,
 }
 
 impl BranchFsBranch {
@@ -42,7 +41,6 @@ impl BranchFsBranch {
 
         Ok(Self {
             ctl_path: branch_ctl,
-            branch_path,
         })
     }
 
@@ -63,10 +61,6 @@ impl BranchFsBranch {
 }
 
 impl CowBranch for BranchFsBranch {
-    fn branch_path(&self) -> &Path {
-        &self.branch_path
-    }
-
     fn commit(&self) -> Result<(), BranchError> {
         self.ctl_ioctl(FS_IOC_BRANCH_COMMIT)
     }

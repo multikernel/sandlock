@@ -35,10 +35,6 @@ impl OverlayBranch {
 }
 
 impl CowBranch for OverlayBranch {
-    fn branch_path(&self) -> &Path {
-        &self.merged
-    }
-
     fn child_mount_config(&self) -> Option<super::ChildMountConfig> {
         Some(super::ChildMountConfig {
             mount_point: self.base_dir.clone(),

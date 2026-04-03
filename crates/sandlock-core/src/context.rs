@@ -4,7 +4,6 @@
 use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::path::PathBuf;
 
 use crate::policy::{FsIsolation, Policy};
 use crate::seccomp::bpf::{self, stmt, jump};
