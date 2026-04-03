@@ -141,7 +141,6 @@ class TestLegacyAccess:
 # ── SYS_readlink (nr 89) ────────────────────────────────────────
 
 class TestLegacyReadlink:
-    @pytest.mark.xfail(reason="handle_chroot_readlink resolves symlinks before readlink — pre-existing bug")
     def test_readlink(self, rootfs):
         # Create a symlink inside chroot
         link = rootfs / "work" / "mylink"

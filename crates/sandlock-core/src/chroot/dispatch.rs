@@ -719,10 +719,41 @@ pub(crate) async fn handle_chroot_readlink(
         return NotifAction::Continue;
     }
 
-    let (host_path, _) = match resolve_chroot_path(notif, dirfd, &path, ctx.root) {
+    // Resolve the path WITHOUT following the final symlink.  readlink
+    // must read the link itself, not its target.  We resolve the parent
+    // directory (following intermediate symlinks) and append the filename.
+    let full_path = if Path::new(&path).is_absolute() {
+        path.clone()
+    } else {
+        let dirfd32 = dirfd as i32;
+        let base_host = if dirfd32 == libc::AT_FDCWD {
+            match std::fs::read_link(format!("/proc/{}/cwd", notif.pid)) {
+                Ok(p) => p,
+                Err(_) => return NotifAction::Errno(libc::EACCES),
+            }
+        } else {
+            match std::fs::read_link(format!("/proc/{}/fd/{}", notif.pid, dirfd)) {
+                Ok(p) => p,
+                Err(_) => return NotifAction::Errno(libc::EACCES),
+            }
+        };
+        let base_virtual = match to_virtual_path(ctx.root, &base_host) {
+            Some(p) => p,
+            None => return NotifAction::Errno(libc::EACCES),
+        };
+        base_virtual.join(&path).to_string_lossy().to_string()
+    };
+    let confined = crate::chroot::resolve::confine(&full_path);
+    let file_name = match confined.file_name() {
+        Some(f) => f.to_os_string(),
+        None => return NotifAction::Errno(libc::EINVAL),
+    };
+    let parent = confined.parent().unwrap_or(Path::new("/"));
+    let (parent_host, _) = match resolve_in_root(ctx.root, parent.to_str().unwrap_or("/")) {
         Some(r) => r,
         None => return NotifAction::Errno(libc::EACCES),
     };
+    let host_path = parent_host.join(&file_name);
 
     // COW
     {
