@@ -1,3 +1,3 @@
 # SPDX-License-Identifier: Apache-2.0
 # Keep in sync with /Cargo.toml
-__version__ = "0.4.4"
+__version__ = "0.4.5"
