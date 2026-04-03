@@ -115,6 +115,7 @@ pub struct Policy {
     // Filesystem branch
     pub fs_isolation: FsIsolation,
     pub workdir: Option<PathBuf>,
+    pub cwd: Option<PathBuf>,
     pub fs_storage: Option<PathBuf>,
     pub max_disk: Option<ByteSize>,
     pub on_exit: BranchAction,
@@ -194,6 +195,7 @@ pub struct PolicyBuilder {
 
     fs_isolation: Option<FsIsolation>,
     workdir: Option<PathBuf>,
+    cwd: Option<PathBuf>,
     fs_storage: Option<PathBuf>,
     max_disk: Option<ByteSize>,
     on_exit: Option<BranchAction>,
@@ -340,6 +342,11 @@ impl PolicyBuilder {
         self
     }
 
+    pub fn cwd(mut self, path: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(path.into());
+        self
+    }
+
     pub fn fs_storage(mut self, path: impl Into<PathBuf>) -> Self {
         self.fs_storage = Some(path.into());
         self
@@ -458,6 +465,7 @@ impl PolicyBuilder {
             hostname: self.hostname,
             fs_isolation,
             workdir: self.workdir,
+            cwd: self.cwd,
             fs_storage: self.fs_storage,
             max_disk: self.max_disk,
             on_exit: self.on_exit.unwrap_or_default(),

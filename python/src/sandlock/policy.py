@@ -292,9 +292,12 @@ class Policy:
 
     # Working directory
     workdir: str | None = None
-    """Working directory for the sandbox.  The child chdir's here before
-    running.  Automatically enables OverlayFS COW protection — writes are
-    captured in a COW layer and committed on success, aborted on error."""
+    """COW root directory.  Only controls which directory COW tracks —
+    does NOT set the child's working directory.  Use ``cwd`` for that."""
+
+    cwd: str | None = None
+    """Child working directory (chdir target).  The child process starts
+    in this directory.  Independent of ``workdir`` (COW root)."""
 
     # COW filesystem isolation
     fs_isolation: FsIsolation = FsIsolation.NONE

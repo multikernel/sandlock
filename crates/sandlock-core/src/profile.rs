@@ -96,6 +96,12 @@ pub fn parse_profile(content: &str) -> Result<Policy, SandlockError> {
     if let Some(v) = sandbox.get("hostname").and_then(|v| v.as_str()) {
         builder = builder.hostname(v);
     }
+    if let Some(v) = sandbox.get("workdir").and_then(|v| v.as_str()) {
+        builder = builder.workdir(v);
+    }
+    if let Some(v) = sandbox.get("cwd").and_then(|v| v.as_str()) {
+        builder = builder.cwd(v);
+    }
     // Parse port arrays
     if let Some(ports) = sandbox.get("net_bind").and_then(|v| v.as_array()) {
         for p in ports { if let Some(n) = p.as_integer() { builder = builder.net_bind_port(n as u16); } }

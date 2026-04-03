@@ -72,6 +72,7 @@ _b_fs_read = _builder_fn("sandlock_policy_builder_fs_read", ctypes.c_char_p)
 _b_fs_write = _builder_fn("sandlock_policy_builder_fs_write", ctypes.c_char_p)
 _b_fs_deny = _builder_fn("sandlock_policy_builder_fs_deny", ctypes.c_char_p)
 _b_workdir = _builder_fn("sandlock_policy_builder_workdir", ctypes.c_char_p)
+_b_cwd = _builder_fn("sandlock_policy_builder_cwd", ctypes.c_char_p)
 _b_chroot = _builder_fn("sandlock_policy_builder_chroot", ctypes.c_char_p)
 _b_max_memory = _builder_fn("sandlock_policy_builder_max_memory", ctypes.c_uint64)
 _b_max_processes = _builder_fn("sandlock_policy_builder_max_processes", ctypes.c_uint32)
@@ -670,6 +671,8 @@ class _NativePolicy:
 
         if policy.workdir:
             b = _b_workdir(b, _encode(str(policy.workdir)))
+        if policy.cwd:
+            b = _b_cwd(b, _encode(str(policy.cwd)))
         if policy.chroot:
             b = _b_chroot(b, _encode(str(policy.chroot)))
 

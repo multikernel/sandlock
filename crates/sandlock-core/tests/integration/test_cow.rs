@@ -195,11 +195,12 @@ async fn test_seccomp_cow_relative_path_abort() {
         .fs_read("/proc").fs_read("/dev")
         .fs_write(&workdir)
         .workdir(&workdir)
+        .cwd(&workdir)
         .on_exit(BranchAction::Abort)
         .build()
         .unwrap();
 
-    // Use relative paths (triggers AT_FDCWD in openat) — the child's cwd is workdir.
+    // Use relative paths (triggers AT_FDCWD in openat) — the child's cwd is set via .cwd().
     let result = Sandbox::run(&policy, &[
         "sh", "-c", "echo MUTATED >> orig.txt; echo leak > leaked.txt"
     ]).await;
@@ -229,6 +230,7 @@ async fn test_seccomp_cow_relative_path_commit() {
         .fs_read("/proc").fs_read("/dev")
         .fs_write(&workdir)
         .workdir(&workdir)
+        .cwd(&workdir)
         .on_exit(BranchAction::Commit)
         .build()
         .unwrap();

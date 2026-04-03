@@ -696,25 +696,24 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
     }
 
     // 6. Optional: change working directory
-    // When chroot is set, default to the chroot root if no workdir specified
-    let effective_workdir = if let Some(ref workdir) = policy.workdir {
+    // cwd controls where the child starts; workdir is only for COW
+    let effective_cwd = if let Some(ref cwd) = policy.cwd {
         if let Some(ref chroot_root) = policy.chroot {
-            // Workdir is virtual (child-visible), translate to host path
-            Some(chroot_root.join(workdir.strip_prefix("/").unwrap_or(workdir)))
+            Some(chroot_root.join(cwd.strip_prefix("/").unwrap_or(cwd)))
         } else {
-            Some(workdir.clone())
+            Some(cwd.clone())
         }
     } else if let Some(ref chroot_root) = policy.chroot {
         // Default to chroot root
-        Some(chroot_root.clone())
+        Some(chroot_root.to_path_buf())
     } else {
         None
     };
 
-    if let Some(ref workdir) = effective_workdir {
-        let c_path = match CString::new(workdir.as_os_str().as_encoded_bytes()) {
-            Ok(p) => p,
-            Err(_) => fail!("invalid workdir path"),
+    if let Some(ref cwd) = effective_cwd {
+        let c_path = match CString::new(cwd.as_os_str().as_encoded_bytes()) {
+            Ok(c) => c,
+            Err(_) => fail!("invalid cwd path"),
         };
         if unsafe { libc::chdir(c_path.as_ptr()) } != 0 {
             fail!("chdir");
