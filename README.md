@@ -505,6 +505,6 @@ Policy(
     # Misc
     chroot=None,
     close_fds=True,
-    privileged=False,              # UID 0 in user namespace
+    uid=None,                      # Map to given UID in user namespace (e.g. 0 for fake root)
 )
 ```

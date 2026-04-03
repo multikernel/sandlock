@@ -28,9 +28,9 @@ fn userns_available() -> bool {
     libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
 }
 
-/// Test that privileged mode makes the child appear as uid 0.
+/// Test that --uid 0 makes the child appear as uid 0.
 #[tokio::test]
-async fn test_privileged_uid_zero() {
+async fn test_uid_zero() {
     if !userns_available() {
         eprintln!("Skipping: user namespaces not available in this environment");
         return;
@@ -43,7 +43,7 @@ async fn test_privileged_uid_zero() {
         .fs_read("/bin")
         .fs_read("/etc")
         .fs_read("/proc")
-        .privileged(true)
+        .uid(0)
         .build()
         .unwrap();
 
@@ -53,9 +53,9 @@ async fn test_privileged_uid_zero() {
     assert_eq!(stdout.trim(), "0", "Expected uid 0, got: {:?}", stdout.trim());
 }
 
-/// Test that privileged mode makes the child appear as gid 0.
+/// Test that --uid 0 makes the child appear as gid 0.
 #[tokio::test]
-async fn test_privileged_gid_zero() {
+async fn test_uid_zero_gid_zero() {
     if !userns_available() {
         eprintln!("Skipping: user namespaces not available in this environment");
         return;
@@ -68,7 +68,7 @@ async fn test_privileged_gid_zero() {
         .fs_read("/bin")
         .fs_read("/etc")
         .fs_read("/proc")
-        .privileged(true)
+        .uid(0)
         .build()
         .unwrap();
 
@@ -78,9 +78,9 @@ async fn test_privileged_gid_zero() {
     assert_eq!(stdout.trim(), "0", "Expected gid 0, got: {:?}", stdout.trim());
 }
 
-/// Test that without privileged, uid is NOT 0 (assuming tests don't run as root).
+/// Test that without --uid, uid is NOT 0 (assuming tests don't run as root).
 #[tokio::test]
-async fn test_unprivileged_uid_nonzero() {
+async fn test_no_uid_keeps_real_uid() {
     let policy = Policy::builder()
         .fs_read("/usr")
         .fs_read("/lib")
@@ -96,20 +96,20 @@ async fn test_unprivileged_uid_nonzero() {
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     // If running as root already, skip this check
     if unsafe { libc::getuid() } != 0 {
-        assert_ne!(stdout.trim(), "0", "Without privileged, uid should not be 0");
+        assert_ne!(stdout.trim(), "0", "Without --uid, uid should not be 0");
     }
 }
 
-/// Test that privileged mode doesn't break basic command execution.
+/// Test that --uid 0 doesn't break basic command execution.
 #[tokio::test]
-async fn test_privileged_echo() {
+async fn test_uid_zero_echo() {
     let policy = Policy::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read("/lib64")
         .fs_read("/bin")
         .fs_read("/etc")
-        .privileged(true)
+        .uid(0)
         .build()
         .unwrap();
 
@@ -117,4 +117,29 @@ async fn test_privileged_echo() {
     assert!(result.success());
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     assert_eq!(stdout.trim(), "hello");
+}
+
+/// Test that --uid 1000 maps to the expected UID inside the namespace.
+#[tokio::test]
+async fn test_uid_custom() {
+    if !userns_available() {
+        eprintln!("Skipping: user namespaces not available in this environment");
+        return;
+    }
+
+    let policy = Policy::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .uid(1000)
+        .build()
+        .unwrap();
+
+    let result = Sandbox::run(&policy, &["id", "-u"]).await.unwrap();
+    assert!(result.success(), "id -u failed: {:?}", result.exit_status);
+    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
+    assert_eq!(stdout.trim(), "1000", "Expected uid 1000, got: {:?}", stdout.trim());
 }

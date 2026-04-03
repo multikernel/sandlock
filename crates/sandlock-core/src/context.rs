@@ -557,18 +557,19 @@ pub(crate) use crate::cow::ChildMountConfig;
 /// Write uid/gid maps for an unprivileged user namespace.
 /// `real_uid`/`real_gid` must be captured *before* unshare(CLONE_NEWUSER),
 /// since getuid()/getgid() return the overflow id (65534) after unshare.
-fn write_id_maps(real_uid: u32, real_gid: u32) {
-    let _ = std::fs::write("/proc/self/uid_map", format!("0 {} 1\n", real_uid));
+/// `target_uid`/`target_gid` are the UIDs visible inside the namespace.
+fn write_id_maps(real_uid: u32, real_gid: u32, target_uid: u32, target_gid: u32) {
+    let _ = std::fs::write("/proc/self/uid_map", format!("{} {} 1\n", target_uid, real_uid));
     let _ = std::fs::write("/proc/self/setgroups", "deny\n");
-    let _ = std::fs::write("/proc/self/gid_map", format!("0 {} 1\n", real_gid));
+    let _ = std::fs::write("/proc/self/gid_map", format!("{} {} 1\n", target_gid, real_gid));
 }
 
 /// Write uid/gid maps using the post-unshare overflow uid (65534).
-/// Used by the OverlayFS COW path which relies on this specific mapping.
+/// Used by the OverlayFS COW path which maps to root (UID 0) inside.
 fn write_id_maps_overflow() {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
-    write_id_maps(uid, gid);
+    write_id_maps(uid, gid, 0, 0);
 }
 
 // ============================================================
@@ -676,12 +677,15 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
     let real_uid = unsafe { libc::getuid() };
     let real_gid = unsafe { libc::getgid() };
 
-    // 5b. User namespace for privileged mode (fake root) or OverlayFS COW
-    if policy.privileged && cow_config.is_none() {
-        if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
-            fail!("unshare(CLONE_NEWUSER)");
+    // 5b. User namespace for --uid mapping (when not using OverlayFS COW,
+    //     which sets up its own user namespace)
+    if let Some(target_uid) = policy.uid {
+        if cow_config.is_none() {
+            if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
+                fail!("unshare(CLONE_NEWUSER)");
+            }
+            write_id_maps(real_uid, real_gid, target_uid, target_uid);
         }
-        write_id_maps(real_uid, real_gid);
     }
 
     // 5c. User + mount namespace for OverlayFS COW (includes CLONE_NEWUSER)

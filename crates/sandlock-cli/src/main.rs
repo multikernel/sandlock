@@ -54,8 +54,9 @@ enum Command {
         max_open_files: Option<u32>,
         #[arg(long)]
         chroot: Option<String>,
+        /// Map to the given UID inside a user namespace (e.g. --uid 0 for fake root)
         #[arg(long)]
-        privileged: bool,
+        uid: Option<u32>,
         #[arg(long)]
         workdir: Option<String>,
         #[arg(long)]
@@ -142,7 +143,7 @@ async fn main() -> Result<()> {
         Command::Run { fs_read, fs_write, max_memory, max_processes, timeout,
             net_allow_host, net_bind, net_connect, time_start, random_seed,
             isolate_ipc, isolate_signals, clean_env, num_cpus, profile: profile_name, status_fd,
-            max_cpu, max_open_files, chroot, privileged, workdir, cwd,
+            max_cpu, max_open_files, chroot, uid, workdir, cwd,
             fs_isolation, fs_storage, max_disk, net_allow, net_deny,
             port_remap, no_randomize_memory, no_huge_pages, deterministic_dirs, hostname, no_coredump,
             env_vars, exec_shell, interactive: _, fs_deny, cpu_cores, gpu_devices, image, dry_run, no_supervisor, cmd } =>
@@ -154,7 +155,7 @@ async fn main() -> Result<()> {
                     &net_allow, &net_deny,
                     &num_cpus, &random_seed, &time_start, no_randomize_memory,
                     no_huge_pages, deterministic_dirs, &hostname, &chroot,
-                    &image, privileged, &workdir, &cwd, &fs_isolation, &fs_storage,
+                    &image, &uid, &workdir, &cwd, &fs_isolation, &fs_storage,
                     &max_disk, port_remap, &cpu_cores, &gpu_devices, dry_run,
                     &status_fd,
                 )?;
@@ -247,7 +248,7 @@ async fn main() -> Result<()> {
             if let Some(n) = max_open_files { builder = builder.max_open_files(n); }
             for p in &fs_deny { builder = builder.fs_deny(p); }
             if let Some(ref path) = chroot { builder = builder.chroot(path); }
-            if privileged { builder = builder.privileged(true); }
+            if let Some(id) = uid { builder = builder.uid(id); }
             if let Some(ref path) = workdir { builder = builder.workdir(path); }
             if let Some(ref path) = cwd { builder = builder.cwd(path); }
             if let Some(ref mode) = fs_isolation {
@@ -455,7 +456,7 @@ fn validate_no_supervisor(
     hostname: &Option<String>,
     chroot: &Option<String>,
     image: &Option<String>,
-    privileged: bool,
+    uid: &Option<u32>,
     workdir: &Option<String>,
     cwd: &Option<String>,
     fs_isolation: &Option<String>,
@@ -488,7 +489,7 @@ fn validate_no_supervisor(
     if hostname.is_some() { bad.push("--hostname"); }
     if chroot.is_some() { bad.push("--chroot"); }
     if image.is_some() { bad.push("--image"); }
-    if privileged { bad.push("--privileged"); }
+    if uid.is_some() { bad.push("--uid"); }
     if workdir.is_some() { bad.push("--workdir"); }
     if cwd.is_some() { bad.push("--cwd"); }
     if fs_isolation.is_some() { bad.push("--fs-isolation"); }

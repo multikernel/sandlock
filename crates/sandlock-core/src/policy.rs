@@ -136,8 +136,8 @@ pub struct Policy {
     pub num_cpus: Option<u32>,
     pub port_remap: bool,
 
-    // Mode flags
-    pub privileged: bool,
+    // User namespace
+    pub uid: Option<u32>,
 
     // Dynamic policy callback
     #[serde(skip)]
@@ -214,7 +214,7 @@ pub struct PolicyBuilder {
     num_cpus: Option<u32>,
     port_remap: bool,
 
-    privileged: bool,
+    uid: Option<u32>,
     policy_fn: Option<crate::policy_fn::PolicyCallback>,
 }
 
@@ -422,8 +422,8 @@ impl PolicyBuilder {
         self
     }
 
-    pub fn privileged(mut self, v: bool) -> Self {
-        self.privileged = v;
+    pub fn uid(mut self, id: u32) -> Self {
+        self.uid = Some(id);
         self
     }
 
@@ -486,7 +486,7 @@ impl PolicyBuilder {
             cpu_cores: self.cpu_cores,
             num_cpus: self.num_cpus,
             port_remap: self.port_remap,
-            privileged: self.privileged,
+            uid: self.uid,
             policy_fn: self.policy_fn,
         })
     }

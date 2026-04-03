@@ -93,7 +93,7 @@ _b_net_connect_port = _builder_fn("sandlock_policy_builder_net_connect_port", ct
 _b_port_remap = _builder_fn("sandlock_policy_builder_port_remap", ctypes.c_bool)
 _b_no_raw_sockets = _builder_fn("sandlock_policy_builder_no_raw_sockets", ctypes.c_bool)
 _b_no_udp = _builder_fn("sandlock_policy_builder_no_udp", ctypes.c_bool)
-_b_privileged = _builder_fn("sandlock_policy_builder_privileged", ctypes.c_bool)
+_b_uid = _builder_fn("sandlock_policy_builder_uid", ctypes.c_uint32)
 _b_isolate_ipc = _builder_fn("sandlock_policy_builder_isolate_ipc", ctypes.c_bool)
 _b_isolate_signals = _builder_fn("sandlock_policy_builder_isolate_signals", ctypes.c_bool)
 _b_random_seed = _builder_fn("sandlock_policy_builder_random_seed", ctypes.c_uint64)
@@ -676,7 +676,7 @@ class _NativePolicy:
         "cpu_cores", "gpu_devices",
         "net_allow_hosts", "net_bind", "net_connect",
         "port_remap", "no_raw_sockets", "no_udp",
-        "privileged", "isolate_ipc", "isolate_signals",
+        "uid", "isolate_ipc", "isolate_signals",
         "random_seed", "time_start", "clean_env", "close_fds", "env",
         "deny_syscalls", "allow_syscalls", "isolate_pids", "max_open_files",
         "no_randomize_memory", "no_huge_pages", "no_coredump", "deterministic_dirs", "hostname",
@@ -765,8 +765,8 @@ class _NativePolicy:
         if policy.no_udp:
             b = _b_no_udp(b, True)
 
-        if policy.privileged:
-            b = _b_privileged(b, True)
+        if policy.uid is not None:
+            b = _b_uid(b, policy.uid)
 
         if policy.isolate_ipc:
             b = _b_isolate_ipc(b, True)

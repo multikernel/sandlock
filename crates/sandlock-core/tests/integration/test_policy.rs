@@ -6,7 +6,7 @@ fn test_default_policy() {
     assert_eq!(policy.max_processes, 64);
     assert!(policy.no_raw_sockets);
     assert!(policy.close_fds);
-    assert!(!policy.privileged);
+    assert!(policy.uid.is_none());
     assert!(policy.fs_writable.is_empty());
     assert!(policy.fs_readable.is_empty());
 }

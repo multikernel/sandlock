@@ -359,12 +359,12 @@ pub unsafe extern "C" fn sandlock_policy_builder_no_udp(
 /// # Safety
 /// `b` must be a valid builder pointer.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_policy_builder_privileged(
-    b: *mut PolicyBuilder, v: bool,
+pub unsafe extern "C" fn sandlock_policy_builder_uid(
+    b: *mut PolicyBuilder, id: u32,
 ) -> *mut PolicyBuilder {
     if b.is_null() { return b; }
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.privileged(v)))
+    Box::into_raw(Box::new(builder.uid(id)))
 }
 
 // ----------------------------------------------------------------

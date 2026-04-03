@@ -124,7 +124,7 @@ Set one or neither, not both.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `privileged` | `bool` | `False` | Map UID 0 inside a user namespace |
+| `uid` | `int \| None` | `None` | Map to given UID inside a user namespace (e.g. `0` for fake root) |
 | `no_coredump` | `bool` | `False` | Disable core dumps |
 
 #### COW filesystem isolation

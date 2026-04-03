@@ -38,16 +38,16 @@ class TestPolicyFromDict:
         p = policy_from_dict({"env": {"FOO": "bar", "BAZ": "qux"}})
         assert p.env == {"FOO": "bar", "BAZ": "qux"}
 
-    def test_boolean_fields(self):
+    def test_boolean_and_uid_fields(self):
         p = policy_from_dict({
             "isolate_ipc": True,
             "isolate_signals": True,
-            "privileged": True,
+            "uid": 0,
             "close_fds": False,
         })
         assert p.isolate_ipc is True
         assert p.isolate_signals is True
-        assert p.privileged is True
+        assert p.uid == 0
         assert p.close_fds is False
 
     def test_net_ports(self):
@@ -122,8 +122,8 @@ class TestListProfiles:
         import sandlock._profile as mod
         monkeypatch.setattr(mod, "_PROFILES_DIR", tmp_path)
 
-        (tmp_path / "build.toml").write_text('privileged = true\n')
-        (tmp_path / "dev.toml").write_text('privileged = false\n')
+        (tmp_path / "build.toml").write_text('uid = 0\n')
+        (tmp_path / "dev.toml").write_text('close_fds = false\n')
         (tmp_path / "not-toml.txt").write_text('ignored')
 
         assert list_profiles() == ["build", "dev"]
@@ -142,10 +142,10 @@ class TestListProfiles:
 class TestMergeCliOverrides:
     def test_scalar_override(self):
         from sandlock._profile import merge_cli_overrides
-        base = Policy(max_memory="256M", privileged=True)
+        base = Policy(max_memory="256M", uid=0)
         result = merge_cli_overrides(base, {"max_memory": "1G"})
         assert result.max_memory == "1G"
-        assert result.privileged is True  # unchanged
+        assert result.uid == 0  # unchanged
 
     def test_list_append(self):
         from sandlock._profile import merge_cli_overrides

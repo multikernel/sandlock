@@ -278,10 +278,10 @@ class Policy:
     close_fds: bool = True
     """Close inherited file descriptors (3+) in the child."""
 
-    privileged: bool = False
-    """If True, map UID 0 (root) inside a user namespace.  The child
-    appears as root inside the namespace but has no real host privileges.
-    Useful for commands that expect ``uid == 0`` (e.g. ``apt install``).
+    uid: int | None = None
+    """Map to the given UID inside a user namespace.  For example,
+    ``uid=0`` gives fake root, ``uid=1000`` maps to UID 1000.
+    The child has no real host privileges regardless of the mapped UID.
     Only effective when user namespaces are available."""
 
     # Seccomp user notification (filesystem virtualization)

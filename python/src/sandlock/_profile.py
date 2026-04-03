@@ -62,7 +62,7 @@ _SIMPLE_FIELDS: dict[str, type] = {
     # Misc
     "port_remap": bool,
     "close_fds": bool,
-    "privileged": bool,
+    "uid": int,
     # Workdir
     "workdir": str,
     # COW isolation
