@@ -303,19 +303,19 @@ pub(crate) async fn handle_chroot_exec(
         None => return NotifAction::Errno(libc::EACCES),
     };
 
-    // Rewrite the child's path buffer to the host path (chroot_root + virtual_path).
-    // Landlock already allows access to the host path, so the kernel will execute
-    // it directly.  The path buffer is on the stack with room to spare
-    // (glibc/musl allocate PATH_MAX for path resolution).
-    let host_str = host_path.to_str().unwrap_or("");
-    let mut host_bytes = host_str.as_bytes().to_vec();
-    host_bytes.push(0); // NUL terminator
-
-    if write_child_mem(notif_fd, notif.id, notif.pid, path_ptr, &host_bytes).is_err() {
-        return NotifAction::Errno(libc::EFAULT);
-    }
-
-    NotifAction::Continue
+    // Open the binary in the supervisor (no Landlock restrictions), inject the
+    // fd into the child, and rewrite the path to /proc/self/fd/N.  This avoids
+    // buffer overflow (the host path is typically much longer than the virtual
+    // path) and lets the kernel load the ELF interpreter via the supervisor's
+    // open fd rather than the child's restricted Landlock domain.
+    inject_fd_and_rewrite_path(
+        notif,
+        notif_fd,
+        &host_path,
+        path_ptr,
+        libc::O_RDONLY | libc::O_CLOEXEC,
+        0, // no O_CLOEXEC on the child fd — must survive exec
+    )
 }
 
 // ============================================================

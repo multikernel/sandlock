@@ -800,7 +800,7 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
         // Empty list = all GPUs visible, don't set env vars
     }
 
-    // 14. execvp
+    // 14. exec
     debug_assert!(!cmd.is_empty(), "cmd must not be empty");
     let argv_ptrs: Vec<*const libc::c_char> = cmd
         .iter()
@@ -808,7 +808,25 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
         .chain(std::iter::once(std::ptr::null()))
         .collect();
 
-    unsafe { libc::execvp(argv_ptrs[0], argv_ptrs.as_ptr()) };
+    if policy.chroot.is_some() {
+        // With chroot the seccomp handler rewrites the filename to a host path
+        // (or /proc/self/fd/N).  Pass a separate PATH_MAX buffer as the `file`
+        // argument so the rewrite does not corrupt argv[0] — which must stay as
+        // the original command name (e.g. busybox uses argv[0] for applet
+        // detection).  execvp still handles PATH lookup for bare command names.
+        let mut exec_path = vec![0u8; libc::PATH_MAX as usize];
+        let orig = cmd[0].as_bytes_with_nul();
+        exec_path[..orig.len()].copy_from_slice(orig);
+
+        unsafe {
+            libc::execvp(
+                exec_path.as_ptr() as *const libc::c_char,
+                argv_ptrs.as_ptr(),
+            )
+        };
+    } else {
+        unsafe { libc::execvp(argv_ptrs[0], argv_ptrs.as_ptr()) };
+    }
 
     // If we get here, exec failed
     fail!(format!("execvp '{}'", cmd[0].to_string_lossy()));

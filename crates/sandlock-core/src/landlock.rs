@@ -231,6 +231,14 @@ pub fn confine(policy: &Policy) -> Result<(), SandlockError> {
     // When chroot is active, translate virtual paths (inside chroot) to host
     // paths by prepending the chroot root.  Skip paths that don't exist in
     // the rootfs.
+    //
+    // We also add the original (host) paths when chroot is active.  This is
+    // needed because the kernel's execve internally opens the ELF interpreter
+    // (e.g. /lib/ld-musl-x86_64.so.1) using the absolute path baked into the
+    // binary — that access goes straight to the host filesystem without any
+    // seccomp interception.  Adding the host paths to Landlock is safe: all
+    // userspace syscalls are still intercepted by seccomp and redirected
+    // through the chroot, so the child cannot directly access host files.
     let chroot_root = policy.chroot.as_deref();
     let fs_write_mask = write_access(abi);
     for path in &policy.fs_writable {
@@ -259,6 +267,16 @@ pub fn confine(policy: &Policy) -> Result<(), SandlockError> {
         add_path_rule(&ruleset_fd, rule_path, READ_ACCESS).map_err(|e| {
             SandlockError::Sandbox(crate::error::SandboxError::Confinement(e))
         })?;
+    }
+
+    // When chroot is active, also allow the original host paths so the kernel
+    // can load ELF interpreters and shared libraries during execve.
+    if chroot_root.is_some() {
+        for path in &policy.fs_readable {
+            if path.exists() {
+                let _ = add_path_rule(&ruleset_fd, path, READ_ACCESS);
+            }
+        }
     }
 
     // GPU device paths (when gpu_devices is set)
