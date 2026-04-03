@@ -101,6 +101,17 @@ class TestCowAbort:
         assert not (rootfs / "tmp" / "marker.txt").exists(), \
             f"[{backend}] file should not leak to rootfs with on_exit=abort"
 
+    def test_abort_cleans_storage(self, rootfs, backend):
+        """Abort must actually remove the upper dir, not just skip cleanup."""
+        storage = tempfile.mkdtemp()
+        p = _cow_policy(rootfs, on_exit="abort", fs_storage=storage, backend=backend)
+        r = Sandbox(p).run(["sh", "-c", "echo data > /tmp/data.txt"])
+        assert r.success, f"[{backend}] failed: {r.stderr}"
+        # The storage dir should be empty (UUID subdir removed by abort).
+        remaining = os.listdir(storage)
+        assert remaining == [], \
+            f"[{backend}] abort should clean up storage, but found: {remaining}"
+
     def test_abort_write_visible_during_run(self, rootfs, backend):
         """Writes should be visible to the child during execution."""
         p = _cow_policy(rootfs, on_exit="abort", backend=backend)
@@ -139,6 +150,23 @@ class TestCowCommit:
         assert (rootfs / "tmp" / "persist.txt").read_text().strip() == "persisted"
         # Clean up
         (rootfs / "tmp" / "persist.txt").unlink()
+
+    def test_commit_cleans_storage(self, rootfs, backend):
+        """Commit must copy to rootfs AND remove the upper dir afterward."""
+        storage = tempfile.mkdtemp()
+        p = _cow_policy(rootfs, on_exit="commit", fs_storage=storage, backend=backend)
+        r = Sandbox(p).run(["sh", "-c", "echo committed > /tmp/committed.txt"])
+        assert r.success, f"[{backend}] failed: {r.stderr}"
+        # File must be in rootfs (commit actually ran)
+        assert (rootfs / "tmp" / "committed.txt").exists(), \
+            f"[{backend}] commit should copy file to rootfs"
+        assert (rootfs / "tmp" / "committed.txt").read_text().strip() == "committed"
+        # Storage should be cleaned up after commit
+        remaining = os.listdir(storage)
+        assert remaining == [], \
+            f"[{backend}] commit should clean up storage, but found: {remaining}"
+        # Clean up rootfs
+        (rootfs / "tmp" / "committed.txt").unlink()
 
 
 # ---------------------------------------------------------------------------

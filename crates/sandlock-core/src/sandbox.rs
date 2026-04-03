@@ -79,6 +79,8 @@ pub struct Sandbox {
     _stderr_read: Option<OwnedFd>,
     /// COW filesystem branch (OverlayFS or BranchFS).
     cow_branch: Option<Box<dyn CowBranch>>,
+    /// Seccomp COW branch extracted from supervisor state after child exits.
+    seccomp_cow: Option<crate::cow::seccomp::SeccompCowBranch>,
     /// Shared supervisor state for freeze/thaw support.
     supervisor_state: Option<Arc<Mutex<SupervisorState>>>,
     /// Control pipe for fork commands (parent end).
@@ -133,6 +135,7 @@ impl Sandbox {
             _stdout_read: None,
             _stderr_read: None,
             cow_branch: None,
+            seccomp_cow: None,
             supervisor_state: None,
             ctrl_fd: None,
             stdout_pipe: None,
@@ -189,20 +192,12 @@ impl Sandbox {
 
     /// Collect changes from whichever COW branch exists.
     async fn collect_changes(&self) -> Vec<crate::dry_run::Change> {
-        // Check OverlayFS/BranchFS COW branch
         if let Some(ref branch) = self.cow_branch {
             return branch.changes().unwrap_or_default();
         }
-
-        // Check seccomp-based COW branch
-        if let Some(ref state) = self.supervisor_state {
-            if let Ok(st) = state.try_lock() {
-                if let Some(ref cow) = st.cow_branch {
-                    return cow.changes().unwrap_or_default();
-                }
-            }
+        if let Some(ref cow) = self.seccomp_cow {
+            return cow.changes().unwrap_or_default();
         }
-
         Vec::new()
     }
 
@@ -211,12 +206,8 @@ impl Sandbox {
         if let Some(branch) = self.cow_branch.take() {
             let _ = branch.abort();
         }
-        if let Some(ref state) = self.supervisor_state {
-            if let Ok(mut st) = state.try_lock() {
-                if let Some(ref mut cow) = st.cow_branch {
-                    let _ = cow.abort();
-                }
-            }
+        if let Some(ref mut cow) = self.seccomp_cow {
+            let _ = cow.abort();
         }
     }
 
@@ -449,6 +440,14 @@ impl Sandbox {
         }
         if let Some(h) = self.throttle_handle.take() {
             h.abort();
+        }
+
+        // Extract seccomp COW branch while we're still in async context
+        // (can properly .lock().await the tokio Mutex).  This avoids the
+        // try_lock() race in sync drop() that could skip cleanup entirely.
+        if let Some(ref state) = self.supervisor_state {
+            let mut st = state.lock().await;
+            self.seccomp_cow = st.cow_branch.take();
         }
 
         // Drain captured stdout/stderr if available
@@ -946,42 +945,33 @@ impl Drop for Sandbox {
             h.abort();
         }
 
-        // COW cleanup based on exit status
+        // COW cleanup based on exit status.
+        // Determine action once, then apply to whichever branch exists.
+        let is_error = matches!(
+            self.state,
+            SandboxState::Stopped(ref s) if !matches!(s, ExitStatus::Code(0))
+        );
+        let action = if is_error {
+            &self.policy.on_error
+        } else {
+            &self.policy.on_exit
+        };
+
+        // OverlayFS / BranchFS COW branch
         if let Some(ref branch) = self.cow_branch {
-            let is_error = matches!(
-                self.state,
-                SandboxState::Stopped(ref s) if !matches!(s, ExitStatus::Code(0))
-            );
-            let action = if is_error {
-                &self.policy.on_error
-            } else {
-                &self.policy.on_exit
-            };
             match action {
                 BranchAction::Commit => { let _ = branch.commit(); }
                 BranchAction::Abort => { let _ = branch.abort(); }
-                BranchAction::Keep => {} // leave COW layer in place
+                BranchAction::Keep => {}
             }
         }
 
-        // Seccomp-based COW cleanup
-        if let Some(ref state) = self.supervisor_state {
-            let Ok(mut st) = state.try_lock() else { return; };
-            if let Some(ref mut cow) = st.cow_branch {
-                let is_error = matches!(
-                    self.state,
-                    SandboxState::Stopped(ref s) if !matches!(s, ExitStatus::Code(0))
-                );
-                let action = if is_error {
-                    &self.policy.on_error
-                } else {
-                    &self.policy.on_exit
-                };
-                match action {
-                    BranchAction::Commit => { let _ = cow.commit(); }
-                    BranchAction::Abort => { let _ = cow.abort(); }
-                    BranchAction::Keep => {}
-                }
+        // Seccomp COW branch (extracted from supervisor state in wait())
+        if let Some(ref mut cow) = self.seccomp_cow {
+            match action {
+                BranchAction::Commit => { let _ = cow.commit(); }
+                BranchAction::Abort => { let _ = cow.abort(); }
+                BranchAction::Keep => {}
             }
         }
     }
