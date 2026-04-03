@@ -39,15 +39,14 @@ pub fn landlock_abi_version() -> Result<u32, error::ConfinementError> {
 /// Minimum Landlock ABI version required by sandlock.
 pub const MIN_LANDLOCK_ABI: u32 = landlock::MIN_ABI;
 
-/// Confine the calling process with Landlock filesystem restrictions.
+/// Confine the calling process with Landlock restrictions.
 ///
 /// This applies `PR_SET_NO_NEW_PRIVS` and Landlock rules from the policy's
-/// `fs_readable`, `fs_writable`, and `fs_denied` fields. The confinement is
-/// **irreversible** — once applied, the process cannot regain access to
-/// restricted paths.
+/// filesystem (`fs_readable`, `fs_writable`, `fs_denied`), IPC
+/// (`isolate_ipc`), and signal (`isolate_signals`) fields. The confinement
+/// is **irreversible**.
 ///
-/// Only filesystem rules from the policy are used. Network, seccomp, resource
-/// limits, and other policy fields are ignored.
+/// Network, seccomp, resource limits, and other policy fields are ignored.
 ///
 /// This does NOT fork or exec — it confines the current process in-place.
 pub fn confine_current_process(policy: &Policy) -> Result<(), SandlockError> {
@@ -63,6 +62,13 @@ pub fn confine_current_process(policy: &Policy) -> Result<(), SandlockError> {
         ));
     }
 
-    // Apply Landlock filesystem rules
-    landlock::confine(policy)
+    // Build a stripped policy with only Landlock-native fields that
+    // confine_current_process supports: filesystem + IPC + signals.
+    // Network port rules are excluded — they require the full sandbox.
+    let mut stripped = policy.clone();
+    stripped.net_bind.clear();
+    stripped.net_connect.clear();
+
+    // Apply Landlock rules
+    landlock::confine(&stripped)
 }

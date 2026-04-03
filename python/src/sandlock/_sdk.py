@@ -183,17 +183,16 @@ def confine(policy: "PolicyDataclass") -> None:
     """Confine the calling process with Landlock restrictions.
 
     Applies PR_SET_NO_NEW_PRIVS and Landlock rules from the policy's
-    filesystem, network port, IPC, and signal isolation fields.
-    The confinement is **irreversible**.
+    filesystem, IPC, and signal isolation fields. The confinement is
+    **irreversible**.
 
-    Only Landlock-enforced fields are used (filesystem paths, TCP port
-    restrictions, isolate_ipc, isolate_signals). Fields that require the
-    seccomp supervisor (e.g. max_memory, net_allow_hosts) are ignored.
+    Only filesystem paths, isolate_ipc, and isolate_signals are used.
+    Network, resource limits, and other policy fields are ignored.
 
     This does NOT fork or exec — it confines the current process in-place.
 
     Args:
-        policy: Policy with filesystem rules to apply.
+        policy: Policy with Landlock rules to apply.
 
     Raises:
         SandlockError: If confinement fails.
