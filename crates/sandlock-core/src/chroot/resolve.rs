@@ -1,3 +1,5 @@
+use std::ffi::CString;
+use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 
 /// Collapse `..` components clamping at `/` (pivot_root semantics).
@@ -110,6 +112,154 @@ pub fn resolve_full(chroot_root: &Path, child_path: &str) -> Option<PathBuf> {
     }
 
     Some(current)
+}
+
+// ============================================================
+// openat2(RESOLVE_IN_ROOT) based resolution
+// ============================================================
+
+/// openat2 syscall number (same on x86_64 and aarch64).
+const SYS_OPENAT2: libc::c_long = 437;
+
+/// RESOLVE_IN_ROOT — treat the dirfd as the filesystem root for resolution.
+const RESOLVE_IN_ROOT: u64 = 0x10;
+
+/// Kernel `struct open_how` for openat2().
+#[repr(C)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
+fn last_errno(fallback: i32) -> i32 {
+    std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(fallback)
+}
+
+/// Open a path confined within `chroot_root` using `openat2(RESOLVE_IN_ROOT)`.
+///
+/// The kernel handles symlink resolution, `..` traversal, and prevents
+/// escapes above the root — eliminating TOCTOU races and edge cases
+/// inherent in userspace path walking.
+pub fn openat2_in_root(
+    chroot_root: &Path,
+    path: &str,
+    flags: i32,
+    mode: u32,
+) -> Result<RawFd, i32> {
+    let c_root =
+        CString::new(chroot_root.to_str().unwrap_or("")).map_err(|_| libc::EINVAL)?;
+    let root_fd = unsafe {
+        libc::open(
+            c_root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        return Err(last_errno(libc::EIO));
+    }
+
+    let rel_path = path.strip_prefix('/').unwrap_or(path);
+    // Empty path means the root itself — use "."
+    let rel_path = if rel_path.is_empty() { "." } else { rel_path };
+    let c_path = CString::new(rel_path).map_err(|_| {
+        unsafe { libc::close(root_fd) };
+        libc::EINVAL
+    })?;
+
+    let how = OpenHow {
+        flags: flags as u64,
+        mode: mode as u64,
+        resolve: RESOLVE_IN_ROOT,
+    };
+
+    let fd = unsafe {
+        libc::syscall(
+            SYS_OPENAT2,
+            root_fd,
+            c_path.as_ptr(),
+            &how as *const OpenHow,
+            std::mem::size_of::<OpenHow>(),
+        )
+    } as i32;
+
+    unsafe { libc::close(root_fd) };
+
+    if fd < 0 {
+        Err(last_errno(libc::ENOENT))
+    } else {
+        Ok(fd)
+    }
+}
+
+/// Resolve a virtual path within the chroot using `openat2(RESOLVE_IN_ROOT)`.
+///
+/// The kernel resolves all symlinks and `..` components, keeping the result
+/// confined to `chroot_root`.  Returns `(host_path, virtual_path)`.
+///
+/// For paths whose final component does not yet exist (e.g. `O_CREAT` targets),
+/// the parent directory is resolved and the filename is appended.
+///
+/// On `ELOOP` (self-referential symlinks like `rootfs/bin → /bin`), falls back
+/// to the manual [`resolve_full`] which has explicit loop-detection for this.
+pub fn resolve_in_root(chroot_root: &Path, child_path: &str) -> Option<(PathBuf, PathBuf)> {
+    // Try resolving the full path.
+    match openat2_in_root(
+        chroot_root,
+        child_path,
+        libc::O_PATH | libc::O_CLOEXEC,
+        0,
+    ) {
+        Ok(fd) => {
+            let host_path = std::fs::read_link(format!("/proc/self/fd/{}", fd)).ok();
+            unsafe { libc::close(fd) };
+            let host_path = host_path?;
+            let virtual_path = to_virtual_path(chroot_root, &host_path)?;
+            return Some((host_path, virtual_path));
+        }
+        Err(libc::ELOOP) => {
+            // Self-referential symlinks (e.g. rootfs/bin → /bin) that
+            // the kernel can't resolve under RESOLVE_IN_ROOT — the
+            // manual resolver has explicit loop-detection for this.
+            let virtual_path = resolve_full(chroot_root, child_path)?;
+            let host_path = to_host_path(chroot_root, &virtual_path);
+            return Some((host_path, virtual_path));
+        }
+        Err(libc::ENOENT) | Err(libc::ENOTDIR) => {
+            // Final component doesn't exist — resolve the parent instead.
+        }
+        Err(_) => return None,
+    }
+
+    // Resolve parent directory, then append the missing filename.
+    let confined = confine(child_path);
+    let file_name = confined.file_name()?;
+    let parent = confined.parent().unwrap_or(Path::new("/"));
+
+    match openat2_in_root(
+        chroot_root,
+        parent.to_str()?,
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        0,
+    ) {
+        Ok(fd) => {
+            let parent_host = std::fs::read_link(format!("/proc/self/fd/{}", fd)).ok();
+            unsafe { libc::close(fd) };
+            let parent_host = parent_host?;
+            let host_path = parent_host.join(file_name);
+            let parent_virtual = to_virtual_path(chroot_root, &parent_host)?;
+            let virtual_path = parent_virtual.join(file_name);
+            Some((host_path, virtual_path))
+        }
+        Err(libc::ELOOP) => {
+            let virtual_path = resolve_full(chroot_root, child_path)?;
+            let host_path = to_host_path(chroot_root, &virtual_path);
+            Some((host_path, virtual_path))
+        }
+        Err(_) => None,
+    }
 }
 
 #[cfg(test)]
@@ -258,5 +408,157 @@ mod tests {
             confine("/a/b/c/../../../../../../../../etc/shadow"),
             PathBuf::from("/etc/shadow")
         );
+    }
+
+    // ============================================================
+    // openat2 / resolve_in_root tests
+    // ============================================================
+
+    #[test]
+    fn test_openat2_in_root_regular_file() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        std::fs::write(root.join("etc/passwd"), "root:x:0:0").unwrap();
+
+        let fd = openat2_in_root(root, "/etc/passwd", libc::O_RDONLY, 0);
+        match fd {
+            Ok(fd) => unsafe { libc::close(fd) },
+            Err(libc::ENOSYS) => return, // kernel too old
+            Err(e) => panic!("unexpected error: {}", e),
+        };
+    }
+
+    #[test]
+    fn test_openat2_in_root_blocks_escape() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+
+        let fd = openat2_in_root(root, "/../../../etc/passwd", libc::O_PATH, 0);
+        match fd {
+            // RESOLVE_IN_ROOT clamps ".." at the root, so this resolves
+            // to <root>/etc/passwd which doesn't exist → ENOENT.
+            Err(libc::ENOENT) => {}
+            Err(libc::ENOSYS) => return,
+            Ok(fd) => {
+                // If it succeeds, the resolved path must be under root.
+                let resolved = std::fs::read_link(format!("/proc/self/fd/{}", fd)).unwrap();
+                unsafe { libc::close(fd) };
+                assert!(
+                    resolved.starts_with(root),
+                    "escaped chroot: {:?}",
+                    resolved
+                );
+            }
+            Err(e) => panic!("unexpected error: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_openat2_in_root_symlink_confined() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        std::fs::write(root.join("etc/shadow"), "confined").unwrap();
+        // Absolute symlink pointing to /etc/shadow — kernel keeps it
+        // confined to root.
+        symlink("/etc/shadow", root.join("evil")).unwrap();
+
+        let fd = openat2_in_root(root, "/evil", libc::O_PATH, 0);
+        match fd {
+            Ok(fd) => {
+                let resolved = std::fs::read_link(format!("/proc/self/fd/{}", fd)).unwrap();
+                unsafe { libc::close(fd) };
+                assert!(resolved.starts_with(root));
+                assert!(resolved.ends_with("etc/shadow"));
+            }
+            Err(libc::ENOSYS) => return,
+            Err(e) => panic!("unexpected error: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_resolve_in_root_no_symlinks() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("usr/bin")).unwrap();
+        std::fs::write(root.join("usr/bin/hello"), "").unwrap();
+
+        let result = resolve_in_root(root, "/usr/bin/hello");
+        assert!(result.is_some());
+        let (host, virt) = result.unwrap();
+        assert_eq!(virt, PathBuf::from("/usr/bin/hello"));
+        assert!(host.starts_with(root));
+    }
+
+    #[test]
+    fn test_resolve_in_root_with_symlink() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("usr/lib64")).unwrap();
+        std::fs::write(root.join("usr/lib64/foo"), "").unwrap();
+        symlink("/usr/lib64", root.join("lib")).unwrap();
+
+        let result = resolve_in_root(root, "/lib/foo");
+        assert!(result.is_some());
+        let (host, virt) = result.unwrap();
+        assert_eq!(virt, PathBuf::from("/usr/lib64/foo"));
+        assert!(host.starts_with(root));
+    }
+
+    #[test]
+    fn test_resolve_in_root_nonexistent_file() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("tmp")).unwrap();
+
+        // File doesn't exist but parent does — should resolve via parent.
+        let result = resolve_in_root(root, "/tmp/newfile");
+        assert!(result.is_some());
+        let (host, virt) = result.unwrap();
+        assert_eq!(virt, PathBuf::from("/tmp/newfile"));
+        assert!(host.ends_with("tmp/newfile"));
+    }
+
+    #[test]
+    fn test_resolve_in_root_escape_via_symlink() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        std::fs::write(root.join("etc/shadow"), "confined").unwrap();
+        // Symlink to absolute path — must stay confined.
+        symlink("/etc/shadow", root.join("evil")).unwrap();
+
+        let result = resolve_in_root(root, "/evil");
+        assert!(result.is_some());
+        let (host, virt) = result.unwrap();
+        assert_eq!(virt, PathBuf::from("/etc/shadow"));
+        assert!(host.starts_with(root));
+    }
+
+    #[test]
+    fn test_resolve_in_root_dotdot_escape() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+
+        let result = resolve_in_root(root, "/a/../../etc/passwd");
+        // Either resolves within root or returns None — never escapes.
+        if let Some((host, _)) = result {
+            assert!(host.starts_with(root));
+        }
+    }
+
+    #[test]
+    fn test_resolve_in_root_root_path() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let result = resolve_in_root(root, "/");
+        assert!(result.is_some());
+        let (host, virt) = result.unwrap();
+        assert_eq!(virt, PathBuf::from("/"));
+        assert_eq!(host, root);
     }
 }

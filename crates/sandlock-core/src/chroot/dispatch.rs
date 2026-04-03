@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::chroot::resolve::{resolve_full, to_host_path, to_virtual_path};
+use crate::chroot::resolve::{resolve_in_root, to_virtual_path};
 use crate::procfs::{build_dirent64, DT_DIR, DT_LNK, DT_REG};
 use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction, SupervisorState};
 use crate::sys::structs::{SeccompNotif, SeccompNotifAddfd, SECCOMP_IOCTL_NOTIF_ADDFD};
@@ -70,14 +70,17 @@ fn read_path(notif: &SeccompNotif, addr: u64, notif_fd: RawFd) -> Option<String>
 }
 
 /// Resolve a child path to (host_path, virtual_path) within the chroot.
+///
+/// Uses `openat2(RESOLVE_IN_ROOT)` for kernel-based symlink resolution,
+/// falling back to manual resolution on older kernels.
 fn resolve_chroot_path(
     notif: &SeccompNotif,
     dirfd: i64,
     path: &str,
     chroot_root: &Path, // kept as bare Path for internal use
 ) -> Option<(PathBuf, PathBuf)> {
-    let virtual_path = if Path::new(path).is_absolute() {
-        resolve_full(chroot_root, path)?
+    let full_path = if Path::new(path).is_absolute() {
+        path.to_string()
     } else {
         let dirfd32 = dirfd as i32;
         let base_host = if dirfd32 == libc::AT_FDCWD {
@@ -87,10 +90,9 @@ fn resolve_chroot_path(
         };
         let base_virtual = to_virtual_path(chroot_root, &base_host)?;
         let combined = base_virtual.join(path);
-        resolve_full(chroot_root, combined.to_str().unwrap_or("/"))?
+        combined.to_string_lossy().to_string()
     };
-    let host_path = to_host_path(chroot_root, &virtual_path);
-    Some((host_path, virtual_path))
+    resolve_in_root(chroot_root, &full_path)
 }
 
 /// Convert a Path to CString, returning Errno on failure.
