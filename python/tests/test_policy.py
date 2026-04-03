@@ -88,6 +88,26 @@ class TestPolicy:
         assert Policy(max_cpu=200).cpu_pct() == 100
 
 
+class TestDiskQuotaPolicy:
+    def test_default_none(self):
+        p = Policy()
+        assert p.max_disk is None
+
+    def test_string_value(self):
+        p = Policy(max_disk="1G")
+        assert p.max_disk == "1G"
+
+    def test_frozen(self):
+        p = Policy(max_disk="512M")
+        with pytest.raises(AttributeError):
+            p.max_disk = "1G"  # type: ignore
+
+    def test_parse_memory_size_for_disk(self):
+        assert parse_memory_size("1G") == 1024 ** 3
+        assert parse_memory_size("512M") == 512 * 1024 ** 2
+        assert parse_memory_size("100K") == 100 * 1024
+
+
 class TestParsePorts:
     def test_single_int(self):
         assert parse_ports([80]) == [80]

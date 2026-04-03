@@ -94,8 +94,10 @@ pub(crate) async fn handle_cow_open(
     }
 
     let real_path = match cow.handle_open(&path, flags) {
-        Some(p) => p,
-        None => return NotifAction::Continue,
+        Ok(Some(p)) => p,
+        Ok(None) => return NotifAction::Continue,
+        Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
+        Err(_) => return NotifAction::Continue,
     };
     drop(st);
 
@@ -128,6 +130,16 @@ pub(crate) async fn handle_cow_write(
     let nr = notif.data.nr as i64;
 
     // Read the path from child memory based on syscall
+    macro_rules! try_cow {
+        ($cow:expr, $call:expr) => {
+            match $call {
+                Ok(true) => return NotifAction::ReturnValue(0),
+                Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
+                _ => {}
+            }
+        };
+    }
+
     if nr == libc::SYS_unlinkat {
         // unlinkat(dirfd, pathname, flags): args[0]=dirfd, args[1]=path, args[2]=flags
         let dirfd = notif.data.args[0] as i64;
@@ -151,8 +163,8 @@ pub(crate) async fn handle_cow_write(
         };
         let mut st = state.lock().await;
         if let Some(cow) = st.cow_branch.as_mut() {
-            if cow.matches(&path) && cow.handle_mkdir(&path) {
-                return NotifAction::ReturnValue(0);
+            if cow.matches(&path) {
+                try_cow!(cow, cow.handle_mkdir(&path));
             }
         }
     } else if nr == libc::SYS_renameat2 {
@@ -169,8 +181,8 @@ pub(crate) async fn handle_cow_write(
         };
         let mut st = state.lock().await;
         if let Some(cow) = st.cow_branch.as_mut() {
-            if cow.matches(&old_path) && cow.handle_rename(&old_path, &new_path) {
-                return NotifAction::ReturnValue(0);
+            if cow.matches(&old_path) {
+                try_cow!(cow, cow.handle_rename(&old_path, &new_path));
             }
         }
     } else if nr == libc::SYS_symlinkat {
@@ -186,8 +198,8 @@ pub(crate) async fn handle_cow_write(
         };
         let mut st = state.lock().await;
         if let Some(cow) = st.cow_branch.as_mut() {
-            if cow.matches(&linkpath) && cow.handle_symlink(&target, &linkpath) {
-                return NotifAction::ReturnValue(0);
+            if cow.matches(&linkpath) {
+                try_cow!(cow, cow.handle_symlink(&target, &linkpath));
             }
         }
     } else if nr == libc::SYS_linkat {
@@ -204,8 +216,8 @@ pub(crate) async fn handle_cow_write(
         };
         let mut st = state.lock().await;
         if let Some(cow) = st.cow_branch.as_mut() {
-            if cow.matches(&new_path) && cow.handle_link(&old_path, &new_path) {
-                return NotifAction::ReturnValue(0);
+            if cow.matches(&new_path) {
+                try_cow!(cow, cow.handle_link(&old_path, &new_path));
             }
         }
     } else if nr == libc::SYS_fchmodat {
@@ -218,8 +230,8 @@ pub(crate) async fn handle_cow_write(
         let mode = (notif.data.args[2] & 0o7777) as u32;
         let mut st = state.lock().await;
         if let Some(cow) = st.cow_branch.as_mut() {
-            if cow.matches(&path) && cow.handle_chmod(&path, mode) {
-                return NotifAction::ReturnValue(0);
+            if cow.matches(&path) {
+                try_cow!(cow, cow.handle_chmod(&path, mode));
             }
         }
     } else if nr == libc::SYS_fchownat {
@@ -233,8 +245,8 @@ pub(crate) async fn handle_cow_write(
         let gid = notif.data.args[3] as u32;
         let mut st = state.lock().await;
         if let Some(cow) = st.cow_branch.as_mut() {
-            if cow.matches(&path) && cow.handle_chown(&path, uid, gid) {
-                return NotifAction::ReturnValue(0);
+            if cow.matches(&path) {
+                try_cow!(cow, cow.handle_chown(&path, uid, gid));
             }
         }
     } else if nr == libc::SYS_truncate {
@@ -246,8 +258,8 @@ pub(crate) async fn handle_cow_write(
         let length = notif.data.args[1] as i64;
         let mut st = state.lock().await;
         if let Some(cow) = st.cow_branch.as_mut() {
-            if cow.matches(&path) && cow.handle_truncate(&path, length) {
-                return NotifAction::ReturnValue(0);
+            if cow.matches(&path) {
+                try_cow!(cow, cow.handle_truncate(&path, length));
             }
         }
     }

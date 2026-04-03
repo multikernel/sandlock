@@ -96,6 +96,9 @@ pub enum BranchError {
 
     #[error("branch conflict: {0}")]
     Conflict(String),
+
+    #[error("disk quota exceeded")]
+    QuotaExceeded,
 }
 
 /// Convenience type alias.

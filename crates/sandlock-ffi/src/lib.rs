@@ -179,6 +179,17 @@ pub unsafe extern "C" fn sandlock_policy_builder_max_memory(
 /// # Safety
 /// `b` must be a valid builder pointer.
 #[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_max_disk(
+    b: *mut PolicyBuilder, bytes: u64,
+) -> *mut PolicyBuilder {
+    if b.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.max_disk(ByteSize(bytes))))
+}
+
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
 pub unsafe extern "C" fn sandlock_policy_builder_max_processes(
     b: *mut PolicyBuilder, n: u32,
 ) -> *mut PolicyBuilder {

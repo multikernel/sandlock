@@ -866,7 +866,8 @@ impl Sandbox {
             if self.policy.workdir.is_some() && self.policy.fs_isolation == FsIsolation::None {
                 let workdir = self.policy.workdir.as_ref().unwrap();
                 let storage = self.policy.fs_storage.as_deref();
-                match crate::cow::seccomp::SeccompCowBranch::create(workdir, storage) {
+                let max_disk = self.policy.max_disk.map(|b| b.0).unwrap_or(0);
+                match crate::cow::seccomp::SeccompCowBranch::create(workdir, storage, max_disk) {
                     Ok(branch) => { sup_state.cow_branch = Some(branch); }
                     Err(e) => { eprintln!("sandlock: seccomp COW branch creation failed: {}", e); }
                 }

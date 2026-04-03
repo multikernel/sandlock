@@ -19,6 +19,22 @@ const O_APPEND: u64 = 0o2000;
 const O_DIRECTORY: u64 = 0o200000;
 const WRITE_FLAGS: u64 = O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND;
 
+/// Recursively compute the total size of all files under `dir`.
+fn dir_size(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                total += dir_size(&path);
+            } else if let Ok(meta) = path.symlink_metadata() {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
 /// Seccomp-based COW branch. Redirects writes to an upper directory
 /// and tracks deletions in memory.
 pub struct SeccompCowBranch {
@@ -29,11 +45,15 @@ pub struct SeccompCowBranch {
     deleted: HashSet<String>,
     has_changes: bool,
     finished: bool,
+    max_disk_bytes: u64,
+    disk_used: u64,
 }
 
 impl SeccompCowBranch {
     /// Create a new seccomp COW branch.
-    pub fn create(workdir: &Path, storage: Option<&Path>) -> Result<Self, BranchError> {
+    ///
+    /// `max_disk_bytes`: maximum bytes allowed in the upper directory (0 = unlimited).
+    pub fn create(workdir: &Path, storage: Option<&Path>, max_disk_bytes: u64) -> Result<Self, BranchError> {
         let storage_base = storage
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::env::temp_dir().join(format!("sandlock-cow-{}", std::process::id())));
@@ -55,6 +75,8 @@ impl SeccompCowBranch {
             deleted: HashSet::new(),
             has_changes: false,
             finished: false,
+            max_disk_bytes,
+            disk_used: 0,
         })
     }
 
@@ -104,6 +126,20 @@ impl SeccompCowBranch {
         self.has_changes = true;
     }
 
+    /// Check whether `additional` bytes would exceed the disk quota.
+    /// Returns `Ok(())` if within quota or quota is unlimited (0).
+    fn check_quota(&self, additional: u64) -> Result<(), BranchError> {
+        if self.max_disk_bytes > 0 && self.disk_used + additional > self.max_disk_bytes {
+            return Err(BranchError::QuotaExceeded);
+        }
+        Ok(())
+    }
+
+    /// Recalculate `disk_used` by walking the upper directory.
+    fn recalc_disk_used(&mut self) {
+        self.disk_used = dir_size(&self.upper);
+    }
+
     /// Ensure a COW copy exists in upper. Returns the upper path.
     pub fn ensure_cow_copy(&mut self, rel_path: &str) -> Result<PathBuf, BranchError> {
         self.deleted.remove(rel_path);
@@ -122,18 +158,23 @@ impl SeccompCowBranch {
         }
 
         if lower_file.is_symlink() {
+            self.check_quota(256)?; // symlinks are small
             let target = fs::read_link(&lower_file)
                 .map_err(|e| BranchError::Operation(format!("readlink: {}", e)))?;
             std::os::unix::fs::symlink(&target, &upper_file)
                 .map_err(|e| BranchError::Operation(format!("symlink: {}", e)))?;
+            self.disk_used += 256;
         } else if lower_file.exists() {
+            let meta = lower_file.metadata()
+                .map_err(|e| BranchError::Operation(format!("metadata: {}", e)))?;
+            let file_size = meta.len();
+            self.check_quota(file_size)?;
             fs::copy(&lower_file, &upper_file)
                 .map_err(|e| BranchError::Operation(format!("copy: {}", e)))?;
             // Preserve permissions
-            let meta = lower_file.metadata()
-                .map_err(|e| BranchError::Operation(format!("metadata: {}", e)))?;
             fs::set_permissions(&upper_file, meta.permissions())
                 .map_err(|e| BranchError::Operation(format!("set permissions: {}", e)))?;
+            self.disk_used += file_size;
         }
 
         Ok(upper_file)
@@ -152,25 +193,30 @@ impl SeccompCowBranch {
     // ---- Syscall handlers (called by cow::dispatch) ----
 
     /// Handle openat: resolve to upper or lower path.
-    pub fn handle_open(&mut self, path: &str, flags: u64) -> Option<PathBuf> {
+    ///
+    /// Returns `Err(QuotaExceeded)` when the write would exceed `max_disk`.
+    pub fn handle_open(&mut self, path: &str, flags: u64) -> Result<Option<PathBuf>, BranchError> {
         if flags & O_DIRECTORY != 0 {
-            return None;
+            return Ok(None);
         }
-        let rel = self.safe_rel(path)?;
+        let rel = match self.safe_rel(path) {
+            Some(r) => r,
+            None => return Ok(None),
+        };
         if self.is_deleted(&rel) {
             if flags & O_CREAT != 0 {
-                return self.ensure_cow_copy(&rel).ok();
+                return self.ensure_cow_copy(&rel).map(Some);
             }
-            return None;
+            return Ok(None);
         }
         if flags & WRITE_FLAGS != 0 {
-            self.ensure_cow_copy(&rel).ok()
+            self.ensure_cow_copy(&rel).map(Some)
         } else {
             let resolved = self.resolve_read(&rel);
             if resolved.exists() || resolved.is_symlink() {
-                Some(resolved)
+                Ok(Some(resolved))
             } else {
-                None
+                Ok(None)
             }
         }
     }
@@ -190,6 +236,7 @@ impl SeccompCowBranch {
             } else {
                 let _ = fs::remove_file(&upper_file);
             }
+            self.recalc_disk_used();
         }
 
         if lower_file.exists() || lower_file.is_symlink() {
@@ -201,43 +248,49 @@ impl SeccompCowBranch {
     }
 
     /// Handle mkdirat.
-    pub fn handle_mkdir(&mut self, path: &str) -> bool {
+    ///
+    /// Returns `Err(QuotaExceeded)` when the directory would exceed `max_disk`.
+    pub fn handle_mkdir(&mut self, path: &str) -> Result<bool, BranchError> {
         let rel = match self.safe_rel(path) {
             Some(r) => r,
-            None => return false,
+            None => return Ok(false),
         };
+        self.check_quota(4096)?; // directory metadata
         self.deleted.remove(&rel);
         self.has_changes = true;
         let upper_dir = self.upper.join(&rel);
-        fs::create_dir_all(&upper_dir).is_ok()
+        let ok = fs::create_dir_all(&upper_dir).is_ok();
+        if ok {
+            self.disk_used += 4096;
+        }
+        Ok(ok)
     }
 
     /// Handle rename.
-    pub fn handle_rename(&mut self, old_path: &str, new_path: &str) -> bool {
+    ///
+    /// Returns `Err(QuotaExceeded)` when the COW copy would exceed `max_disk`.
+    pub fn handle_rename(&mut self, old_path: &str, new_path: &str) -> Result<bool, BranchError> {
         let old_rel = match self.safe_rel(old_path) {
             Some(r) => r,
-            None => return false,
+            None => return Ok(false),
         };
         let new_rel = match self.safe_rel(new_path) {
             Some(r) => r,
-            None => return false,
+            None => return Ok(false),
         };
-        let old_upper = match self.ensure_cow_copy(&old_rel) {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
+        let old_upper = self.ensure_cow_copy(&old_rel)?;
         let new_upper = self.upper.join(&new_rel);
         if let Some(parent) = new_upper.parent() {
             let _ = fs::create_dir_all(parent);
         }
         if fs::rename(&old_upper, &new_upper).is_err() {
-            return false;
+            return Ok(false);
         }
         let lower_old = self.workdir.join(&old_rel);
         if lower_old.exists() || lower_old.is_symlink() {
             self.mark_deleted(&old_rel);
         }
-        true
+        Ok(true)
     }
 
     /// Handle stat: resolve path to upper or lower.
@@ -255,89 +308,106 @@ impl SeccompCowBranch {
     }
 
     /// Handle symlinkat.
-    pub fn handle_symlink(&mut self, target: &str, linkpath: &str) -> bool {
+    ///
+    /// Returns `Err(QuotaExceeded)` when the symlink would exceed `max_disk`.
+    pub fn handle_symlink(&mut self, target: &str, linkpath: &str) -> Result<bool, BranchError> {
         let rel = match self.safe_rel(linkpath) {
             Some(r) => r,
-            None => return false,
+            None => return Ok(false),
         };
         if std::path::Path::new(target).is_absolute() || target.split('/').any(|c| c == "..") {
-            return false;
+            return Ok(false);
         }
+        self.check_quota(256)?;
         self.deleted.remove(&rel);
         self.has_changes = true;
         let upper_link = self.upper.join(&rel);
         if let Some(parent) = upper_link.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        std::os::unix::fs::symlink(target, &upper_link).is_ok()
+        let ok = std::os::unix::fs::symlink(target, &upper_link).is_ok();
+        if ok {
+            self.disk_used += 256;
+        }
+        Ok(ok)
     }
 
     /// Handle linkat.
-    pub fn handle_link(&mut self, oldpath: &str, newpath: &str) -> bool {
+    ///
+    /// Returns `Err(QuotaExceeded)` when the COW copy would exceed `max_disk`.
+    pub fn handle_link(&mut self, oldpath: &str, newpath: &str) -> Result<bool, BranchError> {
         let old_rel = match self.safe_rel(oldpath) {
             Some(r) => r,
-            None => return false,
+            None => return Ok(false),
         };
         let new_rel = match self.safe_rel(newpath) {
             Some(r) => r,
-            None => return false,
+            None => return Ok(false),
         };
-        let old_upper = match self.ensure_cow_copy(&old_rel) {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
+        let old_upper = self.ensure_cow_copy(&old_rel)?;
         let new_upper = self.upper.join(&new_rel);
         if let Some(parent) = new_upper.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        fs::hard_link(&old_upper, &new_upper).is_ok()
+        Ok(fs::hard_link(&old_upper, &new_upper).is_ok())
     }
 
     /// Handle fchmodat.
-    pub fn handle_chmod(&mut self, path: &str, mode: u32) -> bool {
+    ///
+    /// Returns `Err(QuotaExceeded)` when the COW copy would exceed `max_disk`.
+    pub fn handle_chmod(&mut self, path: &str, mode: u32) -> Result<bool, BranchError> {
         let rel = match self.safe_rel(path) {
             Some(r) => r,
-            None => return false,
+            None => return Ok(false),
         };
-        let upper = match self.ensure_cow_copy(&rel) {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
+        let upper = self.ensure_cow_copy(&rel)?;
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&upper, fs::Permissions::from_mode(mode)).is_ok()
+        Ok(fs::set_permissions(&upper, fs::Permissions::from_mode(mode)).is_ok())
     }
 
     /// Handle fchownat.
-    pub fn handle_chown(&mut self, path: &str, uid: u32, gid: u32) -> bool {
+    ///
+    /// Returns `Err(QuotaExceeded)` when the COW copy would exceed `max_disk`.
+    pub fn handle_chown(&mut self, path: &str, uid: u32, gid: u32) -> Result<bool, BranchError> {
         let rel = match self.safe_rel(path) {
             Some(r) => r,
-            None => return false,
+            None => return Ok(false),
         };
-        let upper = match self.ensure_cow_copy(&rel) {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
-        unsafe {
+        let upper = self.ensure_cow_copy(&rel)?;
+        let ok = unsafe {
             let c_path = std::ffi::CString::new(upper.to_str().unwrap_or("")).unwrap();
             libc::chown(c_path.as_ptr(), uid, gid) == 0
-        }
+        };
+        Ok(ok)
     }
 
     /// Handle truncate.
-    pub fn handle_truncate(&mut self, path: &str, length: i64) -> bool {
+    ///
+    /// Returns `Err(QuotaExceeded)` when the truncate would exceed `max_disk`.
+    pub fn handle_truncate(&mut self, path: &str, length: i64) -> Result<bool, BranchError> {
         let rel = match self.safe_rel(path) {
             Some(r) => r,
-            None => return false,
+            None => return Ok(false),
         };
-        let upper = match self.ensure_cow_copy(&rel) {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
+        let new_len = length as u64;
+        let upper = self.ensure_cow_copy(&rel)?;
+        let old_len = upper.metadata().map(|m| m.len()).unwrap_or(0);
+        if new_len > old_len {
+            self.check_quota(new_len - old_len)?;
+        }
         let file = match fs::OpenOptions::new().write(true).open(&upper) {
             Ok(f) => f,
-            Err(_) => return false,
+            Err(_) => return Ok(false),
         };
-        file.set_len(length as u64).is_ok()
+        let ok = file.set_len(new_len).is_ok();
+        if ok {
+            if new_len > old_len {
+                self.disk_used += new_len - old_len;
+            } else {
+                self.disk_used = self.disk_used.saturating_sub(old_len - new_len);
+            }
+        }
+        Ok(ok)
     }
 
     /// Handle readlink.
@@ -493,7 +563,7 @@ mod tests {
     #[test]
     fn test_create_branch() {
         let (workdir, storage) = setup_workdir();
-        let branch = SeccompCowBranch::create(workdir.path(), Some(storage.path())).unwrap();
+        let branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         assert!(branch.upper_dir().exists());
         assert!(!branch.has_changes());
     }
@@ -501,7 +571,7 @@ mod tests {
     #[test]
     fn test_matches() {
         let (workdir, storage) = setup_workdir();
-        let branch = SeccompCowBranch::create(workdir.path(), Some(storage.path())).unwrap();
+        let branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         let wdstr = workdir.path().canonicalize().unwrap();
         let wdstr = wdstr.to_str().unwrap();
         assert!(branch.matches(&format!("{}/foo.txt", wdstr)));
@@ -512,7 +582,7 @@ mod tests {
     #[test]
     fn test_ensure_cow_copy() {
         let (workdir, storage) = setup_workdir();
-        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path())).unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         let upper = branch.ensure_cow_copy("existing.txt").unwrap();
         assert!(upper.exists());
         assert_eq!(fs::read_to_string(&upper).unwrap(), "hello");
@@ -522,7 +592,7 @@ mod tests {
     #[test]
     fn test_resolve_read_prefers_upper() {
         let (workdir, storage) = setup_workdir();
-        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path())).unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         let upper = branch.ensure_cow_copy("existing.txt").unwrap();
         fs::write(&upper, "modified").unwrap();
         let resolved = branch.resolve_read("existing.txt");
@@ -532,7 +602,7 @@ mod tests {
     #[test]
     fn test_is_deleted() {
         let (workdir, storage) = setup_workdir();
-        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path())).unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         assert!(!branch.is_deleted("existing.txt"));
         branch.mark_deleted("existing.txt");
         assert!(branch.is_deleted("existing.txt"));
@@ -541,7 +611,7 @@ mod tests {
     #[test]
     fn test_commit_merges_upper() {
         let (workdir, storage) = setup_workdir();
-        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path())).unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         // Write a new file via COW
         let upper = branch.ensure_cow_copy("new.txt").unwrap();
         fs::write(&upper, "new content").unwrap();
@@ -552,7 +622,7 @@ mod tests {
     #[test]
     fn test_commit_applies_deletions() {
         let (workdir, storage) = setup_workdir();
-        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path())).unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         branch.mark_deleted("existing.txt");
         branch.commit().unwrap();
         assert!(!workdir.path().join("existing.txt").exists());
@@ -561,7 +631,7 @@ mod tests {
     #[test]
     fn test_abort_discards_changes() {
         let (workdir, storage) = setup_workdir();
-        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path())).unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         let upper = branch.ensure_cow_copy("new.txt").unwrap();
         fs::write(&upper, "should be discarded").unwrap();
         branch.abort().unwrap();
@@ -571,7 +641,7 @@ mod tests {
     #[test]
     fn test_changes_added_file() {
         let (workdir, storage) = setup_workdir();
-        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path())).unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         let upper = branch.ensure_cow_copy("brand_new.txt").unwrap();
         fs::write(&upper, "new content").unwrap();
         let changes = branch.changes().unwrap();
@@ -583,7 +653,7 @@ mod tests {
     #[test]
     fn test_changes_modified_file() {
         let (workdir, storage) = setup_workdir();
-        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path())).unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         let upper = branch.ensure_cow_copy("existing.txt").unwrap();
         fs::write(&upper, "modified content").unwrap();
         let changes = branch.changes().unwrap();
@@ -595,7 +665,7 @@ mod tests {
     #[test]
     fn test_changes_deleted_file() {
         let (workdir, storage) = setup_workdir();
-        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path())).unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         branch.mark_deleted("existing.txt");
         let changes = branch.changes().unwrap();
         assert_eq!(changes.len(), 1);
@@ -606,7 +676,7 @@ mod tests {
     #[test]
     fn test_changes_no_changes() {
         let (workdir, storage) = setup_workdir();
-        let branch = SeccompCowBranch::create(workdir.path(), Some(storage.path())).unwrap();
+        let branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         let changes = branch.changes().unwrap();
         assert!(changes.is_empty());
     }
@@ -614,7 +684,7 @@ mod tests {
     #[test]
     fn test_changes_mixed() {
         let (workdir, storage) = setup_workdir();
-        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path())).unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         let upper = branch.ensure_cow_copy("new.txt").unwrap();
         fs::write(&upper, "new").unwrap();
         let upper2 = branch.ensure_cow_copy("existing.txt").unwrap();
@@ -630,5 +700,225 @@ mod tests {
         assert_eq!(changes[1].path, std::path::PathBuf::from("new.txt"));
         assert_eq!(changes[2].kind, crate::dry_run::ChangeKind::Deleted);
         assert_eq!(changes[2].path, std::path::PathBuf::from("subdir/nested.txt"));
+    }
+
+    // ---- Disk quota tests ----
+
+    /// Helper: absolute path string for a file under the workdir.
+    fn abs(branch: &SeccompCowBranch, rel: &str) -> String {
+        format!("{}/{}", branch.workdir_str(), rel)
+    }
+
+    #[test]
+    fn test_quota_exceeded_on_cow_copy() {
+        let (workdir, storage) = setup_workdir();
+        // "existing.txt" = "hello" (5 bytes). Quota = 4 bytes.
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 4).unwrap();
+        let err = branch.ensure_cow_copy("existing.txt").unwrap_err();
+        assert!(matches!(err, BranchError::QuotaExceeded));
+    }
+
+    #[test]
+    fn test_quota_allows_within_limit() {
+        let (workdir, storage) = setup_workdir();
+        // 5 bytes fits in 100-byte quota.
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 100).unwrap();
+        assert!(branch.ensure_cow_copy("existing.txt").is_ok());
+    }
+
+    #[test]
+    fn test_quota_unlimited() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        assert!(branch.ensure_cow_copy("existing.txt").is_ok());
+    }
+
+    #[test]
+    fn test_quota_cumulative_exhaustion() {
+        let (workdir, storage) = setup_workdir();
+        // "existing.txt" = 5 bytes, "subdir/nested.txt" = 6 bytes. Quota = 10.
+        // First copy fits (5 <= 10), second doesn't (5 + 6 > 10).
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 10).unwrap();
+        assert!(branch.ensure_cow_copy("existing.txt").is_ok());
+        let err = branch.ensure_cow_copy("subdir/nested.txt").unwrap_err();
+        assert!(matches!(err, BranchError::QuotaExceeded));
+    }
+
+    #[test]
+    fn test_quota_exact_boundary() {
+        let (workdir, storage) = setup_workdir();
+        // Quota exactly equals file size — should succeed.
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 5).unwrap();
+        assert!(branch.ensure_cow_copy("existing.txt").is_ok());
+    }
+
+    #[test]
+    fn test_quota_handle_open_write_denied() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 4).unwrap();
+        let path = abs(&branch, "existing.txt");
+        let err = branch.handle_open(&path, O_WRONLY).unwrap_err();
+        assert!(matches!(err, BranchError::QuotaExceeded));
+    }
+
+    #[test]
+    fn test_quota_handle_open_read_allowed() {
+        let (workdir, storage) = setup_workdir();
+        // Reads don't consume quota — even a tiny quota should allow reads.
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 1).unwrap();
+        let path = abs(&branch, "existing.txt");
+        let result = branch.handle_open(&path, 0).unwrap(); // O_RDONLY = 0
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_quota_handle_open_create_denied() {
+        let (workdir, storage) = setup_workdir();
+        // O_CREAT on a deleted file triggers ensure_cow_copy.
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 4).unwrap();
+        let path = abs(&branch, "existing.txt");
+        branch.mark_deleted("existing.txt");
+        // O_CREAT on a deleted path — tries to COW-copy the 5-byte file, should fail.
+        let err = branch.handle_open(&path, O_CREAT).unwrap_err();
+        assert!(matches!(err, BranchError::QuotaExceeded));
+    }
+
+    #[test]
+    fn test_quota_handle_mkdir_denied() {
+        let (workdir, storage) = setup_workdir();
+        // mkdir adds 4096 bytes of metadata accounting.
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 100).unwrap();
+        let path = abs(&branch, "newdir");
+        let err = branch.handle_mkdir(&path).unwrap_err();
+        assert!(matches!(err, BranchError::QuotaExceeded));
+    }
+
+    #[test]
+    fn test_quota_handle_mkdir_allowed() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 5000).unwrap();
+        let path = abs(&branch, "newdir");
+        assert!(matches!(branch.handle_mkdir(&path), Ok(true)));
+    }
+
+    #[test]
+    fn test_quota_handle_symlink_denied() {
+        let (workdir, storage) = setup_workdir();
+        // symlink adds 256 bytes of accounting.
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 100).unwrap();
+        let linkpath = abs(&branch, "mylink");
+        let err = branch.handle_symlink("existing.txt", &linkpath).unwrap_err();
+        assert!(matches!(err, BranchError::QuotaExceeded));
+    }
+
+    #[test]
+    fn test_quota_handle_symlink_allowed() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 500).unwrap();
+        let linkpath = abs(&branch, "mylink");
+        assert!(matches!(branch.handle_symlink("existing.txt", &linkpath), Ok(true)));
+    }
+
+    #[test]
+    fn test_quota_handle_rename_denied() {
+        let (workdir, storage) = setup_workdir();
+        // rename triggers ensure_cow_copy of the source.
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 4).unwrap();
+        let old = abs(&branch, "existing.txt");
+        let new = abs(&branch, "renamed.txt");
+        let err = branch.handle_rename(&old, &new).unwrap_err();
+        assert!(matches!(err, BranchError::QuotaExceeded));
+    }
+
+    #[test]
+    fn test_quota_handle_link_denied() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 4).unwrap();
+        let old = abs(&branch, "existing.txt");
+        let new = abs(&branch, "hardlink.txt");
+        let err = branch.handle_link(&old, &new).unwrap_err();
+        assert!(matches!(err, BranchError::QuotaExceeded));
+    }
+
+    #[test]
+    fn test_quota_handle_chmod_denied() {
+        let (workdir, storage) = setup_workdir();
+        // chmod triggers ensure_cow_copy.
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 4).unwrap();
+        let path = abs(&branch, "existing.txt");
+        let err = branch.handle_chmod(&path, 0o644).unwrap_err();
+        assert!(matches!(err, BranchError::QuotaExceeded));
+    }
+
+    #[test]
+    fn test_quota_handle_chown_denied() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 4).unwrap();
+        let path = abs(&branch, "existing.txt");
+        let err = branch.handle_chown(&path, 1000, 1000).unwrap_err();
+        assert!(matches!(err, BranchError::QuotaExceeded));
+    }
+
+    #[test]
+    fn test_quota_handle_truncate_grow_denied() {
+        let (workdir, storage) = setup_workdir();
+        // First, allow the cow copy (5 bytes), then truncate to grow beyond quota.
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 10).unwrap();
+        let path = abs(&branch, "existing.txt");
+        // cow copy uses 5 bytes (5 of 10 used).
+        // Truncating to 20 bytes needs 15 more — exceeds remaining 5.
+        let err = branch.handle_truncate(&path, 20).unwrap_err();
+        assert!(matches!(err, BranchError::QuotaExceeded));
+    }
+
+    #[test]
+    fn test_quota_handle_truncate_shrink_allowed() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 10).unwrap();
+        let path = abs(&branch, "existing.txt");
+        // Truncate to 2 bytes — cow copy (5) + shrink is fine.
+        assert!(matches!(branch.handle_truncate(&path, 2), Ok(true)));
+        // disk_used should now be 2, not 5.
+        assert_eq!(branch.disk_used, 2);
+    }
+
+    #[test]
+    fn test_quota_freed_after_unlink() {
+        let (workdir, storage) = setup_workdir();
+        // Quota = 11 bytes. existing.txt=5, nested.txt=6. Both fit individually.
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 11).unwrap();
+        assert!(branch.ensure_cow_copy("existing.txt").is_ok());
+        // 5 used — nested.txt (6 bytes) fits exactly.
+        assert!(branch.ensure_cow_copy("subdir/nested.txt").is_ok());
+
+        // Now at 11 used. Can't add anything — but unlink existing.txt to free 5 bytes.
+        let path = abs(&branch, "existing.txt");
+        assert!(branch.handle_unlink(&path, false));
+        // disk_used should now be 6 (only nested.txt in upper).
+        assert_eq!(branch.disk_used, 6);
+
+        // Now we can write a new 5-byte file (6 + 5 = 11 <= 11).
+        assert!(branch.ensure_cow_copy("existing.txt").is_ok());
+    }
+
+    #[test]
+    fn test_quota_second_cow_copy_is_free() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 5).unwrap();
+        // First cow copy: 5 bytes used.
+        assert!(branch.ensure_cow_copy("existing.txt").is_ok());
+        // Second cow copy of same file: already in upper, should be free (no quota hit).
+        assert!(branch.ensure_cow_copy("existing.txt").is_ok());
+    }
+
+    #[test]
+    fn test_quota_disk_used_tracking() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 1000).unwrap();
+        assert_eq!(branch.disk_used, 0);
+        branch.ensure_cow_copy("existing.txt").unwrap(); // 5 bytes
+        assert_eq!(branch.disk_used, 5);
+        branch.ensure_cow_copy("subdir/nested.txt").unwrap(); // 6 bytes
+        assert_eq!(branch.disk_used, 11);
     }
 }

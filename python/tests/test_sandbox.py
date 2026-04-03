@@ -407,3 +407,140 @@ class TestNewPolicyFields:
         result = Sandbox(p).run(["echo", "closed"])
         assert result.success
         assert result.stdout.strip() == b"closed"
+
+
+class TestDiskQuota:
+    """Tests for max_disk quota enforcement via seccomp COW.
+
+    The quota is enforced at COW-copy time: when openat() triggers a copy
+    from lower to upper, the copy is rejected with ENOSPC if it would
+    exceed max_disk.  Subsequent write() syscalls to an already-open fd
+    bypass the COW layer (the fd is injected directly), so the quota
+    governs total COW-copy size, not total bytes written.
+    """
+
+    def test_cow_copy_within_quota(self, tmp_path):
+        """COW-copying a small file under a generous quota succeeds."""
+        workdir = tmp_path / "within"
+        workdir.mkdir()
+        (workdir / "small.txt").write_text("hello")  # 5 bytes
+        p = _policy(
+            fs_writable=[str(workdir)],
+            workdir=str(workdir),
+            max_disk="1M",
+        )
+        # Opening for write triggers COW copy of the 5-byte file.
+        result = Sandbox(p).run(
+            ["sh", "-c", f"echo world >> {workdir}/small.txt"]
+        )
+        assert result.success
+
+    def test_cow_copy_exceeds_quota(self, tmp_path):
+        """COW-copying a file larger than max_disk returns ENOSPC."""
+        workdir = tmp_path / "exceed"
+        workdir.mkdir()
+        # Create a 8 KiB file in the lower layer.
+        (workdir / "big.bin").write_bytes(b"\x00" * 8192)
+        p = _policy(
+            fs_writable=[str(workdir)],
+            workdir=str(workdir),
+            max_disk="1K",  # 1024 bytes — smaller than the 8 KiB file
+        )
+        # Trying to open big.bin for write triggers COW copy → ENOSPC.
+        result = Sandbox(p).run(
+            ["sh", "-c", f"echo x >> {workdir}/big.bin"]
+        )
+        assert not result.success
+
+    def test_cumulative_cow_copies_exceed_quota(self, tmp_path):
+        """Multiple COW copies that individually fit but together exceed."""
+        workdir = tmp_path / "cumul"
+        workdir.mkdir()
+        # Two 600-byte files. Quota is 1000 bytes.
+        (workdir / "a.bin").write_bytes(b"A" * 600)
+        (workdir / "b.bin").write_bytes(b"B" * 600)
+        p = _policy(
+            fs_writable=[str(workdir)],
+            workdir=str(workdir),
+            max_disk="1000",
+        )
+        # First open succeeds (600 <= 1000), second fails (600+600 > 1000).
+        result = Sandbox(p).run(
+            ["sh", "-c",
+             f"echo x >> {workdir}/a.bin && echo x >> {workdir}/b.bin"]
+        )
+        assert not result.success
+
+    def test_enospc_in_stderr(self, tmp_path):
+        """The child process should see 'No space left on device'."""
+        workdir = tmp_path / "enospc"
+        workdir.mkdir()
+        (workdir / "big.bin").write_bytes(b"\x00" * 4096)
+        p = _policy(
+            fs_writable=[str(workdir)],
+            workdir=str(workdir),
+            max_disk="512",
+        )
+        result = Sandbox(p).run(
+            ["sh", "-c", f"echo x >> {workdir}/big.bin 2>&1"]
+        )
+        assert not result.success
+        combined = result.stdout + result.stderr
+        assert b"No space" in combined or b"ENOSPC" in combined
+
+    def test_quota_none_is_unlimited(self, tmp_path):
+        """Without max_disk, COW copies are unrestricted."""
+        workdir = tmp_path / "nolimit"
+        workdir.mkdir()
+        (workdir / "data.bin").write_bytes(b"\x00" * 8192)
+        p = _policy(
+            fs_writable=[str(workdir)],
+            workdir=str(workdir),
+        )
+        result = Sandbox(p).run(
+            ["sh", "-c", f"echo x >> {workdir}/data.bin"]
+        )
+        assert result.success
+
+    def test_quota_dry_run_enforced(self, tmp_path):
+        """Quota applies during dry_run (COW is always active)."""
+        workdir = tmp_path / "dryquota"
+        workdir.mkdir()
+        (workdir / "big.bin").write_bytes(b"\x00" * 8192)
+        p = _policy(
+            fs_writable=[str(workdir)],
+            workdir=str(workdir),
+            max_disk="1K",
+        )
+        result = Sandbox(p).dry_run(
+            ["sh", "-c", f"echo x >> {workdir}/big.bin"]
+        )
+        assert not result.success
+
+    def test_quota_accepts_various_units(self, tmp_path):
+        """String sizes like '1G', '512M', '100K' are accepted."""
+        workdir = tmp_path / "units"
+        workdir.mkdir()
+        for size in ("100K", "10M", "1G"):
+            p = _policy(
+                fs_writable=[str(workdir)],
+                workdir=str(workdir),
+                max_disk=size,
+            )
+            result = Sandbox(p).run(["echo", "ok"])
+            assert result.success, f"max_disk={size!r} should be accepted"
+
+    def test_read_does_not_consume_quota(self, tmp_path):
+        """Reading a file should not trigger COW copy or consume quota."""
+        workdir = tmp_path / "readonly"
+        workdir.mkdir()
+        (workdir / "big.bin").write_bytes(b"\x00" * 8192)
+        p = _policy(
+            fs_writable=[str(workdir)],
+            workdir=str(workdir),
+            max_disk="100",  # tiny quota
+        )
+        result = Sandbox(p).run(
+            ["cat", f"{workdir}/big.bin"]
+        )
+        assert result.success

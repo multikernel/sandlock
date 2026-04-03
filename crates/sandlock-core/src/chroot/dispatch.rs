@@ -201,8 +201,10 @@ pub(crate) async fn handle_chroot_open(
             let host_str = host_path.to_string_lossy();
             if cow.matches(&host_str) {
                 let real_path = match cow.handle_open(&host_str, flags) {
-                    Some(p) => p,
-                    None => return NotifAction::Continue,
+                    Ok(Some(p)) => p,
+                    Ok(None) => return NotifAction::Continue,
+                    Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
+                    Err(_) => return NotifAction::Continue,
                 };
                 drop(st);
                 let c_path = match path_cstr(&real_path, libc::EIO) {
@@ -364,8 +366,12 @@ pub(crate) async fn handle_chroot_write(
             let mut st = state.lock().await;
             if let Some(cow) = st.cow_branch.as_mut() {
                 let s = host_path.to_string_lossy();
-                if cow.matches(&s) && cow.handle_mkdir(&s) {
-                    return NotifAction::ReturnValue(0);
+                if cow.matches(&s) {
+                    match cow.handle_mkdir(&s) {
+                        Ok(true) => return NotifAction::ReturnValue(0),
+                        Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
+                        _ => {}
+                    }
                 }
             }
         }
@@ -397,8 +403,12 @@ pub(crate) async fn handle_chroot_write(
             let mut st = state.lock().await;
             if let Some(cow) = st.cow_branch.as_mut() {
                 let old_str = old_host.to_string_lossy();
-                if cow.matches(&old_str) && cow.handle_rename(&old_str, &new_host.to_string_lossy()) {
-                    return NotifAction::ReturnValue(0);
+                if cow.matches(&old_str) {
+                    match cow.handle_rename(&old_str, &new_host.to_string_lossy()) {
+                        Ok(true) => return NotifAction::ReturnValue(0),
+                        Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
+                        _ => {}
+                    }
                 }
             }
         }
@@ -432,8 +442,12 @@ pub(crate) async fn handle_chroot_write(
             let mut st = state.lock().await;
             if let Some(cow) = st.cow_branch.as_mut() {
                 let s = host_link.to_string_lossy();
-                if cow.matches(&s) && cow.handle_symlink(&target, &s) {
-                    return NotifAction::ReturnValue(0);
+                if cow.matches(&s) {
+                    match cow.handle_symlink(&target, &s) {
+                        Ok(true) => return NotifAction::ReturnValue(0),
+                        Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
+                        _ => {}
+                    }
                 }
             }
         }
@@ -471,8 +485,12 @@ pub(crate) async fn handle_chroot_write(
             let mut st = state.lock().await;
             if let Some(cow) = st.cow_branch.as_mut() {
                 let s = new_host.to_string_lossy();
-                if cow.matches(&s) && cow.handle_link(&old_host.to_string_lossy(), &s) {
-                    return NotifAction::ReturnValue(0);
+                if cow.matches(&s) {
+                    match cow.handle_link(&old_host.to_string_lossy(), &s) {
+                        Ok(true) => return NotifAction::ReturnValue(0),
+                        Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
+                        _ => {}
+                    }
                 }
             }
         }
@@ -499,8 +517,12 @@ pub(crate) async fn handle_chroot_write(
             let mut st = state.lock().await;
             if let Some(cow) = st.cow_branch.as_mut() {
                 let s = host_path.to_string_lossy();
-                if cow.matches(&s) && cow.handle_chmod(&s, mode) {
-                    return NotifAction::ReturnValue(0);
+                if cow.matches(&s) {
+                    match cow.handle_chmod(&s, mode) {
+                        Ok(true) => return NotifAction::ReturnValue(0),
+                        Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
+                        _ => {}
+                    }
                 }
             }
         }
@@ -520,8 +542,12 @@ pub(crate) async fn handle_chroot_write(
             let mut st = state.lock().await;
             if let Some(cow) = st.cow_branch.as_mut() {
                 let s = host_path.to_string_lossy();
-                if cow.matches(&s) && cow.handle_chown(&s, uid, gid) {
-                    return NotifAction::ReturnValue(0);
+                if cow.matches(&s) {
+                    match cow.handle_chown(&s, uid, gid) {
+                        Ok(true) => return NotifAction::ReturnValue(0),
+                        Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
+                        _ => {}
+                    }
                 }
             }
         }
@@ -543,8 +569,12 @@ pub(crate) async fn handle_chroot_write(
             let mut st = state.lock().await;
             if let Some(cow) = st.cow_branch.as_mut() {
                 let s = host_path.to_string_lossy();
-                if cow.matches(&s) && cow.handle_truncate(&s, length) {
-                    return NotifAction::ReturnValue(0);
+                if cow.matches(&s) {
+                    match cow.handle_truncate(&s, length) {
+                        Ok(true) => return NotifAction::ReturnValue(0),
+                        Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
+                        _ => {}
+                    }
                 }
             }
         }

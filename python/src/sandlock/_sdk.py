@@ -80,6 +80,7 @@ _b_chroot = _builder_fn("sandlock_policy_builder_chroot", ctypes.c_char_p)
 _b_on_exit = _builder_fn("sandlock_policy_builder_on_exit", ctypes.c_uint8)
 _b_on_error = _builder_fn("sandlock_policy_builder_on_error", ctypes.c_uint8)
 _b_max_memory = _builder_fn("sandlock_policy_builder_max_memory", ctypes.c_uint64)
+_b_max_disk = _builder_fn("sandlock_policy_builder_max_disk", ctypes.c_uint64)
 _b_max_processes = _builder_fn("sandlock_policy_builder_max_processes", ctypes.c_uint32)
 _b_max_cpu = _builder_fn("sandlock_policy_builder_max_cpu", ctypes.c_uint8)
 _b_num_cpus = _builder_fn("sandlock_policy_builder_num_cpus", ctypes.c_uint32)
@@ -694,6 +695,13 @@ class _NativePolicy:
             else:
                 mem_bytes = int(policy.max_memory)
             b = _b_max_memory(b, mem_bytes)
+
+        if policy.max_disk is not None:
+            if isinstance(policy.max_disk, str):
+                disk_bytes = parse_memory_size(policy.max_disk)
+            else:
+                disk_bytes = int(policy.max_disk)
+            b = _b_max_disk(b, disk_bytes)
 
         if policy.max_processes != 64:
             b = _b_max_processes(b, policy.max_processes)
