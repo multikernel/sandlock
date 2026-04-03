@@ -109,6 +109,7 @@ pub struct Policy {
     pub time_start: Option<SystemTime>,
     pub no_randomize_memory: bool,
     pub no_huge_pages: bool,
+    pub no_coredump: bool,
     pub deterministic_dirs: bool,
     pub hostname: Option<String>,
 
@@ -190,6 +191,7 @@ pub struct PolicyBuilder {
     time_start: Option<SystemTime>,
     no_randomize_memory: bool,
     no_huge_pages: bool,
+    no_coredump: bool,
     deterministic_dirs: bool,
     hostname: Option<String>,
 
@@ -319,6 +321,11 @@ impl PolicyBuilder {
 
     pub fn no_huge_pages(mut self, v: bool) -> Self {
         self.no_huge_pages = v;
+        self
+    }
+
+    pub fn no_coredump(mut self, v: bool) -> Self {
+        self.no_coredump = v;
         self
     }
 
@@ -461,6 +468,7 @@ impl PolicyBuilder {
             time_start: self.time_start,
             no_randomize_memory: self.no_randomize_memory,
             no_huge_pages: self.no_huge_pages,
+            no_coredump: self.no_coredump,
             deterministic_dirs: self.deterministic_dirs,
             hostname: self.hostname,
             fs_isolation,

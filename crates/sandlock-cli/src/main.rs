@@ -280,7 +280,7 @@ async fn main() -> Result<()> {
             if no_huge_pages { builder = builder.no_huge_pages(true); }
             if deterministic_dirs { builder = builder.deterministic_dirs(true); }
             if let Some(h) = hostname { builder = builder.hostname(h); }
-            if no_coredump { builder = builder.close_fds(true); }
+            if no_coredump { builder = builder.no_coredump(true); }
             for spec in &env_vars {
                 if let Some((k, v)) = spec.split_once('=') {
                     builder = builder.env_var(k, v);

@@ -450,6 +450,35 @@ class TestGpuDevices:
         assert result.success
 
 
+class TestNoCoredump:
+    """Tests for no_coredump (RLIMIT_CORE=0)."""
+
+    def test_no_coredump_rlimit_zero(self):
+        """With no_coredump=True, RLIMIT_CORE should be 0."""
+        code = (
+            "import resource; "
+            "soft, hard = resource.getrlimit(resource.RLIMIT_CORE); "
+            "print(f'{soft} {hard}')"
+        )
+        p = _policy(no_coredump=True)
+        result = Sandbox(p).run(["python3", "-c", code])
+        assert result.success
+        assert result.stdout.strip() == b"0 0"
+
+    def test_no_coredump_default_off(self):
+        """Without no_coredump, RLIMIT_CORE should be inherited (non-zero)."""
+        code = (
+            "import resource; "
+            "soft, hard = resource.getrlimit(resource.RLIMIT_CORE); "
+            "print(f'{soft} {hard}')"
+        )
+        p = _policy(no_coredump=False)
+        result = Sandbox(p).run(["python3", "-c", code])
+        assert result.success
+        # Default RLIMIT_CORE is typically unlimited (very large number), not "0 0"
+        assert result.stdout.strip() != b"0 0"
+
+
 class TestUnwiredFieldWarning:
     """Test that setting an unknown/unwired Policy field raises a warning."""
 

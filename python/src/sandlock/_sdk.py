@@ -107,6 +107,7 @@ _b_max_open_files = _builder_fn("sandlock_policy_builder_max_open_files", ctypes
 _b_close_fds = _builder_fn("sandlock_policy_builder_close_fds", ctypes.c_bool)
 _b_no_randomize_memory = _builder_fn("sandlock_policy_builder_no_randomize_memory", ctypes.c_bool)
 _b_no_huge_pages = _builder_fn("sandlock_policy_builder_no_huge_pages", ctypes.c_bool)
+_b_no_coredump = _builder_fn("sandlock_policy_builder_no_coredump", ctypes.c_bool)
 _b_deterministic_dirs = _builder_fn("sandlock_policy_builder_deterministic_dirs", ctypes.c_bool)
 _b_hostname = _builder_fn("sandlock_policy_builder_hostname", ctypes.c_char_p)
 _b_cpu_cores = _builder_fn("sandlock_policy_builder_cpu_cores", ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32)
@@ -677,9 +678,9 @@ class _NativePolicy:
         "privileged", "isolate_ipc", "isolate_signals",
         "random_seed", "time_start", "clean_env", "close_fds", "env",
         "deny_syscalls", "allow_syscalls", "isolate_pids", "max_open_files",
-        "no_randomize_memory", "no_huge_pages", "deterministic_dirs", "hostname",
-        # Managed outside _build_from_policy or Python-only:
-        "notif_policy", "no_coredump",
+        "no_randomize_memory", "no_huge_pages", "no_coredump", "deterministic_dirs", "hostname",
+        # Managed outside _build_from_policy:
+        "notif_policy",
     }
 
     @staticmethod
@@ -797,6 +798,8 @@ class _NativePolicy:
             b = _b_no_randomize_memory(b, True)
         if policy.no_huge_pages:
             b = _b_no_huge_pages(b, True)
+        if policy.no_coredump:
+            b = _b_no_coredump(b, True)
         if policy.deterministic_dirs:
             b = _b_deterministic_dirs(b, True)
         if policy.hostname is not None:

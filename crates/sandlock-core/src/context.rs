@@ -645,6 +645,19 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
         }
     }
 
+    // 5c. Optional: disable core dumps
+    if policy.no_coredump {
+        // Set RLIMIT_CORE to 0 — the kernel will not write a core file.
+        // We intentionally do NOT call prctl(PR_SET_DUMPABLE, 0) because
+        // that would break pidfd_getfd which the supervisor needs.
+        // The seccomp filter already blocks the child from calling
+        // prctl(PR_SET_DUMPABLE, ...) so it can't re-enable it.
+        let rlim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &rlim) } != 0 {
+            fail!("setrlimit(RLIMIT_CORE, 0)");
+        }
+    }
+
     // Capture real uid/gid before any unshare (after unshare they become 65534)
     let real_uid = unsafe { libc::getuid() };
     let real_gid = unsafe { libc::getgid() };

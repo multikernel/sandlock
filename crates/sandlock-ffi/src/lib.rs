@@ -524,6 +524,17 @@ pub unsafe extern "C" fn sandlock_policy_builder_no_huge_pages(
 /// # Safety
 /// `b` must be a valid builder pointer.
 #[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_no_coredump(
+    b: *mut PolicyBuilder, v: bool,
+) -> *mut PolicyBuilder {
+    if b.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.no_coredump(v)))
+}
+
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
 pub unsafe extern "C" fn sandlock_policy_builder_deterministic_dirs(
     b: *mut PolicyBuilder, v: bool,
 ) -> *mut PolicyBuilder {
