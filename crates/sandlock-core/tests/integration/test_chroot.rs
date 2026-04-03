@@ -5,12 +5,12 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
-/// Path to the static musl rootfs-helper binary.
+/// Path to the static rootfs-helper binary (compiled by build.rs).
 fn helper_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/rootfs-helper")
         .canonicalize()
-        .expect("rootfs-helper not found — run: musl-gcc -static -O2 -o tests/rootfs-helper tests/rootfs-helper.c")
+        .expect("rootfs-helper not found — build.rs should have compiled it")
 }
 
 /// Minimal fs_readable set needed to run rootfs-helper under chroot.
@@ -60,10 +60,11 @@ fn build_test_rootfs(name: &str) -> PathBuf {
     // Set /tmp sticky
     let _ = fs::set_permissions(rootfs.join("tmp"), fs::Permissions::from_mode(0o1777));
 
-    // Copy the helper binary
+    // Hard-link the helper binary (atomic, avoids ETXTBSY races from copy).
     let dest = rootfs.join("usr/bin/rootfs-helper");
-    fs::copy(&helper, &dest).expect("failed to copy rootfs-helper into rootfs");
-    let _ = fs::set_permissions(&dest, fs::Permissions::from_mode(0o755));
+    fs::hard_link(&helper, &dest)
+        .or_else(|_| fs::copy(&helper, &dest).map(|_| ()))
+        .expect("failed to install rootfs-helper into rootfs");
 
     // Create busybox-style symlinks (relative, within rootfs)
     for cmd in &["sh", "cat", "echo", "ls", "pwd", "readlink", "true", "write"] {

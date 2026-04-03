@@ -44,7 +44,10 @@ def rootfs(tmp_path):
 
     # Copy helper binary
     helper_dst = tmp_path / "usr" / "bin" / "rootfs-helper"
-    shutil.copy2(_HELPER_BIN, helper_dst)
+    try:
+        os.link(_HELPER_BIN, helper_dst)  # hard-link: atomic, avoids ETXTBSY
+    except OSError:
+        shutil.copy2(_HELPER_BIN, helper_dst)
 
     # Busybox-style symlinks
     for name in ("sh", "cat", "echo", "ls", "pwd", "readlink", "stat",

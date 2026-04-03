@@ -209,14 +209,15 @@ async fn test_chroot() {
     let _ = std::fs::create_dir_all(chroot_dir.join("usr/bin"));
     let _ = std::fs::create_dir_all(chroot_dir.join("tmp"));
 
-    // Install static helper binary
+    // Static helper binary (compiled by build.rs)
     let helper = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/rootfs-helper");
     if !helper.exists() {
-        eprintln!("chroot test skipped (rootfs-helper not built)");
+        eprintln!("chroot test skipped (rootfs-helper not compiled by build.rs)");
         return;
     }
-    let _ = std::fs::copy(&helper, chroot_dir.join("usr/bin/rootfs-helper"));
+    let dest = chroot_dir.join("usr/bin/rootfs-helper");
+    let _ = std::fs::hard_link(&helper, &dest).or_else(|_| std::fs::copy(&helper, &dest).map(|_| ()));
     // Busybox-style symlink: cat → rootfs-helper
     let _ = std::os::unix::fs::symlink("rootfs-helper", chroot_dir.join("usr/bin/cat"));
     // Merged-usr symlink: /bin → usr/bin
