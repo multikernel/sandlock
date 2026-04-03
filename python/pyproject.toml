@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=64", "setuptools-rust>=1.7"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -34,8 +34,6 @@ version = {attr = "sandlock._version.__version__"}
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[tool.setuptools.package-data]
-sandlock = ["*.so"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -20,14 +20,15 @@ if TYPE_CHECKING:
 
 def _find_lib() -> str:
     """Find libsandlock_ffi.so."""
-    # 1. Next to this file (installed via pip/maturin)
+    # 1. Next to this file (installed via pip/setuptools-rust)
     pkg_dir = Path(__file__).parent
-    for candidate in [
-        pkg_dir / "libsandlock_ffi.so",
-        pkg_dir / ".." / ".." / ".." / "target" / "release" / "libsandlock_ffi.so",
-    ]:
-        if candidate.exists():
-            return str(candidate.resolve())
+    # Check for cpython-tagged .so first (setuptools-rust), then plain name
+    for candidate in sorted(pkg_dir.glob("libsandlock_ffi*.so"), reverse=True):
+        return str(candidate.resolve())
+    # Dev build location
+    dev_lib = pkg_dir / ".." / ".." / ".." / "target" / "release" / "libsandlock_ffi.so"
+    if dev_lib.exists():
+        return str(dev_lib.resolve())
 
     # 2. System library path
     found = ctypes.util.find_library("sandlock_ffi")
