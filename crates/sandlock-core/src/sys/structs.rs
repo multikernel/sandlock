@@ -31,6 +31,7 @@ pub struct LandlockNetPortAttr {
 // ============================================================
 
 /// Seccomp BPF data passed to filters (64 bytes)
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct SeccompData {
     pub nr: i32,
@@ -40,6 +41,7 @@ pub struct SeccompData {
 }
 
 /// Seccomp user notification (80 bytes)
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct SeccompNotif {
     pub id: u64,

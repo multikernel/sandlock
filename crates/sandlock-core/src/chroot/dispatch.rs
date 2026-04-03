@@ -1021,3 +1021,249 @@ pub(crate) async fn handle_chroot_utimensat(
     }
     NotifAction::ReturnValue(0)
 }
+
+// ============================================================
+// Legacy (non-*at) syscall handlers for musl compatibility
+// ============================================================
+//
+// musl libc uses the older stat/open/access/readlink syscalls instead
+// of the *at variants.  These wrappers translate the argument layout
+// and delegate to the existing *at handlers.
+
+/// Build a synthetic SeccompNotif with modified args, preserving all other fields.
+fn notif_with_args(notif: &SeccompNotif, args: [u64; 6]) -> SeccompNotif {
+    let mut copy = *notif;
+    copy.data.args = args;
+    copy
+}
+
+/// SYS_open(path, flags, mode) → handle_chroot_open via openat(AT_FDCWD, path, flags, mode)
+pub(crate) async fn handle_chroot_legacy_open(
+    notif: &SeccompNotif,
+    state: &Arc<Mutex<SupervisorState>>,
+    notif_fd: RawFd,
+    ctx: &ChrootCtx<'_>,
+) -> NotifAction {
+    // open(path, flags, mode) → openat(AT_FDCWD, path, flags, mode)
+    let synth = notif_with_args(notif, [
+        libc::AT_FDCWD as u64,
+        notif.data.args[0], // path
+        notif.data.args[1], // flags
+        notif.data.args[2], // mode
+        0, 0,
+    ]);
+    handle_chroot_open(&synth, state, notif_fd, ctx).await
+}
+
+/// SYS_stat(path, statbuf) → handle_chroot_stat via newfstatat(AT_FDCWD, path, statbuf, 0)
+pub(crate) async fn handle_chroot_legacy_stat(
+    notif: &SeccompNotif,
+    state: &Arc<Mutex<SupervisorState>>,
+    notif_fd: RawFd,
+    ctx: &ChrootCtx<'_>,
+) -> NotifAction {
+    let synth = notif_with_args(notif, [
+        libc::AT_FDCWD as u64,
+        notif.data.args[0], // path
+        notif.data.args[1], // statbuf
+        0,                  // flags = 0 (follow symlinks)
+        0, 0,
+    ]);
+    handle_chroot_stat(&synth, state, notif_fd, ctx).await
+}
+
+/// SYS_lstat(path, statbuf) → handle_chroot_stat via newfstatat(AT_FDCWD, path, statbuf, AT_SYMLINK_NOFOLLOW)
+pub(crate) async fn handle_chroot_legacy_lstat(
+    notif: &SeccompNotif,
+    state: &Arc<Mutex<SupervisorState>>,
+    notif_fd: RawFd,
+    ctx: &ChrootCtx<'_>,
+) -> NotifAction {
+    let synth = notif_with_args(notif, [
+        libc::AT_FDCWD as u64,
+        notif.data.args[0], // path
+        notif.data.args[1], // statbuf
+        libc::AT_SYMLINK_NOFOLLOW as u64,
+        0, 0,
+    ]);
+    handle_chroot_stat(&synth, state, notif_fd, ctx).await
+}
+
+/// SYS_access(path, mode) → handle_chroot_stat via faccessat(AT_FDCWD, path, mode, 0)
+pub(crate) async fn handle_chroot_legacy_access(
+    notif: &SeccompNotif,
+    state: &Arc<Mutex<SupervisorState>>,
+    notif_fd: RawFd,
+    ctx: &ChrootCtx<'_>,
+) -> NotifAction {
+    // Synthesize as faccessat — reuse SYS_faccessat nr so the handler
+    // recognises it as an access check.
+    let mut synth = notif_with_args(notif, [
+        libc::AT_FDCWD as u64,
+        notif.data.args[0], // path
+        0,                  // statbuf (unused for faccessat path)
+        0,                  // flags
+        0, 0,
+    ]);
+    synth.data.nr = libc::SYS_faccessat as i32;
+    handle_chroot_stat(&synth, state, notif_fd, ctx).await
+}
+
+/// SYS_readlink(path, buf, bufsiz) → handle_chroot_readlink via readlinkat(AT_FDCWD, path, buf, bufsiz)
+pub(crate) async fn handle_chroot_legacy_readlink(
+    notif: &SeccompNotif,
+    state: &Arc<Mutex<SupervisorState>>,
+    notif_fd: RawFd,
+    ctx: &ChrootCtx<'_>,
+) -> NotifAction {
+    let synth = notif_with_args(notif, [
+        libc::AT_FDCWD as u64,
+        notif.data.args[0], // path
+        notif.data.args[1], // buf
+        notif.data.args[2], // bufsiz
+        0, 0,
+    ]);
+    handle_chroot_readlink(&synth, state, notif_fd, ctx).await
+}
+
+/// SYS_unlink(path) → handle_chroot_write via unlinkat(AT_FDCWD, path, 0)
+pub(crate) async fn handle_chroot_legacy_unlink(
+    notif: &SeccompNotif,
+    state: &Arc<Mutex<SupervisorState>>,
+    notif_fd: RawFd,
+    ctx: &ChrootCtx<'_>,
+) -> NotifAction {
+    let mut synth = notif_with_args(notif, [
+        libc::AT_FDCWD as u64,
+        notif.data.args[0], // path
+        0,                  // flags
+        0, 0, 0,
+    ]);
+    synth.data.nr = libc::SYS_unlinkat as i32;
+    handle_chroot_write(&synth, state, notif_fd, ctx).await
+}
+
+/// SYS_rmdir(path) → handle_chroot_write via unlinkat(AT_FDCWD, path, AT_REMOVEDIR)
+pub(crate) async fn handle_chroot_legacy_rmdir(
+    notif: &SeccompNotif,
+    state: &Arc<Mutex<SupervisorState>>,
+    notif_fd: RawFd,
+    ctx: &ChrootCtx<'_>,
+) -> NotifAction {
+    let mut synth = notif_with_args(notif, [
+        libc::AT_FDCWD as u64,
+        notif.data.args[0], // path
+        libc::AT_REMOVEDIR as u64,
+        0, 0, 0,
+    ]);
+    synth.data.nr = libc::SYS_unlinkat as i32;
+    handle_chroot_write(&synth, state, notif_fd, ctx).await
+}
+
+/// SYS_mkdir(path, mode) → handle_chroot_write via mkdirat(AT_FDCWD, path, mode)
+pub(crate) async fn handle_chroot_legacy_mkdir(
+    notif: &SeccompNotif,
+    state: &Arc<Mutex<SupervisorState>>,
+    notif_fd: RawFd,
+    ctx: &ChrootCtx<'_>,
+) -> NotifAction {
+    let mut synth = notif_with_args(notif, [
+        libc::AT_FDCWD as u64,
+        notif.data.args[0], // path
+        notif.data.args[1], // mode
+        0, 0, 0,
+    ]);
+    synth.data.nr = libc::SYS_mkdirat as i32;
+    handle_chroot_write(&synth, state, notif_fd, ctx).await
+}
+
+/// SYS_rename(oldpath, newpath) → handle_chroot_write via renameat2(AT_FDCWD, old, AT_FDCWD, new, 0)
+pub(crate) async fn handle_chroot_legacy_rename(
+    notif: &SeccompNotif,
+    state: &Arc<Mutex<SupervisorState>>,
+    notif_fd: RawFd,
+    ctx: &ChrootCtx<'_>,
+) -> NotifAction {
+    let mut synth = notif_with_args(notif, [
+        libc::AT_FDCWD as u64,
+        notif.data.args[0], // oldpath
+        libc::AT_FDCWD as u64,
+        notif.data.args[1], // newpath
+        0, 0,
+    ]);
+    synth.data.nr = libc::SYS_renameat2 as i32;
+    handle_chroot_write(&synth, state, notif_fd, ctx).await
+}
+
+/// SYS_symlink(target, linkpath) → handle_chroot_write via symlinkat(target, AT_FDCWD, linkpath)
+pub(crate) async fn handle_chroot_legacy_symlink(
+    notif: &SeccompNotif,
+    state: &Arc<Mutex<SupervisorState>>,
+    notif_fd: RawFd,
+    ctx: &ChrootCtx<'_>,
+) -> NotifAction {
+    let mut synth = notif_with_args(notif, [
+        notif.data.args[0], // target
+        libc::AT_FDCWD as u64,
+        notif.data.args[1], // linkpath
+        0, 0, 0,
+    ]);
+    synth.data.nr = libc::SYS_symlinkat as i32;
+    handle_chroot_write(&synth, state, notif_fd, ctx).await
+}
+
+/// SYS_link(oldpath, newpath) → handle_chroot_write via linkat(AT_FDCWD, old, AT_FDCWD, new, 0)
+pub(crate) async fn handle_chroot_legacy_link(
+    notif: &SeccompNotif,
+    state: &Arc<Mutex<SupervisorState>>,
+    notif_fd: RawFd,
+    ctx: &ChrootCtx<'_>,
+) -> NotifAction {
+    let mut synth = notif_with_args(notif, [
+        libc::AT_FDCWD as u64,
+        notif.data.args[0], // oldpath
+        libc::AT_FDCWD as u64,
+        notif.data.args[1], // newpath
+        0, 0,
+    ]);
+    synth.data.nr = libc::SYS_linkat as i32;
+    handle_chroot_write(&synth, state, notif_fd, ctx).await
+}
+
+/// SYS_chmod(path, mode) → handle_chroot_write via fchmodat(AT_FDCWD, path, mode)
+pub(crate) async fn handle_chroot_legacy_chmod(
+    notif: &SeccompNotif,
+    state: &Arc<Mutex<SupervisorState>>,
+    notif_fd: RawFd,
+    ctx: &ChrootCtx<'_>,
+) -> NotifAction {
+    let mut synth = notif_with_args(notif, [
+        libc::AT_FDCWD as u64,
+        notif.data.args[0], // path
+        notif.data.args[1], // mode
+        0, 0, 0,
+    ]);
+    synth.data.nr = libc::SYS_fchmodat as i32;
+    handle_chroot_write(&synth, state, notif_fd, ctx).await
+}
+
+/// SYS_chown/lchown(path, uid, gid) → handle_chroot_write via fchownat(AT_FDCWD, path, uid, gid, flags)
+pub(crate) async fn handle_chroot_legacy_chown(
+    notif: &SeccompNotif,
+    state: &Arc<Mutex<SupervisorState>>,
+    notif_fd: RawFd,
+    ctx: &ChrootCtx<'_>,
+    nofollow: bool,
+) -> NotifAction {
+    let flags = if nofollow { libc::AT_SYMLINK_NOFOLLOW as u64 } else { 0 };
+    let mut synth = notif_with_args(notif, [
+        libc::AT_FDCWD as u64,
+        notif.data.args[0], // path
+        notif.data.args[1], // uid
+        notif.data.args[2], // gid
+        flags,
+        0,
+    ]);
+    synth.data.nr = libc::SYS_fchownat as i32;
+    handle_chroot_write(&synth, state, notif_fd, ctx).await
+}

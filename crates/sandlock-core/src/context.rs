@@ -311,6 +311,7 @@ pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
     if policy.chroot.is_some() {
         nrs.extend_from_slice(&[
             libc::SYS_openat as u32,
+            libc::SYS_open as u32,        // musl uses open(2) instead of openat
             libc::SYS_execve as u32,
             libc::SYS_execveat as u32,
             libc::SYS_unlinkat as u32,
@@ -322,15 +323,28 @@ pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
             libc::SYS_fchownat as u32,
             libc::SYS_truncate as u32,
             libc::SYS_newfstatat as u32,
+            libc::SYS_stat as u32,        // musl uses stat(2) instead of newfstatat
+            libc::SYS_lstat as u32,       // musl uses lstat(2) instead of newfstatat
             libc::SYS_statx as u32,
             libc::SYS_faccessat as u32,
+            libc::SYS_access as u32,      // musl uses access(2) instead of faccessat
             libc::SYS_readlinkat as u32,
+            libc::SYS_readlink as u32,    // musl uses readlink(2) instead of readlinkat
             libc::SYS_getdents64 as u32,
             libc::SYS_getdents as u32,
             libc::SYS_chdir as u32,
             libc::SYS_getcwd as u32,
             libc::SYS_statfs as u32,
             libc::SYS_utimensat as u32,
+            libc::SYS_unlink as u32,      // musl uses unlink(2) instead of unlinkat
+            libc::SYS_rmdir as u32,       // musl uses rmdir(2) instead of unlinkat
+            libc::SYS_mkdir as u32,       // musl uses mkdir(2) instead of mkdirat
+            libc::SYS_rename as u32,      // musl uses rename(2) instead of renameat2
+            libc::SYS_symlink as u32,     // musl uses symlink(2) instead of symlinkat
+            libc::SYS_link as u32,        // musl uses link(2) instead of linkat
+            libc::SYS_chmod as u32,       // musl uses chmod(2) instead of fchmodat
+            libc::SYS_chown as u32,       // musl uses chown(2)/lchown(2) instead of fchownat
+            libc::SYS_lchown as u32,
         ]);
     }
 

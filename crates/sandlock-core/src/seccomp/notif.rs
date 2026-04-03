@@ -542,6 +542,12 @@ async fn dispatch(
                 return action;
             }
         }
+        if nr == libc::SYS_open as i64 {
+            let action = crate::chroot::dispatch::handle_chroot_legacy_open(notif, state, notif_fd, &ctx).await;
+            if !matches!(action, NotifAction::Continue) {
+                return action;
+            }
+        }
         if nr == libc::SYS_execve || nr == libc::SYS_execveat {
             return crate::chroot::dispatch::handle_chroot_exec(notif, state, notif_fd, &ctx).await;
         }
@@ -552,16 +558,56 @@ async fn dispatch(
         {
             return crate::chroot::dispatch::handle_chroot_write(notif, state, notif_fd, &ctx).await;
         }
+        // Legacy write syscalls (musl)
+        if nr == libc::SYS_unlink as i64 {
+            return crate::chroot::dispatch::handle_chroot_legacy_unlink(notif, state, notif_fd, &ctx).await;
+        }
+        if nr == libc::SYS_rmdir as i64 {
+            return crate::chroot::dispatch::handle_chroot_legacy_rmdir(notif, state, notif_fd, &ctx).await;
+        }
+        if nr == libc::SYS_mkdir as i64 {
+            return crate::chroot::dispatch::handle_chroot_legacy_mkdir(notif, state, notif_fd, &ctx).await;
+        }
+        if nr == libc::SYS_rename as i64 {
+            return crate::chroot::dispatch::handle_chroot_legacy_rename(notif, state, notif_fd, &ctx).await;
+        }
+        if nr == libc::SYS_symlink as i64 {
+            return crate::chroot::dispatch::handle_chroot_legacy_symlink(notif, state, notif_fd, &ctx).await;
+        }
+        if nr == libc::SYS_link as i64 {
+            return crate::chroot::dispatch::handle_chroot_legacy_link(notif, state, notif_fd, &ctx).await;
+        }
+        if nr == libc::SYS_chmod as i64 {
+            return crate::chroot::dispatch::handle_chroot_legacy_chmod(notif, state, notif_fd, &ctx).await;
+        }
+        if nr == libc::SYS_chown as i64 {
+            return crate::chroot::dispatch::handle_chroot_legacy_chown(notif, state, notif_fd, &ctx, false).await;
+        }
+        if nr == libc::SYS_lchown as i64 {
+            return crate::chroot::dispatch::handle_chroot_legacy_chown(notif, state, notif_fd, &ctx, true).await;
+        }
         if nr == libc::SYS_newfstatat || nr == libc::SYS_faccessat
             || nr == crate::chroot::dispatch::SYS_FACCESSAT2
         {
             return crate::chroot::dispatch::handle_chroot_stat(notif, state, notif_fd, &ctx).await;
+        }
+        if nr == libc::SYS_stat as i64 {
+            return crate::chroot::dispatch::handle_chroot_legacy_stat(notif, state, notif_fd, &ctx).await;
+        }
+        if nr == libc::SYS_lstat as i64 {
+            return crate::chroot::dispatch::handle_chroot_legacy_lstat(notif, state, notif_fd, &ctx).await;
+        }
+        if nr == libc::SYS_access as i64 {
+            return crate::chroot::dispatch::handle_chroot_legacy_access(notif, state, notif_fd, &ctx).await;
         }
         if nr == libc::SYS_statx {
             return crate::chroot::dispatch::handle_chroot_statx(notif, state, notif_fd, &ctx).await;
         }
         if nr == libc::SYS_readlinkat {
             return crate::chroot::dispatch::handle_chroot_readlink(notif, state, notif_fd, &ctx).await;
+        }
+        if nr == libc::SYS_readlink as i64 {
+            return crate::chroot::dispatch::handle_chroot_legacy_readlink(notif, state, notif_fd, &ctx).await;
         }
         if nr == libc::SYS_getdents64 as i64 || nr == libc::SYS_getdents as i64 {
             return crate::chroot::dispatch::handle_chroot_getdents(notif, state, notif_fd, &ctx).await;
