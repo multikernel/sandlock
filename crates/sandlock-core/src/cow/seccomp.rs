@@ -128,9 +128,19 @@ impl SeccompCowBranch {
 
     /// Check whether `additional` bytes would exceed the disk quota.
     /// Returns `Ok(())` if within quota or quota is unlimited (0).
+    /// Check whether `additional` bytes would exceed the disk quota.
+    /// Returns `Ok(())` if within quota or quota is unlimited (0).
+    /// When `additional` is 0 the check uses `>=` — meaning "quota is
+    /// already exhausted, don't allow any new allocations".
     fn check_quota(&self, additional: u64) -> Result<(), BranchError> {
-        if self.max_disk_bytes > 0 && self.disk_used + additional > self.max_disk_bytes {
-            return Err(BranchError::QuotaExceeded);
+        if self.max_disk_bytes > 0 {
+            if additional == 0 {
+                if self.disk_used >= self.max_disk_bytes {
+                    return Err(BranchError::QuotaExceeded);
+                }
+            } else if self.disk_used + additional > self.max_disk_bytes {
+                return Err(BranchError::QuotaExceeded);
+            }
         }
         Ok(())
     }
@@ -175,6 +185,11 @@ impl SeccompCowBranch {
             fs::set_permissions(&upper_file, meta.permissions())
                 .map_err(|e| BranchError::Operation(format!("set permissions: {}", e)))?;
             self.disk_used += file_size;
+        } else {
+            // New file (not in lower layer). We can't predict how much
+            // the child will write, but we must at least block creation
+            // when the quota is already exceeded.
+            self.check_quota(0)?;
         }
 
         Ok(upper_file)
@@ -195,6 +210,12 @@ impl SeccompCowBranch {
     /// Handle openat: resolve to upper or lower path.
     ///
     /// Returns `Err(QuotaExceeded)` when the write would exceed `max_disk`.
+    ///
+    /// When a quota is active and the open is a write, resync `disk_used`
+    /// from the real upper directory first.  This catches growth from
+    /// `write()` syscalls on previously injected fds (which bypass the
+    /// seccomp supervisor) and prevents new opens once the quota is
+    /// exhausted.
     pub fn handle_open(&mut self, path: &str, flags: u64) -> Result<Option<PathBuf>, BranchError> {
         if flags & O_DIRECTORY != 0 {
             return Ok(None);
@@ -203,13 +224,23 @@ impl SeccompCowBranch {
             Some(r) => r,
             None => return Ok(None),
         };
+
+        let is_write = flags & WRITE_FLAGS != 0;
+
+        // Resync quota accounting before any write open so that bytes
+        // written through previously injected fds are counted.
+        if is_write && self.max_disk_bytes > 0 {
+            self.recalc_disk_used();
+            self.check_quota(0)?;
+        }
+
         if self.is_deleted(&rel) {
             if flags & O_CREAT != 0 {
                 return self.ensure_cow_copy(&rel).map(Some);
             }
             return Ok(None);
         }
-        if flags & WRITE_FLAGS != 0 {
+        if is_write {
             self.ensure_cow_copy(&rel).map(Some)
         } else {
             let resolved = self.resolve_read(&rel);
@@ -920,5 +951,66 @@ mod tests {
         assert_eq!(branch.disk_used, 5);
         branch.ensure_cow_copy("subdir/nested.txt").unwrap(); // 6 bytes
         assert_eq!(branch.disk_used, 11);
+    }
+
+    #[test]
+    fn test_quota_new_file_blocked_when_exhausted() {
+        let (workdir, storage) = setup_workdir();
+        // Quota = 5 bytes. COW-copy existing.txt to fill it exactly.
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 5).unwrap();
+        assert!(branch.ensure_cow_copy("existing.txt").is_ok()); // 5 of 5 used
+
+        // Creating a new file (not in lower) should be blocked — quota is full.
+        let err = branch.ensure_cow_copy("brand_new.txt").unwrap_err();
+        assert!(matches!(err, BranchError::QuotaExceeded));
+    }
+
+    #[test]
+    fn test_quota_new_file_allowed_when_space_remains() {
+        let (workdir, storage) = setup_workdir();
+        // Quota = 100 bytes, 0 used — new file creation should succeed.
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 100).unwrap();
+        assert!(branch.ensure_cow_copy("brand_new.txt").is_ok());
+    }
+
+    #[test]
+    fn test_quota_resync_on_write_open() {
+        let (workdir, storage) = setup_workdir();
+        // Quota = 50 bytes. COW-copy existing.txt (5 bytes tracked).
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 50).unwrap();
+        let path = abs(&branch, "existing.txt");
+        let upper = branch.handle_open(&path, O_WRONLY).unwrap().unwrap();
+
+        // Simulate a write() that bypasses the supervisor — grow the
+        // file in upper directly (as the kernel would via the injected fd).
+        fs::write(&upper, vec![0u8; 50]).unwrap();
+
+        // disk_used counter is stale (still 5), but the next write open
+        // should resync from the real upper dir and see 50 bytes.
+        assert_eq!(branch.disk_used, 5); // stale before resync
+
+        let path2 = abs(&branch, "subdir/nested.txt");
+        let err = branch.handle_open(&path2, O_WRONLY).unwrap_err();
+        assert!(matches!(err, BranchError::QuotaExceeded));
+        // After resync, disk_used reflects the real upper size.
+        assert!(branch.disk_used >= 50);
+    }
+
+    #[test]
+    fn test_quota_resync_not_triggered_on_read() {
+        let (workdir, storage) = setup_workdir();
+        // Quota = 10 bytes. COW-copy existing.txt (5 bytes), then grow
+        // it behind our back. A read-only open should NOT resync or fail.
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 10).unwrap();
+        let write_path = abs(&branch, "existing.txt");
+        let upper = branch.handle_open(&write_path, O_WRONLY).unwrap().unwrap();
+        fs::write(&upper, vec![0u8; 50]).unwrap(); // way over quota
+
+        // Read-only open should succeed without resyncing.
+        let read_path = abs(&branch, "existing.txt");
+        let result = branch.handle_open(&read_path, 0).unwrap(); // O_RDONLY
+        assert!(result.is_some());
+        // disk_used still stale — resync only happens on write opens.
+        assert_eq!(branch.disk_used, 5);
     }
 }
