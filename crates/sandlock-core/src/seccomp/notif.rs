@@ -387,6 +387,11 @@ fn write_child_mem_vm(pid: u32, addr: u64, data: &[u8]) -> Result<(), NotifError
     };
     if ret < 0 {
         Err(NotifError::ChildMemoryRead(io::Error::last_os_error()))
+    } else if (ret as usize) < data.len() {
+        Err(NotifError::ChildMemoryRead(io::Error::new(
+            io::ErrorKind::WriteZero,
+            format!("short write: {} of {} bytes", ret, data.len()),
+        )))
     } else {
         Ok(())
     }

@@ -337,6 +337,44 @@ async fn test_chroot_write_denied_without_fs_write() {
     cleanup_rootfs(&rootfs);
 }
 
+/// execve inside chroot with fs_readable=["/"] should work — regression test
+/// for a bug where the seccomp path rewrite truncated /proc/self/fd/N when
+/// the original path buffer was shorter than the replacement string.
+#[tokio::test]
+async fn test_chroot_exec_with_root_readable() {
+    let rootfs = build_test_rootfs("exec-root-readable");
+
+    // Use fs_read("/") as the bug report specified — Landlock translates this
+    // to the chroot rootfs path, which should cover all paths inside.
+    // We still need host paths for symlink targets since test rootfs uses
+    // symlinks to host directories.
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_read("/etc")
+        .fs_read("/")
+        .build()
+        .unwrap();
+
+    let result = Sandbox::run(&policy, &["/bin/echo", "chroot-exec-ok"]).await;
+    match result {
+        Ok(r) => {
+            assert!(
+                r.success(),
+                "/bin/echo should succeed with fs_read(\"/\"), exit={:?} stderr: {} stdout: {}",
+                r.code(), r.stderr_str().unwrap_or(""), r.stdout_str().unwrap_or("")
+            );
+            let stdout = r.stdout_str().unwrap_or("");
+            assert!(
+                stdout.contains("chroot-exec-ok"),
+                "should print chroot-exec-ok, got: {}",
+                stdout
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
 /// Reading /etc/hostname should fail when /etc is not in fs_readable
 #[tokio::test]
 async fn test_chroot_read_denied_without_fs_read() {
