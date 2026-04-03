@@ -5,15 +5,20 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
-/// Minimal fs_readable set needed to run a binary under chroot.
+/// Path to the static musl rootfs-helper binary.
+fn helper_binary() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/rootfs-helper")
+        .canonicalize()
+        .expect("rootfs-helper not found — run: musl-gcc -static -O2 -o tests/rootfs-helper tests/rootfs-helper.c")
+}
+
+/// Minimal fs_readable set needed to run rootfs-helper under chroot.
 fn minimal_exec_policy(rootfs: &PathBuf) -> sandlock_core::PolicyBuilder {
     Policy::builder()
         .chroot(rootfs)
         .fs_read("/usr")
-        .fs_read("/lib")
-        .fs_read("/lib64")
         .fs_read("/bin")
-        .fs_read("/sbin")
         .fs_read("/proc")
         .fs_read("/dev")
 }
@@ -25,37 +30,61 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
+/// Build a self-contained rootfs with the static rootfs-helper binary.
+///
+/// Layout:
+///   usr/bin/rootfs-helper   — the real binary
+///   usr/bin/sh              — symlink -> rootfs-helper
+///   usr/bin/cat             — symlink -> rootfs-helper
+///   usr/bin/echo            — symlink -> rootfs-helper
+///   usr/bin/ls              — symlink -> rootfs-helper
+///   usr/bin/pwd             — symlink -> rootfs-helper
+///   usr/bin/readlink        — symlink -> rootfs-helper
+///   usr/bin/true            — symlink -> rootfs-helper
+///   usr/bin/write           — symlink -> rootfs-helper
+///   bin                     — symlink -> usr/bin  (merged /usr)
+///   sbin                    — symlink -> usr/sbin (merged /usr)
+///   etc/
+///   proc/
+///   dev/
+///   tmp/                    — mode 1777
 fn build_test_rootfs(name: &str) -> PathBuf {
     let rootfs = temp_dir(name);
-    for dir in &[
-        "usr", "lib", "lib64", "bin", "sbin", "etc", "proc", "dev", "tmp",
-    ] {
-        let host = PathBuf::from("/").join(dir);
-        let target = rootfs.join(dir);
-        if host.exists() && !target.exists() {
-            let _ = std::os::unix::fs::symlink(&host, &target);
-        }
+    let helper = helper_binary();
+
+    // Create real directories
+    for dir in &["usr/bin", "usr/sbin", "etc", "proc", "dev", "tmp"] {
+        let _ = fs::create_dir_all(rootfs.join(dir));
     }
-    let tmp = rootfs.join("tmp");
-    if !tmp.exists() {
-        let _ = fs::create_dir_all(&tmp);
-        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o1777));
+
+    // Set /tmp sticky
+    let _ = fs::set_permissions(rootfs.join("tmp"), fs::Permissions::from_mode(0o1777));
+
+    // Copy the helper binary
+    let dest = rootfs.join("usr/bin/rootfs-helper");
+    fs::copy(&helper, &dest).expect("failed to copy rootfs-helper into rootfs");
+    let _ = fs::set_permissions(&dest, fs::Permissions::from_mode(0o755));
+
+    // Create busybox-style symlinks (relative, within rootfs)
+    for cmd in &["sh", "cat", "echo", "ls", "pwd", "readlink", "true", "write"] {
+        let link = rootfs.join(format!("usr/bin/{}", cmd));
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink("rootfs-helper", &link)
+            .expect("failed to create busybox symlink");
     }
+
+    // Merged /usr symlinks (like real distros)
+    let _ = std::os::unix::fs::symlink("usr/bin", rootfs.join("bin"));
+    let _ = std::os::unix::fs::symlink("usr/sbin", rootfs.join("sbin"));
+
     rootfs
 }
 
 fn cleanup_rootfs(rootfs: &PathBuf) {
-    // Remove symlinks and dirs; ignore errors
-    for dir in &[
-        "usr", "lib", "lib64", "bin", "sbin", "etc", "proc", "dev", "tmp",
-    ] {
-        let target = rootfs.join(dir);
-        let _ = fs::remove_file(&target); // removes symlinks
-    }
     let _ = fs::remove_dir_all(rootfs);
 }
 
-/// List / inside chroot shows rootfs contents (should see "usr", "tmp")
+/// List / inside chroot shows rootfs contents (should see "usr", "tmp", "bin", "etc")
 #[tokio::test]
 async fn test_chroot_ls_root() {
     let rootfs = build_test_rootfs("ls-root");
@@ -63,10 +92,7 @@ async fn test_chroot_ls_root() {
     let policy = Policy::builder()
         .chroot(&rootfs)
         .fs_read("/usr")
-        .fs_read("/lib")
-        .fs_read("/lib64")
         .fs_read("/bin")
-        .fs_read("/sbin")
         .fs_read("/etc")
         .fs_read("/proc")
         .fs_read("/dev")
@@ -74,17 +100,19 @@ async fn test_chroot_ls_root() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, &["ls", "/"]).await;
+    let result = Sandbox::run(&policy, &["rootfs-helper", "ls", "/"]).await;
     match result {
         Ok(r) => {
             assert!(
                 r.success(),
-                "echo /* should succeed, stderr: {}",
+                "ls / should succeed, stderr: {}",
                 r.stderr_str().unwrap_or("")
             );
             let stdout = r.stdout_str().unwrap_or("");
             assert!(stdout.contains("usr"), "should list usr, got: {}", stdout);
             assert!(stdout.contains("tmp"), "should list tmp, got: {}", stdout);
+            assert!(stdout.contains("bin"), "should list bin, got: {}", stdout);
+            assert!(stdout.contains("etc"), "should list etc, got: {}", stdout);
         }
         Err(e) => eprintln!("Chroot test skipped: {}", e),
     }
@@ -98,21 +126,13 @@ async fn test_chroot_no_escape() {
     let rootfs = build_test_rootfs("no-escape");
 
     // Write a sentinel file only inside the chroot's /etc
-    let chroot_etc = rootfs.join("etc");
-    if chroot_etc.is_symlink() {
-        let _ = fs::remove_file(&chroot_etc);
-    }
-    let _ = fs::create_dir_all(&chroot_etc);
     let sentinel = "sandlock-chroot-sentinel";
-    fs::write(chroot_etc.join("sentinel"), sentinel).unwrap();
+    fs::write(rootfs.join("etc/sentinel"), sentinel).unwrap();
 
     let policy = Policy::builder()
         .chroot(&rootfs)
         .fs_read("/usr")
-        .fs_read("/lib")
-        .fs_read("/lib64")
         .fs_read("/bin")
-        .fs_read("/sbin")
         .fs_read("/etc")
         .fs_read("/proc")
         .fs_read("/dev")
@@ -121,7 +141,7 @@ async fn test_chroot_no_escape() {
 
     // Path traversal: /../../etc/sentinel should resolve to /etc/sentinel inside
     // the chroot (the sentinel file we created), not escape to the host.
-    let result = Sandbox::run(&policy, &["cat", "/../../etc/sentinel"]).await;
+    let result = Sandbox::run(&policy, &["rootfs-helper", "cat", "/../../etc/sentinel"]).await;
     match result {
         Ok(r) => {
             assert!(
@@ -151,17 +171,14 @@ async fn test_chroot_getcwd() {
     let policy = Policy::builder()
         .chroot(&rootfs)
         .fs_read("/usr")
-        .fs_read("/lib")
-        .fs_read("/lib64")
         .fs_read("/bin")
-        .fs_read("/sbin")
         .fs_read("/etc")
         .fs_read("/proc")
         .fs_read("/dev")
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, &["pwd"]).await;
+    let result = Sandbox::run(&policy, &["rootfs-helper", "pwd"]).await;
     match result {
         Ok(r) => {
             assert!(
@@ -186,10 +203,7 @@ async fn test_chroot_write_file() {
     let policy = Policy::builder()
         .chroot(&rootfs)
         .fs_read("/usr")
-        .fs_read("/lib")
-        .fs_read("/lib64")
         .fs_read("/bin")
-        .fs_read("/sbin")
         .fs_read("/etc")
         .fs_read("/proc")
         .fs_read("/dev")
@@ -197,9 +211,11 @@ async fn test_chroot_write_file() {
         .build()
         .unwrap();
 
-    let result =
-        Sandbox::run(&policy, &["sh", "-c", "echo hello > /tmp/test.txt && cat /tmp/test.txt"])
-            .await;
+    let result = Sandbox::run(
+        &policy,
+        &["rootfs-helper", "sh", "-c", "echo hello > /tmp/test.txt && cat /tmp/test.txt"],
+    )
+    .await;
     match result {
         Ok(r) => {
             assert!(
@@ -227,19 +243,12 @@ async fn test_chroot_write_file() {
 #[tokio::test]
 async fn test_chroot_with_cow() {
     let rootfs = build_test_rootfs("cow");
-    // Create a real tmp dir (not a symlink) for writes
     let tmp_dir = rootfs.join("tmp");
-    let _ = fs::remove_file(&tmp_dir); // remove symlink if any
-    let _ = fs::create_dir_all(&tmp_dir);
-    let _ = fs::set_permissions(&tmp_dir, fs::Permissions::from_mode(0o1777));
 
     let policy = Policy::builder()
         .chroot(&rootfs)
         .fs_read("/usr")
-        .fs_read("/lib")
-        .fs_read("/lib64")
         .fs_read("/bin")
-        .fs_read("/sbin")
         .fs_read("/etc")
         .fs_read("/proc")
         .fs_read("/dev")
@@ -249,8 +258,11 @@ async fn test_chroot_with_cow() {
         .build()
         .unwrap();
 
-    let result =
-        Sandbox::run(&policy, &["sh", "-c", "echo cow-test > /tmp/cow.txt"]).await;
+    let result = Sandbox::run(
+        &policy,
+        &["rootfs-helper", "sh", "-c", "echo cow-test > /tmp/cow.txt"],
+    )
+    .await;
     match result {
         Ok(r) => {
             assert!(
@@ -280,17 +292,14 @@ async fn test_chroot_proc_self_root() {
     let policy = Policy::builder()
         .chroot(&rootfs)
         .fs_read("/usr")
-        .fs_read("/lib")
-        .fs_read("/lib64")
         .fs_read("/bin")
-        .fs_read("/sbin")
         .fs_read("/etc")
         .fs_read("/proc")
         .fs_read("/dev")
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, &["readlink", "/proc/self/root"]).await;
+    let result = Sandbox::run(&policy, &["rootfs-helper", "readlink", "/proc/self/root"]).await;
     match result {
         Ok(r) => {
             assert!(
@@ -323,7 +332,11 @@ async fn test_chroot_write_denied_without_fs_write() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, &["sh", "-c", "echo denied > /tmp/should-fail.txt"]).await;
+    let result = Sandbox::run(
+        &policy,
+        &["rootfs-helper", "sh", "-c", "echo denied > /tmp/should-fail.txt"],
+    )
+    .await;
     match result {
         Ok(r) => {
             assert!(
@@ -344,22 +357,19 @@ async fn test_chroot_write_denied_without_fs_write() {
 async fn test_chroot_exec_with_root_readable() {
     let rootfs = build_test_rootfs("exec-root-readable");
 
-    // Use fs_read("/") as the bug report specified — Landlock translates this
-    // to the chroot rootfs path, which should cover all paths inside.
-    // We still need host paths for symlink targets since test rootfs uses
-    // symlinks to host directories.
     let policy = minimal_exec_policy(&rootfs)
         .fs_read("/etc")
         .fs_read("/")
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, &["/bin/echo", "chroot-exec-ok"]).await;
+    // Use /bin/rootfs-helper which goes through the bin -> usr/bin symlink
+    let result = Sandbox::run(&policy, &["/bin/rootfs-helper", "echo", "chroot-exec-ok"]).await;
     match result {
         Ok(r) => {
             assert!(
                 r.success(),
-                "/bin/echo should succeed with fs_read(\"/\"), exit={:?} stderr: {} stdout: {}",
+                "/bin/rootfs-helper should succeed with fs_read(\"/\"), exit={:?} stderr: {} stdout: {}",
                 r.code(), r.stderr_str().unwrap_or(""), r.stdout_str().unwrap_or("")
             );
             let stdout = r.stdout_str().unwrap_or("");
@@ -380,12 +390,15 @@ async fn test_chroot_exec_with_root_readable() {
 async fn test_chroot_read_denied_without_fs_read() {
     let rootfs = build_test_rootfs("read-denied");
 
+    // Create a hostname file in the rootfs
+    fs::write(rootfs.join("etc/hostname"), "sandlock-test-host").unwrap();
+
     let policy = minimal_exec_policy(&rootfs)
         // Deliberately NO fs_read("/etc")
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, &["cat", "/etc/hostname"]).await;
+    let result = Sandbox::run(&policy, &["rootfs-helper", "cat", "/etc/hostname"]).await;
     match result {
         Ok(r) => {
             assert!(

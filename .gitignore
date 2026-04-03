@@ -10,3 +10,4 @@ build/
 .eggs/
 *.so
 .venv/
+tests/rootfs-helper

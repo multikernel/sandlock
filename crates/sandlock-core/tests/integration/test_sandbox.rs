@@ -201,28 +201,34 @@ async fn test_nested_sandbox_via_cli() {
 /// Test that chroot changes the root filesystem.
 #[tokio::test]
 async fn test_chroot() {
-    // Create a minimal chroot with /bin/sh
+    // Build a self-contained chroot with the static rootfs-helper binary.
     let chroot_dir = std::env::temp_dir().join(format!(
         "sandlock-test-chroot-{}",
         std::process::id()
     ));
-    let _ = std::fs::create_dir_all(chroot_dir.join("bin"));
-    let _ = std::fs::create_dir_all(chroot_dir.join("lib"));
-    let _ = std::fs::create_dir_all(chroot_dir.join("lib64"));
-    let _ = std::fs::create_dir_all(chroot_dir.join("usr"));
+    let _ = std::fs::create_dir_all(chroot_dir.join("usr/bin"));
     let _ = std::fs::create_dir_all(chroot_dir.join("tmp"));
+
+    // Install static helper binary
+    let helper = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/rootfs-helper");
+    if !helper.exists() {
+        eprintln!("chroot test skipped (rootfs-helper not built)");
+        return;
+    }
+    let _ = std::fs::copy(&helper, chroot_dir.join("usr/bin/rootfs-helper"));
+    // Busybox-style symlink: cat → rootfs-helper
+    let _ = std::os::unix::fs::symlink("rootfs-helper", chroot_dir.join("usr/bin/cat"));
+    // Merged-usr symlink: /bin → usr/bin
+    let _ = std::os::unix::fs::symlink("usr/bin", chroot_dir.join("bin"));
 
     // Create a marker file inside the chroot
     std::fs::write(chroot_dir.join("marker.txt"), "inside-chroot").unwrap();
 
-    let out = std::env::temp_dir().join(format!(
-        "sandlock-test-chroot-out-{}",
-        std::process::id()
-    ));
-
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin")
-        .fs_read("/tmp").fs_read("/")
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/")
         .chroot(&chroot_dir)
         .build()
         .unwrap();
@@ -233,10 +239,8 @@ async fn test_chroot() {
         &["cat", "/marker.txt"],
     ).await;
 
-    // Chroot requires privileged mode or user namespace — may fail on some systems
     match result {
         Ok(r) => {
-            // If it ran, it should have found the marker
             if r.success() {
                 // passed
             }
@@ -247,5 +251,4 @@ async fn test_chroot() {
     }
 
     let _ = std::fs::remove_dir_all(&chroot_dir);
-    let _ = std::fs::remove_file(&out);
 }

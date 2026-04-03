@@ -7,19 +7,19 @@ upper layers.  Parametrized across all COW backends (seccomp, overlayfs).
 """
 
 import os
-import sys
+import shutil
 import threading
 import tempfile
+from pathlib import Path
 
 import pytest
 
 from sandlock import Policy, Sandbox
 
 
-_PYTHON_READABLE = list(dict.fromkeys([
-    "/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/proc", "/dev",
-    sys.prefix,
-]))
+_HELPER_BIN = Path(__file__).resolve().parent.parent.parent / "tests" / "rootfs-helper"
+
+_FS_READABLE = ["/usr", "/usr/bin", "/bin", "/sbin", "/etc", "/proc", "/dev"]
 
 
 # ---------------------------------------------------------------------------
@@ -58,32 +58,51 @@ def backend(request):
 
 @pytest.fixture
 def rootfs(tmp_path):
-    """Build a minimal chroot rootfs using symlinks to host dirs."""
-    for d in ("usr", "lib", "lib64", "bin", "sbin", "etc", "proc", "dev"):
-        host = os.path.join("/", d)
-        target = tmp_path / d
-        if os.path.exists(host) and not target.exists():
-            os.symlink(host, target)
-    (tmp_path / "tmp").mkdir(exist_ok=True)
+    """Build a minimal self-contained chroot rootfs with the helper binary."""
+    # Real directories
+    for d in ("usr/bin", "usr/sbin", "etc", "proc", "dev", "tmp", "work"):
+        (tmp_path / d).mkdir(parents=True, exist_ok=True)
+
+    # Copy helper binary
+    helper_dst = tmp_path / "usr" / "bin" / "rootfs-helper"
+    shutil.copy2(_HELPER_BIN, helper_dst)
+
+    # Busybox-style symlinks
+    for name in ("sh", "cat", "echo", "ls", "pwd", "readlink", "stat",
+                  "mkdir", "rmdir", "chmod", "ln", "rm", "mv", "true",
+                  "false", "write", "access"):
+        link = tmp_path / "usr" / "bin" / name
+        if not link.exists():
+            os.symlink("rootfs-helper", link)
+
+    # Merged-usr symlinks (relative)
+    for name in ("bin", "sbin"):
+        link = tmp_path / name
+        if not link.exists():
+            os.symlink(f"usr/{name}", link)
+
+    # Set tmp permissions
+    os.chmod(tmp_path / "tmp", 0o1777)
+
     return tmp_path
 
 
 def _cow_policy(rootfs, on_exit="abort", fs_storage=None, backend="seccomp"):
     """Build a COW policy for the given backend."""
-    # seccomp backend: fs_isolation left as default (None) — workdir triggers
+    # seccomp backend: fs_isolation left as default (None) -- workdir triggers
     # the seccomp COW path.  overlayfs: explicit.
     fs_isolation = "overlayfs" if backend == "overlayfs" else None
     return Policy(
         chroot=str(rootfs),
         workdir=str(rootfs),
         cwd="/",
-        fs_readable=_PYTHON_READABLE + ["/"],
+        fs_readable=_FS_READABLE + ["/"],
         fs_writable=["/tmp"],
         on_exit=on_exit,
         fs_storage=fs_storage,
         fs_isolation=fs_isolation,
         clean_env=True,
-        env={"PATH": "/bin:/usr/bin"},
+        env={"PATH": "/usr/bin:/bin"},
     )
 
 

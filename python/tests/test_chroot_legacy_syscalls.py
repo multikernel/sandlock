@@ -3,13 +3,13 @@
 
 musl libc uses stat/lstat/open/access/readlink instead of their *at
 variants (newfstatat/openat/etc.).  These tests invoke the legacy
-syscalls directly via ctypes to verify the chroot dispatcher handles
-them — independent of which libc the test runner uses.
+syscalls via the rootfs-helper binary to verify the chroot dispatcher
+handles them correctly.
 """
 
 import os
-import sys
-import textwrap
+import shutil
+from pathlib import Path
 
 import pytest
 
@@ -18,17 +18,18 @@ from sandlock import Policy, Sandbox
 
 # ── helpers ──────────────────────────────────────────────────────
 
-_PYTHON_READABLE = list(dict.fromkeys([
-    "/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/proc", "/dev",
-    sys.prefix,
-]))
+_HELPER_BIN = Path(__file__).resolve().parent.parent.parent / "tests" / "rootfs-helper"
+
+_FS_READABLE = ["/usr", "/usr/bin", "/bin", "/sbin", "/etc", "/proc", "/dev"]
 
 
 def _chroot_policy(rootfs, **overrides):
     defaults = dict(
         chroot=str(rootfs),
         cwd="/",
-        fs_readable=_PYTHON_READABLE + ["/"],
+        fs_readable=_FS_READABLE + ["/"],
+        clean_env=True,
+        env={"PATH": "/usr/bin:/bin"},
     )
     defaults.update(overrides)
     return Policy(**defaults)
@@ -36,106 +37,91 @@ def _chroot_policy(rootfs, **overrides):
 
 @pytest.fixture
 def rootfs(tmp_path):
-    """Build a minimal chroot rootfs using symlinks to host dirs."""
-    for d in ("usr", "lib", "lib64", "bin", "sbin", "etc", "proc", "dev"):
-        host = os.path.join("/", d)
-        target = tmp_path / d
-        if os.path.exists(host) and not target.exists():
-            os.symlink(host, target)
-    (tmp_path / "tmp").mkdir(exist_ok=True)
-    (tmp_path / "work").mkdir(exist_ok=True)
+    """Build a minimal self-contained chroot rootfs with the helper binary."""
+    # Real directories
+    for d in ("usr/bin", "usr/sbin", "etc", "proc", "dev", "tmp", "work"):
+        (tmp_path / d).mkdir(parents=True, exist_ok=True)
+
+    # Copy helper binary
+    helper_dst = tmp_path / "usr" / "bin" / "rootfs-helper"
+    shutil.copy2(_HELPER_BIN, helper_dst)
+
+    # Busybox-style symlinks
+    for name in ("sh", "cat", "echo", "ls", "pwd", "readlink", "stat",
+                  "mkdir", "rmdir", "chmod", "ln", "rm", "mv", "true",
+                  "false", "write", "access"):
+        link = tmp_path / "usr" / "bin" / name
+        if not link.exists():
+            os.symlink("rootfs-helper", link)
+
+    # Merged-usr symlinks (relative)
+    for name in ("bin", "sbin"):
+        link = tmp_path / name
+        if not link.exists():
+            os.symlink(f"usr/{name}", link)
+
+    # Set tmp permissions
+    os.chmod(tmp_path / "tmp", 0o1777)
+
+    # Test data
     (tmp_path / "work" / "hello.txt").write_text("hello-from-chroot")
     return tmp_path
 
 
-def _run_python(rootfs, code, *, fs_writable=None):
-    """Run a Python snippet inside the chroot and return the result."""
+def _run_helper(rootfs, args, *, fs_writable=None):
+    """Run rootfs-helper with the given arguments inside the chroot."""
     policy = _chroot_policy(
         rootfs,
-        fs_readable=_PYTHON_READABLE + ["/", "/work"],
+        fs_readable=_FS_READABLE + ["/", "/work"],
         fs_writable=fs_writable or [],
     )
-    # Dedent so callers can use indented triple-quoted strings.
-    code = textwrap.dedent(code).strip()
-    return Sandbox(policy).run(["python3", "-c", code])
+    return Sandbox(policy).run(["rootfs-helper"] + args)
 
 
 # ── SYS_stat (nr 4) ─────────────────────────────────────────────
 
 class TestLegacyStat:
     def test_stat_existing_file(self, rootfs):
-        r = _run_python(rootfs, """
-            import ctypes, sys
-            buf = ctypes.create_string_buffer(144)
-            ret = ctypes.CDLL(None).syscall(4, b"/work/hello.txt\\0", buf)
-            print(ret)
-        """)
+        r = _run_helper(rootfs, ["legacy-stat", "/work/hello.txt"])
         assert r.success, f"stat failed: {r.stderr}"
-        assert r.stdout.strip() == b"0"
+        assert b"OK" in r.stdout
 
     def test_stat_nonexistent(self, rootfs):
-        r = _run_python(rootfs, """
-            import ctypes
-            buf = ctypes.create_string_buffer(144)
-            ret = ctypes.CDLL(None).syscall(4, b"/work/nope\\0", buf)
-            print(ret)
-        """)
-        assert r.success
-        assert r.stdout.strip() == b"-1"
+        r = _run_helper(rootfs, ["legacy-stat", "/work/nope"])
+        assert not r.success
+        assert b"ERR" in r.stdout
 
 
 # ── SYS_lstat (nr 6) ────────────────────────────────────────────
 
 class TestLegacyLstat:
     def test_lstat_directory(self, rootfs):
-        r = _run_python(rootfs, """
-            import ctypes
-            buf = ctypes.create_string_buffer(144)
-            ret = ctypes.CDLL(None).syscall(6, b"/work\\0", buf)
-            print(ret)
-        """)
+        r = _run_helper(rootfs, ["legacy-lstat", "/work"])
         assert r.success, f"lstat failed: {r.stderr}"
-        assert r.stdout.strip() == b"0"
+        assert b"OK" in r.stdout
 
 
 # ── SYS_open (nr 2) ─────────────────────────────────────────────
 
 class TestLegacyOpen:
     def test_open_read(self, rootfs):
-        r = _run_python(rootfs, """
-            import ctypes, os
-            fd = ctypes.CDLL(None).syscall(2, b"/work/hello.txt\\0", 0, 0)
-            if fd >= 0:
-                data = os.read(fd, 100)
-                os.close(fd)
-                print(data.decode())
-            else:
-                print("FAIL", fd)
-        """)
+        r = _run_helper(rootfs, ["legacy-open", "/work/hello.txt"])
         assert r.success, f"open failed: {r.stderr}"
-        assert b"hello-from-chroot" in r.stdout
+        assert b"OK" in r.stdout
 
 
 # ── SYS_access (nr 21) ──────────────────────────────────────────
 
 class TestLegacyAccess:
     def test_access_existing(self, rootfs):
-        r = _run_python(rootfs, """
-            import ctypes
-            ret = ctypes.CDLL(None).syscall(21, b"/work/hello.txt\\0", 0)
-            print(ret)
-        """)
+        r = _run_helper(rootfs, ["legacy-access", "/work/hello.txt"])
         assert r.success, f"access failed: {r.stderr}"
-        assert r.stdout.strip() == b"0"
+        assert b"OK" in r.stdout
 
     def test_access_nonexistent(self, rootfs):
-        r = _run_python(rootfs, """
-            import ctypes
-            ret = ctypes.CDLL(None).syscall(21, b"/work/nope\\0", 0)
-            print(ret)
-        """)
-        assert r.success
-        assert r.stdout.strip() == b"-1"
+        r = _run_helper(rootfs, ["legacy-access", "/work/nope"])
+        assert not r.success
+        assert b"ERR" in r.stdout
 
 
 # ── SYS_readlink (nr 89) ────────────────────────────────────────
@@ -143,36 +129,25 @@ class TestLegacyAccess:
 class TestLegacyReadlink:
     def test_readlink(self, rootfs):
         # Create a symlink inside chroot
-        link = rootfs / "work" / "mylink"
-        os.symlink("hello.txt", link)
-        r = _run_python(rootfs, """
-            import ctypes
-            buf = ctypes.create_string_buffer(256)
-            ret = ctypes.CDLL(None).syscall(89, b"/work/mylink\\0", buf, 256)
-            if ret > 0:
-                print(buf.value.decode())
-            else:
-                print("FAIL", ret)
-        """)
+        os.symlink("hello.txt", rootfs / "work" / "mylink")
+        r = _run_helper(rootfs, ["legacy-readlink", "/work/mylink"])
         assert r.success, f"readlink failed: {r.stderr}"
-        assert b"hello.txt" in r.stdout
+        assert b"OK" in r.stdout
 
 
 # ── SYS_mkdir (nr 83) / SYS_rmdir (nr 84) ───────────────────────
 
 class TestLegacyMkdirRmdir:
     def test_mkdir_rmdir(self, rootfs):
-        r = _run_python(rootfs, """
-            import ctypes
-            libc = ctypes.CDLL(None)
-            ret = libc.syscall(83, b"/tmp/testdir\\0", 0o755)
-            print("mkdir", ret)
-            ret = libc.syscall(84, b"/tmp/testdir\\0")
-            print("rmdir", ret)
-        """, fs_writable=["/tmp"])
-        assert r.success, f"mkdir/rmdir failed: {r.stderr}"
-        assert b"mkdir 0" in r.stdout
-        assert b"rmdir 0" in r.stdout
+        r = _run_helper(rootfs, ["legacy-mkdir", "/tmp/testdir"],
+                        fs_writable=["/tmp"])
+        assert r.success, f"mkdir failed: {r.stderr}"
+        assert b"OK" in r.stdout
+
+        r = _run_helper(rootfs, ["legacy-rmdir", "/tmp/testdir"],
+                        fs_writable=["/tmp"])
+        assert r.success, f"rmdir failed: {r.stderr}"
+        assert b"OK" in r.stdout
 
 
 # ── SYS_unlink (nr 87) ──────────────────────────────────────────
@@ -180,13 +155,10 @@ class TestLegacyMkdirRmdir:
 class TestLegacyUnlink:
     def test_unlink(self, rootfs):
         (rootfs / "tmp" / "deleteme").write_text("bye")
-        r = _run_python(rootfs, """
-            import ctypes
-            ret = ctypes.CDLL(None).syscall(87, b"/tmp/deleteme\\0")
-            print(ret)
-        """, fs_writable=["/tmp"])
+        r = _run_helper(rootfs, ["legacy-unlink", "/tmp/deleteme"],
+                        fs_writable=["/tmp"])
         assert r.success, f"unlink failed: {r.stderr}"
-        assert r.stdout.strip() == b"0"
+        assert b"OK" in r.stdout
         assert not (rootfs / "tmp" / "deleteme").exists()
 
 
@@ -195,13 +167,10 @@ class TestLegacyUnlink:
 class TestLegacyRename:
     def test_rename(self, rootfs):
         (rootfs / "tmp" / "before.txt").write_text("data")
-        r = _run_python(rootfs, """
-            import ctypes
-            ret = ctypes.CDLL(None).syscall(82, b"/tmp/before.txt\\0", b"/tmp/after.txt\\0")
-            print(ret)
-        """, fs_writable=["/tmp"])
+        r = _run_helper(rootfs, ["legacy-rename", "/tmp/before.txt", "/tmp/after.txt"],
+                        fs_writable=["/tmp"])
         assert r.success, f"rename failed: {r.stderr}"
-        assert r.stdout.strip() == b"0"
+        assert b"OK" in r.stdout
         assert (rootfs / "tmp" / "after.txt").exists()
         assert not (rootfs / "tmp" / "before.txt").exists()
 
@@ -210,13 +179,10 @@ class TestLegacyRename:
 
 class TestLegacySymlink:
     def test_symlink(self, rootfs):
-        r = _run_python(rootfs, """
-            import ctypes
-            ret = ctypes.CDLL(None).syscall(88, b"target.txt\\0", b"/tmp/mylink\\0")
-            print(ret)
-        """, fs_writable=["/tmp"])
+        r = _run_helper(rootfs, ["legacy-symlink", "target.txt", "/tmp/mylink"],
+                        fs_writable=["/tmp"])
         assert r.success, f"symlink failed: {r.stderr}"
-        assert r.stdout.strip() == b"0"
+        assert b"OK" in r.stdout
         assert (rootfs / "tmp" / "mylink").is_symlink()
 
 
@@ -225,10 +191,7 @@ class TestLegacySymlink:
 class TestLegacyChmod:
     def test_chmod(self, rootfs):
         (rootfs / "tmp" / "chmodme").write_text("x")
-        r = _run_python(rootfs, """
-            import ctypes
-            ret = ctypes.CDLL(None).syscall(90, b"/tmp/chmodme\\0", 0o644)
-            print(ret)
-        """, fs_writable=["/tmp"])
+        r = _run_helper(rootfs, ["legacy-chmod", "0755", "/tmp/chmodme"],
+                        fs_writable=["/tmp"])
         assert r.success, f"chmod failed: {r.stderr}"
-        assert r.stdout.strip() == b"0"
+        assert b"OK" in r.stdout
