@@ -445,6 +445,7 @@ static int exec_simple(char *cmdline) {
     int ret = (n > 0) ? dispatch(tokens[0], n - 1, tokens + 1) : 0;
 
     if (saved_stdout >= 0) {
+        fflush(stdout);
         dup2(saved_stdout, STDOUT_FILENO);
         close(saved_stdout);
     }
