@@ -37,7 +37,8 @@ pub enum NotifAction {
     InjectFd { srcfd: RawFd, targetfd: i32 },
     /// Inject a file descriptor using SECCOMP_ADDFD_FLAG_SEND (atomically responds).
     /// The child sees the injected fd as the return value of the syscall.
-    InjectFdSend { srcfd: RawFd },
+    /// The `OwnedFd` is closed automatically after the ioctl completes.
+    InjectFdSend { srcfd: OwnedFd },
     /// Synthetic return value (the child sees this as the syscall result).
     ReturnValue(i64),
     /// Don't respond — used for checkpoint/freeze.
@@ -448,12 +449,11 @@ fn send_response(fd: RawFd, id: u64, action: NotifAction) -> io::Result<()> {
             // SECCOMP_ADDFD_FLAG_SEND atomically injects the fd and responds.
             // No separate NOTIF_SEND needed after this.
             // Fall back to Continue if ADDFD_SEND fails (e.g., old kernel).
-            let result = match inject_fd_and_send(fd, id, srcfd) {
+            // srcfd (OwnedFd) is dropped at end of this arm, closing the fd.
+            match inject_fd_and_send(fd, id, srcfd.as_raw_fd()) {
                 Ok(_new_fd) => Ok(()),
                 Err(_) => respond_continue(fd, id),
-            };
-            unsafe { libc::close(srcfd) };
-            result
+            }
         }
         NotifAction::ReturnValue(val) => respond_value(fd, id, val),
         NotifAction::Hold => Ok(()), // Don't send a response.
@@ -1046,7 +1046,9 @@ mod tests {
         let _ = format!("{:?}", NotifAction::Continue);
         let _ = format!("{:?}", NotifAction::Errno(1));
         let _ = format!("{:?}", NotifAction::InjectFd { srcfd: 3, targetfd: 4 });
-        let _ = format!("{:?}", NotifAction::InjectFdSend { srcfd: 5 });
+        // Use a real fd (dup'd from stderr) so OwnedFd can safely close it.
+        let test_fd = unsafe { OwnedFd::from_raw_fd(libc::dup(2)) };
+        let _ = format!("{:?}", NotifAction::InjectFdSend { srcfd: test_fd });
         let _ = format!("{:?}", NotifAction::ReturnValue(42));
         let _ = format!("{:?}", NotifAction::Hold);
         let _ = format!("{:?}", NotifAction::Kill { sig: 9, pgid: 1 });

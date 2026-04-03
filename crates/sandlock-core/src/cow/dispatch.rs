@@ -3,7 +3,7 @@
 //! Reads paths from child memory, delegates to SeccompCowBranch,
 //! and injects results (fds, stat structs, readlink strings, dirents) back.
 
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -109,10 +109,9 @@ pub(crate) async fn handle_cow_open(
         return NotifAction::Continue;
     }
 
-    // Inject fd and let it be the return value of the child's openat.
-    // The fd is leaked intentionally — SECCOMP_ADDFD_FLAG_SEND
-    // transfers ownership to the child. We must not close it.
-    NotifAction::InjectFdSend { srcfd: fd }
+    // Wrap in OwnedFd — send_response will close it after the ioctl.
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    NotifAction::InjectFdSend { srcfd: owned }
 }
 
 // ============================================================

@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 use std::io::{Seek, SeekFrom, Write};
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -151,31 +151,21 @@ fn inject_memfd(content: &[u8]) -> NotifAction {
     };
 
     // Write content and seek to start.
+    // Borrow the raw fd for File I/O without transferring ownership.
     let raw = memfd.as_raw_fd();
     {
-        // Use raw fd to write — OwnedFd doesn't impl Write.
         let mut file = unsafe { std::fs::File::from_raw_fd(raw) };
         if file.write_all(content).is_err() || file.seek(SeekFrom::Start(0)).is_err() {
-            // Don't drop the OwnedFd via file — we took ownership with from_raw_fd
             std::mem::forget(file);
             return NotifAction::Continue;
         }
-        // Forget the File so it doesn't close the fd — OwnedFd still owns it.
+        // Forget the File so it doesn't close the fd — memfd (OwnedFd) still owns it.
         std::mem::forget(file);
     }
 
-    // Leak the OwnedFd so it stays alive through the ioctl in send_response.
-    // SECCOMP_ADDFD_FLAG_SEND atomically injects the fd and responds to the syscall,
-    // so the child sees the memfd as the return value from openat (not the real file).
-    let leaked_fd = raw;
-    std::mem::forget(memfd);
-
-    NotifAction::InjectFdSend {
-        srcfd: leaked_fd,
-    }
+    // Move the OwnedFd into InjectFdSend — send_response will close it after the ioctl.
+    NotifAction::InjectFdSend { srcfd: memfd }
 }
-
-use std::os::unix::io::FromRawFd;
 
 // ============================================================
 // Read path from child memory

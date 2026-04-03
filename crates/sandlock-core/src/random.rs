@@ -83,9 +83,8 @@ pub(crate) fn handle_random_open(
         std::mem::forget(file);
     }
 
-    // Leak the OwnedFd so it stays alive through the ADDFD ioctl.
-    std::mem::forget(memfd);
-    Some(NotifAction::InjectFdSend { srcfd: raw })
+    // Move the OwnedFd into InjectFdSend — send_response will close it after the ioctl.
+    Some(NotifAction::InjectFdSend { srcfd: memfd })
 }
 
 #[cfg(test)]

@@ -4,7 +4,7 @@
 //! and performs on-behalf operations. Composes with COW when active.
 
 use std::ffi::CString;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -260,7 +260,8 @@ pub(crate) async fn handle_chroot_open(
                 if fd < 0 {
                     return NotifAction::Continue;
                 }
-                return NotifAction::InjectFdSend { srcfd: fd };
+                let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+                return NotifAction::InjectFdSend { srcfd: owned };
             }
         }
     }
@@ -273,7 +274,8 @@ pub(crate) async fn handle_chroot_open(
     if fd < 0 {
         return NotifAction::Errno(last_errno(libc::EIO));
     }
-    NotifAction::InjectFdSend { srcfd: fd }
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    NotifAction::InjectFdSend { srcfd: owned }
 }
 
 // ============================================================
