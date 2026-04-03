@@ -611,8 +611,13 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
 
     // 4. Optional: disable ASLR
     if policy.no_randomize_memory {
-        const ADDR_NO_RANDOMIZE: u64 = 0x0040000;
-        if unsafe { libc::personality(ADDR_NO_RANDOMIZE as libc::c_ulong) } == -1 {
+        const ADDR_NO_RANDOMIZE: libc::c_ulong = 0x0040000;
+        // Read current personality first (0xffffffff = query), then OR in the flag.
+        let current = unsafe { libc::personality(0xffffffff) };
+        if current == -1 {
+            fail!("personality(query)");
+        }
+        if unsafe { libc::personality(current as libc::c_ulong | ADDR_NO_RANDOMIZE) } == -1 {
             fail!("personality(ADDR_NO_RANDOMIZE)");
         }
     }
