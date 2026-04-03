@@ -22,11 +22,12 @@ def _find_lib() -> str:
     """Find libsandlock_ffi.so."""
     pkg_dir = Path(__file__).parent
 
-    # 1. Dev build from cargo — preferred during development so
-    #    `cargo build --release` is all that's needed (no manual copy).
-    dev_lib = pkg_dir / ".." / ".." / ".." / "target" / "release" / "libsandlock_ffi.so"
-    if dev_lib.exists():
-        return str(dev_lib.resolve())
+    # 1. Dev build from cargo — pick the most recently built profile.
+    target_dir = pkg_dir / ".." / ".." / ".." / "target"
+    candidates = [target_dir / p / "libsandlock_ffi.so" for p in ("debug", "release")]
+    candidates = [c for c in candidates if c.exists()]
+    if candidates:
+        return str(max(candidates, key=lambda c: c.stat().st_mtime).resolve())
 
     # 2. Next to this file (installed via pip/setuptools-rust)
     for candidate in sorted(pkg_dir.glob("libsandlock_ffi*.so"), reverse=True):
