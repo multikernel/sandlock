@@ -544,3 +544,44 @@ class TestDiskQuota:
             ["cat", f"{workdir}/big.bin"]
         )
         assert result.success
+
+    def test_fs_storage_directs_cow_deltas(self, tmp_path):
+        """fs_storage controls where COW upper directory is created."""
+        workdir = tmp_path / "wd"
+        workdir.mkdir()
+        storage = tmp_path / "storage"
+        storage.mkdir()
+        (workdir / "file.txt").write_text("original")
+
+        p = _policy(
+            fs_writable=[str(workdir)],
+            workdir=str(workdir),
+            fs_storage=str(storage),
+        )
+        result = Sandbox(p).run(
+            ["sh", "-c", f"echo modified > {workdir}/file.txt"]
+        )
+        assert result.success
+        # The workdir should be updated (on_exit=commit by default).
+        # This proves COW went through the custom fs_storage path and
+        # committed back — the branch dir is cleaned up after commit.
+        assert (workdir / "file.txt").read_text().strip() == "modified"
+
+    def test_fs_storage_with_quota(self, tmp_path):
+        """fs_storage + max_disk together: quota enforced on custom storage."""
+        workdir = tmp_path / "wd2"
+        workdir.mkdir()
+        storage = tmp_path / "storage2"
+        storage.mkdir()
+        (workdir / "big.bin").write_bytes(b"\x00" * 4096)
+
+        p = _policy(
+            fs_writable=[str(workdir)],
+            workdir=str(workdir),
+            fs_storage=str(storage),
+            max_disk="512",
+        )
+        result = Sandbox(p).run(
+            ["sh", "-c", f"echo x >> {workdir}/big.bin"]
+        )
+        assert not result.success

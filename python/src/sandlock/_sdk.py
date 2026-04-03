@@ -74,6 +74,7 @@ def _builder_fn(name, *extra_args):
 _b_fs_read = _builder_fn("sandlock_policy_builder_fs_read", ctypes.c_char_p)
 _b_fs_write = _builder_fn("sandlock_policy_builder_fs_write", ctypes.c_char_p)
 _b_fs_deny = _builder_fn("sandlock_policy_builder_fs_deny", ctypes.c_char_p)
+_b_fs_storage = _builder_fn("sandlock_policy_builder_fs_storage", ctypes.c_char_p)
 _b_workdir = _builder_fn("sandlock_policy_builder_workdir", ctypes.c_char_p)
 _b_cwd = _builder_fn("sandlock_policy_builder_cwd", ctypes.c_char_p)
 _b_chroot = _builder_fn("sandlock_policy_builder_chroot", ctypes.c_char_p)
@@ -675,6 +676,8 @@ class _NativePolicy:
         for p in (policy.fs_denied or []):
             b = _b_fs_deny(b, _encode(str(p)))
 
+        if policy.fs_storage:
+            b = _b_fs_storage(b, _encode(str(policy.fs_storage)))
         if policy.workdir:
             b = _b_workdir(b, _encode(str(policy.workdir)))
         if policy.cwd:
