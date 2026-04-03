@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::chroot::resolve::{resolve_in_root, to_virtual_path};
+use crate::chroot::resolve::{openat2_in_root, resolve_in_root, to_virtual_path};
 use crate::procfs::{build_dirent64, DT_DIR, DT_LNK, DT_REG};
 use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction, SupervisorState};
 use crate::sys::structs::{SeccompNotif, SeccompNotifAddfd, SECCOMP_IOCTL_NOTIF_ADDFD};
@@ -125,54 +125,6 @@ async fn cow_resolve(
     Ok(host_path.to_path_buf())
 }
 
-/// Open a host path in the supervisor, inject the fd into the child via
-/// SECCOMP_ADDFD, then write `/proc/self/fd/N\0` to the child's path buffer.
-/// Returns the action to send back (Continue on success, Errno on failure).
-fn inject_fd_and_rewrite_path(
-    notif: &SeccompNotif,
-    notif_fd: RawFd,
-    host_path: &Path,
-    path_ptr: u64,
-    open_flags: i32,
-    newfd_flags: u32,
-) -> NotifAction {
-    let c_path = match path_cstr(host_path, libc::ENOENT) {
-        Ok(c) => c,
-        Err(a) => return a,
-    };
-    let src_fd = unsafe { libc::open(c_path.as_ptr(), open_flags) };
-    if src_fd < 0 {
-        return NotifAction::Errno(last_errno(libc::ENOENT));
-    }
-
-    let addfd = SeccompNotifAddfd {
-        id: notif.id,
-        flags: 0,
-        srcfd: src_fd as u32,
-        newfd: 0,
-        newfd_flags,
-    };
-    let child_fd = unsafe {
-        libc::ioctl(
-            notif_fd,
-            SECCOMP_IOCTL_NOTIF_ADDFD as libc::c_ulong,
-            &addfd as *const _,
-        )
-    };
-    unsafe { libc::close(src_fd) };
-
-    if child_fd < 0 {
-        return NotifAction::Errno(libc::EIO);
-    }
-
-    let fd_path = format!("/proc/self/fd/{}\0", child_fd);
-    if write_child_mem(notif_fd, notif.id, notif.pid, path_ptr, fd_path.as_bytes()).is_err() {
-        return NotifAction::Errno(libc::EFAULT);
-    }
-
-    NotifAction::Continue
-}
-
 /// Read path arg at `arg_idx`, resolve chroot path using dirfd at `dirfd_idx`.
 /// Returns (path_string, host_path) or an appropriate NotifAction.
 /// Returns (path_string, host_path, virtual_path).
@@ -226,6 +178,7 @@ pub(crate) async fn handle_chroot_open(
         None => return NotifAction::Continue,
     };
 
+    // Resolve to get the virtual path for access control.
     let (host_path, virtual_path) = match resolve_chroot_path(notif, dirfd, &rel_path, ctx.root) {
         Some(r) => r,
         None => return NotifAction::Errno(libc::EACCES),
@@ -241,7 +194,7 @@ pub(crate) async fn handle_chroot_open(
         return NotifAction::Errno(libc::EACCES);
     }
 
-    // COW path
+    // COW path — COW operates on host paths, must use libc::open.
     {
         let mut st = state.lock().await;
         if let Some(cow) = st.cow_branch.as_mut() {
@@ -266,14 +219,14 @@ pub(crate) async fn handle_chroot_open(
         }
     }
 
-    let c_path = match path_cstr(&host_path, libc::EIO) {
-        Ok(c) => c,
-        Err(_) => return NotifAction::Continue,
+    // Open directly via openat2(RESOLVE_IN_ROOT) — single atomic open
+    // confined to the chroot root, no resolve-then-reopen TOCTOU gap.
+    let vp_str = virtual_path.to_string_lossy();
+    let mode = if is_write { 0o666 } else { 0 };
+    let fd = match openat2_in_root(ctx.root, &vp_str, flags as i32, mode) {
+        Ok(fd) => fd,
+        Err(errno) => return NotifAction::Errno(errno),
     };
-    let fd = unsafe { libc::open(c_path.as_ptr(), flags as i32, 0o666) };
-    if fd < 0 {
-        return NotifAction::Errno(last_errno(libc::EIO));
-    }
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
     NotifAction::InjectFdSend { srcfd: owned }
 }
@@ -300,24 +253,68 @@ pub(crate) async fn handle_chroot_exec(
         None => return NotifAction::Continue,
     };
 
-    let (host_path, _) = match resolve_chroot_path(notif, dirfd, &rel_path, ctx.root) {
-        Some(r) => r,
-        None => return NotifAction::Errno(libc::EACCES),
+    // Build the full virtual path from dirfd + relative path.
+    let full_path = if Path::new(&rel_path).is_absolute() {
+        rel_path
+    } else {
+        let dirfd32 = dirfd as i32;
+        let base_host = if dirfd32 == libc::AT_FDCWD {
+            match std::fs::read_link(format!("/proc/{}/cwd", notif.pid)) {
+                Ok(p) => p,
+                Err(_) => return NotifAction::Errno(libc::EACCES),
+            }
+        } else {
+            match std::fs::read_link(format!("/proc/{}/fd/{}", notif.pid, dirfd)) {
+                Ok(p) => p,
+                Err(_) => return NotifAction::Errno(libc::EACCES),
+            }
+        };
+        match to_virtual_path(ctx.root, &base_host) {
+            Some(base) => base.join(&rel_path).to_string_lossy().to_string(),
+            None => return NotifAction::Errno(libc::EACCES),
+        }
     };
 
-    // Open the binary in the supervisor (no Landlock restrictions), inject the
-    // fd into the child, and rewrite the path to /proc/self/fd/N.  This avoids
-    // buffer overflow (the host path is typically much longer than the virtual
-    // path) and lets the kernel load the ELF interpreter via the supervisor's
-    // open fd rather than the child's restricted Landlock domain.
-    inject_fd_and_rewrite_path(
-        notif,
-        notif_fd,
-        &host_path,
-        path_ptr,
+    // Open the binary directly via openat2(RESOLVE_IN_ROOT). Single atomic
+    // open confined to the chroot root — no resolve-then-reopen TOCTOU gap.
+    let src_fd = match openat2_in_root(
+        ctx.root,
+        &full_path,
         libc::O_RDONLY | libc::O_CLOEXEC,
-        0, // no O_CLOEXEC on the child fd — must survive exec
-    )
+        0,
+    ) {
+        Ok(fd) => fd,
+        Err(_) => return NotifAction::Errno(libc::ENOENT),
+    };
+
+    // Inject the fd into the child and rewrite the path to /proc/self/fd/N
+    // so the kernel loads the ELF from the injected fd.
+    let addfd = SeccompNotifAddfd {
+        id: notif.id,
+        flags: 0,
+        srcfd: src_fd as u32,
+        newfd: 0,
+        newfd_flags: 0, // no O_CLOEXEC — must survive exec
+    };
+    let child_fd = unsafe {
+        libc::ioctl(
+            notif_fd,
+            SECCOMP_IOCTL_NOTIF_ADDFD as libc::c_ulong,
+            &addfd as *const _,
+        )
+    };
+    unsafe { libc::close(src_fd) };
+
+    if child_fd < 0 {
+        return NotifAction::Errno(libc::EIO);
+    }
+
+    let fd_path = format!("/proc/self/fd/{}\0", child_fd);
+    if write_child_mem(notif_fd, notif.id, notif.pid, path_ptr, fd_path.as_bytes()).is_err() {
+        return NotifAction::Errno(libc::EFAULT);
+    }
+
+    NotifAction::Continue
 }
 
 // ============================================================
@@ -896,23 +893,57 @@ pub(crate) async fn handle_chroot_chdir(
         None => return NotifAction::Continue,
     };
 
-    let (host_path, _) = match resolve_chroot_path(notif, libc::AT_FDCWD as i64, &path, ctx.root) {
-        Some(r) => r,
-        None => return NotifAction::Errno(libc::EACCES),
+    // Build the full virtual path from AT_FDCWD + path.
+    let full_path = if Path::new(&path).is_absolute() {
+        path
+    } else {
+        match std::fs::read_link(format!("/proc/{}/cwd", notif.pid)) {
+            Ok(cwd) => match to_virtual_path(ctx.root, &cwd) {
+                Some(base) => base.join(&path).to_string_lossy().to_string(),
+                None => return NotifAction::Errno(libc::EACCES),
+            },
+            Err(_) => return NotifAction::Errno(libc::EACCES),
+        }
     };
 
-    if !host_path.is_dir() {
-        return NotifAction::Errno(libc::ENOTDIR);
+    // Open directly via openat2(RESOLVE_IN_ROOT).
+    let src_fd = match openat2_in_root(
+        ctx.root,
+        &full_path,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        0,
+    ) {
+        Ok(fd) => fd,
+        Err(errno) => return NotifAction::Errno(errno),
+    };
+
+    // Inject fd into child and rewrite path to /proc/self/fd/N.
+    let addfd = SeccompNotifAddfd {
+        id: notif.id,
+        flags: 0,
+        srcfd: src_fd as u32,
+        newfd: 0,
+        newfd_flags: libc::O_CLOEXEC as u32,
+    };
+    let child_fd = unsafe {
+        libc::ioctl(
+            notif_fd,
+            SECCOMP_IOCTL_NOTIF_ADDFD as libc::c_ulong,
+            &addfd as *const _,
+        )
+    };
+    unsafe { libc::close(src_fd) };
+
+    if child_fd < 0 {
+        return NotifAction::Errno(libc::EIO);
     }
 
-    inject_fd_and_rewrite_path(
-        notif,
-        notif_fd,
-        &host_path,
-        path_ptr,
-        libc::O_RDONLY | libc::O_DIRECTORY,
-        libc::O_CLOEXEC as u32,
-    )
+    let fd_path = format!("/proc/self/fd/{}\0", child_fd);
+    if write_child_mem(notif_fd, notif.id, notif.pid, path_ptr, fd_path.as_bytes()).is_err() {
+        return NotifAction::Errno(libc::EFAULT);
+    }
+
+    NotifAction::Continue
 }
 
 // ============================================================
