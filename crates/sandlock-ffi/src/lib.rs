@@ -121,6 +121,46 @@ pub unsafe extern "C" fn sandlock_policy_builder_chroot(
     Box::into_raw(Box::new(builder.chroot(path)))
 }
 
+/// Set the COW branch action on successful exit.
+/// `action`: 0 = Commit, 1 = Abort, 2 = Keep.
+///
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_on_exit(
+    b: *mut PolicyBuilder,
+    action: u8,
+) -> *mut PolicyBuilder {
+    if b.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    let action = match action {
+        1 => sandlock_core::policy::BranchAction::Abort,
+        2 => sandlock_core::policy::BranchAction::Keep,
+        _ => sandlock_core::policy::BranchAction::Commit,
+    };
+    Box::into_raw(Box::new(builder.on_exit(action)))
+}
+
+/// Set the COW branch action on error exit.
+/// `action`: 0 = Commit, 1 = Abort, 2 = Keep.
+///
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_on_error(
+    b: *mut PolicyBuilder,
+    action: u8,
+) -> *mut PolicyBuilder {
+    if b.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    let action = match action {
+        1 => sandlock_core::policy::BranchAction::Abort,
+        2 => sandlock_core::policy::BranchAction::Keep,
+        _ => sandlock_core::policy::BranchAction::Commit,
+    };
+    Box::into_raw(Box::new(builder.on_error(action)))
+}
+
 // ----------------------------------------------------------------
 // Policy Builder — resource limits
 // ----------------------------------------------------------------

@@ -76,6 +76,8 @@ _b_fs_deny = _builder_fn("sandlock_policy_builder_fs_deny", ctypes.c_char_p)
 _b_workdir = _builder_fn("sandlock_policy_builder_workdir", ctypes.c_char_p)
 _b_cwd = _builder_fn("sandlock_policy_builder_cwd", ctypes.c_char_p)
 _b_chroot = _builder_fn("sandlock_policy_builder_chroot", ctypes.c_char_p)
+_b_on_exit = _builder_fn("sandlock_policy_builder_on_exit", ctypes.c_uint8)
+_b_on_error = _builder_fn("sandlock_policy_builder_on_error", ctypes.c_uint8)
 _b_max_memory = _builder_fn("sandlock_policy_builder_max_memory", ctypes.c_uint64)
 _b_max_processes = _builder_fn("sandlock_policy_builder_max_processes", ctypes.c_uint32)
 _b_max_cpu = _builder_fn("sandlock_policy_builder_max_cpu", ctypes.c_uint8)
@@ -677,6 +679,13 @@ class _NativePolicy:
             b = _b_cwd(b, _encode(str(policy.cwd)))
         if policy.chroot:
             b = _b_chroot(b, _encode(str(policy.chroot)))
+
+        # COW branch actions (0=Commit, 1=Abort, 2=Keep)
+        _action_map = {"commit": 0, "abort": 1, "keep": 2}
+        on_exit_val = policy.on_exit.value if hasattr(policy.on_exit, 'value') else str(policy.on_exit)
+        on_error_val = policy.on_error.value if hasattr(policy.on_error, 'value') else str(policy.on_error)
+        b = _b_on_exit(b, _action_map.get(on_exit_val, 0))
+        b = _b_on_error(b, _action_map.get(on_error_val, 1))
 
         if policy.max_memory is not None:
             if isinstance(policy.max_memory, str):
