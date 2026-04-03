@@ -102,9 +102,9 @@ enum Command {
         /// Dry-run: run the command, show filesystem changes, then discard
         #[arg(long)]
         dry_run: bool,
-        /// Landlock-only mode: apply Landlock rules and exec directly (no seccomp/supervisor)
+        /// No-supervisor mode: apply Landlock rules + deny-only seccomp filter, then exec directly
         #[arg(long)]
-        landlock_only: bool,
+        no_supervisor: bool,
         #[arg(last = true)]
         cmd: Vec<String>,
     },
@@ -145,10 +145,10 @@ async fn main() -> Result<()> {
             max_cpu, max_open_files, chroot, privileged, workdir, cwd,
             fs_isolation, fs_storage, max_disk, net_allow, net_deny,
             port_remap, no_randomize_memory, no_huge_pages, deterministic_dirs, hostname, no_coredump,
-            env_vars, exec_shell, interactive: _, fs_deny, cpu_cores, gpu_devices, image, dry_run, landlock_only, cmd } =>
+            env_vars, exec_shell, interactive: _, fs_deny, cpu_cores, gpu_devices, image, dry_run, no_supervisor, cmd } =>
         {
-            if landlock_only {
-                validate_landlock_only(
+            if no_supervisor {
+                validate_no_supervisor(
                     &max_memory, &max_processes, &max_cpu, &max_open_files,
                     &timeout, &net_allow_host, &net_bind, &net_connect,
                     &net_allow, &net_deny,
@@ -197,7 +197,7 @@ async fn main() -> Result<()> {
                     cmd.iter().map(|s| s.as_str()).collect()
                 };
 
-                return landlock_only_exec(&policy, &cmd_strs);
+                return no_supervisor_exec(&policy, &cmd_strs);
             }
 
             // Start from profile or default
@@ -433,9 +433,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Validate that no flags incompatible with --landlock-only are set.
+/// Validate that no flags incompatible with --no-supervisor are set.
 #[allow(clippy::too_many_arguments)]
-fn validate_landlock_only(
+fn validate_no_supervisor(
     max_memory: &Option<String>,
     max_processes: &Option<u32>,
     max_cpu: &Option<u8>,
@@ -502,7 +502,7 @@ fn validate_landlock_only(
 
     if !bad.is_empty() {
         return Err(anyhow!(
-            "--landlock-only is incompatible with: {}",
+            "--no-supervisor is incompatible with: {}",
             bad.join(", ")
         ));
     }
@@ -510,14 +510,20 @@ fn validate_landlock_only(
     Ok(())
 }
 
-/// Execute a command with Landlock-only confinement (no seccomp/supervisor).
-/// Applies Landlock confinement via confine_current_process, handles env, then execs.
-fn landlock_only_exec(policy: &Policy, cmd: &[&str]) -> Result<()> {
+/// Execute a command with no-supervisor confinement.
+/// Applies Landlock + deny-only seccomp filter, handles env, then execs.
+fn no_supervisor_exec(policy: &Policy, cmd: &[&str]) -> Result<()> {
     use std::ffi::CString;
 
     // 1. Apply Landlock confinement (sets NO_NEW_PRIVS + Landlock rules)
     sandlock_core::confine_current_process(policy)
-        .map_err(|e| anyhow!("filesystem confinement failed: {}", e))?;
+        .map_err(|e| anyhow!("Landlock confinement failed: {}", e))?;
+
+    // 2. Install deny-only seccomp filter (blocks dangerous syscalls without supervisor)
+    let deny_nrs = sandlock_core::context::no_supervisor_deny_syscall_numbers();
+    let filter = sandlock_core::seccomp::bpf::assemble_filter(&[], &deny_nrs, &[]);
+    sandlock_core::seccomp::bpf::install_deny_filter(&filter)
+        .map_err(|e| anyhow!("seccomp deny filter failed: {}", e))?;
 
     // 3. Apply environment settings
     if policy.clean_env {

@@ -295,3 +295,32 @@ pub const DEFAULT_DENY_SYSCALLS: &[&str] = &[
     "io_uring_enter",
     "io_uring_register",
 ];
+
+/// Deny list for --no-supervisor mode.
+///
+/// More relaxed than DEFAULT_DENY_SYSCALLS because a full sandbox supervisor
+/// may run inside the outer no-supervisor sandbox and needs syscalls like
+/// ptrace, process_vm_readv/writev, unshare, mount, and setns.
+///
+/// Only blocks syscalls that could damage the host or escape all containment.
+pub const NO_SUPERVISOR_DENY_SYSCALLS: &[&str] = &[
+    // Swap / reboot / shutdown — host-wide damage
+    "swapon",
+    "swapoff",
+    "reboot",
+    "kexec_load",
+    // Kernel modules — arbitrary kernel code execution
+    "init_module",
+    "finit_module",
+    "delete_module",
+    // Kernel introspection / attack surface
+    "perf_event_open",
+    "bpf",
+    // Direct hardware access
+    "ioperm",
+    "iopl",
+    // io_uring bypasses seccomp for I/O operations
+    "io_uring_setup",
+    "io_uring_enter",
+    "io_uring_register",
+];

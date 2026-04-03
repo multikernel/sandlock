@@ -372,6 +372,15 @@ pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
     nrs
 }
 
+/// Resolve `NO_SUPERVISOR_DENY_SYSCALLS` names to numbers.
+pub fn no_supervisor_deny_syscall_numbers() -> Vec<u32> {
+    use crate::sys::structs::NO_SUPERVISOR_DENY_SYSCALLS;
+    NO_SUPERVISOR_DENY_SYSCALLS
+        .iter()
+        .filter_map(|n| syscall_name_to_nr(n))
+        .collect()
+}
+
 /// Resolve `deny_syscalls` names to numbers.
 ///
 /// If both `deny_syscalls` and `allow_syscalls` are `None`, returns the
