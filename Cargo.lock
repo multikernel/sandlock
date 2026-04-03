@@ -514,6 +514,7 @@ dependencies = [
  "anyhow",
  "clap",
  "jiff",
+ "libc",
  "sandlock-core",
  "serde",
  "serde_json",

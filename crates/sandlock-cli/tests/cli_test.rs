@@ -116,3 +116,75 @@ fn test_time_start_fakes_year() {
         stdout.trim()
     );
 }
+
+#[test]
+fn test_fs_only_echo() {
+    let output = sandlock_bin()
+        .args(["run", "--fs-only", "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "-r", "/etc", "--", "echo", "fs-only-test"])
+        .output()
+        .expect("failed to run sandlock --fs-only");
+    assert!(output.status.success(), "Exit status: {:?}, stderr: {}", output.status, String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("fs-only-test"));
+}
+
+#[test]
+fn test_fs_only_blocks_denied_path() {
+    let output = sandlock_bin()
+        .args(["run", "--fs-only", "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "--", "cat", "/etc/hostname"])
+        .output()
+        .expect("failed to run");
+    assert!(!output.status.success(), "Should fail without /etc readable");
+}
+
+#[test]
+fn test_fs_only_rejects_incompatible_flags() {
+    let output = sandlock_bin()
+        .args(["run", "--fs-only", "--max-memory", "100M", "-r", "/usr", "--", "echo", "hi"])
+        .output()
+        .expect("failed to run");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--fs-only is incompatible with"), "stderr: {}", stderr);
+}
+
+#[test]
+fn test_fs_only_writable_path() {
+    let output = sandlock_bin()
+        .args(["run", "--fs-only", "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "-w", "/tmp", "--",
+               "sh", "-c", "echo fs-only-write > /tmp/sandlock-fs-only-test && cat /tmp/sandlock-fs-only-test"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success(), "Exit status: {:?}, stderr: {}", output.status, String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("fs-only-write"));
+    let _ = std::fs::remove_file("/tmp/sandlock-fs-only-test");
+}
+
+#[test]
+fn test_fs_only_nested_sandbox() {
+    let sandlock_path = env!("CARGO_BIN_EXE_sandlock");
+    let sandlock_dir = std::path::Path::new(sandlock_path).parent().unwrap().to_str().unwrap();
+    let output = sandlock_bin()
+        .args(["run", "--fs-only",
+               "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "-r", "/etc",
+               "-r", "/proc", "-r", "/dev", "-w", "/tmp",
+               "-r", sandlock_dir,
+               "--", sandlock_path, "run",
+               "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "-r", "/etc",
+               "--", "echo", "nested-works"])
+        .output()
+        .expect("failed to run nested sandbox");
+    assert!(output.status.success(), "Exit status: {:?}, stderr: {}", output.status, String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("nested-works"));
+}
+
+#[test]
+fn test_fs_only_exit_code() {
+    let output = sandlock_bin()
+        .args(["run", "--fs-only", "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "--", "sh", "-c", "exit 42"])
+        .output()
+        .expect("failed to run");
+    assert_eq!(output.status.code(), Some(42));
+}

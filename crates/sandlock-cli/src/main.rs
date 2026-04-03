@@ -100,6 +100,9 @@ enum Command {
         /// Dry-run: run the command, show filesystem changes, then discard
         #[arg(long)]
         dry_run: bool,
+        /// Filesystem-only mode: apply Landlock fs rules and exec directly (no seccomp/supervisor)
+        #[arg(long)]
+        fs_only: bool,
         #[arg(last = true)]
         cmd: Vec<String>,
     },
@@ -140,8 +143,59 @@ async fn main() -> Result<()> {
             max_cpu, max_open_files, chroot, privileged, workdir,
             fs_isolation, fs_storage, max_disk, net_allow, net_deny,
             port_remap, no_randomize_memory, no_huge_pages, deterministic_dirs, hostname, no_coredump,
-            env_vars, exec_shell, interactive: _, fs_deny, cpu_cores, gpu_devices, image, dry_run, cmd } =>
+            env_vars, exec_shell, interactive: _, fs_deny, cpu_cores, gpu_devices, image, dry_run, fs_only, cmd } =>
         {
+            if fs_only {
+                validate_fs_only(
+                    &max_memory, &max_processes, &max_cpu, &max_open_files,
+                    &timeout, &net_allow_host, &net_bind, &net_connect,
+                    &net_allow, &net_deny, isolate_ipc, isolate_signals,
+                    &num_cpus, &random_seed, &time_start, no_randomize_memory,
+                    no_huge_pages, deterministic_dirs, &hostname, &chroot,
+                    &image, privileged, &workdir, &fs_isolation, &fs_storage,
+                    &max_disk, port_remap, &cpu_cores, &gpu_devices, dry_run,
+                    &status_fd,
+                )?;
+
+                // Build a minimal policy with only fs rules
+                let mut builder = if let Some(ref name) = profile_name {
+                    let base = sandlock_core::profile::load_profile(name)?;
+                    let mut b = Policy::builder();
+                    for p in &base.fs_readable { b = b.fs_read(p); }
+                    for p in &base.fs_writable { b = b.fs_write(p); }
+                    for p in &base.fs_denied { b = b.fs_deny(p); }
+                    b
+                } else {
+                    Policy::builder()
+                };
+
+                for p in &fs_read { builder = builder.fs_read(p); }
+                for p in &fs_write { builder = builder.fs_write(p); }
+                for p in &fs_deny { builder = builder.fs_deny(p); }
+                if clean_env { builder = builder.clean_env(true); }
+                for spec in &env_vars {
+                    if let Some((k, v)) = spec.split_once('=') {
+                        builder = builder.env_var(k, v);
+                    } else {
+                        return Err(anyhow!("--env requires KEY=VALUE, got: {}", spec));
+                    }
+                }
+
+                let policy = builder.build()?;
+
+                if exec_shell.is_none() && cmd.is_empty() {
+                    return Err(anyhow!("no command specified"));
+                }
+
+                let cmd_strs: Vec<&str> = if let Some(ref shell_cmd) = exec_shell {
+                    vec!["/bin/sh", "-c", shell_cmd.as_str()]
+                } else {
+                    cmd.iter().map(|s| s.as_str()).collect()
+                };
+
+                return fs_only_exec(&policy, &cmd_strs);
+            }
+
             // Start from profile or default
             let mut builder = if let Some(ref name) = profile_name {
                 let base = profile::load_profile(name)?;
@@ -372,6 +426,148 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Validate that no flags incompatible with --fs-only are set.
+#[allow(clippy::too_many_arguments)]
+fn validate_fs_only(
+    max_memory: &Option<String>,
+    max_processes: &Option<u32>,
+    max_cpu: &Option<u8>,
+    max_open_files: &Option<u32>,
+    timeout: &Option<u64>,
+    net_allow_host: &[String],
+    net_bind: &[u16],
+    net_connect: &[u16],
+    net_allow: &[String],
+    net_deny: &[String],
+    isolate_ipc: bool,
+    isolate_signals: bool,
+    num_cpus: &Option<u32>,
+    random_seed: &Option<u64>,
+    time_start: &Option<String>,
+    no_randomize_memory: bool,
+    no_huge_pages: bool,
+    deterministic_dirs: bool,
+    hostname: &Option<String>,
+    chroot: &Option<String>,
+    image: &Option<String>,
+    privileged: bool,
+    workdir: &Option<String>,
+    fs_isolation: &Option<String>,
+    fs_storage: &Option<String>,
+    max_disk: &Option<String>,
+    port_remap: bool,
+    cpu_cores: &[u32],
+    gpu_devices: &[u32],
+    dry_run: bool,
+    status_fd: &Option<i32>,
+) -> Result<()> {
+    let mut bad = Vec::new();
+
+    if max_memory.is_some() { bad.push("--max-memory"); }
+    if max_processes.is_some() { bad.push("--max-processes"); }
+    if max_cpu.is_some() { bad.push("--max-cpu"); }
+    if max_open_files.is_some() { bad.push("--max-open-files"); }
+    if timeout.is_some() { bad.push("--timeout"); }
+    if !net_allow_host.is_empty() { bad.push("--net-allow-host"); }
+    if !net_bind.is_empty() { bad.push("--net-bind"); }
+    if !net_connect.is_empty() { bad.push("--net-connect"); }
+    if !net_allow.is_empty() { bad.push("--net-allow"); }
+    if !net_deny.is_empty() { bad.push("--net-deny"); }
+    if isolate_ipc { bad.push("--isolate-ipc"); }
+    if isolate_signals { bad.push("--isolate-signals"); }
+    if num_cpus.is_some() { bad.push("--num-cpus"); }
+    if random_seed.is_some() { bad.push("--random-seed"); }
+    if time_start.is_some() { bad.push("--time-start"); }
+    if no_randomize_memory { bad.push("--no-randomize-memory"); }
+    if no_huge_pages { bad.push("--no-huge-pages"); }
+    if deterministic_dirs { bad.push("--deterministic-dirs"); }
+    if hostname.is_some() { bad.push("--hostname"); }
+    if chroot.is_some() { bad.push("--chroot"); }
+    if image.is_some() { bad.push("--image"); }
+    if privileged { bad.push("--privileged"); }
+    if workdir.is_some() { bad.push("--workdir"); }
+    if fs_isolation.is_some() { bad.push("--fs-isolation"); }
+    if fs_storage.is_some() { bad.push("--fs-storage"); }
+    if max_disk.is_some() { bad.push("--max-disk"); }
+    if port_remap { bad.push("--port-remap"); }
+    if !cpu_cores.is_empty() { bad.push("--cpu-cores"); }
+    if !gpu_devices.is_empty() { bad.push("--gpu"); }
+    if dry_run { bad.push("--dry-run"); }
+    if status_fd.is_some() { bad.push("--status-fd"); }
+
+    if !bad.is_empty() {
+        return Err(anyhow!(
+            "--fs-only is incompatible with: {}",
+            bad.join(", ")
+        ));
+    }
+
+    Ok(())
+}
+
+/// Execute a command with Landlock-only confinement (no seccomp/supervisor).
+/// Sets PR_SET_NO_NEW_PRIVS, applies Landlock rules, handles env, then execs.
+fn fs_only_exec(policy: &Policy, cmd: &[&str]) -> Result<()> {
+    use std::ffi::CString;
+
+    // 1. Set PR_SET_NO_NEW_PRIVS so Landlock can be enforced
+    let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+    if ret != 0 {
+        return Err(anyhow!(
+            "prctl(PR_SET_NO_NEW_PRIVS) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // 2. Apply Landlock confinement
+    sandlock_core::landlock::confine(policy)
+        .map_err(|e| anyhow!("landlock confinement failed: {}", e))?;
+
+    // 3. Apply environment settings
+    if policy.clean_env {
+        // Preserve only essential vars, clear the rest
+        let keep: Vec<(String, String)> = ["PATH", "HOME", "USER", "TERM", "LANG"]
+            .iter()
+            .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
+            .collect();
+        // Clear all env vars
+        for (k, _) in std::env::vars() {
+            std::env::remove_var(&k);
+        }
+        // Restore kept ones
+        for (k, v) in &keep {
+            std::env::set_var(k, v);
+        }
+    }
+    for (k, v) in &policy.env {
+        std::env::set_var(k, v);
+    }
+
+    // 4. exec the command
+    let c_prog = CString::new(cmd[0])
+        .map_err(|_| anyhow!("invalid command name: {}", cmd[0]))?;
+    let c_args: Vec<CString> = cmd
+        .iter()
+        .map(|a| CString::new(*a).map_err(|_| anyhow!("invalid argument: {}", a)))
+        .collect::<Result<Vec<_>>>()?;
+    let c_arg_ptrs: Vec<*const libc::c_char> = c_args
+        .iter()
+        .map(|a| a.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect();
+
+    unsafe {
+        libc::execvp(c_prog.as_ptr(), c_arg_ptrs.as_ptr());
+    }
+
+    // If we get here, execvp failed
+    Err(anyhow!(
+        "execvp({}) failed: {}",
+        cmd[0],
+        std::io::Error::last_os_error()
+    ))
 }
 
 /// Parse an ISO 8601 timestamp (e.g. "2000-01-01T00:00:00Z") into a SystemTime.
