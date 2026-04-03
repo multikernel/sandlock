@@ -66,6 +66,32 @@ jobs:
           name: sdist
           path: python/dist/*.tar.gz
 
+  # Build pre-compiled wheels so users don't need a Rust toolchain
+  wheels:
+    name: Build wheels
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.22
+        with:
+          package-dir: python
+          output-dir: wheelhouse
+        env:
+          CIBW_BUILD: "cp310-manylinux* cp311-manylinux* cp312-manylinux* cp313-manylinux*"
+          CIBW_ARCHS_LINUX: x86_64
+          CIBW_BEFORE_ALL_LINUX: >
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y &&
+            echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.bashrc
+          CIBW_ENVIRONMENT_LINUX: 'PATH="$HOME/.cargo/bin:$PATH"'
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels
+          path: wheelhouse/*.whl
+
   # Test
   test:
     name: Test (py${{ matrix.python }})
@@ -114,7 +140,7 @@ jobs:
   # Publish Python package to PyPI
   publish-pypi:
     name: Publish to PyPI
-    needs: [sdist, test]
+    needs: [sdist, wheels, test]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -126,13 +152,19 @@ jobs:
           name: sdist
           path: dist/
 
+      - name: Download wheels
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels
+          path: dist/
+
       - name: Publish to PyPI
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
         run: |
           pip install twine
-          twine upload dist/*.tar.gz
+          twine upload dist/*
 
   # Create GitHub Release with Rust binaries
   github-release:
