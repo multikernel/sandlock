@@ -102,9 +102,9 @@ enum Command {
         /// Dry-run: run the command, show filesystem changes, then discard
         #[arg(long)]
         dry_run: bool,
-        /// Filesystem-only mode: apply Landlock fs rules and exec directly (no seccomp/supervisor)
+        /// Landlock-only mode: apply Landlock rules and exec directly (no seccomp/supervisor)
         #[arg(long)]
-        fs_only: bool,
+        landlock_only: bool,
         #[arg(last = true)]
         cmd: Vec<String>,
     },
@@ -145,13 +145,13 @@ async fn main() -> Result<()> {
             max_cpu, max_open_files, chroot, privileged, workdir, cwd,
             fs_isolation, fs_storage, max_disk, net_allow, net_deny,
             port_remap, no_randomize_memory, no_huge_pages, deterministic_dirs, hostname, no_coredump,
-            env_vars, exec_shell, interactive: _, fs_deny, cpu_cores, gpu_devices, image, dry_run, fs_only, cmd } =>
+            env_vars, exec_shell, interactive: _, fs_deny, cpu_cores, gpu_devices, image, dry_run, landlock_only, cmd } =>
         {
-            if fs_only {
-                validate_fs_only(
+            if landlock_only {
+                validate_landlock_only(
                     &max_memory, &max_processes, &max_cpu, &max_open_files,
                     &timeout, &net_allow_host, &net_bind, &net_connect,
-                    &net_allow, &net_deny, isolate_ipc, isolate_signals,
+                    &net_allow, &net_deny,
                     &num_cpus, &random_seed, &time_start, no_randomize_memory,
                     no_huge_pages, deterministic_dirs, &hostname, &chroot,
                     &image, privileged, &workdir, &cwd, &fs_isolation, &fs_storage,
@@ -182,6 +182,8 @@ async fn main() -> Result<()> {
                         return Err(anyhow!("--env requires KEY=VALUE, got: {}", spec));
                     }
                 }
+                if isolate_ipc { builder = builder.isolate_ipc(true); }
+                if isolate_signals { builder = builder.isolate_signals(true); }
 
                 let policy = builder.build()?;
 
@@ -195,7 +197,7 @@ async fn main() -> Result<()> {
                     cmd.iter().map(|s| s.as_str()).collect()
                 };
 
-                return fs_only_exec(&policy, &cmd_strs);
+                return landlock_only_exec(&policy, &cmd_strs);
             }
 
             // Start from profile or default
@@ -431,9 +433,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Validate that no flags incompatible with --fs-only are set.
+/// Validate that no flags incompatible with --landlock-only are set.
 #[allow(clippy::too_many_arguments)]
-fn validate_fs_only(
+fn validate_landlock_only(
     max_memory: &Option<String>,
     max_processes: &Option<u32>,
     max_cpu: &Option<u8>,
@@ -444,8 +446,6 @@ fn validate_fs_only(
     net_connect: &[u16],
     net_allow: &[String],
     net_deny: &[String],
-    isolate_ipc: bool,
-    isolate_signals: bool,
     num_cpus: &Option<u32>,
     random_seed: &Option<u64>,
     time_start: &Option<String>,
@@ -479,8 +479,6 @@ fn validate_fs_only(
     if !net_connect.is_empty() { bad.push("--net-connect"); }
     if !net_allow.is_empty() { bad.push("--net-allow"); }
     if !net_deny.is_empty() { bad.push("--net-deny"); }
-    if isolate_ipc { bad.push("--isolate-ipc"); }
-    if isolate_signals { bad.push("--isolate-signals"); }
     if num_cpus.is_some() { bad.push("--num-cpus"); }
     if random_seed.is_some() { bad.push("--random-seed"); }
     if time_start.is_some() { bad.push("--time-start"); }
@@ -504,7 +502,7 @@ fn validate_fs_only(
 
     if !bad.is_empty() {
         return Err(anyhow!(
-            "--fs-only is incompatible with: {}",
+            "--landlock-only is incompatible with: {}",
             bad.join(", ")
         ));
     }
@@ -513,8 +511,8 @@ fn validate_fs_only(
 }
 
 /// Execute a command with Landlock-only confinement (no seccomp/supervisor).
-/// Applies filesystem confinement via confine_current_process, handles env, then execs.
-fn fs_only_exec(policy: &Policy, cmd: &[&str]) -> Result<()> {
+/// Applies Landlock confinement via confine_current_process, handles env, then execs.
+fn landlock_only_exec(policy: &Policy, cmd: &[&str]) -> Result<()> {
     use std::ffi::CString;
 
     // 1. Apply Landlock confinement (sets NO_NEW_PRIVS + Landlock rules)

@@ -180,13 +180,15 @@ def min_landlock_abi() -> int:
 
 
 def confine(policy: "PolicyDataclass") -> None:
-    """Confine the calling process with Landlock filesystem restrictions.
+    """Confine the calling process with Landlock restrictions.
 
     Applies PR_SET_NO_NEW_PRIVS and Landlock rules from the policy's
-    fs_readable, fs_writable, and fs_denied fields. The confinement is
-    **irreversible**.
+    filesystem, network port, IPC, and signal isolation fields.
+    The confinement is **irreversible**.
 
-    Only filesystem rules are used. All other policy fields are ignored.
+    Only Landlock-enforced fields are used (filesystem paths, TCP port
+    restrictions, isolate_ipc, isolate_signals). Fields that require the
+    seccomp supervisor (e.g. max_memory, net_allow_hosts) are ignored.
 
     This does NOT fork or exec — it confines the current process in-place.
 

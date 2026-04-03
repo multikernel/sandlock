@@ -124,11 +124,11 @@ sandlock run --dry-run --workdir . -w . -r /usr -r /lib -r /bin -r /etc -- make 
 # Use a saved profile
 sandlock run -p build -- make -j4
 
-# Filesystem-only confinement (Landlock only, no seccomp/supervisor)
-sandlock run --fs-only -r /usr -r /lib -r /lib64 -r /bin -w /tmp -- ./script.sh
+# Landlock-only confinement (Landlock rules only, no seccomp/supervisor)
+sandlock run --landlock-only -r /usr -r /lib -r /lib64 -r /bin -w /tmp -- ./script.sh
 
 # Nested sandboxing: confine sandlock's own supervisor
-sandlock run --fs-only -r /proc -r /usr -r /lib -r /lib64 -r /bin -r /etc -w /tmp -- \
+sandlock run --landlock-only -r /proc -r /usr -r /lib -r /lib64 -r /bin -r /etc -w /tmp -- \
   sandlock run -r /usr -w /tmp -- untrusted-command
 ```
 
