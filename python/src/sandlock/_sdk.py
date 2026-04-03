@@ -760,8 +760,7 @@ class _NativePolicy:
 
         if policy.port_remap:
             b = _b_port_remap(b, True)
-        if not policy.no_raw_sockets:
-            b = _b_no_raw_sockets(b, False)
+        b = _b_no_raw_sockets(b, policy.no_raw_sockets)
         if policy.no_udp:
             b = _b_no_udp(b, True)
 
@@ -780,8 +779,7 @@ class _NativePolicy:
             b = _b_time_start(b, epoch_secs)
         if policy.clean_env:
             b = _b_clean_env(b, True)
-        if policy.close_fds:
-            b = _b_close_fds(b, True)
+        b = _b_close_fds(b, policy.close_fds)
         for k, v in (policy.env or {}).items():
             b = _b_env_var(b, _encode(k), _encode(v))
 
