@@ -39,6 +39,15 @@ impl CowBranch for OverlayBranch {
         &self.merged
     }
 
+    fn child_mount_config(&self) -> Option<super::ChildMountConfig> {
+        Some(super::ChildMountConfig {
+            mount_point: self.base_dir.clone(),
+            upper: self.upper.clone(),
+            work: self.storage.join("work"),
+            lowers: vec![self.base_dir.clone()],
+        })
+    }
+
     fn commit(&self) -> Result<(), BranchError> {
         // Walk upper/, copy each entry to the base dir
         // Handle whiteouts: char device with major=0, minor=0 means deletion

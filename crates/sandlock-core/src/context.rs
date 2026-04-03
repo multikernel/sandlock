@@ -543,13 +543,8 @@ fn close_fds_above(min_fd: RawFd, keep: &[RawFd]) {
 // COW filesystem config passed from parent to child
 // ============================================================
 
-/// Overlay mount configuration for the child process.
-pub(crate) struct CowConfig {
-    pub merged: PathBuf,
-    pub upper: PathBuf,
-    pub work: PathBuf,
-    pub lowers: Vec<PathBuf>,
-}
+// Re-export ChildMountConfig so callers can use the old import path.
+pub(crate) use crate::cow::ChildMountConfig;
 
 /// Write uid/gid maps for an unprivileged user namespace.
 /// `real_uid`/`real_gid` must be captured *before* unshare(CLONE_NEWUSER),
@@ -576,7 +571,7 @@ fn write_id_maps_overflow() {
 ///
 /// This function **never returns**: it calls `execvp` on success or
 /// `_exit(127)` on any error.
-pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, cow_config: Option<&CowConfig>, nested: bool) -> ! {
+pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, cow_config: Option<&ChildMountConfig>, nested: bool) -> ! {
     // Helper: abort child on error. Includes the OS error automatically.
     macro_rules! fail {
         ($msg:expr) => {{
@@ -673,7 +668,11 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
         // Write uid/gid maps using overflow uid (preserves existing COW behavior)
         write_id_maps_overflow();
 
-        // Mount the overlay filesystem
+        // Mount the overlay filesystem ON TOP of the workdir so the child
+        // sees the merged view at the original path.  The kernel resolves
+        // lowerdir before the covering mount takes effect, so using the
+        // same path as both lowerdir and mount-point is safe inside our
+        // private mount namespace.
         let lowerdir = cow.lowers.iter()
             .map(|p| p.display().to_string())
             .collect::<Vec<_>>()
@@ -685,9 +684,9 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
             cow.work.display(),
         );
 
-        let merged_cstr = match CString::new(cow.merged.to_str().unwrap_or("")) {
+        let mount_cstr = match CString::new(cow.mount_point.to_str().unwrap_or("")) {
             Ok(c) => c,
-            Err(_) => fail!("invalid merged path"),
+            Err(_) => fail!("invalid overlay mount point path"),
         };
         let overlay_cstr = CString::new("overlay").unwrap();
         let opts_cstr = match CString::new(opts) {
@@ -698,7 +697,7 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
         let ret = unsafe {
             libc::mount(
                 overlay_cstr.as_ptr(),
-                merged_cstr.as_ptr(),
+                mount_cstr.as_ptr(),
                 overlay_cstr.as_ptr(),
                 0,
                 opts_cstr.as_ptr() as *const libc::c_void,

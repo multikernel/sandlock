@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::context::{self, CowConfig, PipePair, read_u32_fd, write_u32_fd};
+use crate::context::{self, PipePair, read_u32_fd, write_u32_fd};
 use crate::cow::{CowBranch, overlayfs::OverlayBranch, branchfs::BranchFsBranch};
 use crate::error::{SandboxError, SandlockError};
 use crate::network;
@@ -673,31 +673,8 @@ impl Sandbox {
             FsIsolation::None => None,
         };
 
-        // Build CowConfig for child if OverlayFS
-        let cow_config = if let Some(ref branch) = cow_branch {
-            if self.policy.fs_isolation == FsIsolation::OverlayFs {
-                // Downcast to get overlay-specific paths
-                // The branch_path is the merged dir; we need upper/work/lowers too.
-                // We stored this info in the OverlayBranch; extract via CowConfig.
-                // Since we can't downcast easily, we'll build CowConfig from policy info.
-                let workdir = self.policy.workdir.as_ref().unwrap();
-                let merged = branch.branch_path().to_path_buf();
-                // Derive upper/work from merged's parent (storage/uuid/)
-                let branch_dir = merged.parent().unwrap();
-                let upper = branch_dir.join("upper");
-                let work = branch_dir.join("work");
-                Some(CowConfig {
-                    merged,
-                    upper,
-                    work,
-                    lowers: vec![workdir.clone()],
-                })
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        // Ask the backend for mount config (only OverlayFS needs one).
+        let cow_config = cow_branch.as_ref().and_then(|b| b.child_mount_config());
 
         // 6. Create stdout/stderr capture pipes (if capture mode)
         let (stdout_r, stderr_r) = if capture {
