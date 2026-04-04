@@ -23,6 +23,7 @@ serde_json = "1"
 walkdir = "2"
 toml = "0.8"
 pathdiff = "0.2"
+hudsucker = "0.22"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
