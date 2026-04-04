@@ -93,6 +93,8 @@ _b_net_connect_port = _builder_fn("sandlock_policy_builder_net_connect_port", ct
 _b_port_remap = _builder_fn("sandlock_policy_builder_port_remap", ctypes.c_bool)
 _b_no_raw_sockets = _builder_fn("sandlock_policy_builder_no_raw_sockets", ctypes.c_bool)
 _b_no_udp = _builder_fn("sandlock_policy_builder_no_udp", ctypes.c_bool)
+_b_http_allow = _builder_fn("sandlock_policy_builder_http_allow", ctypes.c_char_p)
+_b_http_deny = _builder_fn("sandlock_policy_builder_http_deny", ctypes.c_char_p)
 _b_uid = _builder_fn("sandlock_policy_builder_uid", ctypes.c_uint32)
 _b_isolate_ipc = _builder_fn("sandlock_policy_builder_isolate_ipc", ctypes.c_bool)
 _b_isolate_signals = _builder_fn("sandlock_policy_builder_isolate_signals", ctypes.c_bool)
@@ -676,6 +678,7 @@ class _NativePolicy:
         "cpu_cores", "gpu_devices",
         "net_allow_hosts", "net_bind", "net_connect",
         "port_remap", "no_raw_sockets", "no_udp",
+        "http_allow", "http_deny",
         "uid", "isolate_ipc", "isolate_signals",
         "random_seed", "time_start", "clean_env", "close_fds", "env",
         "deny_syscalls", "allow_syscalls", "isolate_pids", "max_open_files",
@@ -758,6 +761,11 @@ class _NativePolicy:
             b = _b_net_bind_port(b, port)
         for port in parse_ports(policy.net_connect) if policy.net_connect else []:
             b = _b_net_connect_port(b, port)
+
+        for rule in (policy.http_allow or []):
+            b = _b_http_allow(b, _encode(str(rule)))
+        for rule in (policy.http_deny or []):
+            b = _b_http_deny(b, _encode(str(rule)))
 
         if policy.port_remap:
             b = _b_port_remap(b, True)
