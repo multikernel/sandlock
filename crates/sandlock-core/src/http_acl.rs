@@ -153,8 +153,6 @@ impl HttpHandler for AclHandler {
 pub struct HttpAclProxyHandle {
     /// Local address the proxy is listening on.
     pub addr: SocketAddr,
-    /// Whether HTTPS MITM is active (user provided CA cert+key).
-    pub has_https: bool,
     /// Shared map for the supervisor to record original destination IPs.
     pub orig_dest: OrigDestMap,
     /// Send to this channel to trigger graceful proxy shutdown.
@@ -201,8 +199,7 @@ pub async fn spawn_http_acl_proxy(
     ca_cert: Option<&Path>,
     ca_key: Option<&Path>,
 ) -> std::io::Result<HttpAclProxyHandle> {
-    // Load or skip CA for HTTPS MITM.
-    let has_https = ca_cert.is_some() && ca_key.is_some();
+    // Load CA for HTTPS MITM if provided.
 
     let (key_pair, cert) = if let (Some(cert_path), Some(key_path)) = (ca_cert, ca_key) {
         let key_pem = std::fs::read_to_string(key_path).map_err(|e| {
@@ -274,7 +271,6 @@ pub async fn spawn_http_acl_proxy(
 
     Ok(HttpAclProxyHandle {
         addr,
-        has_https,
         orig_dest,
         shutdown_tx: Some(shutdown_tx),
     })

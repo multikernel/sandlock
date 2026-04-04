@@ -195,6 +195,10 @@ class Policy:
     http_deny: Sequence[str] = field(default_factory=list)
     """HTTP deny rules. Checked before allow rules. Format: "METHOD host/path"."""
 
+    http_ports: Sequence[int] = field(default_factory=list)
+    """TCP ports to intercept for HTTP ACL. Defaults to [80] (plus 443 with
+    https_ca). Override to intercept custom ports like 8080."""
+
     https_ca: str | None = None
     """PEM CA certificate path for HTTPS MITM. When set, port 443 is also
     intercepted by the HTTP ACL proxy."""

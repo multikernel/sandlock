@@ -204,6 +204,9 @@ pub struct Policy {
     // HTTP ACL
     pub http_allow: Vec<HttpRule>,
     pub http_deny: Vec<HttpRule>,
+    /// TCP ports to intercept for HTTP ACL. Defaults to [80] (plus 443 when
+    /// https_ca is set). Override with `http_ports` to intercept custom ports.
+    pub http_ports: Vec<u16>,
     /// PEM CA cert for HTTPS MITM. When set, port 443 is also intercepted.
     pub https_ca: Option<PathBuf>,
     /// PEM CA key for HTTPS MITM. Required when https_ca is set.
@@ -296,6 +299,7 @@ pub struct PolicyBuilder {
 
     http_allow: Vec<String>,
     http_deny: Vec<String>,
+    http_ports: Vec<u16>,
     https_ca: Option<PathBuf>,
     https_key: Option<PathBuf>,
 
@@ -397,6 +401,11 @@ impl PolicyBuilder {
 
     pub fn http_deny(mut self, rule: &str) -> Self {
         self.http_deny.push(rule.to_string());
+        self
+    }
+
+    pub fn http_port(mut self, port: u16) -> Self {
+        self.http_ports.push(port);
         self
     }
 
@@ -600,6 +609,17 @@ impl PolicyBuilder {
             .map(|s| HttpRule::parse(s))
             .collect::<Result<_, _>>()?;
 
+        // Default HTTP intercept ports: 80 always, 443 when HTTPS CA is configured.
+        let http_ports = if self.http_ports.is_empty() && (!http_allow.is_empty() || !http_deny.is_empty()) {
+            let mut ports = vec![80];
+            if self.https_ca.is_some() {
+                ports.push(443);
+            }
+            ports
+        } else {
+            self.http_ports
+        };
+
         // Validate: fs_isolation != None requires workdir
         let fs_isolation = self.fs_isolation.unwrap_or_default();
         if fs_isolation != FsIsolation::None && self.workdir.is_none() {
@@ -619,6 +639,7 @@ impl PolicyBuilder {
             no_udp: self.no_udp,
             http_allow,
             http_deny,
+            http_ports,
             https_ca: self.https_ca,
             https_key: self.https_key,
             isolate_ipc: self.isolate_ipc,

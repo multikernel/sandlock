@@ -75,6 +75,9 @@ enum Command {
         http_allow: Vec<String>,
         #[arg(long = "http-deny", value_name = "RULE")]
         http_deny: Vec<String>,
+        /// TCP ports to intercept for HTTP ACL (default: 80, plus 443 with --https-ca)
+        #[arg(long = "http-port", value_name = "PORT")]
+        http_ports: Vec<u16>,
         /// PEM CA certificate for HTTPS MITM (enables port 443 interception)
         #[arg(long = "https-ca", value_name = "PATH")]
         https_ca: Option<String>,
@@ -155,7 +158,7 @@ async fn main() -> Result<()> {
             isolate_ipc, isolate_signals, clean_env, num_cpus, profile: profile_name, status_fd,
             max_cpu, max_open_files, chroot, uid, workdir, cwd,
             fs_isolation, fs_storage, max_disk, net_allow, net_deny,
-            http_allow, http_deny, https_ca, https_key,
+            http_allow, http_deny, http_ports, https_ca, https_key,
             port_remap, no_randomize_memory, no_huge_pages, deterministic_dirs, hostname, no_coredump,
             env_vars, exec_shell, interactive: _, fs_deny, cpu_cores, gpu_devices, image, dry_run, no_supervisor, cmd } =>
         {
@@ -163,7 +166,7 @@ async fn main() -> Result<()> {
                 validate_no_supervisor(
                     &max_memory, &max_processes, &max_cpu, &max_open_files,
                     &timeout, &net_allow_host, &net_bind, &net_connect,
-                    &net_allow, &net_deny, &http_allow, &http_deny,
+                    &net_allow, &net_deny, &http_allow, &http_deny, &http_ports,
                     &num_cpus, &random_seed, &time_start, no_randomize_memory,
                     no_huge_pages, deterministic_dirs, &hostname, &chroot,
                     &image, &uid, &workdir, &cwd, &fs_isolation, &fs_storage,
@@ -236,6 +239,9 @@ async fn main() -> Result<()> {
                     let s = format!("{} {}{}", rule.method, rule.host, rule.path);
                     b = b.http_deny(&s);
                 }
+                for port in &base.http_ports {
+                    b = b.http_port(*port);
+                }
                 if let Some(mem) = base.max_memory { b = b.max_memory(mem); }
                 b = b.max_processes(base.max_processes);
                 if let Some(cpu) = base.max_cpu { b = b.max_cpu(cpu); }
@@ -302,6 +308,7 @@ async fn main() -> Result<()> {
             }
             for rule in &http_allow { builder = builder.http_allow(rule); }
             for rule in &http_deny { builder = builder.http_deny(rule); }
+            for port in &http_ports { builder = builder.http_port(*port); }
             if let Some(ref ca) = https_ca { builder = builder.https_ca(ca); }
             if let Some(ref key) = https_key { builder = builder.https_key(key); }
             if port_remap { builder = builder.port_remap(true); }
@@ -477,6 +484,7 @@ fn validate_no_supervisor(
     net_deny: &[String],
     http_allow: &[String],
     http_deny: &[String],
+    http_ports: &[u16],
     num_cpus: &Option<u32>,
     random_seed: &Option<u64>,
     time_start: &Option<String>,
@@ -513,6 +521,7 @@ fn validate_no_supervisor(
     if !net_deny.is_empty() { bad.push("--net-deny"); }
     if !http_allow.is_empty() { bad.push("--http-allow"); }
     if !http_deny.is_empty() { bad.push("--http-deny"); }
+    if !http_ports.is_empty() { bad.push("--http-port"); }
     if num_cpus.is_some() { bad.push("--num-cpus"); }
     if random_seed.is_some() { bad.push("--random-seed"); }
     if time_start.is_some() { bad.push("--time-start"); }

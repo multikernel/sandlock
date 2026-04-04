@@ -95,6 +95,7 @@ _b_no_raw_sockets = _builder_fn("sandlock_policy_builder_no_raw_sockets", ctypes
 _b_no_udp = _builder_fn("sandlock_policy_builder_no_udp", ctypes.c_bool)
 _b_http_allow = _builder_fn("sandlock_policy_builder_http_allow", ctypes.c_char_p)
 _b_http_deny = _builder_fn("sandlock_policy_builder_http_deny", ctypes.c_char_p)
+_b_http_port = _builder_fn("sandlock_policy_builder_http_port", ctypes.c_uint16)
 _b_https_ca = _builder_fn("sandlock_policy_builder_https_ca", ctypes.c_char_p)
 _b_https_key = _builder_fn("sandlock_policy_builder_https_key", ctypes.c_char_p)
 _b_uid = _builder_fn("sandlock_policy_builder_uid", ctypes.c_uint32)
@@ -680,7 +681,7 @@ class _NativePolicy:
         "cpu_cores", "gpu_devices",
         "net_allow_hosts", "net_bind", "net_connect",
         "port_remap", "no_raw_sockets", "no_udp",
-        "http_allow", "http_deny", "https_ca", "https_key",
+        "http_allow", "http_deny", "http_ports", "https_ca", "https_key",
         "uid", "isolate_ipc", "isolate_signals",
         "random_seed", "time_start", "clean_env", "close_fds", "env",
         "deny_syscalls", "allow_syscalls", "isolate_pids", "max_open_files",
@@ -768,6 +769,8 @@ class _NativePolicy:
             b = _b_http_allow(b, _encode(str(rule)))
         for rule in (policy.http_deny or []):
             b = _b_http_deny(b, _encode(str(rule)))
+        for port in (policy.http_ports or []):
+            b = _b_http_port(b, int(port))
         if policy.https_ca:
             b = _b_https_ca(b, _encode(str(policy.https_ca)))
         if policy.https_key:

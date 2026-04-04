@@ -398,6 +398,18 @@ pub unsafe extern "C" fn sandlock_policy_builder_http_deny(
 }
 
 /// # Safety
+/// `b` must be a valid pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_http_port(
+    b: *mut PolicyBuilder,
+    port: u16,
+) -> *mut PolicyBuilder {
+    if b.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.http_port(port)))
+}
+
+/// # Safety
 /// `b` and `path` must be valid pointers.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_policy_builder_https_ca(
