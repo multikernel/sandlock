@@ -368,6 +368,36 @@ pub unsafe extern "C" fn sandlock_policy_builder_uid(
 }
 
 // ----------------------------------------------------------------
+// Policy Builder — HTTP ACL
+// ----------------------------------------------------------------
+
+/// # Safety
+/// `b` and `rule` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_http_allow(
+    b: *mut PolicyBuilder,
+    rule: *const c_char,
+) -> *mut PolicyBuilder {
+    if b.is_null() || rule.is_null() { return b; }
+    let rule = CStr::from_ptr(rule).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.http_allow(rule)))
+}
+
+/// # Safety
+/// `b` and `rule` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_http_deny(
+    b: *mut PolicyBuilder,
+    rule: *const c_char,
+) -> *mut PolicyBuilder {
+    if b.is_null() || rule.is_null() { return b; }
+    let rule = CStr::from_ptr(rule).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.http_deny(rule)))
+}
+
+// ----------------------------------------------------------------
 // Policy Builder — isolation & determinism
 // ----------------------------------------------------------------
 
