@@ -139,7 +139,7 @@ struct SandboxStatus {
     signal: Option<i32>,
 }
 
-#[tokio::main]
+#[tokio::main(worker_threads = 2)]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
