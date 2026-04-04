@@ -66,15 +66,6 @@ pub struct HttpAclProxyHandle {
     shutdown_tx: Option<oneshot::Sender<()>>,
 }
 
-impl HttpAclProxyHandle {
-    /// Initiate graceful shutdown of the proxy.
-    pub fn shutdown(mut self) {
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(());
-        }
-    }
-}
-
 impl Drop for HttpAclProxyHandle {
     fn drop(&mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
