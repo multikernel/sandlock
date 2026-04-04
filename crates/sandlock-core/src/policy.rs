@@ -294,8 +294,8 @@ pub struct PolicyBuilder {
     no_raw_sockets: Option<bool>,
     no_udp: bool,
 
-    http_allow: Vec<HttpRule>,
-    http_deny: Vec<HttpRule>,
+    http_allow: Vec<String>,
+    http_deny: Vec<String>,
     https_ca: Option<PathBuf>,
     https_key: Option<PathBuf>,
 
@@ -391,12 +391,12 @@ impl PolicyBuilder {
     }
 
     pub fn http_allow(mut self, rule: &str) -> Self {
-        self.http_allow.push(HttpRule::parse(rule).expect("invalid HTTP allow rule"));
+        self.http_allow.push(rule.to_string());
         self
     }
 
     pub fn http_deny(mut self, rule: &str) -> Self {
-        self.http_deny.push(HttpRule::parse(rule).expect("invalid HTTP deny rule"));
+        self.http_deny.push(rule.to_string());
         self
     }
 
@@ -581,6 +581,25 @@ impl PolicyBuilder {
             }
         }
 
+        // Validate: https_ca and https_key must both be set or both unset
+        if self.https_ca.is_some() != self.https_key.is_some() {
+            return Err(PolicyError::Invalid(
+                "--https-ca and --https-key must both be provided together".into(),
+            ));
+        }
+
+        // Parse HTTP rules (deferred from builder methods to propagate errors)
+        let http_allow: Vec<HttpRule> = self
+            .http_allow
+            .iter()
+            .map(|s| HttpRule::parse(s))
+            .collect::<Result<_, _>>()?;
+        let http_deny: Vec<HttpRule> = self
+            .http_deny
+            .iter()
+            .map(|s| HttpRule::parse(s))
+            .collect::<Result<_, _>>()?;
+
         // Validate: fs_isolation != None requires workdir
         let fs_isolation = self.fs_isolation.unwrap_or_default();
         if fs_isolation != FsIsolation::None && self.workdir.is_none() {
@@ -598,8 +617,8 @@ impl PolicyBuilder {
             net_connect: self.net_connect,
             no_raw_sockets: self.no_raw_sockets.unwrap_or(true),
             no_udp: self.no_udp,
-            http_allow: self.http_allow,
-            http_deny: self.http_deny,
+            http_allow,
+            http_deny,
             https_ca: self.https_ca,
             https_key: self.https_key,
             isolate_ipc: self.isolate_ipc,
@@ -802,5 +821,48 @@ mod http_rule_tests {
         assert_eq!(policy.http_deny.len(), 1);
         assert_eq!(policy.http_allow[0].method, "GET");
         assert_eq!(policy.http_deny[0].host, "*");
+    }
+
+    #[test]
+    fn builder_invalid_http_allow_returns_error() {
+        let result = Policy::builder()
+            .http_allow("GETexample.com")
+            .build();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn builder_invalid_http_deny_returns_error() {
+        let result = Policy::builder()
+            .http_deny("BADRULE")
+            .build();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn builder_https_ca_without_key_returns_error() {
+        let result = Policy::builder()
+            .https_ca("/tmp/ca.pem")
+            .build();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn builder_https_key_without_ca_returns_error() {
+        let result = Policy::builder()
+            .https_key("/tmp/key.pem")
+            .build();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn builder_https_ca_and_key_together_ok() {
+        let policy = Policy::builder()
+            .https_ca("/tmp/ca.pem")
+            .https_key("/tmp/key.pem")
+            .build()
+            .unwrap();
+        assert!(policy.https_ca.is_some());
+        assert!(policy.https_key.is_some());
     }
 }
