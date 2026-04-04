@@ -17,6 +17,12 @@ use crate::policy::{http_acl_check, HttpRule};
 /// supervisor on redirect, read by the proxy handler to verify the Host header.
 pub type OrigDestMap = Arc<std::sync::RwLock<HashMap<SocketAddr, IpAddr>>>;
 
+/// TTL-based DNS cache entry.
+struct DnsCacheEntry {
+    ips: Vec<IpAddr>,
+    expires: std::time::Instant,
+}
+
 /// ACL-enforcing HTTP handler for hudsucker.
 #[derive(Clone)]
 struct AclHandler {
@@ -24,9 +30,44 @@ struct AclHandler {
     deny_rules: Arc<Vec<HttpRule>>,
     /// Map of client_addr → original destination IP, populated by supervisor.
     orig_dest: OrigDestMap,
+    /// DNS resolution cache: hostname → resolved IPs with TTL.
+    dns_cache: Arc<tokio::sync::Mutex<HashMap<String, DnsCacheEntry>>>,
 }
 
+/// DNS cache TTL — resolved IPs are reused for this duration.
+const DNS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl AclHandler {
+    /// Resolve a hostname with caching. Returns cached IPs if fresh,
+    /// otherwise performs a lookup and caches the result.
+    async fn resolve_cached(&self, host: &str) -> Option<Vec<IpAddr>> {
+        // Check cache first.
+        {
+            let cache = self.dns_cache.lock().await;
+            if let Some(entry) = cache.get(host) {
+                if entry.expires > std::time::Instant::now() {
+                    return Some(entry.ips.clone());
+                }
+            }
+        }
+
+        // Cache miss or expired — resolve.
+        let lookup = format!("{}:0", host);
+        let resolved = tokio::net::lookup_host(&lookup).await.ok()?;
+        let ips: Vec<IpAddr> = resolved.map(|sa| sa.ip()).collect();
+
+        // Store in cache.
+        let mut cache = self.dns_cache.lock().await;
+        cache.insert(
+            host.to_string(),
+            DnsCacheEntry {
+                ips: ips.clone(),
+                expires: std::time::Instant::now() + DNS_CACHE_TTL,
+            },
+        );
+        Some(ips)
+    }
+
     /// Verify that the claimed host resolves to the original destination IP.
     /// Returns true if verification passes or is not applicable.
     async fn verify_host(&self, client_addr: &SocketAddr, claimed_host: &str) -> bool {
@@ -47,15 +88,11 @@ impl AclHandler {
             return ip == orig_ip;
         }
 
-        // Resolve the claimed hostname and check if any result matches.
-        let lookup = format!("{}:0", claimed_host);
-        let resolved = tokio::net::lookup_host(&lookup).await;
-        match resolved {
-            Ok(addrs) => addrs
-                .into_iter()
-                .any(|sa| sa.ip() == orig_ip),
+        // Resolve the claimed hostname (with caching) and check if any result matches.
+        match self.resolve_cached(claimed_host).await {
+            Some(ips) => ips.iter().any(|ip| *ip == orig_ip),
             // DNS failure for the claimed host — deny.
-            Err(_) => false,
+            None => false,
         }
     }
 }
@@ -211,6 +248,7 @@ pub async fn spawn_http_acl_proxy(
         allow_rules: Arc::new(allow),
         deny_rules: Arc::new(deny),
         orig_dest: Arc::clone(&orig_dest),
+        dns_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     };
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
