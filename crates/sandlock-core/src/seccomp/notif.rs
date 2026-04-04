@@ -97,6 +97,8 @@ pub struct SupervisorState {
     pub live_policy: Option<std::sync::Arc<std::sync::RwLock<crate::policy_fn::LivePolicy>>>,
     /// Dynamically denied paths from policy_fn.
     pub denied_paths: std::sync::Arc<std::sync::RwLock<HashSet<String>>>,
+    /// HTTP ACL proxy address (None if HTTP ACL not active).
+    pub http_acl_addr: Option<std::net::SocketAddr>,
 }
 
 impl SupervisorState {
@@ -130,6 +132,7 @@ impl SupervisorState {
             pid_ip_overrides: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
             live_policy: None,
             denied_paths: std::sync::Arc::new(std::sync::RwLock::new(HashSet::new())),
+            http_acl_addr: None,
         }
     }
 }
@@ -219,6 +222,7 @@ pub struct NotifPolicy {
     pub chroot_denied: Vec<std::path::PathBuf>,
     pub deterministic_dirs: bool,
     pub hostname: Option<String>,
+    pub has_http_acl: bool,
 }
 
 // ============================================================
@@ -497,7 +501,7 @@ async fn dispatch(
     }
 
     // Network syscalls
-    if policy.has_net_allowlist
+    if (policy.has_net_allowlist || policy.has_http_acl)
         && (nr == libc::SYS_connect || nr == libc::SYS_sendto || nr == libc::SYS_sendmsg)
     {
         return crate::network::handle_net(notif, state, notif_fd).await;

@@ -49,6 +49,25 @@ fn parse_ip_from_sockaddr(bytes: &[u8]) -> Option<IpAddr> {
 }
 
 // ============================================================
+// parse_port_from_sockaddr — parse TCP port from sockaddr bytes
+// ============================================================
+
+/// Parse TCP port from a sockaddr byte buffer.
+/// Returns None for non-IP families (AF_UNIX etc.).
+fn parse_port_from_sockaddr(bytes: &[u8]) -> Option<u16> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    let family = u16::from_ne_bytes([bytes[0], bytes[1]]) as u32;
+    match family {
+        f if f == AF_INET || f == AF_INET6 => {
+            Some(u16::from_be_bytes([bytes[2], bytes[3]]))
+        }
+        _ => None,
+    }
+}
+
+// ============================================================
 // connect_on_behalf — perform connect() on behalf of the child (TOCTOU-safe)
 // ============================================================
 
@@ -86,11 +105,46 @@ async fn connect_on_behalf(
                 return NotifAction::Errno(ECONNREFUSED);
             }
         }
+        // Check for HTTP ACL redirect
+        let dest_port = parse_port_from_sockaddr(&addr_bytes);
+        let http_acl_addr = st.http_acl_addr;
+
         let child_pidfd = match st.child_pidfd {
             Some(fd) => fd,
             None => return NotifAction::Errno(libc::ENOSYS),
         };
         drop(st);
+
+        // Determine the actual connect target (redirect HTTP/HTTPS to proxy)
+        let (connect_addr, connect_len) = if let Some(proxy_addr) = http_acl_addr {
+            if dest_port == Some(80) || dest_port == Some(443) {
+                // Redirect to proxy
+                let mut sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+                sa.sin_family = libc::AF_INET as u16;
+                sa.sin_port = proxy_addr.port().to_be();
+                match proxy_addr {
+                    std::net::SocketAddr::V4(v4) => {
+                        sa.sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
+                    }
+                    std::net::SocketAddr::V6(_) => {
+                        // Proxy always binds to 127.0.0.1 — IPv6 unreachable
+                        return NotifAction::Errno(libc::EAFNOSUPPORT);
+                    }
+                }
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        &sa as *const _ as *const u8,
+                        std::mem::size_of::<libc::sockaddr_in>(),
+                    )
+                }
+                .to_vec();
+                (bytes, std::mem::size_of::<libc::sockaddr_in>() as u32)
+            } else {
+                (addr_bytes.clone(), addr_len)
+            }
+        } else {
+            (addr_bytes.clone(), addr_len)
+        };
 
         // 3. Duplicate child's socket into supervisor
         let dup_fd = match crate::seccomp::notif::dup_child_fd(child_pidfd, sockfd) {
@@ -102,8 +156,8 @@ async fn connect_on_behalf(
         let ret = unsafe {
             libc::connect(
                 dup_fd.as_raw_fd(),
-                addr_bytes.as_ptr() as *const libc::sockaddr,
-                addr_len as libc::socklen_t,
+                connect_addr.as_ptr() as *const libc::sockaddr,
+                connect_len as libc::socklen_t,
             )
         };
 

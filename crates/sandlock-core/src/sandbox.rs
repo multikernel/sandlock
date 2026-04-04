@@ -837,6 +837,7 @@ impl Sandbox {
                 chroot_denied: self.policy.fs_denied.clone(),
                 deterministic_dirs: self.policy.deterministic_dirs,
                 hostname: self.policy.hostname.clone(),
+                has_http_acl: false,
             };
 
             // Create SupervisorState
