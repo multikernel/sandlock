@@ -124,16 +124,19 @@ impl HttpRule {
             return false;
         }
         // Path match
-        glob_match(&self.path, path)
+        prefix_or_exact_match(&self.path, path)
     }
 }
 
-/// Simple glob matching for paths. Supports trailing `*` as a prefix match.
+/// Simple prefix or exact matching for paths. Supports trailing `*` as a prefix match.
 ///
+/// Only supports:
 /// - `"/*"` or `"*"` matches everything
-/// - `"/v1/*"` matches "/v1/foo", "/v1/foo/bar"
-/// - `"/v1/models"` matches exactly "/v1/models"
-pub fn glob_match(pattern: &str, value: &str) -> bool {
+/// - `"/v1/*"` matches "/v1/foo", "/v1/foo/bar" (prefix match)
+/// - `"/v1/models"` matches exactly "/v1/models" (exact match)
+///
+/// Does NOT support mid-pattern wildcards (e.g., "/v1/*/models").
+pub fn prefix_or_exact_match(pattern: &str, value: &str) -> bool {
     if pattern == "/*" || pattern == "*" {
         return true;
     }
@@ -382,16 +385,12 @@ impl PolicyBuilder {
     }
 
     pub fn http_allow(mut self, rule: &str) -> Self {
-        if let Ok(r) = HttpRule::parse(rule) {
-            self.http_allow.push(r);
-        }
+        self.http_allow.push(HttpRule::parse(rule).expect("invalid HTTP allow rule"));
         self
     }
 
     pub fn http_deny(mut self, rule: &str) -> Self {
-        if let Ok(r) = HttpRule::parse(rule) {
-            self.http_deny.push(r);
-        }
+        self.http_deny.push(HttpRule::parse(rule).expect("invalid HTTP deny rule"));
         self
     }
 
@@ -674,28 +673,28 @@ mod http_rule_tests {
         assert!(HttpRule::parse("GET  ").is_err());
     }
 
-    // --- glob_match tests ---
+    // --- prefix_or_exact_match tests ---
 
     #[test]
-    fn glob_match_wildcard_all() {
-        assert!(glob_match("/*", "/anything"));
-        assert!(glob_match("*", "/anything"));
-        assert!(glob_match("/*", "/"));
+    fn prefix_or_exact_match_wildcard_all() {
+        assert!(prefix_or_exact_match("/*", "/anything"));
+        assert!(prefix_or_exact_match("*", "/anything"));
+        assert!(prefix_or_exact_match("/*", "/"));
     }
 
     #[test]
-    fn glob_match_prefix() {
-        assert!(glob_match("/v1/*", "/v1/foo"));
-        assert!(glob_match("/v1/*", "/v1/foo/bar"));
-        assert!(glob_match("/v1/*", "/v1/"));
-        assert!(!glob_match("/v1/*", "/v2/foo"));
+    fn prefix_or_exact_match_prefix() {
+        assert!(prefix_or_exact_match("/v1/*", "/v1/foo"));
+        assert!(prefix_or_exact_match("/v1/*", "/v1/foo/bar"));
+        assert!(prefix_or_exact_match("/v1/*", "/v1/"));
+        assert!(!prefix_or_exact_match("/v1/*", "/v2/foo"));
     }
 
     #[test]
-    fn glob_match_exact() {
-        assert!(glob_match("/v1/models", "/v1/models"));
-        assert!(!glob_match("/v1/models", "/v1/models/extra"));
-        assert!(!glob_match("/v1/models", "/v1/model"));
+    fn prefix_or_exact_match_exact() {
+        assert!(prefix_or_exact_match("/v1/models", "/v1/models"));
+        assert!(!prefix_or_exact_match("/v1/models", "/v1/models/extra"));
+        assert!(!prefix_or_exact_match("/v1/models", "/v1/model"));
     }
 
     // --- HttpRule::matches tests ---
