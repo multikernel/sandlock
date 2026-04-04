@@ -882,6 +882,7 @@ impl Sandbox {
 
             sup_state.http_acl_addr = self.http_acl_handle.as_ref().map(|h| h.addr);
             sup_state.http_acl_has_https = self.http_acl_handle.as_ref().map(|h| h.has_https).unwrap_or(false);
+            sup_state.http_acl_orig_dest = self.http_acl_handle.as_ref().map(|h| h.orig_dest.clone());
 
             // Seccomp COW branch
             if self.policy.workdir.is_some() && self.policy.fs_isolation == FsIsolation::None {

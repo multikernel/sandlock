@@ -109,6 +109,7 @@ async fn connect_on_behalf(
         let dest_port = parse_port_from_sockaddr(&addr_bytes);
         let http_acl_addr = st.http_acl_addr;
         let http_acl_has_https = st.http_acl_has_https;
+        let http_acl_orig_dest = st.http_acl_orig_dest.clone();
 
         let child_pidfd = match st.child_pidfd {
             Some(fd) => fd,
@@ -117,8 +118,10 @@ async fn connect_on_behalf(
         drop(st);
 
         // Determine the actual connect target (redirect HTTP/HTTPS to proxy)
+        let mut redirected = false;
         let (connect_addr, connect_len) = if let Some(proxy_addr) = http_acl_addr {
             if dest_port == Some(80) || (http_acl_has_https && dest_port == Some(443)) {
+                redirected = true;
                 // Redirect to proxy
                 let mut sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
                 sa.sin_family = libc::AF_INET as u16;
@@ -162,7 +165,35 @@ async fn connect_on_behalf(
             )
         };
 
-        // 5. Return result
+        // 5. Record original dest IP for Host header verification on redirect
+        if ret == 0 && redirected {
+            if let Some(ref orig_dest_map) = http_acl_orig_dest {
+                if let Some(orig_ip) = parse_ip_from_sockaddr(&addr_bytes) {
+                    // getsockname() to find the local addr the proxy sees as client_addr
+                    let mut local_sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+                    let mut local_len: libc::socklen_t =
+                        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+                    let gs_ret = unsafe {
+                        libc::getsockname(
+                            dup_fd.as_raw_fd(),
+                            &mut local_sa as *mut _ as *mut libc::sockaddr,
+                            &mut local_len,
+                        )
+                    };
+                    if gs_ret == 0 {
+                        let local_port = u16::from_be(local_sa.sin_port);
+                        let local_ip = Ipv4Addr::from(u32::from_be(local_sa.sin_addr.s_addr));
+                        let local_addr =
+                            std::net::SocketAddr::V4(std::net::SocketAddrV4::new(local_ip, local_port));
+                        if let Ok(mut map) = orig_dest_map.write() {
+                            map.insert(local_addr, orig_ip);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 6. Return result
         if ret == 0 {
             NotifAction::ReturnValue(0)
         } else {

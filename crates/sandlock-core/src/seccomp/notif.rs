@@ -101,6 +101,8 @@ pub struct SupervisorState {
     pub http_acl_addr: Option<std::net::SocketAddr>,
     /// Whether HTTPS MITM is active (user provided CA cert).
     pub http_acl_has_https: bool,
+    /// Shared map for recording original destination IPs on proxy redirect.
+    pub http_acl_orig_dest: Option<crate::http_acl::OrigDestMap>,
 }
 
 impl SupervisorState {
@@ -136,6 +138,7 @@ impl SupervisorState {
             denied_paths: std::sync::Arc::new(std::sync::RwLock::new(HashSet::new())),
             http_acl_addr: None,
             http_acl_has_https: false,
+            http_acl_orig_dest: None,
         }
     }
 }
