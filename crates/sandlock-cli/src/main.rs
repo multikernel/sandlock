@@ -71,6 +71,10 @@ enum Command {
         net_allow: Vec<String>,
         #[arg(long = "net-deny", value_name = "PROTO")]
         net_deny: Vec<String>,
+        #[arg(long = "http-allow", value_name = "RULE")]
+        http_allow: Vec<String>,
+        #[arg(long = "http-deny", value_name = "RULE")]
+        http_deny: Vec<String>,
         #[arg(long)]
         port_remap: bool,
         #[arg(long)]
@@ -145,6 +149,7 @@ async fn main() -> Result<()> {
             isolate_ipc, isolate_signals, clean_env, num_cpus, profile: profile_name, status_fd,
             max_cpu, max_open_files, chroot, uid, workdir, cwd,
             fs_isolation, fs_storage, max_disk, net_allow, net_deny,
+            http_allow, http_deny,
             port_remap, no_randomize_memory, no_huge_pages, deterministic_dirs, hostname, no_coredump,
             env_vars, exec_shell, interactive: _, fs_deny, cpu_cores, gpu_devices, image, dry_run, no_supervisor, cmd } =>
         {
@@ -152,7 +157,7 @@ async fn main() -> Result<()> {
                 validate_no_supervisor(
                     &max_memory, &max_processes, &max_cpu, &max_open_files,
                     &timeout, &net_allow_host, &net_bind, &net_connect,
-                    &net_allow, &net_deny,
+                    &net_allow, &net_deny, &http_allow, &http_deny,
                     &num_cpus, &random_seed, &time_start, no_randomize_memory,
                     no_huge_pages, deterministic_dirs, &hostname, &chroot,
                     &image, &uid, &workdir, &cwd, &fs_isolation, &fs_storage,
@@ -281,6 +286,8 @@ async fn main() -> Result<()> {
                     other => return Err(anyhow!("unknown --net-deny protocol: {}", other)),
                 }
             }
+            for rule in &http_allow { builder = builder.http_allow(rule); }
+            for rule in &http_deny { builder = builder.http_deny(rule); }
             if port_remap { builder = builder.port_remap(true); }
             if !cpu_cores.is_empty() { builder = builder.cpu_cores(cpu_cores); }
             if !gpu_devices.is_empty() { builder = builder.gpu_devices(gpu_devices); }
@@ -452,6 +459,8 @@ fn validate_no_supervisor(
     net_connect: &[u16],
     net_allow: &[String],
     net_deny: &[String],
+    http_allow: &[String],
+    http_deny: &[String],
     num_cpus: &Option<u32>,
     random_seed: &Option<u64>,
     time_start: &Option<String>,
@@ -486,6 +495,8 @@ fn validate_no_supervisor(
     if !net_connect.is_empty() { bad.push("--net-connect"); }
     if !net_allow.is_empty() { bad.push("--net-allow"); }
     if !net_deny.is_empty() { bad.push("--net-deny"); }
+    if !http_allow.is_empty() { bad.push("--http-allow"); }
+    if !http_deny.is_empty() { bad.push("--http-deny"); }
     if num_cpus.is_some() { bad.push("--num-cpus"); }
     if random_seed.is_some() { bad.push("--random-seed"); }
     if time_start.is_some() { bad.push("--time-start"); }
