@@ -74,6 +74,111 @@ pub enum BranchAction {
     Keep,
 }
 
+/// An HTTP access control rule.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct HttpRule {
+    pub method: String,
+    pub host: String,
+    pub path: String,
+}
+
+impl HttpRule {
+    /// Parse a rule from "METHOD host/path" format.
+    ///
+    /// Examples:
+    /// - `"GET api.example.com/v1/*"` → method="GET", host="api.example.com", path="/v1/*"
+    /// - `"* */admin/*"` → method="*", host="*", path="/admin/*"
+    /// - `"GET example.com"` → method="GET", host="example.com", path="/*"
+    pub fn parse(s: &str) -> Result<Self, PolicyError> {
+        let s = s.trim();
+        let (method, rest) = s
+            .split_once(char::is_whitespace)
+            .ok_or_else(|| PolicyError::Invalid(format!("invalid http rule: {}", s)))?;
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return Err(PolicyError::Invalid(format!("invalid http rule: {}", s)));
+        }
+
+        let (host, path) = if let Some(pos) = rest.find('/') {
+            let (h, p) = rest.split_at(pos);
+            (h.to_string(), p.to_string())
+        } else {
+            (rest.to_string(), "/*".to_string())
+        };
+
+        Ok(HttpRule {
+            method: method.to_uppercase(),
+            host,
+            path,
+        })
+    }
+
+    /// Check whether this rule matches the given request parameters.
+    pub fn matches(&self, method: &str, host: &str, path: &str) -> bool {
+        // Method match
+        if self.method != "*" && !self.method.eq_ignore_ascii_case(method) {
+            return false;
+        }
+        // Host match
+        if self.host != "*" && !self.host.eq_ignore_ascii_case(host) {
+            return false;
+        }
+        // Path match
+        glob_match(&self.path, path)
+    }
+}
+
+/// Simple glob matching for paths. Supports trailing `*` as a prefix match.
+///
+/// - `"/*"` or `"*"` matches everything
+/// - `"/v1/*"` matches "/v1/foo", "/v1/foo/bar"
+/// - `"/v1/models"` matches exactly "/v1/models"
+pub fn glob_match(pattern: &str, value: &str) -> bool {
+    if pattern == "/*" || pattern == "*" {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        value.starts_with(prefix)
+    } else {
+        pattern == value
+    }
+}
+
+/// Evaluate HTTP ACL rules against a request.
+///
+/// - Deny rules are checked first; if any match, return false.
+/// - Allow rules are checked next; if any match, return true.
+/// - If allow rules exist but none matched, return false (deny-by-default).
+/// - If no rules at all, return true (unrestricted).
+pub fn http_acl_check(
+    allow: &[HttpRule],
+    deny: &[HttpRule],
+    method: &str,
+    host: &str,
+    path: &str,
+) -> bool {
+    // Deny rules checked first
+    for rule in deny {
+        if rule.matches(method, host, path) {
+            return false;
+        }
+    }
+    // Allow rules checked next
+    if allow.is_empty() && deny.is_empty() {
+        return true; // unrestricted
+    }
+    if allow.is_empty() {
+        // Only deny rules exist; anything not denied is allowed
+        return true;
+    }
+    for rule in allow {
+        if rule.matches(method, host, path) {
+            return true;
+        }
+    }
+    false // allow rules exist but none matched
+}
+
 /// Sandbox policy configuration.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Policy {
@@ -92,6 +197,10 @@ pub struct Policy {
     pub net_connect: Vec<u16>,
     pub no_raw_sockets: bool,
     pub no_udp: bool,
+
+    // HTTP ACL
+    pub http_allow: Vec<HttpRule>,
+    pub http_deny: Vec<HttpRule>,
 
     // Namespace isolation
     pub isolate_ipc: bool,
@@ -177,6 +286,9 @@ pub struct PolicyBuilder {
     net_connect: Vec<u16>,
     no_raw_sockets: Option<bool>,
     no_udp: bool,
+
+    http_allow: Vec<HttpRule>,
+    http_deny: Vec<HttpRule>,
 
     isolate_ipc: bool,
     isolate_signals: bool,
@@ -266,6 +378,20 @@ impl PolicyBuilder {
 
     pub fn no_udp(mut self, v: bool) -> Self {
         self.no_udp = v;
+        self
+    }
+
+    pub fn http_allow(mut self, rule: &str) -> Self {
+        if let Ok(r) = HttpRule::parse(rule) {
+            self.http_allow.push(r);
+        }
+        self
+    }
+
+    pub fn http_deny(mut self, rule: &str) -> Self {
+        if let Ok(r) = HttpRule::parse(rule) {
+            self.http_deny.push(r);
+        }
         self
     }
 
@@ -457,6 +583,8 @@ impl PolicyBuilder {
             net_connect: self.net_connect,
             no_raw_sockets: self.no_raw_sockets.unwrap_or(true),
             no_udp: self.no_udp,
+            http_allow: self.http_allow,
+            http_deny: self.http_deny,
             isolate_ipc: self.isolate_ipc,
             isolate_signals: self.isolate_signals,
             isolate_pids: self.isolate_pids,
@@ -489,5 +617,173 @@ impl PolicyBuilder {
             uid: self.uid,
             policy_fn: self.policy_fn,
         })
+    }
+}
+
+#[cfg(test)]
+mod http_rule_tests {
+    use super::*;
+
+    // --- HttpRule::parse tests ---
+
+    #[test]
+    fn parse_basic_get() {
+        let rule = HttpRule::parse("GET api.example.com/v1/*").unwrap();
+        assert_eq!(rule.method, "GET");
+        assert_eq!(rule.host, "api.example.com");
+        assert_eq!(rule.path, "/v1/*");
+    }
+
+    #[test]
+    fn parse_wildcard_method_and_host() {
+        let rule = HttpRule::parse("* */admin/*").unwrap();
+        assert_eq!(rule.method, "*");
+        assert_eq!(rule.host, "*");
+        assert_eq!(rule.path, "/admin/*");
+    }
+
+    #[test]
+    fn parse_post_with_exact_path() {
+        let rule = HttpRule::parse("POST example.com/upload").unwrap();
+        assert_eq!(rule.method, "POST");
+        assert_eq!(rule.host, "example.com");
+        assert_eq!(rule.path, "/upload");
+    }
+
+    #[test]
+    fn parse_no_path_defaults_to_wildcard() {
+        let rule = HttpRule::parse("GET example.com").unwrap();
+        assert_eq!(rule.method, "GET");
+        assert_eq!(rule.host, "example.com");
+        assert_eq!(rule.path, "/*");
+    }
+
+    #[test]
+    fn parse_method_uppercased() {
+        let rule = HttpRule::parse("get example.com/foo").unwrap();
+        assert_eq!(rule.method, "GET");
+    }
+
+    #[test]
+    fn parse_error_no_space() {
+        assert!(HttpRule::parse("GETexample.com").is_err());
+    }
+
+    #[test]
+    fn parse_error_empty_host() {
+        assert!(HttpRule::parse("GET  ").is_err());
+    }
+
+    // --- glob_match tests ---
+
+    #[test]
+    fn glob_match_wildcard_all() {
+        assert!(glob_match("/*", "/anything"));
+        assert!(glob_match("*", "/anything"));
+        assert!(glob_match("/*", "/"));
+    }
+
+    #[test]
+    fn glob_match_prefix() {
+        assert!(glob_match("/v1/*", "/v1/foo"));
+        assert!(glob_match("/v1/*", "/v1/foo/bar"));
+        assert!(glob_match("/v1/*", "/v1/"));
+        assert!(!glob_match("/v1/*", "/v2/foo"));
+    }
+
+    #[test]
+    fn glob_match_exact() {
+        assert!(glob_match("/v1/models", "/v1/models"));
+        assert!(!glob_match("/v1/models", "/v1/models/extra"));
+        assert!(!glob_match("/v1/models", "/v1/model"));
+    }
+
+    // --- HttpRule::matches tests ---
+
+    #[test]
+    fn matches_exact() {
+        let rule = HttpRule::parse("GET api.example.com/v1/models").unwrap();
+        assert!(rule.matches("GET", "api.example.com", "/v1/models"));
+        assert!(!rule.matches("POST", "api.example.com", "/v1/models"));
+        assert!(!rule.matches("GET", "other.com", "/v1/models"));
+        assert!(!rule.matches("GET", "api.example.com", "/v1/other"));
+    }
+
+    #[test]
+    fn matches_wildcard_method() {
+        let rule = HttpRule::parse("* api.example.com/v1/*").unwrap();
+        assert!(rule.matches("GET", "api.example.com", "/v1/foo"));
+        assert!(rule.matches("POST", "api.example.com", "/v1/bar"));
+    }
+
+    #[test]
+    fn matches_wildcard_host() {
+        let rule = HttpRule::parse("GET */v1/*").unwrap();
+        assert!(rule.matches("GET", "any.host.com", "/v1/foo"));
+    }
+
+    #[test]
+    fn matches_case_insensitive_method() {
+        let rule = HttpRule::parse("GET example.com/foo").unwrap();
+        assert!(rule.matches("get", "example.com", "/foo"));
+        assert!(rule.matches("Get", "example.com", "/foo"));
+    }
+
+    #[test]
+    fn matches_case_insensitive_host() {
+        let rule = HttpRule::parse("GET Example.COM/foo").unwrap();
+        assert!(rule.matches("GET", "example.com", "/foo"));
+    }
+
+    // --- http_acl_check tests ---
+
+    #[test]
+    fn acl_no_rules_allows_all() {
+        assert!(http_acl_check(&[], &[], "GET", "example.com", "/foo"));
+    }
+
+    #[test]
+    fn acl_allow_only_permits_matching() {
+        let allow = vec![HttpRule::parse("GET api.example.com/v1/*").unwrap()];
+        assert!(http_acl_check(&allow, &[], "GET", "api.example.com", "/v1/foo"));
+        assert!(!http_acl_check(&allow, &[], "POST", "api.example.com", "/v1/foo"));
+        assert!(!http_acl_check(&allow, &[], "GET", "other.com", "/v1/foo"));
+    }
+
+    #[test]
+    fn acl_deny_only_blocks_matching() {
+        let deny = vec![HttpRule::parse("* */admin/*").unwrap()];
+        assert!(!http_acl_check(&[], &deny, "GET", "example.com", "/admin/settings"));
+        assert!(http_acl_check(&[], &deny, "GET", "example.com", "/public/page"));
+    }
+
+    #[test]
+    fn acl_deny_takes_precedence_over_allow() {
+        let allow = vec![HttpRule::parse("* example.com/*").unwrap()];
+        let deny = vec![HttpRule::parse("* example.com/admin/*").unwrap()];
+        assert!(http_acl_check(&allow, &deny, "GET", "example.com", "/public"));
+        assert!(!http_acl_check(&allow, &deny, "GET", "example.com", "/admin/settings"));
+    }
+
+    #[test]
+    fn acl_allow_deny_by_default_when_no_match() {
+        let allow = vec![HttpRule::parse("GET api.example.com/v1/*").unwrap()];
+        // Different host, not matched by allow -> denied
+        assert!(!http_acl_check(&allow, &[], "GET", "evil.com", "/v1/foo"));
+    }
+
+    // --- PolicyBuilder integration ---
+
+    #[test]
+    fn builder_http_rules() {
+        let policy = Policy::builder()
+            .http_allow("GET api.example.com/v1/*")
+            .http_deny("* */admin/*")
+            .build()
+            .unwrap();
+        assert_eq!(policy.http_allow.len(), 1);
+        assert_eq!(policy.http_deny.len(), 1);
+        assert_eq!(policy.http_allow[0].method, "GET");
+        assert_eq!(policy.http_deny[0].host, "*");
     }
 }
