@@ -222,6 +222,14 @@ async fn main() -> Result<()> {
                 for h in &base.net_allow_hosts { b = b.net_allow_host(h); }
                 for p in &base.net_bind { b = b.net_bind_port(*p); }
                 for p in &base.net_connect { b = b.net_connect_port(*p); }
+                for rule in &base.http_allow {
+                    let s = format!("{} {}{}", rule.method, rule.host, rule.path);
+                    b = b.http_allow(&s);
+                }
+                for rule in &base.http_deny {
+                    let s = format!("{} {}{}", rule.method, rule.host, rule.path);
+                    b = b.http_deny(&s);
+                }
                 if let Some(mem) = base.max_memory { b = b.max_memory(mem); }
                 b = b.max_processes(base.max_processes);
                 if let Some(cpu) = base.max_cpu { b = b.max_cpu(cpu); }

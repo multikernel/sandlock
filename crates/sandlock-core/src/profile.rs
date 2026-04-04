@@ -54,6 +54,12 @@ pub fn parse_profile(content: &str) -> Result<Policy, SandlockError> {
     if let Some(hosts) = sandbox.get("net_allow_hosts").and_then(|v| v.as_array()) {
         for h in hosts { if let Some(s) = h.as_str() { builder = builder.net_allow_host(s); } }
     }
+    if let Some(rules) = sandbox.get("http_allow").and_then(|v| v.as_array()) {
+        for r in rules { if let Some(s) = r.as_str() { builder = builder.http_allow(s); } }
+    }
+    if let Some(rules) = sandbox.get("http_deny").and_then(|v| v.as_array()) {
+        for r in rules { if let Some(s) = r.as_str() { builder = builder.http_deny(s); } }
+    }
 
     // Parse integers
     if let Some(v) = sandbox.get("max_processes").and_then(|v| v.as_integer()) {
