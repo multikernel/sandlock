@@ -653,20 +653,13 @@ impl Sandbox {
             let handle = crate::http_acl::spawn_http_acl_proxy(
                 self.policy.http_allow.clone(),
                 self.policy.http_deny.clone(),
+                self.policy.https_ca.as_deref(),
+                self.policy.https_key.as_deref(),
             ).await.map_err(SandboxError::Io)?;
             Some(handle)
         } else {
             None
         };
-
-        // Inject SSL_CERT_FILE and fs_readable for CA cert
-        if let Some(ref handle) = http_acl_handle {
-            self.policy.env.insert(
-                "SSL_CERT_FILE".to_string(),
-                handle.ca_cert_path.to_string_lossy().to_string(),
-            );
-            self.policy.fs_readable.push(handle.ca_cert_path.clone());
-        }
 
         // 6. Create COW branch if requested
         let cow_branch: Option<Box<dyn CowBranch>> = match self.policy.fs_isolation {
@@ -887,6 +880,7 @@ impl Sandbox {
             }
 
             sup_state.http_acl_addr = http_acl_handle.as_ref().map(|h| h.addr);
+            sup_state.http_acl_has_https = http_acl_handle.as_ref().map(|h| h.has_https).unwrap_or(false);
 
             // Seccomp COW branch
             if self.policy.workdir.is_some() && self.policy.fs_isolation == FsIsolation::None {

@@ -195,6 +195,13 @@ class Policy:
     http_deny: Sequence[str] = field(default_factory=list)
     """HTTP deny rules. Checked before allow rules. Format: "METHOD host/path"."""
 
+    https_ca: str | None = None
+    """PEM CA certificate path for HTTPS MITM. When set, port 443 is also
+    intercepted by the HTTP ACL proxy."""
+
+    https_key: str | None = None
+    """PEM CA private key path for HTTPS MITM. Required with https_ca."""
+
     # Resource limits
     max_memory: str | int | None = None
     """Memory limit. String like '512M' or int bytes."""

@@ -108,6 +108,7 @@ async fn connect_on_behalf(
         // Check for HTTP ACL redirect
         let dest_port = parse_port_from_sockaddr(&addr_bytes);
         let http_acl_addr = st.http_acl_addr;
+        let http_acl_has_https = st.http_acl_has_https;
 
         let child_pidfd = match st.child_pidfd {
             Some(fd) => fd,
@@ -117,7 +118,7 @@ async fn connect_on_behalf(
 
         // Determine the actual connect target (redirect HTTP/HTTPS to proxy)
         let (connect_addr, connect_len) = if let Some(proxy_addr) = http_acl_addr {
-            if dest_port == Some(80) || dest_port == Some(443) {
+            if dest_port == Some(80) || (http_acl_has_https && dest_port == Some(443)) {
                 // Redirect to proxy
                 let mut sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
                 sa.sin_family = libc::AF_INET as u16;

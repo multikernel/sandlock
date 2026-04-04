@@ -75,6 +75,12 @@ enum Command {
         http_allow: Vec<String>,
         #[arg(long = "http-deny", value_name = "RULE")]
         http_deny: Vec<String>,
+        /// PEM CA certificate for HTTPS MITM (enables port 443 interception)
+        #[arg(long = "https-ca", value_name = "PATH")]
+        https_ca: Option<String>,
+        /// PEM CA private key for HTTPS MITM (required with --https-ca)
+        #[arg(long = "https-key", value_name = "PATH")]
+        https_key: Option<String>,
         #[arg(long)]
         port_remap: bool,
         #[arg(long)]
@@ -149,7 +155,7 @@ async fn main() -> Result<()> {
             isolate_ipc, isolate_signals, clean_env, num_cpus, profile: profile_name, status_fd,
             max_cpu, max_open_files, chroot, uid, workdir, cwd,
             fs_isolation, fs_storage, max_disk, net_allow, net_deny,
-            http_allow, http_deny,
+            http_allow, http_deny, https_ca, https_key,
             port_remap, no_randomize_memory, no_huge_pages, deterministic_dirs, hostname, no_coredump,
             env_vars, exec_shell, interactive: _, fs_deny, cpu_cores, gpu_devices, image, dry_run, no_supervisor, cmd } =>
         {
@@ -296,6 +302,8 @@ async fn main() -> Result<()> {
             }
             for rule in &http_allow { builder = builder.http_allow(rule); }
             for rule in &http_deny { builder = builder.http_deny(rule); }
+            if let Some(ref ca) = https_ca { builder = builder.https_ca(ca); }
+            if let Some(ref key) = https_key { builder = builder.https_key(key); }
             if port_remap { builder = builder.port_remap(true); }
             if !cpu_cores.is_empty() { builder = builder.cpu_cores(cpu_cores); }
             if !gpu_devices.is_empty() { builder = builder.gpu_devices(gpu_devices); }

@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 
 use hudsucker::certificate_authority::RcgenAuthority;
@@ -55,61 +55,69 @@ impl HttpHandler for AclHandler {
     }
 }
 
-/// Handle returned by [`spawn_http_acl_proxy`] with the proxy's address and CA cert path.
+/// Handle returned by [`spawn_http_acl_proxy`].
 pub struct HttpAclProxyHandle {
     /// Local address the proxy is listening on.
     pub addr: SocketAddr,
-    /// Path to the PEM-encoded CA certificate file.
-    pub ca_cert_path: PathBuf,
+    /// Whether HTTPS MITM is active (user provided CA cert+key).
+    pub has_https: bool,
 }
 
-/// Spawn a hudsucker-based transparent MITM proxy that enforces HTTP ACL rules.
+/// Spawn a hudsucker-based HTTP ACL proxy.
 ///
-/// The proxy listens on a random local port and generates a self-signed CA
-/// certificate for HTTPS interception. Returns a handle with the bound address
-/// and the path to the CA cert PEM file.
+/// If `ca_cert` and `ca_key` are provided, the proxy also intercepts HTTPS
+/// traffic via MITM using the given CA. Otherwise, only plaintext HTTP
+/// (port 80) is intercepted.
 pub async fn spawn_http_acl_proxy(
     allow: Vec<HttpRule>,
     deny: Vec<HttpRule>,
+    ca_cert: Option<&Path>,
+    ca_key: Option<&Path>,
 ) -> std::io::Result<HttpAclProxyHandle> {
-    // Generate a CA key pair and self-signed certificate.
-    let key_pair = KeyPair::generate().map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::Other, format!("failed to generate CA key: {e}"))
-    })?;
+    // Load or skip CA for HTTPS MITM.
+    let has_https = ca_cert.is_some() && ca_key.is_some();
 
-    let mut ca_params = CertificateParams::default();
-    ca_params.is_ca = hudsucker::rcgen::IsCa::Ca(hudsucker::rcgen::BasicConstraints::Unconstrained);
-    ca_params
-        .distinguished_name
-        .push(hudsucker::rcgen::DnType::CommonName, "sandlock CA");
+    let (key_pair, cert) = if let (Some(cert_path), Some(key_path)) = (ca_cert, ca_key) {
+        let key_pem = std::fs::read_to_string(key_path).map_err(|e| {
+            std::io::Error::new(e.kind(), format!("failed to read --https-key {:?}: {e}", key_path))
+        })?;
+        let cert_pem = std::fs::read_to_string(cert_path).map_err(|e| {
+            std::io::Error::new(e.kind(), format!("failed to read --https-ca {:?}: {e}", cert_path))
+        })?;
+        let kp = KeyPair::from_pem(&key_pem).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("invalid CA key: {e}"))
+        })?;
+        let params = CertificateParams::from_ca_cert_pem(&cert_pem).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("invalid CA cert: {e}"))
+        })?;
+        let cert = params.self_signed(&kp).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("CA cert error: {e}"))
+        })?;
+        (kp, cert)
+    } else {
+        // No HTTPS — generate a dummy CA (hudsucker requires one, but it
+        // won't be used since we only intercept port 80).
+        let kp = KeyPair::generate().map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::Other, format!("keygen failed: {e}"))
+        })?;
+        let mut params = CertificateParams::default();
+        params.is_ca = hudsucker::rcgen::IsCa::Ca(hudsucker::rcgen::BasicConstraints::Unconstrained);
+        let cert = params.self_signed(&kp).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::Other, format!("self-sign failed: {e}"))
+        })?;
+        (kp, cert)
+    };
 
-    let ca_cert = ca_params.self_signed(&key_pair).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("failed to self-sign CA cert: {e}"),
-        )
-    })?;
+    let ca = RcgenAuthority::new(key_pair, cert, 1_000);
 
-    // Write CA cert PEM to a temp file so the child can trust it.
-    let pid = std::process::id();
-    let ca_cert_path = PathBuf::from(format!("/tmp/sandlock-http-acl-ca-{pid}.pem"));
-    let pem = ca_cert.pem();
-    std::fs::write(&ca_cert_path, pem.as_bytes())?;
-
-    // Build the RcgenAuthority for hudsucker.
-    let ca = RcgenAuthority::new(key_pair, ca_cert, 1_000);
-
-    // Build the ACL handler.
     let handler = AclHandler {
         allow_rules: Arc::new(allow),
         deny_rules: Arc::new(deny),
     };
 
-    // Bind to a random local port.
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
 
-    // Build and spawn the proxy.
     let proxy = Proxy::builder()
         .with_listener(listener)
         .with_rustls_client()
@@ -123,5 +131,5 @@ pub async fn spawn_http_acl_proxy(
         }
     });
 
-    Ok(HttpAclProxyHandle { addr, ca_cert_path })
+    Ok(HttpAclProxyHandle { addr, has_https })
 }

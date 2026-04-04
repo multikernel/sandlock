@@ -99,6 +99,8 @@ pub struct SupervisorState {
     pub denied_paths: std::sync::Arc<std::sync::RwLock<HashSet<String>>>,
     /// HTTP ACL proxy address (None if HTTP ACL not active).
     pub http_acl_addr: Option<std::net::SocketAddr>,
+    /// Whether HTTPS MITM is active (user provided CA cert).
+    pub http_acl_has_https: bool,
 }
 
 impl SupervisorState {
@@ -133,6 +135,7 @@ impl SupervisorState {
             live_policy: None,
             denied_paths: std::sync::Arc::new(std::sync::RwLock::new(HashSet::new())),
             http_acl_addr: None,
+            http_acl_has_https: false,
         }
     }
 }

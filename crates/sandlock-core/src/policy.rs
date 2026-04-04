@@ -204,6 +204,10 @@ pub struct Policy {
     // HTTP ACL
     pub http_allow: Vec<HttpRule>,
     pub http_deny: Vec<HttpRule>,
+    /// PEM CA cert for HTTPS MITM. When set, port 443 is also intercepted.
+    pub https_ca: Option<PathBuf>,
+    /// PEM CA key for HTTPS MITM. Required when https_ca is set.
+    pub https_key: Option<PathBuf>,
 
     // Namespace isolation
     pub isolate_ipc: bool,
@@ -292,6 +296,8 @@ pub struct PolicyBuilder {
 
     http_allow: Vec<HttpRule>,
     http_deny: Vec<HttpRule>,
+    https_ca: Option<PathBuf>,
+    https_key: Option<PathBuf>,
 
     isolate_ipc: bool,
     isolate_signals: bool,
@@ -391,6 +397,16 @@ impl PolicyBuilder {
 
     pub fn http_deny(mut self, rule: &str) -> Self {
         self.http_deny.push(HttpRule::parse(rule).expect("invalid HTTP deny rule"));
+        self
+    }
+
+    pub fn https_ca(mut self, path: impl Into<PathBuf>) -> Self {
+        self.https_ca = Some(path.into());
+        self
+    }
+
+    pub fn https_key(mut self, path: impl Into<PathBuf>) -> Self {
+        self.https_key = Some(path.into());
         self
     }
 
@@ -584,6 +600,8 @@ impl PolicyBuilder {
             no_udp: self.no_udp,
             http_allow: self.http_allow,
             http_deny: self.http_deny,
+            https_ca: self.https_ca,
+            https_key: self.https_key,
             isolate_ipc: self.isolate_ipc,
             isolate_signals: self.isolate_signals,
             isolate_pids: self.isolate_pids,

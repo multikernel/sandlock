@@ -397,6 +397,32 @@ pub unsafe extern "C" fn sandlock_policy_builder_http_deny(
     Box::into_raw(Box::new(builder.http_deny(rule)))
 }
 
+/// # Safety
+/// `b` and `path` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_https_ca(
+    b: *mut PolicyBuilder,
+    path: *const c_char,
+) -> *mut PolicyBuilder {
+    if b.is_null() || path.is_null() { return b; }
+    let path = CStr::from_ptr(path).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.https_ca(path)))
+}
+
+/// # Safety
+/// `b` and `path` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_https_key(
+    b: *mut PolicyBuilder,
+    path: *const c_char,
+) -> *mut PolicyBuilder {
+    if b.is_null() || path.is_null() { return b; }
+    let path = CStr::from_ptr(path).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.https_key(path)))
+}
+
 // ----------------------------------------------------------------
 // Policy Builder — isolation & determinism
 // ----------------------------------------------------------------
