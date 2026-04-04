@@ -200,23 +200,31 @@ pub(crate) async fn handle_chroot_open(
         if let Some(cow) = st.cow_branch.as_mut() {
             let host_str = host_path.to_string_lossy();
             if cow.matches(&host_str) {
-                let real_path = match cow.handle_open(&host_str, flags) {
-                    Ok(Some(p)) => p,
-                    Ok(None) => return NotifAction::Continue,
-                    Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
-                    Err(_) => return NotifAction::Continue,
-                };
-                drop(st);
-                let c_path = match path_cstr(&real_path, libc::EIO) {
-                    Ok(c) => c,
-                    Err(_) => return NotifAction::Continue,
-                };
-                let fd = unsafe { libc::open(c_path.as_ptr(), flags as i32, 0o666) };
-                if fd < 0 {
-                    return NotifAction::Continue;
+                match cow.handle_open(&host_str, flags) {
+                    Ok(Some(real_path)) => {
+                        drop(st);
+                        let c_path = match path_cstr(&real_path, libc::EINVAL) {
+                            Ok(c) => c,
+                            Err(a) => return a,
+                        };
+                        let fd = unsafe { libc::open(c_path.as_ptr(), flags as i32, 0o666) };
+                        if fd < 0 {
+                            return NotifAction::Errno(last_errno(libc::EIO));
+                        }
+                        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+                        return NotifAction::InjectFdSend { srcfd: owned };
+                    }
+                    Ok(None) => {
+                        // Fall through to openat2_in_root below. This keeps
+                        // directory opens and other non-COW cases confined to
+                        // the chroot instead of executing the original host
+                        // syscall.
+                    }
+                    Err(crate::error::BranchError::QuotaExceeded) => {
+                        return NotifAction::Errno(libc::ENOSPC);
+                    }
+                    Err(_) => return NotifAction::Errno(libc::EIO),
                 }
-                let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-                return NotifAction::InjectFdSend { srcfd: owned };
             }
         }
     }

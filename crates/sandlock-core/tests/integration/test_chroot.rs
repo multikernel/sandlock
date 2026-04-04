@@ -240,6 +240,60 @@ async fn test_chroot_write_file() {
     cleanup_rootfs(&rootfs);
 }
 
+/// Directory opens under chroot + COW must stay inside the chroot.
+#[tokio::test]
+async fn test_chroot_cow_directory_open_stays_in_rootfs() {
+    let rootfs = build_test_rootfs("cow-dir-open");
+    let tmp_dir = rootfs.join("tmp");
+
+    fs::write(rootfs.join("tmp/rootfs-only.txt"), "rootfs").unwrap();
+
+    let host_marker = std::env::temp_dir().join(format!(
+        "sandlock-host-marker-{}",
+        std::process::id()
+    ));
+    fs::write(&host_marker, "host").unwrap();
+
+    let policy = Policy::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_read("/tmp")
+        .workdir(&tmp_dir)
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+
+    let result = Sandbox::run(&policy, &["rootfs-helper", "ls", "/tmp"]).await;
+    match result {
+        Ok(r) => {
+            assert!(
+                r.success(),
+                "ls /tmp should succeed, stderr: {}",
+                r.stderr_str().unwrap_or("")
+            );
+            let stdout = r.stdout_str().unwrap_or("");
+            assert!(
+                stdout.contains("rootfs-only.txt"),
+                "expected to see rootfs file in /tmp, got: {}",
+                stdout
+            );
+            assert!(
+                !stdout.contains(host_marker.file_name().unwrap().to_string_lossy().as_ref()),
+                "host /tmp leaked into chroot listing: {}",
+                stdout
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    let _ = fs::remove_file(&host_marker);
+    cleanup_rootfs(&rootfs);
+}
+
 /// chroot + COW with BranchAction::Abort discards writes
 #[tokio::test]
 async fn test_chroot_with_cow() {
