@@ -7,6 +7,7 @@ use hudsucker::hyper::{Request, Response, StatusCode};
 use hudsucker::rcgen::{CertificateParams, KeyPair};
 use hudsucker::{Body, HttpContext, HttpHandler, Proxy, RequestOrResponse};
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 
 use crate::policy::{http_acl_check, HttpRule};
 
@@ -61,7 +62,47 @@ pub struct HttpAclProxyHandle {
     pub addr: SocketAddr,
     /// Whether HTTPS MITM is active (user provided CA cert+key).
     pub has_https: bool,
+    /// Send to this channel to trigger graceful proxy shutdown.
+    shutdown_tx: Option<oneshot::Sender<()>>,
 }
+
+impl HttpAclProxyHandle {
+    /// Initiate graceful shutdown of the proxy.
+    pub fn shutdown(mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+impl Drop for HttpAclProxyHandle {
+    fn drop(&mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// Pre-generated dummy CA for HTTP-only mode, avoiding per-spawn keygen cost.
+fn dummy_ca() -> std::io::Result<(KeyPair, hudsucker::rcgen::Certificate)> {
+    use hudsucker::rcgen::{BasicConstraints, IsCa};
+
+    let kp = KeyPair::generate().map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::Other, format!("keygen failed: {e}"))
+    })?;
+    let mut params = CertificateParams::default();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let cert = params.self_signed(&kp).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::Other, format!("self-sign failed: {e}"))
+    })?;
+    Ok((kp, cert))
+}
+
+static DUMMY_CA: std::sync::LazyLock<std::io::Result<(Vec<u8>, Vec<u8>)>> =
+    std::sync::LazyLock::new(|| {
+        let (kp, cert) = dummy_ca()?;
+        Ok((kp.serialize_pem().into_bytes(), cert.pem().into_bytes()))
+    });
 
 /// Spawn a hudsucker-based HTTP ACL proxy.
 ///
@@ -95,15 +136,20 @@ pub async fn spawn_http_acl_proxy(
         })?;
         (kp, cert)
     } else {
-        // No HTTPS — generate a dummy CA (hudsucker requires one, but it
-        // won't be used since we only intercept port 80).
-        let kp = KeyPair::generate().map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, format!("keygen failed: {e}"))
+        // HTTP-only mode — reuse a lazily-generated dummy CA to avoid
+        // expensive keygen on every spawn.
+        let (key_pem, cert_pem) = DUMMY_CA.as_ref().map_err(|e| {
+            std::io::Error::new(e.kind(), format!("dummy CA init failed: {e}"))
         })?;
-        let mut params = CertificateParams::default();
-        params.is_ca = hudsucker::rcgen::IsCa::Ca(hudsucker::rcgen::BasicConstraints::Unconstrained);
+        let kp = KeyPair::from_pem(std::str::from_utf8(key_pem).unwrap()).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::Other, format!("dummy CA key: {e}"))
+        })?;
+        let params = CertificateParams::from_ca_cert_pem(std::str::from_utf8(cert_pem).unwrap())
+            .map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::Other, format!("dummy CA cert: {e}"))
+            })?;
         let cert = params.self_signed(&kp).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, format!("self-sign failed: {e}"))
+            std::io::Error::new(std::io::ErrorKind::Other, format!("dummy CA sign: {e}"))
         })?;
         (kp, cert)
     };
@@ -118,11 +164,16 @@ pub async fn spawn_http_acl_proxy(
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
 
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
     let proxy = Proxy::builder()
         .with_listener(listener)
         .with_rustls_client()
         .with_ca(ca)
         .with_http_handler(handler)
+        .with_graceful_shutdown(async {
+            let _ = shutdown_rx.await;
+        })
         .build();
 
     tokio::spawn(async move {
@@ -131,5 +182,9 @@ pub async fn spawn_http_acl_proxy(
         }
     });
 
-    Ok(HttpAclProxyHandle { addr, has_https })
+    Ok(HttpAclProxyHandle {
+        addr,
+        has_https,
+        shutdown_tx: Some(shutdown_tx),
+    })
 }

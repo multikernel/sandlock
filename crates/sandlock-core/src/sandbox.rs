@@ -93,6 +93,8 @@ pub struct Sandbox {
     work_fn: Option<Arc<dyn Fn(u32) + Send + Sync + 'static>>,
     /// Optional fd overrides for stdin/stdout/stderr (used by Pipeline).
     io_overrides: Option<(Option<i32>, Option<i32>, Option<i32>)>,
+    /// HTTP ACL proxy handle — kept alive so the proxy runs while the child is alive.
+    http_acl_handle: Option<crate::http_acl::HttpAclProxyHandle>,
 }
 
 impl Sandbox {
@@ -142,6 +144,7 @@ impl Sandbox {
             init_fn: None,
             work_fn: None,
             io_overrides: None,
+            http_acl_handle: None,
         }
     }
 
@@ -649,17 +652,15 @@ impl Sandbox {
         };
 
         // 5. Spawn HTTP ACL proxy if rules are configured
-        let http_acl_handle = if !self.policy.http_allow.is_empty() || !self.policy.http_deny.is_empty() {
+        if !self.policy.http_allow.is_empty() || !self.policy.http_deny.is_empty() {
             let handle = crate::http_acl::spawn_http_acl_proxy(
                 self.policy.http_allow.clone(),
                 self.policy.http_deny.clone(),
                 self.policy.https_ca.as_deref(),
                 self.policy.https_key.as_deref(),
             ).await.map_err(SandboxError::Io)?;
-            Some(handle)
-        } else {
-            None
-        };
+            self.http_acl_handle = Some(handle);
+        }
 
         // 6. Create COW branch if requested
         let cow_branch: Option<Box<dyn CowBranch>> = match self.policy.fs_isolation {
@@ -879,8 +880,8 @@ impl Sandbox {
                 sup_state.child_pidfd = Some(pfd.as_raw_fd());
             }
 
-            sup_state.http_acl_addr = http_acl_handle.as_ref().map(|h| h.addr);
-            sup_state.http_acl_has_https = http_acl_handle.as_ref().map(|h| h.has_https).unwrap_or(false);
+            sup_state.http_acl_addr = self.http_acl_handle.as_ref().map(|h| h.addr);
+            sup_state.http_acl_has_https = self.http_acl_handle.as_ref().map(|h| h.has_https).unwrap_or(false);
 
             // Seccomp COW branch
             if self.policy.workdir.is_some() && self.policy.fs_isolation == FsIsolation::None {
