@@ -42,9 +42,11 @@ pub const MIN_LANDLOCK_ABI: u32 = landlock::MIN_ABI;
 /// Confine the calling process with Landlock restrictions.
 ///
 /// This applies `PR_SET_NO_NEW_PRIVS` and Landlock rules from the policy's
-/// filesystem (`fs_readable`, `fs_writable`, `fs_denied`), IPC
-/// (`isolate_ipc`), and signal (`isolate_signals`) fields. The confinement
-/// is **irreversible**.
+/// filesystem (`fs_readable`, `fs_writable`), IPC (`isolate_ipc`), and
+/// signal (`isolate_signals`) fields. The confinement is **irreversible**.
+///
+/// `fs_denied` is not enforced here because it requires supervisor-mediated
+/// path interception rather than Landlock's allowlist model.
 ///
 /// Network, seccomp, resource limits, and other policy fields are ignored.
 ///

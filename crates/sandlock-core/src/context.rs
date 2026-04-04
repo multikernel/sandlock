@@ -347,7 +347,17 @@ pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
         ]);
     }
 
-    // Dynamic policy callback — intercept key syscalls for event emission
+    // Explicit deny-paths need path-bearing syscalls intercepted.
+    if !policy.fs_denied.is_empty() {
+        nrs.extend_from_slice(&[
+            libc::SYS_openat as u32,
+            libc::SYS_open as u32,
+            libc::SYS_execve as u32,
+            libc::SYS_execveat as u32,
+        ]);
+    }
+
+    // Dynamic policy callback — intercept key syscalls for event emission.
     if policy.policy_fn.is_some() {
         nrs.extend_from_slice(&[
             libc::SYS_openat as u32,

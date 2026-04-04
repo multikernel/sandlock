@@ -143,13 +143,31 @@ async fn test_denied_path_blocks_read() {
         .build()
         .unwrap();
 
-    let cmd_str = format!("cat {} 2>/dev/null", input.display());
-    let result = Sandbox::run_interactive(&policy, &["sh", "-c", &cmd_str])
+    let result = Sandbox::run(&policy, &["cat", input.to_str().unwrap()])
         .await
         .unwrap();
     assert!(!result.success(), "cat should fail on denied path");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_denied_path_blocks_exec() {
+    let policy = Policy::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_deny("/bin/cat")
+        .fs_write("/tmp")
+        .build()
+        .unwrap();
+
+    let result = Sandbox::run(&policy, &["/bin/cat", "/etc/hostname"]).await.unwrap();
+    assert!(!result.success(), "exec should fail on denied binary path");
 }
 
 #[tokio::test]

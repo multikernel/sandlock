@@ -157,16 +157,21 @@ async fn main() -> Result<()> {
                     no_huge_pages, deterministic_dirs, &hostname, &chroot,
                     &image, &uid, &workdir, &cwd, &fs_isolation, &fs_storage,
                     &max_disk, port_remap, &cpu_cores, &gpu_devices, dry_run,
-                    &status_fd,
+                    &status_fd, &fs_deny,
                 )?;
 
                 // Build a minimal policy with only fs rules
                 let mut builder = if let Some(ref name) = profile_name {
                     let base = sandlock_core::profile::load_profile(name)?;
+                    if !base.fs_denied.is_empty() {
+                        return Err(anyhow!(
+                            "--no-supervisor is incompatible with: --fs-deny (from profile {})",
+                            name
+                        ));
+                    }
                     let mut b = Policy::builder();
                     for p in &base.fs_readable { b = b.fs_read(p); }
                     for p in &base.fs_writable { b = b.fs_write(p); }
-                    for p in &base.fs_denied { b = b.fs_deny(p); }
                     b
                 } else {
                     Policy::builder()
@@ -467,6 +472,7 @@ fn validate_no_supervisor(
     gpu_devices: &[u32],
     dry_run: bool,
     status_fd: &Option<i32>,
+    fs_deny: &[String],
 ) -> Result<()> {
     let mut bad = Vec::new();
 
@@ -500,6 +506,7 @@ fn validate_no_supervisor(
     if !gpu_devices.is_empty() { bad.push("--gpu"); }
     if dry_run { bad.push("--dry-run"); }
     if status_fd.is_some() { bad.push("--status-fd"); }
+    if !fs_deny.is_empty() { bad.push("--fs-deny"); }
 
     if !bad.is_empty() {
         return Err(anyhow!(

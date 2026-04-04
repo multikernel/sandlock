@@ -24,14 +24,22 @@ pub(crate) struct ChrootCtx<'a> {
     pub root: &'a Path,
     pub readable: &'a [PathBuf],
     pub writable: &'a [PathBuf],
+    pub denied: &'a [PathBuf],
 }
 
 impl ChrootCtx<'_> {
+    fn is_denied(&self, virtual_path: &Path) -> bool {
+        self.denied.iter().any(|p| virtual_path.starts_with(p))
+    }
+
     /// Check if `virtual_path` is allowed for reading.
     /// Also allows access to ancestor directories of readable paths
     /// (e.g. "/" is allowed if "/usr" is readable, since you need to open "/"
     /// to list or traverse to "/usr").
     fn can_read(&self, virtual_path: &Path) -> bool {
+        if self.is_denied(virtual_path) {
+            return false;
+        }
         self.readable.is_empty()
             || self.readable.iter().any(|p| virtual_path.starts_with(p) || p.starts_with(virtual_path))
             || self.writable.iter().any(|p| virtual_path.starts_with(p) || p.starts_with(virtual_path))
@@ -39,7 +47,8 @@ impl ChrootCtx<'_> {
 
     /// Check if `virtual_path` is allowed for writing.
     fn can_write(&self, virtual_path: &Path) -> bool {
-        self.writable.iter().any(|p| virtual_path.starts_with(p))
+        !self.is_denied(virtual_path)
+            && self.writable.iter().any(|p| virtual_path.starts_with(p))
     }
 }
 
@@ -285,11 +294,16 @@ pub(crate) async fn handle_chroot_exec(
         }
     };
 
+    let virtual_path = crate::chroot::resolve::confine(&full_path);
+    if !ctx.can_read(&virtual_path) {
+        return NotifAction::Errno(libc::EACCES);
+    }
+
     // Open the binary directly via openat2(RESOLVE_IN_ROOT). Single atomic
     // open confined to the chroot root — no resolve-then-reopen TOCTOU gap.
     let src_fd = match openat2_in_root(
         ctx.root,
-        &full_path,
+        &virtual_path.to_string_lossy(),
         libc::O_RDONLY | libc::O_CLOEXEC,
         0,
     ) {

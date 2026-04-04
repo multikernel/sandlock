@@ -161,17 +161,16 @@ impl SupervisorState {
     /// Check if a path is dynamically denied.
     pub fn is_path_denied(&self, path: &str) -> bool {
         if let Ok(denied) = self.denied_paths.read() {
-            denied.iter().any(|d| path == d || path.starts_with(&format!("{}/", d)))
+            let path = std::path::Path::new(path);
+            denied.iter().any(|d| path.starts_with(std::path::Path::new(d)))
         } else {
             false
         }
     }
 
-    /// Check if an openat notification targets a denied path.
+    /// Check if a path-bearing notification targets a denied path.
     pub fn is_path_denied_for_notif(&self, notif: &SeccompNotif, notif_fd: RawFd) -> bool {
-        let path_ptr = notif.data.args[1];
-        if path_ptr == 0 { return false; }
-        if let Some(path) = read_path_for_event(notif, path_ptr, notif_fd) {
+        if let Some(path) = resolve_path_for_notif(notif, notif_fd) {
             self.is_path_denied(&path)
         } else {
             false
@@ -216,6 +215,8 @@ pub struct NotifPolicy {
     pub chroot_readable: Vec<std::path::PathBuf>,
     /// Virtual paths allowed for writing under chroot (original user-specified paths).
     pub chroot_writable: Vec<std::path::PathBuf>,
+    /// Virtual paths explicitly denied under chroot.
+    pub chroot_denied: Vec<std::path::PathBuf>,
     pub deterministic_dirs: bool,
     pub hostname: Option<String>,
 }
@@ -537,6 +538,7 @@ async fn dispatch(
             root: chroot_root,
             readable: &policy.chroot_readable,
             writable: &policy.chroot_writable,
+            denied: &policy.chroot_denied,
         };
         if nr == libc::SYS_openat {
             let action = crate::chroot::dispatch::handle_chroot_open(notif, state, notif_fd, &ctx).await;
@@ -807,6 +809,69 @@ fn read_path_for_event(notif: &SeccompNotif, addr: u64, notif_fd: RawFd) -> Opti
     String::from_utf8(bytes[..nul].to_vec()).ok()
 }
 
+fn normalize_path(path: &std::path::Path) -> String {
+    use std::path::{Component, PathBuf};
+
+    let mut normalized = PathBuf::new();
+    let absolute = path.is_absolute();
+    if absolute {
+        normalized.push("/");
+    }
+
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+            Component::Prefix(_) => {}
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        if absolute { "/".into() } else { ".".into() }
+    } else {
+        normalized.to_string_lossy().into_owned()
+    }
+}
+
+fn resolve_at_path_for_event(notif: &SeccompNotif, dirfd: i64, path: &str) -> Option<String> {
+    use std::path::Path;
+
+    if Path::new(path).is_absolute() {
+        return Some(normalize_path(Path::new(path)));
+    }
+
+    let dirfd32 = dirfd as i32;
+    let base = if dirfd32 == libc::AT_FDCWD {
+        std::fs::read_link(format!("/proc/{}/cwd", notif.pid)).ok()?
+    } else {
+        std::fs::read_link(format!("/proc/{}/fd/{}", notif.pid, dirfd32)).ok()?
+    };
+
+    Some(normalize_path(&base.join(path)))
+}
+
+fn resolve_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Option<String> {
+    let nr = notif.data.nr as i64;
+    match nr {
+        n if n == libc::SYS_openat => {
+            let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
+            resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
+        }
+        n if n == libc::SYS_open || n == libc::SYS_execve => {
+            let path = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
+            resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
+        }
+        n if n == libc::SYS_execveat => {
+            let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
+            resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
+        }
+        _ => None,
+    }
+}
+
 /// Extract IP and port from a sockaddr in child memory.
 fn read_sockaddr_for_event(notif: &SeccompNotif, addr: u64, len: usize, notif_fd: RawFd)
     -> (Option<std::net::IpAddr>, Option<u16>)
@@ -999,7 +1064,10 @@ pub async fn supervisor(
                 let mut action = {
                     let st = state.lock().await;
                     let nr = notif.data.nr as i64;
-                    if nr == libc::SYS_openat && st.is_path_denied_for_notif(&notif, fd) {
+                    let should_precheck_denied = policy.chroot_root.is_none()
+                        && [libc::SYS_openat, libc::SYS_open, libc::SYS_execve, libc::SYS_execveat]
+                            .contains(&nr);
+                    if should_precheck_denied && st.is_path_denied_for_notif(&notif, fd) {
                         NotifAction::Errno(libc::EACCES)
                     } else {
                         drop(st);

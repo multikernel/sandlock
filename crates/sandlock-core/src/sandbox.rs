@@ -834,6 +834,7 @@ impl Sandbox {
                 chroot_root: self.policy.chroot.clone(),
                 chroot_readable: self.policy.fs_readable.clone(),
                 chroot_writable: self.policy.fs_writable.clone(),
+                chroot_denied: self.policy.fs_denied.clone(),
                 deterministic_dirs: self.policy.deterministic_dirs,
                 hostname: self.policy.hostname.clone(),
             };
@@ -874,6 +875,12 @@ impl Sandbox {
             }
 
             // Policy callback thread
+            if let Ok(mut denied) = sup_state.denied_paths.write() {
+                for path in &self.policy.fs_denied {
+                    denied.insert(path.to_string_lossy().into_owned());
+                }
+            }
+
             if let Some(ref callback) = self.policy.policy_fn {
                 let live = crate::policy_fn::LivePolicy {
                     allowed_ips: match &sup_state.network_policy {

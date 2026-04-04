@@ -440,6 +440,35 @@ async fn test_chroot_exec_with_root_readable() {
     cleanup_rootfs(&rootfs);
 }
 
+/// fs_deny should override fs_read inside chroot using virtual paths.
+#[tokio::test]
+async fn test_chroot_fs_deny_blocks_virtual_path() {
+    let rootfs = build_test_rootfs("fs-deny");
+
+    fs::write(rootfs.join("etc/hostname"), "sandlock-test-host").unwrap();
+
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_read("/etc")
+        .fs_deny("/etc/hostname")
+        .build()
+        .unwrap();
+
+    let result = Sandbox::run(&policy, &["rootfs-helper", "cat", "/etc/hostname"]).await;
+    match result {
+        Ok(r) => {
+            assert!(
+                !r.success(),
+                "cat /etc/hostname should fail when fs_deny overrides fs_read, exit={:?} stdout={}",
+                r.code(),
+                r.stdout_str().unwrap_or("")
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
 /// Reading /etc/hostname should fail when /etc is not in fs_readable
 #[tokio::test]
 async fn test_chroot_read_denied_without_fs_read() {

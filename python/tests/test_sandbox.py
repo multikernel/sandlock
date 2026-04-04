@@ -55,6 +55,18 @@ class TestSandboxRun:
         result = Sandbox(_policy()).run(["sh", "-c", "exit 42"])
         assert result.exit_code == 42
 
+    def test_fs_denied_blocks_read(self, tmp_dir):
+        secret = tmp_dir / "secret.txt"
+        secret.write_text("top-secret")
+
+        policy = _policy(
+            fs_readable=[*_PYTHON_READABLE, str(tmp_dir)],
+            fs_denied=[str(secret)],
+        )
+        result = Sandbox(policy).run(["cat", str(secret)])
+
+        assert not result.success
+
 
 class TestPortRemap:
     """Test transparent TCP port remapping."""
