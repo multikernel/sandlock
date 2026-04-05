@@ -468,6 +468,11 @@ impl PolicyBuilder {
 
     pub fn http_port(mut self, port: u16) -> Self {
         self.http_ports.push(port);
+        // HTTP ACL intercepts TCP connections on this port, so it must be
+        // in the Landlock net_connect allowlist too.
+        if !self.net_connect.contains(&port) {
+            self.net_connect.push(port);
+        }
         self
     }
 

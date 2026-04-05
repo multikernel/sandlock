@@ -195,12 +195,9 @@ pub fn confine(policy: &Policy) -> Result<(), SandlockError> {
     // Step 2 -- build handled_access_fs / handled_access_net / scoped.
     let handled_access_fs = base_fs_access(abi);
 
-    let has_net = !policy.net_bind.is_empty() || !policy.net_connect.is_empty();
-    let handled_access_net = if has_net {
-        LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP
-    } else {
-        0
-    };
+    // Always restrict TCP bind/connect via Landlock.  Empty net_bind/net_connect
+    // means deny all — same semantics as fs_readable/fs_writable.
+    let handled_access_net = LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP;
 
     let scoped = {
         let mut s: u64 = 0;

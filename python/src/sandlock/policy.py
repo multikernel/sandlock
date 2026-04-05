@@ -168,11 +168,11 @@ class Policy:
 
     # Network (Landlock ABI v4+, TCP only)
     net_bind: Sequence[int | str] = field(default_factory=list)
-    """TCP ports the sandbox may bind.  Empty = unrestricted.
+    """TCP ports the sandbox may bind.  Empty = deny all.
     Each entry is a port number or a ``"lo-hi"`` range string."""
 
     net_connect: Sequence[int | str] = field(default_factory=list)
-    """TCP ports the sandbox may connect to.  Empty = unrestricted.
+    """TCP ports the sandbox may connect to.  Empty = deny all.
     Each entry is a port number or a ``"lo-hi"`` range string."""
 
     # Socket type restrictions (seccomp-enforced)

@@ -209,13 +209,14 @@ async fn test_http_deny_precedence() {
     let _ = std::fs::remove_file(&out_denied);
 }
 
-/// Without any HTTP ACL rules, traffic passes through normally.
+/// Without any HTTP ACL rules, traffic passes through normally
+/// (provided the port is in net_connect).
 #[tokio::test]
 async fn test_http_no_acl_unrestricted() {
     let out = temp_file("no-acl");
     let (port, srv) = spawn_http_server(1);
 
-    let policy = base_policy().build().unwrap();
+    let policy = base_policy().net_connect_port(port).build().unwrap();
 
     let script = http_script(&format!("http://127.0.0.1:{}/get", port), &out);
     let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])

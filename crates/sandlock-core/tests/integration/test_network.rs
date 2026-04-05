@@ -48,9 +48,12 @@ async fn test_net_allow_host_blocks_disallowed() {
 async fn test_net_allow_host_permits_allowed() {
     let out = temp_file("allow");
 
+    // Use a fixed port so we can add it to net_connect.
+    let test_port: u16 = 19753;
     let policy = base_policy()
         .net_allow_host("127.0.0.1")
-        .net_bind_port(0)
+        .net_bind_port(test_port)
+        .net_connect_port(test_port)
         .port_remap(true)
         .build()
         .unwrap();
@@ -60,7 +63,7 @@ async fn test_net_allow_host_permits_allowed() {
         "import socket, threading\n",
         "srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
         "srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
-        "srv.bind(('127.0.0.1', 0))\n",
+        "srv.bind(('127.0.0.1', {port}))\n",
         "srv.listen(1)\n",
         "port = srv.getsockname()[1]\n",
         "def accept():\n",
@@ -74,7 +77,7 @@ async fn test_net_allow_host_permits_allowed() {
         "t.join(timeout=2)\n",
         "srv.close()\n",
         "open('{out}', 'w').write('CONNECTED')\n",
-    ), out = out.display());
+    ), out = out.display(), port = test_port);
 
     let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
@@ -84,13 +87,14 @@ async fn test_net_allow_host_permits_allowed() {
     let _ = std::fs::remove_file(&out);
 }
 
-/// Test that without net_allow_host, connections are unrestricted.
+/// Test that without net_allow_host, connections are unrestricted
+/// (provided the port is in net_connect).
 #[tokio::test]
 async fn test_no_net_allow_host_unrestricted() {
     let out = temp_file("unrestricted");
 
-    // No net_allow_host — all connections allowed
-    let policy = base_policy().build().unwrap();
+    // No net_allow_host — connections allowed on permitted ports
+    let policy = base_policy().net_connect_port(1).build().unwrap();
 
     // Connect to localhost on a port that doesn't exist — should get ECONNREFUSED (not EPERM)
     let script = format!(concat!(

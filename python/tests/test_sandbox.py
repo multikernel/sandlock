@@ -217,7 +217,7 @@ class TestPortRemap:
             "print(json.dumps({'server_port': server_port, 'sent': total_sent, "
             "'received': len(received), 'data_ok': bytes(received) == payload}))"
         )
-        policy = _policy(port_remap=True)
+        policy = _policy(port_remap=True, net_bind=[7070], net_connect=[7070])
         result = Sandbox(policy).run(["python3", "-c", code])
 
         assert result.success, f"Sandbox failed: {result}"
