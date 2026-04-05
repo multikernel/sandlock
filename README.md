@@ -23,6 +23,7 @@ protects your working directory automatically.
 | Kernel | Shared | Shared | Separate guest |
 | Filesystem isolation | Landlock + seccomp COW | Overlay | Block-level |
 | Network isolation | Landlock + seccomp notif | Network namespace | TAP device |
+| HTTP-level ACL | Method + host + path rules | N/A | N/A |
 | Syscall filtering | seccomp-bpf | seccomp | N/A |
 | Resource limits | seccomp notif + SIGSTOP | cgroup v2 | VM config |
 
@@ -102,6 +103,19 @@ sandlock run -m 512M -P 20 -t 30 -- ./compute.sh
 # Domain-based network isolation
 sandlock run --net-allow-host api.openai.com -r /usr -r /lib -r /etc -- python3 agent.py
 
+# HTTP-level ACL (method + host + path rules via transparent proxy)
+sandlock run \
+  --http-allow "GET docs.python.org/*" \
+  --http-allow "POST api.openai.com/v1/chat/completions" \
+  --http-deny "* */admin/*" \
+  -r /usr -r /lib -r /etc -- python3 agent.py
+
+# HTTPS MITM with user-provided CA (enables ACL on port 443)
+sandlock run \
+  --http-allow "POST api.openai.com/v1/*" \
+  --https-ca ca.pem --https-key ca-key.pem \
+  -r /usr -r /lib -r /etc -- python3 agent.py
+
 # TCP port restrictions (Landlock)
 sandlock run --net-bind 8080 --net-connect 443 -r /usr -r /lib -r /etc -- python3 server.py
 
@@ -150,6 +164,14 @@ policy = Policy(
 result = Sandbox(policy).run(["python3", "-c", "print('hello')"])
 assert result.success
 assert b"hello" in result.stdout
+
+# HTTP ACL: only allow specific API calls
+agent_policy = Policy(
+    fs_readable=["/usr", "/lib", "/etc"],
+    http_allow=["POST api.openai.com/v1/chat/completions"],
+    http_deny=["* */admin/*"],
+)
+result = Sandbox(agent_policy).run(["python3", "agent.py"])
 
 # Confine the current process (Landlock filesystem only, irreversible)
 confine(Policy(fs_readable=["/usr", "/lib"], fs_writable=["/tmp"]))
@@ -259,6 +281,14 @@ let policy = Policy::builder()
 let result = Sandbox::run(&policy, &["echo", "hello"]).await?;
 assert!(result.success());
 
+// HTTP ACL: restrict API access at the HTTP level
+let policy = Policy::builder()
+    .fs_read("/usr").fs_read("/lib").fs_read("/etc")
+    .http_allow("POST api.openai.com/v1/chat/completions")
+    .http_deny("* */admin/*")
+    .build()?;
+let result = Sandbox::run(&policy, &["python3", "agent.py"]).await?;
+
 // Confine the current process (Landlock filesystem only, irreversible)
 let policy = Policy::builder()
     .fs_read("/usr").fs_read("/lib")
@@ -342,7 +372,7 @@ The async notification supervisor (tokio) handles intercepted syscalls:
 |---|---|
 | `clone/fork/vfork` | Process count enforcement |
 | `mmap/munmap/brk/mremap` | Memory limit tracking |
-| `connect/sendto/sendmsg` | IP allowlist + on-behalf execution |
+| `connect/sendto/sendmsg` | IP allowlist + on-behalf execution + HTTP ACL redirect |
 | `bind` | On-behalf bind + port remapping |
 | `openat` | /proc virtualization, COW interception |
 | `unlinkat/mkdirat/renameat2` | COW write interception |
@@ -468,6 +498,13 @@ Policy(
     net_allow_hosts=["api.example.com"],  # Domain allowlist
     net_bind=[8080],               # TCP bind ports (Landlock ABI v4+)
     net_connect=[443],             # TCP connect ports
+
+    # HTTP ACL (transparent proxy)
+    http_allow=["POST api.openai.com/v1/*"],  # Allow rules (METHOD host/path)
+    http_deny=["* */admin/*"],     # Deny rules (checked first)
+    http_ports=[80],               # Ports to intercept (default: [80])
+    https_ca="ca.pem",             # CA cert for HTTPS MITM (adds port 443)
+    https_key="ca-key.pem",        # CA key for HTTPS MITM
 
     # Socket restrictions
     no_raw_sockets=True,           # Block SOCK_RAW (default)

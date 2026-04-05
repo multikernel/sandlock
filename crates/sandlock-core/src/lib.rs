@@ -22,6 +22,7 @@ pub mod image;
 pub mod fork;
 pub(crate) mod chroot;
 pub mod dry_run;
+pub(crate) mod http_acl;
 
 pub use error::SandlockError;
 pub use checkpoint::Checkpoint;

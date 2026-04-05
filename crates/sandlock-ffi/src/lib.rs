@@ -368,6 +368,74 @@ pub unsafe extern "C" fn sandlock_policy_builder_uid(
 }
 
 // ----------------------------------------------------------------
+// Policy Builder — HTTP ACL
+// ----------------------------------------------------------------
+
+/// # Safety
+/// `b` and `rule` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_http_allow(
+    b: *mut PolicyBuilder,
+    rule: *const c_char,
+) -> *mut PolicyBuilder {
+    if b.is_null() || rule.is_null() { return b; }
+    let rule = CStr::from_ptr(rule).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.http_allow(rule)))
+}
+
+/// # Safety
+/// `b` and `rule` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_http_deny(
+    b: *mut PolicyBuilder,
+    rule: *const c_char,
+) -> *mut PolicyBuilder {
+    if b.is_null() || rule.is_null() { return b; }
+    let rule = CStr::from_ptr(rule).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.http_deny(rule)))
+}
+
+/// # Safety
+/// `b` must be a valid pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_http_port(
+    b: *mut PolicyBuilder,
+    port: u16,
+) -> *mut PolicyBuilder {
+    if b.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.http_port(port)))
+}
+
+/// # Safety
+/// `b` and `path` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_https_ca(
+    b: *mut PolicyBuilder,
+    path: *const c_char,
+) -> *mut PolicyBuilder {
+    if b.is_null() || path.is_null() { return b; }
+    let path = CStr::from_ptr(path).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.https_ca(path)))
+}
+
+/// # Safety
+/// `b` and `path` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_https_key(
+    b: *mut PolicyBuilder,
+    path: *const c_char,
+) -> *mut PolicyBuilder {
+    if b.is_null() || path.is_null() { return b; }
+    let path = CStr::from_ptr(path).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.https_key(path)))
+}
+
+// ----------------------------------------------------------------
 // Policy Builder — isolation & determinism
 // ----------------------------------------------------------------
 

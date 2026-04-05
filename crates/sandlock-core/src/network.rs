@@ -49,6 +49,25 @@ fn parse_ip_from_sockaddr(bytes: &[u8]) -> Option<IpAddr> {
 }
 
 // ============================================================
+// parse_port_from_sockaddr — parse TCP port from sockaddr bytes
+// ============================================================
+
+/// Parse TCP port from a sockaddr byte buffer.
+/// Returns None for non-IP families (AF_UNIX etc.).
+fn parse_port_from_sockaddr(bytes: &[u8]) -> Option<u16> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    let family = u16::from_ne_bytes([bytes[0], bytes[1]]) as u32;
+    match family {
+        f if f == AF_INET || f == AF_INET6 => {
+            Some(u16::from_be_bytes([bytes[2], bytes[3]]))
+        }
+        _ => None,
+    }
+}
+
+// ============================================================
 // connect_on_behalf — perform connect() on behalf of the child (TOCTOU-safe)
 // ============================================================
 
@@ -86,11 +105,76 @@ async fn connect_on_behalf(
                 return NotifAction::Errno(ECONNREFUSED);
             }
         }
+        // Check for HTTP ACL redirect
+        let dest_port = parse_port_from_sockaddr(&addr_bytes);
+        let http_acl_addr = st.http_acl_addr;
+        let http_acl_intercept = dest_port.map_or(false, |p| st.http_acl_ports.contains(&p));
+        let http_acl_orig_dest = st.http_acl_orig_dest.clone();
+
         let child_pidfd = match st.child_pidfd {
             Some(fd) => fd,
             None => return NotifAction::Errno(libc::ENOSYS),
         };
         drop(st);
+
+        // Determine the actual connect target (redirect HTTP/HTTPS to proxy)
+        let mut redirected = false;
+        let is_ipv6 = parse_ip_from_sockaddr(&addr_bytes)
+            .map_or(false, |ip| ip.is_ipv6());
+        let (connect_addr, connect_len) = if let Some(proxy_addr) = http_acl_addr {
+            if http_acl_intercept {
+                redirected = true;
+                if is_ipv6 {
+                    // IPv6 socket: redirect via IPv4-mapped IPv6 address
+                    // (::ffff:127.0.0.1) so it connects to the IPv4 proxy.
+                    let mut sa6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+                    sa6.sin6_family = libc::AF_INET6 as u16;
+                    sa6.sin6_port = proxy_addr.port().to_be();
+                    // Build ::ffff:127.0.0.1
+                    let mapped = std::net::Ipv6Addr::from(
+                        match proxy_addr {
+                            std::net::SocketAddr::V4(v4) => v4.ip().to_ipv6_mapped(),
+                            std::net::SocketAddr::V6(v6) => *v6.ip(),
+                        }
+                    );
+                    sa6.sin6_addr.s6_addr = mapped.octets();
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            &sa6 as *const _ as *const u8,
+                            std::mem::size_of::<libc::sockaddr_in6>(),
+                        )
+                    }
+                    .to_vec();
+                    (bytes, std::mem::size_of::<libc::sockaddr_in6>() as u32)
+                } else {
+                    // IPv4 socket: redirect directly.
+                    let mut sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+                    sa.sin_family = libc::AF_INET as u16;
+                    sa.sin_port = proxy_addr.port().to_be();
+                    match proxy_addr {
+                        std::net::SocketAddr::V4(v4) => {
+                            sa.sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
+                        }
+                        std::net::SocketAddr::V6(_) => {
+                            // Proxy always binds to 127.0.0.1
+                            return NotifAction::Errno(libc::EAFNOSUPPORT);
+                        }
+                    }
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            &sa as *const _ as *const u8,
+                            std::mem::size_of::<libc::sockaddr_in>(),
+                        )
+                    }
+                    .to_vec();
+                    (bytes, std::mem::size_of::<libc::sockaddr_in>() as u32)
+                }
+            } else {
+                (addr_bytes.clone(), addr_len)
+            }
+        } else {
+            (addr_bytes.clone(), addr_len)
+        };
 
         // 3. Duplicate child's socket into supervisor
         let dup_fd = match crate::seccomp::notif::dup_child_fd(child_pidfd, sockfd) {
@@ -98,16 +182,95 @@ async fn connect_on_behalf(
             Err(_) => return NotifAction::Errno(libc::ENOSYS),
         };
 
-        // 4. Perform connect in supervisor with our validated sockaddr
+        // 4. Record original dest IP *before* connect to prevent TOCTOU race:
+        //    the proxy may receive the request before we write the mapping if
+        //    we do it after connect(). We already have the original IP from
+        //    addr_bytes (our immune copy).
+        if redirected {
+            if let Some(ref orig_dest_map) = http_acl_orig_dest {
+                if let Some(orig_ip) = parse_ip_from_sockaddr(&addr_bytes) {
+                    // Bind the socket so getsockname() returns the local addr
+                    // the proxy will see as client_addr.
+                    if is_ipv6 {
+                        let mut bind_sa6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+                        bind_sa6.sin6_family = libc::AF_INET6 as u16;
+                        // port 0 + IN6ADDR_ANY = kernel picks ephemeral port
+                        unsafe {
+                            libc::bind(
+                                dup_fd.as_raw_fd(),
+                                &bind_sa6 as *const _ as *const libc::sockaddr,
+                                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                            );
+                        }
+                        let mut local_sa6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+                        let mut local_len: libc::socklen_t =
+                            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+                        let gs_ret = unsafe {
+                            libc::getsockname(
+                                dup_fd.as_raw_fd(),
+                                &mut local_sa6 as *mut _ as *mut libc::sockaddr,
+                                &mut local_len,
+                            )
+                        };
+                        if gs_ret == 0 {
+                            let local_port = u16::from_be(local_sa6.sin6_port);
+                            let local_ip = Ipv6Addr::from(local_sa6.sin6_addr.s6_addr);
+                            let local_addr = std::net::SocketAddr::V6(
+                                std::net::SocketAddrV6::new(local_ip, local_port, 0, 0),
+                            );
+                            if let Ok(mut map) = orig_dest_map.write() {
+                                map.insert(local_addr, orig_ip);
+                            }
+                        }
+                    } else {
+                        let mut bind_sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+                        bind_sa.sin_family = libc::AF_INET as u16;
+                        // port 0 + INADDR_ANY = kernel picks ephemeral port
+                        unsafe {
+                            libc::bind(
+                                dup_fd.as_raw_fd(),
+                                &bind_sa as *const _ as *const libc::sockaddr,
+                                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                            );
+                        }
+                        let mut local_sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+                        let mut local_len: libc::socklen_t =
+                            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+                        let gs_ret = unsafe {
+                            libc::getsockname(
+                                dup_fd.as_raw_fd(),
+                                &mut local_sa as *mut _ as *mut libc::sockaddr,
+                                &mut local_len,
+                            )
+                        };
+                        if gs_ret == 0 {
+                            let local_port = u16::from_be(local_sa.sin_port);
+                            let local_ip = Ipv4Addr::from(u32::from_be(local_sa.sin_addr.s_addr));
+                            let local_addr = std::net::SocketAddr::V4(
+                                std::net::SocketAddrV4::new(local_ip, local_port),
+                            );
+                            if let Ok(mut map) = orig_dest_map.write() {
+                                map.insert(local_addr, orig_ip);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 5. Perform connect in supervisor with our validated sockaddr
         let ret = unsafe {
             libc::connect(
                 dup_fd.as_raw_fd(),
-                addr_bytes.as_ptr() as *const libc::sockaddr,
-                addr_len as libc::socklen_t,
+                connect_addr.as_ptr() as *const libc::sockaddr,
+                connect_len as libc::socklen_t,
             )
         };
 
-        // 5. Return result
+        // 6. Return result.
+        // On failure, the stale orig_dest entry is harmless: the proxy never
+        // sees this connection, and the entry will be cleaned up on the next
+        // successful request from the same local address (or on shutdown).
         if ret == 0 {
             NotifAction::ReturnValue(0)
         } else {

@@ -93,6 +93,8 @@ pub struct Sandbox {
     work_fn: Option<Arc<dyn Fn(u32) + Send + Sync + 'static>>,
     /// Optional fd overrides for stdin/stdout/stderr (used by Pipeline).
     io_overrides: Option<(Option<i32>, Option<i32>, Option<i32>)>,
+    /// HTTP ACL proxy handle — kept alive so the proxy runs while the child is alive.
+    http_acl_handle: Option<crate::http_acl::HttpAclProxyHandle>,
 }
 
 impl Sandbox {
@@ -142,6 +144,7 @@ impl Sandbox {
             init_fn: None,
             work_fn: None,
             io_overrides: None,
+            http_acl_handle: None,
         }
     }
 
@@ -648,7 +651,18 @@ impl Sandbox {
             std::collections::HashSet::new()
         };
 
-        // 5. Create COW branch if requested
+        // 5. Spawn HTTP ACL proxy if rules are configured
+        if !self.policy.http_allow.is_empty() || !self.policy.http_deny.is_empty() {
+            let handle = crate::http_acl::spawn_http_acl_proxy(
+                self.policy.http_allow.clone(),
+                self.policy.http_deny.clone(),
+                self.policy.https_ca.as_deref(),
+                self.policy.https_key.as_deref(),
+            ).await.map_err(SandboxError::Io)?;
+            self.http_acl_handle = Some(handle);
+        }
+
+        // 6. Create COW branch if requested
         let cow_branch: Option<Box<dyn CowBranch>> = match self.policy.fs_isolation {
             FsIsolation::OverlayFs => {
                 let workdir = self.policy.workdir.as_ref()
@@ -822,7 +836,9 @@ impl Sandbox {
                 max_processes: self.policy.max_processes,
                 has_memory_limit: self.policy.max_memory.is_some(),
                 has_net_allowlist: !self.policy.net_allow_hosts.is_empty()
-                    || self.policy.policy_fn.is_some(),
+                    || self.policy.policy_fn.is_some()
+                    || !self.policy.http_allow.is_empty()
+                    || !self.policy.http_deny.is_empty(),
                 has_random_seed: self.policy.random_seed.is_some(),
                 has_time_start: self.policy.time_start.is_some(),
                 time_offset: time_offset_val,
@@ -837,6 +853,7 @@ impl Sandbox {
                 chroot_denied: self.policy.fs_denied.clone(),
                 deterministic_dirs: self.policy.deterministic_dirs,
                 hostname: self.policy.hostname.clone(),
+                has_http_acl: !self.policy.http_allow.is_empty() || !self.policy.http_deny.is_empty(),
             };
 
             // Create SupervisorState
@@ -862,6 +879,10 @@ impl Sandbox {
                 use std::os::unix::io::AsRawFd;
                 sup_state.child_pidfd = Some(pfd.as_raw_fd());
             }
+
+            sup_state.http_acl_addr = self.http_acl_handle.as_ref().map(|h| h.addr);
+            sup_state.http_acl_ports = self.policy.http_ports.iter().copied().collect();
+            sup_state.http_acl_orig_dest = self.http_acl_handle.as_ref().map(|h| h.orig_dest.clone());
 
             // Seccomp COW branch
             if self.policy.workdir.is_some() && self.policy.fs_isolation == FsIsolation::None {

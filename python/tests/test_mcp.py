@@ -14,7 +14,9 @@ class TestDenyByDefault:
         policy = policy_for_tool(workspace="/tmp/ws")
         assert policy.fs_writable == []
         assert "/tmp/ws" in policy.fs_readable
-        assert policy.net_connect == []
+        assert policy.net_connect == [0]
+        assert policy.net_bind == [0]
+        assert policy.no_udp is True
         assert policy.isolate_pids is True
         assert policy.isolate_ipc is True
         assert policy.no_raw_sockets is True
@@ -22,7 +24,7 @@ class TestDenyByDefault:
     def test_empty_capabilities(self):
         policy = policy_for_tool(workspace="/tmp/ws", capabilities={})
         assert policy.fs_writable == []
-        assert policy.net_connect == []
+        assert policy.net_connect == [0]
 
 
 class TestCapabilities:

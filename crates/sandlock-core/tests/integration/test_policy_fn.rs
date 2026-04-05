@@ -214,7 +214,7 @@ async fn test_policy_fn_execve_argv() {
 /// Test argv_contains helper.
 #[tokio::test]
 async fn test_policy_fn_deny_by_argv() {
-    let out = temp_file("deny-argv");
+    let _out = temp_file("deny-argv");
 
     let policy = base_policy()
         .policy_fn(move |event, _ctx| {

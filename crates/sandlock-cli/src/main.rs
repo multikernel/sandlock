@@ -71,6 +71,19 @@ enum Command {
         net_allow: Vec<String>,
         #[arg(long = "net-deny", value_name = "PROTO")]
         net_deny: Vec<String>,
+        #[arg(long = "http-allow", value_name = "RULE")]
+        http_allow: Vec<String>,
+        #[arg(long = "http-deny", value_name = "RULE")]
+        http_deny: Vec<String>,
+        /// TCP ports to intercept for HTTP ACL (default: 80, plus 443 with --https-ca)
+        #[arg(long = "http-port", value_name = "PORT")]
+        http_ports: Vec<u16>,
+        /// PEM CA certificate for HTTPS MITM (enables port 443 interception)
+        #[arg(long = "https-ca", value_name = "PATH")]
+        https_ca: Option<String>,
+        /// PEM CA private key for HTTPS MITM (required with --https-ca)
+        #[arg(long = "https-key", value_name = "PATH")]
+        https_key: Option<String>,
         #[arg(long)]
         port_remap: bool,
         #[arg(long)]
@@ -135,7 +148,7 @@ struct SandboxStatus {
     signal: Option<i32>,
 }
 
-#[tokio::main]
+#[tokio::main(worker_threads = 2)]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -145,6 +158,7 @@ async fn main() -> Result<()> {
             isolate_ipc, isolate_signals, clean_env, num_cpus, profile: profile_name, status_fd,
             max_cpu, max_open_files, chroot, uid, workdir, cwd,
             fs_isolation, fs_storage, max_disk, net_allow, net_deny,
+            http_allow, http_deny, http_ports, https_ca, https_key,
             port_remap, no_randomize_memory, no_huge_pages, deterministic_dirs, hostname, no_coredump,
             env_vars, exec_shell, interactive: _, fs_deny, cpu_cores, gpu_devices, image, dry_run, no_supervisor, cmd } =>
         {
@@ -152,7 +166,7 @@ async fn main() -> Result<()> {
                 validate_no_supervisor(
                     &max_memory, &max_processes, &max_cpu, &max_open_files,
                     &timeout, &net_allow_host, &net_bind, &net_connect,
-                    &net_allow, &net_deny,
+                    &net_allow, &net_deny, &http_allow, &http_deny, &http_ports,
                     &num_cpus, &random_seed, &time_start, no_randomize_memory,
                     no_huge_pages, deterministic_dirs, &hostname, &chroot,
                     &image, &uid, &workdir, &cwd, &fs_isolation, &fs_storage,
@@ -217,6 +231,17 @@ async fn main() -> Result<()> {
                 for h in &base.net_allow_hosts { b = b.net_allow_host(h); }
                 for p in &base.net_bind { b = b.net_bind_port(*p); }
                 for p in &base.net_connect { b = b.net_connect_port(*p); }
+                for rule in &base.http_allow {
+                    let s = format!("{} {}{}", rule.method, rule.host, rule.path);
+                    b = b.http_allow(&s);
+                }
+                for rule in &base.http_deny {
+                    let s = format!("{} {}{}", rule.method, rule.host, rule.path);
+                    b = b.http_deny(&s);
+                }
+                for port in &base.http_ports {
+                    b = b.http_port(*port);
+                }
                 if let Some(mem) = base.max_memory { b = b.max_memory(mem); }
                 b = b.max_processes(base.max_processes);
                 if let Some(cpu) = base.max_cpu { b = b.max_cpu(cpu); }
@@ -281,6 +306,11 @@ async fn main() -> Result<()> {
                     other => return Err(anyhow!("unknown --net-deny protocol: {}", other)),
                 }
             }
+            for rule in &http_allow { builder = builder.http_allow(rule); }
+            for rule in &http_deny { builder = builder.http_deny(rule); }
+            for port in &http_ports { builder = builder.http_port(*port); }
+            if let Some(ref ca) = https_ca { builder = builder.https_ca(ca); }
+            if let Some(ref key) = https_key { builder = builder.https_key(key); }
             if port_remap { builder = builder.port_remap(true); }
             if !cpu_cores.is_empty() { builder = builder.cpu_cores(cpu_cores); }
             if !gpu_devices.is_empty() { builder = builder.gpu_devices(gpu_devices); }
@@ -452,6 +482,9 @@ fn validate_no_supervisor(
     net_connect: &[u16],
     net_allow: &[String],
     net_deny: &[String],
+    http_allow: &[String],
+    http_deny: &[String],
+    http_ports: &[u16],
     num_cpus: &Option<u32>,
     random_seed: &Option<u64>,
     time_start: &Option<String>,
@@ -486,6 +519,9 @@ fn validate_no_supervisor(
     if !net_connect.is_empty() { bad.push("--net-connect"); }
     if !net_allow.is_empty() { bad.push("--net-allow"); }
     if !net_deny.is_empty() { bad.push("--net-deny"); }
+    if !http_allow.is_empty() { bad.push("--http-allow"); }
+    if !http_deny.is_empty() { bad.push("--http-deny"); }
+    if !http_ports.is_empty() { bad.push("--http-port"); }
     if num_cpus.is_some() { bad.push("--num-cpus"); }
     if random_seed.is_some() { bad.push("--random-seed"); }
     if time_start.is_some() { bad.push("--time-start"); }

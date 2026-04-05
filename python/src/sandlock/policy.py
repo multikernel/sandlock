@@ -186,6 +186,26 @@ class Policy:
     IP-family sockets — AF_UNIX datagrams are unaffected.  Useful when
     only TCP connectivity is desired.  Enforced via seccomp BPF."""
 
+    # HTTP ACL
+    http_allow: Sequence[str] = field(default_factory=list)
+    """HTTP allow rules. Format: "METHOD host/path" with glob matching.
+    When non-empty, all other HTTP requests are denied by default.
+    A transparent MITM proxy is spawned in the supervisor."""
+
+    http_deny: Sequence[str] = field(default_factory=list)
+    """HTTP deny rules. Checked before allow rules. Format: "METHOD host/path"."""
+
+    http_ports: Sequence[int] = field(default_factory=list)
+    """TCP ports to intercept for HTTP ACL. Defaults to [80] (plus 443 with
+    https_ca). Override to intercept custom ports like 8080."""
+
+    https_ca: str | None = None
+    """PEM CA certificate path for HTTPS MITM. When set, port 443 is also
+    intercepted by the HTTP ACL proxy."""
+
+    https_key: str | None = None
+    """PEM CA private key path for HTTPS MITM. Required with https_ca."""
+
     # Resource limits
     max_memory: str | int | None = None
     """Memory limit. String like '512M' or int bytes."""

@@ -69,10 +69,12 @@ def policy_for_tool(
             workspace, "/usr", "/lib", "/lib64", "/etc", "/bin", "/sbin",
             _PYTHON_PREFIX,
         ])),
-        "net_connect": [],
+        "net_bind": [0],
+        "net_connect": [0],
         "isolate_pids": True,
         "isolate_ipc": True,
         "no_raw_sockets": True,
+        "no_udp": True,
         "clean_env": True,
     }
 
