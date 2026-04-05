@@ -103,6 +103,9 @@ pub struct SupervisorState {
     pub http_acl_ports: std::collections::HashSet<u16>,
     /// Shared map for recording original destination IPs on proxy redirect.
     pub http_acl_orig_dest: Option<crate::http_acl::OrigDestMap>,
+    /// Virtual exe path for chroot (set by handle_chroot_exec when memfd patching
+    /// rewrites PT_INTERP, since /proc/self/exe would otherwise show the memfd path).
+    pub chroot_exe: Option<std::path::PathBuf>,
 }
 
 impl SupervisorState {
@@ -139,6 +142,7 @@ impl SupervisorState {
             http_acl_addr: None,
             http_acl_ports: std::collections::HashSet::new(),
             http_acl_orig_dest: None,
+            chroot_exe: None,
         }
     }
 }

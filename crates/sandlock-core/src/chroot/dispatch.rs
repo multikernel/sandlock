@@ -4,7 +4,8 @@
 //! and performs on-behalf operations. Composes with COW when active.
 
 use std::ffi::CString;
-use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -251,12 +252,140 @@ pub(crate) async fn handle_chroot_open(
 }
 
 // ============================================================
+// ELF PT_INTERP helpers
+// ============================================================
+
+/// Read PT_INTERP from an ELF binary fd. Returns the interpreter path and its
+/// file offset + length so we can patch it in a memfd copy.
+fn read_pt_interp(fd: RawFd) -> Option<(String, u64, usize)> {
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut header = [0u8; 64]; // ELF64 header is 64 bytes
+    if file.read_exact(&mut header).is_err() {
+        std::mem::forget(file); // don't close the fd
+        return None;
+    }
+
+    // Verify ELF magic
+    if &header[..4] != b"\x7fELF" {
+        std::mem::forget(file);
+        return None;
+    }
+
+    // ELF64: e_phoff at offset 32 (8 bytes), e_phentsize at 54 (2 bytes), e_phnum at 56 (2 bytes)
+    let e_phoff = u64::from_le_bytes(header[32..40].try_into().ok()?);
+    let e_phentsize = u16::from_le_bytes(header[54..56].try_into().ok()?) as u64;
+    let e_phnum = u16::from_le_bytes(header[56..58].try_into().ok()?) as usize;
+
+    // Scan program headers for PT_INTERP (type 3)
+    const PT_INTERP: u32 = 3;
+    for i in 0..e_phnum {
+        let ph_offset = e_phoff + (i as u64) * e_phentsize;
+        let mut phdr = [0u8; 56]; // ELF64 Phdr is 56 bytes
+        if file.seek(SeekFrom::Start(ph_offset)).is_err() {
+            break;
+        }
+        if file.read_exact(&mut phdr).is_err() {
+            break;
+        }
+        let p_type = u32::from_le_bytes(phdr[0..4].try_into().ok()?);
+        if p_type != PT_INTERP {
+            continue;
+        }
+        let p_offset = u64::from_le_bytes(phdr[8..16].try_into().ok()?);
+        let p_filesz = u64::from_le_bytes(phdr[32..40].try_into().ok()?) as usize;
+        if p_filesz == 0 || p_filesz > 256 {
+            break;
+        }
+
+        // Read the interpreter path string
+        let mut buf = vec![0u8; p_filesz];
+        if file.seek(SeekFrom::Start(p_offset)).is_err() {
+            break;
+        }
+        if file.read_exact(&mut buf).is_err() {
+            break;
+        }
+        let nul = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        let interp = String::from_utf8_lossy(&buf[..nul]).to_string();
+
+        std::mem::forget(file);
+        return Some((interp, p_offset, p_filesz));
+    }
+
+    std::mem::forget(file);
+    None
+}
+
+/// Create a memfd copy of `src_fd` with PT_INTERP patched to `new_interp`.
+/// Uses sendfile for efficient kernel-to-kernel copy, then patches the
+/// interpreter path in place.
+fn memfd_with_patched_interp(
+    src_fd: RawFd,
+    new_interp: &str,
+    interp_offset: u64,
+    interp_capacity: usize,
+) -> Option<OwnedFd> {
+    // Get file size
+    let size = {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(src_fd, &mut stat) } < 0 {
+            return None;
+        }
+        stat.st_size as usize
+    };
+
+    // Create memfd
+    let memfd = crate::sys::syscall::memfd_create("sandlock-exec", 0).ok()?;
+    let mfd = memfd.as_raw_fd();
+
+    // Set size
+    if unsafe { libc::ftruncate(mfd, size as libc::off_t) } < 0 {
+        return None;
+    }
+
+    // sendfile: kernel-to-kernel copy, no userspace buffer
+    let mut offset: libc::off_t = 0;
+    let mut remaining = size;
+    while remaining > 0 {
+        let n = unsafe {
+            libc::sendfile(mfd, src_fd, &mut offset, remaining)
+        };
+        if n <= 0 {
+            return None;
+        }
+        remaining -= n as usize;
+    }
+
+    // Patch PT_INTERP in the memfd
+    let new_bytes = new_interp.as_bytes();
+    if new_bytes.len() >= interp_capacity {
+        return None; // new path too long for the PT_INTERP field
+    }
+    let mut patch = vec![0u8; interp_capacity];
+    patch[..new_bytes.len()].copy_from_slice(new_bytes);
+    // NUL-fill the rest (already zeroed)
+
+    let mut mfd_file = unsafe { std::fs::File::from_raw_fd(mfd) };
+    if mfd_file.seek(SeekFrom::Start(interp_offset)).is_err() {
+        std::mem::forget(mfd_file);
+        return None;
+    }
+    if mfd_file.write_all(&patch).is_err() {
+        std::mem::forget(mfd_file);
+        return None;
+    }
+    std::mem::forget(mfd_file); // don't close — OwnedFd owns it
+
+    Some(memfd)
+}
+
+// ============================================================
 // execve/execveat handler
 // ============================================================
 
 pub(crate) async fn handle_chroot_exec(
     notif: &SeccompNotif,
-    _state: &Arc<Mutex<SupervisorState>>,
+    state: &Arc<Mutex<SupervisorState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
@@ -311,12 +440,80 @@ pub(crate) async fn handle_chroot_exec(
         Err(_) => return NotifAction::Errno(libc::ENOENT),
     };
 
-    // Inject the fd into the child and rewrite the path to /proc/self/fd/N
-    // so the kernel loads the ELF from the injected fd.
+    // Read PT_INTERP from the binary. If it has one, open the image's
+    // interpreter and create a memfd copy with PT_INTERP patched to
+    // point at the injected interpreter fd. This ensures the kernel loads
+    // the image's ld-linux (not the host's), avoiding glibc version
+    // mismatches between ld.so and libc.so.
+    let exec_fd = if let Some((interp_path, interp_offset, interp_cap)) = read_pt_interp(src_fd) {
+        // Open the image's interpreter from the chroot root
+        let interp_src = match openat2_in_root(
+            ctx.root,
+            &interp_path,
+            libc::O_RDONLY | libc::O_CLOEXEC,
+            0,
+        ) {
+            Ok(fd) => fd,
+            Err(_) => {
+                unsafe { libc::close(src_fd) };
+                return NotifAction::Errno(libc::ENOENT);
+            }
+        };
+
+        // Inject the interpreter fd into the child (must survive exec)
+        let addfd_interp = SeccompNotifAddfd {
+            id: notif.id,
+            flags: 0,
+            srcfd: interp_src as u32,
+            newfd: 0,
+            newfd_flags: 0,
+        };
+        let child_interp_fd = unsafe {
+            libc::ioctl(
+                notif_fd,
+                SECCOMP_IOCTL_NOTIF_ADDFD as libc::c_ulong,
+                &addfd_interp as *const _,
+            )
+        };
+        unsafe { libc::close(interp_src) };
+
+        if child_interp_fd < 0 {
+            unsafe { libc::close(src_fd) };
+            return NotifAction::Errno(libc::EIO);
+        }
+
+        // Create a memfd copy with PT_INTERP patched to /proc/self/fd/<interp_fd>
+        let new_interp = format!("/proc/self/fd/{}", child_interp_fd);
+        match memfd_with_patched_interp(src_fd, &new_interp, interp_offset, interp_cap) {
+            Some(memfd) => {
+                unsafe { libc::close(src_fd) };
+                memfd
+            }
+            None => {
+                // Patching failed (e.g., new path too long) — fall back to
+                // original binary. Host ld-linux will be used; this is the
+                // pre-existing behavior and may work if versions are compatible.
+                unsafe { OwnedFd::from_raw_fd(src_fd) }
+            }
+        }
+    } else {
+        // Statically linked or not ELF — use the binary directly.
+        unsafe { OwnedFd::from_raw_fd(src_fd) }
+    };
+
+    // Record the virtual exe path so /proc/self/exe queries return the
+    // correct path (memfd-backed binaries would otherwise show the memfd path).
+    {
+        let mut st = state.lock().await;
+        st.chroot_exe = Some(virtual_path.clone());
+    }
+
+    // Inject the (possibly patched) binary fd into the child and rewrite
+    // the path to /proc/self/fd/N so the kernel loads it.
     let addfd = SeccompNotifAddfd {
         id: notif.id,
         flags: 0,
-        srcfd: src_fd as u32,
+        srcfd: exec_fd.as_raw_fd() as u32,
         newfd: 0,
         newfd_flags: 0, // no O_CLOEXEC — must survive exec
     };
@@ -327,7 +524,7 @@ pub(crate) async fn handle_chroot_exec(
             &addfd as *const _,
         )
     };
-    unsafe { libc::close(src_fd) };
+    drop(exec_fd);
 
     if child_fd < 0 {
         return NotifAction::Errno(libc::EIO);
@@ -760,8 +957,16 @@ pub(crate) async fn handle_chroot_readlink(
         return write_target(b"/");
     }
 
-    // Special case: /proc/self/exe -> strip chroot prefix
+    // Special case: /proc/self/exe -> return the virtual path recorded during exec
+    // (needed because memfd-backed binaries would show "/memfd:sandlock-exec" otherwise).
     if path == "/proc/self/exe" {
+        let st = state.lock().await;
+        if let Some(ref exe) = st.chroot_exe {
+            let s = exe.to_string_lossy();
+            return write_target(s.as_bytes());
+        }
+        drop(st);
+        // Fallback: strip chroot prefix from /proc/{pid}/exe
         if let Ok(real_exe) = std::fs::read_link(format!("/proc/{}/exe", notif.pid)) {
             let virtual_exe = to_virtual_path(ctx.root, &real_exe).unwrap_or(real_exe);
             let s = virtual_exe.to_string_lossy();
