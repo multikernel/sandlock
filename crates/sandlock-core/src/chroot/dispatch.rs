@@ -12,7 +12,6 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::chroot::resolve::{confine, openat2_in_root, resolve_existing_in_root, resolve_in_root, to_virtual_path};
-use crate::procfs::{build_dirent64, DT_DIR, DT_LNK, DT_REG};
 use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction, SupervisorState};
 use crate::sys::structs::{SeccompNotif, SeccompNotifAddfd, SECCOMP_IOCTL_NOTIF_ADDFD};
 
@@ -1212,92 +1211,17 @@ pub(crate) async fn handle_chroot_readlink(
 // ============================================================
 
 pub(crate) async fn handle_chroot_getdents(
-    notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
-    notif_fd: RawFd,
-    ctx: &ChrootCtx<'_>,
+    _notif: &SeccompNotif,
+    _state: &Arc<Mutex<SupervisorState>>,
+    _notif_fd: RawFd,
+    _ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
-    let pid = notif.pid;
-    let child_fd = (notif.data.args[0] & 0xFFFFFFFF) as u32;
-    let buf_addr = notif.data.args[1];
-    let buf_size = (notif.data.args[2] & 0xFFFFFFFF) as usize;
-
-    let link_path = format!("/proc/{}/fd/{}", pid, child_fd);
-    let target = match std::fs::read_link(&link_path) {
-        Ok(t) => t,
-        Err(_) => return NotifAction::Continue,
-    };
-
-    let host_dir = if ctx.host_to_virtual(&target).is_some() {
-        target
-    } else {
-        return NotifAction::Continue;
-    };
-
-    // COW delegation
-    {
-        let st = state.lock().await;
-        if let Some(cow) = st.cow_branch.as_ref() {
-            if cow.matches(&host_dir.to_string_lossy()) {
-                return NotifAction::Continue;
-            }
-        }
-    }
-
-    let cache_key = (pid as i32, child_fd);
-    let mut st = state.lock().await;
-
-    if !st.chroot_dir_cache.contains_key(&cache_key) {
-        let dir = match std::fs::read_dir(&host_dir) {
-            Ok(d) => d,
-            Err(_) => return NotifAction::Errno(libc::ENOENT),
-        };
-
-        let mut entries = Vec::new();
-        let mut d_off: i64 = 0;
-        for entry in dir.flatten() {
-            let name = entry.file_name();
-            d_off += 1;
-            let d_type = match entry.file_type() {
-                Ok(ft) if ft.is_dir() => DT_DIR,
-                Ok(ft) if ft.is_symlink() => DT_LNK,
-                _ => DT_REG,
-            };
-            use std::os::unix::fs::MetadataExt;
-            let d_ino = std::fs::symlink_metadata(entry.path())
-                .map(|m| m.ino())
-                .unwrap_or(0);
-            entries.push(build_dirent64(d_ino, d_off, d_type, &name.to_string_lossy()));
-        }
-        st.chroot_dir_cache.insert(cache_key, entries);
-    }
-
-    let entries = match st.chroot_dir_cache.get_mut(&cache_key) {
-        Some(e) => e,
-        None => return NotifAction::Continue,
-    };
-
-    let mut result = Vec::new();
-    let mut consumed = 0;
-    for entry in entries.iter() {
-        if result.len() + entry.len() > buf_size {
-            break;
-        }
-        result.extend_from_slice(entry);
-        consumed += 1;
-    }
-    if consumed > 0 {
-        entries.drain(..consumed);
-    }
-    // Keep empty Vec as EOF sentinel — don't remove.
-    drop(st);
-
-    if !result.is_empty() {
-        if write_child_mem(notif_fd, notif.id, pid, buf_addr, &result).is_err() {
-            return NotifAction::Continue;
-        }
-    }
-    NotifAction::ReturnValue(result.len() as i64)
+    // The child's fd already points to the real host directory (injected
+    // by the chroot openat handler).  Let the kernel handle getdents
+    // directly — it returns the correct entries from the host path.
+    // No filtering or caching needed; denied paths are enforced at open
+    // time, not at directory listing time.
+    NotifAction::Continue
 }
 
 // ============================================================
