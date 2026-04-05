@@ -286,6 +286,11 @@ class Policy:
     chroot: str | None = None
     """Path to chroot into before applying other confinement."""
 
+    fs_mount: Mapping[str, str] = field(default_factory=dict)
+    """Map virtual paths to host directories inside chroot.
+    Example: {"/work": "/host/sandbox/work"} makes /work inside the
+    chroot resolve to /host/sandbox/work on the host."""
+
     # Environment
     clean_env: bool = False
     """If True, start with a minimal environment (PATH, HOME, USER, TERM, LANG).

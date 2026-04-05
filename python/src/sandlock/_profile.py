@@ -49,6 +49,7 @@ _SIMPLE_FIELDS: dict[str, type] = {
     "cpu_cores": list,
     # Chroot
     "chroot": str,
+    "fs_mount": dict,
     # Environment
     "clean_env": bool,
     "env": dict,

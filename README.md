@@ -129,6 +129,9 @@ sandlock run --time-start "2000-01-01T00:00:00Z" --random-seed 42 -- ./build.sh
 # Port virtualization (multiple sandboxes can bind the same port)
 sandlock run --port-remap --net-bind 6379 -r /usr -r /lib -r /etc -- redis-server --port 6379
 
+# Chroot with per-sandbox mount (no kernel bind mount needed)
+sandlock run --chroot ./rootfs --fs-mount /work:/tmp/sandbox/work -- /bin/sh
+
 # COW filesystem (writes captured, committed on success)
 sandlock run --workdir /opt/project -r /usr -r /lib -- python3 task.py
 
@@ -172,6 +175,15 @@ agent_policy = Policy(
     http_deny=["* */admin/*"],
 )
 result = Sandbox(agent_policy).run(["python3", "agent.py"])
+
+# Chroot with per-sandbox mount (Docker-style -v, no root needed)
+chroot_policy = Policy(
+    chroot="/opt/rootfs",
+    fs_mount={"/work": "/tmp/sandbox-1/work"},  # maps /work inside chroot
+    fs_readable=["/usr", "/bin", "/lib", "/etc"],
+    cwd="/work",
+)
+result = Sandbox(chroot_policy).run(["python3", "task.py"])
 
 # Confine the current process (Landlock filesystem only, irreversible)
 confine(Policy(fs_readable=["/usr", "/lib"], fs_writable=["/tmp"]))
@@ -532,6 +544,10 @@ Policy(
     clean_env=False,               # Minimal env
     env={"KEY": "value"},          # Override env vars
 
+    # Chroot + mount mapping
+    chroot=None,                   # Path to chroot into
+    fs_mount={"/work": "/host/sandbox/work"},  # Map virtual paths to host dirs
+
     # COW isolation
     workdir=None,                  # COW root directory
     cwd=None,                      # Child working directory
@@ -540,7 +556,6 @@ Policy(
     on_error=BranchAction.ABORT,
 
     # Misc
-    chroot=None,
     close_fds=True,
     uid=None,                      # Map to given UID in user namespace (e.g. 0 for fake root)
 )

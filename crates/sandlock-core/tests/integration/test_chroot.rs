@@ -497,3 +497,49 @@ async fn test_chroot_read_denied_without_fs_read() {
 
     cleanup_rootfs(&rootfs);
 }
+
+/// fs_mount maps a host directory to a virtual path inside the chroot.
+/// A file written to the host directory should be readable at the virtual path.
+#[tokio::test]
+async fn test_fs_mount_read_write() {
+    let rootfs = build_test_rootfs("fs-mount-rw");
+
+    // Create a /work directory inside the rootfs so the mount point exists
+    fs::create_dir_all(rootfs.join("work")).unwrap();
+
+    let work_dir = temp_dir("fs-mount-work");
+
+    // Write a test file in the host directory that will be mounted at /work
+    fs::write(work_dir.join("input.txt"), "hello mount").unwrap();
+
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_read("/tmp")
+        .fs_write("/tmp")
+        .fs_read("/work")
+        .fs_write("/work")
+        .fs_mount("/work", &work_dir)
+        .build()
+        .unwrap();
+
+    let result = Sandbox::run(&policy, &["rootfs-helper", "cat", "/work/input.txt"]).await;
+    match result {
+        Ok(r) => {
+            assert!(
+                r.success(),
+                "cat /work/input.txt failed: exit={:?} stderr={}",
+                r.code(),
+                r.stderr_str().unwrap_or("")
+            );
+            assert_eq!(
+                r.stdout_str().unwrap_or("").trim(),
+                "hello mount",
+                "expected 'hello mount', got: {}",
+                r.stdout_str().unwrap_or("")
+            );
+        }
+        Err(e) => eprintln!("fs_mount test skipped: {}", e),
+    }
+
+    let _ = fs::remove_dir_all(&rootfs);
+    let _ = fs::remove_dir_all(&work_dir);
+}

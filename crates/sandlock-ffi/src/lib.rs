@@ -170,6 +170,23 @@ pub unsafe extern "C" fn sandlock_policy_builder_chroot(
     Box::into_raw(Box::new(builder.chroot(path)))
 }
 
+/// Add a filesystem mount mapping (virtual_path -> host_path).
+///
+/// # Safety
+/// `b`, `virtual_path`, and `host_path` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_fs_mount(
+    b: *mut PolicyBuilder,
+    virtual_path: *const c_char,
+    host_path: *const c_char,
+) -> *mut PolicyBuilder {
+    if b.is_null() || virtual_path.is_null() || host_path.is_null() { return b; }
+    let vp = CStr::from_ptr(virtual_path).to_str().unwrap_or("");
+    let hp = CStr::from_ptr(host_path).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.fs_mount(vp, hp)))
+}
+
 /// Set the COW branch action on successful exit.
 /// `action`: 0 = Commit, 1 = Abort, 2 = Keep.
 ///

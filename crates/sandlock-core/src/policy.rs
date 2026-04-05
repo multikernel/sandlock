@@ -303,6 +303,9 @@ pub struct Policy {
     pub on_exit: BranchAction,
     pub on_error: BranchAction,
 
+    // Mount mappings: (virtual_path_inside_chroot, host_path_on_disk)
+    pub fs_mount: Vec<(PathBuf, PathBuf)>,
+
     // Environment
     pub chroot: Option<PathBuf>,
     pub clean_env: bool,
@@ -390,6 +393,7 @@ pub struct PolicyBuilder {
     on_exit: Option<BranchAction>,
     on_error: Option<BranchAction>,
 
+    fs_mount: Vec<(PathBuf, PathBuf)>,
     chroot: Option<PathBuf>,
     clean_env: bool,
     env: HashMap<String, String>,
@@ -596,6 +600,11 @@ impl PolicyBuilder {
         self
     }
 
+    pub fn fs_mount(mut self, virtual_path: impl Into<PathBuf>, host_path: impl Into<PathBuf>) -> Self {
+        self.fs_mount.push((virtual_path.into(), host_path.into()));
+        self
+    }
+
     pub fn clean_env(mut self, v: bool) -> Self {
         self.clean_env = v;
         self
@@ -730,6 +739,7 @@ impl PolicyBuilder {
             max_disk: self.max_disk,
             on_exit: self.on_exit.unwrap_or_default(),
             on_error: self.on_error.unwrap_or_default(),
+            fs_mount: self.fs_mount,
             chroot: self.chroot,
             clean_env: self.clean_env,
             env: self.env,

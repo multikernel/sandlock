@@ -80,6 +80,7 @@ _b_gpu_devices = _builder_fn("sandlock_policy_builder_gpu_devices", ctypes.POINT
 _b_workdir = _builder_fn("sandlock_policy_builder_workdir", ctypes.c_char_p)
 _b_cwd = _builder_fn("sandlock_policy_builder_cwd", ctypes.c_char_p)
 _b_chroot = _builder_fn("sandlock_policy_builder_chroot", ctypes.c_char_p)
+_b_fs_mount = _builder_fn("sandlock_policy_builder_fs_mount", ctypes.c_char_p, ctypes.c_char_p)
 _b_on_exit = _builder_fn("sandlock_policy_builder_on_exit", ctypes.c_uint8)
 _b_on_error = _builder_fn("sandlock_policy_builder_on_error", ctypes.c_uint8)
 _b_max_memory = _builder_fn("sandlock_policy_builder_max_memory", ctypes.c_uint64)
@@ -676,7 +677,7 @@ class _NativePolicy:
     # is Python-side only; no_coredump is a Python convenience alias).
     _HANDLED_FIELDS: set[str] = {
         "fs_writable", "fs_readable", "fs_denied", "fs_storage", "fs_isolation",
-        "workdir", "cwd", "chroot", "on_exit", "on_error",
+        "workdir", "cwd", "chroot", "fs_mount", "on_exit", "on_error",
         "max_memory", "max_disk", "max_processes", "max_cpu", "num_cpus",
         "cpu_cores", "gpu_devices",
         "net_allow_hosts", "net_bind", "net_connect",
@@ -726,6 +727,8 @@ class _NativePolicy:
             b = _b_cwd(b, _encode(str(policy.cwd)))
         if policy.chroot:
             b = _b_chroot(b, _encode(str(policy.chroot)))
+        for vp, hp in (policy.fs_mount or {}).items():
+            b = _b_fs_mount(b, _encode(str(vp)), _encode(str(hp)))
 
         # COW branch actions (0=Commit, 1=Abort, 2=Keep)
         _action_map = {"commit": 0, "abort": 1, "keep": 2}

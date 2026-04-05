@@ -851,6 +851,9 @@ impl Sandbox {
                 chroot_readable: self.policy.fs_readable.clone(),
                 chroot_writable: self.policy.fs_writable.clone(),
                 chroot_denied: self.policy.fs_denied.clone(),
+                chroot_mounts: self.policy.fs_mount.iter().map(|(vp, hp)| {
+                    (vp.clone(), std::fs::canonicalize(hp).unwrap_or_else(|_| hp.clone()))
+                }).collect(),
                 deterministic_dirs: self.policy.deterministic_dirs,
                 hostname: self.policy.hostname.clone(),
                 has_http_acl: !self.policy.http_allow.is_empty() || !self.policy.http_deny.is_empty(),

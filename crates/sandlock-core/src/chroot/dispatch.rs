@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::chroot::resolve::{openat2_in_root, resolve_existing_in_root, resolve_in_root, to_virtual_path};
+use crate::chroot::resolve::{confine, openat2_in_root, resolve_existing_in_root, resolve_in_root, to_virtual_path};
 use crate::procfs::{build_dirent64, DT_DIR, DT_LNK, DT_REG};
 use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction, SupervisorState};
 use crate::sys::structs::{SeccompNotif, SeccompNotifAddfd, SECCOMP_IOCTL_NOTIF_ADDFD};
@@ -26,6 +26,7 @@ pub(crate) struct ChrootCtx<'a> {
     pub readable: &'a [PathBuf],
     pub writable: &'a [PathBuf],
     pub denied: &'a [PathBuf],
+    pub mounts: &'a [(PathBuf, PathBuf)],
 }
 
 impl ChrootCtx<'_> {
@@ -41,6 +42,9 @@ impl ChrootCtx<'_> {
         if self.is_denied(virtual_path) {
             return false;
         }
+        if self.is_mounted(virtual_path) {
+            return true;
+        }
         self.readable.is_empty()
             || self.readable.iter().any(|p| virtual_path.starts_with(p) || p.starts_with(virtual_path))
             || self.writable.iter().any(|p| virtual_path.starts_with(p) || p.starts_with(virtual_path))
@@ -48,8 +52,84 @@ impl ChrootCtx<'_> {
 
     /// Check if `virtual_path` is allowed for writing.
     fn can_write(&self, virtual_path: &Path) -> bool {
-        !self.is_denied(virtual_path)
-            && self.writable.iter().any(|p| virtual_path.starts_with(p))
+        if self.is_denied(virtual_path) {
+            return false;
+        }
+        if self.is_mounted(virtual_path) {
+            return true;
+        }
+        self.writable.iter().any(|p| virtual_path.starts_with(p))
+    }
+
+    /// Check if a virtual path falls under any mount point.
+    fn is_mounted(&self, virtual_path: &Path) -> bool {
+        self.mounts.iter().any(|(vp, _)| virtual_path.starts_with(vp))
+    }
+
+    /// Return (mount_target_dir, sub_path_string) for a virtual path under a mount.
+    /// Uses longest-prefix matching when multiple mounts could match.
+    fn mount_target(&self, virtual_path: &Path) -> Option<(&Path, String)> {
+        let mut best: Option<(&Path, &Path)> = None;
+        for (vp, hp) in self.mounts {
+            if virtual_path.starts_with(vp) {
+                if best.is_none() || vp.as_os_str().len() > best.unwrap().0.as_os_str().len() {
+                    best = Some((vp.as_path(), hp.as_path()));
+                }
+            }
+        }
+        let (mount_vp, mount_hp) = best?;
+        let sub = virtual_path.strip_prefix(mount_vp).ok()?;
+        let sub_str = if sub.as_os_str().is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", sub.to_string_lossy())
+        };
+        Some((mount_hp, sub_str))
+    }
+
+    /// Resolve a virtual path against mounts for paths that may not exist yet (O_CREAT).
+    /// Returns (host_path, virtual_path).
+    fn resolve_mount(&self, virtual_path: &str) -> Option<(PathBuf, PathBuf)> {
+        let confined = confine(virtual_path);
+        let (mount_target, sub_path) = self.mount_target(&confined)?;
+        if let Some(result) = resolve_in_root(mount_target, &sub_path) {
+            let vp = confined;
+            return Some((result.0, vp));
+        }
+        None
+    }
+
+    /// Resolve a virtual path against mounts for paths that must exist.
+    /// Returns (host_path, virtual_path).
+    fn resolve_mount_existing(&self, virtual_path: &str) -> Option<(PathBuf, PathBuf)> {
+        let confined = confine(virtual_path);
+        let (mount_target, sub_path) = self.mount_target(&confined)?;
+        if let Some(result) = resolve_existing_in_root(mount_target, &sub_path) {
+            let vp = confined;
+            return Some((result.0, vp));
+        }
+        None
+    }
+
+    /// Inverse: given a host path, return the virtual path.
+    /// Checks mount targets first, then falls back to chroot root.
+    fn host_to_virtual(&self, host_path: &Path) -> Option<PathBuf> {
+        // Check mounts first (longest prefix match)
+        let mut best: Option<(&Path, &Path, usize)> = None;
+        for (vp, hp) in self.mounts {
+            if host_path.starts_with(hp) {
+                let len = hp.as_os_str().len();
+                if best.is_none() || len > best.unwrap().2 {
+                    best = Some((vp.as_path(), hp.as_path(), len));
+                }
+            }
+        }
+        if let Some((mount_vp, mount_hp, _)) = best {
+            let rel = host_path.strip_prefix(mount_hp).ok()?;
+            return Some(mount_vp.join(rel));
+        }
+        // Fall back to chroot root
+        to_virtual_path(self.root, host_path)
     }
 }
 
@@ -84,7 +164,7 @@ fn build_virtual_path(
     notif: &SeccompNotif,
     dirfd: i64,
     path: &str,
-    chroot_root: &Path,
+    ctx: &ChrootCtx<'_>,
 ) -> Option<String> {
     if Path::new(path).is_absolute() {
         Some(path.to_string())
@@ -95,7 +175,7 @@ fn build_virtual_path(
         } else {
             std::fs::read_link(format!("/proc/{}/fd/{}", notif.pid, dirfd)).ok()?
         };
-        let base_virtual = to_virtual_path(chroot_root, &base_host)?;
+        let base_virtual = ctx.host_to_virtual(&base_host)?;
         let combined = base_virtual.join(path);
         Some(combined.to_string_lossy().to_string())
     }
@@ -105,14 +185,19 @@ fn build_virtual_path(
 ///
 /// Falls back to parent resolution for paths whose final component does not
 /// yet exist (needed for O_CREAT targets).
+/// Checks mounts first — if the virtual path falls under a mount point,
+/// resolution is confined to the mount target directory.
 fn resolve_chroot_path(
     notif: &SeccompNotif,
     dirfd: i64,
     path: &str,
-    chroot_root: &Path,
+    ctx: &ChrootCtx<'_>,
 ) -> Option<(PathBuf, PathBuf)> {
-    let full_path = build_virtual_path(notif, dirfd, path, chroot_root)?;
-    resolve_in_root(chroot_root, &full_path)
+    let full_path = build_virtual_path(notif, dirfd, path, ctx)?;
+    if let Some(result) = ctx.resolve_mount(&full_path) {
+        return Some(result);
+    }
+    resolve_in_root(ctx.root, &full_path)
 }
 
 /// Resolve a child path that must already exist within the chroot.
@@ -120,14 +205,18 @@ fn resolve_chroot_path(
 /// Unlike [`resolve_chroot_path`], this does NOT fall back to parent
 /// resolution, so the returned host path is always fully resolved by the
 /// kernel — no unresolved symlinks that could escape the chroot.
+/// Checks mounts first.
 fn resolve_chroot_path_existing(
     notif: &SeccompNotif,
     dirfd: i64,
     path: &str,
-    chroot_root: &Path,
+    ctx: &ChrootCtx<'_>,
 ) -> Option<(PathBuf, PathBuf)> {
-    let full_path = build_virtual_path(notif, dirfd, path, chroot_root)?;
-    resolve_existing_in_root(chroot_root, &full_path)
+    let full_path = build_virtual_path(notif, dirfd, path, ctx)?;
+    if let Some(result) = ctx.resolve_mount_existing(&full_path) {
+        return Some(result);
+    }
+    resolve_existing_in_root(ctx.root, &full_path)
 }
 
 /// Convert a Path to CString, returning Errno on failure.
@@ -166,7 +255,7 @@ async fn cow_resolve(
 fn read_and_resolve(
     notif: &SeccompNotif,
     notif_fd: RawFd,
-    chroot_root: &Path,
+    ctx: &ChrootCtx<'_>,
     dirfd_idx: usize,
     path_idx: usize,
 ) -> Result<(String, PathBuf, PathBuf), NotifAction> {
@@ -174,7 +263,7 @@ fn read_and_resolve(
         .ok_or(NotifAction::Continue)?;
     let dirfd = notif.data.args[dirfd_idx] as i64;
     let (host_path, virtual_path) =
-        resolve_chroot_path(notif, dirfd, &path, chroot_root).ok_or(NotifAction::Errno(libc::EACCES))?;
+        resolve_chroot_path(notif, dirfd, &path, ctx).ok_or(NotifAction::Errno(libc::EACCES))?;
     Ok((path, host_path, virtual_path))
 }
 
@@ -183,7 +272,7 @@ fn read_and_resolve(
 fn read_and_resolve_existing(
     notif: &SeccompNotif,
     notif_fd: RawFd,
-    chroot_root: &Path,
+    ctx: &ChrootCtx<'_>,
     dirfd_idx: usize,
     path_idx: usize,
 ) -> Result<(String, PathBuf, PathBuf), NotifAction> {
@@ -191,7 +280,7 @@ fn read_and_resolve_existing(
         .ok_or(NotifAction::Continue)?;
     let dirfd = notif.data.args[dirfd_idx] as i64;
     let (host_path, virtual_path) =
-        resolve_chroot_path_existing(notif, dirfd, &path, chroot_root)
+        resolve_chroot_path_existing(notif, dirfd, &path, ctx)
             .ok_or(NotifAction::Errno(libc::ENOENT))?;
     Ok((path, host_path, virtual_path))
 }
@@ -232,7 +321,7 @@ pub(crate) async fn handle_chroot_open(
     };
 
     // Resolve to get the virtual path for access control.
-    let (host_path, virtual_path) = match resolve_chroot_path(notif, dirfd, &rel_path, ctx.root) {
+    let (host_path, virtual_path) = match resolve_chroot_path(notif, dirfd, &rel_path, ctx) {
         Some(r) => r,
         None => return NotifAction::Errno(libc::EACCES),
     };
@@ -283,10 +372,15 @@ pub(crate) async fn handle_chroot_open(
     }
 
     // Open directly via openat2(RESOLVE_IN_ROOT) — single atomic open
-    // confined to the chroot root, no resolve-then-reopen TOCTOU gap.
+    // confined to the chroot root (or mount target), no resolve-then-reopen TOCTOU gap.
     let vp_str = virtual_path.to_string_lossy();
     let mode = if is_write { 0o666 } else { 0 };
-    let fd = match openat2_in_root(ctx.root, &vp_str, flags as i32, mode) {
+    let (resolve_root, resolve_path) = if let Some((mt, sub)) = ctx.mount_target(&virtual_path) {
+        (mt.to_path_buf(), sub)
+    } else {
+        (ctx.root.to_path_buf(), vp_str.to_string())
+    };
+    let fd = match openat2_in_root(&resolve_root, &resolve_path, flags as i32, mode) {
         Ok(fd) => fd,
         Err(errno) => return NotifAction::Errno(errno),
     };
@@ -460,7 +554,7 @@ pub(crate) async fn handle_chroot_exec(
                 Err(_) => return NotifAction::Errno(libc::EACCES),
             }
         };
-        match to_virtual_path(ctx.root, &base_host) {
+        match ctx.host_to_virtual(&base_host) {
             Some(base) => base.join(&rel_path).to_string_lossy().to_string(),
             None => return NotifAction::Errno(libc::EACCES),
         }
@@ -472,10 +566,15 @@ pub(crate) async fn handle_chroot_exec(
     }
 
     // Open the binary directly via openat2(RESOLVE_IN_ROOT). Single atomic
-    // open confined to the chroot root — no resolve-then-reopen TOCTOU gap.
+    // open confined to the chroot root (or mount target) — no resolve-then-reopen TOCTOU gap.
+    let (exec_root, exec_path) = if let Some((mt, sub)) = ctx.mount_target(&virtual_path) {
+        (mt.to_path_buf(), sub)
+    } else {
+        (ctx.root.to_path_buf(), virtual_path.to_string_lossy().to_string())
+    };
     let src_fd = match openat2_in_root(
-        ctx.root,
-        &virtual_path.to_string_lossy(),
+        &exec_root,
+        &exec_path,
         libc::O_RDONLY | libc::O_CLOEXEC,
         0,
     ) {
@@ -489,7 +588,9 @@ pub(crate) async fn handle_chroot_exec(
     // the image's ld-linux (not the host's), avoiding glibc version
     // mismatches between ld.so and libc.so.
     let exec_fd = if let Some((interp_path, interp_offset, interp_cap)) = read_pt_interp(src_fd) {
-        // Open the image's interpreter from the chroot root
+        // Open the image's interpreter from the chroot root (intentionally
+        // NOT mount-aware ��� the dynamic linker should come from the base
+        // image, not from workspace mounts).
         let interp_src = match openat2_in_root(
             ctx.root,
             &interp_path,
@@ -594,7 +695,7 @@ pub(crate) async fn handle_chroot_write(
     let nr = notif.data.nr as i64;
 
     if nr == libc::SYS_unlinkat {
-        let (_, host_path, vp) = match read_and_resolve(notif, notif_fd, ctx.root, 0, 1) {
+        let (_, host_path, vp) = match read_and_resolve(notif, notif_fd, ctx, 0, 1) {
             Ok(r) => r,
             Err(a) => return a,
         };
@@ -617,7 +718,7 @@ pub(crate) async fn handle_chroot_write(
     }
 
     if nr == libc::SYS_mkdirat {
-        let (_, host_path, vp) = match read_and_resolve(notif, notif_fd, ctx.root, 0, 1) {
+        let (_, host_path, vp) = match read_and_resolve(notif, notif_fd, ctx, 0, 1) {
             Ok(r) => r,
             Err(a) => return a,
         };
@@ -649,11 +750,11 @@ pub(crate) async fn handle_chroot_write(
             Some(p) => p,
             None => return NotifAction::Continue,
         };
-        let (old_host, old_vp) = match resolve_chroot_path(notif, notif.data.args[0] as i64, &old_path, ctx.root) {
+        let (old_host, old_vp) = match resolve_chroot_path(notif, notif.data.args[0] as i64, &old_path, ctx) {
             Some(r) => r,
             None => return NotifAction::Errno(libc::EACCES),
         };
-        let (new_host, new_vp) = match resolve_chroot_path(notif, notif.data.args[2] as i64, &new_path, ctx.root) {
+        let (new_host, new_vp) = match resolve_chroot_path(notif, notif.data.args[2] as i64, &new_path, ctx) {
             Some(r) => r,
             None => return NotifAction::Errno(libc::EACCES),
         };
@@ -694,7 +795,7 @@ pub(crate) async fn handle_chroot_write(
             Some(p) => p,
             None => return NotifAction::Continue,
         };
-        let (host_link, link_vp) = match resolve_chroot_path(notif, notif.data.args[1] as i64, &linkpath, ctx.root) {
+        let (host_link, link_vp) = match resolve_chroot_path(notif, notif.data.args[1] as i64, &linkpath, ctx) {
             Some(r) => r,
             None => return NotifAction::Errno(libc::EACCES),
         };
@@ -733,11 +834,11 @@ pub(crate) async fn handle_chroot_write(
             Some(p) => p,
             None => return NotifAction::Continue,
         };
-        let (old_host, _) = match resolve_chroot_path(notif, notif.data.args[0] as i64, &old_path, ctx.root) {
+        let (old_host, _) = match resolve_chroot_path(notif, notif.data.args[0] as i64, &old_path, ctx) {
             Some(r) => r,
             None => return NotifAction::Errno(libc::EACCES),
         };
-        let (new_host, new_vp) = match resolve_chroot_path(notif, notif.data.args[2] as i64, &new_path, ctx.root) {
+        let (new_host, new_vp) = match resolve_chroot_path(notif, notif.data.args[2] as i64, &new_path, ctx) {
             Some(r) => r,
             None => return NotifAction::Errno(libc::EACCES),
         };
@@ -768,7 +869,7 @@ pub(crate) async fn handle_chroot_write(
     }
 
     if nr == libc::SYS_fchmodat {
-        let (_, host_path, vp) = match read_and_resolve(notif, notif_fd, ctx.root, 0, 1) {
+        let (_, host_path, vp) = match read_and_resolve(notif, notif_fd, ctx, 0, 1) {
             Ok(r) => r,
             Err(a) => return a,
         };
@@ -792,7 +893,7 @@ pub(crate) async fn handle_chroot_write(
     }
 
     if nr == libc::SYS_fchownat {
-        let (_, host_path, vp) = match read_and_resolve(notif, notif_fd, ctx.root, 0, 1) {
+        let (_, host_path, vp) = match read_and_resolve(notif, notif_fd, ctx, 0, 1) {
             Ok(r) => r,
             Err(a) => return a,
         };
@@ -821,10 +922,11 @@ pub(crate) async fn handle_chroot_write(
             Some(p) => p,
             None => return NotifAction::Continue,
         };
-        let (host_path, _) = match resolve_chroot_path(notif, libc::AT_FDCWD as i64, &path, ctx.root) {
+        let (host_path, vp) = match resolve_chroot_path(notif, libc::AT_FDCWD as i64, &path, ctx) {
             Some(r) => r,
             None => return NotifAction::Errno(libc::EACCES),
         };
+        if !ctx.can_write(&vp) { return NotifAction::Errno(libc::EACCES); }
         let length = notif.data.args[1] as i64;
 
         {
@@ -902,7 +1004,7 @@ pub(crate) async fn handle_chroot_stat(
         return NotifAction::Continue;
     }
 
-    let (_, host_path, vp) = match read_and_resolve_existing(notif, notif_fd, ctx.root, 0, 1) {
+    let (_, host_path, vp) = match read_and_resolve_existing(notif, notif_fd, ctx, 0, 1) {
         Ok(r) => r,
         Err(a) => return a,
     };
@@ -950,7 +1052,7 @@ pub(crate) async fn handle_chroot_statx(
         _ => return NotifAction::Continue,
     };
 
-    let (host_path, vp) = match resolve_chroot_path_existing(notif, dirfd, &path, ctx.root) {
+    let (host_path, vp) = match resolve_chroot_path_existing(notif, dirfd, &path, ctx) {
         Some(r) => r,
         None => return NotifAction::Errno(libc::ENOENT),
     };
@@ -1022,7 +1124,7 @@ pub(crate) async fn handle_chroot_readlink(
         drop(st);
         // Fallback: strip chroot prefix from /proc/{pid}/exe
         if let Ok(real_exe) = std::fs::read_link(format!("/proc/{}/exe", notif.pid)) {
-            let virtual_exe = to_virtual_path(ctx.root, &real_exe).unwrap_or(real_exe);
+            let virtual_exe = ctx.host_to_virtual(&real_exe).unwrap_or(real_exe);
             let s = virtual_exe.to_string_lossy();
             return write_target(s.as_bytes());
         }
@@ -1047,7 +1149,7 @@ pub(crate) async fn handle_chroot_readlink(
                 Err(_) => return NotifAction::Errno(libc::EACCES),
             }
         };
-        let base_virtual = match to_virtual_path(ctx.root, &base_host) {
+        let base_virtual = match ctx.host_to_virtual(&base_host) {
             Some(p) => p,
             None => return NotifAction::Errno(libc::EACCES),
         };
@@ -1059,9 +1161,19 @@ pub(crate) async fn handle_chroot_readlink(
         None => return NotifAction::Errno(libc::EINVAL),
     };
     let parent = confined.parent().unwrap_or(Path::new("/"));
-    let (parent_host, _) = match resolve_in_root(ctx.root, parent.to_str().unwrap_or("/")) {
-        Some(r) => r,
-        None => return NotifAction::Errno(libc::EACCES),
+
+    // Check mount first for parent resolution
+    let parent_str = parent.to_str().unwrap_or("/");
+    let parent_host = if let Some((mt, sub)) = ctx.mount_target(parent) {
+        match resolve_in_root(mt, &sub) {
+            Some((hp, _)) => hp,
+            None => return NotifAction::Errno(libc::EACCES),
+        }
+    } else {
+        match resolve_in_root(ctx.root, parent_str) {
+            Some((hp, _)) => hp,
+            None => return NotifAction::Errno(libc::EACCES),
+        }
     };
     let host_path = parent_host.join(&file_name);
 
@@ -1086,9 +1198,9 @@ pub(crate) async fn handle_chroot_readlink(
         Err(_) => return NotifAction::Errno(libc::ENOENT),
     };
 
-    // Strip chroot prefix from absolute targets
+    // Strip chroot/mount prefix from absolute targets
     let display = if target.is_absolute() {
-        to_virtual_path(ctx.root, &target).unwrap_or(target)
+        ctx.host_to_virtual(&target).unwrap_or(target)
     } else {
         target
     };
@@ -1116,7 +1228,7 @@ pub(crate) async fn handle_chroot_getdents(
         Err(_) => return NotifAction::Continue,
     };
 
-    let host_dir = if to_virtual_path(ctx.root, &target).is_some() {
+    let host_dir = if ctx.host_to_virtual(&target).is_some() {
         target
     } else {
         return NotifAction::Continue;
@@ -1209,7 +1321,7 @@ pub(crate) async fn handle_chroot_chdir(
         path
     } else {
         match std::fs::read_link(format!("/proc/{}/cwd", notif.pid)) {
-            Ok(cwd) => match to_virtual_path(ctx.root, &cwd) {
+            Ok(cwd) => match ctx.host_to_virtual(&cwd) {
                 Some(base) => base.join(&path).to_string_lossy().to_string(),
                 None => return NotifAction::Errno(libc::EACCES),
             },
@@ -1217,10 +1329,16 @@ pub(crate) async fn handle_chroot_chdir(
         }
     };
 
-    // Open directly via openat2(RESOLVE_IN_ROOT).
+    // Open directly via openat2(RESOLVE_IN_ROOT), routing to mount target if applicable.
+    let confined = confine(&full_path);
+    let (chdir_root, chdir_path) = if let Some((mt, sub)) = ctx.mount_target(&confined) {
+        (mt.to_path_buf(), sub)
+    } else {
+        (ctx.root.to_path_buf(), full_path.clone())
+    };
     let src_fd = match openat2_in_root(
-        ctx.root,
-        &full_path,
+        &chdir_root,
+        &chdir_path,
         libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
         0,
     ) {
@@ -1275,7 +1393,7 @@ pub(crate) async fn handle_chroot_getcwd(
         Err(_) => return NotifAction::Continue,
     };
 
-    let virtual_cwd = to_virtual_path(ctx.root, &cwd).unwrap_or_else(|| PathBuf::from("/"));
+    let virtual_cwd = ctx.host_to_virtual(&cwd).unwrap_or_else(|| PathBuf::from("/"));
     let cwd_str = virtual_cwd.to_string_lossy();
     let cwd_bytes = cwd_str.as_bytes();
 
@@ -1309,7 +1427,7 @@ pub(crate) async fn handle_chroot_statfs(
         None => return NotifAction::Continue,
     };
 
-    let (host_path, _) = match resolve_chroot_path_existing(notif, libc::AT_FDCWD as i64, &path, ctx.root) {
+    let (host_path, _) = match resolve_chroot_path_existing(notif, libc::AT_FDCWD as i64, &path, ctx) {
         Some(r) => r,
         None => return NotifAction::Errno(libc::ENOENT),
     };
@@ -1359,7 +1477,7 @@ pub(crate) async fn handle_chroot_utimensat(
         None => return NotifAction::Continue,
     };
 
-    let (host_path, vp) = match resolve_chroot_path(notif, dirfd, &path, ctx.root) {
+    let (host_path, vp) = match resolve_chroot_path(notif, dirfd, &path, ctx) {
         Some(r) => r,
         None => return NotifAction::Errno(libc::EACCES),
     };

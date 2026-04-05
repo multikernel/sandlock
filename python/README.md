@@ -55,6 +55,8 @@ Unset fields mean "no restriction" unless noted otherwise.
 | `fs_denied` | `list[str]` | `[]` | Paths explicitly denied |
 | `workdir` | `str \| None` | `None` | Working directory; enables COW protection |
 | `chroot` | `str \| None` | `None` | Path to chroot into before confinement |
+| `fs_mount` | `dict[str, str]` | `{}` | Map virtual paths to host directories inside chroot |
+| `cwd` | `str \| None` | `None` | Child working directory |
 
 #### Network
 
@@ -96,6 +98,36 @@ policy = Policy(
     http_deny=["* */admin/*"],
 )
 result = Sandbox(policy).run(["python3", "agent.py"])
+```
+
+#### Chroot with mount mapping
+
+Map host directories into a chroot — like Docker's `-v /host:/container`
+but without kernel bind mounts or root privileges. Each sandbox gets its
+own persistent workspace while sharing a read-only rootfs.
+
+```python
+policy = Policy(
+    chroot="/opt/rootfs",
+    fs_mount={"/work": "/tmp/sandbox-1/work"},
+    fs_readable=["/usr", "/bin", "/lib", "/etc"],
+    cwd="/work",
+)
+result = Sandbox(policy).run(["python3", "task.py"])
+```
+
+Combine with `workdir` + `max_disk` for quota-enforced writes:
+
+```python
+policy = Policy(
+    chroot="/opt/rootfs",
+    fs_mount={"/work": "/tmp/sandbox-1/work"},
+    workdir="/tmp/sandbox-1/work",
+    fs_storage="/tmp/sandbox-1/cow",
+    max_disk="100M",
+    on_exit="commit",
+    fs_readable=["/usr", "/bin", "/lib", "/etc"],
+)
 ```
 
 #### IPC and process isolation

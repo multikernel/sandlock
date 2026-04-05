@@ -230,6 +230,8 @@ pub struct NotifPolicy {
     pub chroot_writable: Vec<std::path::PathBuf>,
     /// Virtual paths explicitly denied under chroot.
     pub chroot_denied: Vec<std::path::PathBuf>,
+    /// Mount mappings: (virtual_path, host_path) pairs.
+    pub chroot_mounts: Vec<(std::path::PathBuf, std::path::PathBuf)>,
     pub deterministic_dirs: bool,
     pub hostname: Option<String>,
     pub has_http_acl: bool,
@@ -553,6 +555,7 @@ async fn dispatch(
             readable: &policy.chroot_readable,
             writable: &policy.chroot_writable,
             denied: &policy.chroot_denied,
+            mounts: &policy.chroot_mounts,
         };
         if nr == libc::SYS_openat {
             let action = crate::chroot::dispatch::handle_chroot_open(notif, state, notif_fd, &ctx).await;
