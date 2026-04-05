@@ -146,6 +146,23 @@ impl HttpHandler for AclHandler {
         }
 
         if http_acl_check(&self.allow_rules, &self.deny_rules, &method, &host, &path) {
+            // For transparent proxying, the client sends relative URIs
+            // (e.g. "GET /path"). hudsucker needs an absolute URI to know
+            // where to forward. Reconstruct it from the Host header.
+            let mut req = req;
+            if req.uri().authority().is_none() {
+                let host_port = req
+                    .headers()
+                    .get("host")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                if !host_port.is_empty() {
+                    if let Ok(uri) = format!("http://{}{}", host_port, req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/")).parse() {
+                        *req.uri_mut() = uri;
+                    }
+                }
+            }
             req.into()
         } else {
             Response::builder()
