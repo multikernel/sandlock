@@ -101,7 +101,13 @@ impl HttpRule {
 
         let (host, path) = if let Some(pos) = rest.find('/') {
             let (h, p) = rest.split_at(pos);
-            (h.to_string(), p.to_string())
+            // Normalize the rule path, but preserve trailing * for glob matching.
+            let has_wildcard = p.ends_with('*');
+            let mut normalized = normalize_path(p);
+            if has_wildcard && !normalized.ends_with('*') {
+                normalized.push('*');
+            }
+            (h.to_string(), normalized)
         } else {
             (rest.to_string(), "/*".to_string())
         };
@@ -114,6 +120,8 @@ impl HttpRule {
     }
 
     /// Check whether this rule matches the given request parameters.
+    /// The request path is normalized before matching to prevent bypasses
+    /// via `//`, `/../`, `/.`, or percent-encoding.
     pub fn matches(&self, method: &str, host: &str, path: &str) -> bool {
         // Method match
         if self.method != "*" && !self.method.eq_ignore_ascii_case(method) {
@@ -123,9 +131,63 @@ impl HttpRule {
         if self.host != "*" && !self.host.eq_ignore_ascii_case(host) {
             return false;
         }
-        // Path match
-        prefix_or_exact_match(&self.path, path)
+        // Path match — normalize to prevent encoding/traversal bypasses
+        let normalized = normalize_path(path);
+        prefix_or_exact_match(&self.path, &normalized)
     }
+}
+
+/// Normalize an HTTP path to prevent ACL bypasses via encoding tricks.
+///
+/// - Decodes percent-encoded characters (e.g. `%2F` → `/`, `%61` → `a`)
+/// - Collapses duplicate slashes (`//` → `/`)
+/// - Resolves `.` and `..` segments
+/// - Ensures the path starts with `/`
+pub fn normalize_path(path: &str) -> String {
+    // 1. Percent-decode
+    let mut decoded = String::with_capacity(path.len());
+    let mut chars = path.bytes();
+    while let Some(b) = chars.next() {
+        if b == b'%' {
+            let hi = chars.next();
+            let lo = chars.next();
+            if let (Some(h), Some(l)) = (hi, lo) {
+                let hex = [h, l];
+                if let Ok(s) = std::str::from_utf8(&hex) {
+                    if let Ok(val) = u8::from_str_radix(s, 16) {
+                        decoded.push(val as char);
+                        continue;
+                    }
+                }
+                // Malformed percent encoding — keep as-is
+                decoded.push(b as char);
+                decoded.push(h as char);
+                decoded.push(l as char);
+            } else {
+                decoded.push(b as char);
+            }
+        } else {
+            decoded.push(b as char);
+        }
+    }
+
+    // 2. Split into segments, resolve . and .., skip empty segments (collapses //)
+    let mut segments: Vec<&str> = Vec::new();
+    for seg in decoded.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            s => segments.push(s),
+        }
+    }
+
+    // 3. Reconstruct with leading /
+    let mut result = String::with_capacity(decoded.len());
+    result.push('/');
+    result.push_str(&segments.join("/"));
+    result
 }
 
 /// Simple prefix or exact matching for paths. Supports trailing `*` as a prefix match.
@@ -885,5 +947,93 @@ mod http_rule_tests {
             .unwrap();
         assert!(policy.https_ca.is_some());
         assert!(policy.https_key.is_some());
+    }
+
+    // --- normalize_path tests ---
+
+    #[test]
+    fn normalize_path_basic() {
+        assert_eq!(normalize_path("/foo/bar"), "/foo/bar");
+        assert_eq!(normalize_path("/"), "/");
+    }
+
+    #[test]
+    fn normalize_path_double_slashes() {
+        assert_eq!(normalize_path("/foo//bar"), "/foo/bar");
+        assert_eq!(normalize_path("//foo///bar//"), "/foo/bar");
+    }
+
+    #[test]
+    fn normalize_path_dot_segments() {
+        assert_eq!(normalize_path("/foo/./bar"), "/foo/bar");
+        assert_eq!(normalize_path("/foo/../bar"), "/bar");
+        assert_eq!(normalize_path("/foo/bar/../../baz"), "/baz");
+    }
+
+    #[test]
+    fn normalize_path_dotdot_at_root() {
+        assert_eq!(normalize_path("/../foo"), "/foo");
+        assert_eq!(normalize_path("/../../foo"), "/foo");
+    }
+
+    #[test]
+    fn normalize_path_percent_encoding() {
+        // %2F = /, %61 = a
+        assert_eq!(normalize_path("/foo%2Fbar"), "/foo/bar");
+        assert_eq!(normalize_path("/%61dmin/settings"), "/admin/settings");
+    }
+
+    #[test]
+    fn normalize_path_mixed_bypass_attempts() {
+        // Double-encoded traversal
+        assert_eq!(normalize_path("/v1/./admin/settings"), "/v1/admin/settings");
+        assert_eq!(normalize_path("/v1/../admin/settings"), "/admin/settings");
+        assert_eq!(normalize_path("/v1//admin/settings"), "/v1/admin/settings");
+        assert_eq!(normalize_path("/v1/%2e%2e/admin"), "/admin");
+    }
+
+    // --- ACL bypass prevention tests ---
+
+    #[test]
+    fn acl_deny_prevents_double_slash_bypass() {
+        let deny = vec![HttpRule::parse("* */admin/*").unwrap()];
+        // These should all be caught by the deny rule
+        assert!(!http_acl_check(&[], &deny, "GET", "example.com", "/admin/settings"));
+        assert!(!http_acl_check(&[], &deny, "GET", "example.com", "//admin/settings"));
+        assert!(!http_acl_check(&[], &deny, "GET", "example.com", "/admin//settings"));
+    }
+
+    #[test]
+    fn acl_deny_prevents_dot_segment_bypass() {
+        let deny = vec![HttpRule::parse("* */admin/*").unwrap()];
+        assert!(!http_acl_check(&[], &deny, "GET", "example.com", "/./admin/settings"));
+        assert!(!http_acl_check(&[], &deny, "GET", "example.com", "/public/../admin/settings"));
+    }
+
+    #[test]
+    fn acl_deny_prevents_percent_encoding_bypass() {
+        let deny = vec![HttpRule::parse("* */admin/*").unwrap()];
+        // %61dmin = admin
+        assert!(!http_acl_check(&[], &deny, "GET", "example.com", "/%61dmin/settings"));
+    }
+
+    #[test]
+    fn acl_allow_normalized_path_still_works() {
+        let allow = vec![HttpRule::parse("GET example.com/v1/models").unwrap()];
+        assert!(http_acl_check(&allow, &[], "GET", "example.com", "/v1/models"));
+        assert!(http_acl_check(&allow, &[], "GET", "example.com", "/v1/./models"));
+        assert!(http_acl_check(&allow, &[], "GET", "example.com", "/v1//models"));
+        // These resolve to different paths and should be denied
+        assert!(!http_acl_check(&allow, &[], "GET", "example.com", "/v1/models/extra"));
+        assert!(!http_acl_check(&allow, &[], "GET", "example.com", "/v2/models"));
+    }
+
+    #[test]
+    fn parse_normalizes_rule_path() {
+        let rule = HttpRule::parse("GET example.com/v1/./models/*").unwrap();
+        assert_eq!(rule.path, "/v1/models/*");
+
+        let rule = HttpRule::parse("GET example.com/v1//models").unwrap();
+        assert_eq!(rule.path, "/v1/models");
     }
 }
