@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::chroot::resolve::{openat2_in_root, resolve_in_root, to_virtual_path};
+use crate::chroot::resolve::{openat2_in_root, resolve_existing_in_root, resolve_in_root, to_virtual_path};
 use crate::procfs::{build_dirent64, DT_DIR, DT_LNK, DT_REG};
 use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction, SupervisorState};
 use crate::sys::structs::{SeccompNotif, SeccompNotifAddfd, SECCOMP_IOCTL_NOTIF_ADDFD};
@@ -79,18 +79,15 @@ fn read_path(notif: &SeccompNotif, addr: u64, notif_fd: RawFd) -> Option<String>
     String::from_utf8(result).ok()
 }
 
-/// Resolve a child path to (host_path, virtual_path) within the chroot.
-///
-/// Uses `openat2(RESOLVE_IN_ROOT)` for kernel-based symlink resolution,
-/// falling back to manual resolution on older kernels.
-fn resolve_chroot_path(
+/// Build the full virtual path from dirfd + relative path.
+fn build_virtual_path(
     notif: &SeccompNotif,
     dirfd: i64,
     path: &str,
-    chroot_root: &Path, // kept as bare Path for internal use
-) -> Option<(PathBuf, PathBuf)> {
-    let full_path = if Path::new(path).is_absolute() {
-        path.to_string()
+    chroot_root: &Path,
+) -> Option<String> {
+    if Path::new(path).is_absolute() {
+        Some(path.to_string())
     } else {
         let dirfd32 = dirfd as i32;
         let base_host = if dirfd32 == libc::AT_FDCWD {
@@ -100,9 +97,37 @@ fn resolve_chroot_path(
         };
         let base_virtual = to_virtual_path(chroot_root, &base_host)?;
         let combined = base_virtual.join(path);
-        combined.to_string_lossy().to_string()
-    };
+        Some(combined.to_string_lossy().to_string())
+    }
+}
+
+/// Resolve a child path to (host_path, virtual_path) within the chroot.
+///
+/// Falls back to parent resolution for paths whose final component does not
+/// yet exist (needed for O_CREAT targets).
+fn resolve_chroot_path(
+    notif: &SeccompNotif,
+    dirfd: i64,
+    path: &str,
+    chroot_root: &Path,
+) -> Option<(PathBuf, PathBuf)> {
+    let full_path = build_virtual_path(notif, dirfd, path, chroot_root)?;
     resolve_in_root(chroot_root, &full_path)
+}
+
+/// Resolve a child path that must already exist within the chroot.
+///
+/// Unlike [`resolve_chroot_path`], this does NOT fall back to parent
+/// resolution, so the returned host path is always fully resolved by the
+/// kernel — no unresolved symlinks that could escape the chroot.
+fn resolve_chroot_path_existing(
+    notif: &SeccompNotif,
+    dirfd: i64,
+    path: &str,
+    chroot_root: &Path,
+) -> Option<(PathBuf, PathBuf)> {
+    let full_path = build_virtual_path(notif, dirfd, path, chroot_root)?;
+    resolve_existing_in_root(chroot_root, &full_path)
 }
 
 /// Convert a Path to CString, returning Errno on failure.
@@ -136,12 +161,12 @@ async fn cow_resolve(
 }
 
 /// Read path arg at `arg_idx`, resolve chroot path using dirfd at `dirfd_idx`.
-/// Returns (path_string, host_path) or an appropriate NotifAction.
+/// Falls back to parent resolution for O_CREAT targets.
 /// Returns (path_string, host_path, virtual_path).
 fn read_and_resolve(
     notif: &SeccompNotif,
     notif_fd: RawFd,
-    chroot_root: &Path, // kept as bare Path for internal use
+    chroot_root: &Path,
     dirfd_idx: usize,
     path_idx: usize,
 ) -> Result<(String, PathBuf, PathBuf), NotifAction> {
@@ -150,6 +175,24 @@ fn read_and_resolve(
     let dirfd = notif.data.args[dirfd_idx] as i64;
     let (host_path, virtual_path) =
         resolve_chroot_path(notif, dirfd, &path, chroot_root).ok_or(NotifAction::Errno(libc::EACCES))?;
+    Ok((path, host_path, virtual_path))
+}
+
+/// Like [`read_and_resolve`] but requires the path to already exist.
+/// Returns a fully kernel-resolved host path with no unresolved symlinks.
+fn read_and_resolve_existing(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+    chroot_root: &Path,
+    dirfd_idx: usize,
+    path_idx: usize,
+) -> Result<(String, PathBuf, PathBuf), NotifAction> {
+    let path = read_path(notif, notif.data.args[path_idx], notif_fd)
+        .ok_or(NotifAction::Continue)?;
+    let dirfd = notif.data.args[dirfd_idx] as i64;
+    let (host_path, virtual_path) =
+        resolve_chroot_path_existing(notif, dirfd, &path, chroot_root)
+            .ok_or(NotifAction::Errno(libc::ENOENT))?;
     Ok((path, host_path, virtual_path))
 }
 
@@ -859,7 +902,7 @@ pub(crate) async fn handle_chroot_stat(
         return NotifAction::Continue;
     }
 
-    let (_, host_path, vp) = match read_and_resolve(notif, notif_fd, ctx.root, 0, 1) {
+    let (_, host_path, vp) = match read_and_resolve_existing(notif, notif_fd, ctx.root, 0, 1) {
         Ok(r) => r,
         Err(a) => return a,
     };
@@ -907,9 +950,9 @@ pub(crate) async fn handle_chroot_statx(
         _ => return NotifAction::Continue,
     };
 
-    let (host_path, vp) = match resolve_chroot_path(notif, dirfd, &path, ctx.root) {
+    let (host_path, vp) = match resolve_chroot_path_existing(notif, dirfd, &path, ctx.root) {
         Some(r) => r,
-        None => return NotifAction::Errno(libc::EACCES),
+        None => return NotifAction::Errno(libc::ENOENT),
     };
     if !ctx.can_read(&vp) { return NotifAction::Errno(libc::EACCES); }
 
@@ -1266,9 +1309,9 @@ pub(crate) async fn handle_chroot_statfs(
         None => return NotifAction::Continue,
     };
 
-    let (host_path, _) = match resolve_chroot_path(notif, libc::AT_FDCWD as i64, &path, ctx.root) {
+    let (host_path, _) = match resolve_chroot_path_existing(notif, libc::AT_FDCWD as i64, &path, ctx.root) {
         Some(r) => r,
-        None => return NotifAction::Errno(libc::EACCES),
+        None => return NotifAction::Errno(libc::ENOENT),
     };
 
     let c_path = match path_cstr(&host_path, libc::ENOENT) {

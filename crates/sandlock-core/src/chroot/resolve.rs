@@ -127,27 +127,13 @@ pub fn openat2_in_root(
 /// Self-referential symlinks (e.g. `rootfs/bin → /bin`) return `ELOOP` and
 /// are treated as resolution failures — such rootfs layouts are unsupported.
 pub fn resolve_in_root(chroot_root: &Path, child_path: &str) -> Option<(PathBuf, PathBuf)> {
-    // Try resolving the full path.
-    match openat2_in_root(
-        chroot_root,
-        child_path,
-        libc::O_PATH | libc::O_CLOEXEC,
-        0,
-    ) {
-        Ok(fd) => {
-            let host_path = std::fs::read_link(format!("/proc/self/fd/{}", fd)).ok();
-            unsafe { libc::close(fd) };
-            let host_path = host_path?;
-            let virtual_path = to_virtual_path(chroot_root, &host_path)?;
-            return Some((host_path, virtual_path));
-        }
-        Err(libc::ENOENT) | Err(libc::ENOTDIR) => {
-            // Final component doesn't exist — resolve the parent instead.
-        }
-        Err(_) => return None,
+    if let Some(result) = resolve_existing_in_root(chroot_root, child_path) {
+        return Some(result);
     }
 
-    // Resolve parent directory, then append the missing filename.
+    // Full path doesn't exist — resolve parent directory and append the
+    // missing filename.  This is needed for O_CREAT targets where the
+    // final component will be created.
     let confined = confine(child_path);
     let file_name = confined.file_name()?;
     let parent = confined.parent().unwrap_or(Path::new("/"));
@@ -165,6 +151,33 @@ pub fn resolve_in_root(chroot_root: &Path, child_path: &str) -> Option<(PathBuf,
             let host_path = parent_host.join(file_name);
             let parent_virtual = to_virtual_path(chroot_root, &parent_host)?;
             let virtual_path = parent_virtual.join(file_name);
+            Some((host_path, virtual_path))
+        }
+        Err(_) => None,
+    }
+}
+
+/// Resolve a virtual path that must already exist within the chroot.
+///
+/// Unlike [`resolve_in_root`], this does NOT fall back to parent resolution
+/// when the path doesn't exist. The kernel resolves all symlinks confined to
+/// `chroot_root`, so the returned host path is always fully resolved — no
+/// dangling symlinks that could escape the chroot when followed by the host.
+///
+/// Use this for read-only lookups (stat, access, readlink) where the file
+/// must already exist.
+pub fn resolve_existing_in_root(chroot_root: &Path, child_path: &str) -> Option<(PathBuf, PathBuf)> {
+    match openat2_in_root(
+        chroot_root,
+        child_path,
+        libc::O_PATH | libc::O_CLOEXEC,
+        0,
+    ) {
+        Ok(fd) => {
+            let host_path = std::fs::read_link(format!("/proc/self/fd/{}", fd)).ok();
+            unsafe { libc::close(fd) };
+            let host_path = host_path?;
+            let virtual_path = to_virtual_path(chroot_root, &host_path)?;
             Some((host_path, virtual_path))
         }
         Err(_) => None,
@@ -377,5 +390,66 @@ mod tests {
         let (host, virt) = result.unwrap();
         assert_eq!(virt, PathBuf::from("/"));
         assert_eq!(host, root);
+    }
+
+    #[test]
+    fn test_resolve_existing_follows_symlink() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("usr/local/bin")).unwrap();
+        std::fs::write(root.join("usr/local/bin/python3.12"), "binary").unwrap();
+        symlink("python3.12", root.join("usr/local/bin/python3")).unwrap();
+
+        // resolve_existing_in_root should follow the symlink and return
+        // the resolved target path, not the symlink itself.
+        let result = resolve_existing_in_root(root, "/usr/local/bin/python3");
+        match result {
+            Some((host, virt)) => {
+                assert!(host.starts_with(root));
+                assert!(host.ends_with("python3.12"),
+                    "host path should be resolved through symlink: {:?}", host);
+                assert_eq!(virt, PathBuf::from("/usr/local/bin/python3.12"));
+            }
+            None => {
+                // openat2 not available on this kernel — skip
+            }
+        }
+    }
+
+    #[test]
+    fn test_resolve_existing_absolute_symlink_confined() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("usr/bin")).unwrap();
+        std::fs::write(root.join("usr/bin/python3.12"), "binary").unwrap();
+        std::fs::create_dir_all(root.join("usr/local/bin")).unwrap();
+        // Absolute symlink — must stay confined to chroot root.
+        symlink("/usr/bin/python3.12", root.join("usr/local/bin/python3")).unwrap();
+
+        let result = resolve_existing_in_root(root, "/usr/local/bin/python3");
+        match result {
+            Some((host, virt)) => {
+                assert!(host.starts_with(root),
+                    "absolute symlink must not escape chroot: {:?}", host);
+                assert!(host.ends_with("usr/bin/python3.12"));
+                assert_eq!(virt, PathBuf::from("/usr/bin/python3.12"));
+            }
+            None => {
+                // openat2 not available — skip
+            }
+        }
+    }
+
+    #[test]
+    fn test_resolve_existing_returns_none_for_missing() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("usr/bin")).unwrap();
+
+        let result = resolve_existing_in_root(root, "/usr/bin/nonexistent");
+        // openat2 may not be available, but if it is, missing file → None
+        if resolve_existing_in_root(root, "/usr/bin").is_some() {
+            assert!(result.is_none());
+        }
     }
 }
