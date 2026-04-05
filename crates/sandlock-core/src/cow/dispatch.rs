@@ -469,8 +469,13 @@ pub(crate) async fn handle_cow_getdents(
         return NotifAction::Continue;
     }
 
-    // Build cache on first call
+    // Build cache on first call; invalidate if fd was reused for a different dir.
     let cache_key = (pid as i32, child_fd);
+    if let Some((cached_target, _)) = st.cow_dir_cache.get(&cache_key) {
+        if *cached_target != target {
+            st.cow_dir_cache.remove(&cache_key);
+        }
+    }
     if !st.cow_dir_cache.contains_key(&cache_key) {
         let cow = st.cow_branch.as_ref().unwrap();
         let workdir_str = cow.workdir_str();
@@ -511,11 +516,11 @@ pub(crate) async fn handle_cow_getdents(
                 .unwrap_or(0);
             entries.push(build_dirent64(d_ino, d_off, d_type, name));
         }
-        st.cow_dir_cache.insert(cache_key, entries);
+        st.cow_dir_cache.insert(cache_key, (target.clone(), entries));
     }
 
     let entries = match st.cow_dir_cache.get_mut(&cache_key) {
-        Some(e) => e,
+        Some((_, e)) => e,
         None => return NotifAction::Continue,
     };
 

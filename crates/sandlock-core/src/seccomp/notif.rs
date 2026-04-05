@@ -84,7 +84,8 @@ pub struct SupervisorState {
     /// Seccomp-based COW branch (None if COW disabled).
     pub cow_branch: Option<crate::cow::seccomp::SeccompCowBranch>,
     /// Getdents cache for COW directories.
-    pub cow_dir_cache: HashMap<(i32, u32), Vec<Vec<u8>>>,
+    /// Value is (host_path, entries) to detect fd reuse and invalidate stale entries.
+    pub cow_dir_cache: HashMap<(i32, u32), (String, Vec<Vec<u8>>)>,
     /// pidfd for the child process (for pidfd_getfd on-behalf syscalls).
     pub child_pidfd: Option<RawFd>,
     /// Event sender for dynamic policy callback (None if no policy_fn).
