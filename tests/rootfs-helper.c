@@ -101,6 +101,25 @@ static int cmd_stat(int argc, char **argv) {
     return 0;
 }
 
+/* ── fstat-fd: open a file, then fstat the fd (AT_EMPTY_PATH) ── */
+static int cmd_fstat_fd(int argc, char **argv) {
+    if (argc < 1) { fprintf(stderr, "fstat-fd: missing operand\n"); return 1; }
+    int fd = open(argv[0], O_RDONLY);
+    if (fd < 0) {
+        printf("ERR open %d\n", errno);
+        return 1;
+    }
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        printf("ERR fstat %d\n", errno);
+        close(fd);
+        return 1;
+    }
+    close(fd);
+    printf("OK size=%ld ino=%ld\n", (long)st.st_size, (long)st.st_ino);
+    return 0;
+}
+
 /* ── mkdir ──────────────────────────────────────────────────── */
 static int cmd_mkdir(int argc, char **argv) {
     if (argc < 1) { fprintf(stderr, "mkdir: missing operand\n"); return 1; }
@@ -362,6 +381,7 @@ static int dispatch(const char *cmd, int argc, char **argv) {
         return 1;
     }
     if (strcmp(cmd, "access") == 0)         return cmd_access(argc, argv);
+    if (strcmp(cmd, "fstat-fd") == 0)      return cmd_fstat_fd(argc, argv);
     if (strcmp(cmd, "true") == 0)           return 0;
     if (strcmp(cmd, "false") == 0)          return 1;
 

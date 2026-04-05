@@ -850,6 +850,15 @@ pub(crate) async fn handle_chroot_stat(
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
     let nr = notif.data.nr as i64;
+    let flags = notif.data.args[3];
+
+    // AT_EMPTY_PATH: fstat(fd, &statbuf) — the fd already points to the
+    // correct file (injected by the chroot handler or inherited). Let the
+    // kernel stat it directly.
+    if (flags & libc::AT_EMPTY_PATH as u64) != 0 {
+        return NotifAction::Continue;
+    }
+
     let (_, host_path, vp) = match read_and_resolve(notif, notif_fd, ctx.root, 0, 1) {
         Ok(r) => r,
         Err(a) => return a,
@@ -888,13 +897,15 @@ pub(crate) async fn handle_chroot_statx(
     let mask = notif.data.args[3] as u32;
     let statxbuf_addr = notif.data.args[4];
 
-    let path = match read_path(notif, path_ptr, notif_fd) {
-        Some(p) => p,
-        None => return NotifAction::Continue,
-    };
-    if path.is_empty() {
+    // AT_EMPTY_PATH: stat the fd directly, no chroot path resolution needed.
+    if (flags & libc::AT_EMPTY_PATH) != 0 {
         return NotifAction::Continue;
     }
+
+    let path = match read_path(notif, path_ptr, notif_fd) {
+        Some(p) if !p.is_empty() => p,
+        _ => return NotifAction::Continue,
+    };
 
     let (host_path, vp) = match resolve_chroot_path(notif, dirfd, &path, ctx.root) {
         Some(r) => r,

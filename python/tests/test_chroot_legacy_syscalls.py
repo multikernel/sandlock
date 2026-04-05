@@ -52,7 +52,7 @@ def rootfs(tmp_path):
     # Busybox-style symlinks
     for name in ("sh", "cat", "echo", "ls", "pwd", "readlink", "stat",
                   "mkdir", "rmdir", "chmod", "ln", "rm", "mv", "true",
-                  "false", "write", "access"):
+                  "false", "write", "access", "fstat-fd"):
         link = tmp_path / "usr" / "bin" / name
         if not link.exists():
             os.symlink("rootfs-helper", link)
@@ -198,3 +198,23 @@ class TestLegacyChmod:
                         fs_writable=["/tmp"])
         assert r.success, f"chmod failed: {r.stderr}"
         assert b"OK" in r.stdout
+
+
+# ── fstat via AT_EMPTY_PATH ─────────────────────────────────────
+
+class TestFstatFd:
+    """fstat(fd) uses newfstatat(fd, "", buf, AT_EMPTY_PATH) internally.
+
+    The chroot handler must pass this through to the kernel (the fd
+    already points to the correct file), not attempt chroot path
+    resolution on the empty string.
+    """
+
+    def test_fstat_fd_on_chroot_file(self, rootfs):
+        """Open a file inside the chroot, then fstat the fd."""
+        r = _run_helper(rootfs, ["fstat-fd", "/work/hello.txt"])
+        assert r.success, f"fstat-fd failed: {r.stderr}"
+        out = r.stdout.decode()
+        assert "OK" in out
+        # Verify the size matches the file we created in the rootfs
+        assert "size=17" in out  # "hello-from-chroot" is 17 bytes
