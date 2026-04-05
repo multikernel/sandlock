@@ -79,7 +79,10 @@ impl AclHandler {
 
         let orig_ip = match orig_ip {
             Some(ip) => ip,
-            // No mapping means the connection wasn't redirected by us — allow.
+            // No mapping: this can happen for non-redirected connections
+            // (e.g. non-intercepted ports) or if the supervisor hasn't
+            // recorded it yet. Since we write the mapping before connect(),
+            // absence here means the connection was not redirected — allow.
             None => return true,
         };
 
@@ -126,6 +129,10 @@ impl HttpHandler for AclHandler {
         // Verify the Host header matches the original destination IP to
         // prevent spoofing (e.g. Host: allowed.com while connecting to evil.com).
         if !self.verify_host(&ctx.client_addr, &host).await {
+            // Clean up the mapping to prevent memory leaks on blocked requests.
+            if let Ok(mut map) = self.orig_dest.write() {
+                map.remove(&ctx.client_addr);
+            }
             return Response::builder()
                 .status(StatusCode::FORBIDDEN)
                 .body(Body::from("Blocked by sandlock: Host header does not match connection destination"))
@@ -133,11 +140,12 @@ impl HttpHandler for AclHandler {
                 .into();
         }
 
+        // Clean up the mapping now that verification passed.
+        if let Ok(mut map) = self.orig_dest.write() {
+            map.remove(&ctx.client_addr);
+        }
+
         if http_acl_check(&self.allow_rules, &self.deny_rules, &method, &host, &path) {
-            // Clean up the mapping now that the request has been validated.
-            if let Ok(mut map) = self.orig_dest.write() {
-                map.remove(&ctx.client_addr);
-            }
             req.into()
         } else {
             Response::builder()

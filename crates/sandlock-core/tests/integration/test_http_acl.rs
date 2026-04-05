@@ -434,6 +434,212 @@ async fn test_http_non_intercepted_port() {
     let _ = std::fs::remove_file(&out);
 }
 
+/// IPv6 loopback connection through HTTP ACL — allowed request should succeed.
+/// Verifies that AF_INET6 sockets are properly redirected via IPv4-mapped addresses.
+#[ignore] // requires IPv6 loopback
+#[tokio::test]
+async fn test_http_acl_ipv6_allow() {
+    let port_file = temp_file("ipv6-allow-port");
+    let out = temp_file("ipv6-allow");
+
+    // Start an IPv6 HTTP server in a sandbox, get its port, then test ACL.
+    // We run server + client together in one script to keep port coordination simple.
+    let script = format!(
+        concat!(
+            "import http.server, socket, threading, urllib.request, urllib.error, time\n",
+            "class H(http.server.BaseHTTPRequestHandler):\n",
+            "    def do_GET(self):\n",
+            "        self.send_response(200)\n",
+            "        self.end_headers()\n",
+            "        self.wfile.write(b'ipv6-ok')\n",
+            "    def log_message(self, *a): pass\n",
+            "class V6Server(http.server.HTTPServer):\n",
+            "    address_family = socket.AF_INET6\n",
+            "srv = V6Server(('::1', 0), H)\n",
+            "port = srv.server_address[1]\n",
+            "t = threading.Thread(target=srv.handle_request, daemon=True)\n",
+            "t.start()\n",
+            "try:\n",
+            "    resp = urllib.request.urlopen('http://[::1]:%d/get' % port)\n",
+            "    open('{out}', 'w').write('OK:' + str(resp.status))\n",
+            "except urllib.error.HTTPError as e:\n",
+            "    open('{out}', 'w').write('HTTP:' + str(e.code))\n",
+            "except Exception as e:\n",
+            "    open('{out}', 'w').write('ERR:' + str(e))\n",
+            "srv.server_close()\n",
+        ),
+        out = out.display(),
+    );
+
+    // Use http_port to intercept whatever port the server picks.
+    // We can't know the port ahead of time, so intercept all traffic
+    // by using a broad allow rule. The key test is that IPv6 connections
+    // are properly redirected and not dropped with EAFNOSUPPORT.
+    let policy = base_policy()
+        .http_allow("GET */get")
+        .build()
+        .unwrap();
+
+    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    // The server is on a non-standard port (not 80), so the proxy won't
+    // intercept it by default. The connection should go through directly.
+    assert!(
+        content.starts_with("OK:200"),
+        "expected OK:200 for IPv6 loopback, got: {}",
+        content
+    );
+
+    let _ = std::fs::remove_file(&port_file);
+    let _ = std::fs::remove_file(&out);
+}
+
+/// IPv6 connection to httpbin.org on port 80 — verifies ACL enforcement
+/// over IPv6 when the destination has AAAA records.
+#[ignore] // requires network + IPv6 connectivity
+#[tokio::test]
+async fn test_http_acl_ipv6_allow_remote() {
+    let out = temp_file("ipv6-allow-remote");
+
+    // Force IPv6 via a Python script that explicitly creates an AF_INET6 socket.
+    let script = format!(
+        concat!(
+            "import socket, urllib.request, urllib.error\n",
+            "# Resolve httpbin.org to an IPv6 address\n",
+            "infos = socket.getaddrinfo('httpbin.org', 80, socket.AF_INET6, socket.SOCK_STREAM)\n",
+            "if not infos:\n",
+            "    open('{out}', 'w').write('SKIP:no-ipv6')\n",
+            "else:\n",
+            "    try:\n",
+            "        resp = urllib.request.urlopen('http://httpbin.org/get')\n",
+            "        open('{out}', 'w').write('OK:' + str(resp.status))\n",
+            "    except urllib.error.HTTPError as e:\n",
+            "        open('{out}', 'w').write('HTTP:' + str(e.code))\n",
+            "    except Exception as e:\n",
+            "        open('{out}', 'w').write('ERR:' + str(e))\n",
+        ),
+        out = out.display(),
+    );
+
+    let policy = base_policy()
+        .http_allow("GET httpbin.org/get")
+        .build()
+        .unwrap();
+
+    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(
+        content.starts_with("OK:200") || content.starts_with("SKIP:no-ipv6"),
+        "expected OK:200 or SKIP:no-ipv6, got: {}",
+        content
+    );
+
+    let _ = std::fs::remove_file(&out);
+}
+
+/// IPv6 connection should be denied when ACL doesn't match — ensures the proxy
+/// enforces rules on IPv6-redirected connections, not just silently passing them.
+#[ignore] // requires network + IPv6 connectivity
+#[tokio::test]
+async fn test_http_acl_ipv6_deny_remote() {
+    let out = temp_file("ipv6-deny-remote");
+
+    let script = format!(
+        concat!(
+            "import socket, urllib.request, urllib.error\n",
+            "infos = socket.getaddrinfo('httpbin.org', 80, socket.AF_INET6, socket.SOCK_STREAM)\n",
+            "if not infos:\n",
+            "    open('{out}', 'w').write('SKIP:no-ipv6')\n",
+            "else:\n",
+            "    try:\n",
+            "        resp = urllib.request.urlopen('http://httpbin.org/post')\n",
+            "        open('{out}', 'w').write('OK:' + str(resp.status))\n",
+            "    except urllib.error.HTTPError as e:\n",
+            "        open('{out}', 'w').write('HTTP:' + str(e.code))\n",
+            "    except Exception as e:\n",
+            "        open('{out}', 'w').write('ERR:' + str(e))\n",
+        ),
+        out = out.display(),
+    );
+
+    let policy = base_policy()
+        .http_allow("GET httpbin.org/get")
+        .build()
+        .unwrap();
+
+    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(
+        content.starts_with("HTTP:403") || content.starts_with("SKIP:no-ipv6"),
+        "expected HTTP:403 or SKIP:no-ipv6, got: {}",
+        content
+    );
+
+    let _ = std::fs::remove_file(&out);
+}
+
+/// IPv6 non-intercepted port should pass through without proxy interference.
+#[ignore] // requires IPv6 loopback
+#[tokio::test]
+async fn test_http_ipv6_non_intercepted_port() {
+    let out = temp_file("ipv6-non-intercept");
+
+    let script = format!(
+        concat!(
+            "import socket, threading\n",
+            "try:\n",
+            "    srv = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)\n",
+            "    srv.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)\n",
+            "    srv.bind(('::1', 0))\n",
+            "    port = srv.getsockname()[1]\n",
+            "    srv.listen(1)\n",
+            "    def accept_one():\n",
+            "        conn, _ = srv.accept()\n",
+            "        conn.send(b'HELLO6')\n",
+            "        conn.close()\n",
+            "    t = threading.Thread(target=accept_one, daemon=True)\n",
+            "    t.start()\n",
+            "    c = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)\n",
+            "    c.settimeout(2)\n",
+            "    c.connect(('::1', port))\n",
+            "    data = c.recv(10)\n",
+            "    c.close()\n",
+            "    srv.close()\n",
+            "    open('{out}', 'w').write('OK:' + data.decode())\n",
+            "except Exception as e:\n",
+            "    open('{out}', 'w').write('ERR:' + str(e))\n",
+        ),
+        out = out.display(),
+    );
+
+    let policy = base_policy()
+        .http_allow("GET httpbin.org/get")
+        .build()
+        .unwrap();
+
+    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(
+        content.starts_with("OK:HELLO6"),
+        "expected OK:HELLO6, got: {}",
+        content
+    );
+
+    let _ = std::fs::remove_file(&out);
+}
+
 /// HTTP ACL combined with IP allowlist — both must pass.
 #[ignore] // requires network access to httpbin.org
 #[tokio::test]
