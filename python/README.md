@@ -67,6 +67,37 @@ Unset fields mean "no restriction" unless noted otherwise.
 | `no_raw_sockets` | `bool` | `True` | Block raw IP sockets |
 | `no_udp` | `bool` | `False` | Block UDP sockets |
 
+#### HTTP ACL
+
+Enforce method + host + path rules on HTTP traffic via a transparent
+MITM proxy. When `http_allow` is set, all non-matching HTTP requests are
+denied by default. Deny rules are checked first and take precedence.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `http_allow` | `list[str]` | `[]` | Allow rules in `"METHOD host/path"` format |
+| `http_deny` | `list[str]` | `[]` | Deny rules in `"METHOD host/path"` format |
+| `http_ports` | `list[int]` | `[80]` | TCP ports to intercept (443 added when `https_ca` is set) |
+| `https_ca` | `str \| None` | `None` | CA certificate for HTTPS MITM |
+| `https_key` | `str \| None` | `None` | CA private key for HTTPS MITM |
+
+Rule format: `"METHOD host/path"` where method and host can be `*` for
+wildcard, and path supports trailing `*` for prefix matching. Paths are
+normalized (percent-decoding, `..` resolution, `//` collapsing) before
+matching to prevent bypasses.
+
+```python
+policy = Policy(
+    fs_readable=["/usr", "/lib", "/etc"],
+    http_allow=[
+        "GET docs.python.org/*",
+        "POST api.openai.com/v1/chat/completions",
+    ],
+    http_deny=["* */admin/*"],
+)
+result = Sandbox(policy).run(["python3", "agent.py"])
+```
+
 #### IPC and process isolation
 
 | Parameter | Type | Default | Description |
