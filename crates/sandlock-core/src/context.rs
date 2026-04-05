@@ -304,6 +304,7 @@ pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
             libc::SYS_newfstatat as u32,
             libc::SYS_statx as u32,
             libc::SYS_faccessat as u32,
+            439u32,                       // SYS_faccessat2 — glibc 2.33+ uses this instead of faccessat
             libc::SYS_readlinkat as u32,
             libc::SYS_getdents64 as u32,
             libc::SYS_getdents as u32,
@@ -330,6 +331,7 @@ pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
             libc::SYS_lstat as u32,       // musl uses lstat(2) instead of newfstatat
             libc::SYS_statx as u32,
             libc::SYS_faccessat as u32,
+            439u32,                       // SYS_faccessat2 — glibc 2.33+ uses this instead of faccessat
             libc::SYS_access as u32,      // musl uses access(2) instead of faccessat
             libc::SYS_readlinkat as u32,
             libc::SYS_readlink as u32,    // musl uses readlink(2) instead of readlinkat
@@ -970,6 +972,33 @@ mod tests {
         assert!(nrs.contains(&(libc::SYS_connect as u32)));
         assert!(nrs.contains(&(libc::SYS_sendto as u32)));
         assert!(nrs.contains(&(libc::SYS_sendmsg as u32)));
+    }
+
+    /// SYS_faccessat2 (439) must be in the notification filter for both
+    /// chroot and COW modes — glibc 2.33+ uses it instead of faccessat.
+    #[test]
+    fn test_notif_syscalls_faccessat2() {
+        const SYS_FACCESSAT2: u32 = 439;
+
+        // Chroot mode
+        let policy = Policy::builder()
+            .chroot("/tmp")
+            .build()
+            .unwrap();
+        let nrs = notif_syscalls(&policy);
+        assert!(nrs.contains(&(libc::SYS_faccessat as u32)));
+        assert!(nrs.contains(&SYS_FACCESSAT2),
+                "chroot notif filter must include SYS_faccessat2 (439)");
+
+        // COW mode
+        let policy = Policy::builder()
+            .workdir("/tmp")
+            .build()
+            .unwrap();
+        let nrs = notif_syscalls(&policy);
+        assert!(nrs.contains(&(libc::SYS_faccessat as u32)));
+        assert!(nrs.contains(&SYS_FACCESSAT2),
+                "COW notif filter must include SYS_faccessat2 (439)");
     }
 
     #[test]
