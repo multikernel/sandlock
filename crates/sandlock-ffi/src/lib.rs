@@ -975,6 +975,7 @@ pub unsafe extern "C" fn sandlock_dry_run(
 /// `r` must be a valid dry-run result pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_dry_run_result_exit_code(r: *const sandlock_dry_run_result_t) -> c_int {
+    if r.is_null() { return -1; }
     (*r)._private.run_result.code().unwrap_or(-1) as c_int
 }
 
@@ -984,6 +985,7 @@ pub unsafe extern "C" fn sandlock_dry_run_result_exit_code(r: *const sandlock_dr
 /// `r` must be a valid dry-run result pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_dry_run_result_success(r: *const sandlock_dry_run_result_t) -> bool {
+    if r.is_null() { return false; }
     (*r)._private.run_result.success()
 }
 
@@ -995,6 +997,7 @@ pub unsafe extern "C" fn sandlock_dry_run_result_success(r: *const sandlock_dry_
 pub unsafe extern "C" fn sandlock_dry_run_result_stdout_bytes(
     r: *const sandlock_dry_run_result_t, len: *mut usize,
 ) -> *const u8 {
+    if r.is_null() { if !len.is_null() { *len = 0; } return ptr::null(); }
     match &(*r)._private.run_result.stdout {
         Some(v) => { *len = v.len(); v.as_ptr() }
         None => { *len = 0; ptr::null() }
@@ -1009,6 +1012,7 @@ pub unsafe extern "C" fn sandlock_dry_run_result_stdout_bytes(
 pub unsafe extern "C" fn sandlock_dry_run_result_stderr_bytes(
     r: *const sandlock_dry_run_result_t, len: *mut usize,
 ) -> *const u8 {
+    if r.is_null() { if !len.is_null() { *len = 0; } return ptr::null(); }
     match &(*r)._private.run_result.stderr {
         Some(v) => { *len = v.len(); v.as_ptr() }
         None => { *len = 0; ptr::null() }
@@ -1021,6 +1025,7 @@ pub unsafe extern "C" fn sandlock_dry_run_result_stderr_bytes(
 /// `r` must be a valid dry-run result pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_dry_run_result_changes_len(r: *const sandlock_dry_run_result_t) -> usize {
+    if r.is_null() { return 0; }
     (*r)._private.changes.len()
 }
 
@@ -1032,8 +1037,11 @@ pub unsafe extern "C" fn sandlock_dry_run_result_changes_len(r: *const sandlock_
 pub unsafe extern "C" fn sandlock_dry_run_result_change_kind(
     r: *const sandlock_dry_run_result_t, i: usize,
 ) -> c_char {
+    if r.is_null() { return 0; }
+    let changes = &(*r)._private.changes;
+    if i >= changes.len() { return 0; }
     use sandlock_core::ChangeKind;
-    match (&(*r)._private.changes)[i].kind {
+    match changes[i].kind {
         ChangeKind::Added => b'A' as c_char,
         ChangeKind::Modified => b'M' as c_char,
         ChangeKind::Deleted => b'D' as c_char,
@@ -1048,7 +1056,10 @@ pub unsafe extern "C" fn sandlock_dry_run_result_change_kind(
 pub unsafe extern "C" fn sandlock_dry_run_result_change_path(
     r: *const sandlock_dry_run_result_t, i: usize,
 ) -> *mut c_char {
-    let path = (&(*r)._private.changes)[i].path.to_string_lossy();
+    if r.is_null() { return ptr::null_mut(); }
+    let changes = &(*r)._private.changes;
+    if i >= changes.len() { return ptr::null_mut(); }
+    let path = changes[i].path.to_string_lossy();
     match CString::new(path.as_bytes()) {
         Ok(cs) => cs.into_raw(),
         Err(_) => ptr::null_mut(),

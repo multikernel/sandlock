@@ -16,6 +16,10 @@ use std::os::unix::io::AsRawFd;
 use crate::seccomp::notif::{read_child_mem, NotifAction, SupervisorState};
 use crate::sys::structs::{SeccompNotif, AF_INET, AF_INET6, ECONNREFUSED};
 
+/// Maximum buffer size for sendto/sendmsg on-behalf operations (64 MiB).
+/// Prevents a sandboxed process from triggering OOM in the supervisor.
+const MAX_SEND_BUF: usize = 64 << 20;
+
 // ============================================================
 // parse_ip_from_sockaddr — parse IP from a sockaddr byte buffer
 // ============================================================
@@ -308,6 +312,9 @@ async fn sendto_on_behalf(
     let sockfd = args[0] as i32;
     let buf_ptr = args[1];
     let buf_len = args[2] as usize;
+    if buf_len > MAX_SEND_BUF {
+        return NotifAction::Errno(libc::EMSGSIZE);
+    }
     let flags = args[3] as i32;
     let addr_ptr = args[4];
     let addr_len = args[5] as u32;
@@ -460,6 +467,10 @@ async fn sendmsg_on_behalf(
         if off + 16 > iov_bytes.len() { break; }
         let iov_base = u64::from_ne_bytes(iov_bytes[off..off + 8].try_into().unwrap());
         let iov_len = u64::from_ne_bytes(iov_bytes[off + 8..off + 16].try_into().unwrap()) as usize;
+
+        if iov_len > MAX_SEND_BUF {
+            return NotifAction::Errno(libc::EMSGSIZE);
+        }
 
         if iov_base == 0 || iov_len == 0 {
             data_bufs.push(Vec::new());
