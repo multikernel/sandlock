@@ -825,13 +825,11 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
         Err(e) => fail!(format!("read ready signal: {}", e)),
     }
 
-    // 12. Optional: close all fds above stderr
-    if policy.close_fds {
-        if keep_fd >= 0 {
-            close_fds_above(2, &[keep_fd]);
-        } else {
-            close_fds_above(2, &[]);
-        }
+    // 12. Close all fds above stderr (always on for isolation)
+    if keep_fd >= 0 {
+        close_fds_above(2, &[keep_fd]);
+    } else {
+        close_fds_above(2, &[]);
     }
 
     // 13. Apply environment

@@ -408,11 +408,6 @@ class TestNewPolicyFields:
         result = Sandbox(p).run(["echo", "ok"])
         assert result.success
 
-    def test_close_fds(self):
-        p = _policy(close_fds=True)
-        result = Sandbox(p).run(["echo", "closed"])
-        assert result.success
-        assert result.stdout.strip() == b"closed"
 
 
 class TestFsIsolation:

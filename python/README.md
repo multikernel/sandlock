@@ -167,7 +167,6 @@ Set one or neither, not both.
 |-----------|------|---------|-------------|
 | `clean_env` | `bool` | `False` | Start with minimal environment |
 | `env` | `dict[str, str]` | `{}` | Variables to set/override in the child |
-| `close_fds` | `bool` | `True` | Close inherited file descriptors (3+) |
 
 #### GPU access
 

@@ -58,7 +58,6 @@ _SIMPLE_FIELDS: dict[str, type] = {
     "no_coredump": bool,
     # Misc
     "port_remap": bool,
-    "close_fds": bool,
     "uid": int,
     # Workdir
     "workdir": str,

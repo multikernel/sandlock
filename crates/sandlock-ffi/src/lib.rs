@@ -543,17 +543,6 @@ pub unsafe extern "C" fn sandlock_policy_builder_max_open_files(
 /// # Safety
 /// `b` must be a valid builder pointer.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_policy_builder_close_fds(
-    b: *mut PolicyBuilder, v: bool,
-) -> *mut PolicyBuilder {
-    if b.is_null() { return b; }
-    let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.close_fds(v)))
-}
-
-/// # Safety
-/// `b` must be a valid builder pointer.
-#[no_mangle]
 pub unsafe extern "C" fn sandlock_policy_builder_no_randomize_memory(
     b: *mut PolicyBuilder, v: bool,
 ) -> *mut PolicyBuilder {

@@ -41,10 +41,8 @@ class TestPolicyFromDict:
     def test_boolean_and_uid_fields(self):
         p = policy_from_dict({
             "uid": 0,
-            "close_fds": False,
         })
         assert p.uid == 0
-        assert p.close_fds is False
 
     def test_net_ports(self):
         p = policy_from_dict({
@@ -119,7 +117,7 @@ class TestListProfiles:
         monkeypatch.setattr(mod, "_PROFILES_DIR", tmp_path)
 
         (tmp_path / "build.toml").write_text('uid = 0\n')
-        (tmp_path / "dev.toml").write_text('close_fds = false\n')
+        (tmp_path / "dev.toml").write_text('clean_env = true\n')
         (tmp_path / "not-toml.txt").write_text('ignored')
 
         assert list_profiles() == ["build", "dev"]

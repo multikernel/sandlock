@@ -286,9 +286,6 @@ class Policy:
     env: Mapping[str, str] = field(default_factory=dict)
     """Variables to set or override in the child.  Applied after clean_env."""
 
-    # Misc
-    close_fds: bool = True
-    """Close inherited file descriptors (3+) in the child."""
 
     uid: int | None = None
     """Map to the given UID inside a user namespace.  For example,

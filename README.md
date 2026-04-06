@@ -550,7 +550,6 @@ Policy(
     on_error=BranchAction.ABORT,
 
     # Misc
-    close_fds=True,
     uid=None,                      # Map to given UID in user namespace (e.g. 0 for fake root)
 )
 ```

@@ -107,7 +107,6 @@ _b_time_start = _builder_fn("sandlock_policy_builder_time_start", ctypes.c_uint6
 _b_deny_syscalls = _builder_fn("sandlock_policy_builder_deny_syscalls", ctypes.c_char_p)
 _b_allow_syscalls = _builder_fn("sandlock_policy_builder_allow_syscalls", ctypes.c_char_p)
 _b_max_open_files = _builder_fn("sandlock_policy_builder_max_open_files", ctypes.c_uint32)
-_b_close_fds = _builder_fn("sandlock_policy_builder_close_fds", ctypes.c_bool)
 _b_no_randomize_memory = _builder_fn("sandlock_policy_builder_no_randomize_memory", ctypes.c_bool)
 _b_no_huge_pages = _builder_fn("sandlock_policy_builder_no_huge_pages", ctypes.c_bool)
 _b_no_coredump = _builder_fn("sandlock_policy_builder_no_coredump", ctypes.c_bool)
@@ -681,7 +680,7 @@ class _NativePolicy:
         "port_remap", "no_raw_sockets", "no_udp",
         "http_allow", "http_deny", "http_ports", "https_ca", "https_key",
         "uid",
-        "random_seed", "time_start", "clean_env", "close_fds", "env",
+        "random_seed", "time_start", "clean_env", "env",
         "deny_syscalls", "allow_syscalls", "max_open_files",
         "no_randomize_memory", "no_huge_pages", "no_coredump", "deterministic_dirs", "hostname",
         # Managed outside _build_from_policy:
@@ -792,7 +791,6 @@ class _NativePolicy:
             b = _b_time_start(b, epoch_secs)
         if policy.clean_env:
             b = _b_clean_env(b, True)
-        b = _b_close_fds(b, policy.close_fds)
         for k, v in (policy.env or {}).items():
             b = _b_env_var(b, _encode(k), _encode(v))
 

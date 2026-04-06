@@ -307,8 +307,6 @@ pub struct Policy {
     pub chroot: Option<PathBuf>,
     pub clean_env: bool,
     pub env: HashMap<String, String>,
-    pub close_fds: bool,
-
     // Devices
     pub gpu_devices: Option<Vec<u32>>,
 
@@ -390,7 +388,6 @@ pub struct PolicyBuilder {
     chroot: Option<PathBuf>,
     clean_env: bool,
     env: HashMap<String, String>,
-    close_fds: Option<bool>,
 
     gpu_devices: Option<Vec<u32>>,
 
@@ -593,10 +590,6 @@ impl PolicyBuilder {
         self
     }
 
-    pub fn close_fds(mut self, v: bool) -> Self {
-        self.close_fds = Some(v);
-        self
-    }
 
     pub fn gpu_devices(mut self, devices: Vec<u32>) -> Self {
         self.gpu_devices = Some(devices);
@@ -718,7 +711,6 @@ impl PolicyBuilder {
             chroot: self.chroot,
             clean_env: self.clean_env,
             env: self.env,
-            close_fds: self.close_fds.unwrap_or(true),
             gpu_devices: self.gpu_devices,
             cpu_cores: self.cpu_cores,
             num_cpus: self.num_cpus,

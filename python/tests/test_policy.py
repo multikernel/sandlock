@@ -56,7 +56,6 @@ class TestPolicy:
         assert p.max_memory is None
         assert p.max_processes == 64
         assert p.max_cpu is None
-        assert p.close_fds is True
 
     def test_frozen(self):
         p = Policy(max_memory="512M")
