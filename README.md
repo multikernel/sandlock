@@ -162,8 +162,8 @@ policy = Policy(
     clean_env=True,
 )
 
-# Run a command
-result = Sandbox(policy).run(["python3", "-c", "print('hello')"])
+# Run a command (with optional timeout in seconds)
+result = Sandbox(policy).run(["python3", "-c", "print('hello')"], timeout=30)
 assert result.success
 assert b"hello" in result.stdout
 

@@ -19,7 +19,7 @@ policy = Policy(
     fs_readable=["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev"],
     fs_writable=["/tmp"],
 )
-result = Sandbox(policy).run(["echo", "hello"])
+result = Sandbox(policy).run(["echo", "hello"], timeout=10)
 assert result.success
 print(result.stdout)  # b"hello\n"
 ```
