@@ -68,6 +68,51 @@ pub(crate) fn generate_uptime(elapsed_secs: f64) -> Vec<u8> {
     format!("{:.2} 0.00\n", elapsed_secs.max(0.0)).into_bytes()
 }
 
+// ============================================================
+// /proc/loadavg generator + EWMA tracker
+// ============================================================
+
+/// Exponential weighted moving average load tracker, matching the Linux kernel's
+/// algorithm (kernel/sched/loadavg.c). Sampled every 5 seconds.
+#[derive(Debug, Clone)]
+pub struct LoadAvg {
+    pub avg_1: f64,
+    pub avg_5: f64,
+    pub avg_15: f64,
+}
+
+// Decay factors: e^(-5/60), e^(-5/300), e^(-5/900)
+const EXP_1: f64 = 0.9200444146293232; // e^(-1/12)
+const EXP_5: f64 = 0.9834714538216174; // e^(-1/60)
+const EXP_15: f64 = 0.9944598480048967; // e^(-1/180)
+
+impl LoadAvg {
+    pub fn new() -> Self {
+        Self { avg_1: 0.0, avg_5: 0.0, avg_15: 0.0 }
+    }
+
+    /// Update averages with current runnable process count.
+    /// Called every 5 seconds by the sampling task.
+    pub fn sample(&mut self, running: u32) {
+        let r = running as f64;
+        self.avg_1 = self.avg_1 * EXP_1 + r * (1.0 - EXP_1);
+        self.avg_5 = self.avg_5 * EXP_5 + r * (1.0 - EXP_5);
+        self.avg_15 = self.avg_15 * EXP_15 + r * (1.0 - EXP_15);
+    }
+}
+
+/// Generate /proc/loadavg from tracked EWMA values.
+/// Format: "avg1 avg5 avg15 running/total last_pid\n"
+pub(crate) fn generate_loadavg(load: &LoadAvg, running: u32, total: u32, last_pid: i32) -> Vec<u8> {
+    format!(
+        "{:.2} {:.2} {:.2} {}/{} {}\n",
+        load.avg_1, load.avg_5, load.avg_15,
+        running.max(1).min(total), total,
+        last_pid.max(0),
+    )
+    .into_bytes()
+}
+
 // /proc/meminfo generator
 // ============================================================
 
@@ -240,6 +285,16 @@ pub(crate) async fn handle_proc_open(
         let st = state.lock().await;
         let elapsed = st.start_instant.elapsed().as_secs_f64();
         let content = generate_uptime(elapsed);
+        return inject_memfd(&content);
+    }
+
+    // Virtualize /proc/loadavg when proc virtualization is active.
+    if path == "/proc/loadavg" {
+        let st = state.lock().await;
+        let total = st.proc_pids.len() as u32;
+        let running = st.proc_count;
+        let last_pid = st.proc_pids.iter().max().copied().unwrap_or(0);
+        let content = generate_loadavg(&st.load_avg, running, total, last_pid);
         return inject_memfd(&content);
     }
 
@@ -701,6 +756,59 @@ mod tests {
         let info = generate_uptime(-5.0);
         let text = String::from_utf8(info).unwrap();
         assert!(text.starts_with("0.00"));
+    }
+
+    #[test]
+    fn test_loadavg_ewma() {
+        let mut la = LoadAvg::new();
+        assert_eq!(la.avg_1, 0.0);
+        assert_eq!(la.avg_5, 0.0);
+        assert_eq!(la.avg_15, 0.0);
+
+        // After sampling with 4 running processes, averages should rise
+        for _ in 0..12 {
+            la.sample(4);
+        }
+        // 1-min average should converge faster than 5 and 15
+        assert!(la.avg_1 > la.avg_5);
+        assert!(la.avg_5 > la.avg_15);
+        assert!(la.avg_1 > 2.0); // should be well above 0 after 60s of load=4
+    }
+
+    #[test]
+    fn test_loadavg_ewma_decay() {
+        let mut la = LoadAvg::new();
+        // Load up
+        for _ in 0..60 {
+            la.sample(10);
+        }
+        let peak = la.avg_1;
+        // Load drops to 0
+        for _ in 0..60 {
+            la.sample(0);
+        }
+        assert!(la.avg_1 < peak * 0.1, "1-min avg should decay quickly");
+    }
+
+    #[test]
+    fn test_generate_loadavg() {
+        let la = LoadAvg { avg_1: 1.23, avg_5: 0.45, avg_15: 0.12 };
+        let info = generate_loadavg(&la, 3, 10, 42);
+        let text = String::from_utf8(info).unwrap();
+        assert!(text.contains("1.23"));
+        assert!(text.contains("0.45"));
+        assert!(text.contains("0.12"));
+        assert!(text.contains("3/10"));
+        assert!(text.contains("42"));
+    }
+
+    #[test]
+    fn test_generate_loadavg_zero_procs() {
+        let la = LoadAvg::new();
+        let info = generate_loadavg(&la, 0, 0, 0);
+        let text = String::from_utf8(info).unwrap();
+        // running should be clamped: max(0,1).min(0) = 0
+        assert!(text.contains("0/0"));
     }
 
     #[test]

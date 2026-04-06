@@ -74,6 +74,7 @@ pub struct Sandbox {
     pidfd: Option<OwnedFd>,
     notif_handle: Option<JoinHandle<()>>,
     throttle_handle: Option<JoinHandle<()>>,
+    loadavg_handle: Option<JoinHandle<()>>,
     /// Capture pipe read ends — kept alive so the child doesn't get SIGPIPE.
     _stdout_read: Option<OwnedFd>,
     _stderr_read: Option<OwnedFd>,
@@ -134,6 +135,7 @@ impl Sandbox {
             pidfd: None,
             notif_handle: None,
             throttle_handle: None,
+            loadavg_handle: None,
             _stdout_read: None,
             _stderr_read: None,
             cow_branch: None,
@@ -442,6 +444,9 @@ impl Sandbox {
             h.abort();
         }
         if let Some(h) = self.throttle_handle.take() {
+            h.abort();
+        }
+        if let Some(h) = self.loadavg_handle.take() {
             h.abort();
         }
 
@@ -929,10 +934,27 @@ impl Sandbox {
             let sup_state = Arc::new(Mutex::new(sup_state));
             self.supervisor_state = Some(Arc::clone(&sup_state));
 
+            let has_proc_virt = notif_policy.has_proc_virt;
+
             // Spawn notif supervisor
             self.notif_handle = Some(tokio::spawn(
-                notif::supervisor(notif_fd, notif_policy, sup_state),
+                notif::supervisor(notif_fd, notif_policy, Arc::clone(&sup_state)),
             ));
+
+            // Spawn load average sampling task (every 5s, like the kernel)
+            if has_proc_virt {
+                let la_state = Arc::clone(&sup_state);
+                self.loadavg_handle = Some(tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(5));
+                    interval.tick().await; // skip immediate first tick
+                    loop {
+                        interval.tick().await;
+                        let mut st = la_state.lock().await;
+                        let running = st.proc_count;
+                        st.load_avg.sample(running);
+                    }
+                }));
+            }
         }
 
         // 15. Optionally spawn CPU throttle task
@@ -974,6 +996,9 @@ impl Drop for Sandbox {
             h.abort();
         }
         if let Some(h) = self.throttle_handle.take() {
+            h.abort();
+        }
+        if let Some(h) = self.loadavg_handle.take() {
             h.abort();
         }
 

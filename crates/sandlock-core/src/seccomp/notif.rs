@@ -64,6 +64,7 @@ pub enum NetworkPolicy {
 /// Runtime state shared across notification handlers.
 pub struct SupervisorState {
     pub start_instant: std::time::Instant,
+    pub load_avg: crate::procfs::LoadAvg,
     pub mem_used: u64,
     pub brk_bases: HashMap<i32, u64>,
     pub proc_count: u32,
@@ -118,6 +119,7 @@ impl SupervisorState {
     ) -> Self {
         Self {
             start_instant: std::time::Instant::now(),
+            load_avg: crate::procfs::LoadAvg::new(),
             mem_used: 0,
             brk_bases: HashMap::new(),
             proc_count: 0,
