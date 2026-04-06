@@ -888,6 +888,9 @@ impl Sandbox {
                 sup_state.child_pidfd = Some(pfd.as_raw_fd());
             }
 
+            // Seed proc_pids with the initial child so /proc filtering includes it.
+            sup_state.proc_pids.insert(pid);
+
             sup_state.http_acl_addr = self.http_acl_handle.as_ref().map(|h| h.addr);
             sup_state.http_acl_ports = self.policy.http_ports.iter().copied().collect();
             sup_state.http_acl_orig_dest = self.http_acl_handle.as_ref().map(|h| h.orig_dest.clone());

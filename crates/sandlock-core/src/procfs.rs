@@ -631,11 +631,13 @@ pub(crate) async fn handle_getdents(
         consumed += 1;
     }
 
+    // Empty cache = already fully drained on a prior call → return 0 (EOF).
+    if entries.is_empty() {
+        return NotifAction::ReturnValue(0);
+    }
+
     if consumed > 0 {
         entries.drain(..consumed);
-    }
-    if entries.is_empty() {
-        st.getdents_cache.remove(&cache_key);
     }
 
     drop(st);
