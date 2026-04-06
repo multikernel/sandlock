@@ -58,6 +58,16 @@ pub(crate) fn generate_cpuinfo(num_cpus: u32) -> Vec<u8> {
 }
 
 // ============================================================
+// /proc/uptime generator
+
+/// Generate /proc/uptime showing virtual uptime since sandbox start.
+/// Format: "<uptime_secs> <idle_secs>\n"
+/// When time_start is set, uptime starts at 0 and ticks forward from sandbox creation.
+pub(crate) fn generate_uptime(elapsed_secs: f64) -> Vec<u8> {
+    // idle time is reported as 0 — the sandbox has no meaningful idle metric.
+    format!("{:.2} 0.00\n", elapsed_secs.max(0.0)).into_bytes()
+}
+
 // /proc/meminfo generator
 // ============================================================
 
@@ -222,6 +232,14 @@ pub(crate) async fn handle_proc_open(
     if path == "/proc/meminfo" && policy.max_memory_bytes > 0 {
         let st = state.lock().await;
         let content = generate_meminfo(policy.max_memory_bytes, st.mem_used);
+        return inject_memfd(&content);
+    }
+
+    // Virtualize /proc/uptime when time_start is set.
+    if path == "/proc/uptime" && policy.has_time_start {
+        let st = state.lock().await;
+        let elapsed = st.start_instant.elapsed().as_secs_f64();
+        let content = generate_uptime(elapsed);
         return inject_memfd(&content);
     }
 
@@ -661,6 +679,28 @@ mod tests {
         let text = String::from_utf8(info).unwrap();
         // Free should be 0 (saturating sub)
         assert!(text.contains("MemFree:        0 kB"));
+    }
+
+    #[test]
+    fn test_generate_uptime() {
+        let info = generate_uptime(123.456);
+        let text = String::from_utf8(info).unwrap();
+        assert!(text.starts_with("123.46"));
+        assert!(text.contains("0.00"));
+    }
+
+    #[test]
+    fn test_generate_uptime_zero() {
+        let info = generate_uptime(0.0);
+        let text = String::from_utf8(info).unwrap();
+        assert!(text.starts_with("0.00"));
+    }
+
+    #[test]
+    fn test_generate_uptime_negative_clamped() {
+        let info = generate_uptime(-5.0);
+        let text = String::from_utf8(info).unwrap();
+        assert!(text.starts_with("0.00"));
     }
 
     #[test]

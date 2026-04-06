@@ -843,7 +843,7 @@ impl Sandbox {
                 has_time_start: self.policy.time_start.is_some(),
                 time_offset: time_offset_val,
                 num_cpus: self.policy.num_cpus,
-                has_proc_virt: self.policy.num_cpus.is_some() || self.policy.max_memory.is_some() || self.policy.isolate_pids || self.policy.port_remap,
+                has_proc_virt: self.policy.num_cpus.is_some() || self.policy.max_memory.is_some() || self.policy.isolate_pids || self.policy.port_remap || self.policy.time_start.is_some(),
                 isolate_pids: self.policy.isolate_pids,
                 port_remap: self.policy.port_remap,
                 cow_enabled: self.policy.workdir.is_some() && self.policy.fs_isolation == FsIsolation::None,

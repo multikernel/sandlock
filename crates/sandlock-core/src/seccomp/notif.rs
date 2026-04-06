@@ -63,6 +63,7 @@ pub enum NetworkPolicy {
 
 /// Runtime state shared across notification handlers.
 pub struct SupervisorState {
+    pub start_instant: std::time::Instant,
     pub mem_used: u64,
     pub brk_bases: HashMap<i32, u64>,
     pub proc_count: u32,
@@ -116,6 +117,7 @@ impl SupervisorState {
         random_state: Option<ChaCha8Rng>,
     ) -> Self {
         Self {
+            start_instant: std::time::Instant::now(),
             mem_used: 0,
             brk_bases: HashMap::new(),
             proc_count: 0,
