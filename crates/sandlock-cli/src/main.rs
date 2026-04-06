@@ -100,6 +100,9 @@ enum Command {
         interactive: bool,
         #[arg(long = "fs-deny", value_name = "PATH")]
         fs_deny: Vec<String>,
+        /// Mount a host path inside the sandbox (e.g. --fs-mount /work:/host/path)
+        #[arg(long = "fs-mount", value_name = "VIRTUAL:HOST")]
+        fs_mount: Vec<String>,
         /// CPU cores to pin the sandbox to (e.g. --cpu-cores 0,2,3)
         #[arg(long = "cpu-cores", value_delimiter = ',')]
         cpu_cores: Vec<u32>,
@@ -156,7 +159,7 @@ async fn main() -> Result<()> {
             fs_isolation, fs_storage, max_disk, net_allow, net_deny,
             http_allow, http_deny, http_ports, https_ca, https_key,
             port_remap, no_randomize_memory, no_huge_pages, deterministic_dirs, hostname, no_coredump,
-            env_vars, exec_shell, interactive: _, fs_deny, cpu_cores, gpu_devices, image, dry_run, no_supervisor, cmd } =>
+            env_vars, exec_shell, interactive: _, fs_deny, fs_mount, cpu_cores, gpu_devices, image, dry_run, no_supervisor, cmd } =>
         {
             if no_supervisor {
                 validate_no_supervisor(
@@ -167,7 +170,7 @@ async fn main() -> Result<()> {
                     no_huge_pages, deterministic_dirs, &hostname, &chroot,
                     &image, &uid, &workdir, &cwd, &fs_isolation, &fs_storage,
                     &max_disk, port_remap, &cpu_cores, &gpu_devices, dry_run,
-                    &status_fd, &fs_deny,
+                    &status_fd, &fs_deny, &fs_mount,
                 )?;
 
                 // Build a minimal policy with only fs rules
@@ -267,6 +270,11 @@ async fn main() -> Result<()> {
             if let Some(cpu) = max_cpu { builder = builder.max_cpu(cpu); }
             if let Some(n) = max_open_files { builder = builder.max_open_files(n); }
             for p in &fs_deny { builder = builder.fs_deny(p); }
+            for spec in &fs_mount {
+                let (virt, host) = spec.split_once(':')
+                    .ok_or_else(|| anyhow!("--fs-mount requires VIRTUAL:HOST, got: {}", spec))?;
+                builder = builder.fs_mount(virt, host);
+            }
             if let Some(ref path) = chroot { builder = builder.chroot(path); }
             if let Some(id) = uid { builder = builder.uid(id); }
             if let Some(ref path) = workdir { builder = builder.workdir(path); }
@@ -496,6 +504,7 @@ fn validate_no_supervisor(
     dry_run: bool,
     status_fd: &Option<i32>,
     fs_deny: &[String],
+    fs_mount: &[String],
 ) -> Result<()> {
     let mut bad = Vec::new();
 
@@ -533,6 +542,7 @@ fn validate_no_supervisor(
     if dry_run { bad.push("--dry-run"); }
     if status_fd.is_some() { bad.push("--status-fd"); }
     if !fs_deny.is_empty() { bad.push("--fs-deny"); }
+    if !fs_mount.is_empty() { bad.push("--fs-mount"); }
 
     if !bad.is_empty() {
         return Err(anyhow!(
