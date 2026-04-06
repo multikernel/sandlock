@@ -134,6 +134,112 @@ pub(crate) fn generate_meminfo(total_bytes: u64, used_bytes: u64) -> Vec<u8> {
 }
 
 // ============================================================
+// /proc/mounts and /proc/self/mountinfo virtualization
+// ============================================================
+
+/// Detect the filesystem type of a host path via statfs(2).
+fn detect_fstype(path: &std::path::Path) -> &'static str {
+    let c_path = match std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
+        Ok(p) => p,
+        Err(_) => return "unknown",
+    };
+    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c_path.as_ptr(), &mut buf) } != 0 {
+        return "unknown";
+    }
+    // Map f_type magic to filesystem name.
+    // Values from linux/magic.h and statfs(2).
+    match buf.f_type {
+        0xEF53 => "ext4",            // EXT2/3/4_SUPER_MAGIC
+        0x9123683E => "btrfs",        // BTRFS_SUPER_MAGIC
+        0x58465342 => "xfs",          // XFS_SUPER_MAGIC
+        0x01021994 => "tmpfs",        // TMPFS_MAGIC
+        0x6969 => "nfs",              // NFS_SUPER_MAGIC
+        0x5346544E => "ntfs",         // NTFS_SB_MAGIC
+        0x65735546 => "fuse",         // FUSE_SUPER_MAGIC
+        0x28cd3d45 => "cramfs",       // CRAMFS_MAGIC
+        0x3153464A => "jfs",          // JFS_SUPER_MAGIC
+        0x52654973 => "reiserfs",     // REISERFS_SUPER_MAGIC
+        0xF2F52010 => "f2fs",         // F2FS_SUPER_MAGIC
+        0x4244 => "hfs",              // HFS_SUPER_MAGIC
+        0x482B => "hfsplus",          // HFSPLUS_SUPER_MAGIC
+        0x1021997 => "v9fs",          // V9FS_MAGIC
+        0xFF534D42 => "cifs",         // CIFS_SUPER_MAGIC
+        0x73717368 => "squashfs",     // SQUASHFS_MAGIC
+        0x62656572 => "sysfs",        // SYSFS_MAGIC
+        0x9FA0 => "proc",            // PROC_SUPER_MAGIC
+        0x61756673 => "aufs",         // AUFS_SUPER_MAGIC
+        0x794C7630 => "overlayfs",    // OVERLAYFS_SUPER_MAGIC
+        0x01161970 => "gfs2",         // GFS2_MAGIC
+        0x5A4F4653 => "zonefs",       // ZONEFS_MAGIC
+        0xCAFE001 => "bcachefs",      // BCACHEFS_SUPER_MAGIC (approximation)
+        _ => "unknown",
+    }
+}
+
+/// Generate a virtual /proc/mounts showing only the sandbox's own mounts.
+///
+/// Produces standard `/proc/mounts` format: `device mountpoint type options dump pass`
+/// Shows the root entry and each fs_mount entry. Filesystem types are detected
+/// from the actual host paths via statfs(2).
+pub(crate) fn generate_proc_mounts(
+    chroot_root: Option<&std::path::Path>,
+    chroot_mounts: &[(std::path::PathBuf, std::path::PathBuf)],
+) -> Vec<u8> {
+    let mut buf = String::new();
+
+    if let Some(root) = chroot_root {
+        let fstype = detect_fstype(root);
+        buf.push_str(&format!("sandlock / {} rw,relatime 0 0\n", fstype));
+    } else {
+        buf.push_str("rootfs / rootfs rw 0 0\n");
+    }
+
+    for (virtual_path, host_path) in chroot_mounts {
+        let vp = virtual_path.to_string_lossy();
+        let fstype = detect_fstype(host_path);
+        buf.push_str(&format!("sandlock {} {} rw,relatime 0 0\n", vp, fstype));
+    }
+
+    buf.into_bytes()
+}
+
+/// Generate a virtual /proc/self/mountinfo showing only the sandbox's own mounts.
+///
+/// Format (per mount_namespaces(7)):
+/// `mount_id parent_id major:minor root mount_point options optional_fields - fs_type source super_options`
+pub(crate) fn generate_proc_mountinfo(
+    chroot_root: Option<&std::path::Path>,
+    chroot_mounts: &[(std::path::PathBuf, std::path::PathBuf)],
+) -> Vec<u8> {
+    let mut buf = String::new();
+    let mut mount_id: u32 = 20;
+
+    if let Some(root) = chroot_root {
+        let fstype = detect_fstype(root);
+        buf.push_str(&format!(
+            "{} 1 8:1 / / rw,relatime - {} sandlock rw\n", mount_id, fstype
+        ));
+    } else {
+        buf.push_str(&format!(
+            "{} 1 0:1 / / rw - rootfs rootfs rw\n", mount_id
+        ));
+    }
+    mount_id += 1;
+
+    for (virtual_path, host_path) in chroot_mounts {
+        let vp = virtual_path.to_string_lossy();
+        let fstype = detect_fstype(host_path);
+        buf.push_str(&format!(
+            "{} 20 8:1 / {} rw,relatime - {} sandlock rw\n", mount_id, vp, fstype
+        ));
+        mount_id += 1;
+    }
+
+    buf.into_bytes()
+}
+
+// ============================================================
 // /proc/net/tcp filtering
 // ============================================================
 
@@ -303,6 +409,24 @@ pub(crate) async fn handle_proc_open(
         let is_v6 = path.ends_with('6');
         let st = state.lock().await;
         let content = generate_proc_net_tcp(&st.port_map.bound_ports, is_v6);
+        return inject_memfd(&content);
+    }
+
+    // Virtualize /proc/mounts and /proc/self/mounts.
+    if path == "/proc/mounts" || path == "/proc/self/mounts" {
+        let content = generate_proc_mounts(
+            policy.chroot_root.as_deref(),
+            &policy.chroot_mounts,
+        );
+        return inject_memfd(&content);
+    }
+
+    // Virtualize /proc/self/mountinfo.
+    if path == "/proc/self/mountinfo" {
+        let content = generate_proc_mountinfo(
+            policy.chroot_root.as_deref(),
+            &policy.chroot_mounts,
+        );
         return inject_memfd(&content);
     }
 
@@ -811,6 +935,72 @@ mod tests {
         let text = String::from_utf8(info).unwrap();
         // running should be clamped: max(0,1).min(0) = 0
         assert!(text.contains("0/0"));
+    }
+
+    #[test]
+    fn test_detect_fstype_root() {
+        // / should always return a known fstype
+        let fstype = detect_fstype(std::path::Path::new("/"));
+        assert_ne!(fstype, "unknown", "root fs should have a known type");
+    }
+
+    #[test]
+    fn test_detect_fstype_nonexistent() {
+        let fstype = detect_fstype(std::path::Path::new("/no/such/path"));
+        assert_eq!(fstype, "unknown");
+    }
+
+    #[test]
+    fn test_generate_proc_mounts_chroot() {
+        // Use real paths so detect_fstype works
+        let tmp = std::env::temp_dir();
+        let mounts = vec![
+            (std::path::PathBuf::from("/work"), tmp.clone()),
+            (std::path::PathBuf::from("/data"), tmp.clone()),
+        ];
+        let content = generate_proc_mounts(Some(tmp.as_path()), &mounts);
+        let text = String::from_utf8(content).unwrap();
+        // Root entry with detected fstype (not hardcoded ext4)
+        assert!(text.starts_with("sandlock / "), "Should start with root entry, got: {}", text);
+        assert!(text.contains("sandlock /work "));
+        assert!(text.contains("sandlock /data "));
+        // Should NOT contain host paths
+        assert!(!text.contains(tmp.to_str().unwrap()));
+        // Fstype should be detected, not "unknown" (tmp is on a real fs)
+        let root_line = text.lines().next().unwrap();
+        assert!(!root_line.contains("unknown"), "root fstype should be detected, got: {}", root_line);
+    }
+
+    #[test]
+    fn test_generate_proc_mounts_no_chroot() {
+        let mounts: Vec<(std::path::PathBuf, std::path::PathBuf)> = vec![];
+        let content = generate_proc_mounts(None, &mounts);
+        let text = String::from_utf8(content).unwrap();
+        assert!(text.contains("rootfs / rootfs rw 0 0"));
+        assert_eq!(text.lines().count(), 1);
+    }
+
+    #[test]
+    fn test_generate_proc_mountinfo_chroot() {
+        let tmp = std::env::temp_dir();
+        let mounts = vec![
+            (std::path::PathBuf::from("/work"), tmp.clone()),
+        ];
+        let content = generate_proc_mountinfo(Some(tmp.as_path()), &mounts);
+        let text = String::from_utf8(content).unwrap();
+        assert!(text.contains("/ / rw,relatime -"));
+        assert!(text.contains("/ /work rw,relatime -"));
+        assert!(!text.contains(tmp.to_str().unwrap()));
+        assert_eq!(text.lines().count(), 2);
+    }
+
+    #[test]
+    fn test_generate_proc_mountinfo_no_chroot() {
+        let mounts: Vec<(std::path::PathBuf, std::path::PathBuf)> = vec![];
+        let content = generate_proc_mountinfo(None, &mounts);
+        let text = String::from_utf8(content).unwrap();
+        assert!(text.contains("/ / rw - rootfs rootfs rw"));
+        assert_eq!(text.lines().count(), 1);
     }
 
     #[test]

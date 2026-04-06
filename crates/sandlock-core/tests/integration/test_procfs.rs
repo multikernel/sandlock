@@ -138,6 +138,42 @@ async fn test_proc_net_tcp_filtered() {
     let _ = std::fs::remove_file(&out);
 }
 
+/// Test that /proc/mounts is virtualized and only shows sandbox mounts.
+#[tokio::test]
+async fn test_proc_mounts_virtualized() {
+    let policy = Policy::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin")
+        .fs_read("/etc").fs_read("/proc").fs_read("/dev")
+        .build()
+        .unwrap();
+
+    let result = Sandbox::run(&policy, &["cat", "/proc/mounts"]).await.unwrap();
+    assert!(result.success(), "cat /proc/mounts should succeed");
+    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
+    // Should contain the root entry (no chroot → rootfs)
+    assert!(stdout.contains("rootfs / rootfs rw 0 0"), "Should show root mount, got: {}", stdout);
+    // Should NOT leak host mounts (e.g. /home, /boot, real device paths)
+    assert!(!stdout.contains("/home"), "Should not leak host /home mount");
+    assert!(!stdout.contains("nvme"), "Should not leak host disk device names");
+}
+
+/// Test that /proc/self/mountinfo is virtualized.
+#[tokio::test]
+async fn test_proc_self_mountinfo_virtualized() {
+    let policy = Policy::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin")
+        .fs_read("/etc").fs_read("/proc").fs_read("/dev")
+        .build()
+        .unwrap();
+
+    let result = Sandbox::run(&policy, &["cat", "/proc/self/mountinfo"]).await.unwrap();
+    assert!(result.success(), "cat /proc/self/mountinfo should succeed");
+    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
+    // Should contain root entry in mountinfo format
+    assert!(stdout.contains("/ / rw - rootfs rootfs rw"), "Should show root in mountinfo, got: {}", stdout);
+    assert!(!stdout.contains("/home"), "Should not leak host /home mount in mountinfo");
+}
+
 /// Test that /proc/net/tcp hides host ports when sandbox has no bindings.
 #[tokio::test]
 async fn test_proc_net_tcp_hides_host_ports() {
