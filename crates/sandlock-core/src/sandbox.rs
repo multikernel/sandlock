@@ -848,8 +848,6 @@ impl Sandbox {
                 has_time_start: self.policy.time_start.is_some(),
                 time_offset: time_offset_val,
                 num_cpus: self.policy.num_cpus,
-                has_proc_virt: true,
-                isolate_pids: true,
                 port_remap: self.policy.port_remap,
                 cow_enabled: self.policy.workdir.is_some() && self.policy.fs_isolation == FsIsolation::None,
                 chroot_root: self.policy.chroot.as_ref().and_then(|p| std::fs::canonicalize(p).ok()),
@@ -937,27 +935,23 @@ impl Sandbox {
             let sup_state = Arc::new(Mutex::new(sup_state));
             self.supervisor_state = Some(Arc::clone(&sup_state));
 
-            let has_proc_virt = notif_policy.has_proc_virt;
-
             // Spawn notif supervisor
             self.notif_handle = Some(tokio::spawn(
                 notif::supervisor(notif_fd, notif_policy, Arc::clone(&sup_state)),
             ));
 
             // Spawn load average sampling task (every 5s, like the kernel)
-            if has_proc_virt {
-                let la_state = Arc::clone(&sup_state);
-                self.loadavg_handle = Some(tokio::spawn(async move {
-                    let mut interval = tokio::time::interval(Duration::from_secs(5));
-                    interval.tick().await; // skip immediate first tick
-                    loop {
-                        interval.tick().await;
-                        let mut st = la_state.lock().await;
-                        let running = st.proc_count;
-                        st.load_avg.sample(running);
-                    }
-                }));
-            }
+            let la_state = Arc::clone(&sup_state);
+            self.loadavg_handle = Some(tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(5));
+                interval.tick().await; // skip immediate first tick
+                loop {
+                    interval.tick().await;
+                    let mut st = la_state.lock().await;
+                    let running = st.proc_count;
+                    st.load_avg.sample(running);
+                }
+            }));
         }
 
         // 15. Optionally spawn CPU throttle task
