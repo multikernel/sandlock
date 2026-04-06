@@ -274,10 +274,7 @@ pub struct Policy {
     /// PEM CA key for HTTPS MITM. Required when https_ca is set.
     pub https_key: Option<PathBuf>,
 
-    // Namespace isolation
-    pub isolate_ipc: bool,
-    pub isolate_signals: bool,
-    pub isolate_pids: bool,
+    // Namespace isolation — always enabled, not user-configurable.
 
     // Resource limits
     pub max_memory: Option<ByteSize>,
@@ -367,10 +364,6 @@ pub struct PolicyBuilder {
     http_ports: Vec<u16>,
     https_ca: Option<PathBuf>,
     https_key: Option<PathBuf>,
-
-    isolate_ipc: bool,
-    isolate_signals: bool,
-    isolate_pids: bool,
 
     max_memory: Option<ByteSize>,
     max_processes: Option<u32>,
@@ -487,21 +480,6 @@ impl PolicyBuilder {
 
     pub fn https_key(mut self, path: impl Into<PathBuf>) -> Self {
         self.https_key = Some(path.into());
-        self
-    }
-
-    pub fn isolate_ipc(mut self, v: bool) -> Self {
-        self.isolate_ipc = v;
-        self
-    }
-
-    pub fn isolate_signals(mut self, v: bool) -> Self {
-        self.isolate_signals = v;
-        self
-    }
-
-    pub fn isolate_pids(mut self, v: bool) -> Self {
-        self.isolate_pids = v;
         self
     }
 
@@ -718,9 +696,6 @@ impl PolicyBuilder {
             http_ports,
             https_ca: self.https_ca,
             https_key: self.https_key,
-            isolate_ipc: self.isolate_ipc,
-            isolate_signals: self.isolate_signals,
-            isolate_pids: self.isolate_pids,
             max_memory: self.max_memory,
             max_processes: self.max_processes.unwrap_or(64),
             max_open_files: self.max_open_files,

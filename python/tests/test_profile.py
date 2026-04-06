@@ -40,13 +40,9 @@ class TestPolicyFromDict:
 
     def test_boolean_and_uid_fields(self):
         p = policy_from_dict({
-            "isolate_ipc": True,
-            "isolate_signals": True,
             "uid": 0,
             "close_fds": False,
         })
-        assert p.isolate_ipc is True
-        assert p.isolate_signals is True
         assert p.uid == 0
         assert p.close_fds is False
 

@@ -135,17 +135,6 @@ fn test_branch_action_defaults() {
 }
 
 #[test]
-fn test_isolate_flags() {
-    let p = Policy::builder()
-        .isolate_ipc(true)
-        .isolate_signals(true)
-        .build()
-        .unwrap();
-    assert!(p.isolate_ipc);
-    assert!(p.isolate_signals);
-}
-
-#[test]
 fn test_port_remap_flag() {
     let p = Policy::builder().port_remap(true).build().unwrap();
     assert!(p.port_remap);

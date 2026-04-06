@@ -37,10 +37,6 @@ enum Command {
         #[arg(long)]
         random_seed: Option<u64>,
         #[arg(long)]
-        isolate_ipc: bool,
-        #[arg(long)]
-        isolate_signals: bool,
-        #[arg(long)]
         clean_env: bool,
         #[arg(long)]
         num_cpus: Option<u32>,
@@ -155,7 +151,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Run { fs_read, fs_write, max_memory, max_processes, timeout,
             net_allow_host, net_bind, net_connect, time_start, random_seed,
-            isolate_ipc, isolate_signals, clean_env, num_cpus, profile: profile_name, status_fd,
+            clean_env, num_cpus, profile: profile_name, status_fd,
             max_cpu, max_open_files, chroot, uid, workdir, cwd,
             fs_isolation, fs_storage, max_disk, net_allow, net_deny,
             http_allow, http_deny, http_ports, https_ca, https_key,
@@ -202,8 +198,6 @@ async fn main() -> Result<()> {
                         return Err(anyhow!("--env requires KEY=VALUE, got: {}", spec));
                     }
                 }
-                if isolate_ipc { builder = builder.isolate_ipc(true); }
-                if isolate_signals { builder = builder.isolate_signals(true); }
 
                 let policy = builder.build()?;
 
@@ -249,8 +243,6 @@ async fn main() -> Result<()> {
                 if let Some(n) = base.num_cpus { b = b.num_cpus(n); }
                 b = b.no_raw_sockets(base.no_raw_sockets);
                 b = b.no_udp(base.no_udp);
-                b = b.isolate_ipc(base.isolate_ipc);
-                b = b.isolate_signals(base.isolate_signals);
                 b = b.clean_env(base.clean_env);
                 b
             } else {
@@ -266,8 +258,6 @@ async fn main() -> Result<()> {
             for p in &net_bind { builder = builder.net_bind_port(*p); }
             for p in &net_connect { builder = builder.net_connect_port(*p); }
             if let Some(seed) = random_seed { builder = builder.random_seed(seed); }
-            if isolate_ipc { builder = builder.isolate_ipc(true); }
-            if isolate_signals { builder = builder.isolate_signals(true); }
             if clean_env { builder = builder.clean_env(true); }
             if let Some(n) = num_cpus { builder = builder.num_cpus(n); }
             if let Some(ref ts) = time_start {

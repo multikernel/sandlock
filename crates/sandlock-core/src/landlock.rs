@@ -199,16 +199,8 @@ pub fn confine(policy: &Policy) -> Result<(), SandlockError> {
     // means deny all — same semantics as fs_readable/fs_writable.
     let handled_access_net = LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP;
 
-    let scoped = {
-        let mut s: u64 = 0;
-        if policy.isolate_ipc {
-            s |= LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET;
-        }
-        if policy.isolate_signals {
-            s |= LANDLOCK_SCOPE_SIGNAL;
-        }
-        s
-    };
+    // IPC and signal isolation are always enabled.
+    let scoped = LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET | LANDLOCK_SCOPE_SIGNAL;
 
     // Step 3 — create ruleset.
     let attr = LandlockRulesetAttr {

@@ -148,19 +148,6 @@ class Policy:
     contain only these domains (resolved at sandbox creation time).
     Empty = unrestricted (real /etc/hosts is visible)."""
 
-    # IPC scoping (Landlock ABI v6+, Linux 6.12+)
-    isolate_ipc: bool = False
-    """Block connections to abstract UNIX sockets outside the sandbox."""
-
-    isolate_signals: bool = False
-    """Block sending signals to processes outside the sandbox."""
-
-    isolate_pids: bool = False
-    """Hide foreign process entries in /proc.  When enabled, directory
-    listings of /proc only show the sandbox's own PIDs, and direct
-    access to /proc/<foreign_pid>/... is denied.  Uses seccomp user
-    notification with a fast prefix check for minimal overhead."""
-
     no_coredump: bool = False
     """Disable core dumps and restrict /proc/pid access from other
     processes.  Applied via prctl(PR_SET_DUMPABLE, 0).  Prevents

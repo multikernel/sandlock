@@ -34,10 +34,6 @@ _SIMPLE_FIELDS: dict[str, type] = {
     "net_allow_hosts": list,
     "net_bind": list,
     "net_connect": list,
-    # IPC scoping
-    "isolate_ipc": bool,
-    "isolate_signals": bool,
-    "isolate_pids": bool,
     "no_raw_sockets": bool,
     "no_udp": bool,
     # Resources

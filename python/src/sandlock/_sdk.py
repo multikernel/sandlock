@@ -100,15 +100,12 @@ _b_http_port = _builder_fn("sandlock_policy_builder_http_port", ctypes.c_uint16)
 _b_https_ca = _builder_fn("sandlock_policy_builder_https_ca", ctypes.c_char_p)
 _b_https_key = _builder_fn("sandlock_policy_builder_https_key", ctypes.c_char_p)
 _b_uid = _builder_fn("sandlock_policy_builder_uid", ctypes.c_uint32)
-_b_isolate_ipc = _builder_fn("sandlock_policy_builder_isolate_ipc", ctypes.c_bool)
-_b_isolate_signals = _builder_fn("sandlock_policy_builder_isolate_signals", ctypes.c_bool)
 _b_random_seed = _builder_fn("sandlock_policy_builder_random_seed", ctypes.c_uint64)
 _b_clean_env = _builder_fn("sandlock_policy_builder_clean_env", ctypes.c_bool)
 _b_env_var = _builder_fn("sandlock_policy_builder_env_var", ctypes.c_char_p, ctypes.c_char_p)
 _b_time_start = _builder_fn("sandlock_policy_builder_time_start", ctypes.c_uint64)
 _b_deny_syscalls = _builder_fn("sandlock_policy_builder_deny_syscalls", ctypes.c_char_p)
 _b_allow_syscalls = _builder_fn("sandlock_policy_builder_allow_syscalls", ctypes.c_char_p)
-_b_isolate_pids = _builder_fn("sandlock_policy_builder_isolate_pids", ctypes.c_bool)
 _b_max_open_files = _builder_fn("sandlock_policy_builder_max_open_files", ctypes.c_uint32)
 _b_close_fds = _builder_fn("sandlock_policy_builder_close_fds", ctypes.c_bool)
 _b_no_randomize_memory = _builder_fn("sandlock_policy_builder_no_randomize_memory", ctypes.c_bool)
@@ -192,7 +189,7 @@ def confine(policy: "PolicyDataclass") -> None:
     filesystem, IPC, and signal isolation fields. The confinement is
     **irreversible**.
 
-    Only filesystem paths, isolate_ipc, and isolate_signals are used.
+    Only filesystem paths are used (IPC and signal isolation are always enabled).
     Network, resource limits, and other policy fields are ignored.
 
     This does NOT fork or exec — it confines the current process in-place.
@@ -683,9 +680,9 @@ class _NativePolicy:
         "net_allow_hosts", "net_bind", "net_connect",
         "port_remap", "no_raw_sockets", "no_udp",
         "http_allow", "http_deny", "http_ports", "https_ca", "https_key",
-        "uid", "isolate_ipc", "isolate_signals",
+        "uid",
         "random_seed", "time_start", "clean_env", "close_fds", "env",
-        "deny_syscalls", "allow_syscalls", "isolate_pids", "max_open_files",
+        "deny_syscalls", "allow_syscalls", "max_open_files",
         "no_randomize_memory", "no_huge_pages", "no_coredump", "deterministic_dirs", "hostname",
         # Managed outside _build_from_policy:
         "notif_policy",
@@ -788,11 +785,6 @@ class _NativePolicy:
         if policy.uid is not None:
             b = _b_uid(b, policy.uid)
 
-        if policy.isolate_ipc:
-            b = _b_isolate_ipc(b, True)
-        if policy.isolate_signals:
-            b = _b_isolate_signals(b, True)
-
         if policy.random_seed is not None:
             b = _b_random_seed(b, policy.random_seed)
         if policy.time_start is not None:
@@ -808,8 +800,6 @@ class _NativePolicy:
             b = _b_deny_syscalls(b, _encode(",".join(policy.deny_syscalls)))
         if policy.allow_syscalls:
             b = _b_allow_syscalls(b, _encode(",".join(policy.allow_syscalls)))
-        if policy.isolate_pids:
-            b = _b_isolate_pids(b, True)
         if policy.max_open_files is not None:
             b = _b_max_open_files(b, policy.max_open_files)
 

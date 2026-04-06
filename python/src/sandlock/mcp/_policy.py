@@ -71,8 +71,6 @@ def policy_for_tool(
         ])),
         "net_bind": [],
         "net_connect": [],
-        "isolate_pids": True,
-        "isolate_ipc": True,
         "no_raw_sockets": True,
         "no_udp": True,
         "clean_env": True,

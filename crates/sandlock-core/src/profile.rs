@@ -90,13 +90,7 @@ pub fn parse_profile(content: &str) -> Result<Policy, SandlockError> {
     if let Some(v) = sandbox.get("no_udp").and_then(|v| v.as_bool()) {
         builder = builder.no_udp(v);
     }
-    if let Some(v) = sandbox.get("isolate_ipc").and_then(|v| v.as_bool()) {
-        builder = builder.isolate_ipc(v);
-    }
-    if let Some(v) = sandbox.get("isolate_signals").and_then(|v| v.as_bool()) {
-        builder = builder.isolate_signals(v);
-    }
-    if let Some(v) = sandbox.get("clean_env").and_then(|v| v.as_bool()) {
+if let Some(v) = sandbox.get("clean_env").and_then(|v| v.as_bool()) {
         builder = builder.clean_env(v);
     }
     if let Some(v) = sandbox.get("deterministic_dirs").and_then(|v| v.as_bool()) {

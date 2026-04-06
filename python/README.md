@@ -130,14 +130,6 @@ policy = Policy(
 )
 ```
 
-#### IPC and process isolation
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `isolate_ipc` | `bool` | `False` | Block abstract UNIX socket connections outside sandbox |
-| `isolate_signals` | `bool` | `False` | Block signals to processes outside sandbox |
-| `isolate_pids` | `bool` | `False` | Hide foreign PIDs in /proc |
-
 #### Resource limits
 
 | Parameter | Type | Default | Description |

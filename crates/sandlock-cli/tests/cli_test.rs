@@ -200,24 +200,3 @@ fn test_no_supervisor_exit_code() {
     assert_eq!(output.status.code(), Some(42));
 }
 
-#[test]
-fn test_no_supervisor_with_isolate_ipc() {
-    let output = sandlock_bin()
-        .args(["run", "--no-supervisor", "--isolate-ipc", "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "-r", "/etc", "--", "echo", "ipc-ok"])
-        .output()
-        .expect("failed to run");
-    assert!(output.status.success(), "Exit status: {:?}, stderr: {}", output.status, String::from_utf8_lossy(&output.stderr));
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("ipc-ok"));
-}
-
-#[test]
-fn test_no_supervisor_with_isolate_signals() {
-    let output = sandlock_bin()
-        .args(["run", "--no-supervisor", "--isolate-signals", "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "-r", "/etc", "--", "echo", "sig-ok"])
-        .output()
-        .expect("failed to run");
-    assert!(output.status.success(), "Exit status: {:?}, stderr: {}", output.status, String::from_utf8_lossy(&output.stderr));
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("sig-ok"));
-}

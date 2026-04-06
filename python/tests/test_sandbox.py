@@ -401,12 +401,6 @@ class TestNewPolicyFields:
         assert result.success
         assert result.stdout.strip() == b"ok"
 
-    def test_isolate_pids(self):
-        p = _policy(isolate_pids=True)
-        result = Sandbox(p).run(["echo", "isolated"])
-        assert result.success
-        assert result.stdout.strip() == b"isolated"
-
     def test_max_open_files(self):
         # max_open_files is accepted by the policy but not yet enforced
         # in the sandbox — just verify it doesn't crash.

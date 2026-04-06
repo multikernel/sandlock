@@ -119,8 +119,8 @@ sandlock run \
 # TCP port restrictions (Landlock)
 sandlock run --net-bind 8080 --net-connect 443 -r /usr -r /lib -r /etc -- python3 server.py
 
-# IPC scoping + clean environment
-sandlock run --isolate-ipc --isolate-signals --clean-env --env CC=gcc \
+# Clean environment
+sandlock run --clean-env --env CC=gcc \
   -r /usr -r /lib -w /tmp -- make
 
 # Deterministic execution (frozen time + seeded randomness)
@@ -159,7 +159,6 @@ policy = Policy(
     fs_readable=["/usr", "/lib", "/etc"],
     max_memory="256M",
     max_processes=10,
-    isolate_ipc=True,
     clean_env=True,
 )
 
@@ -340,7 +339,6 @@ Save reusable policies as TOML files in `~/.config/sandlock/profiles/`:
 fs_writable = ["/tmp/work"]
 fs_readable = ["/usr", "/lib", "/lib64", "/bin", "/etc"]
 clean_env = true
-isolate_ipc = true
 max_memory = "512M"
 max_processes = 50
 
@@ -521,10 +519,6 @@ Policy(
     # Socket restrictions
     no_raw_sockets=True,           # Block SOCK_RAW (default)
     no_udp=False,                  # Block SOCK_DGRAM
-
-    # IPC scoping (Landlock ABI v6+)
-    isolate_ipc=False,             # Block abstract UNIX sockets to host
-    isolate_signals=False,         # Block signals to host processes
 
     # Resources
     max_memory="512M",             # Memory limit

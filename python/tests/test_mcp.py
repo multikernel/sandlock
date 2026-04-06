@@ -17,8 +17,6 @@ class TestDenyByDefault:
         assert policy.net_connect == []
         assert policy.net_bind == []
         assert policy.no_udp is True
-        assert policy.isolate_pids is True
-        assert policy.isolate_ipc is True
         assert policy.no_raw_sockets is True
 
     def test_empty_capabilities(self):

@@ -270,19 +270,15 @@ pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
         nrs.push(libc::SYS_openat as u32);
     }
 
-    // /proc virtualization needs openat interception
-    if policy.num_cpus.is_some() || policy.max_memory.is_some() || policy.isolate_pids || policy.port_remap {
-        nrs.push(libc::SYS_openat as u32);
-    }
+    // /proc virtualization (always on: PID filtering, sensitive path blocking)
+    nrs.push(libc::SYS_openat as u32);
+    nrs.extend_from_slice(&[
+        libc::SYS_getdents64 as u32,
+        libc::SYS_getdents as u32,
+    ]);
     // Virtualize sched_getaffinity so nproc/sysconf agree with /proc/cpuinfo
     if policy.num_cpus.is_some() {
         nrs.push(libc::SYS_sched_getaffinity as u32);
-    }
-    if policy.isolate_pids || policy.deterministic_dirs {
-        nrs.extend_from_slice(&[
-            libc::SYS_getdents64 as u32,
-            libc::SYS_getdents as u32,
-        ]);
     }
     if policy.hostname.is_some() {
         nrs.push(libc::SYS_uname as u32);

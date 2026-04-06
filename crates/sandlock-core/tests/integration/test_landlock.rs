@@ -239,7 +239,7 @@ async fn test_isolate_ipc() {
         .fs_read("/proc")
         .fs_read("/dev")
         .fs_write("/tmp")
-        .isolate_ipc(true)
+
         .build()
         .unwrap();
 
@@ -293,7 +293,7 @@ async fn test_isolate_signals_blocks_parent() {
         .fs_read("/proc")
         .fs_read("/dev")
         .fs_write("/tmp")
-        .isolate_signals(true)
+
         .build()
         .unwrap();
 
@@ -344,7 +344,7 @@ async fn test_isolate_signals_allows_self() {
         .fs_read("/proc")
         .fs_read("/dev")
         .fs_write("/tmp")
-        .isolate_signals(true)
+
         .build()
         .unwrap();
 

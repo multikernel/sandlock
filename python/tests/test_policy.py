@@ -197,23 +197,4 @@ class TestCpuCores:
         assert p.cpu_cores == [0, 2, 3]
 
 
-class TestIpcScoping:
-    def test_defaults_to_off(self):
-        p = Policy()
-        assert p.isolate_ipc is False
-        assert p.isolate_signals is False
-
-    def test_enable_ipc(self):
-        p = Policy(isolate_ipc=True)
-        assert p.isolate_ipc is True
-
-    def test_enable_signals(self):
-        p = Policy(isolate_signals=True)
-        assert p.isolate_signals is True
-
-    def test_enable_both(self):
-        p = Policy(isolate_ipc=True, isolate_signals=True)
-        assert p.isolate_ipc is True
-        assert p.isolate_signals is True
-
 

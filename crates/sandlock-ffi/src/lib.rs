@@ -459,28 +459,6 @@ pub unsafe extern "C" fn sandlock_policy_builder_https_key(
 /// # Safety
 /// `b` must be a valid builder pointer.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_policy_builder_isolate_ipc(
-    b: *mut PolicyBuilder, v: bool,
-) -> *mut PolicyBuilder {
-    if b.is_null() { return b; }
-    let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.isolate_ipc(v)))
-}
-
-/// # Safety
-/// `b` must be a valid builder pointer.
-#[no_mangle]
-pub unsafe extern "C" fn sandlock_policy_builder_isolate_signals(
-    b: *mut PolicyBuilder, v: bool,
-) -> *mut PolicyBuilder {
-    if b.is_null() { return b; }
-    let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.isolate_signals(v)))
-}
-
-/// # Safety
-/// `b` must be a valid builder pointer.
-#[no_mangle]
 pub unsafe extern "C" fn sandlock_policy_builder_random_seed(
     b: *mut PolicyBuilder, seed: u64,
 ) -> *mut PolicyBuilder {
@@ -549,17 +527,6 @@ pub unsafe extern "C" fn sandlock_policy_builder_allow_syscalls(
     let s = CStr::from_ptr(names).to_str().unwrap_or("");
     let calls: Vec<String> = s.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
     Box::into_raw(Box::new(builder.allow_syscalls(calls)))
-}
-
-/// # Safety
-/// `b` must be a valid builder pointer.
-#[no_mangle]
-pub unsafe extern "C" fn sandlock_policy_builder_isolate_pids(
-    b: *mut PolicyBuilder, v: bool,
-) -> *mut PolicyBuilder {
-    if b.is_null() { return b; }
-    let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.isolate_pids(v)))
 }
 
 /// # Safety
