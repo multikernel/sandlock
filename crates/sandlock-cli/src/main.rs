@@ -6,7 +6,7 @@ use anyhow::{Result, anyhow};
 use std::time::SystemTime;
 
 #[derive(Parser)]
-#[command(name = "sandlock", about = "Lightweight process sandbox")]
+#[command(name = "sandlock", about = "Lightweight process sandbox", version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
