@@ -423,7 +423,15 @@ class PolicyContext:
 # ----------------------------------------------------------------
 
 def _encode(s: str) -> bytes:
-    return s.encode("utf-8") if isinstance(s, str) else s
+    if isinstance(s, str):
+        result = s.encode("utf-8")
+    elif isinstance(s, bytes):
+        result = s
+    else:
+        result = str(s).encode("utf-8")
+    if b'\x00' in result:
+        raise ValueError(f"NUL byte in string argument: {result!r}")
+    return result
 
 def _make_argv(cmd: Sequence[str]):
     """Create a (c_char_p array, argc) pair from a list of strings."""
@@ -477,6 +485,15 @@ class Checkpoint:
         # Later:
         cp2 = Checkpoint.load("my-checkpoint")
     """
+
+    @staticmethod
+    def _validate_name(name: str) -> None:
+        """Reject checkpoint names that could escape the storage directory."""
+        if not name or '/' in name or os.sep in name or name.startswith('.'):
+            raise ValueError(
+                f"Invalid checkpoint name: {name!r}. "
+                "Use a simple name without path separators."
+            )
 
     def __init__(self, ptr: int):
         self._ptr = ptr
@@ -539,6 +556,7 @@ class Checkpoint:
         Returns:
             Path to the checkpoint directory.
         """
+        self._validate_name(name)
         root = Path(store) if store is not None else _DEFAULT_STORE
         root.mkdir(parents=True, exist_ok=True)
         cp_dir = root / name
@@ -562,6 +580,7 @@ class Checkpoint:
         Raises:
             FileNotFoundError: If the checkpoint does not exist.
         """
+        cls._validate_name(name)
         root = Path(store) if store is not None else _DEFAULT_STORE
         cp_dir = root / name
         if not cp_dir.is_dir():
@@ -637,6 +656,7 @@ class Checkpoint:
             FileNotFoundError: If the checkpoint does not exist.
         """
         import shutil
+        cls._validate_name(name)
         root = Path(store) if store is not None else _DEFAULT_STORE
         cp_dir = root / name
         if not cp_dir.is_dir():
