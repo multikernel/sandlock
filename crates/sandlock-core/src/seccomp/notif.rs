@@ -694,10 +694,16 @@ async fn dispatch(
     // /proc virtualization
     if policy.has_proc_virt {
         if nr == libc::SYS_openat as i64 {
-            return crate::procfs::handle_proc_open(notif, state, policy, notif_fd).await;
+            let action = crate::procfs::handle_proc_open(notif, state, policy, notif_fd).await;
+            if !matches!(action, NotifAction::Continue) {
+                return action;
+            }
         }
         if policy.isolate_pids && (nr == libc::SYS_getdents64 as i64 || nr == libc::SYS_getdents as i64) {
-            return crate::procfs::handle_getdents(notif, state, policy, notif_fd).await;
+            let action = crate::procfs::handle_getdents(notif, state, policy, notif_fd).await;
+            if !matches!(action, NotifAction::Continue) {
+                return action;
+            }
         }
     }
 
