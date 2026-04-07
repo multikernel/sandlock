@@ -135,7 +135,7 @@ policy = Policy(
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `max_memory` | `str \| int \| None` | `None` | Memory limit, e.g. `"512M"` or int bytes |
-| `max_processes` | `int` | `64` | Lifetime fork count limit |
+| `max_processes` | `int` | `64` | Peak concurrent process limit |
 | `max_open_files` | `int \| None` | `None` | Max file descriptors (RLIMIT_NOFILE) |
 | `max_cpu` | `int \| None` | `None` | CPU throttle as percentage of one core (1-100) |
 | `cpu_cores` | `list[int] \| None` | `None` | CPU cores to pin sandbox to |

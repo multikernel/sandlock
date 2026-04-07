@@ -888,6 +888,8 @@ impl Sandbox {
 
             // Seed proc_pids with the initial child so /proc filtering includes it.
             sup_state.proc_pids.insert(pid);
+            // Count the initial child for the concurrent process limit.
+            sup_state.proc_count = 1;
 
             sup_state.http_acl_addr = self.http_acl_handle.as_ref().map(|h| h.addr);
             sup_state.http_acl_ports = self.policy.http_ports.iter().copied().collect();
@@ -948,7 +950,7 @@ impl Sandbox {
                 loop {
                     interval.tick().await;
                     let mut st = la_state.lock().await;
-                    let running = st.proc_count;
+                    let running = st.proc_pids.len() as u32;
                     st.load_avg.sample(running);
                 }
             }));

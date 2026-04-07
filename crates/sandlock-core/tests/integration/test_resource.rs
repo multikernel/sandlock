@@ -133,6 +133,48 @@ async fn test_timeout_kills_process() {
 async fn test_process_limit_enforced() {
     let out = temp_path("proc-limit");
 
+    // Fork children that stay alive (sleep) so they count toward the concurrent
+    // process limit.  With max_processes=3, the parent counts as 1, so only 2
+    // additional children can be alive at once.
+    let script = format!(concat!(
+        "import os, time\n",
+        "count = 0\n",
+        "for i in range(10):\n",
+        "  try:\n",
+        "    pid = os.fork()\n",
+        "    if pid == 0:\n",
+        "      time.sleep(60)\n",
+        "      os._exit(0)\n",
+        "    else:\n",
+        "      count += 1\n",
+        "  except OSError:\n",
+        "    break\n",
+        "open('{out}', 'w').write(str(count))\n",
+    ), out = out.display());
+
+    let policy = base_policy().max_processes(3).build().unwrap();
+    Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+        .await
+        .unwrap();
+
+    let content = std::fs::read_to_string(&out).expect("temp file should exist");
+    let count: u32 = content.trim().parse().expect("should be a number");
+    assert!(
+        count < 10,
+        "expected some forks to fail with process limit, but all {} succeeded",
+        count,
+    );
+
+    let _ = std::fs::remove_file(&out);
+}
+
+#[tokio::test]
+async fn test_process_limit_allows_sequential_reuse() {
+    let out = temp_path("proc-reuse");
+
+    // Fork+wait sequentially: each child exits before the next fork, so peak
+    // concurrent processes never exceeds 2 (parent + 1 child).  With
+    // max_processes=3 this should succeed for all iterations.
     let script = format!(concat!(
         "import os\n",
         "count = 0\n",
@@ -156,9 +198,9 @@ async fn test_process_limit_enforced() {
 
     let content = std::fs::read_to_string(&out).expect("temp file should exist");
     let count: u32 = content.trim().parse().expect("should be a number");
-    assert!(
-        count < 20,
-        "expected some forks to fail with process limit, but all {} succeeded",
+    assert_eq!(
+        count, 20,
+        "all 20 sequential forks should succeed (peak concurrent = 2), but only {} did",
         count,
     );
 

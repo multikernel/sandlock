@@ -232,6 +232,8 @@ pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
         libc::SYS_clone as u32,
         libc::SYS_clone3 as u32,
         libc::SYS_vfork as u32,
+        libc::SYS_wait4 as u32,
+        libc::SYS_waitid as u32,
     ];
 
     if policy.max_memory.is_some() {

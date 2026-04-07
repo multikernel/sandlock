@@ -398,7 +398,7 @@ pub(crate) async fn handle_proc_open(
     if path == "/proc/loadavg" {
         let st = state.lock().await;
         let total = st.proc_pids.len() as u32;
-        let running = st.proc_count;
+        let running = total;
         let last_pid = st.proc_pids.iter().max().copied().unwrap_or(0);
         let content = generate_loadavg(&st.load_avg, running, total, last_pid);
         return inject_memfd(&content);

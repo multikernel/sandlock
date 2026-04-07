@@ -45,7 +45,7 @@ pub(crate) async fn handle_fork(
         return NotifAction::Hold;
     }
 
-    // Enforce process limit.
+    // Enforce concurrent process limit.
     if st.proc_count >= st.max_processes {
         return NotifAction::Errno(EAGAIN);
     }
@@ -53,6 +53,20 @@ pub(crate) async fn handle_fork(
     st.proc_count += 1;
     st.proc_pids.insert(notif.pid as i32);
 
+    NotifAction::Continue
+}
+
+/// Handle wait4/waitid notifications — decrement the concurrent process count.
+///
+/// The wait hasn't completed yet (seccomp notify fires before the syscall),
+/// but we know a child is about to be reaped, so we decrement optimistically.
+/// The kernel will complete the wait after we return Continue.
+pub(crate) async fn handle_wait(
+    _notif: &SeccompNotif,
+    state: &Arc<Mutex<SupervisorState>>,
+) -> NotifAction {
+    let mut st = state.lock().await;
+    st.proc_count = st.proc_count.saturating_sub(1);
     NotifAction::Continue
 }
 

@@ -68,8 +68,9 @@ pub struct SupervisorState {
     pub load_avg: crate::procfs::LoadAvg,
     pub mem_used: u64,
     pub brk_bases: HashMap<i32, u64>,
-    pub proc_count: u32,
     pub proc_pids: HashSet<i32>,
+    /// Live concurrent process count — incremented on fork, decremented on wait.
+    pub proc_count: u32,
     pub hold_forks: bool,
     pub held_notif_ids: Vec<u64>,
     /// Global network policy: unrestricted or limited to a set of IPs.
@@ -123,8 +124,8 @@ impl SupervisorState {
             load_avg: crate::procfs::LoadAvg::new(),
             mem_used: 0,
             brk_bases: HashMap::new(),
-            proc_count: 0,
             proc_pids: HashSet::new(),
+            proc_count: 0,
             hold_forks: false,
             held_notif_ids: Vec::new(),
             network_policy: NetworkPolicy::Unrestricted,
@@ -507,6 +508,11 @@ async fn dispatch(
     // Fork/clone family
     if nr == libc::SYS_clone || nr == libc::SYS_clone3 || nr == libc::SYS_vfork {
         return crate::resource::handle_fork(notif, state, policy).await;
+    }
+
+    // Wait family — decrement process count when a child is reaped.
+    if nr == libc::SYS_wait4 || nr == libc::SYS_waitid {
+        return crate::resource::handle_wait(notif, state).await;
     }
 
     // Memory management syscalls
@@ -1185,7 +1191,6 @@ mod tests {
     fn test_supervisor_state_new() {
         let state = SupervisorState::new(1024 * 1024, 10, None, None);
         assert_eq!(state.mem_used, 0);
-        assert_eq!(state.proc_count, 0);
         assert_eq!(state.max_memory_bytes, 1024 * 1024);
         assert_eq!(state.max_processes, 10);
         assert!(state.brk_bases.is_empty());

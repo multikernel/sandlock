@@ -522,7 +522,7 @@ Policy(
 
     # Resources
     max_memory="512M",             # Memory limit
-    max_processes=64,              # Fork count limit
+    max_processes=64,              # Peak concurrent process limit
     max_cpu=50,                    # CPU throttle (% of one core)
     max_open_files=256,            # fd limit
     port_remap=False,              # Virtual port space
