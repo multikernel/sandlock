@@ -735,15 +735,7 @@ pub(crate) async fn handle_cow_getdents(
     }
     if !st.dir_cache.contains_key(&cache_key) {
         let cow = st.branch.as_ref().unwrap();
-        let workdir_str = cow.workdir_str();
-        let rel_path = if target == workdir_str {
-            ".".to_string()
-        } else {
-            target
-                .strip_prefix(&format!("{}/", workdir_str))
-                .unwrap_or(".")
-                .to_string()
-        };
+        let rel_path = cow.safe_rel(&target).unwrap_or_else(|| ".".to_string());
         let merged = cow.list_merged_dir(&rel_path);
 
         let upper_dir = cow.upper_dir().join(&rel_path);

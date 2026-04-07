@@ -137,7 +137,7 @@ impl SeccompCowBranch {
     }
 
     /// Compute relative path from workdir. Returns None if path escapes.
-    fn safe_rel(&self, path: &str) -> Option<String> {
+    pub fn safe_rel(&self, path: &str) -> Option<String> {
         let rel = pathdiff::diff_paths(path, &self.workdir)?;
         let rel_str = rel.to_string_lossy().into_owned();
         if rel_str == ".." || rel_str.starts_with("../") {
@@ -1326,5 +1326,35 @@ mod tests {
         branch.disk_used = 50;
         branch.rollback_copy(30);
         assert_eq!(branch.disk_used, 20);
+    }
+
+    #[test]
+    fn test_safe_rel_root_workdir() {
+        let storage = tempfile::tempdir().unwrap();
+        // Use "/" as workdir — the bug was that getdents used
+        // strip_prefix("{workdir}/") which produced "//" for root,
+        // causing all paths to fall back to "." and list the root
+        // directory contents instead of the target directory.
+        let branch = SeccompCowBranch::create(Path::new("/"), Some(storage.path()), 0).unwrap();
+
+        assert_eq!(branch.safe_rel("/etc/apt"), Some("etc/apt".to_string()));
+        assert_eq!(branch.safe_rel("/var/lib"), Some("var/lib".to_string()));
+        assert_eq!(branch.safe_rel("/"), Some("".to_string()));
+        assert!(branch.matches("/anything"));
+    }
+
+    #[test]
+    fn test_list_merged_dir_root_workdir() {
+        let storage = tempfile::tempdir().unwrap();
+        let branch = SeccompCowBranch::create(Path::new("/"), Some(storage.path()), 0).unwrap();
+
+        // list_merged_dir with a path derived from safe_rel should list
+        // that directory, not the root.
+        let rel = branch.safe_rel("/etc/apt/sources.list.d").unwrap();
+        let entries = branch.list_merged_dir(&rel);
+        // Should contain actual files from /etc/apt/sources.list.d/,
+        // not top-level dirs like "bin", "usr", "var".
+        assert!(!entries.iter().any(|e| e == "bin" || e == "usr" || e == "var"),
+            "list_merged_dir returned root entries instead of target dir: {:?}", entries);
     }
 }
