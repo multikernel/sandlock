@@ -79,11 +79,6 @@ pub struct SupervisorState {
     pub getdents_cache: HashMap<(i32, u32), Vec<Vec<u8>>>,
     /// Base address of the last vDSO we patched (0 = not yet patched).
     pub vdso_patched_addr: u64,
-    /// Seccomp-based COW branch (None if COW disabled).
-    pub cow_branch: Option<crate::cow::seccomp::SeccompCowBranch>,
-    /// Getdents cache for COW directories.
-    /// Value is (host_path, entries) to detect fd reuse and invalidate stale entries.
-    pub cow_dir_cache: HashMap<(i32, u32), (String, Vec<Vec<u8>>)>,
     /// pidfd for the child process (for pidfd_getfd on-behalf syscalls).
     pub child_pidfd: Option<RawFd>,
     /// Event sender for dynamic policy callback (None if no policy_fn).
@@ -122,9 +117,6 @@ impl SupervisorState {
             port_map: PortMap::new(),
             getdents_cache: HashMap::new(),
             vdso_patched_addr: 0,
-            cow_branch: None,
-            cow_dir_cache: HashMap::new(),
-
             child_pidfd: None,
             policy_event_tx: None,
             pid_ip_overrides: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -811,7 +803,7 @@ async fn handle_notification(
             NotifAction::Errno(libc::EACCES)
         } else {
             drop(st);
-            dispatch_table.dispatch(notif, state, fd).await
+            dispatch_table.dispatch(notif, state, &ctx.cow, fd).await
         }
     };
 

@@ -13,17 +13,17 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use super::notif::{NotifAction, NotifPolicy, SupervisorState};
-use super::state::ResourceState;
+use super::state::{CowState, ResourceState};
 use crate::sys::structs::SeccompNotif;
 
 // ============================================================
 // Types
 // ============================================================
 
-/// An async handler function.  Receives the notification, shared state, and
-/// the notif fd.  Returns a `NotifAction`.
+/// An async handler function.  Receives the notification, shared state,
+/// COW state, and the notif fd.  Returns a `NotifAction`.
 pub type HandlerFn = Box<
-    dyn Fn(SeccompNotif, Arc<Mutex<SupervisorState>>, RawFd) -> Pin<Box<dyn Future<Output = NotifAction> + Send>>
+    dyn Fn(SeccompNotif, Arc<Mutex<SupervisorState>>, Arc<Mutex<CowState>>, RawFd) -> Pin<Box<dyn Future<Output = NotifAction> + Send>>
         + Send
         + Sync,
 >;
@@ -63,12 +63,13 @@ impl DispatchTable {
         &self,
         notif: SeccompNotif,
         state: &Arc<Mutex<SupervisorState>>,
+        cow: &Arc<Mutex<CowState>>,
         notif_fd: RawFd,
     ) -> NotifAction {
         let nr = notif.data.nr as i64;
         if let Some(chain) = self.chains.get(&nr) {
             for handler in &chain.handlers {
-                let action = handler(notif, Arc::clone(state), notif_fd).await;
+                let action = handler(notif, Arc::clone(state), Arc::clone(cow), notif_fd).await;
                 if !matches!(action, NotifAction::Continue) {
                     return action;
                 }
@@ -97,7 +98,7 @@ pub fn build_dispatch_table(
     for &nr in &[libc::SYS_clone, libc::SYS_clone3, libc::SYS_vfork] {
         let policy = Arc::clone(policy);
         let resource = Arc::clone(resource);
-        table.register(nr, Box::new(move |notif, state, _notif_fd| {
+        table.register(nr, Box::new(move |notif, state, _cow, _notif_fd| {
             let policy = Arc::clone(&policy);
             let resource = Arc::clone(&resource);
             Box::pin(async move {
@@ -111,7 +112,7 @@ pub fn build_dispatch_table(
     // ------------------------------------------------------------------
     for &nr in &[libc::SYS_wait4, libc::SYS_waitid] {
         let resource = Arc::clone(resource);
-        table.register(nr, Box::new(move |notif, _state, _notif_fd| {
+        table.register(nr, Box::new(move |notif, _state, _cow, _notif_fd| {
             let resource = Arc::clone(&resource);
             Box::pin(async move {
                 crate::resource::handle_wait(&notif, &resource).await
@@ -129,7 +130,7 @@ pub fn build_dispatch_table(
         ] {
             let policy = Arc::clone(policy);
             let resource = Arc::clone(resource);
-            table.register(nr, Box::new(move |notif, _state, _notif_fd| {
+            table.register(nr, Box::new(move |notif, _state, _cow, _notif_fd| {
                 let policy = Arc::clone(&policy);
                 let resource = Arc::clone(&resource);
                 Box::pin(async move {
@@ -144,7 +145,7 @@ pub fn build_dispatch_table(
     // ------------------------------------------------------------------
     if policy.has_net_allowlist || policy.has_http_acl {
         for &nr in &[libc::SYS_connect, libc::SYS_sendto, libc::SYS_sendmsg] {
-            table.register(nr, Box::new(|notif, state, notif_fd| {
+            table.register(nr, Box::new(|notif, state, _cow, notif_fd| {
                 Box::pin(async move {
                     crate::network::handle_net(&notif, &state, notif_fd).await
                 })
@@ -156,7 +157,7 @@ pub fn build_dispatch_table(
     // Deterministic random — getrandom()
     // ------------------------------------------------------------------
     if policy.has_random_seed {
-        table.register(libc::SYS_getrandom, Box::new(|notif, state, notif_fd| {
+        table.register(libc::SYS_getrandom, Box::new(|notif, state, _cow, notif_fd| {
             Box::pin(async move {
                 let mut st = state.lock().await;
                 if let Some(ref mut rng) = st.random_state {
@@ -172,7 +173,7 @@ pub fn build_dispatch_table(
     // Deterministic random — /dev/urandom opens (openat)
     // ------------------------------------------------------------------
     if policy.has_random_seed {
-        table.register(libc::SYS_openat, Box::new(|notif, state, notif_fd| {
+        table.register(libc::SYS_openat, Box::new(|notif, state, _cow, notif_fd| {
             Box::pin(async move {
                 let mut st = state.lock().await;
                 if let Some(ref mut rng) = st.random_state {
@@ -195,7 +196,7 @@ pub fn build_dispatch_table(
             libc::SYS_timerfd_settime as i64,
             libc::SYS_timer_settime as i64,
         ] {
-            table.register(nr, Box::new(move |notif, _state, notif_fd| {
+            table.register(nr, Box::new(move |notif, _state, _cow, notif_fd| {
                 Box::pin(async move {
                     crate::time::handle_timer(&notif, time_offset, notif_fd)
                 })
@@ -223,7 +224,7 @@ pub fn build_dispatch_table(
     {
         let policy = Arc::clone(policy);
         let resource = Arc::clone(resource);
-        table.register(libc::SYS_openat, Box::new(move |notif, state, notif_fd| {
+        table.register(libc::SYS_openat, Box::new(move |notif, state, _cow, notif_fd| {
             let policy = Arc::clone(&policy);
             let resource = Arc::clone(&resource);
             Box::pin(async move {
@@ -233,7 +234,7 @@ pub fn build_dispatch_table(
     }
     for &nr in &[libc::SYS_getdents64, libc::SYS_getdents as i64] {
         let policy = Arc::clone(policy);
-        table.register(nr, Box::new(move |notif, state, notif_fd| {
+        table.register(nr, Box::new(move |notif, state, _cow, notif_fd| {
             let policy = Arc::clone(&policy);
             Box::pin(async move {
                 crate::procfs::handle_getdents(&notif, &state, &policy, notif_fd).await
@@ -245,7 +246,7 @@ pub fn build_dispatch_table(
     // Virtual CPU count
     // ------------------------------------------------------------------
     if let Some(n) = policy.num_cpus {
-        table.register(libc::SYS_sched_getaffinity, Box::new(move |notif, _state, notif_fd| {
+        table.register(libc::SYS_sched_getaffinity, Box::new(move |notif, _state, _cow, notif_fd| {
             Box::pin(async move {
                 crate::procfs::handle_sched_getaffinity(&notif, n, notif_fd)
             })
@@ -258,13 +259,13 @@ pub fn build_dispatch_table(
     if let Some(ref hostname) = policy.hostname {
         let hostname = hostname.clone();
         let hostname2 = hostname.clone();
-        table.register(libc::SYS_uname, Box::new(move |notif, _state, notif_fd| {
+        table.register(libc::SYS_uname, Box::new(move |notif, _state, _cow, notif_fd| {
             let hostname = hostname.clone();
             Box::pin(async move {
                 crate::procfs::handle_uname(&notif, &hostname, notif_fd)
             })
         }));
-        table.register(libc::SYS_openat, Box::new(move |notif, _state, notif_fd| {
+        table.register(libc::SYS_openat, Box::new(move |notif, _state, _cow, notif_fd| {
             let hostname = hostname2.clone();
             Box::pin(async move {
                 if let Some(action) = crate::procfs::handle_hostname_open(&notif, &hostname, notif_fd) {
@@ -281,7 +282,7 @@ pub fn build_dispatch_table(
     // ------------------------------------------------------------------
     if policy.deterministic_dirs {
         for &nr in &[libc::SYS_getdents64, libc::SYS_getdents as i64] {
-            table.register(nr, Box::new(|notif, state, notif_fd| {
+            table.register(nr, Box::new(|notif, state, _cow, notif_fd| {
                 Box::pin(async move {
                     crate::procfs::handle_sorted_getdents(&notif, &state, notif_fd).await
                 })
@@ -293,7 +294,7 @@ pub fn build_dispatch_table(
     // Bind — on-behalf
     // ------------------------------------------------------------------
     if policy.port_remap || policy.has_net_allowlist {
-        table.register(libc::SYS_bind, Box::new(|notif, state, notif_fd| {
+        table.register(libc::SYS_bind, Box::new(|notif, state, _cow, notif_fd| {
             Box::pin(async move {
                 crate::port_remap::handle_bind(&notif, &state, notif_fd).await
             })
@@ -304,7 +305,7 @@ pub fn build_dispatch_table(
     // getsockname — port remap
     // ------------------------------------------------------------------
     if policy.port_remap {
-        table.register(libc::SYS_getsockname, Box::new(|notif, state, notif_fd| {
+        table.register(libc::SYS_getsockname, Box::new(|notif, state, _cow, notif_fd| {
             Box::pin(async move {
                 crate::port_remap::handle_getsockname(&notif, &state, notif_fd).await
             })
@@ -326,7 +327,7 @@ fn register_chroot_handlers(table: &mut DispatchTable, policy: &Arc<NotifPolicy>
     macro_rules! chroot_handler {
         ($policy:expr, $handler:expr) => {{
             let policy = Arc::clone($policy);
-            let handler_fn: HandlerFn = Box::new(move |notif, state, notif_fd| {
+            let handler_fn: HandlerFn = Box::new(move |notif, state, cow, notif_fd| {
                 let policy = Arc::clone(&policy);
                 Box::pin(async move {
                     let ctx = ChrootCtx {
@@ -336,7 +337,7 @@ fn register_chroot_handlers(table: &mut DispatchTable, policy: &Arc<NotifPolicy>
                         denied: &policy.chroot_denied,
                         mounts: &policy.chroot_mounts,
                     };
-                    $handler(&notif, &state, notif_fd, &ctx).await
+                    $handler(&notif, &state, &cow, notif_fd, &ctx).await
                 })
             });
             handler_fn
@@ -347,7 +348,7 @@ fn register_chroot_handlers(table: &mut DispatchTable, policy: &Arc<NotifPolicy>
     macro_rules! chroot_handler_fallthrough {
         ($policy:expr, $handler:expr) => {{
             let policy = Arc::clone($policy);
-            let handler_fn: HandlerFn = Box::new(move |notif, state, notif_fd| {
+            let handler_fn: HandlerFn = Box::new(move |notif, state, cow, notif_fd| {
                 let policy = Arc::clone(&policy);
                 Box::pin(async move {
                     let ctx = ChrootCtx {
@@ -357,7 +358,7 @@ fn register_chroot_handlers(table: &mut DispatchTable, policy: &Arc<NotifPolicy>
                         denied: &policy.chroot_denied,
                         mounts: &policy.chroot_mounts,
                     };
-                    $handler(&notif, &state, notif_fd, &ctx).await
+                    $handler(&notif, &state, &cow, notif_fd, &ctx).await
                 })
             });
             handler_fn
@@ -407,7 +408,7 @@ fn register_chroot_handlers(table: &mut DispatchTable, policy: &Arc<NotifPolicy>
     // chown — non-follow
     {
         let policy = Arc::clone(policy);
-        table.register(libc::SYS_chown as i64, Box::new(move |notif, state, notif_fd| {
+        table.register(libc::SYS_chown as i64, Box::new(move |notif, state, cow, notif_fd| {
             let policy = Arc::clone(&policy);
             Box::pin(async move {
                 let ctx = ChrootCtx {
@@ -417,7 +418,7 @@ fn register_chroot_handlers(table: &mut DispatchTable, policy: &Arc<NotifPolicy>
                     denied: &policy.chroot_denied,
                     mounts: &policy.chroot_mounts,
                 };
-                crate::chroot::dispatch::handle_chroot_legacy_chown(&notif, &state, notif_fd, &ctx, false).await
+                crate::chroot::dispatch::handle_chroot_legacy_chown(&notif, &state, &cow, notif_fd, &ctx, false).await
             })
         }));
     }
@@ -425,7 +426,7 @@ fn register_chroot_handlers(table: &mut DispatchTable, policy: &Arc<NotifPolicy>
     // lchown — follow
     {
         let policy = Arc::clone(policy);
-        table.register(libc::SYS_lchown as i64, Box::new(move |notif, state, notif_fd| {
+        table.register(libc::SYS_lchown as i64, Box::new(move |notif, state, cow, notif_fd| {
             let policy = Arc::clone(&policy);
             Box::pin(async move {
                 let ctx = ChrootCtx {
@@ -435,7 +436,7 @@ fn register_chroot_handlers(table: &mut DispatchTable, policy: &Arc<NotifPolicy>
                     denied: &policy.chroot_denied,
                     mounts: &policy.chroot_mounts,
                 };
-                crate::chroot::dispatch::handle_chroot_legacy_chown(&notif, &state, notif_fd, &ctx, true).await
+                crate::chroot::dispatch::handle_chroot_legacy_chown(&notif, &state, &cow, notif_fd, &ctx, true).await
             })
         }));
     }
@@ -496,9 +497,9 @@ fn register_cow_handlers(table: &mut DispatchTable) {
         libc::SYS_symlinkat, libc::SYS_linkat, libc::SYS_fchmodat,
         libc::SYS_fchownat, libc::SYS_truncate,
     ] {
-        table.register(nr, Box::new(|notif, state, notif_fd| {
+        table.register(nr, Box::new(|notif, _state, cow, notif_fd| {
             Box::pin(async move {
-                crate::cow::dispatch::handle_cow_write(&notif, &state, notif_fd).await
+                crate::cow::dispatch::handle_cow_write(&notif, &cow, notif_fd).await
             })
         }));
     }
@@ -511,9 +512,9 @@ fn register_cow_handlers(table: &mut DispatchTable) {
         libc::SYS_chmod as i64, libc::SYS_chown as i64,
         libc::SYS_lchown as i64,
     ] {
-        table.register(nr, Box::new(|notif, state, notif_fd| {
+        table.register(nr, Box::new(|notif, _state, cow, notif_fd| {
             Box::pin(async move {
-                crate::cow::dispatch::handle_cow_legacy_write(&notif, &state, notif_fd).await
+                crate::cow::dispatch::handle_cow_legacy_write(&notif, &cow, notif_fd).await
             })
         }));
     }
@@ -524,18 +525,18 @@ fn register_cow_handlers(table: &mut DispatchTable) {
         crate::cow::dispatch::SYS_FACCESSAT2,
         libc::SYS_access as i64,
     ] {
-        table.register(nr, Box::new(|notif, state, notif_fd| {
+        table.register(nr, Box::new(|notif, _state, cow, notif_fd| {
             Box::pin(async move {
-                crate::cow::dispatch::handle_cow_access(&notif, &state, notif_fd).await
+                crate::cow::dispatch::handle_cow_access(&notif, &cow, notif_fd).await
             })
         }));
     }
 
     // openat/open — fallthrough
     for &nr in &[libc::SYS_openat, libc::SYS_open as i64] {
-        table.register(nr, Box::new(|notif, state, notif_fd| {
+        table.register(nr, Box::new(|notif, _state, cow, notif_fd| {
             Box::pin(async move {
-                crate::cow::dispatch::handle_cow_open(&notif, &state, notif_fd).await
+                crate::cow::dispatch::handle_cow_open(&notif, &cow, notif_fd).await
             })
         }));
     }
@@ -546,34 +547,34 @@ fn register_cow_handlers(table: &mut DispatchTable) {
         libc::SYS_stat as i64, libc::SYS_lstat as i64,
         libc::SYS_access as i64,
     ] {
-        table.register(nr, Box::new(|notif, state, notif_fd| {
+        table.register(nr, Box::new(|notif, _state, cow, notif_fd| {
             Box::pin(async move {
-                crate::cow::dispatch::handle_cow_stat(&notif, &state, notif_fd).await
+                crate::cow::dispatch::handle_cow_stat(&notif, &cow, notif_fd).await
             })
         }));
     }
 
     // statx — fallthrough
-    table.register(libc::SYS_statx, Box::new(|notif, state, notif_fd| {
+    table.register(libc::SYS_statx, Box::new(|notif, _state, cow, notif_fd| {
         Box::pin(async move {
-            crate::cow::dispatch::handle_cow_statx(&notif, &state, notif_fd).await
+            crate::cow::dispatch::handle_cow_statx(&notif, &cow, notif_fd).await
         })
     }));
 
     // readlink — fallthrough
     for &nr in &[libc::SYS_readlinkat, libc::SYS_readlink as i64] {
-        table.register(nr, Box::new(|notif, state, notif_fd| {
+        table.register(nr, Box::new(|notif, _state, cow, notif_fd| {
             Box::pin(async move {
-                crate::cow::dispatch::handle_cow_readlink(&notif, &state, notif_fd).await
+                crate::cow::dispatch::handle_cow_readlink(&notif, &cow, notif_fd).await
             })
         }));
     }
 
     // getdents — fallthrough
     for &nr in &[libc::SYS_getdents64, libc::SYS_getdents as i64] {
-        table.register(nr, Box::new(|notif, state, notif_fd| {
+        table.register(nr, Box::new(|notif, _state, cow, notif_fd| {
             Box::pin(async move {
-                crate::cow::dispatch::handle_cow_getdents(&notif, &state, notif_fd).await
+                crate::cow::dispatch::handle_cow_getdents(&notif, &cow, notif_fd).await
             })
         }));
     }

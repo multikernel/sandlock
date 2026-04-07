@@ -9,7 +9,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::procfs::{build_dirent64, DT_DIR, DT_LNK, DT_REG};
-use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction, SupervisorState};
+use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction};
+use crate::seccomp::state::CowState;
 use crate::sys::structs::SeccompNotif;
 
 /// Read a NUL-terminated path from child memory (up to 4096 bytes for filesystem paths).
@@ -70,7 +71,7 @@ fn resolve_at_path(notif: &SeccompNotif, dirfd: i64, path: &str) -> String {
 /// openat(dirfd, pathname, flags, mode): args[0]=dirfd, args[1]=path, args[2]=flags
 pub(crate) async fn handle_cow_open(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
 ) -> NotifAction {
     use crate::cow::seccomp::CowOpenPlan;
@@ -87,8 +88,8 @@ pub(crate) async fn handle_cow_open(
 
     // Phase 1: determine plan under lock (no heavy I/O)
     let plan = {
-        let mut st = state.lock().await;
-        let cow = match st.cow_branch.as_mut() {
+        let mut st = cow_state.lock().await;
+        let cow = match st.branch.as_mut() {
             Some(c) => c,
             None => return NotifAction::Continue,
         };
@@ -142,8 +143,8 @@ pub(crate) async fn handle_cow_open(
                 Ok(Ok(())) => upper,
                 Ok(Err(_)) | Err(_) => {
                     // Copy failed — roll back quota and let kernel handle it
-                    let mut st = state.lock().await;
-                    if let Some(cow) = st.cow_branch.as_mut() {
+                    let mut st = cow_state.lock().await;
+                    if let Some(cow) = st.branch.as_mut() {
                         cow.rollback_copy(file_size);
                     }
                     return NotifAction::Continue;
@@ -180,7 +181,7 @@ pub(crate) async fn handle_cow_open(
 /// fchmodat, fchownat, utimensat, truncate.
 pub(crate) async fn handle_cow_write(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
 ) -> NotifAction {
     let nr = notif.data.nr as i64;
@@ -204,8 +205,8 @@ pub(crate) async fn handle_cow_write(
             None => return NotifAction::Continue,
         };
         let is_dir = (notif.data.args[2] & libc::AT_REMOVEDIR as u64) != 0;
-        let mut st = state.lock().await;
-        if let Some(cow) = st.cow_branch.as_mut() {
+        let mut st = cow_state.lock().await;
+        if let Some(cow) = st.branch.as_mut() {
             if cow.matches(&path) && cow.handle_unlink(&path, is_dir) {
                 return NotifAction::ReturnValue(0);
             }
@@ -217,8 +218,8 @@ pub(crate) async fn handle_cow_write(
             Some(p) => resolve_at_path(notif, dirfd, &p),
             None => return NotifAction::Continue,
         };
-        let mut st = state.lock().await;
-        if let Some(cow) = st.cow_branch.as_mut() {
+        let mut st = cow_state.lock().await;
+        if let Some(cow) = st.branch.as_mut() {
             if cow.matches(&path) {
                 try_cow!(cow, cow.handle_mkdir(&path));
             }
@@ -235,8 +236,8 @@ pub(crate) async fn handle_cow_write(
             Some(p) => resolve_at_path(notif, new_dirfd, &p),
             None => return NotifAction::Continue,
         };
-        let mut st = state.lock().await;
-        if let Some(cow) = st.cow_branch.as_mut() {
+        let mut st = cow_state.lock().await;
+        if let Some(cow) = st.branch.as_mut() {
             if cow.matches(&old_path) {
                 try_cow!(cow, cow.handle_rename(&old_path, &new_path));
             }
@@ -252,8 +253,8 @@ pub(crate) async fn handle_cow_write(
             Some(p) => resolve_at_path(notif, dirfd, &p),
             None => return NotifAction::Continue,
         };
-        let mut st = state.lock().await;
-        if let Some(cow) = st.cow_branch.as_mut() {
+        let mut st = cow_state.lock().await;
+        if let Some(cow) = st.branch.as_mut() {
             if cow.matches(&linkpath) {
                 try_cow!(cow, cow.handle_symlink(&target, &linkpath));
             }
@@ -270,8 +271,8 @@ pub(crate) async fn handle_cow_write(
             Some(p) => resolve_at_path(notif, new_dirfd, &p),
             None => return NotifAction::Continue,
         };
-        let mut st = state.lock().await;
-        if let Some(cow) = st.cow_branch.as_mut() {
+        let mut st = cow_state.lock().await;
+        if let Some(cow) = st.branch.as_mut() {
             if cow.matches(&new_path) {
                 try_cow!(cow, cow.handle_link(&old_path, &new_path));
             }
@@ -284,8 +285,8 @@ pub(crate) async fn handle_cow_write(
             None => return NotifAction::Continue,
         };
         let mode = (notif.data.args[2] & 0o7777) as u32;
-        let mut st = state.lock().await;
-        if let Some(cow) = st.cow_branch.as_mut() {
+        let mut st = cow_state.lock().await;
+        if let Some(cow) = st.branch.as_mut() {
             if cow.matches(&path) {
                 try_cow!(cow, cow.handle_chmod(&path, mode));
             }
@@ -299,8 +300,8 @@ pub(crate) async fn handle_cow_write(
         };
         let uid = notif.data.args[2] as u32;
         let gid = notif.data.args[3] as u32;
-        let mut st = state.lock().await;
-        if let Some(cow) = st.cow_branch.as_mut() {
+        let mut st = cow_state.lock().await;
+        if let Some(cow) = st.branch.as_mut() {
             if cow.matches(&path) {
                 try_cow!(cow, cow.handle_chown(&path, uid, gid));
             }
@@ -312,8 +313,8 @@ pub(crate) async fn handle_cow_write(
             None => return NotifAction::Continue,
         };
         let length = notif.data.args[1] as i64;
-        let mut st = state.lock().await;
-        if let Some(cow) = st.cow_branch.as_mut() {
+        let mut st = cow_state.lock().await;
+        if let Some(cow) = st.branch.as_mut() {
             if cow.matches(&path) {
                 try_cow!(cow, cow.handle_truncate(&path, length));
             }
@@ -331,7 +332,7 @@ pub(crate) async fn handle_cow_write(
 /// These are used by some libc implementations instead of the *at variants.
 pub(crate) async fn handle_cow_legacy_write(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
 ) -> NotifAction {
     let nr = notif.data.nr as i64;
@@ -352,8 +353,8 @@ pub(crate) async fn handle_cow_legacy_write(
             Some(p) => p,
             None => return NotifAction::Continue,
         };
-        let mut st = state.lock().await;
-        if let Some(cow) = st.cow_branch.as_mut() {
+        let mut st = cow_state.lock().await;
+        if let Some(cow) = st.branch.as_mut() {
             if cow.matches(&path) && cow.handle_unlink(&path, false) {
                 return NotifAction::ReturnValue(0);
             }
@@ -364,8 +365,8 @@ pub(crate) async fn handle_cow_legacy_write(
             Some(p) => p,
             None => return NotifAction::Continue,
         };
-        let mut st = state.lock().await;
-        if let Some(cow) = st.cow_branch.as_mut() {
+        let mut st = cow_state.lock().await;
+        if let Some(cow) = st.branch.as_mut() {
             if cow.matches(&path) && cow.handle_unlink(&path, true) {
                 return NotifAction::ReturnValue(0);
             }
@@ -376,8 +377,8 @@ pub(crate) async fn handle_cow_legacy_write(
             Some(p) => p,
             None => return NotifAction::Continue,
         };
-        let mut st = state.lock().await;
-        if let Some(cow) = st.cow_branch.as_mut() {
+        let mut st = cow_state.lock().await;
+        if let Some(cow) = st.branch.as_mut() {
             if cow.matches(&path) {
                 try_cow!(cow, cow.handle_mkdir(&path));
             }
@@ -392,8 +393,8 @@ pub(crate) async fn handle_cow_legacy_write(
             Some(p) => p,
             None => return NotifAction::Continue,
         };
-        let mut st = state.lock().await;
-        if let Some(cow) = st.cow_branch.as_mut() {
+        let mut st = cow_state.lock().await;
+        if let Some(cow) = st.branch.as_mut() {
             if cow.matches(&old_path) {
                 try_cow!(cow, cow.handle_rename(&old_path, &new_path));
             }
@@ -408,8 +409,8 @@ pub(crate) async fn handle_cow_legacy_write(
             Some(p) => p,
             None => return NotifAction::Continue,
         };
-        let mut st = state.lock().await;
-        if let Some(cow) = st.cow_branch.as_mut() {
+        let mut st = cow_state.lock().await;
+        if let Some(cow) = st.branch.as_mut() {
             if cow.matches(&linkpath) {
                 try_cow!(cow, cow.handle_symlink(&target, &linkpath));
             }
@@ -424,8 +425,8 @@ pub(crate) async fn handle_cow_legacy_write(
             Some(p) => p,
             None => return NotifAction::Continue,
         };
-        let mut st = state.lock().await;
-        if let Some(cow) = st.cow_branch.as_mut() {
+        let mut st = cow_state.lock().await;
+        if let Some(cow) = st.branch.as_mut() {
             if cow.matches(&new_path) {
                 try_cow!(cow, cow.handle_link(&old_path, &new_path));
             }
@@ -437,8 +438,8 @@ pub(crate) async fn handle_cow_legacy_write(
             None => return NotifAction::Continue,
         };
         let mode = (notif.data.args[1] & 0o7777) as u32;
-        let mut st = state.lock().await;
-        if let Some(cow) = st.cow_branch.as_mut() {
+        let mut st = cow_state.lock().await;
+        if let Some(cow) = st.branch.as_mut() {
             if cow.matches(&path) {
                 try_cow!(cow, cow.handle_chmod(&path, mode));
             }
@@ -451,8 +452,8 @@ pub(crate) async fn handle_cow_legacy_write(
         };
         let uid = notif.data.args[1] as u32;
         let gid = notif.data.args[2] as u32;
-        let mut st = state.lock().await;
-        if let Some(cow) = st.cow_branch.as_mut() {
+        let mut st = cow_state.lock().await;
+        if let Some(cow) = st.branch.as_mut() {
             if cow.matches(&path) {
                 try_cow!(cow, cow.handle_chown(&path, uid, gid));
             }
@@ -474,7 +475,7 @@ pub(crate) const SYS_FACCESSAT2: i64 = 439;
 /// don't fail before the COW layer can redirect their writes.
 pub(crate) async fn handle_cow_access(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
 ) -> NotifAction {
     let nr = notif.data.nr as i64;
@@ -501,8 +502,8 @@ pub(crate) async fn handle_cow_access(
         return NotifAction::Continue;
     }
 
-    let st = state.lock().await;
-    let cow = match st.cow_branch.as_ref() {
+    let st = cow_state.lock().await;
+    let cow = match st.branch.as_ref() {
         Some(c) => c,
         None => return NotifAction::Continue,
     };
@@ -530,7 +531,7 @@ pub(crate) async fn handle_cow_access(
 /// Actually, simpler: for stat, we do the stat ourselves and write the result.
 pub(crate) async fn handle_cow_stat(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
 ) -> NotifAction {
     let nr = notif.data.nr as i64;
@@ -543,8 +544,8 @@ pub(crate) async fn handle_cow_stat(
         None => return NotifAction::Continue,
     };
 
-    let st = state.lock().await;
-    let cow = match st.cow_branch.as_ref() {
+    let st = cow_state.lock().await;
+    let cow = match st.branch.as_ref() {
         Some(c) => c,
         None => return NotifAction::Continue,
     };
@@ -624,7 +625,7 @@ pub(crate) async fn handle_cow_stat(
 /// Handle statx — resolve path then let kernel handle (complex struct).
 pub(crate) async fn handle_cow_statx(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
 ) -> NotifAction {
     // statx(dirfd, pathname, flags, mask, statxbuf)
@@ -634,8 +635,8 @@ pub(crate) async fn handle_cow_statx(
         None => return NotifAction::Continue,
     };
 
-    let st = state.lock().await;
-    let cow = match st.cow_branch.as_ref() {
+    let st = cow_state.lock().await;
+    let cow = match st.branch.as_ref() {
         Some(c) => c,
         None => return NotifAction::Continue,
     };
@@ -653,7 +654,7 @@ pub(crate) async fn handle_cow_statx(
 /// Handle readlinkat — read symlink from upper/lower, write to child buffer.
 pub(crate) async fn handle_cow_readlink(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
 ) -> NotifAction {
     // readlinkat(dirfd, pathname, buf, bufsiz)
@@ -665,8 +666,8 @@ pub(crate) async fn handle_cow_readlink(
     let buf_addr = notif.data.args[2];
     let bufsiz = (notif.data.args[3] & 0xFFFFFFFF) as usize;
 
-    let st = state.lock().await;
-    let cow = match st.cow_branch.as_ref() {
+    let st = cow_state.lock().await;
+    let cow = match st.branch.as_ref() {
         Some(c) => c,
         None => return NotifAction::Continue,
     };
@@ -695,7 +696,7 @@ pub(crate) async fn handle_cow_readlink(
 /// Handle getdents64 for COW directories — merge upper + lower entries.
 pub(crate) async fn handle_cow_getdents(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
 ) -> NotifAction {
     let pid = notif.pid;
@@ -710,8 +711,8 @@ pub(crate) async fn handle_cow_getdents(
         Err(_) => return NotifAction::Continue,
     };
 
-    let mut st = state.lock().await;
-    let cow = match st.cow_branch.as_ref() {
+    let mut st = cow_state.lock().await;
+    let cow = match st.branch.as_ref() {
         Some(c) => c,
         None => return NotifAction::Continue,
     };
@@ -722,13 +723,13 @@ pub(crate) async fn handle_cow_getdents(
 
     // Build cache on first call; invalidate if fd was reused for a different dir.
     let cache_key = (pid as i32, child_fd);
-    if let Some((cached_target, _)) = st.cow_dir_cache.get(&cache_key) {
+    if let Some((cached_target, _)) = st.dir_cache.get(&cache_key) {
         if *cached_target != target {
-            st.cow_dir_cache.remove(&cache_key);
+            st.dir_cache.remove(&cache_key);
         }
     }
-    if !st.cow_dir_cache.contains_key(&cache_key) {
-        let cow = st.cow_branch.as_ref().unwrap();
+    if !st.dir_cache.contains_key(&cache_key) {
+        let cow = st.branch.as_ref().unwrap();
         let workdir_str = cow.workdir_str();
         let rel_path = if target == workdir_str {
             ".".to_string()
@@ -767,10 +768,10 @@ pub(crate) async fn handle_cow_getdents(
                 .unwrap_or(0);
             entries.push(build_dirent64(d_ino, d_off, d_type, name));
         }
-        st.cow_dir_cache.insert(cache_key, (target.clone(), entries));
+        st.dir_cache.insert(cache_key, (target.clone(), entries));
     }
 
-    let entries = match st.cow_dir_cache.get_mut(&cache_key) {
+    let entries = match st.dir_cache.get_mut(&cache_key) {
         Some((_, e)) => e,
         None => return NotifAction::Continue,
     };
@@ -789,7 +790,7 @@ pub(crate) async fn handle_cow_getdents(
         entries.drain(..consumed);
     }
     if entries.is_empty() {
-        st.cow_dir_cache.remove(&cache_key);
+        st.dir_cache.remove(&cache_key);
     }
     drop(st);
 

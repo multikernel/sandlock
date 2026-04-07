@@ -19,7 +19,7 @@ use crate::policy::{BranchAction, FsIsolation, Policy};
 use crate::result::{ExitStatus, RunResult};
 use crate::seccomp::ctx::SupervisorCtx;
 use crate::seccomp::notif::{self, NotifPolicy, SupervisorState};
-use crate::seccomp::state::ResourceState;
+use crate::seccomp::state::{CowState, ResourceState};
 use crate::sys::syscall;
 
 // ============================================================
@@ -88,6 +88,8 @@ pub struct Sandbox {
     supervisor_state: Option<Arc<Mutex<SupervisorState>>>,
     /// Shared resource state for freeze/thaw and loadavg support.
     supervisor_resource: Option<Arc<Mutex<ResourceState>>>,
+    /// Shared COW state for post-wait extraction.
+    supervisor_cow: Option<Arc<Mutex<CowState>>>,
     /// Control pipe for fork commands (parent end).
     ctrl_fd: Option<OwnedFd>,
     /// Stdout pipe read end (for fork clones — used by reduce).
@@ -146,6 +148,7 @@ impl Sandbox {
             seccomp_cow: None,
             supervisor_state: None,
             supervisor_resource: None,
+            supervisor_cow: None,
             ctrl_fd: None,
             stdout_pipe: None,
             init_fn: None,
@@ -458,9 +461,9 @@ impl Sandbox {
         // Extract seccomp COW branch while we're still in async context
         // (can properly .lock().await the tokio Mutex).  This avoids the
         // try_lock() race in sync drop() that could skip cleanup entirely.
-        if let Some(ref state) = self.supervisor_state {
-            let mut st = state.lock().await;
-            self.seccomp_cow = st.cow_branch.take();
+        if let Some(ref cow_state) = self.supervisor_cow {
+            let mut cow = cow_state.lock().await;
+            self.seccomp_cow = cow.branch.take();
         }
 
         // Drain captured stdout/stderr if available
@@ -905,12 +908,13 @@ impl Sandbox {
             sup_state.http_acl_orig_dest = self.http_acl_handle.as_ref().map(|h| h.orig_dest.clone());
 
             // Seccomp COW branch
+            let mut cow_state = CowState::new();
             if self.policy.workdir.is_some() && self.policy.fs_isolation == FsIsolation::None {
                 let workdir = self.policy.workdir.as_ref().unwrap();
                 let storage = self.policy.fs_storage.as_deref();
                 let max_disk = self.policy.max_disk.map(|b| b.0).unwrap_or(0);
                 match crate::cow::seccomp::SeccompCowBranch::create(workdir, storage, max_disk) {
-                    Ok(branch) => { sup_state.cow_branch = Some(branch); }
+                    Ok(branch) => { cow_state.branch = Some(branch); }
                     Err(e) => { eprintln!("sandlock: seccomp COW branch creation failed: {}", e); }
                 }
             }
@@ -953,9 +957,13 @@ impl Sandbox {
             let res_state = Arc::new(Mutex::new(res_state));
             self.supervisor_resource = Some(Arc::clone(&res_state));
 
+            let cow_state = Arc::new(Mutex::new(cow_state));
+            self.supervisor_cow = Some(Arc::clone(&cow_state));
+
             let ctx = Arc::new(SupervisorCtx {
                 state: Arc::clone(&sup_state),
                 resource: Arc::clone(&res_state),
+                cow: Arc::clone(&cow_state),
                 policy: Arc::new(notif_policy),
                 child_pidfd: child_pidfd_raw,
                 notif_fd: notif_raw_fd,

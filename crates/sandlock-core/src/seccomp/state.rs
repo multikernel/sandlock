@@ -43,3 +43,28 @@ impl ResourceState {
         }
     }
 }
+
+// ============================================================
+// CowState — copy-on-write filesystem state
+// ============================================================
+
+/// Copy-on-write filesystem state.
+///
+/// Extracted from `SupervisorState` so that COW handlers can lock this
+/// independently from other domain states.
+pub struct CowState {
+    /// Seccomp-based COW branch (None if COW disabled).
+    pub branch: Option<crate::cow::seccomp::SeccompCowBranch>,
+    /// Getdents cache for COW directories.
+    /// Value is (host_path, entries) to detect fd reuse and invalidate stale entries.
+    pub dir_cache: HashMap<(i32, u32), (String, Vec<Vec<u8>>)>,
+}
+
+impl CowState {
+    pub fn new() -> Self {
+        Self {
+            branch: None,
+            dir_cache: HashMap::new(),
+        }
+    }
+}

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use super::notif::{NotifPolicy, SupervisorState};
-use super::state::ResourceState;
+use super::state::{CowState, ResourceState};
 
 /// Holds all supervisor state and policy. Passed to every handler.
 /// Currently wraps the monolithic SupervisorState; domain states will
@@ -13,6 +13,8 @@ pub struct SupervisorCtx {
     pub state: Arc<Mutex<SupervisorState>>,
     /// Resource-limit state (memory, processes, checkpoint).
     pub resource: Arc<Mutex<ResourceState>>,
+    /// Copy-on-write filesystem state.
+    pub cow: Arc<Mutex<CowState>>,
     /// Immutable policy — no lock needed.
     pub policy: Arc<NotifPolicy>,
     /// pidfd for the child process (immutable after spawn).

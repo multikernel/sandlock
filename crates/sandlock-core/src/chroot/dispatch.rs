@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 
 use crate::chroot::resolve::{confine, openat2_in_root, resolve_existing_in_root, resolve_in_root, to_virtual_path};
 use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction, SupervisorState};
+use crate::seccomp::state::CowState;
 use crate::sys::structs::{SeccompNotif, SeccompNotifAddfd, SECCOMP_IOCTL_NOTIF_ADDFD};
 
 // ============================================================
@@ -233,11 +234,11 @@ fn last_errno(fallback: i32) -> i32 {
 /// Resolve host_path through COW (handle_stat), returning the real path.
 /// Falls back to host_path if COW is inactive or doesn't match.
 async fn cow_resolve(
-    state: &Arc<Mutex<SupervisorState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     host_path: &Path,
 ) -> Result<PathBuf, NotifAction> {
-    let st = state.lock().await;
-    if let Some(ref cow) = st.cow_branch {
+    let cs = cow_state.lock().await;
+    if let Some(ref cow) = cs.branch {
         let host_str = host_path.to_string_lossy();
         if cow.matches(&host_str) {
             return cow
@@ -307,6 +308,7 @@ pub(crate) const SYS_FACCESSAT2: i64 = 439;
 pub(crate) async fn handle_chroot_open(
     notif: &SeccompNotif,
     state: &Arc<Mutex<SupervisorState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
@@ -337,13 +339,13 @@ pub(crate) async fn handle_chroot_open(
 
     // COW path — COW operates on host paths, must use libc::open.
     {
-        let mut st = state.lock().await;
-        if let Some(cow) = st.cow_branch.as_mut() {
+        let mut cs = cow_state.lock().await;
+        if let Some(cow) = cs.branch.as_mut() {
             let host_str = host_path.to_string_lossy();
             if cow.matches(&host_str) {
                 match cow.handle_open(&host_str, flags) {
                     Ok(Some(real_path)) => {
-                        drop(st);
+                        drop(cs);
                         let c_path = match path_cstr(&real_path, libc::EINVAL) {
                             Ok(c) => c,
                             Err(a) => return a,
@@ -535,6 +537,7 @@ fn memfd_with_patched_interp(
 pub(crate) async fn handle_chroot_exec(
     notif: &SeccompNotif,
     state: &Arc<Mutex<SupervisorState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
@@ -701,6 +704,7 @@ pub(crate) async fn handle_chroot_exec(
 pub(crate) async fn handle_chroot_write(
     notif: &SeccompNotif,
     state: &Arc<Mutex<SupervisorState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
@@ -715,8 +719,8 @@ pub(crate) async fn handle_chroot_write(
         let is_dir = (notif.data.args[2] & libc::AT_REMOVEDIR as u64) != 0;
 
         {
-            let mut st = state.lock().await;
-            if let Some(cow) = st.cow_branch.as_mut() {
+            let mut cs = cow_state.lock().await;
+            if let Some(cow) = cs.branch.as_mut() {
                 let s = host_path.to_string_lossy();
                 if cow.matches(&s) && cow.handle_unlink(&s, is_dir) {
                     return NotifAction::ReturnValue(0);
@@ -738,8 +742,8 @@ pub(crate) async fn handle_chroot_write(
         let mode = notif.data.args[2] as u32;
 
         {
-            let mut st = state.lock().await;
-            if let Some(cow) = st.cow_branch.as_mut() {
+            let mut cs = cow_state.lock().await;
+            if let Some(cow) = cs.branch.as_mut() {
                 let s = host_path.to_string_lossy();
                 if cow.matches(&s) {
                     match cow.handle_mkdir(&s) {
@@ -775,8 +779,8 @@ pub(crate) async fn handle_chroot_write(
         }
 
         {
-            let mut st = state.lock().await;
-            if let Some(cow) = st.cow_branch.as_mut() {
+            let mut cs = cow_state.lock().await;
+            if let Some(cow) = cs.branch.as_mut() {
                 let old_str = old_host.to_string_lossy();
                 if cow.matches(&old_str) {
                     match cow.handle_rename(&old_str, &new_host.to_string_lossy()) {
@@ -814,8 +818,8 @@ pub(crate) async fn handle_chroot_write(
         if !ctx.can_write(&link_vp) { return NotifAction::Errno(libc::EACCES); }
 
         {
-            let mut st = state.lock().await;
-            if let Some(cow) = st.cow_branch.as_mut() {
+            let mut cs = cow_state.lock().await;
+            if let Some(cow) = cs.branch.as_mut() {
                 let s = host_link.to_string_lossy();
                 if cow.matches(&s) {
                     match cow.handle_symlink(&target, &s) {
@@ -857,8 +861,8 @@ pub(crate) async fn handle_chroot_write(
         if !ctx.can_write(&new_vp) { return NotifAction::Errno(libc::EACCES); }
 
         {
-            let mut st = state.lock().await;
-            if let Some(cow) = st.cow_branch.as_mut() {
+            let mut cs = cow_state.lock().await;
+            if let Some(cow) = cs.branch.as_mut() {
                 let s = new_host.to_string_lossy();
                 if cow.matches(&s) {
                     match cow.handle_link(&old_host.to_string_lossy(), &s) {
@@ -889,8 +893,8 @@ pub(crate) async fn handle_chroot_write(
         let mode = (notif.data.args[2] & 0o7777) as u32;
 
         {
-            let mut st = state.lock().await;
-            if let Some(cow) = st.cow_branch.as_mut() {
+            let mut cs = cow_state.lock().await;
+            if let Some(cow) = cs.branch.as_mut() {
                 let s = host_path.to_string_lossy();
                 if cow.matches(&s) {
                     match cow.handle_chmod(&s, mode) {
@@ -914,8 +918,8 @@ pub(crate) async fn handle_chroot_write(
         let gid = notif.data.args[3] as u32;
 
         {
-            let mut st = state.lock().await;
-            if let Some(cow) = st.cow_branch.as_mut() {
+            let mut cs = cow_state.lock().await;
+            if let Some(cow) = cs.branch.as_mut() {
                 let s = host_path.to_string_lossy();
                 if cow.matches(&s) {
                     match cow.handle_chown(&s, uid, gid) {
@@ -942,8 +946,8 @@ pub(crate) async fn handle_chroot_write(
         let length = notif.data.args[1] as i64;
 
         {
-            let mut st = state.lock().await;
-            if let Some(cow) = st.cow_branch.as_mut() {
+            let mut cs = cow_state.lock().await;
+            if let Some(cow) = cs.branch.as_mut() {
                 let s = host_path.to_string_lossy();
                 if cow.matches(&s) {
                     match cow.handle_truncate(&s, length) {
@@ -1003,6 +1007,7 @@ fn stat_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path) -> NotifAc
 pub(crate) async fn handle_chroot_stat(
     notif: &SeccompNotif,
     state: &Arc<Mutex<SupervisorState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
@@ -1022,7 +1027,7 @@ pub(crate) async fn handle_chroot_stat(
     };
     if !ctx.can_read(&vp) { return NotifAction::Errno(libc::EACCES); }
 
-    let real_path = match cow_resolve(state, &host_path).await {
+    let real_path = match cow_resolve(cow_state, &host_path).await {
         Ok(p) => p,
         Err(a) => return a,
     };
@@ -1045,6 +1050,7 @@ pub(crate) async fn handle_chroot_stat(
 pub(crate) async fn handle_chroot_statx(
     notif: &SeccompNotif,
     state: &Arc<Mutex<SupervisorState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
@@ -1070,7 +1076,7 @@ pub(crate) async fn handle_chroot_statx(
     };
     if !ctx.can_read(&vp) { return NotifAction::Errno(libc::EACCES); }
 
-    let real_path = match cow_resolve(state, &host_path).await {
+    let real_path = match cow_resolve(cow_state, &host_path).await {
         Ok(p) => p,
         Err(a) => return a,
     };
@@ -1100,6 +1106,7 @@ pub(crate) async fn handle_chroot_statx(
 pub(crate) async fn handle_chroot_readlink(
     notif: &SeccompNotif,
     state: &Arc<Mutex<SupervisorState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
@@ -1191,15 +1198,15 @@ pub(crate) async fn handle_chroot_readlink(
 
     // COW
     {
-        let st = state.lock().await;
-        if let Some(cow) = st.cow_branch.as_ref() {
+        let cs = cow_state.lock().await;
+        if let Some(cow) = cs.branch.as_ref() {
             let host_str = host_path.to_string_lossy();
             if cow.matches(&host_str) {
                 let target = match cow.handle_readlink(&host_str) {
                     Some(t) => t,
                     None => return NotifAction::Errno(libc::ENOENT),
                 };
-                drop(st);
+                drop(cs);
                 return write_target(target.as_bytes());
             }
         }
@@ -1226,6 +1233,7 @@ pub(crate) async fn handle_chroot_readlink(
 pub(crate) async fn handle_chroot_getdents(
     _notif: &SeccompNotif,
     _state: &Arc<Mutex<SupervisorState>>,
+    _cow_state: &Arc<Mutex<CowState>>,
     _notif_fd: RawFd,
     _ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
@@ -1244,6 +1252,7 @@ pub(crate) async fn handle_chroot_getdents(
 pub(crate) async fn handle_chroot_chdir(
     notif: &SeccompNotif,
     _state: &Arc<Mutex<SupervisorState>>,
+    _cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
@@ -1319,6 +1328,7 @@ pub(crate) async fn handle_chroot_chdir(
 pub(crate) async fn handle_chroot_getcwd(
     notif: &SeccompNotif,
     _state: &Arc<Mutex<SupervisorState>>,
+    _cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
@@ -1354,6 +1364,7 @@ pub(crate) async fn handle_chroot_getcwd(
 pub(crate) async fn handle_chroot_statfs(
     notif: &SeccompNotif,
     _state: &Arc<Mutex<SupervisorState>>,
+    _cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
@@ -1397,6 +1408,7 @@ pub(crate) async fn handle_chroot_statfs(
 pub(crate) async fn handle_chroot_utimensat(
     notif: &SeccompNotif,
     state: &Arc<Mutex<SupervisorState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
@@ -1420,7 +1432,7 @@ pub(crate) async fn handle_chroot_utimensat(
     };
     if !ctx.can_write(&vp) { return NotifAction::Errno(libc::EACCES); }
 
-    let real_path = match cow_resolve(state, &host_path).await {
+    let real_path = match cow_resolve(cow_state, &host_path).await {
         Ok(p) => p,
         Err(a) => return a,
     };
@@ -1471,6 +1483,7 @@ fn notif_with_args(notif: &SeccompNotif, args: [u64; 6]) -> SeccompNotif {
 pub(crate) async fn handle_chroot_legacy_open(
     notif: &SeccompNotif,
     state: &Arc<Mutex<SupervisorState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
@@ -1482,13 +1495,14 @@ pub(crate) async fn handle_chroot_legacy_open(
         notif.data.args[2], // mode
         0, 0,
     ]);
-    handle_chroot_open(&synth, state, notif_fd, ctx).await
+    handle_chroot_open(&synth, state, cow_state, notif_fd, ctx).await
 }
 
 /// SYS_stat(path, statbuf) → handle_chroot_stat via newfstatat(AT_FDCWD, path, statbuf, 0)
 pub(crate) async fn handle_chroot_legacy_stat(
     notif: &SeccompNotif,
     state: &Arc<Mutex<SupervisorState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
@@ -1499,13 +1513,14 @@ pub(crate) async fn handle_chroot_legacy_stat(
         0,                  // flags = 0 (follow symlinks)
         0, 0,
     ]);
-    handle_chroot_stat(&synth, state, notif_fd, ctx).await
+    handle_chroot_stat(&synth, state, cow_state, notif_fd, ctx).await
 }
 
 /// SYS_lstat(path, statbuf) → handle_chroot_stat via newfstatat(AT_FDCWD, path, statbuf, AT_SYMLINK_NOFOLLOW)
 pub(crate) async fn handle_chroot_legacy_lstat(
     notif: &SeccompNotif,
     state: &Arc<Mutex<SupervisorState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
@@ -1516,13 +1531,14 @@ pub(crate) async fn handle_chroot_legacy_lstat(
         libc::AT_SYMLINK_NOFOLLOW as u64,
         0, 0,
     ]);
-    handle_chroot_stat(&synth, state, notif_fd, ctx).await
+    handle_chroot_stat(&synth, state, cow_state, notif_fd, ctx).await
 }
 
 /// SYS_access(path, mode) → handle_chroot_stat via faccessat(AT_FDCWD, path, mode, 0)
 pub(crate) async fn handle_chroot_legacy_access(
     notif: &SeccompNotif,
     state: &Arc<Mutex<SupervisorState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
@@ -1536,13 +1552,14 @@ pub(crate) async fn handle_chroot_legacy_access(
         0, 0,
     ]);
     synth.data.nr = libc::SYS_faccessat as i32;
-    handle_chroot_stat(&synth, state, notif_fd, ctx).await
+    handle_chroot_stat(&synth, state, cow_state, notif_fd, ctx).await
 }
 
 /// SYS_readlink(path, buf, bufsiz) → handle_chroot_readlink via readlinkat(AT_FDCWD, path, buf, bufsiz)
 pub(crate) async fn handle_chroot_legacy_readlink(
     notif: &SeccompNotif,
     state: &Arc<Mutex<SupervisorState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
@@ -1553,13 +1570,14 @@ pub(crate) async fn handle_chroot_legacy_readlink(
         notif.data.args[2], // bufsiz
         0, 0,
     ]);
-    handle_chroot_readlink(&synth, state, notif_fd, ctx).await
+    handle_chroot_readlink(&synth, state, cow_state, notif_fd, ctx).await
 }
 
 /// SYS_unlink(path) → handle_chroot_write via unlinkat(AT_FDCWD, path, 0)
 pub(crate) async fn handle_chroot_legacy_unlink(
     notif: &SeccompNotif,
     state: &Arc<Mutex<SupervisorState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
@@ -1570,13 +1588,14 @@ pub(crate) async fn handle_chroot_legacy_unlink(
         0, 0, 0,
     ]);
     synth.data.nr = libc::SYS_unlinkat as i32;
-    handle_chroot_write(&synth, state, notif_fd, ctx).await
+    handle_chroot_write(&synth, state, cow_state, notif_fd, ctx).await
 }
 
 /// SYS_rmdir(path) → handle_chroot_write via unlinkat(AT_FDCWD, path, AT_REMOVEDIR)
 pub(crate) async fn handle_chroot_legacy_rmdir(
     notif: &SeccompNotif,
     state: &Arc<Mutex<SupervisorState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
@@ -1587,13 +1606,14 @@ pub(crate) async fn handle_chroot_legacy_rmdir(
         0, 0, 0,
     ]);
     synth.data.nr = libc::SYS_unlinkat as i32;
-    handle_chroot_write(&synth, state, notif_fd, ctx).await
+    handle_chroot_write(&synth, state, cow_state, notif_fd, ctx).await
 }
 
 /// SYS_mkdir(path, mode) → handle_chroot_write via mkdirat(AT_FDCWD, path, mode)
 pub(crate) async fn handle_chroot_legacy_mkdir(
     notif: &SeccompNotif,
     state: &Arc<Mutex<SupervisorState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
@@ -1604,13 +1624,14 @@ pub(crate) async fn handle_chroot_legacy_mkdir(
         0, 0, 0,
     ]);
     synth.data.nr = libc::SYS_mkdirat as i32;
-    handle_chroot_write(&synth, state, notif_fd, ctx).await
+    handle_chroot_write(&synth, state, cow_state, notif_fd, ctx).await
 }
 
 /// SYS_rename(oldpath, newpath) → handle_chroot_write via renameat2(AT_FDCWD, old, AT_FDCWD, new, 0)
 pub(crate) async fn handle_chroot_legacy_rename(
     notif: &SeccompNotif,
     state: &Arc<Mutex<SupervisorState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
@@ -1622,13 +1643,14 @@ pub(crate) async fn handle_chroot_legacy_rename(
         0, 0,
     ]);
     synth.data.nr = libc::SYS_renameat2 as i32;
-    handle_chroot_write(&synth, state, notif_fd, ctx).await
+    handle_chroot_write(&synth, state, cow_state, notif_fd, ctx).await
 }
 
 /// SYS_symlink(target, linkpath) → handle_chroot_write via symlinkat(target, AT_FDCWD, linkpath)
 pub(crate) async fn handle_chroot_legacy_symlink(
     notif: &SeccompNotif,
     state: &Arc<Mutex<SupervisorState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
@@ -1639,13 +1661,14 @@ pub(crate) async fn handle_chroot_legacy_symlink(
         0, 0, 0,
     ]);
     synth.data.nr = libc::SYS_symlinkat as i32;
-    handle_chroot_write(&synth, state, notif_fd, ctx).await
+    handle_chroot_write(&synth, state, cow_state, notif_fd, ctx).await
 }
 
 /// SYS_link(oldpath, newpath) → handle_chroot_write via linkat(AT_FDCWD, old, AT_FDCWD, new, 0)
 pub(crate) async fn handle_chroot_legacy_link(
     notif: &SeccompNotif,
     state: &Arc<Mutex<SupervisorState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
@@ -1657,13 +1680,14 @@ pub(crate) async fn handle_chroot_legacy_link(
         0, 0,
     ]);
     synth.data.nr = libc::SYS_linkat as i32;
-    handle_chroot_write(&synth, state, notif_fd, ctx).await
+    handle_chroot_write(&synth, state, cow_state, notif_fd, ctx).await
 }
 
 /// SYS_chmod(path, mode) → handle_chroot_write via fchmodat(AT_FDCWD, path, mode)
 pub(crate) async fn handle_chroot_legacy_chmod(
     notif: &SeccompNotif,
     state: &Arc<Mutex<SupervisorState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
@@ -1674,13 +1698,14 @@ pub(crate) async fn handle_chroot_legacy_chmod(
         0, 0, 0,
     ]);
     synth.data.nr = libc::SYS_fchmodat as i32;
-    handle_chroot_write(&synth, state, notif_fd, ctx).await
+    handle_chroot_write(&synth, state, cow_state, notif_fd, ctx).await
 }
 
 /// SYS_chown/lchown(path, uid, gid) → handle_chroot_write via fchownat(AT_FDCWD, path, uid, gid, flags)
 pub(crate) async fn handle_chroot_legacy_chown(
     notif: &SeccompNotif,
     state: &Arc<Mutex<SupervisorState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
     nofollow: bool,
@@ -1695,5 +1720,5 @@ pub(crate) async fn handle_chroot_legacy_chown(
         0,
     ]);
     synth.data.nr = libc::SYS_fchownat as i32;
-    handle_chroot_write(&synth, state, notif_fd, ctx).await
+    handle_chroot_write(&synth, state, cow_state, notif_fd, ctx).await
 }
