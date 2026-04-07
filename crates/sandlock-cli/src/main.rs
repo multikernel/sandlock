@@ -247,6 +247,8 @@ async fn main() -> Result<()> {
                 b = b.no_raw_sockets(base.no_raw_sockets);
                 b = b.no_udp(base.no_udp);
                 b = b.clean_env(base.clean_env);
+                if let Some(ref w) = base.workdir { b = b.workdir(w); }
+                if let Some(ref c) = base.cwd { b = b.cwd(c); }
                 b
             } else {
                 Policy::builder()
