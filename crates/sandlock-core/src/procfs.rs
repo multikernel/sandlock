@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction, NotifPolicy, SupervisorState};
+use crate::seccomp::state::ProcfsState;
 use crate::sys::structs::{SeccompNotif, EACCES};
 use crate::sys::syscall;
 
@@ -354,8 +355,9 @@ fn read_path(notif: &SeccompNotif, addr: u64, notif_fd: RawFd) -> Option<String>
 /// - Lets everything else through.
 pub(crate) async fn handle_proc_open(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    procfs: &Arc<Mutex<ProcfsState>>,
     resource: &Arc<Mutex<crate::seccomp::state::ResourceState>>,
+    state: &Arc<Mutex<SupervisorState>>,
     policy: &NotifPolicy,
     notif_fd: RawFd,
 ) -> NotifAction {
@@ -397,11 +399,11 @@ pub(crate) async fn handle_proc_open(
 
     // Virtualize /proc/loadavg when proc virtualization is active.
     if path == "/proc/loadavg" {
-        let st = state.lock().await;
+        let pfs = procfs.lock().await;
         let rs = resource.lock().await;
-        let total = st.proc_pids.len() as u32;
+        let total = pfs.proc_pids.len() as u32;
         let running = rs.proc_count;
-        let last_pid = st.proc_pids.iter().max().copied().unwrap_or(0);
+        let last_pid = pfs.proc_pids.iter().max().copied().unwrap_or(0);
         let content = generate_loadavg(&rs.load_avg, running, total, last_pid);
         return inject_memfd(&content);
     }
@@ -546,7 +548,7 @@ pub(crate) fn handle_hostname_open(
 /// regardless of filesystem internals.
 pub(crate) async fn handle_sorted_getdents(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    procfs: &Arc<Mutex<ProcfsState>>,
     notif_fd: RawFd,
 ) -> NotifAction {
     let pid = notif.pid;
@@ -555,11 +557,11 @@ pub(crate) async fn handle_sorted_getdents(
     let buf_size = (notif.data.args[2] & 0xFFFF_FFFF) as usize;
 
     let cache_key = (pid as i32, child_fd);
-    let mut st = state.lock().await;
+    let mut pfs = procfs.lock().await;
 
     // Build and cache sorted entries on first call for this (pid, fd) pair.
     // An empty Vec means "already fully consumed" — return 0 (EOF).
-    if !st.getdents_cache.contains_key(&cache_key) {
+    if !pfs.getdents_cache.contains_key(&cache_key) {
         let link_path = format!("/proc/{}/fd/{}", pid, child_fd);
         let dir_path = match std::fs::read_link(&link_path) {
             Ok(t) => t,
@@ -598,10 +600,10 @@ pub(crate) async fn handle_sorted_getdents(
             })
             .collect();
 
-        st.getdents_cache.insert(cache_key, entries);
+        pfs.getdents_cache.insert(cache_key, entries);
     }
 
-    let entries = match st.getdents_cache.get_mut(&cache_key) {
+    let entries = match pfs.getdents_cache.get_mut(&cache_key) {
         Some(e) => e,
         None => return NotifAction::Continue,
     };
@@ -626,7 +628,7 @@ pub(crate) async fn handle_sorted_getdents(
         entries.drain(..consumed);
     }
 
-    drop(st);
+    drop(pfs);
 
     if !result.is_empty() {
         if write_child_mem(notif_fd, notif.id, pid, buf_addr, &result).is_err() {
@@ -713,7 +715,7 @@ fn build_filtered_dirents(sandbox_pids: &HashSet<i32>) -> Vec<Vec<u8>> {
 /// set of entries that hides PIDs not belonging to the sandbox.
 pub(crate) async fn handle_getdents(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    procfs: &Arc<Mutex<ProcfsState>>,
     _policy: &NotifPolicy,
     notif_fd: RawFd,
 ) -> NotifAction {
@@ -733,15 +735,15 @@ pub(crate) async fn handle_getdents(
     }
 
     let cache_key = (pid as i32, child_fd);
-    let mut st = state.lock().await;
+    let mut pfs = procfs.lock().await;
 
     // Build and cache entries on first call for this (pid, fd) pair.
-    if !st.getdents_cache.contains_key(&cache_key) {
-        let entries = build_filtered_dirents(&st.proc_pids);
-        st.getdents_cache.insert(cache_key, entries);
+    if !pfs.getdents_cache.contains_key(&cache_key) {
+        let entries = build_filtered_dirents(&pfs.proc_pids);
+        pfs.getdents_cache.insert(cache_key, entries);
     }
 
-    let entries = match st.getdents_cache.get_mut(&cache_key) {
+    let entries = match pfs.getdents_cache.get_mut(&cache_key) {
         Some(e) => e,
         None => return NotifAction::Continue,
     };
@@ -766,7 +768,7 @@ pub(crate) async fn handle_getdents(
         entries.drain(..consumed);
     }
 
-    drop(st);
+    drop(pfs);
 
     // Write the result into the child's buffer and return the byte count.
     if !result.is_empty() {

@@ -3,7 +3,7 @@
 // Extracted from the monolithic `SupervisorState` so that resource-limit
 // handlers can lock this independently from other domain states.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Resource-limit runtime state shared across notification handlers.
 pub struct ResourceState {
@@ -40,6 +40,34 @@ impl ResourceState {
             held_notif_ids: Vec::new(),
             load_avg: crate::procfs::LoadAvg::new(),
             start_instant: std::time::Instant::now(),
+        }
+    }
+}
+
+// ============================================================
+// ProcfsState — /proc virtualization state
+// ============================================================
+
+/// /proc virtualization runtime state.
+///
+/// Extracted from `SupervisorState` so that /proc handlers can lock this
+/// independently from other domain states.
+pub struct ProcfsState {
+    /// PIDs belonging to the sandbox (for /proc PID filtering).
+    pub proc_pids: HashSet<i32>,
+    /// Cache of filtered dirent entries keyed by (pid, fd).
+    /// Populated on first getdents64 call for a /proc directory, drained on subsequent calls.
+    pub getdents_cache: HashMap<(i32, u32), Vec<Vec<u8>>>,
+    /// Base address of the last vDSO we patched (0 = not yet patched).
+    pub vdso_patched_addr: u64,
+}
+
+impl ProcfsState {
+    pub fn new() -> Self {
+        Self {
+            proc_pids: HashSet::new(),
+            getdents_cache: HashMap::new(),
+            vdso_patched_addr: 0,
         }
     }
 }

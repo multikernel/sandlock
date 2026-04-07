@@ -3,8 +3,8 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::seccomp::notif::{NotifAction, NotifPolicy, SupervisorState};
-use crate::seccomp::state::ResourceState;
+use crate::seccomp::notif::{NotifAction, NotifPolicy};
+use crate::seccomp::state::{ProcfsState, ResourceState};
 use crate::sys::structs::{
     SeccompNotif, CLONE_NS_FLAGS, EAGAIN, EPERM,
 };
@@ -19,11 +19,11 @@ const MAP_ANONYMOUS: u64 = 0x20;
 ///
 /// Enforces namespace creation ban, process limits, and checkpoint hold.
 /// Needs both `ResourceState` (for proc_count, hold_forks, etc.) and
-/// `SupervisorState` (for proc_pids).
+/// `ProcfsState` (for proc_pids).
 pub(crate) async fn handle_fork(
     notif: &SeccompNotif,
     resource: &Arc<Mutex<ResourceState>>,
-    state: &Arc<Mutex<SupervisorState>>,
+    procfs: &Arc<Mutex<ProcfsState>>,
     _policy: &NotifPolicy,
 ) -> NotifAction {
     let nr = notif.data.nr as i64;
@@ -57,8 +57,8 @@ pub(crate) async fn handle_fork(
     rs.proc_count += 1;
     drop(rs);
 
-    let mut st = state.lock().await;
-    st.proc_pids.insert(notif.pid as i32);
+    let mut pfs = procfs.lock().await;
+    pfs.proc_pids.insert(notif.pid as i32);
 
     NotifAction::Continue
 }

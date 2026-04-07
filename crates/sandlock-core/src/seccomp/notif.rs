@@ -68,17 +68,11 @@ pub enum NetworkPolicy {
 /// held_notif_ids, load_avg, start_instant, max_memory_bytes, max_processes)
 /// have been extracted to `ResourceState` in `state.rs`.
 pub struct SupervisorState {
-    pub proc_pids: HashSet<i32>,
     /// Global network policy: unrestricted or limited to a set of IPs.
     pub network_policy: NetworkPolicy,
     pub time_offset: Option<i64>,
     pub random_state: Option<ChaCha8Rng>,
     pub port_map: PortMap,
-    /// Cache of filtered dirent entries keyed by (pid, fd).
-    /// Populated on first getdents64 call for a /proc directory, drained on subsequent calls.
-    pub getdents_cache: HashMap<(i32, u32), Vec<Vec<u8>>>,
-    /// Base address of the last vDSO we patched (0 = not yet patched).
-    pub vdso_patched_addr: u64,
     /// pidfd for the child process (for pidfd_getfd on-behalf syscalls).
     pub child_pidfd: Option<RawFd>,
     /// Event sender for dynamic policy callback (None if no policy_fn).
@@ -110,13 +104,10 @@ impl SupervisorState {
         random_state: Option<ChaCha8Rng>,
     ) -> Self {
         Self {
-            proc_pids: HashSet::new(),
             network_policy: NetworkPolicy::Unrestricted,
             time_offset,
             random_state,
             port_map: PortMap::new(),
-            getdents_cache: HashMap::new(),
-            vdso_patched_addr: 0,
             child_pidfd: None,
             policy_event_tx: None,
             pid_ip_overrides: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -475,17 +466,17 @@ fn send_response(fd: RawFd, id: u64, action: NotifAction) -> io::Result<()> {
 // ============================================================
 
 /// Re-patch the vDSO if the base address changed (e.g. after exec replaces it).
-fn maybe_patch_vdso(pid: i32, state: &mut SupervisorState, policy: &NotifPolicy) {
+fn maybe_patch_vdso(pid: i32, procfs: &mut super::state::ProcfsState, policy: &NotifPolicy) {
     let base = match crate::vdso::find_vdso_base(pid) {
         Ok(addr) => addr,
         Err(_) => return,
     };
-    if base == state.vdso_patched_addr {
+    if base == procfs.vdso_patched_addr {
         return; // already patched this vDSO
     }
     let time_offset = if policy.has_time_start { Some(policy.time_offset) } else { None };
     if crate::vdso::patch(pid, time_offset, policy.has_random_seed).is_ok() {
-        state.vdso_patched_addr = base;
+        procfs.vdso_patched_addr = base;
     }
 }
 
@@ -788,8 +779,8 @@ async fn handle_notification(
 
     // Re-patch vDSO if needed (exec replaces it with a fresh copy).
     if policy.has_time_start || policy.has_random_seed {
-        let mut st = state.lock().await;
-        maybe_patch_vdso(notif.pid as i32, &mut st, policy);
+        let mut pfs = ctx.procfs.lock().await;
+        maybe_patch_vdso(notif.pid as i32, &mut pfs, policy);
     }
 
     // Check dynamic path denials before dispatch
@@ -803,7 +794,7 @@ async fn handle_notification(
             NotifAction::Errno(libc::EACCES)
         } else {
             drop(st);
-            dispatch_table.dispatch(notif, state, &ctx.cow, fd).await
+            dispatch_table.dispatch(notif, state, &ctx.cow, &ctx.procfs, fd).await
         }
     };
 
@@ -836,7 +827,7 @@ pub async fn supervisor(
     let fd = notif_fd.as_raw_fd();
 
     // Build the dispatch table once at startup.
-    let dispatch_table = Arc::new(super::dispatch::build_dispatch_table(&ctx.policy, &ctx.resource));
+    let dispatch_table = Arc::new(super::dispatch::build_dispatch_table(&ctx.policy, &ctx.resource, &ctx.procfs));
 
     // Try to enable sync wakeup (Linux 6.7+, ignore error on older kernels).
     try_set_sync_wakeup(fd);
@@ -906,7 +897,6 @@ mod tests {
     #[test]
     fn test_supervisor_state_new() {
         let state = SupervisorState::new(None, None);
-        assert!(state.proc_pids.is_empty());
         assert!(matches!(state.network_policy, NetworkPolicy::Unrestricted));
         assert!(state.time_offset.is_none());
         assert!(state.random_state.is_none());

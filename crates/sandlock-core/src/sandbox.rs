@@ -19,7 +19,7 @@ use crate::policy::{BranchAction, FsIsolation, Policy};
 use crate::result::{ExitStatus, RunResult};
 use crate::seccomp::ctx::SupervisorCtx;
 use crate::seccomp::notif::{self, NotifPolicy, SupervisorState};
-use crate::seccomp::state::{CowState, ResourceState};
+use crate::seccomp::state::{CowState, ProcfsState, ResourceState};
 use crate::sys::syscall;
 
 // ============================================================
@@ -892,8 +892,9 @@ impl Sandbox {
                 sup_state.child_pidfd = Some(pfd.as_raw_fd());
             }
 
-            // Seed proc_pids with the initial child so /proc filtering includes it.
-            sup_state.proc_pids.insert(pid);
+            // Create ProcfsState and seed proc_pids with the initial child.
+            let mut procfs_state = ProcfsState::new();
+            procfs_state.proc_pids.insert(pid);
 
             // Create ResourceState for memory/process limits.
             let mut res_state = ResourceState::new(
@@ -960,10 +961,13 @@ impl Sandbox {
             let cow_state = Arc::new(Mutex::new(cow_state));
             self.supervisor_cow = Some(Arc::clone(&cow_state));
 
+            let procfs_state = Arc::new(Mutex::new(procfs_state));
+
             let ctx = Arc::new(SupervisorCtx {
                 state: Arc::clone(&sup_state),
                 resource: Arc::clone(&res_state),
                 cow: Arc::clone(&cow_state),
+                procfs: Arc::clone(&procfs_state),
                 policy: Arc::new(notif_policy),
                 child_pidfd: child_pidfd_raw,
                 notif_fd: notif_raw_fd,
