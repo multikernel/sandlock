@@ -839,16 +839,11 @@ pub(crate) async fn handle_cow_chdir(
     }
 
     // Check if it exists in the upper layer.
-    let rel = abs_path
-        .strip_prefix(&format!("{}/", cow.workdir_str()))
-        .or_else(|| {
-            if abs_path == cow.workdir_str() { Some(".") } else { None }
-        });
-    let rel = match rel {
+    let rel = match cow.safe_rel(&abs_path) {
         Some(r) => r,
         None => return NotifAction::Continue,
     };
-    let upper_path = cow.upper_dir().join(rel);
+    let upper_path = cow.upper_dir().join(&rel);
     drop(st);
 
     // If the directory exists on the real filesystem, let the kernel handle it.

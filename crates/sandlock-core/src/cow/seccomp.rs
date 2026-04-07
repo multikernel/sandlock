@@ -121,9 +121,10 @@ impl SeccompCowBranch {
         self.has_changes
     }
 
-    /// Check if a path is under the workdir.
+    /// Check if a path is under the workdir (but not inside the COW storage).
     pub fn matches(&self, path: &str) -> bool {
-        std::path::Path::new(path).starts_with(&self.workdir_str)
+        let p = std::path::Path::new(path);
+        p.starts_with(&self.workdir_str) && !p.starts_with(&self.storage_dir)
     }
 
     /// Check if a path has been modified or deleted in the COW layer.
