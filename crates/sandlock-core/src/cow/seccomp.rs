@@ -20,6 +20,26 @@ const O_EXCL: u64 = 0o200;
 const O_DIRECTORY: u64 = 0o200000;
 const WRITE_FLAGS: u64 = O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND;
 
+/// Plan returned by `prepare_open` — describes what I/O to do after releasing the lock.
+#[derive(Debug)]
+pub enum CowOpenPlan {
+    /// No interception needed — let the kernel handle it.
+    Skip,
+    /// File already resolved (upper or lower) — open this path directly.
+    Resolved(PathBuf),
+    /// Need to copy lower to upper, then open upper.
+    NeedsCopy {
+        upper: PathBuf,
+        lower: PathBuf,
+        file_size: u64,
+        rel_path: String,
+    },
+    /// Upper path ready (already exists in upper, or new file placeholder).
+    UpperReady {
+        upper: PathBuf,
+    },
+}
+
 /// Recursively compute the total size of all files under `dir`.
 fn dir_size(dir: &Path) -> u64 {
     let mut total = 0u64;
@@ -293,6 +313,129 @@ impl SeccompCowBranch {
                 Ok(None)
             }
         }
+    }
+
+    /// Prepare an open without doing the file copy.
+    ///
+    /// Returns a plan that describes what I/O needs to happen after the lock
+    /// is released. This keeps the lock held only for metadata checks.
+    pub fn prepare_open(&mut self, path: &str, flags: u64) -> Result<CowOpenPlan, BranchError> {
+        if flags & O_DIRECTORY != 0 {
+            return Ok(CowOpenPlan::Skip);
+        }
+        let rel = match self.safe_rel(path) {
+            Some(r) => r,
+            None => return Ok(CowOpenPlan::Skip),
+        };
+
+        let is_write = flags & WRITE_FLAGS != 0;
+
+        // Resync quota accounting before any write open.
+        if is_write && self.max_disk_bytes > 0 {
+            self.recalc_disk_used();
+            self.check_quota(0)?;
+        }
+
+        if self.is_deleted(&rel) {
+            if flags & O_CREAT != 0 {
+                return self.prepare_cow_copy(&rel);
+            }
+            return Ok(CowOpenPlan::Skip);
+        }
+
+        // O_EXCL: fail if file already exists
+        if flags & O_CREAT != 0 && flags & O_EXCL != 0 {
+            let upper_file = self.upper.join(&rel);
+            let lower_file = self.workdir.join(&rel);
+            if upper_file.exists() || upper_file.is_symlink()
+                || lower_file.exists() || lower_file.is_symlink()
+            {
+                return Err(BranchError::Exists);
+            }
+            return self.prepare_cow_copy(&rel);
+        }
+
+        if is_write {
+            self.prepare_cow_copy(&rel)
+        } else {
+            let resolved = self.resolve_read(&rel);
+            if resolved.exists() || resolved.is_symlink() {
+                Ok(CowOpenPlan::Resolved(resolved))
+            } else {
+                Ok(CowOpenPlan::Skip)
+            }
+        }
+    }
+
+    /// Prepare a COW copy — determine what I/O is needed without doing it.
+    ///
+    /// Updates metadata (deleted set, has_changes, quota reservation) but
+    /// defers the actual `fs::copy()` to the caller.
+    fn prepare_cow_copy(&mut self, rel_path: &str) -> Result<CowOpenPlan, BranchError> {
+        self.deleted.remove(rel_path);
+        self.has_changes = true;
+
+        let upper_file = self.upper.join(rel_path);
+        let lower_file = self.workdir.join(rel_path);
+
+        // Already in upper — no copy needed
+        if upper_file.exists() || upper_file.is_symlink() {
+            return Ok(CowOpenPlan::UpperReady { upper: upper_file });
+        }
+
+        // Create parent dirs in upper
+        if let Some(parent) = upper_file.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| BranchError::Operation(format!("create parent: {}", e)))?;
+        }
+
+        // Symlink — copy immediately (tiny, not worth spawn_blocking)
+        if lower_file.is_symlink() {
+            self.check_quota(256)?;
+            let target = fs::read_link(&lower_file)
+                .map_err(|e| BranchError::Operation(format!("readlink: {}", e)))?;
+            std::os::unix::fs::symlink(&target, &upper_file)
+                .map_err(|e| BranchError::Operation(format!("symlink: {}", e)))?;
+            self.disk_used += 256;
+            return Ok(CowOpenPlan::UpperReady { upper: upper_file });
+        }
+
+        // Directory — create immediately (no data copy)
+        if lower_file.is_dir() {
+            self.check_quota(4096)?;
+            fs::create_dir_all(&upper_file)
+                .map_err(|e| BranchError::Operation(format!("create dir: {}", e)))?;
+            if let Ok(meta) = lower_file.metadata() {
+                let _ = fs::set_permissions(&upper_file, meta.permissions());
+            }
+            self.disk_used += 4096;
+            return Ok(CowOpenPlan::UpperReady { upper: upper_file });
+        }
+
+        // Regular file that exists in lower — needs copy (potentially large)
+        if lower_file.exists() {
+            let meta = lower_file.metadata()
+                .map_err(|e| BranchError::Operation(format!("metadata: {}", e)))?;
+            let file_size = meta.len();
+            self.check_quota(file_size)?;
+            // Reserve the quota now; actual copy happens outside the lock
+            self.disk_used += file_size;
+            return Ok(CowOpenPlan::NeedsCopy {
+                upper: upper_file,
+                lower: lower_file,
+                file_size,
+                rel_path: rel_path.to_string(),
+            });
+        }
+
+        // New file (not in lower) — just a placeholder in upper
+        self.check_quota(0)?;
+        Ok(CowOpenPlan::UpperReady { upper: upper_file })
+    }
+
+    /// Roll back quota reservation if the copy failed.
+    pub fn rollback_copy(&mut self, file_size: u64) {
+        self.disk_used = self.disk_used.saturating_sub(file_size);
     }
 
     /// Handle unlink/rmdir.
@@ -1103,5 +1246,74 @@ mod tests {
         let flags = 0o1 | 0o100 | 0o200;
         let err = branch.handle_open(&path, flags).unwrap_err();
         assert!(matches!(err, BranchError::Exists));
+    }
+
+    #[test]
+    fn test_prepare_open_read_unmodified_skips() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let path = abs(&branch, "existing.txt");
+        // O_RDONLY
+        let plan = branch.prepare_open(&path, 0).unwrap();
+        assert!(matches!(plan, CowOpenPlan::Resolved(_)));
+    }
+
+    #[test]
+    fn test_prepare_open_write_existing_needs_copy() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let path = abs(&branch, "existing.txt");
+        // O_WRONLY
+        let plan = branch.prepare_open(&path, 0o1).unwrap();
+        assert!(matches!(plan, CowOpenPlan::NeedsCopy { .. }));
+    }
+
+    #[test]
+    fn test_prepare_open_write_already_in_upper() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        branch.ensure_cow_copy("existing.txt").unwrap();
+        let path = abs(&branch, "existing.txt");
+        let plan = branch.prepare_open(&path, 0o1).unwrap();
+        assert!(matches!(plan, CowOpenPlan::UpperReady { .. }));
+    }
+
+    #[test]
+    fn test_prepare_open_new_file() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let path = abs(&branch, "brand_new.txt");
+        // O_WRONLY | O_CREAT
+        let plan = branch.prepare_open(&path, 0o1 | 0o100).unwrap();
+        assert!(matches!(plan, CowOpenPlan::UpperReady { .. }));
+    }
+
+    #[test]
+    fn test_prepare_open_excl_existing_returns_exists() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let path = abs(&branch, "existing.txt");
+        let flags = 0o1 | 0o100 | 0o200;
+        let err = branch.prepare_open(&path, flags).unwrap_err();
+        assert!(matches!(err, BranchError::Exists));
+    }
+
+    #[test]
+    fn test_prepare_open_quota_reserves_before_copy() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 100).unwrap();
+        let path = abs(&branch, "existing.txt");
+        let plan = branch.prepare_open(&path, 0o1).unwrap();
+        assert!(matches!(plan, CowOpenPlan::NeedsCopy { file_size: 5, .. }));
+        assert_eq!(branch.disk_used, 5);
+    }
+
+    #[test]
+    fn test_rollback_copy() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 100).unwrap();
+        branch.disk_used = 50;
+        branch.rollback_copy(30);
+        assert_eq!(branch.disk_used, 20);
     }
 }

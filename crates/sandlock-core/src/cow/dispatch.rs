@@ -73,6 +73,8 @@ pub(crate) async fn handle_cow_open(
     state: &Arc<Mutex<SupervisorState>>,
     notif_fd: RawFd,
 ) -> NotifAction {
+    use crate::cow::seccomp::CowOpenPlan;
+
     let dirfd = notif.data.args[0] as i64;
     let path_ptr = notif.data.args[1];
     let flags = notif.data.args[2];
@@ -83,35 +85,74 @@ pub(crate) async fn handle_cow_open(
     };
     let path = resolve_at_path(notif, dirfd, &rel_path);
 
-    let mut st = state.lock().await;
-    let cow = match st.cow_branch.as_mut() {
-        Some(c) => c,
-        None => return NotifAction::Continue,
+    // Phase 1: determine plan under lock (no heavy I/O)
+    let plan = {
+        let mut st = state.lock().await;
+        let cow = match st.cow_branch.as_mut() {
+            Some(c) => c,
+            None => return NotifAction::Continue,
+        };
+
+        if !cow.matches(&path) {
+            return NotifAction::Continue;
+        }
+
+        // Read-only opens don't need interception unless the file was
+        // modified or deleted in the COW layer.
+        const WRITE_FLAGS: u64 = 0o1 | 0o2 | 0o100 | 0o1000 | 0o2000;
+        let is_write = flags & WRITE_FLAGS != 0;
+        if !is_write && !cow.needs_read_intercept(&path) {
+            return NotifAction::Continue;
+        }
+
+        match cow.prepare_open(&path, flags) {
+            Ok(plan) => plan,
+            Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
+            Err(crate::error::BranchError::Exists) => return NotifAction::Errno(libc::EEXIST),
+            Err(_) => return NotifAction::Continue,
+        }
+    };
+    // Lock is released here
+
+    // Phase 2: execute I/O plan without holding the lock
+    let real_path = match plan {
+        CowOpenPlan::Skip => return NotifAction::Continue,
+        CowOpenPlan::Resolved(p) | CowOpenPlan::UpperReady { upper: p } => p,
+        CowOpenPlan::NeedsCopy { upper, lower, file_size, rel_path: _rel } => {
+            // Do the potentially-expensive copy on a blocking thread
+            let upper_clone = upper.clone();
+            let copy_result = tokio::task::spawn_blocking(move || {
+                match std::fs::copy(&lower, &upper_clone) {
+                    Ok(_) => {
+                        // Preserve permissions
+                        if let Ok(meta) = lower.metadata() {
+                            let _ = std::fs::set_permissions(&upper_clone, meta.permissions());
+                        }
+                        Ok(())
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                        // Can't read the lower file — create empty fallback
+                        std::fs::File::create(&upper_clone).map(|_| ())
+                    }
+                    Err(e) => Err(e),
+                }
+            }).await;
+
+            match copy_result {
+                Ok(Ok(())) => upper,
+                Ok(Err(_)) | Err(_) => {
+                    // Copy failed — roll back quota and let kernel handle it
+                    let mut st = state.lock().await;
+                    if let Some(cow) = st.cow_branch.as_mut() {
+                        cow.rollback_copy(file_size);
+                    }
+                    return NotifAction::Continue;
+                }
+            }
+        }
     };
 
-    if !cow.matches(&path) {
-        return NotifAction::Continue;
-    }
-
-    // Read-only opens don't need interception unless the file was
-    // modified or deleted in the COW layer. This avoids routing every
-    // read through the supervisor when workdir is broad (e.g. "/").
-    const WRITE_FLAGS: u64 = 0o1 | 0o2 | 0o100 | 0o1000 | 0o2000; // O_WRONLY|O_RDWR|O_CREAT|O_TRUNC|O_APPEND
-    let is_write = flags & WRITE_FLAGS != 0;
-    if !is_write && !cow.needs_read_intercept(&path) {
-        return NotifAction::Continue;
-    }
-
-    let real_path = match cow.handle_open(&path, flags) {
-        Ok(Some(p)) => p,
-        Ok(None) => return NotifAction::Continue,
-        Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
-        Err(crate::error::BranchError::Exists) => return NotifAction::Errno(libc::EEXIST),
-        Err(_) => return NotifAction::Continue,
-    };
-    drop(st);
-
-    // Open the resolved path in the supervisor and inject the fd
+    // Phase 3: open the resolved path and inject fd
     let c_path = match std::ffi::CString::new(real_path.to_str().unwrap_or("")) {
         Ok(c) => c,
         Err(_) => return NotifAction::Continue,
@@ -121,7 +162,6 @@ pub(crate) async fn handle_cow_open(
         return NotifAction::Continue;
     }
 
-    // Wrap in OwnedFd — send_response will close it after the ioctl.
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
     NotifAction::InjectFdSend { srcfd: owned }
 }
