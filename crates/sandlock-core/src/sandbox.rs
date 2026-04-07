@@ -18,8 +18,8 @@ use crate::network;
 use crate::policy::{BranchAction, FsIsolation, Policy};
 use crate::result::{ExitStatus, RunResult};
 use crate::seccomp::ctx::SupervisorCtx;
-use crate::seccomp::notif::{self, NotifPolicy, SupervisorState};
-use crate::seccomp::state::{CowState, ProcfsState, ResourceState};
+use crate::seccomp::notif::{self, NotifPolicy};
+use crate::seccomp::state::{ChrootState, CowState, NetworkState, PolicyFnState, ProcfsState, ResourceState, TimeRandomState};
 use crate::sys::syscall;
 
 // ============================================================
@@ -84,8 +84,6 @@ pub struct Sandbox {
     cow_branch: Option<Box<dyn CowBranch>>,
     /// Seccomp COW branch extracted from supervisor state after child exits.
     seccomp_cow: Option<crate::cow::seccomp::SeccompCowBranch>,
-    /// Shared supervisor state for freeze/thaw support.
-    supervisor_state: Option<Arc<Mutex<SupervisorState>>>,
     /// Shared resource state for freeze/thaw and loadavg support.
     supervisor_resource: Option<Arc<Mutex<ResourceState>>>,
     /// Shared COW state for post-wait extraction.
@@ -146,7 +144,6 @@ impl Sandbox {
             _stderr_read: None,
             cow_branch: None,
             seccomp_cow: None,
-            supervisor_state: None,
             supervisor_resource: None,
             supervisor_cow: None,
             ctrl_fd: None,
@@ -870,45 +867,39 @@ impl Sandbox {
                 has_http_acl: !self.policy.http_allow.is_empty() || !self.policy.http_deny.is_empty(),
             };
 
-            // Create SupervisorState
+            // Create domain states
             use rand::SeedableRng;
             use rand_chacha::ChaCha8Rng;
 
             let random_state = self.policy.random_seed.map(|seed| ChaCha8Rng::seed_from_u64(seed));
             let time_offset = self.policy.time_start.map(|t| crate::time::calculate_time_offset(t));
 
-            let mut sup_state = SupervisorState::new(
-                time_offset,
-                random_state,
-            );
-            sup_state.network_policy = if self.policy.net_allow_hosts.is_empty() {
+            // TimeRandomState
+            let time_random_state = TimeRandomState::new(time_offset, random_state);
+
+            // NetworkState
+            let mut net_state = NetworkState::new();
+            net_state.network_policy = if self.policy.net_allow_hosts.is_empty() {
                 crate::seccomp::notif::NetworkPolicy::Unrestricted
             } else {
                 crate::seccomp::notif::NetworkPolicy::AllowList(resolved_ips)
             };
+            net_state.http_acl_addr = self.http_acl_handle.as_ref().map(|h| h.addr);
+            net_state.http_acl_ports = self.policy.http_ports.iter().copied().collect();
+            net_state.http_acl_orig_dest = self.http_acl_handle.as_ref().map(|h| h.orig_dest.clone());
 
-            if let Some(ref pfd) = pidfd {
-                use std::os::unix::io::AsRawFd;
-                sup_state.child_pidfd = Some(pfd.as_raw_fd());
-            }
-
-            // Create ProcfsState and seed proc_pids with the initial child.
+            // ProcfsState
             let mut procfs_state = ProcfsState::new();
             procfs_state.proc_pids.insert(pid);
 
-            // Create ResourceState for memory/process limits.
+            // ResourceState
             let mut res_state = ResourceState::new(
                 notif_policy.max_memory_bytes,
                 notif_policy.max_processes,
             );
-            // Count the initial child for the concurrent process limit.
             res_state.proc_count = 1;
 
-            sup_state.http_acl_addr = self.http_acl_handle.as_ref().map(|h| h.addr);
-            sup_state.http_acl_ports = self.policy.http_ports.iter().copied().collect();
-            sup_state.http_acl_orig_dest = self.http_acl_handle.as_ref().map(|h| h.orig_dest.clone());
-
-            // Seccomp COW branch
+            // CowState
             let mut cow_state = CowState::new();
             if self.policy.workdir.is_some() && self.policy.fs_isolation == FsIsolation::None {
                 let workdir = self.policy.workdir.as_ref().unwrap();
@@ -920,8 +911,10 @@ impl Sandbox {
                 }
             }
 
-            // Policy callback thread
-            if let Ok(mut denied) = sup_state.denied_paths.write() {
+            // PolicyFnState
+            let mut policy_fn_state = PolicyFnState::new();
+
+            if let Ok(mut denied) = policy_fn_state.denied_paths.write() {
                 for path in &self.policy.fs_denied {
                     denied.insert(path.to_string_lossy().into_owned());
                 }
@@ -929,7 +922,7 @@ impl Sandbox {
 
             if let Some(ref callback) = self.policy.policy_fn {
                 let live = crate::policy_fn::LivePolicy {
-                    allowed_ips: match &sup_state.network_policy {
+                    allowed_ips: match &net_state.network_policy {
                         crate::seccomp::notif::NetworkPolicy::AllowList(ips) => ips.clone(),
                         crate::seccomp::notif::NetworkPolicy::Unrestricted => std::collections::HashSet::new(),
                     },
@@ -938,22 +931,21 @@ impl Sandbox {
                 };
                 let ceiling = live.clone();
                 let live = std::sync::Arc::new(std::sync::RwLock::new(live));
-                let denied_paths = sup_state.denied_paths.clone();
-                let pid_overrides = sup_state.pid_ip_overrides.clone();
-                // Store live_policy reference so supervisor reads dynamic updates
-                sup_state.live_policy = Some(live.clone());
+                let denied_paths = policy_fn_state.denied_paths.clone();
+                let pid_overrides = net_state.pid_ip_overrides.clone();
+                policy_fn_state.live_policy = Some(live.clone());
                 let tx = crate::policy_fn::spawn_policy_fn(
                     callback.clone(), live, ceiling, pid_overrides, denied_paths,
                 );
-                sup_state.policy_event_tx = Some(tx);
+                policy_fn_state.event_tx = Some(tx);
             }
+
+            // ChrootState
+            let chroot_state = ChrootState::new();
 
             use std::os::unix::io::AsRawFd;
             let notif_raw_fd = notif_fd.as_raw_fd();
             let child_pidfd_raw = pidfd.as_ref().map(|pfd| pfd.as_raw_fd());
-
-            let sup_state = Arc::new(Mutex::new(sup_state));
-            self.supervisor_state = Some(Arc::clone(&sup_state));
 
             let res_state = Arc::new(Mutex::new(res_state));
             self.supervisor_resource = Some(Arc::clone(&res_state));
@@ -962,12 +954,19 @@ impl Sandbox {
             self.supervisor_cow = Some(Arc::clone(&cow_state));
 
             let procfs_state = Arc::new(Mutex::new(procfs_state));
+            let net_state = Arc::new(Mutex::new(net_state));
+            let time_random_state = Arc::new(Mutex::new(time_random_state));
+            let policy_fn_state = Arc::new(Mutex::new(policy_fn_state));
+            let chroot_state = Arc::new(Mutex::new(chroot_state));
 
             let ctx = Arc::new(SupervisorCtx {
-                state: Arc::clone(&sup_state),
                 resource: Arc::clone(&res_state),
                 cow: Arc::clone(&cow_state),
                 procfs: Arc::clone(&procfs_state),
+                network: Arc::clone(&net_state),
+                time_random: Arc::clone(&time_random_state),
+                policy_fn: Arc::clone(&policy_fn_state),
+                chroot: Arc::clone(&chroot_state),
                 policy: Arc::new(notif_policy),
                 child_pidfd: child_pidfd_raw,
                 notif_fd: notif_raw_fd,

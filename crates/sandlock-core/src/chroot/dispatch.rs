@@ -12,8 +12,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::chroot::resolve::{confine, openat2_in_root, resolve_existing_in_root, resolve_in_root, to_virtual_path};
-use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction, SupervisorState};
-use crate::seccomp::state::CowState;
+use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction};
+use crate::seccomp::state::{ChrootState, CowState};
 use crate::sys::structs::{SeccompNotif, SeccompNotifAddfd, SECCOMP_IOCTL_NOTIF_ADDFD};
 
 // ============================================================
@@ -307,7 +307,7 @@ pub(crate) const SYS_FACCESSAT2: i64 = 439;
 
 pub(crate) async fn handle_chroot_open(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    _chroot_state: &Arc<Mutex<ChrootState>>,
     cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
@@ -536,8 +536,8 @@ fn memfd_with_patched_interp(
 
 pub(crate) async fn handle_chroot_exec(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
-    cow_state: &Arc<Mutex<CowState>>,
+    chroot_state: &Arc<Mutex<ChrootState>>,
+    _cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
@@ -663,8 +663,8 @@ pub(crate) async fn handle_chroot_exec(
     // Record the virtual exe path so /proc/self/exe queries return the
     // correct path (memfd-backed binaries would otherwise show the memfd path).
     {
-        let mut st = state.lock().await;
-        st.chroot_exe = Some(virtual_path.clone());
+        let mut cs = chroot_state.lock().await;
+        cs.chroot_exe = Some(virtual_path.clone());
     }
 
     // Inject the (possibly patched) binary fd into the child and rewrite
@@ -703,7 +703,7 @@ pub(crate) async fn handle_chroot_exec(
 
 pub(crate) async fn handle_chroot_write(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    _chroot_state: &Arc<Mutex<ChrootState>>,
     cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
@@ -1006,7 +1006,7 @@ fn stat_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path) -> NotifAc
 
 pub(crate) async fn handle_chroot_stat(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    _chroot_state: &Arc<Mutex<ChrootState>>,
     cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
@@ -1049,7 +1049,7 @@ pub(crate) async fn handle_chroot_stat(
 
 pub(crate) async fn handle_chroot_statx(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    _chroot_state: &Arc<Mutex<ChrootState>>,
     cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
@@ -1105,7 +1105,7 @@ pub(crate) async fn handle_chroot_statx(
 
 pub(crate) async fn handle_chroot_readlink(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    chroot_state: &Arc<Mutex<ChrootState>>,
     cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
@@ -1135,12 +1135,12 @@ pub(crate) async fn handle_chroot_readlink(
     // Special case: /proc/self/exe -> return the virtual path recorded during exec
     // (needed because memfd-backed binaries would show "/memfd:sandlock-exec" otherwise).
     if path == "/proc/self/exe" {
-        let st = state.lock().await;
-        if let Some(ref exe) = st.chroot_exe {
+        let cs = chroot_state.lock().await;
+        if let Some(ref exe) = cs.chroot_exe {
             let s = exe.to_string_lossy();
             return write_target(s.as_bytes());
         }
-        drop(st);
+        drop(cs);
         // Fallback: strip chroot prefix from /proc/{pid}/exe
         if let Ok(real_exe) = std::fs::read_link(format!("/proc/{}/exe", notif.pid)) {
             let virtual_exe = ctx.host_to_virtual(&real_exe).unwrap_or(real_exe);
@@ -1232,7 +1232,7 @@ pub(crate) async fn handle_chroot_readlink(
 
 pub(crate) async fn handle_chroot_getdents(
     _notif: &SeccompNotif,
-    _state: &Arc<Mutex<SupervisorState>>,
+    _chroot_state: &Arc<Mutex<ChrootState>>,
     _cow_state: &Arc<Mutex<CowState>>,
     _notif_fd: RawFd,
     _ctx: &ChrootCtx<'_>,
@@ -1251,7 +1251,7 @@ pub(crate) async fn handle_chroot_getdents(
 
 pub(crate) async fn handle_chroot_chdir(
     notif: &SeccompNotif,
-    _state: &Arc<Mutex<SupervisorState>>,
+    _chroot_state: &Arc<Mutex<ChrootState>>,
     _cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
@@ -1327,7 +1327,7 @@ pub(crate) async fn handle_chroot_chdir(
 
 pub(crate) async fn handle_chroot_getcwd(
     notif: &SeccompNotif,
-    _state: &Arc<Mutex<SupervisorState>>,
+    _chroot_state: &Arc<Mutex<ChrootState>>,
     _cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
@@ -1363,7 +1363,7 @@ pub(crate) async fn handle_chroot_getcwd(
 
 pub(crate) async fn handle_chroot_statfs(
     notif: &SeccompNotif,
-    _state: &Arc<Mutex<SupervisorState>>,
+    _chroot_state: &Arc<Mutex<ChrootState>>,
     _cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
@@ -1407,7 +1407,7 @@ pub(crate) async fn handle_chroot_statfs(
 
 pub(crate) async fn handle_chroot_utimensat(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    _chroot_state: &Arc<Mutex<ChrootState>>,
     cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
@@ -1482,7 +1482,7 @@ fn notif_with_args(notif: &SeccompNotif, args: [u64; 6]) -> SeccompNotif {
 /// SYS_open(path, flags, mode) → handle_chroot_open via openat(AT_FDCWD, path, flags, mode)
 pub(crate) async fn handle_chroot_legacy_open(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    chroot_state: &Arc<Mutex<ChrootState>>,
     cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
@@ -1495,13 +1495,13 @@ pub(crate) async fn handle_chroot_legacy_open(
         notif.data.args[2], // mode
         0, 0,
     ]);
-    handle_chroot_open(&synth, state, cow_state, notif_fd, ctx).await
+    handle_chroot_open(&synth, chroot_state, cow_state, notif_fd, ctx).await
 }
 
 /// SYS_stat(path, statbuf) → handle_chroot_stat via newfstatat(AT_FDCWD, path, statbuf, 0)
 pub(crate) async fn handle_chroot_legacy_stat(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    chroot_state: &Arc<Mutex<ChrootState>>,
     cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
@@ -1513,13 +1513,13 @@ pub(crate) async fn handle_chroot_legacy_stat(
         0,                  // flags = 0 (follow symlinks)
         0, 0,
     ]);
-    handle_chroot_stat(&synth, state, cow_state, notif_fd, ctx).await
+    handle_chroot_stat(&synth, chroot_state, cow_state, notif_fd, ctx).await
 }
 
 /// SYS_lstat(path, statbuf) → handle_chroot_stat via newfstatat(AT_FDCWD, path, statbuf, AT_SYMLINK_NOFOLLOW)
 pub(crate) async fn handle_chroot_legacy_lstat(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    chroot_state: &Arc<Mutex<ChrootState>>,
     cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
@@ -1531,13 +1531,13 @@ pub(crate) async fn handle_chroot_legacy_lstat(
         libc::AT_SYMLINK_NOFOLLOW as u64,
         0, 0,
     ]);
-    handle_chroot_stat(&synth, state, cow_state, notif_fd, ctx).await
+    handle_chroot_stat(&synth, chroot_state, cow_state, notif_fd, ctx).await
 }
 
 /// SYS_access(path, mode) → handle_chroot_stat via faccessat(AT_FDCWD, path, mode, 0)
 pub(crate) async fn handle_chroot_legacy_access(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    chroot_state: &Arc<Mutex<ChrootState>>,
     cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
@@ -1552,13 +1552,13 @@ pub(crate) async fn handle_chroot_legacy_access(
         0, 0,
     ]);
     synth.data.nr = libc::SYS_faccessat as i32;
-    handle_chroot_stat(&synth, state, cow_state, notif_fd, ctx).await
+    handle_chroot_stat(&synth, chroot_state, cow_state, notif_fd, ctx).await
 }
 
 /// SYS_readlink(path, buf, bufsiz) → handle_chroot_readlink via readlinkat(AT_FDCWD, path, buf, bufsiz)
 pub(crate) async fn handle_chroot_legacy_readlink(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    chroot_state: &Arc<Mutex<ChrootState>>,
     cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
@@ -1570,13 +1570,13 @@ pub(crate) async fn handle_chroot_legacy_readlink(
         notif.data.args[2], // bufsiz
         0, 0,
     ]);
-    handle_chroot_readlink(&synth, state, cow_state, notif_fd, ctx).await
+    handle_chroot_readlink(&synth, chroot_state, cow_state, notif_fd, ctx).await
 }
 
 /// SYS_unlink(path) → handle_chroot_write via unlinkat(AT_FDCWD, path, 0)
 pub(crate) async fn handle_chroot_legacy_unlink(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    chroot_state: &Arc<Mutex<ChrootState>>,
     cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
@@ -1588,13 +1588,13 @@ pub(crate) async fn handle_chroot_legacy_unlink(
         0, 0, 0,
     ]);
     synth.data.nr = libc::SYS_unlinkat as i32;
-    handle_chroot_write(&synth, state, cow_state, notif_fd, ctx).await
+    handle_chroot_write(&synth, chroot_state, cow_state, notif_fd, ctx).await
 }
 
 /// SYS_rmdir(path) → handle_chroot_write via unlinkat(AT_FDCWD, path, AT_REMOVEDIR)
 pub(crate) async fn handle_chroot_legacy_rmdir(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    chroot_state: &Arc<Mutex<ChrootState>>,
     cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
@@ -1606,13 +1606,13 @@ pub(crate) async fn handle_chroot_legacy_rmdir(
         0, 0, 0,
     ]);
     synth.data.nr = libc::SYS_unlinkat as i32;
-    handle_chroot_write(&synth, state, cow_state, notif_fd, ctx).await
+    handle_chroot_write(&synth, chroot_state, cow_state, notif_fd, ctx).await
 }
 
 /// SYS_mkdir(path, mode) → handle_chroot_write via mkdirat(AT_FDCWD, path, mode)
 pub(crate) async fn handle_chroot_legacy_mkdir(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    chroot_state: &Arc<Mutex<ChrootState>>,
     cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
@@ -1624,13 +1624,13 @@ pub(crate) async fn handle_chroot_legacy_mkdir(
         0, 0, 0,
     ]);
     synth.data.nr = libc::SYS_mkdirat as i32;
-    handle_chroot_write(&synth, state, cow_state, notif_fd, ctx).await
+    handle_chroot_write(&synth, chroot_state, cow_state, notif_fd, ctx).await
 }
 
 /// SYS_rename(oldpath, newpath) → handle_chroot_write via renameat2(AT_FDCWD, old, AT_FDCWD, new, 0)
 pub(crate) async fn handle_chroot_legacy_rename(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    chroot_state: &Arc<Mutex<ChrootState>>,
     cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
@@ -1643,13 +1643,13 @@ pub(crate) async fn handle_chroot_legacy_rename(
         0, 0,
     ]);
     synth.data.nr = libc::SYS_renameat2 as i32;
-    handle_chroot_write(&synth, state, cow_state, notif_fd, ctx).await
+    handle_chroot_write(&synth, chroot_state, cow_state, notif_fd, ctx).await
 }
 
 /// SYS_symlink(target, linkpath) → handle_chroot_write via symlinkat(target, AT_FDCWD, linkpath)
 pub(crate) async fn handle_chroot_legacy_symlink(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    chroot_state: &Arc<Mutex<ChrootState>>,
     cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
@@ -1661,13 +1661,13 @@ pub(crate) async fn handle_chroot_legacy_symlink(
         0, 0, 0,
     ]);
     synth.data.nr = libc::SYS_symlinkat as i32;
-    handle_chroot_write(&synth, state, cow_state, notif_fd, ctx).await
+    handle_chroot_write(&synth, chroot_state, cow_state, notif_fd, ctx).await
 }
 
 /// SYS_link(oldpath, newpath) → handle_chroot_write via linkat(AT_FDCWD, old, AT_FDCWD, new, 0)
 pub(crate) async fn handle_chroot_legacy_link(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    chroot_state: &Arc<Mutex<ChrootState>>,
     cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
@@ -1680,13 +1680,13 @@ pub(crate) async fn handle_chroot_legacy_link(
         0, 0,
     ]);
     synth.data.nr = libc::SYS_linkat as i32;
-    handle_chroot_write(&synth, state, cow_state, notif_fd, ctx).await
+    handle_chroot_write(&synth, chroot_state, cow_state, notif_fd, ctx).await
 }
 
 /// SYS_chmod(path, mode) → handle_chroot_write via fchmodat(AT_FDCWD, path, mode)
 pub(crate) async fn handle_chroot_legacy_chmod(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    chroot_state: &Arc<Mutex<ChrootState>>,
     cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
@@ -1698,13 +1698,13 @@ pub(crate) async fn handle_chroot_legacy_chmod(
         0, 0, 0,
     ]);
     synth.data.nr = libc::SYS_fchmodat as i32;
-    handle_chroot_write(&synth, state, cow_state, notif_fd, ctx).await
+    handle_chroot_write(&synth, chroot_state, cow_state, notif_fd, ctx).await
 }
 
 /// SYS_chown/lchown(path, uid, gid) → handle_chroot_write via fchownat(AT_FDCWD, path, uid, gid, flags)
 pub(crate) async fn handle_chroot_legacy_chown(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    chroot_state: &Arc<Mutex<ChrootState>>,
     cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
@@ -1720,5 +1720,5 @@ pub(crate) async fn handle_chroot_legacy_chown(
         0,
     ]);
     synth.data.nr = libc::SYS_fchownat as i32;
-    handle_chroot_write(&synth, state, cow_state, notif_fd, ctx).await
+    handle_chroot_write(&synth, chroot_state, cow_state, notif_fd, ctx).await
 }

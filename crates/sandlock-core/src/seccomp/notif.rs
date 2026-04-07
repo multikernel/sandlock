@@ -2,18 +2,15 @@
 // notifications from the kernel, dispatches them to handler functions, and
 // sends responses.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io;
 use std::net::IpAddr;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
-use rand_chacha::ChaCha8Rng;
 use tokio::io::unix::AsyncFd;
-use tokio::sync::Mutex;
 
 use crate::error::NotifError;
-use crate::port_remap::PortMap;
 use crate::sys::structs::{
     SeccompNotif, SeccompNotifAddfd, SeccompNotifResp,
     SECCOMP_ADDFD_FLAG_SEND, SECCOMP_IOCTL_NOTIF_ADDFD, SECCOMP_IOCTL_NOTIF_ID_VALID, SECCOMP_IOCTL_NOTIF_RECV,
@@ -50,7 +47,7 @@ pub enum NotifAction {
 }
 
 // ============================================================
-// SupervisorState — runtime state shared across handlers
+// NetworkPolicy — network access policy enum
 // ============================================================
 
 /// Global network policy for the sandbox.
@@ -62,106 +59,16 @@ pub enum NetworkPolicy {
     AllowList(HashSet<IpAddr>),
 }
 
-/// Runtime state shared across notification handlers.
-///
-/// Resource-limit fields (proc_count, mem_used, brk_bases, hold_forks,
-/// held_notif_ids, load_avg, start_instant, max_memory_bytes, max_processes)
-/// have been extracted to `ResourceState` in `state.rs`.
-pub struct SupervisorState {
-    /// Global network policy: unrestricted or limited to a set of IPs.
-    pub network_policy: NetworkPolicy,
-    pub time_offset: Option<i64>,
-    pub random_state: Option<ChaCha8Rng>,
-    pub port_map: PortMap,
-    /// pidfd for the child process (for pidfd_getfd on-behalf syscalls).
-    pub child_pidfd: Option<RawFd>,
-    /// Event sender for dynamic policy callback (None if no policy_fn).
-    pub policy_event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::policy_fn::PolicyEvent>>,
-    /// Per-PID network overrides from policy_fn.
-    pub pid_ip_overrides: std::sync::Arc<std::sync::RwLock<HashMap<u32, HashSet<IpAddr>>>>,
-    /// Shared live policy for dynamic updates (None if no policy_fn).
-    pub live_policy: Option<std::sync::Arc<std::sync::RwLock<crate::policy_fn::LivePolicy>>>,
-    /// Dynamically denied paths from policy_fn.
-    pub denied_paths: std::sync::Arc<std::sync::RwLock<HashSet<String>>>,
-    /// HTTP ACL proxy address (None if HTTP ACL not active).
-    pub http_acl_addr: Option<std::net::SocketAddr>,
-    /// TCP ports to intercept and redirect to the HTTP ACL proxy.
-    pub http_acl_ports: std::collections::HashSet<u16>,
-    /// Shared map for recording original destination IPs on proxy redirect.
-    pub http_acl_orig_dest: Option<crate::http_acl::OrigDestMap>,
-    /// Virtual exe path for chroot (set by handle_chroot_exec when memfd patching
-    /// rewrites PT_INTERP, since /proc/self/exe would otherwise show the memfd path).
-    pub chroot_exe: Option<std::path::PathBuf>,
-}
-
-impl SupervisorState {
-    /// Create a new supervisor state.
-    ///
-    /// Resource-limit parameters (max_memory_bytes, max_processes) are now
-    /// provided via `ResourceState::new()` instead.
-    pub fn new(
-        time_offset: Option<i64>,
-        random_state: Option<ChaCha8Rng>,
-    ) -> Self {
-        Self {
-            network_policy: NetworkPolicy::Unrestricted,
-            time_offset,
-            random_state,
-            port_map: PortMap::new(),
-            child_pidfd: None,
-            policy_event_tx: None,
-            pid_ip_overrides: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
-            live_policy: None,
-            denied_paths: std::sync::Arc::new(std::sync::RwLock::new(HashSet::new())),
-            http_acl_addr: None,
-            http_acl_ports: std::collections::HashSet::new(),
-            http_acl_orig_dest: None,
-            chroot_exe: None,
-        }
-    }
-}
-
-impl SupervisorState {
-    /// Get the effective network policy for a PID.
-    ///
-    /// Priority: per-PID override > live policy > global network_policy.
-    /// Returns `NetworkPolicy::Unrestricted` if no restrictions apply.
-    pub fn effective_network_policy(&self, pid: u32) -> NetworkPolicy {
-        // Per-PID override takes priority
-        if let Ok(overrides) = self.pid_ip_overrides.read() {
-            if let Some(ips) = overrides.get(&pid) {
-                return NetworkPolicy::AllowList(ips.clone());
-            }
-        }
-        // Live policy (dynamic updates from policy_fn)
-        if let Some(ref lp) = self.live_policy {
-            if let Ok(live) = lp.read() {
-                if !live.allowed_ips.is_empty() {
-                    return NetworkPolicy::AllowList(live.allowed_ips.clone());
-                }
-            }
-        }
-        // Global policy
-        self.network_policy.clone()
-    }
-
-    /// Check if a path is dynamically denied.
-    pub fn is_path_denied(&self, path: &str) -> bool {
-        if let Ok(denied) = self.denied_paths.read() {
-            let path = std::path::Path::new(path);
-            denied.iter().any(|d| path.starts_with(std::path::Path::new(d)))
-        } else {
-            false
-        }
-    }
-
-    /// Check if a path-bearing notification targets a denied path.
-    pub fn is_path_denied_for_notif(&self, notif: &SeccompNotif, notif_fd: RawFd) -> bool {
-        if let Some(path) = resolve_path_for_notif(notif, notif_fd) {
-            self.is_path_denied(&path)
-        } else {
-            false
-        }
+/// Check if a path-bearing notification targets a denied path.
+pub(crate) fn is_path_denied_for_notif(
+    policy_fn_state: &super::state::PolicyFnState,
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+) -> bool {
+    if let Some(path) = resolve_path_for_notif(notif, notif_fd) {
+        policy_fn_state.is_path_denied(&path)
+    } else {
+        false
     }
 }
 
@@ -671,15 +578,15 @@ fn read_argv_for_event(notif: &SeccompNotif, argv_ptr: u64, notif_fd: RawFd) -> 
 async fn emit_policy_event(
     notif: &SeccompNotif,
     action: &NotifAction,
-    state: &Arc<Mutex<SupervisorState>>,
+    policy_fn_state: &Arc<tokio::sync::Mutex<super::state::PolicyFnState>>,
     notif_fd: RawFd,
 ) -> Option<crate::policy_fn::Verdict> {
-    let st = state.lock().await;
-    let tx = match st.policy_event_tx.as_ref() {
+    let pfs = policy_fn_state.lock().await;
+    let tx = match pfs.event_tx.as_ref() {
         Some(tx) => tx.clone(),
         None => return None,
     };
-    drop(st);
+    drop(pfs);
 
     let nr = notif.data.nr as i64;
     let denied = matches!(action, NotifAction::Errno(_));
@@ -770,12 +677,11 @@ async fn emit_policy_event(
 /// dispatch, policy event emission, and response.
 async fn handle_notification(
     notif: SeccompNotif,
-    ctx: &super::ctx::SupervisorCtx,
+    ctx: &Arc<super::ctx::SupervisorCtx>,
     dispatch_table: &super::dispatch::DispatchTable,
     fd: RawFd,
 ) {
     let policy = &ctx.policy;
-    let state = &ctx.state;
 
     // Re-patch vDSO if needed (exec replaces it with a fresh copy).
     if policy.has_time_start || policy.has_random_seed {
@@ -785,21 +691,25 @@ async fn handle_notification(
 
     // Check dynamic path denials before dispatch
     let mut action = {
-        let st = state.lock().await;
         let nr = notif.data.nr as i64;
         let should_precheck_denied = policy.chroot_root.is_none()
             && [libc::SYS_openat, libc::SYS_open, libc::SYS_execve, libc::SYS_execveat]
                 .contains(&nr);
-        if should_precheck_denied && st.is_path_denied_for_notif(&notif, fd) {
-            NotifAction::Errno(libc::EACCES)
+        if should_precheck_denied {
+            let pfs = ctx.policy_fn.lock().await;
+            if is_path_denied_for_notif(&pfs, &notif, fd) {
+                NotifAction::Errno(libc::EACCES)
+            } else {
+                drop(pfs);
+                dispatch_table.dispatch(notif, ctx, fd).await
+            }
         } else {
-            drop(st);
-            dispatch_table.dispatch(notif, state, &ctx.cow, &ctx.procfs, fd).await
+            dispatch_table.dispatch(notif, ctx, fd).await
         }
     };
 
     // Emit event to policy_fn callback if active
-    if let Some(verdict) = emit_policy_event(&notif, &action, state, fd).await {
+    if let Some(verdict) = emit_policy_event(&notif, &action, &ctx.policy_fn, fd).await {
         use crate::policy_fn::Verdict;
         match verdict {
             Verdict::Deny => { action = NotifAction::Errno(libc::EPERM); }
@@ -827,7 +737,7 @@ pub async fn supervisor(
     let fd = notif_fd.as_raw_fd();
 
     // Build the dispatch table once at startup.
-    let dispatch_table = Arc::new(super::dispatch::build_dispatch_table(&ctx.policy, &ctx.resource, &ctx.procfs));
+    let dispatch_table = Arc::new(super::dispatch::build_dispatch_table(&ctx.policy, &ctx.resource));
 
     // Try to enable sync wakeup (Linux 6.7+, ignore error on older kernels).
     try_set_sync_wakeup(fd);
@@ -895,11 +805,17 @@ mod tests {
     }
 
     #[test]
-    fn test_supervisor_state_new() {
-        let state = SupervisorState::new(None, None);
-        assert!(matches!(state.network_policy, NetworkPolicy::Unrestricted));
-        assert!(state.time_offset.is_none());
-        assert!(state.random_state.is_none());
+    fn test_network_state_new() {
+        let ns = super::super::state::NetworkState::new();
+        assert!(matches!(ns.network_policy, NetworkPolicy::Unrestricted));
+        assert!(ns.port_map.bound_ports.is_empty());
+    }
+
+    #[test]
+    fn test_time_random_state_new() {
+        let tr = super::super::state::TimeRandomState::new(None, None);
+        assert!(tr.time_offset.is_none());
+        assert!(tr.random_state.is_none());
     }
 
     #[test]

@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction, SupervisorState};
+use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction};
+use crate::seccomp::state::NetworkState;
 use crate::sys::structs::{SeccompNotif, AF_INET, AF_INET6};
 
 // ============================================================
@@ -150,7 +151,7 @@ fn allocate_real_port(family: u32) -> Option<u16> {
 /// bind(sockfd, addr, addrlen): args[0]=fd, args[1]=addr_ptr, args[2]=addrlen
 pub(crate) async fn handle_bind(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    network: &Arc<Mutex<NetworkState>>,
     notif_fd: RawFd,
 ) -> NotifAction {
     let sockfd = notif.data.args[0] as i32;
@@ -186,15 +187,15 @@ pub(crate) async fn handle_bind(
             };
         }
 
-        let mut st = state.lock().await;
+        let mut ns = network.lock().await;
         // Apply port remapping on our copy
-        if let Some(real_port) = st.port_map.allocate_or_reserve(virtual_port, family) {
+        if let Some(real_port) = ns.port_map.allocate_or_reserve(virtual_port, family) {
             if real_port != virtual_port {
                 set_port_in_sockaddr(&mut bytes, real_port);
             }
         }
 
-        drop(st);
+        drop(ns);
 
         // Duplicate child's socket and bind in supervisor
         let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
@@ -244,7 +245,7 @@ pub(crate) async fn handle_bind(
 /// getsockname(sockfd, addr, addrlen): args[0]=fd, args[1]=addr_ptr, args[2]=addrlen_ptr
 pub(crate) async fn handle_getsockname(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    network: &Arc<Mutex<NetworkState>>,
     notif_fd: RawFd,
 ) -> NotifAction {
     let addr_ptr = notif.data.args[1];
@@ -272,11 +273,11 @@ pub(crate) async fn handle_getsockname(
     };
 
     if let Some(real_port) = extract_port(&bytes) {
-        let st = state.lock().await;
-        if let Some(virtual_port) = st.port_map.get_virtual(real_port) {
+        let ns = network.lock().await;
+        if let Some(virtual_port) = ns.port_map.get_virtual(real_port) {
             // Rewrite the port in the sockaddr buffer.
             set_port_in_sockaddr(&mut bytes, virtual_port);
-            drop(st);
+            drop(ns);
             // Write the modified sockaddr back to child memory.
             let _ = write_child_mem(notif_fd, notif.id, notif.pid, addr_ptr, &bytes);
         }

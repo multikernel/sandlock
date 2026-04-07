@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction, NotifPolicy, SupervisorState};
-use crate::seccomp::state::ProcfsState;
+use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction, NotifPolicy};
+use crate::seccomp::state::{NetworkState, ProcfsState};
 use crate::sys::structs::{SeccompNotif, EACCES};
 use crate::sys::syscall;
 
@@ -357,7 +357,7 @@ pub(crate) async fn handle_proc_open(
     notif: &SeccompNotif,
     procfs: &Arc<Mutex<ProcfsState>>,
     resource: &Arc<Mutex<crate::seccomp::state::ResourceState>>,
-    state: &Arc<Mutex<SupervisorState>>,
+    network: &Arc<Mutex<NetworkState>>,
     policy: &NotifPolicy,
     notif_fd: RawFd,
 ) -> NotifAction {
@@ -411,8 +411,8 @@ pub(crate) async fn handle_proc_open(
     // Virtualize /proc/net/tcp and /proc/net/tcp6 when port_remap is active.
     if policy.port_remap && (path == "/proc/net/tcp" || path == "/proc/net/tcp6") {
         let is_v6 = path.ends_with('6');
-        let st = state.lock().await;
-        let content = generate_proc_net_tcp(&st.port_map.bound_ports, is_v6);
+        let ns = network.lock().await;
+        let content = generate_proc_net_tcp(&ns.port_map.bound_ports, is_v6);
         return inject_memfd(&content);
     }
 

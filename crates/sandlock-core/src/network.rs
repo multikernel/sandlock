@@ -6,14 +6,11 @@
 use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
-
-use std::os::unix::io::AsRawFd;
-
-use crate::seccomp::notif::{read_child_mem, NotifAction, SupervisorState};
+use crate::seccomp::ctx::SupervisorCtx;
+use crate::seccomp::notif::{read_child_mem, NotifAction};
 use crate::sys::structs::{SeccompNotif, AF_INET, AF_INET6, ECONNREFUSED};
 
 /// Maximum buffer size for sendto/sendmsg on-behalf operations (64 MiB).
@@ -84,7 +81,7 @@ fn parse_port_from_sockaddr(bytes: &[u8]) -> Option<u16> {
 /// 5. Return result to child
 async fn connect_on_behalf(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    ctx: &Arc<SupervisorCtx>,
     notif_fd: RawFd,
 ) -> NotifAction {
     let args = &notif.data.args;
@@ -101,9 +98,13 @@ async fn connect_on_behalf(
 
     // 2. Check IP against allowlist
     if let Some(ip) = parse_ip_from_sockaddr(&addr_bytes) {
-        let st = state.lock().await;
+        let ns = ctx.network.lock().await;
+        let live_policy = {
+            let pfs = ctx.policy_fn.lock().await;
+            pfs.live_policy.clone()
+        };
         if let crate::seccomp::notif::NetworkPolicy::AllowList(ref allowed) =
-            st.effective_network_policy(notif.pid)
+            ns.effective_network_policy(notif.pid, live_policy.as_ref())
         {
             if !allowed.contains(&ip) {
                 return NotifAction::Errno(ECONNREFUSED);
@@ -111,11 +112,11 @@ async fn connect_on_behalf(
         }
         // Check for HTTP ACL redirect
         let dest_port = parse_port_from_sockaddr(&addr_bytes);
-        let http_acl_addr = st.http_acl_addr;
-        let http_acl_intercept = dest_port.map_or(false, |p| st.http_acl_ports.contains(&p));
-        let http_acl_orig_dest = st.http_acl_orig_dest.clone();
+        let http_acl_addr = ns.http_acl_addr;
+        let http_acl_intercept = dest_port.map_or(false, |p| ns.http_acl_ports.contains(&p));
+        let http_acl_orig_dest = ns.http_acl_orig_dest.clone();
 
-        drop(st);
+        drop(ns);
 
         // Determine the actual connect target (redirect HTTP/HTTPS to proxy)
         let mut redirected = false;
@@ -301,7 +302,7 @@ async fn connect_on_behalf(
 /// primarily UDP. Connected sockets (addr_ptr == NULL) use CONTINUE.
 async fn sendto_on_behalf(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    ctx: &Arc<SupervisorCtx>,
     notif_fd: RawFd,
 ) -> NotifAction {
     let args = &notif.data.args;
@@ -328,15 +329,19 @@ async fn sendto_on_behalf(
 
     // 2. Check IP against allowlist
     if let Some(ip) = parse_ip_from_sockaddr(&addr_bytes) {
-        let st = state.lock().await;
+        let ns = ctx.network.lock().await;
+        let live_policy = {
+            let pfs = ctx.policy_fn.lock().await;
+            pfs.live_policy.clone()
+        };
         if let crate::seccomp::notif::NetworkPolicy::AllowList(ref allowed) =
-            st.effective_network_policy(notif.pid)
+            ns.effective_network_policy(notif.pid, live_policy.as_ref())
         {
             if !allowed.contains(&ip) {
                 return NotifAction::Errno(ECONNREFUSED);
             }
         }
-        drop(st);
+        drop(ns);
 
         // 3. Copy data buffer from child memory
         let data = match read_child_mem(notif_fd, notif.id, notif.pid, buf_ptr, buf_len) {
@@ -387,7 +392,7 @@ async fn sendto_on_behalf(
 /// 8. Return byte count or errno
 async fn sendmsg_on_behalf(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    ctx: &Arc<SupervisorCtx>,
     notif_fd: RawFd,
 ) -> NotifAction {
     let args = &notif.data.args;
@@ -428,15 +433,19 @@ async fn sendmsg_on_behalf(
         None => return NotifAction::Continue, // Non-IP family — allow through
     };
 
-    let st = state.lock().await;
+    let ns = ctx.network.lock().await;
+    let live_policy = {
+        let pfs = ctx.policy_fn.lock().await;
+        pfs.live_policy.clone()
+    };
     if let crate::seccomp::notif::NetworkPolicy::AllowList(ref allowed) =
-        st.effective_network_policy(notif.pid)
+        ns.effective_network_policy(notif.pid, live_policy.as_ref())
     {
         if !allowed.contains(&ip) {
             return NotifAction::Errno(ECONNREFUSED);
         }
     }
-    drop(st);
+    drop(ns);
 
     // 4. Copy iovec entries and their data buffers from child memory
     // Safety: cap iovlen to prevent excessive allocation
@@ -528,17 +537,17 @@ async fn sendmsg_on_behalf(
 /// re-read by the kernel after validation.
 pub(crate) async fn handle_net(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    ctx: &Arc<SupervisorCtx>,
     notif_fd: RawFd,
 ) -> NotifAction {
     let nr = notif.data.nr as i64;
 
     if nr == libc::SYS_connect {
-        connect_on_behalf(notif, state, notif_fd).await
+        connect_on_behalf(notif, ctx, notif_fd).await
     } else if nr == libc::SYS_sendto {
-        sendto_on_behalf(notif, state, notif_fd).await
+        sendto_on_behalf(notif, ctx, notif_fd).await
     } else if nr == libc::SYS_sendmsg {
-        sendmsg_on_behalf(notif, state, notif_fd).await
+        sendmsg_on_behalf(notif, ctx, notif_fd).await
     } else {
         NotifAction::Continue
     }
