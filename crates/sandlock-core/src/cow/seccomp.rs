@@ -603,11 +603,14 @@ impl SeccompCowBranch {
             None => return Ok(false),
         };
         let upper = self.ensure_cow_copy(&rel)?;
-        let ok = unsafe {
+        // Best-effort: try the real chown but succeed either way — the
+        // supervisor typically lacks CAP_CHOWN so this will fail, but
+        // in COW/dry-run mode the ownership doesn't matter.
+        unsafe {
             let c_path = std::ffi::CString::new(upper.to_str().unwrap_or("")).unwrap();
-            libc::chown(c_path.as_ptr(), uid, gid) == 0
-        };
-        Ok(ok)
+            libc::chown(c_path.as_ptr(), uid, gid);
+        }
+        Ok(true)
     }
 
     /// Handle truncate.
