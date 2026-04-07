@@ -950,7 +950,7 @@ impl Sandbox {
                 loop {
                     interval.tick().await;
                     let mut st = la_state.lock().await;
-                    let running = st.proc_pids.len() as u32;
+                    let running = st.proc_count;
                     st.load_avg.sample(running);
                 }
             }));
