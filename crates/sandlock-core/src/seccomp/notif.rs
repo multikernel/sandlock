@@ -694,26 +694,33 @@ async fn dispatch(
             // Fall through to proc virt / other handlers
         }
 
-        // Read syscalls — only intercept when COW has changes (optimization)
-        let has_changes = {
-            let st = state.lock().await;
-            st.cow_branch.as_ref().map_or(false, |c| c.has_changes())
-        };
-        if has_changes {
-            if nr == libc::SYS_newfstatat || nr == libc::SYS_faccessat
-                || nr == libc::SYS_stat as i64 || nr == libc::SYS_lstat as i64
-                || nr == libc::SYS_access as i64
-            {
-                return crate::cow::dispatch::handle_cow_stat(notif, state, notif_fd).await;
+        // Read syscalls — handlers check has_changes + path match internally
+        // (single lock acquisition instead of pre-check + handler double-lock)
+        if nr == libc::SYS_newfstatat || nr == libc::SYS_faccessat
+            || nr == libc::SYS_stat as i64 || nr == libc::SYS_lstat as i64
+            || nr == libc::SYS_access as i64
+        {
+            let action = crate::cow::dispatch::handle_cow_stat(notif, state, notif_fd).await;
+            if !matches!(action, NotifAction::Continue) {
+                return action;
             }
-            if nr == libc::SYS_statx {
-                return crate::cow::dispatch::handle_cow_statx(notif, state, notif_fd).await;
+        }
+        if nr == libc::SYS_statx {
+            let action = crate::cow::dispatch::handle_cow_statx(notif, state, notif_fd).await;
+            if !matches!(action, NotifAction::Continue) {
+                return action;
             }
-            if nr == libc::SYS_readlinkat || nr == libc::SYS_readlink as i64 {
-                return crate::cow::dispatch::handle_cow_readlink(notif, state, notif_fd).await;
+        }
+        if nr == libc::SYS_readlinkat || nr == libc::SYS_readlink as i64 {
+            let action = crate::cow::dispatch::handle_cow_readlink(notif, state, notif_fd).await;
+            if !matches!(action, NotifAction::Continue) {
+                return action;
             }
-            if nr == libc::SYS_getdents64 as i64 || nr == libc::SYS_getdents as i64 {
-                return crate::cow::dispatch::handle_cow_getdents(notif, state, notif_fd).await;
+        }
+        if nr == libc::SYS_getdents64 as i64 || nr == libc::SYS_getdents as i64 {
+            let action = crate::cow::dispatch::handle_cow_getdents(notif, state, notif_fd).await;
+            if !matches!(action, NotifAction::Continue) {
+                return action;
             }
         }
     }

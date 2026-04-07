@@ -503,7 +503,7 @@ pub(crate) async fn handle_cow_stat(
         None => return NotifAction::Continue,
     };
 
-    if !cow.matches(&path) {
+    if !cow.has_changes() || !cow.matches(&path) {
         return NotifAction::Continue;
     }
 
@@ -594,7 +594,7 @@ pub(crate) async fn handle_cow_statx(
         None => return NotifAction::Continue,
     };
 
-    if !cow.matches(&path) {
+    if !cow.has_changes() || !cow.matches(&path) {
         return NotifAction::Continue;
     }
 
@@ -625,7 +625,7 @@ pub(crate) async fn handle_cow_readlink(
         None => return NotifAction::Continue,
     };
 
-    if !cow.matches(&path) {
+    if !cow.has_changes() || !cow.matches(&path) {
         return NotifAction::Continue;
     }
 
@@ -670,7 +670,7 @@ pub(crate) async fn handle_cow_getdents(
         None => return NotifAction::Continue,
     };
 
-    if !cow.matches(&target) {
+    if !cow.has_changes() || !cow.matches(&target) {
         return NotifAction::Continue;
     }
 
