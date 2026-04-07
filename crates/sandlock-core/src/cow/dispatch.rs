@@ -106,6 +106,7 @@ pub(crate) async fn handle_cow_open(
         Ok(Some(p)) => p,
         Ok(None) => return NotifAction::Continue,
         Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
+        Err(crate::error::BranchError::Exists) => return NotifAction::Errno(libc::EEXIST),
         Err(_) => return NotifAction::Continue,
     };
     drop(st);

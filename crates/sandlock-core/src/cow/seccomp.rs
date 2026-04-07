@@ -16,6 +16,7 @@ const O_RDWR: u64 = 0o2;
 const O_CREAT: u64 = 0o100;
 const O_TRUNC: u64 = 0o1000;
 const O_APPEND: u64 = 0o2000;
+const O_EXCL: u64 = 0o200;
 const O_DIRECTORY: u64 = 0o200000;
 const WRITE_FLAGS: u64 = O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND;
 
@@ -268,6 +269,20 @@ impl SeccompCowBranch {
             }
             return Ok(None);
         }
+
+        // O_EXCL: fail if file already exists (in upper or lower)
+        if flags & O_CREAT != 0 && flags & O_EXCL != 0 {
+            let upper_file = self.upper.join(&rel);
+            let lower_file = self.workdir.join(&rel);
+            if upper_file.exists() || upper_file.is_symlink()
+                || lower_file.exists() || lower_file.is_symlink()
+            {
+                return Err(BranchError::Exists);
+            }
+            // File truly doesn't exist — create in upper
+            return self.ensure_cow_copy(&rel).map(Some);
+        }
+
         if is_write {
             self.ensure_cow_copy(&rel).map(Some)
         } else {
@@ -1040,5 +1055,53 @@ mod tests {
         assert!(result.is_some());
         // disk_used still stale — resync only happens on write opens.
         assert_eq!(branch.disk_used, 5);
+    }
+
+    #[test]
+    fn test_handle_open_excl_existing_file_returns_exists() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let path = abs(&branch, "existing.txt");
+        // O_WRONLY | O_CREAT | O_EXCL
+        let flags = 0o1 | 0o100 | 0o200;
+        let err = branch.handle_open(&path, flags).unwrap_err();
+        assert!(matches!(err, BranchError::Exists));
+    }
+
+    #[test]
+    fn test_handle_open_excl_new_file_succeeds() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let path = abs(&branch, "brand_new.txt");
+        // O_WRONLY | O_CREAT | O_EXCL
+        let flags = 0o1 | 0o100 | 0o200;
+        let result = branch.handle_open(&path, flags).unwrap();
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_handle_open_excl_deleted_file_succeeds() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let path = abs(&branch, "existing.txt");
+        branch.mark_deleted("existing.txt");
+        // O_WRONLY | O_CREAT | O_EXCL — deleted file should be recreatable
+        let flags = 0o1 | 0o100 | 0o200;
+        let result = branch.handle_open(&path, flags).unwrap();
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_handle_open_excl_upper_only_returns_exists() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        // Create a file only in upper (brand new file)
+        let upper = branch.ensure_cow_copy("brand_new.txt").unwrap();
+        std::fs::write(&upper, "content").unwrap();
+        let path = abs(&branch, "brand_new.txt");
+        // O_WRONLY | O_CREAT | O_EXCL — file exists in upper
+        let flags = 0o1 | 0o100 | 0o200;
+        let err = branch.handle_open(&path, flags).unwrap_err();
+        assert!(matches!(err, BranchError::Exists));
     }
 }
