@@ -102,7 +102,17 @@ impl SeccompCowBranch {
 
     /// Check if a path is under the workdir.
     pub fn matches(&self, path: &str) -> bool {
-        path == self.workdir_str || path.starts_with(&format!("{}/", self.workdir_str))
+        std::path::Path::new(path).starts_with(&self.workdir_str)
+    }
+
+    /// Check if a path has been modified or deleted in the COW layer.
+    /// Used to skip read-only opens for unmodified files.
+    pub fn needs_read_intercept(&self, path: &str) -> bool {
+        if let Some(rel) = self.safe_rel(path) {
+            self.is_deleted(&rel) || self.upper.join(&rel).exists()
+        } else {
+            false
+        }
     }
 
     /// Compute relative path from workdir. Returns None if path escapes.
@@ -174,17 +184,35 @@ impl SeccompCowBranch {
             std::os::unix::fs::symlink(&target, &upper_file)
                 .map_err(|e| BranchError::Operation(format!("symlink: {}", e)))?;
             self.disk_used += 256;
+        } else if lower_file.is_dir() {
+            self.check_quota(4096)?;
+            fs::create_dir_all(&upper_file)
+                .map_err(|e| BranchError::Operation(format!("create dir: {}", e)))?;
+            // Preserve permissions
+            if let Ok(meta) = lower_file.metadata() {
+                let _ = fs::set_permissions(&upper_file, meta.permissions());
+            }
+            self.disk_used += 4096;
         } else if lower_file.exists() {
             let meta = lower_file.metadata()
                 .map_err(|e| BranchError::Operation(format!("metadata: {}", e)))?;
             let file_size = meta.len();
             self.check_quota(file_size)?;
-            fs::copy(&lower_file, &upper_file)
-                .map_err(|e| BranchError::Operation(format!("copy: {}", e)))?;
-            // Preserve permissions
-            fs::set_permissions(&upper_file, meta.permissions())
-                .map_err(|e| BranchError::Operation(format!("set permissions: {}", e)))?;
-            self.disk_used += file_size;
+            match fs::copy(&lower_file, &upper_file) {
+                Ok(_) => {
+                    // Preserve permissions
+                    fs::set_permissions(&upper_file, meta.permissions())
+                        .map_err(|e| BranchError::Operation(format!("set permissions: {}", e)))?;
+                    self.disk_used += file_size;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    // Can't read the lower file (e.g. root-owned 0640).
+                    // Create an empty file in upper so writes can proceed.
+                    fs::File::create(&upper_file)
+                        .map_err(|e| BranchError::Operation(format!("create fallback: {}", e)))?;
+                }
+                Err(e) => return Err(BranchError::Operation(format!("copy: {}", e))),
+            }
         } else {
             // New file (not in lower layer). We can't predict how much
             // the child will write, but we must at least block creation

@@ -664,9 +664,29 @@ async fn dispatch(
         {
             return crate::cow::dispatch::handle_cow_write(notif, state, notif_fd).await;
         }
+        // Legacy write syscalls (used by glibc/musl instead of *at variants)
+        if nr == libc::SYS_unlink as i64 || nr == libc::SYS_rmdir as i64
+            || nr == libc::SYS_mkdir as i64 || nr == libc::SYS_rename as i64
+            || nr == libc::SYS_symlink as i64 || nr == libc::SYS_link as i64
+            || nr == libc::SYS_chmod as i64 || nr == libc::SYS_chown as i64
+            || nr == libc::SYS_lchown as i64
+        {
+            return crate::cow::dispatch::handle_cow_legacy_write(notif, state, notif_fd).await;
+        }
+
+        // faccessat/access with W_OK — always return success for COW-managed paths
+        // so programs like dpkg that pre-check write access don't bail out.
+        if nr == libc::SYS_faccessat || nr == crate::cow::dispatch::SYS_FACCESSAT2
+            || nr == libc::SYS_access as i64
+        {
+            let action = crate::cow::dispatch::handle_cow_access(notif, state, notif_fd).await;
+            if !matches!(action, NotifAction::Continue) {
+                return action;
+            }
+        }
 
         // openat — try COW first, fall through to proc virt if not COW path
-        if nr == libc::SYS_openat {
+        if nr == libc::SYS_openat || nr == libc::SYS_open as i64 {
             let action = crate::cow::dispatch::handle_cow_open(notif, state, notif_fd).await;
             if !matches!(action, NotifAction::Continue) {
                 return action;
@@ -680,13 +700,16 @@ async fn dispatch(
             st.cow_branch.as_ref().map_or(false, |c| c.has_changes())
         };
         if has_changes {
-            if nr == libc::SYS_newfstatat || nr == libc::SYS_faccessat {
+            if nr == libc::SYS_newfstatat || nr == libc::SYS_faccessat
+                || nr == libc::SYS_stat as i64 || nr == libc::SYS_lstat as i64
+                || nr == libc::SYS_access as i64
+            {
                 return crate::cow::dispatch::handle_cow_stat(notif, state, notif_fd).await;
             }
             if nr == libc::SYS_statx {
                 return crate::cow::dispatch::handle_cow_statx(notif, state, notif_fd).await;
             }
-            if nr == libc::SYS_readlinkat {
+            if nr == libc::SYS_readlinkat || nr == libc::SYS_readlink as i64 {
                 return crate::cow::dispatch::handle_cow_readlink(notif, state, notif_fd).await;
             }
             if nr == libc::SYS_getdents64 as i64 || nr == libc::SYS_getdents as i64 {

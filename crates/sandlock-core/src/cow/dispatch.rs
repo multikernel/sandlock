@@ -93,6 +93,15 @@ pub(crate) async fn handle_cow_open(
         return NotifAction::Continue;
     }
 
+    // Read-only opens don't need interception unless the file was
+    // modified or deleted in the COW layer. This avoids routing every
+    // read through the supervisor when workdir is broad (e.g. "/").
+    const WRITE_FLAGS: u64 = 0o1 | 0o2 | 0o100 | 0o1000 | 0o2000; // O_WRONLY|O_RDWR|O_CREAT|O_TRUNC|O_APPEND
+    let is_write = flags & WRITE_FLAGS != 0;
+    if !is_write && !cow.needs_read_intercept(&path) {
+        return NotifAction::Continue;
+    }
+
     let real_path = match cow.handle_open(&path, flags) {
         Ok(Some(p)) => p,
         Ok(None) => return NotifAction::Continue,
@@ -268,11 +277,206 @@ pub(crate) async fn handle_cow_write(
 }
 
 // ============================================================
-// Read operation handlers (stat, readlink, getdents)
+// Legacy write syscall handlers (chmod, unlink, mkdir, etc.)
+// ============================================================
+
+/// Handle legacy write syscalls where the path is in args[0] instead of args[1].
+/// These are used by some libc implementations instead of the *at variants.
+pub(crate) async fn handle_cow_legacy_write(
+    notif: &SeccompNotif,
+    state: &Arc<Mutex<SupervisorState>>,
+    notif_fd: RawFd,
+) -> NotifAction {
+    let nr = notif.data.nr as i64;
+
+    macro_rules! try_cow {
+        ($cow:expr, $call:expr) => {
+            match $call {
+                Ok(true) => return NotifAction::ReturnValue(0),
+                Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
+                _ => {}
+            }
+        };
+    }
+
+    if nr == libc::SYS_unlink as i64 {
+        // unlink(pathname): args[0]=path
+        let path = match read_path(notif, notif.data.args[0], notif_fd) {
+            Some(p) => p,
+            None => return NotifAction::Continue,
+        };
+        let mut st = state.lock().await;
+        if let Some(cow) = st.cow_branch.as_mut() {
+            if cow.matches(&path) && cow.handle_unlink(&path, false) {
+                return NotifAction::ReturnValue(0);
+            }
+        }
+    } else if nr == libc::SYS_rmdir as i64 {
+        // rmdir(pathname): args[0]=path
+        let path = match read_path(notif, notif.data.args[0], notif_fd) {
+            Some(p) => p,
+            None => return NotifAction::Continue,
+        };
+        let mut st = state.lock().await;
+        if let Some(cow) = st.cow_branch.as_mut() {
+            if cow.matches(&path) && cow.handle_unlink(&path, true) {
+                return NotifAction::ReturnValue(0);
+            }
+        }
+    } else if nr == libc::SYS_mkdir as i64 {
+        // mkdir(pathname, mode): args[0]=path
+        let path = match read_path(notif, notif.data.args[0], notif_fd) {
+            Some(p) => p,
+            None => return NotifAction::Continue,
+        };
+        let mut st = state.lock().await;
+        if let Some(cow) = st.cow_branch.as_mut() {
+            if cow.matches(&path) {
+                try_cow!(cow, cow.handle_mkdir(&path));
+            }
+        }
+    } else if nr == libc::SYS_rename as i64 {
+        // rename(oldpath, newpath): args[0]=old, args[1]=new
+        let old_path = match read_path(notif, notif.data.args[0], notif_fd) {
+            Some(p) => p,
+            None => return NotifAction::Continue,
+        };
+        let new_path = match read_path(notif, notif.data.args[1], notif_fd) {
+            Some(p) => p,
+            None => return NotifAction::Continue,
+        };
+        let mut st = state.lock().await;
+        if let Some(cow) = st.cow_branch.as_mut() {
+            if cow.matches(&old_path) {
+                try_cow!(cow, cow.handle_rename(&old_path, &new_path));
+            }
+        }
+    } else if nr == libc::SYS_symlink as i64 {
+        // symlink(target, linkpath): args[0]=target, args[1]=linkpath
+        let target = match read_path(notif, notif.data.args[0], notif_fd) {
+            Some(p) => p,
+            None => return NotifAction::Continue,
+        };
+        let linkpath = match read_path(notif, notif.data.args[1], notif_fd) {
+            Some(p) => p,
+            None => return NotifAction::Continue,
+        };
+        let mut st = state.lock().await;
+        if let Some(cow) = st.cow_branch.as_mut() {
+            if cow.matches(&linkpath) {
+                try_cow!(cow, cow.handle_symlink(&target, &linkpath));
+            }
+        }
+    } else if nr == libc::SYS_link as i64 {
+        // link(oldpath, newpath): args[0]=old, args[1]=new
+        let old_path = match read_path(notif, notif.data.args[0], notif_fd) {
+            Some(p) => p,
+            None => return NotifAction::Continue,
+        };
+        let new_path = match read_path(notif, notif.data.args[1], notif_fd) {
+            Some(p) => p,
+            None => return NotifAction::Continue,
+        };
+        let mut st = state.lock().await;
+        if let Some(cow) = st.cow_branch.as_mut() {
+            if cow.matches(&new_path) {
+                try_cow!(cow, cow.handle_link(&old_path, &new_path));
+            }
+        }
+    } else if nr == libc::SYS_chmod as i64 {
+        // chmod(pathname, mode): args[0]=path, args[1]=mode
+        let path = match read_path(notif, notif.data.args[0], notif_fd) {
+            Some(p) => p,
+            None => return NotifAction::Continue,
+        };
+        let mode = (notif.data.args[1] & 0o7777) as u32;
+        let mut st = state.lock().await;
+        if let Some(cow) = st.cow_branch.as_mut() {
+            if cow.matches(&path) {
+                try_cow!(cow, cow.handle_chmod(&path, mode));
+            }
+        }
+    } else if nr == libc::SYS_chown as i64 || nr == libc::SYS_lchown as i64 {
+        // chown(pathname, uid, gid): args[0]=path, args[1]=uid, args[2]=gid
+        let path = match read_path(notif, notif.data.args[0], notif_fd) {
+            Some(p) => p,
+            None => return NotifAction::Continue,
+        };
+        let uid = notif.data.args[1] as u32;
+        let gid = notif.data.args[2] as u32;
+        let mut st = state.lock().await;
+        if let Some(cow) = st.cow_branch.as_mut() {
+            if cow.matches(&path) {
+                try_cow!(cow, cow.handle_chown(&path, uid, gid));
+            }
+        }
+    }
+
+    NotifAction::Continue
+}
+
+// ============================================================
+// access() handler — fake W_OK for COW-managed paths
 // ============================================================
 
 /// SYS_faccessat2 syscall number on x86_64 (439). Not always in libc crate.
-const SYS_FACCESSAT2: i64 = 439;
+pub(crate) const SYS_FACCESSAT2: i64 = 439;
+
+/// Handle faccessat/faccessat2/access — return success for W_OK checks on
+/// COW-managed paths so programs that pre-check write permissions (like dpkg)
+/// don't fail before the COW layer can redirect their writes.
+pub(crate) async fn handle_cow_access(
+    notif: &SeccompNotif,
+    state: &Arc<Mutex<SupervisorState>>,
+    notif_fd: RawFd,
+) -> NotifAction {
+    let nr = notif.data.nr as i64;
+
+    // access(pathname, mode): args[0]=path, args[1]=mode
+    // faccessat(dirfd, pathname, mode, flags): args[0]=dirfd, args[1]=path, args[2]=mode
+    let (path, mode) = if nr == libc::SYS_access as i64 {
+        let p = match read_path(notif, notif.data.args[0], notif_fd) {
+            Some(p) => p,
+            None => return NotifAction::Continue,
+        };
+        (p, notif.data.args[1] as i32)
+    } else {
+        let dirfd = notif.data.args[0] as i64;
+        let p = match read_path(notif, notif.data.args[1], notif_fd) {
+            Some(p) => resolve_at_path(notif, dirfd, &p),
+            None => return NotifAction::Continue,
+        };
+        (p, notif.data.args[2] as i32)
+    };
+
+    // Only intercept W_OK checks
+    if mode & libc::W_OK == 0 {
+        return NotifAction::Continue;
+    }
+
+    let st = state.lock().await;
+    let cow = match st.cow_branch.as_ref() {
+        Some(c) => c,
+        None => return NotifAction::Continue,
+    };
+
+    if !cow.matches(&path) {
+        return NotifAction::Continue;
+    }
+
+    // Path is under workdir and W_OK was requested — writes will be
+    // redirected to the COW upper layer, so report success.
+    // Check the path actually exists on the real filesystem.
+    if std::path::Path::new(&path).exists() {
+        return NotifAction::ReturnValue(0);
+    }
+
+    NotifAction::Continue
+}
+
+// ============================================================
+// Read operation handlers (stat, readlink, getdents)
+// ============================================================
 
 /// Handle newfstatat / faccessat — resolve path then Continue to let kernel stat.
 /// The trick: we rewrite the path pointer in child memory to point to the resolved path.
