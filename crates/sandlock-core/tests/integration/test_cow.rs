@@ -255,6 +255,48 @@ async fn test_seccomp_cow_relative_path_commit() {
     let _ = fs::remove_dir_all(&workdir);
 }
 
+/// Test that chdir works for directories created inside COW.
+///
+/// When a directory is created via COW (only exists in the upper layer),
+/// chdir must be intercepted and redirected to the upper path.  Without
+/// this, the kernel returns ENOENT because it doesn't see the COW directory.
+#[tokio::test]
+async fn test_seccomp_cow_chdir_to_created_dir() {
+    let workdir = temp_dir("seccomp-chdir");
+    let out_file = workdir.join("chdir_ok.txt");
+
+    let policy = Policy::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc").fs_read("/dev")
+        .fs_write(&workdir)
+        .workdir(&workdir)
+        .cwd(&workdir)
+        .on_exit(BranchAction::Commit)
+        .build()
+        .unwrap();
+
+    // mkdir creates the dir in COW upper only; cd must see it via interception.
+    let script = format!(
+        "mkdir -p subdir/deep && cd subdir/deep && pwd > {}",
+        out_file.display()
+    );
+    let result = Sandbox::run(&policy, &["sh", "-c", &script]).await;
+    match result {
+        Ok(r) => {
+            assert!(r.success(), "script should succeed, stderr: {}", r.stderr_str().unwrap_or(""));
+            let content = fs::read_to_string(&out_file).unwrap();
+            assert!(
+                content.trim().ends_with("subdir/deep"),
+                "pwd should end with subdir/deep, got: {}",
+                content.trim()
+            );
+        }
+        Err(e) => eprintln!("Seccomp COW chdir test skipped: {}", e),
+    }
+
+    let _ = fs::remove_dir_all(&workdir);
+}
+
 /// Test that seccomp COW read isolation works (reads original before any writes).
 #[tokio::test]
 async fn test_seccomp_cow_read_existing() {

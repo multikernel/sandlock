@@ -809,3 +809,103 @@ pub(crate) async fn handle_cow_getdents(
 
     NotifAction::ReturnValue(result.len() as i64)
 }
+
+/// Handle chdir — redirect to COW upper directory if the target was created
+/// by COW and doesn't exist on the real filesystem.
+///
+/// Opens the upper directory, injects the fd into the child, and rewrites
+/// the path arg to /proc/self/fd/N so the kernel chdir succeeds.
+pub(crate) async fn handle_cow_chdir(
+    notif: &SeccompNotif,
+    cow_state: &Arc<Mutex<CowState>>,
+    notif_fd: RawFd,
+) -> NotifAction {
+    let path_ptr = notif.data.args[0];
+    let path = match read_path(notif, path_ptr, notif_fd) {
+        Some(p) => p,
+        None => return NotifAction::Continue,
+    };
+
+    // Resolve relative paths against the process's cwd.
+    let abs_path = if std::path::Path::new(&path).is_absolute() {
+        path
+    } else {
+        match std::fs::read_link(format!("/proc/{}/cwd", notif.pid)) {
+            Ok(cwd) => cwd.join(&path).to_string_lossy().into_owned(),
+            Err(_) => return NotifAction::Continue,
+        }
+    };
+
+    let st = cow_state.lock().await;
+    let cow = match st.branch.as_ref() {
+        Some(c) => c,
+        None => return NotifAction::Continue,
+    };
+
+    if !cow.matches(&abs_path) {
+        return NotifAction::Continue;
+    }
+
+    // Check if it exists in the upper layer.
+    let rel = abs_path
+        .strip_prefix(&format!("{}/", cow.workdir_str()))
+        .or_else(|| {
+            if abs_path == cow.workdir_str() { Some(".") } else { None }
+        });
+    let rel = match rel {
+        Some(r) => r,
+        None => return NotifAction::Continue,
+    };
+    let upper_path = cow.upper_dir().join(rel);
+    drop(st);
+
+    // If the directory exists on the real filesystem, let the kernel handle it.
+    if std::path::Path::new(&abs_path).is_dir() {
+        return NotifAction::Continue;
+    }
+
+    // Only intervene if the directory exists in the COW upper layer.
+    if !upper_path.is_dir() {
+        return NotifAction::Continue;
+    }
+
+    // Open the upper directory and inject fd into the child.
+    let c_path = match std::ffi::CString::new(upper_path.to_str().unwrap_or("")) {
+        Ok(c) => c,
+        Err(_) => return NotifAction::Continue,
+    };
+    let src_fd = unsafe {
+        libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
+    };
+    if src_fd < 0 {
+        return NotifAction::Errno(libc::ENOENT);
+    }
+
+    let addfd = crate::sys::structs::SeccompNotifAddfd {
+        id: notif.id,
+        flags: 0,
+        srcfd: src_fd as u32,
+        newfd: 0,
+        newfd_flags: libc::O_CLOEXEC as u32,
+    };
+    let child_fd = unsafe {
+        libc::ioctl(
+            notif_fd,
+            crate::sys::structs::SECCOMP_IOCTL_NOTIF_ADDFD as libc::c_ulong,
+            &addfd as *const _,
+        )
+    };
+    unsafe { libc::close(src_fd) };
+
+    if child_fd < 0 {
+        return NotifAction::Errno(libc::EIO);
+    }
+
+    // Rewrite the path argument to /proc/self/fd/N.
+    let fd_path = format!("/proc/self/fd/{}\0", child_fd);
+    if write_child_mem(notif_fd, notif.id, notif.pid, path_ptr, fd_path.as_bytes()).is_err() {
+        return NotifAction::Errno(libc::EFAULT);
+    }
+
+    NotifAction::Continue
+}

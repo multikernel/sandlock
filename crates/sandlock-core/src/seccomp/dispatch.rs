@@ -591,4 +591,12 @@ fn register_cow_handlers(table: &mut DispatchTable) {
             })
         }));
     }
+
+    // chdir — redirect to upper dir if target was created by COW
+    table.register(libc::SYS_chdir, Box::new(|notif, ctx, notif_fd| {
+        let cow = Arc::clone(&ctx.cow);
+        Box::pin(async move {
+            crate::cow::dispatch::handle_cow_chdir(&notif, &cow, notif_fd).await
+        })
+    }));
 }

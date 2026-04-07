@@ -321,6 +321,7 @@ pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
             libc::SYS_readlink as u32,
             libc::SYS_getdents64 as u32,
             libc::SYS_getdents as u32,
+            libc::SYS_chdir as u32,
         ]);
     }
 
