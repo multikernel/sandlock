@@ -58,9 +58,9 @@ pub(crate) async fn handle_fork(
 
 /// Handle wait4/waitid notifications — decrement the concurrent process count.
 ///
-/// The wait hasn't completed yet (seccomp notify fires before the syscall),
-/// but we know a child is about to be reaped, so we decrement optimistically.
-/// The kernel will complete the wait after we return Continue.
+/// Only blocking waits reach the supervisor (WNOHANG/WNOWAIT calls are
+/// filtered out by BPF and allowed without notification).  A blocking wait
+/// will definitely reap a child, so we decrement before the kernel executes it.
 pub(crate) async fn handle_wait(
     _notif: &SeccompNotif,
     state: &Arc<Mutex<SupervisorState>>,

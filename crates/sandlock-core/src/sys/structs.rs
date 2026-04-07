@@ -197,6 +197,7 @@ pub const OFFSET_ARCH: u32 = 4;
 pub const OFFSET_ARGS0_LO: u32 = 16;
 pub const OFFSET_ARGS1_LO: u32 = 24;
 pub const OFFSET_ARGS2_LO: u32 = 32;
+pub const OFFSET_ARGS3_LO: u32 = 40;
 
 // ============================================================
 // Clone namespace flags

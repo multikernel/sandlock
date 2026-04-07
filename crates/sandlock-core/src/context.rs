@@ -10,10 +10,11 @@ use crate::seccomp::bpf::{self, stmt, jump};
 use crate::sys::structs::{
     AF_INET, AF_INET6, AF_NETLINK,
     BPF_ABS, BPF_ALU, BPF_AND, BPF_JEQ, BPF_JSET, BPF_JMP, BPF_K, BPF_LD, BPF_RET, BPF_W,
-    CLONE_NS_FLAGS, DEFAULT_DENY_SYSCALLS, EPERM, NETLINK_SOCK_DIAG, SECCOMP_RET_ERRNO,
+    CLONE_NS_FLAGS, DEFAULT_DENY_SYSCALLS, EPERM, NETLINK_SOCK_DIAG,
+    SECCOMP_RET_ALLOW, SECCOMP_RET_ERRNO,
     SOCK_DGRAM, SOCK_RAW, SOCK_TYPE_MASK, TIOCLINUX, TIOCSTI,
     PR_SET_DUMPABLE, PR_SET_SECUREBITS, PR_SET_PTRACER,
-    OFFSET_ARGS0_LO, OFFSET_ARGS1_LO, OFFSET_ARGS2_LO, OFFSET_NR,
+    OFFSET_ARGS0_LO, OFFSET_ARGS1_LO, OFFSET_ARGS2_LO, OFFSET_ARGS3_LO, OFFSET_NR,
     SockFilter,
 };
 
@@ -542,6 +543,36 @@ pub fn arg_filters(policy: &Policy) -> Vec<SockFilter> {
         }
         // Deny return (reached by any matching JEQ)
         insns.push(stmt(BPF_RET | BPF_K, ret_errno));
+    }
+
+    // --- wait4: skip notification for WNOHANG/WNOWAIT (non-blocking) ---
+    // wait4(pid, status, options, rusage) — options is arg2
+    // 5 instructions:
+    //   LD NR
+    //   JEQ wait4 → +0, skip 3
+    //   LD arg2
+    //   JSET (WNOHANG|WNOWAIT) → +0, skip 1
+    //   RET ALLOW
+    {
+        let nr_wait4 = libc::SYS_wait4 as u32;
+        let wnohang_or_wnowait = (libc::WNOHANG | 0x0100_0000/* WNOWAIT */) as u32;
+        insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR));
+        insns.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr_wait4, 0, 3));
+        insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARGS2_LO));
+        insns.push(jump(BPF_JMP | BPF_JSET | BPF_K, wnohang_or_wnowait, 0, 1));
+        insns.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+    }
+
+    // --- waitid: skip notification for WNOHANG/WNOWAIT (non-blocking) ---
+    // waitid(idtype, id, infop, options, rusage) — options is arg3
+    {
+        let nr_waitid = libc::SYS_waitid as u32;
+        let wnohang_or_wnowait = (libc::WNOHANG | 0x0100_0000/* WNOWAIT */) as u32;
+        insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR));
+        insns.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr_waitid, 0, 3));
+        insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARGS3_LO));
+        insns.push(jump(BPF_JMP | BPF_JSET | BPF_K, wnohang_or_wnowait, 0, 1));
+        insns.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
     }
 
     insns
