@@ -352,8 +352,13 @@ pub(crate) async fn handle_chroot_open(
                         if fd < 0 {
                             return NotifAction::Errno(last_errno(libc::EIO));
                         }
+                        let newfd_flags = if flags & libc::O_CLOEXEC as u64 != 0 {
+                            libc::O_CLOEXEC as u32
+                        } else {
+                            0
+                        };
                         let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-                        return NotifAction::InjectFdSend { srcfd: owned };
+                        return NotifAction::InjectFdSend { srcfd: owned, newfd_flags };
                     }
                     Ok(None) => {
                         // Fall through to openat2_in_root below. This keeps
@@ -363,6 +368,9 @@ pub(crate) async fn handle_chroot_open(
                     }
                     Err(crate::error::BranchError::QuotaExceeded) => {
                         return NotifAction::Errno(libc::ENOSPC);
+                    }
+                    Err(crate::error::BranchError::Exists) => {
+                        return NotifAction::Errno(libc::EEXIST);
                     }
                     Err(_) => return NotifAction::Errno(libc::EIO),
                 }
@@ -383,8 +391,13 @@ pub(crate) async fn handle_chroot_open(
         Ok(fd) => fd,
         Err(errno) => return NotifAction::Errno(errno),
     };
+    let newfd_flags = if flags & libc::O_CLOEXEC as u64 != 0 {
+        libc::O_CLOEXEC as u32
+    } else {
+        0
+    };
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    NotifAction::InjectFdSend { srcfd: owned }
+    NotifAction::InjectFdSend { srcfd: owned, newfd_flags }
 }
 
 // ============================================================

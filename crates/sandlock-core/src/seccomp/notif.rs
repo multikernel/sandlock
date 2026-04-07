@@ -38,7 +38,8 @@ pub enum NotifAction {
     /// Inject a file descriptor using SECCOMP_ADDFD_FLAG_SEND (atomically responds).
     /// The child sees the injected fd as the return value of the syscall.
     /// The `OwnedFd` is closed automatically after the ioctl completes.
-    InjectFdSend { srcfd: OwnedFd },
+    /// `newfd_flags` controls flags on the injected fd (e.g. O_CLOEXEC).
+    InjectFdSend { srcfd: OwnedFd, newfd_flags: u32 },
     /// Synthetic return value (the child sees this as the syscall result).
     ReturnValue(i64),
     /// Don't respond — used for checkpoint/freeze.
@@ -300,13 +301,13 @@ fn respond_value(fd: RawFd, id: u64, val: i64) -> io::Result<()> {
 /// Uses the SEND flag to atomically inject the fd and respond to the syscall.
 /// The ioctl return value is the fd number assigned in the child process.
 /// After this call, no additional SECCOMP_IOCTL_NOTIF_SEND is needed.
-fn inject_fd_and_send(fd: RawFd, id: u64, srcfd: RawFd) -> io::Result<i32> {
+fn inject_fd_and_send(fd: RawFd, id: u64, srcfd: RawFd, newfd_flags: u32) -> io::Result<i32> {
     let addfd = SeccompNotifAddfd {
         id,
         flags: SECCOMP_ADDFD_FLAG_SEND,
         srcfd: srcfd as u32,
         newfd: 0,   // ignored when SECCOMP_ADDFD_FLAG_SETFD is not set
-        newfd_flags: libc::O_CLOEXEC as u32,
+        newfd_flags,
     };
     let ret = unsafe {
         libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_ADDFD as libc::c_ulong, &addfd as *const _)
@@ -469,12 +470,12 @@ fn send_response(fd: RawFd, id: u64, action: NotifAction) -> io::Result<()> {
             inject_fd(fd, id, srcfd, targetfd)?;
             respond_continue(fd, id)
         }
-        NotifAction::InjectFdSend { srcfd } => {
+        NotifAction::InjectFdSend { srcfd, newfd_flags } => {
             // SECCOMP_ADDFD_FLAG_SEND atomically injects the fd and responds.
             // No separate NOTIF_SEND needed after this.
             // Fall back to Continue if ADDFD_SEND fails (e.g., old kernel).
             // srcfd (OwnedFd) is dropped at end of this arm, closing the fd.
-            match inject_fd_and_send(fd, id, srcfd.as_raw_fd()) {
+            match inject_fd_and_send(fd, id, srcfd.as_raw_fd(), newfd_flags) {
                 Ok(_new_fd) => Ok(()),
                 Err(_) => respond_continue(fd, id),
             }
@@ -1174,7 +1175,7 @@ mod tests {
         let _ = format!("{:?}", NotifAction::InjectFd { srcfd: 3, targetfd: 4 });
         // Use a real fd (dup'd from stderr) so OwnedFd can safely close it.
         let test_fd = unsafe { OwnedFd::from_raw_fd(libc::dup(2)) };
-        let _ = format!("{:?}", NotifAction::InjectFdSend { srcfd: test_fd });
+        let _ = format!("{:?}", NotifAction::InjectFdSend { srcfd: test_fd, newfd_flags: 0 });
         let _ = format!("{:?}", NotifAction::ReturnValue(42));
         let _ = format!("{:?}", NotifAction::Hold);
         let _ = format!("{:?}", NotifAction::Kill { sig: 9, pgid: 1 });

@@ -162,8 +162,14 @@ pub(crate) async fn handle_cow_open(
         return NotifAction::Continue;
     }
 
+    // Preserve O_CLOEXEC from the original openat flags.
+    let newfd_flags = if flags & libc::O_CLOEXEC as u64 != 0 {
+        libc::O_CLOEXEC as u32
+    } else {
+        0
+    };
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    NotifAction::InjectFdSend { srcfd: owned }
+    NotifAction::InjectFdSend { srcfd: owned, newfd_flags }
 }
 
 // ============================================================

@@ -325,7 +325,7 @@ fn inject_memfd(content: &[u8]) -> NotifAction {
     }
 
     // Move the OwnedFd into InjectFdSend — send_response will close it after the ioctl.
-    NotifAction::InjectFdSend { srcfd: memfd }
+    NotifAction::InjectFdSend { srcfd: memfd, newfd_flags: libc::O_CLOEXEC as u32 }
 }
 
 // ============================================================
