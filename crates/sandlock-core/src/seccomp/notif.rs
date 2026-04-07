@@ -794,6 +794,57 @@ async fn emit_policy_event(
 }
 
 // ============================================================
+// Per-notification handler (runs in a spawned task)
+// ============================================================
+
+/// Process a single seccomp notification: vDSO re-patch, path denial check,
+/// dispatch, policy event emission, and response.
+async fn handle_notification(
+    notif: SeccompNotif,
+    ctx: &super::ctx::SupervisorCtx,
+    dispatch_table: &super::dispatch::DispatchTable,
+    fd: RawFd,
+) {
+    let policy = &ctx.policy;
+    let state = &ctx.state;
+
+    // Re-patch vDSO if needed (exec replaces it with a fresh copy).
+    if policy.has_time_start || policy.has_random_seed {
+        let mut st = state.lock().await;
+        maybe_patch_vdso(notif.pid as i32, &mut st, policy);
+    }
+
+    // Check dynamic path denials before dispatch
+    let mut action = {
+        let st = state.lock().await;
+        let nr = notif.data.nr as i64;
+        let should_precheck_denied = policy.chroot_root.is_none()
+            && [libc::SYS_openat, libc::SYS_open, libc::SYS_execve, libc::SYS_execveat]
+                .contains(&nr);
+        if should_precheck_denied && st.is_path_denied_for_notif(&notif, fd) {
+            NotifAction::Errno(libc::EACCES)
+        } else {
+            drop(st);
+            dispatch_table.dispatch(notif, state, fd).await
+        }
+    };
+
+    // Emit event to policy_fn callback if active
+    if let Some(verdict) = emit_policy_event(&notif, &action, state, fd).await {
+        use crate::policy_fn::Verdict;
+        match verdict {
+            Verdict::Deny => { action = NotifAction::Errno(libc::EPERM); }
+            Verdict::DenyWith(errno) => { action = NotifAction::Errno(errno); }
+            Verdict::Audit => { /* allow, but could log here */ }
+            Verdict::Allow => {}
+        }
+    }
+
+    // Ignore error — child may have exited between recv and response.
+    let _ = send_response(fd, notif.id, action);
+}
+
+// ============================================================
 // Main supervisor loop
 // ============================================================
 
@@ -805,11 +856,9 @@ pub async fn supervisor(
     ctx: Arc<super::ctx::SupervisorCtx>,
 ) {
     let fd = notif_fd.as_raw_fd();
-    let policy = &ctx.policy;
-    let state = &ctx.state;
 
     // Build the dispatch table once at startup.
-    let dispatch_table = Arc::new(super::dispatch::build_dispatch_table(policy));
+    let dispatch_table = Arc::new(super::dispatch::build_dispatch_table(&ctx.policy));
 
     // Try to enable sync wakeup (Linux 6.7+, ignore error on older kernels).
     try_set_sync_wakeup(fd);
@@ -833,41 +882,17 @@ pub async fn supervisor(
 
         match recv_notif(fd) {
             Ok(notif) => {
-                // Re-patch vDSO if needed (exec replaces it with a fresh copy).
-                if policy.has_time_start || policy.has_random_seed {
-                    let mut st = state.lock().await;
-                    maybe_patch_vdso(notif.pid as i32, &mut st, policy);
-                }
-                // Check dynamic path denials before dispatch
-                let mut action = {
-                    let st = state.lock().await;
-                    let nr = notif.data.nr as i64;
-                    let should_precheck_denied = policy.chroot_root.is_none()
-                        && [libc::SYS_openat, libc::SYS_open, libc::SYS_execve, libc::SYS_execveat]
-                            .contains(&nr);
-                    if should_precheck_denied && st.is_path_denied_for_notif(&notif, fd) {
-                        NotifAction::Errno(libc::EACCES)
-                    } else {
-                        drop(st);
-                        dispatch_table.dispatch(notif, state, fd).await
-                    }
-                };
-
-                // Emit event to policy_fn callback if active
-                if let Some(verdict) = emit_policy_event(&notif, &action, state, fd).await {
-                    use crate::policy_fn::Verdict;
-                    match verdict {
-                        Verdict::Deny => { action = NotifAction::Errno(libc::EPERM); }
-                        Verdict::DenyWith(errno) => { action = NotifAction::Errno(errno); }
-                        Verdict::Audit => { /* allow, but could log here */ }
-                        Verdict::Allow => {}
-                    }
-                }
-
-                // Ignore error — child may have exited between recv and response.
-                let _ = send_response(fd, notif.id, action);
+                // Spawn a task per notification for concurrent handling.
+                let ctx = ctx.clone();
+                let dt = dispatch_table.clone();
+                tokio::spawn(async move {
+                    handle_notification(notif, &ctx, &dt, fd).await;
+                });
             }
-            Err(ref e) if e.raw_os_error() == Some(libc::EAGAIN) || e.raw_os_error() == Some(libc::EWOULDBLOCK) => {
+            Err(ref e)
+                if e.raw_os_error() == Some(libc::EAGAIN)
+                    || e.raw_os_error() == Some(libc::EWOULDBLOCK) =>
+            {
                 guard.clear_ready();
                 continue;
             }
