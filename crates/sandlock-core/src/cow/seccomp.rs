@@ -321,6 +321,17 @@ impl SeccompCowBranch {
     /// is released. This keeps the lock held only for metadata checks.
     pub fn prepare_open(&mut self, path: &str, flags: u64) -> Result<CowOpenPlan, BranchError> {
         if flags & O_DIRECTORY != 0 {
+            // Resolve O_DIRECTORY opens to the upper layer if the directory
+            // was created by COW and doesn't exist on the real filesystem.
+            let rel = match self.safe_rel(path) {
+                Some(r) => r,
+                None => return Ok(CowOpenPlan::Skip),
+            };
+            let upper_dir = self.upper.join(&rel);
+            let lower_dir = self.workdir.join(&rel);
+            if upper_dir.is_dir() && !lower_dir.is_dir() {
+                return Ok(CowOpenPlan::Resolved(upper_dir));
+            }
             return Ok(CowOpenPlan::Skip);
         }
         let rel = match self.safe_rel(path) {

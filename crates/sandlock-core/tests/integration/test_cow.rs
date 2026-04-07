@@ -255,6 +255,50 @@ async fn test_seccomp_cow_relative_path_commit() {
     let _ = fs::remove_dir_all(&workdir);
 }
 
+/// Test that openat with O_DIRECTORY works for COW-created directories.
+///
+/// When a directory is created via COW (only in upper layer), openat with
+/// O_DIRECTORY must resolve to the upper path.  Without this fix,
+/// prepare_open skipped O_DIRECTORY opens and the kernel returned ENOENT.
+#[tokio::test]
+async fn test_seccomp_cow_open_directory() {
+    let workdir = temp_dir("seccomp-opendir");
+    let out_file = workdir.join("opendir_ok.txt");
+
+    let policy = Policy::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc").fs_read("/dev")
+        .fs_write(&workdir)
+        .workdir(&workdir)
+        .cwd(&workdir)
+        .on_exit(BranchAction::Commit)
+        .build()
+        .unwrap();
+
+    // mkdir creates the dir in COW upper; python opens it with O_DIRECTORY.
+    let script = format!(
+        concat!(
+            "mkdir -p subdir && python3 -c \"",
+            "import os; ",
+            "fd = os.open('subdir', os.O_RDONLY | os.O_DIRECTORY); ",
+            "os.close(fd); ",
+            "open('{}', 'w').write('ok')\"",
+        ),
+        out_file.display()
+    );
+    let result = Sandbox::run(&policy, &["sh", "-c", &script]).await;
+    match result {
+        Ok(r) => {
+            assert!(r.success(), "script should succeed, stderr: {}", r.stderr_str().unwrap_or(""));
+            let content = fs::read_to_string(&out_file).unwrap();
+            assert_eq!(content, "ok");
+        }
+        Err(e) => eprintln!("Seccomp COW opendir test skipped: {}", e),
+    }
+
+    let _ = fs::remove_dir_all(&workdir);
+}
+
 /// Test that chdir works for directories created inside COW.
 ///
 /// When a directory is created via COW (only exists in the upper layer),
