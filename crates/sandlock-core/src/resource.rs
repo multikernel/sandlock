@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::seccomp::notif::{NotifAction, NotifPolicy, SupervisorState};
+use crate::seccomp::state::ResourceState;
 use crate::sys::structs::{
     SeccompNotif, CLONE_NS_FLAGS, EAGAIN, EPERM,
 };
@@ -17,8 +18,11 @@ const MAP_ANONYMOUS: u64 = 0x20;
 /// Handle fork/clone/vfork notifications.
 ///
 /// Enforces namespace creation ban, process limits, and checkpoint hold.
+/// Needs both `ResourceState` (for proc_count, hold_forks, etc.) and
+/// `SupervisorState` (for proc_pids).
 pub(crate) async fn handle_fork(
     notif: &SeccompNotif,
+    resource: &Arc<Mutex<ResourceState>>,
     state: &Arc<Mutex<SupervisorState>>,
     _policy: &NotifPolicy,
 ) -> NotifAction {
@@ -37,20 +41,23 @@ pub(crate) async fn handle_fork(
     }
     // For clone3: BPF arg filter handles dangerous cases; proceed to limit check.
 
-    let mut st = state.lock().await;
+    let mut rs = resource.lock().await;
 
     // Checkpoint/freeze: hold the fork notification.
-    if st.hold_forks {
-        st.held_notif_ids.push(notif.id);
+    if rs.hold_forks {
+        rs.held_notif_ids.push(notif.id);
         return NotifAction::Hold;
     }
 
     // Enforce concurrent process limit.
-    if st.proc_count >= st.max_processes {
+    if rs.proc_count >= rs.max_processes {
         return NotifAction::Errno(EAGAIN);
     }
 
-    st.proc_count += 1;
+    rs.proc_count += 1;
+    drop(rs);
+
+    let mut st = state.lock().await;
     st.proc_pids.insert(notif.pid as i32);
 
     NotifAction::Continue
@@ -63,10 +70,10 @@ pub(crate) async fn handle_fork(
 /// will definitely reap a child, so we decrement before the kernel executes it.
 pub(crate) async fn handle_wait(
     _notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    resource: &Arc<Mutex<ResourceState>>,
 ) -> NotifAction {
-    let mut st = state.lock().await;
-    st.proc_count = st.proc_count.saturating_sub(1);
+    let mut rs = resource.lock().await;
+    rs.proc_count = rs.proc_count.saturating_sub(1);
     NotifAction::Continue
 }
 
@@ -75,14 +82,14 @@ pub(crate) async fn handle_wait(
 /// Tracks anonymous memory usage and enforces the configured memory limit.
 pub(crate) async fn handle_memory(
     notif: &SeccompNotif,
-    state: &Arc<Mutex<SupervisorState>>,
+    resource: &Arc<Mutex<ResourceState>>,
     policy: &NotifPolicy,
 ) -> NotifAction {
     let nr = notif.data.nr as i64;
     let args = &notif.data.args;
     let limit = policy.max_memory_bytes;
 
-    let mut st = state.lock().await;
+    let mut st = resource.lock().await;
 
     let kill = NotifAction::Kill { sig: libc::SIGKILL, pgid: notif.pid as i32 };
 

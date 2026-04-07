@@ -13,6 +13,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use super::notif::{NotifAction, NotifPolicy, SupervisorState};
+use super::state::ResourceState;
 use crate::sys::structs::SeccompNotif;
 
 // ============================================================
@@ -84,7 +85,10 @@ impl DispatchTable {
 /// Build the dispatch table from a `NotifPolicy`.  Every branch from the old
 /// monolithic `dispatch()` function is translated into a `table.register()` call.
 /// Priority is preserved by registration order.
-pub fn build_dispatch_table(policy: &Arc<NotifPolicy>) -> DispatchTable {
+pub fn build_dispatch_table(
+    policy: &Arc<NotifPolicy>,
+    resource: &Arc<Mutex<ResourceState>>,
+) -> DispatchTable {
     let mut table = DispatchTable::new();
 
     // ------------------------------------------------------------------
@@ -92,10 +96,12 @@ pub fn build_dispatch_table(policy: &Arc<NotifPolicy>) -> DispatchTable {
     // ------------------------------------------------------------------
     for &nr in &[libc::SYS_clone, libc::SYS_clone3, libc::SYS_vfork] {
         let policy = Arc::clone(policy);
+        let resource = Arc::clone(resource);
         table.register(nr, Box::new(move |notif, state, _notif_fd| {
             let policy = Arc::clone(&policy);
+            let resource = Arc::clone(&resource);
             Box::pin(async move {
-                crate::resource::handle_fork(&notif, &state, &policy).await
+                crate::resource::handle_fork(&notif, &resource, &state, &policy).await
             })
         }));
     }
@@ -104,9 +110,11 @@ pub fn build_dispatch_table(policy: &Arc<NotifPolicy>) -> DispatchTable {
     // Wait family (always on)
     // ------------------------------------------------------------------
     for &nr in &[libc::SYS_wait4, libc::SYS_waitid] {
-        table.register(nr, Box::new(|notif, state, _notif_fd| {
+        let resource = Arc::clone(resource);
+        table.register(nr, Box::new(move |notif, _state, _notif_fd| {
+            let resource = Arc::clone(&resource);
             Box::pin(async move {
-                crate::resource::handle_wait(&notif, &state).await
+                crate::resource::handle_wait(&notif, &resource).await
             })
         }));
     }
@@ -120,10 +128,12 @@ pub fn build_dispatch_table(policy: &Arc<NotifPolicy>) -> DispatchTable {
             libc::SYS_mremap, libc::SYS_shmget,
         ] {
             let policy = Arc::clone(policy);
-            table.register(nr, Box::new(move |notif, state, _notif_fd| {
+            let resource = Arc::clone(resource);
+            table.register(nr, Box::new(move |notif, _state, _notif_fd| {
                 let policy = Arc::clone(&policy);
+                let resource = Arc::clone(&resource);
                 Box::pin(async move {
-                    crate::resource::handle_memory(&notif, &state, &policy).await
+                    crate::resource::handle_memory(&notif, &resource, &policy).await
                 })
             }));
         }
@@ -212,10 +222,12 @@ pub fn build_dispatch_table(policy: &Arc<NotifPolicy>) -> DispatchTable {
     // ------------------------------------------------------------------
     {
         let policy = Arc::clone(policy);
+        let resource = Arc::clone(resource);
         table.register(libc::SYS_openat, Box::new(move |notif, state, notif_fd| {
             let policy = Arc::clone(&policy);
+            let resource = Arc::clone(&resource);
             Box::pin(async move {
-                crate::procfs::handle_proc_open(&notif, &state, &policy, notif_fd).await
+                crate::procfs::handle_proc_open(&notif, &state, &resource, &policy, notif_fd).await
             })
         }));
     }

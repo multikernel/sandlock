@@ -63,20 +63,14 @@ pub enum NetworkPolicy {
 }
 
 /// Runtime state shared across notification handlers.
+///
+/// Resource-limit fields (proc_count, mem_used, brk_bases, hold_forks,
+/// held_notif_ids, load_avg, start_instant, max_memory_bytes, max_processes)
+/// have been extracted to `ResourceState` in `state.rs`.
 pub struct SupervisorState {
-    pub start_instant: std::time::Instant,
-    pub load_avg: crate::procfs::LoadAvg,
-    pub mem_used: u64,
-    pub brk_bases: HashMap<i32, u64>,
     pub proc_pids: HashSet<i32>,
-    /// Live concurrent process count — incremented on fork, decremented on wait.
-    pub proc_count: u32,
-    pub hold_forks: bool,
-    pub held_notif_ids: Vec<u64>,
     /// Global network policy: unrestricted or limited to a set of IPs.
     pub network_policy: NetworkPolicy,
-    pub max_memory_bytes: u64,
-    pub max_processes: u32,
     pub time_offset: Option<i64>,
     pub random_state: Option<ChaCha8Rng>,
     pub port_map: PortMap,
@@ -112,25 +106,17 @@ pub struct SupervisorState {
 }
 
 impl SupervisorState {
-    /// Create a new supervisor state with the given limits.
+    /// Create a new supervisor state.
+    ///
+    /// Resource-limit parameters (max_memory_bytes, max_processes) are now
+    /// provided via `ResourceState::new()` instead.
     pub fn new(
-        max_memory_bytes: u64,
-        max_processes: u32,
         time_offset: Option<i64>,
         random_state: Option<ChaCha8Rng>,
     ) -> Self {
         Self {
-            start_instant: std::time::Instant::now(),
-            load_avg: crate::procfs::LoadAvg::new(),
-            mem_used: 0,
-            brk_bases: HashMap::new(),
             proc_pids: HashSet::new(),
-            proc_count: 0,
-            hold_forks: false,
-            held_notif_ids: Vec::new(),
             network_policy: NetworkPolicy::Unrestricted,
-            max_memory_bytes,
-            max_processes,
             time_offset,
             random_state,
             port_map: PortMap::new(),
@@ -858,7 +844,7 @@ pub async fn supervisor(
     let fd = notif_fd.as_raw_fd();
 
     // Build the dispatch table once at startup.
-    let dispatch_table = Arc::new(super::dispatch::build_dispatch_table(&ctx.policy));
+    let dispatch_table = Arc::new(super::dispatch::build_dispatch_table(&ctx.policy, &ctx.resource));
 
     // Try to enable sync wakeup (Linux 6.7+, ignore error on older kernels).
     try_set_sync_wakeup(fd);
@@ -927,17 +913,22 @@ mod tests {
 
     #[test]
     fn test_supervisor_state_new() {
-        let state = SupervisorState::new(1024 * 1024, 10, None, None);
-        assert_eq!(state.mem_used, 0);
-        assert_eq!(state.max_memory_bytes, 1024 * 1024);
-        assert_eq!(state.max_processes, 10);
-        assert!(state.brk_bases.is_empty());
+        let state = SupervisorState::new(None, None);
         assert!(state.proc_pids.is_empty());
-        assert!(!state.hold_forks);
-        assert!(state.held_notif_ids.is_empty());
         assert!(matches!(state.network_policy, NetworkPolicy::Unrestricted));
         assert!(state.time_offset.is_none());
         assert!(state.random_state.is_none());
+    }
+
+    #[test]
+    fn test_resource_state_new() {
+        let rs = super::super::state::ResourceState::new(1024 * 1024, 10);
+        assert_eq!(rs.mem_used, 0);
+        assert_eq!(rs.max_memory_bytes, 1024 * 1024);
+        assert_eq!(rs.max_processes, 10);
+        assert!(rs.brk_bases.is_empty());
+        assert!(!rs.hold_forks);
+        assert!(rs.held_notif_ids.is_empty());
     }
 
     #[test]

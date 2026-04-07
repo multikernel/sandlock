@@ -19,6 +19,7 @@ use crate::policy::{BranchAction, FsIsolation, Policy};
 use crate::result::{ExitStatus, RunResult};
 use crate::seccomp::ctx::SupervisorCtx;
 use crate::seccomp::notif::{self, NotifPolicy, SupervisorState};
+use crate::seccomp::state::ResourceState;
 use crate::sys::syscall;
 
 // ============================================================
@@ -85,6 +86,8 @@ pub struct Sandbox {
     seccomp_cow: Option<crate::cow::seccomp::SeccompCowBranch>,
     /// Shared supervisor state for freeze/thaw support.
     supervisor_state: Option<Arc<Mutex<SupervisorState>>>,
+    /// Shared resource state for freeze/thaw and loadavg support.
+    supervisor_resource: Option<Arc<Mutex<ResourceState>>>,
     /// Control pipe for fork commands (parent end).
     ctrl_fd: Option<OwnedFd>,
     /// Stdout pipe read end (for fork clones — used by reduce).
@@ -142,6 +145,7 @@ impl Sandbox {
             cow_branch: None,
             seccomp_cow: None,
             supervisor_state: None,
+            supervisor_resource: None,
             ctrl_fd: None,
             stdout_pipe: None,
             init_fn: None,
@@ -544,10 +548,10 @@ impl Sandbox {
     pub(crate) async fn freeze(&self) -> Result<(), SandlockError> {
         let pid = self.child_pid.ok_or(SandlockError::Sandbox(SandboxError::NotRunning))?;
 
-        // Set hold_forks in supervisor state
-        if let Some(ref state) = self.supervisor_state {
-            let mut st = state.lock().await;
-            st.hold_forks = true;
+        // Set hold_forks in resource state
+        if let Some(ref resource) = self.supervisor_resource {
+            let mut rs = resource.lock().await;
+            rs.hold_forks = true;
         }
 
         // SIGSTOP the process group
@@ -560,10 +564,10 @@ impl Sandbox {
         let pid = self.child_pid.ok_or(SandlockError::Sandbox(SandboxError::NotRunning))?;
 
         // Release held forks
-        if let Some(ref state) = self.supervisor_state {
-            let mut st = state.lock().await;
-            st.hold_forks = false;
-            st.held_notif_ids.clear();
+        if let Some(ref resource) = self.supervisor_resource {
+            let mut rs = resource.lock().await;
+            rs.hold_forks = false;
+            rs.held_notif_ids.clear();
         }
 
         // SIGCONT the process group
@@ -871,8 +875,6 @@ impl Sandbox {
             let time_offset = self.policy.time_start.map(|t| crate::time::calculate_time_offset(t));
 
             let mut sup_state = SupervisorState::new(
-                notif_policy.max_memory_bytes,
-                notif_policy.max_processes,
                 time_offset,
                 random_state,
             );
@@ -889,8 +891,14 @@ impl Sandbox {
 
             // Seed proc_pids with the initial child so /proc filtering includes it.
             sup_state.proc_pids.insert(pid);
+
+            // Create ResourceState for memory/process limits.
+            let mut res_state = ResourceState::new(
+                notif_policy.max_memory_bytes,
+                notif_policy.max_processes,
+            );
             // Count the initial child for the concurrent process limit.
-            sup_state.proc_count = 1;
+            res_state.proc_count = 1;
 
             sup_state.http_acl_addr = self.http_acl_handle.as_ref().map(|h| h.addr);
             sup_state.http_acl_ports = self.policy.http_ports.iter().copied().collect();
@@ -942,8 +950,12 @@ impl Sandbox {
             let sup_state = Arc::new(Mutex::new(sup_state));
             self.supervisor_state = Some(Arc::clone(&sup_state));
 
+            let res_state = Arc::new(Mutex::new(res_state));
+            self.supervisor_resource = Some(Arc::clone(&res_state));
+
             let ctx = Arc::new(SupervisorCtx {
                 state: Arc::clone(&sup_state),
+                resource: Arc::clone(&res_state),
                 policy: Arc::new(notif_policy),
                 child_pidfd: child_pidfd_raw,
                 notif_fd: notif_raw_fd,
@@ -955,15 +967,15 @@ impl Sandbox {
             ));
 
             // Spawn load average sampling task (every 5s, like the kernel)
-            let la_state = Arc::clone(&sup_state);
+            let la_resource = Arc::clone(&res_state);
             self.loadavg_handle = Some(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(5));
                 interval.tick().await; // skip immediate first tick
                 loop {
                     interval.tick().await;
-                    let mut st = la_state.lock().await;
-                    let running = st.proc_count;
-                    st.load_avg.sample(running);
+                    let mut rs = la_resource.lock().await;
+                    let running = rs.proc_count;
+                    rs.load_avg.sample(running);
                 }
             }));
         }

@@ -355,6 +355,7 @@ fn read_path(notif: &SeccompNotif, addr: u64, notif_fd: RawFd) -> Option<String>
 pub(crate) async fn handle_proc_open(
     notif: &SeccompNotif,
     state: &Arc<Mutex<SupervisorState>>,
+    resource: &Arc<Mutex<crate::seccomp::state::ResourceState>>,
     policy: &NotifPolicy,
     notif_fd: RawFd,
 ) -> NotifAction {
@@ -381,15 +382,15 @@ pub(crate) async fn handle_proc_open(
 
     // Virtualize /proc/meminfo.
     if path == "/proc/meminfo" && policy.max_memory_bytes > 0 {
-        let st = state.lock().await;
-        let content = generate_meminfo(policy.max_memory_bytes, st.mem_used);
+        let rs = resource.lock().await;
+        let content = generate_meminfo(policy.max_memory_bytes, rs.mem_used);
         return inject_memfd(&content);
     }
 
     // Virtualize /proc/uptime when time_start is set.
     if path == "/proc/uptime" && policy.has_time_start {
-        let st = state.lock().await;
-        let elapsed = st.start_instant.elapsed().as_secs_f64();
+        let rs = resource.lock().await;
+        let elapsed = rs.start_instant.elapsed().as_secs_f64();
         let content = generate_uptime(elapsed);
         return inject_memfd(&content);
     }
@@ -397,10 +398,11 @@ pub(crate) async fn handle_proc_open(
     // Virtualize /proc/loadavg when proc virtualization is active.
     if path == "/proc/loadavg" {
         let st = state.lock().await;
+        let rs = resource.lock().await;
         let total = st.proc_pids.len() as u32;
-        let running = st.proc_count;
+        let running = rs.proc_count;
         let last_pid = st.proc_pids.iter().max().copied().unwrap_or(0);
-        let content = generate_loadavg(&st.load_avg, running, total, last_pid);
+        let content = generate_loadavg(&rs.load_avg, running, total, last_pid);
         return inject_memfd(&content);
     }
 
