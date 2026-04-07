@@ -523,6 +523,75 @@ pub(crate) async fn handle_cow_access(
 }
 
 // ============================================================
+// utimensat handler
+// ============================================================
+
+/// Handle utimensat — resolve path to COW upper then set timestamps.
+/// utimensat(dirfd, pathname, times, flags)
+pub(crate) async fn handle_cow_utimensat(
+    notif: &SeccompNotif,
+    cow_state: &Arc<Mutex<CowState>>,
+    notif_fd: RawFd,
+) -> NotifAction {
+    let dirfd = notif.data.args[0] as i64;
+    let path_ptr = notif.data.args[1];
+    let times_ptr = notif.data.args[2];
+    let flags = notif.data.args[3] as i32;
+
+    if path_ptr == 0 {
+        return NotifAction::Continue;
+    }
+
+    let path = match read_path(notif, path_ptr, notif_fd) {
+        Some(p) => resolve_at_path(notif, dirfd, &p),
+        None => return NotifAction::Continue,
+    };
+
+    let upper_path = {
+        let mut st = cow_state.lock().await;
+        let cow = match st.branch.as_mut() {
+            Some(c) => c,
+            None => return NotifAction::Continue,
+        };
+        if !cow.matches(&path) {
+            return NotifAction::Continue;
+        }
+        match cow.handle_utimensat(&path) {
+            Ok(Some(p)) => p,
+            Ok(None) => return NotifAction::Continue,
+            Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
+            Err(_) => return NotifAction::Continue,
+        }
+    };
+
+    // Read times from child memory (2 x struct timespec = 32 bytes on x86_64)
+    let times = if times_ptr != 0 {
+        match read_child_mem(notif_fd, notif.id, notif.pid, times_ptr, 32) {
+            Ok(data) => {
+                let mut ts: [libc::timespec; 2] = unsafe { std::mem::zeroed() };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), &mut ts as *mut _ as *mut u8, 32);
+                }
+                Some(ts)
+            }
+            Err(_) => return NotifAction::Errno(libc::EFAULT),
+        }
+    } else {
+        None
+    };
+
+    let c_path = match std::ffi::CString::new(upper_path.to_str().unwrap_or("")) {
+        Ok(c) => c,
+        Err(_) => return NotifAction::Continue,
+    };
+    let times_raw = times.as_ref().map(|t| t.as_ptr()).unwrap_or(std::ptr::null());
+    if unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times_raw, flags) } < 0 {
+        return NotifAction::Errno(libc::EIO);
+    }
+    NotifAction::ReturnValue(0)
+}
+
+// ============================================================
 // Read operation handlers (stat, readlink, getdents)
 // ============================================================
 

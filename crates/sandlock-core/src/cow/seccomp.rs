@@ -639,6 +639,17 @@ impl SeccompCowBranch {
         Ok(ok)
     }
 
+    /// Handle utimensat — resolve to upper, return the upper path for the
+    /// caller to call utimensat on.
+    pub fn handle_utimensat(&mut self, path: &str) -> Result<Option<PathBuf>, BranchError> {
+        let rel = match self.safe_rel(path) {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        let upper = self.ensure_cow_copy(&rel)?;
+        Ok(Some(upper))
+    }
+
     /// Handle readlink.
     pub fn handle_readlink(&self, path: &str) -> Option<String> {
         let rel = self.safe_rel(path)?;

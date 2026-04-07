@@ -526,6 +526,14 @@ fn register_cow_handlers(table: &mut DispatchTable) {
         }));
     }
 
+    // utimensat — unconditional return
+    table.register(libc::SYS_utimensat, Box::new(|notif, ctx, notif_fd| {
+        let cow = Arc::clone(&ctx.cow);
+        Box::pin(async move {
+            crate::cow::dispatch::handle_cow_utimensat(&notif, &cow, notif_fd).await
+        })
+    }));
+
     // faccessat/access — fallthrough
     for &nr in &[
         libc::SYS_faccessat,

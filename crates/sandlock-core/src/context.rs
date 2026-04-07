@@ -310,6 +310,7 @@ pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
             libc::SYS_chown as u32,
             libc::SYS_lchown as u32,
             libc::SYS_truncate as u32,
+            libc::SYS_utimensat as u32,
             libc::SYS_newfstatat as u32,
             libc::SYS_stat as u32,
             libc::SYS_lstat as u32,
