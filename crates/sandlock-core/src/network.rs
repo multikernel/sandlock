@@ -115,10 +115,6 @@ async fn connect_on_behalf(
         let http_acl_intercept = dest_port.map_or(false, |p| st.http_acl_ports.contains(&p));
         let http_acl_orig_dest = st.http_acl_orig_dest.clone();
 
-        let child_pidfd = match st.child_pidfd {
-            Some(fd) => fd,
-            None => return NotifAction::Errno(libc::ENOSYS),
-        };
         drop(st);
 
         // Determine the actual connect target (redirect HTTP/HTTPS to proxy)
@@ -180,8 +176,8 @@ async fn connect_on_behalf(
             (addr_bytes.clone(), addr_len)
         };
 
-        // 3. Duplicate child's socket into supervisor
-        let dup_fd = match crate::seccomp::notif::dup_child_fd(child_pidfd, sockfd) {
+        // 3. Duplicate child's socket into supervisor (use notif.pid for grandchild support)
+        let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
             Ok(fd) => fd,
             Err(_) => return NotifAction::Errno(libc::ENOSYS),
         };
@@ -340,10 +336,6 @@ async fn sendto_on_behalf(
                 return NotifAction::Errno(ECONNREFUSED);
             }
         }
-        let child_pidfd = match st.child_pidfd {
-            Some(fd) => fd,
-            None => return NotifAction::Errno(libc::ENOSYS),
-        };
         drop(st);
 
         // 3. Copy data buffer from child memory
@@ -352,8 +344,8 @@ async fn sendto_on_behalf(
             Err(_) => return NotifAction::Errno(libc::EIO),
         };
 
-        // 4. Duplicate child's socket into supervisor
-        let dup_fd = match crate::seccomp::notif::dup_child_fd(child_pidfd, sockfd) {
+        // 4. Duplicate child's socket into supervisor (use notif.pid for grandchild support)
+        let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
             Ok(fd) => fd,
             Err(_) => return NotifAction::Errno(libc::ENOSYS),
         };
@@ -444,10 +436,6 @@ async fn sendmsg_on_behalf(
             return NotifAction::Errno(ECONNREFUSED);
         }
     }
-    let child_pidfd = match st.child_pidfd {
-        Some(fd) => fd,
-        None => return NotifAction::Errno(libc::ENOSYS),
-    };
     drop(st);
 
     // 4. Copy iovec entries and their data buffers from child memory
@@ -500,8 +488,8 @@ async fn sendmsg_on_behalf(
         None
     };
 
-    // 6. Duplicate child's socket into supervisor
-    let dup_fd = match crate::seccomp::notif::dup_child_fd(child_pidfd, sockfd) {
+    // 6. Duplicate child's socket into supervisor (use notif.pid for grandchild support)
+    let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
         Ok(fd) => fd,
         Err(_) => return NotifAction::Errno(libc::ENOSYS),
     };

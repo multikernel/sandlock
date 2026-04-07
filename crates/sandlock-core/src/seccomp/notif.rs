@@ -194,12 +194,18 @@ impl SupervisorState {
     }
 }
 
-/// Duplicate a file descriptor from the child process into the supervisor.
-/// Uses pidfd_getfd (syscall 438, Linux 5.6+).
-pub(crate) fn dup_child_fd(child_pidfd: RawFd, target_fd: i32) -> Result<OwnedFd, io::Error> {
+/// Duplicate a file descriptor from an arbitrary process (by PID) into the supervisor.
+/// Opens a pidfd for the given PID, then calls pidfd_getfd.
+pub(crate) fn dup_fd_from_pid(pid: u32, target_fd: i32) -> Result<OwnedFd, io::Error> {
+    const SYS_PIDFD_OPEN: i64 = 434;
     const SYS_PIDFD_GETFD: i64 = 438;
+    let pidfd = unsafe { libc::syscall(SYS_PIDFD_OPEN, pid as i64, 0i64) };
+    if pidfd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let pidfd_owned = unsafe { OwnedFd::from_raw_fd(pidfd as i32) };
     let ret = unsafe {
-        libc::syscall(SYS_PIDFD_GETFD, child_pidfd as i64, target_fd as i64, 0i64)
+        libc::syscall(SYS_PIDFD_GETFD, pidfd_owned.as_raw_fd() as i64, target_fd as i64, 0i64)
     };
     if ret < 0 {
         Err(io::Error::last_os_error())

@@ -172,14 +172,7 @@ pub(crate) async fn handle_bind(
     if let Some(virtual_port) = extract_port(&bytes) {
         if virtual_port == 0 {
             // Ephemeral port — still do on-behalf for TOCTOU safety
-            let st = state.lock().await;
-            let child_pidfd = match st.child_pidfd {
-                Some(fd) => fd,
-                None => return NotifAction::Errno(libc::ENOSYS),
-            };
-            drop(st);
-
-            let dup_fd = match crate::seccomp::notif::dup_child_fd(child_pidfd, sockfd) {
+            let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
                 Ok(fd) => fd,
                 Err(_) => return NotifAction::Errno(libc::ENOSYS),
             };
@@ -201,14 +194,10 @@ pub(crate) async fn handle_bind(
             }
         }
 
-        let child_pidfd = match st.child_pidfd {
-            Some(fd) => fd,
-            None => return NotifAction::Errno(libc::ENOSYS),
-        };
         drop(st);
 
         // Duplicate child's socket and bind in supervisor
-        let dup_fd = match crate::seccomp::notif::dup_child_fd(child_pidfd, sockfd) {
+        let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
             Ok(fd) => fd,
             Err(_) => return NotifAction::Errno(libc::ENOSYS),
         };
@@ -224,14 +213,7 @@ pub(crate) async fn handle_bind(
         }
     } else {
         // Non-IP family — still do on-behalf for consistency
-        let st = state.lock().await;
-        let child_pidfd = match st.child_pidfd {
-            Some(fd) => fd,
-            None => return NotifAction::Errno(libc::ENOSYS),
-        };
-        drop(st);
-
-        let dup_fd = match crate::seccomp::notif::dup_child_fd(child_pidfd, sockfd) {
+        let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
             Ok(fd) => fd,
             Err(_) => return NotifAction::Errno(libc::ENOSYS),
         };
