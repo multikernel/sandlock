@@ -1093,10 +1093,11 @@ async fn emit_policy_event(
 /// Runs until the notification fd is closed (child exits or filter is removed).
 pub async fn supervisor(
     notif_fd: OwnedFd,
-    policy: NotifPolicy,
-    state: Arc<Mutex<SupervisorState>>,
+    ctx: Arc<super::ctx::SupervisorCtx>,
 ) {
     let fd = notif_fd.as_raw_fd();
+    let policy = &ctx.policy;
+    let state = &ctx.state;
 
     // Try to enable sync wakeup (Linux 6.7+, ignore error on older kernels).
     try_set_sync_wakeup(fd);
@@ -1123,7 +1124,7 @@ pub async fn supervisor(
                 // Re-patch vDSO if needed (exec replaces it with a fresh copy).
                 if policy.has_time_start || policy.has_random_seed {
                     let mut st = state.lock().await;
-                    maybe_patch_vdso(notif.pid as i32, &mut st, &policy);
+                    maybe_patch_vdso(notif.pid as i32, &mut st, policy);
                 }
                 // Check dynamic path denials before dispatch
                 let mut action = {
@@ -1136,12 +1137,12 @@ pub async fn supervisor(
                         NotifAction::Errno(libc::EACCES)
                     } else {
                         drop(st);
-                        dispatch(&notif, &policy, &state, fd).await
+                        dispatch(&notif, policy, state, fd).await
                     }
                 };
 
                 // Emit event to policy_fn callback if active
-                if let Some(verdict) = emit_policy_event(&notif, &action, &state, fd).await {
+                if let Some(verdict) = emit_policy_event(&notif, &action, state, fd).await {
                     use crate::policy_fn::Verdict;
                     match verdict {
                         Verdict::Deny => { action = NotifAction::Errno(libc::EPERM); }

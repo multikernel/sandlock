@@ -17,6 +17,7 @@ use crate::error::{SandboxError, SandlockError};
 use crate::network;
 use crate::policy::{BranchAction, FsIsolation, Policy};
 use crate::result::{ExitStatus, RunResult};
+use crate::seccomp::ctx::SupervisorCtx;
 use crate::seccomp::notif::{self, NotifPolicy, SupervisorState};
 use crate::sys::syscall;
 
@@ -934,12 +935,23 @@ impl Sandbox {
                 sup_state.policy_event_tx = Some(tx);
             }
 
+            use std::os::unix::io::AsRawFd;
+            let notif_raw_fd = notif_fd.as_raw_fd();
+            let child_pidfd_raw = pidfd.as_ref().map(|pfd| pfd.as_raw_fd());
+
             let sup_state = Arc::new(Mutex::new(sup_state));
             self.supervisor_state = Some(Arc::clone(&sup_state));
 
+            let ctx = Arc::new(SupervisorCtx {
+                state: Arc::clone(&sup_state),
+                policy: Arc::new(notif_policy),
+                child_pidfd: child_pidfd_raw,
+                notif_fd: notif_raw_fd,
+            });
+
             // Spawn notif supervisor
             self.notif_handle = Some(tokio::spawn(
-                notif::supervisor(notif_fd, notif_policy, Arc::clone(&sup_state)),
+                notif::supervisor(notif_fd, ctx),
             ));
 
             // Spawn load average sampling task (every 5s, like the kernel)
