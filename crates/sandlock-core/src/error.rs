@@ -99,6 +99,9 @@ pub enum BranchError {
 
     #[error("disk quota exceeded")]
     QuotaExceeded,
+
+    #[error("file already exists")]
+    Exists,
 }
 
 /// Convenience type alias.
