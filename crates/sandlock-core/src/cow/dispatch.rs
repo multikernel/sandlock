@@ -723,9 +723,14 @@ pub(crate) async fn handle_cow_getdents(
 
     // Build cache on first call; invalidate if fd was reused for a different dir.
     let cache_key = (pid as i32, child_fd);
-    if let Some((cached_target, _)) = st.dir_cache.get(&cache_key) {
+    if let Some((cached_target, entries)) = st.dir_cache.get(&cache_key) {
         if *cached_target != target {
+            // fd reused for a different directory — rebuild.
             st.dir_cache.remove(&cache_key);
+        } else if entries.is_empty() {
+            // Previously fully drained — return end-of-directory and clean up.
+            st.dir_cache.remove(&cache_key);
+            return NotifAction::ReturnValue(0);
         }
     }
     if !st.dir_cache.contains_key(&cache_key) {
@@ -790,7 +795,9 @@ pub(crate) async fn handle_cow_getdents(
         entries.drain(..consumed);
     }
     if entries.is_empty() {
-        st.dir_cache.remove(&cache_key);
+        // Mark as fully read by leaving an empty entry list in the cache.
+        // This prevents rebuilding the cache on the next call — the empty
+        // cache will produce ReturnValue(0) which signals end-of-directory.
     }
     drop(st);
 

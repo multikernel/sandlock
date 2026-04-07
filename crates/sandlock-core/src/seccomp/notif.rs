@@ -8,8 +8,6 @@ use std::net::IpAddr;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
-use tokio::io::unix::AsyncFd;
-
 use crate::error::NotifError;
 use crate::sys::structs::{
     SeccompNotif, SeccompNotifAddfd, SeccompNotifResp,
@@ -742,43 +740,31 @@ pub async fn supervisor(
     // Try to enable sync wakeup (Linux 6.7+, ignore error on older kernels).
     try_set_sync_wakeup(fd);
 
-    // Set the fd non-blocking for use with tokio's AsyncFd.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags >= 0 {
-        unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-    }
+    // SECCOMP_IOCTL_NOTIF_RECV blocks regardless of O_NONBLOCK, so we
+    // receive notifications in a blocking thread and send them to the
+    // async handler via a channel.  This guarantees we never miss a
+    // notification — the thread is always blocked in recv_notif ready
+    // for the next one.
+    //
+    // Notifications are processed sequentially (not spawned) to avoid
+    // mutex contention between concurrent handlers.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SeccompNotif>();
 
-    let async_fd = match AsyncFd::new(notif_fd) {
-        Ok(afd) => afd,
-        Err(_) => return,
-    };
-
-    loop {
-        let mut guard = match async_fd.readable().await {
-            Ok(g) => g,
-            Err(_) => break,
-        };
-
-        match recv_notif(fd) {
-            Ok(notif) => {
-                // Spawn a task per notification for concurrent handling.
-                let ctx = ctx.clone();
-                let dt = dispatch_table.clone();
-                tokio::spawn(async move {
-                    handle_notification(notif, &ctx, &dt, fd).await;
-                });
+    std::thread::spawn(move || {
+        loop {
+            match recv_notif(fd) {
+                Ok(notif) => {
+                    if tx.send(notif).is_err() {
+                        break; // receiver dropped — supervisor shutting down
+                    }
+                }
+                Err(_) => break, // fd closed — child exited
             }
-            Err(ref e)
-                if e.raw_os_error() == Some(libc::EAGAIN)
-                    || e.raw_os_error() == Some(libc::EWOULDBLOCK) =>
-            {
-                guard.clear_ready();
-                continue;
-            }
-            Err(_) => break, // Listener fd closed or fatal error.
         }
+    });
 
-        guard.clear_ready();
+    while let Some(notif) = rx.recv().await {
+        handle_notification(notif, &ctx, &dispatch_table, fd).await;
     }
 }
 
