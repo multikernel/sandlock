@@ -177,302 +177,184 @@ pub(crate) async fn handle_cow_open(
 // Write operation handlers
 // ============================================================
 
-/// Handle write-type syscalls: unlinkat, mkdirat, renameat2, symlinkat, linkat,
-/// fchmodat, fchownat, utimensat, truncate.
+/// Parsed COW write operation with resolved paths and extracted arguments.
+enum CowWriteOp {
+    Unlink { path: String, is_dir: bool },
+    Mkdir { path: String },
+    Rename { old_path: String, new_path: String },
+    Symlink { target: String, linkpath: String },
+    Link { old_path: String, new_path: String },
+    Chmod { path: String, mode: u32 },
+    Chown { path: String, uid: u32, gid: u32 },
+    Truncate { path: String, length: i64 },
+}
+
+/// Read and resolve a path argument. For *at syscalls, pass the dirfd arg index;
+/// for legacy syscalls, pass None to use the raw path.
+fn read_resolved(
+    notif: &SeccompNotif,
+    path_arg: usize,
+    dirfd_arg: Option<usize>,
+    notif_fd: RawFd,
+) -> Option<String> {
+    let raw = read_path(notif, notif.data.args[path_arg], notif_fd)?;
+    match dirfd_arg {
+        Some(i) => Some(resolve_at_path(notif, notif.data.args[i] as i64, &raw)),
+        None => Some(raw),
+    }
+}
+
+/// Parse the syscall into a CowWriteOp, reading and resolving paths from child memory.
+fn parse_cow_write(notif: &SeccompNotif, notif_fd: RawFd) -> Option<CowWriteOp> {
+    let nr = notif.data.nr as i64;
+
+    // *at variants (dirfd in args[0], path in args[1])
+    if nr == libc::SYS_unlinkat {
+        let path = read_resolved(notif, 1, Some(0), notif_fd)?;
+        let is_dir = (notif.data.args[2] & libc::AT_REMOVEDIR as u64) != 0;
+        return Some(CowWriteOp::Unlink { path, is_dir });
+    }
+    if nr == libc::SYS_mkdirat {
+        return Some(CowWriteOp::Mkdir { path: read_resolved(notif, 1, Some(0), notif_fd)? });
+    }
+    if nr == libc::SYS_renameat2 {
+        let old_path = read_resolved(notif, 1, Some(0), notif_fd)?;
+        let new_path = read_resolved(notif, 3, Some(2), notif_fd)?;
+        return Some(CowWriteOp::Rename { old_path, new_path });
+    }
+    if nr == libc::SYS_symlinkat {
+        // symlinkat(target, newdirfd, linkpath): target is raw, linkpath is resolved
+        let target = read_path(notif, notif.data.args[0], notif_fd)?;
+        let linkpath = read_resolved(notif, 2, Some(1), notif_fd)?;
+        return Some(CowWriteOp::Symlink { target, linkpath });
+    }
+    if nr == libc::SYS_linkat {
+        let old_path = read_resolved(notif, 1, Some(0), notif_fd)?;
+        let new_path = read_resolved(notif, 3, Some(2), notif_fd)?;
+        return Some(CowWriteOp::Link { old_path, new_path });
+    }
+    if nr == libc::SYS_fchmodat {
+        let path = read_resolved(notif, 1, Some(0), notif_fd)?;
+        return Some(CowWriteOp::Chmod { path, mode: (notif.data.args[2] & 0o7777) as u32 });
+    }
+    if nr == libc::SYS_fchownat {
+        let path = read_resolved(notif, 1, Some(0), notif_fd)?;
+        return Some(CowWriteOp::Chown { path, uid: notif.data.args[2] as u32, gid: notif.data.args[3] as u32 });
+    }
+
+    // Legacy variants (path in args[0], no dirfd)
+    if nr == libc::SYS_unlink as i64 {
+        return Some(CowWriteOp::Unlink { path: read_resolved(notif, 0, None, notif_fd)?, is_dir: false });
+    }
+    if nr == libc::SYS_rmdir as i64 {
+        return Some(CowWriteOp::Unlink { path: read_resolved(notif, 0, None, notif_fd)?, is_dir: true });
+    }
+    if nr == libc::SYS_mkdir as i64 {
+        return Some(CowWriteOp::Mkdir { path: read_resolved(notif, 0, None, notif_fd)? });
+    }
+    if nr == libc::SYS_rename as i64 {
+        let old_path = read_resolved(notif, 0, None, notif_fd)?;
+        let new_path = read_resolved(notif, 1, None, notif_fd)?;
+        return Some(CowWriteOp::Rename { old_path, new_path });
+    }
+    if nr == libc::SYS_symlink as i64 {
+        let target = read_path(notif, notif.data.args[0], notif_fd)?;
+        let linkpath = read_resolved(notif, 1, None, notif_fd)?;
+        return Some(CowWriteOp::Symlink { target, linkpath });
+    }
+    if nr == libc::SYS_link as i64 {
+        let old_path = read_resolved(notif, 0, None, notif_fd)?;
+        let new_path = read_resolved(notif, 1, None, notif_fd)?;
+        return Some(CowWriteOp::Link { old_path, new_path });
+    }
+    if nr == libc::SYS_chmod as i64 {
+        let path = read_resolved(notif, 0, None, notif_fd)?;
+        return Some(CowWriteOp::Chmod { path, mode: (notif.data.args[1] & 0o7777) as u32 });
+    }
+    if nr == libc::SYS_chown as i64 || nr == libc::SYS_lchown as i64 {
+        let path = read_resolved(notif, 0, None, notif_fd)?;
+        return Some(CowWriteOp::Chown { path, uid: notif.data.args[1] as u32, gid: notif.data.args[2] as u32 });
+    }
+
+    // truncate (legacy only, path in args[0])
+    if nr == libc::SYS_truncate {
+        let path = read_resolved(notif, 0, None, notif_fd)?;
+        return Some(CowWriteOp::Truncate { path, length: notif.data.args[1] as i64 });
+    }
+
+    None
+}
+
+/// Map a BranchError result to a NotifAction.
+fn cow_result(r: Result<bool, crate::error::BranchError>) -> NotifAction {
+    match r {
+        Ok(true) => NotifAction::ReturnValue(0),
+        Err(crate::error::BranchError::QuotaExceeded) => NotifAction::Errno(libc::ENOSPC),
+        _ => NotifAction::Continue,
+    }
+}
+
+/// Map an unlink result (returns errno directly) to a NotifAction.
+fn unlink_result(r: Result<bool, i32>) -> NotifAction {
+    match r {
+        Ok(true) => NotifAction::ReturnValue(0),
+        Err(errno) => NotifAction::Errno(errno),
+        _ => NotifAction::Continue,
+    }
+}
+
+/// Handle all write-type syscalls: both *at variants (unlinkat, mkdirat, etc.)
+/// and legacy variants (unlink, rmdir, mkdir, etc.).
 pub(crate) async fn handle_cow_write(
     notif: &SeccompNotif,
     cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
 ) -> NotifAction {
-    let nr = notif.data.nr as i64;
+    let op = match parse_cow_write(notif, notif_fd) {
+        Some(op) => op,
+        None => return NotifAction::Continue,
+    };
 
-    // Read the path from child memory based on syscall
-    macro_rules! try_cow {
-        ($cow:expr, $call:expr) => {
-            match $call {
-                Ok(true) => return NotifAction::ReturnValue(0),
-                Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
-                _ => {}
-            }
-        };
-    }
+    let mut st = cow_state.lock().await;
+    let cow = match st.branch.as_mut() {
+        Some(c) => c,
+        None => return NotifAction::Continue,
+    };
 
-    if nr == libc::SYS_unlinkat {
-        // unlinkat(dirfd, pathname, flags): args[0]=dirfd, args[1]=path, args[2]=flags
-        let dirfd = notif.data.args[0] as i64;
-        let path = match read_path(notif, notif.data.args[1], notif_fd) {
-            Some(p) => resolve_at_path(notif, dirfd, &p),
-            None => return NotifAction::Continue,
-        };
-        let is_dir = (notif.data.args[2] & libc::AT_REMOVEDIR as u64) != 0;
-        let mut st = cow_state.lock().await;
-        if let Some(cow) = st.branch.as_mut() {
-            if cow.matches(&path) {
-                match cow.handle_unlink(&path, is_dir) {
-                    Ok(true) => return NotifAction::ReturnValue(0),
-                    Err(errno) => return NotifAction::Errno(errno),
-                    _ => {}
-                }
-            }
+    match op {
+        CowWriteOp::Unlink { ref path, is_dir } => {
+            if !cow.matches(path) { return NotifAction::Continue; }
+            unlink_result(cow.handle_unlink(path, is_dir))
         }
-    } else if nr == libc::SYS_mkdirat {
-        // mkdirat(dirfd, pathname, mode)
-        let dirfd = notif.data.args[0] as i64;
-        let path = match read_path(notif, notif.data.args[1], notif_fd) {
-            Some(p) => resolve_at_path(notif, dirfd, &p),
-            None => return NotifAction::Continue,
-        };
-        let mut st = cow_state.lock().await;
-        if let Some(cow) = st.branch.as_mut() {
-            if cow.matches(&path) {
-                try_cow!(cow, cow.handle_mkdir(&path));
-            }
+        CowWriteOp::Mkdir { ref path } => {
+            if !cow.matches(path) { return NotifAction::Continue; }
+            cow_result(cow.handle_mkdir(path))
         }
-    } else if nr == libc::SYS_renameat2 {
-        // renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
-        let old_dirfd = notif.data.args[0] as i64;
-        let new_dirfd = notif.data.args[2] as i64;
-        let old_path = match read_path(notif, notif.data.args[1], notif_fd) {
-            Some(p) => resolve_at_path(notif, old_dirfd, &p),
-            None => return NotifAction::Continue,
-        };
-        let new_path = match read_path(notif, notif.data.args[3], notif_fd) {
-            Some(p) => resolve_at_path(notif, new_dirfd, &p),
-            None => return NotifAction::Continue,
-        };
-        let mut st = cow_state.lock().await;
-        if let Some(cow) = st.branch.as_mut() {
-            if cow.matches(&old_path) {
-                try_cow!(cow, cow.handle_rename(&old_path, &new_path));
-            }
+        CowWriteOp::Rename { ref old_path, ref new_path } => {
+            if !cow.matches(old_path) { return NotifAction::Continue; }
+            cow_result(cow.handle_rename(old_path, new_path))
         }
-    } else if nr == libc::SYS_symlinkat {
-        // symlinkat(target, newdirfd, linkpath)
-        let target = match read_path(notif, notif.data.args[0], notif_fd) {
-            Some(p) => p,
-            None => return NotifAction::Continue,
-        };
-        let dirfd = notif.data.args[1] as i64;
-        let linkpath = match read_path(notif, notif.data.args[2], notif_fd) {
-            Some(p) => resolve_at_path(notif, dirfd, &p),
-            None => return NotifAction::Continue,
-        };
-        let mut st = cow_state.lock().await;
-        if let Some(cow) = st.branch.as_mut() {
-            if cow.matches(&linkpath) {
-                try_cow!(cow, cow.handle_symlink(&target, &linkpath));
-            }
+        CowWriteOp::Symlink { ref target, ref linkpath } => {
+            if !cow.matches(linkpath) { return NotifAction::Continue; }
+            cow_result(cow.handle_symlink(target, linkpath))
         }
-    } else if nr == libc::SYS_linkat {
-        // linkat(olddirfd, oldpath, newdirfd, newpath, flags)
-        let old_dirfd = notif.data.args[0] as i64;
-        let new_dirfd = notif.data.args[2] as i64;
-        let old_path = match read_path(notif, notif.data.args[1], notif_fd) {
-            Some(p) => resolve_at_path(notif, old_dirfd, &p),
-            None => return NotifAction::Continue,
-        };
-        let new_path = match read_path(notif, notif.data.args[3], notif_fd) {
-            Some(p) => resolve_at_path(notif, new_dirfd, &p),
-            None => return NotifAction::Continue,
-        };
-        let mut st = cow_state.lock().await;
-        if let Some(cow) = st.branch.as_mut() {
-            if cow.matches(&new_path) {
-                try_cow!(cow, cow.handle_link(&old_path, &new_path));
-            }
+        CowWriteOp::Link { ref old_path, ref new_path } => {
+            if !cow.matches(new_path) { return NotifAction::Continue; }
+            cow_result(cow.handle_link(old_path, new_path))
         }
-    } else if nr == libc::SYS_fchmodat {
-        // fchmodat(dirfd, pathname, mode, flags)
-        let dirfd = notif.data.args[0] as i64;
-        let path = match read_path(notif, notif.data.args[1], notif_fd) {
-            Some(p) => resolve_at_path(notif, dirfd, &p),
-            None => return NotifAction::Continue,
-        };
-        let mode = (notif.data.args[2] & 0o7777) as u32;
-        let mut st = cow_state.lock().await;
-        if let Some(cow) = st.branch.as_mut() {
-            if cow.matches(&path) {
-                try_cow!(cow, cow.handle_chmod(&path, mode));
-            }
+        CowWriteOp::Chmod { ref path, mode } => {
+            if !cow.matches(path) { return NotifAction::Continue; }
+            cow_result(cow.handle_chmod(path, mode))
         }
-    } else if nr == libc::SYS_fchownat {
-        // fchownat(dirfd, pathname, uid, gid, flags)
-        let dirfd = notif.data.args[0] as i64;
-        let path = match read_path(notif, notif.data.args[1], notif_fd) {
-            Some(p) => resolve_at_path(notif, dirfd, &p),
-            None => return NotifAction::Continue,
-        };
-        let uid = notif.data.args[2] as u32;
-        let gid = notif.data.args[3] as u32;
-        let mut st = cow_state.lock().await;
-        if let Some(cow) = st.branch.as_mut() {
-            if cow.matches(&path) {
-                try_cow!(cow, cow.handle_chown(&path, uid, gid));
-            }
+        CowWriteOp::Chown { ref path, uid, gid } => {
+            if !cow.matches(path) { return NotifAction::Continue; }
+            cow_result(cow.handle_chown(path, uid, gid))
         }
-    } else if nr == libc::SYS_truncate {
-        // truncate(path, length): args[0]=path, args[1]=length
-        let path = match read_path(notif, notif.data.args[0], notif_fd) {
-            Some(p) => p,
-            None => return NotifAction::Continue,
-        };
-        let length = notif.data.args[1] as i64;
-        let mut st = cow_state.lock().await;
-        if let Some(cow) = st.branch.as_mut() {
-            if cow.matches(&path) {
-                try_cow!(cow, cow.handle_truncate(&path, length));
-            }
+        CowWriteOp::Truncate { ref path, length } => {
+            if !cow.matches(path) { return NotifAction::Continue; }
+            cow_result(cow.handle_truncate(path, length))
         }
     }
-
-    NotifAction::Continue
-}
-
-// ============================================================
-// Legacy write syscall handlers (chmod, unlink, mkdir, etc.)
-// ============================================================
-
-/// Handle legacy write syscalls where the path is in args[0] instead of args[1].
-/// These are used by some libc implementations instead of the *at variants.
-pub(crate) async fn handle_cow_legacy_write(
-    notif: &SeccompNotif,
-    cow_state: &Arc<Mutex<CowState>>,
-    notif_fd: RawFd,
-) -> NotifAction {
-    let nr = notif.data.nr as i64;
-
-    macro_rules! try_cow {
-        ($cow:expr, $call:expr) => {
-            match $call {
-                Ok(true) => return NotifAction::ReturnValue(0),
-                Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
-                _ => {}
-            }
-        };
-    }
-
-    if nr == libc::SYS_unlink as i64 {
-        // unlink(pathname): args[0]=path
-        let path = match read_path(notif, notif.data.args[0], notif_fd) {
-            Some(p) => p,
-            None => return NotifAction::Continue,
-        };
-        let mut st = cow_state.lock().await;
-        if let Some(cow) = st.branch.as_mut() {
-            if cow.matches(&path) {
-                match cow.handle_unlink(&path, false) {
-                    Ok(true) => return NotifAction::ReturnValue(0),
-                    Err(errno) => return NotifAction::Errno(errno),
-                    _ => {}
-                }
-            }
-        }
-    } else if nr == libc::SYS_rmdir as i64 {
-        // rmdir(pathname): args[0]=path
-        let path = match read_path(notif, notif.data.args[0], notif_fd) {
-            Some(p) => p,
-            None => return NotifAction::Continue,
-        };
-        let mut st = cow_state.lock().await;
-        if let Some(cow) = st.branch.as_mut() {
-            if cow.matches(&path) {
-                match cow.handle_unlink(&path, true) {
-                    Ok(true) => return NotifAction::ReturnValue(0),
-                    Err(errno) => return NotifAction::Errno(errno),
-                    _ => {}
-                }
-            }
-        }
-    } else if nr == libc::SYS_mkdir as i64 {
-        // mkdir(pathname, mode): args[0]=path
-        let path = match read_path(notif, notif.data.args[0], notif_fd) {
-            Some(p) => p,
-            None => return NotifAction::Continue,
-        };
-        let mut st = cow_state.lock().await;
-        if let Some(cow) = st.branch.as_mut() {
-            if cow.matches(&path) {
-                try_cow!(cow, cow.handle_mkdir(&path));
-            }
-        }
-    } else if nr == libc::SYS_rename as i64 {
-        // rename(oldpath, newpath): args[0]=old, args[1]=new
-        let old_path = match read_path(notif, notif.data.args[0], notif_fd) {
-            Some(p) => p,
-            None => return NotifAction::Continue,
-        };
-        let new_path = match read_path(notif, notif.data.args[1], notif_fd) {
-            Some(p) => p,
-            None => return NotifAction::Continue,
-        };
-        let mut st = cow_state.lock().await;
-        if let Some(cow) = st.branch.as_mut() {
-            if cow.matches(&old_path) {
-                try_cow!(cow, cow.handle_rename(&old_path, &new_path));
-            }
-        }
-    } else if nr == libc::SYS_symlink as i64 {
-        // symlink(target, linkpath): args[0]=target, args[1]=linkpath
-        let target = match read_path(notif, notif.data.args[0], notif_fd) {
-            Some(p) => p,
-            None => return NotifAction::Continue,
-        };
-        let linkpath = match read_path(notif, notif.data.args[1], notif_fd) {
-            Some(p) => p,
-            None => return NotifAction::Continue,
-        };
-        let mut st = cow_state.lock().await;
-        if let Some(cow) = st.branch.as_mut() {
-            if cow.matches(&linkpath) {
-                try_cow!(cow, cow.handle_symlink(&target, &linkpath));
-            }
-        }
-    } else if nr == libc::SYS_link as i64 {
-        // link(oldpath, newpath): args[0]=old, args[1]=new
-        let old_path = match read_path(notif, notif.data.args[0], notif_fd) {
-            Some(p) => p,
-            None => return NotifAction::Continue,
-        };
-        let new_path = match read_path(notif, notif.data.args[1], notif_fd) {
-            Some(p) => p,
-            None => return NotifAction::Continue,
-        };
-        let mut st = cow_state.lock().await;
-        if let Some(cow) = st.branch.as_mut() {
-            if cow.matches(&new_path) {
-                try_cow!(cow, cow.handle_link(&old_path, &new_path));
-            }
-        }
-    } else if nr == libc::SYS_chmod as i64 {
-        // chmod(pathname, mode): args[0]=path, args[1]=mode
-        let path = match read_path(notif, notif.data.args[0], notif_fd) {
-            Some(p) => p,
-            None => return NotifAction::Continue,
-        };
-        let mode = (notif.data.args[1] & 0o7777) as u32;
-        let mut st = cow_state.lock().await;
-        if let Some(cow) = st.branch.as_mut() {
-            if cow.matches(&path) {
-                try_cow!(cow, cow.handle_chmod(&path, mode));
-            }
-        }
-    } else if nr == libc::SYS_chown as i64 || nr == libc::SYS_lchown as i64 {
-        // chown(pathname, uid, gid): args[0]=path, args[1]=uid, args[2]=gid
-        let path = match read_path(notif, notif.data.args[0], notif_fd) {
-            Some(p) => p,
-            None => return NotifAction::Continue,
-        };
-        let uid = notif.data.args[1] as u32;
-        let gid = notif.data.args[2] as u32;
-        let mut st = cow_state.lock().await;
-        if let Some(cow) = st.branch.as_mut() {
-            if cow.matches(&path) {
-                try_cow!(cow, cow.handle_chown(&path, uid, gid));
-            }
-        }
-    }
-
-    NotifAction::Continue
 }
 
 // ============================================================

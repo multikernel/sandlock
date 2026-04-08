@@ -496,22 +496,11 @@ fn register_chroot_handlers(table: &mut DispatchTable, policy: &Arc<NotifPolicy>
 // ============================================================
 
 fn register_cow_handlers(table: &mut DispatchTable) {
-    // Write syscalls — unconditional return
+    // Write syscalls (*at variants + legacy)
     for &nr in &[
         libc::SYS_unlinkat, libc::SYS_mkdirat, libc::SYS_renameat2,
         libc::SYS_symlinkat, libc::SYS_linkat, libc::SYS_fchmodat,
         libc::SYS_fchownat, libc::SYS_truncate,
-    ] {
-        table.register(nr, Box::new(|notif, ctx, notif_fd| {
-            let cow = Arc::clone(&ctx.cow);
-            Box::pin(async move {
-                crate::cow::dispatch::handle_cow_write(&notif, &cow, notif_fd).await
-            })
-        }));
-    }
-
-    // Legacy write syscalls
-    for &nr in &[
         libc::SYS_unlink as i64, libc::SYS_rmdir as i64,
         libc::SYS_mkdir as i64, libc::SYS_rename as i64,
         libc::SYS_symlink as i64, libc::SYS_link as i64,
@@ -521,7 +510,7 @@ fn register_cow_handlers(table: &mut DispatchTable) {
         table.register(nr, Box::new(|notif, ctx, notif_fd| {
             let cow = Arc::clone(&ctx.cow);
             Box::pin(async move {
-                crate::cow::dispatch::handle_cow_legacy_write(&notif, &cow, notif_fd).await
+                crate::cow::dispatch::handle_cow_write(&notif, &cow, notif_fd).await
             })
         }));
     }
