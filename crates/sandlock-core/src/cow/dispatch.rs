@@ -207,8 +207,12 @@ pub(crate) async fn handle_cow_write(
         let is_dir = (notif.data.args[2] & libc::AT_REMOVEDIR as u64) != 0;
         let mut st = cow_state.lock().await;
         if let Some(cow) = st.branch.as_mut() {
-            if cow.matches(&path) && cow.handle_unlink(&path, is_dir) {
-                return NotifAction::ReturnValue(0);
+            if cow.matches(&path) {
+                match cow.handle_unlink(&path, is_dir) {
+                    Ok(true) => return NotifAction::ReturnValue(0),
+                    Err(errno) => return NotifAction::Errno(errno),
+                    _ => {}
+                }
             }
         }
     } else if nr == libc::SYS_mkdirat {
@@ -355,8 +359,12 @@ pub(crate) async fn handle_cow_legacy_write(
         };
         let mut st = cow_state.lock().await;
         if let Some(cow) = st.branch.as_mut() {
-            if cow.matches(&path) && cow.handle_unlink(&path, false) {
-                return NotifAction::ReturnValue(0);
+            if cow.matches(&path) {
+                match cow.handle_unlink(&path, false) {
+                    Ok(true) => return NotifAction::ReturnValue(0),
+                    Err(errno) => return NotifAction::Errno(errno),
+                    _ => {}
+                }
             }
         }
     } else if nr == libc::SYS_rmdir as i64 {
@@ -367,8 +375,12 @@ pub(crate) async fn handle_cow_legacy_write(
         };
         let mut st = cow_state.lock().await;
         if let Some(cow) = st.branch.as_mut() {
-            if cow.matches(&path) && cow.handle_unlink(&path, true) {
-                return NotifAction::ReturnValue(0);
+            if cow.matches(&path) {
+                match cow.handle_unlink(&path, true) {
+                    Ok(true) => return NotifAction::ReturnValue(0),
+                    Err(errno) => return NotifAction::Errno(errno),
+                    _ => {}
+                }
             }
         }
     } else if nr == libc::SYS_mkdir as i64 {

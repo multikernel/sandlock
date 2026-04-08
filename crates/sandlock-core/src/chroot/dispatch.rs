@@ -722,8 +722,12 @@ pub(crate) async fn handle_chroot_write(
             let mut cs = cow_state.lock().await;
             if let Some(cow) = cs.branch.as_mut() {
                 let s = host_path.to_string_lossy();
-                if cow.matches(&s) && cow.handle_unlink(&s, is_dir) {
-                    return NotifAction::ReturnValue(0);
+                if cow.matches(&s) {
+                    match cow.handle_unlink(&s, is_dir) {
+                        Ok(true) => return NotifAction::ReturnValue(0),
+                        Err(errno) => return NotifAction::Errno(errno),
+                        _ => {}
+                    }
                 }
             }
         }

@@ -451,13 +451,39 @@ impl SeccompCowBranch {
     }
 
     /// Handle unlink/rmdir.
-    pub fn handle_unlink(&mut self, path: &str, is_dir: bool) -> bool {
+    ///
+    /// Returns `Ok(true)` on success, `Ok(false)` if the path doesn't match,
+    /// or `Err(errno)` for filesystem errors (e.g. ENOTDIR when rmdir is
+    /// called on a non-directory, EISDIR when unlink is called on a directory).
+    pub fn handle_unlink(&mut self, path: &str, is_dir: bool) -> Result<bool, i32> {
         let rel = match self.safe_rel(path) {
             Some(r) => r,
-            None => return false,
+            None => return Ok(false),
         };
         let upper_file = self.upper.join(&rel);
         let lower_file = self.workdir.join(&rel);
+
+        // Check type mismatches: rmdir on a non-directory or unlink on a directory.
+        // We check both upper (COW layer) and lower (real filesystem).
+        let check_path = if upper_file.exists() || upper_file.is_symlink() {
+            Some(&upper_file)
+        } else if lower_file.exists() || lower_file.is_symlink() {
+            Some(&lower_file)
+        } else {
+            None
+        };
+
+        if let Some(p) = check_path {
+            let is_actual_dir = p.is_dir();
+            if is_dir && !is_actual_dir {
+                // rmdir() on a non-directory → ENOTDIR
+                return Err(libc::ENOTDIR);
+            }
+            if !is_dir && is_actual_dir {
+                // unlink() on a directory → EISDIR
+                return Err(libc::EISDIR);
+            }
+        }
 
         if upper_file.exists() || upper_file.is_symlink() {
             if is_dir {
@@ -473,7 +499,7 @@ impl SeccompCowBranch {
         } else {
             self.has_changes = true;
         }
-        true
+        Ok(true)
     }
 
     /// Handle mkdirat.
@@ -1136,7 +1162,7 @@ mod tests {
 
         // Now at 11 used. Can't add anything — but unlink existing.txt to free 5 bytes.
         let path = abs(&branch, "existing.txt");
-        assert!(branch.handle_unlink(&path, false));
+        assert!(branch.handle_unlink(&path, false).unwrap());
         // disk_used should now be 6 (only nested.txt in upper).
         assert_eq!(branch.disk_used, 6);
 
@@ -1371,5 +1397,72 @@ mod tests {
         // not top-level dirs like "bin", "usr", "var".
         assert!(!entries.iter().any(|e| e == "bin" || e == "usr" || e == "var"),
             "list_merged_dir returned root entries instead of target dir: {:?}", entries);
+    }
+
+    #[test]
+    fn test_rmdir_on_file_returns_enotdir() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+
+        // existing.txt is a regular file in the lower layer.
+        // rmdir (is_dir=true) on it must fail with ENOTDIR.
+        let path = abs(&branch, "existing.txt");
+        let err = branch.handle_unlink(&path, true).unwrap_err();
+        assert_eq!(err, libc::ENOTDIR);
+
+        // The file should still exist (rmdir must not remove it).
+        assert!(workdir.path().join("existing.txt").exists());
+    }
+
+    #[test]
+    fn test_rmdir_on_cow_file_returns_enotdir() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+
+        // Copy file to upper layer, then try rmdir on it.
+        branch.ensure_cow_copy("existing.txt").unwrap();
+        let path = abs(&branch, "existing.txt");
+        let err = branch.handle_unlink(&path, true).unwrap_err();
+        assert_eq!(err, libc::ENOTDIR);
+
+        // The file should still be in the upper layer.
+        assert!(branch.upper_dir().join("existing.txt").exists());
+    }
+
+    #[test]
+    fn test_unlink_on_directory_returns_eisdir() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+
+        // Create a directory in the upper layer via handle_mkdir.
+        let dir_path = abs(&branch, "mydir");
+        assert!(branch.handle_mkdir(&dir_path).unwrap());
+
+        // unlink (is_dir=false) on a directory must fail with EISDIR.
+        let err = branch.handle_unlink(&dir_path, false).unwrap_err();
+        assert_eq!(err, libc::EISDIR);
+    }
+
+    #[test]
+    fn test_rmdir_on_directory_succeeds() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+
+        // Create a directory in the upper layer.
+        let dir_path = abs(&branch, "mydir");
+        assert!(branch.handle_mkdir(&dir_path).unwrap());
+
+        // rmdir (is_dir=true) on a real directory should succeed.
+        assert!(branch.handle_unlink(&dir_path, true).unwrap());
+    }
+
+    #[test]
+    fn test_unlink_on_file_succeeds() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+
+        // unlink (is_dir=false) on a regular file should succeed.
+        let path = abs(&branch, "existing.txt");
+        assert!(branch.handle_unlink(&path, false).unwrap());
     }
 }
