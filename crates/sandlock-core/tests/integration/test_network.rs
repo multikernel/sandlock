@@ -1,4 +1,5 @@
 use sandlock_core::{Policy, Sandbox};
+use std::net::TcpListener;
 use std::path::PathBuf;
 
 fn temp_file(name: &str) -> PathBuf {
@@ -118,5 +119,52 @@ async fn test_no_net_allow_host_unrestricted() {
     // Without allowlist, should get REFUSED (not BLOCKED)
     assert_eq!(content, "REFUSED", "without net_allow_host, connect should not be blocked by seccomp");
 
+    let _ = std::fs::remove_file(&out);
+}
+
+/// Test that a grandchild process (forked from the sandboxed child) can
+/// perform network operations. Before the fix in f9eeda3, the supervisor
+/// used a stored pidfd for the original child, so pidfd_getfd failed when
+/// the socket belonged to a grandchild's fd table.
+#[tokio::test]
+async fn test_grandchild_network_connect() {
+    let out = temp_file("grandchild");
+
+    // Spawn a local TCP server outside the sandbox for the grandchild to connect to.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let srv = std::thread::spawn(move || {
+        let (mut conn, _) = listener.accept().unwrap();
+        let _ = std::io::Write::write_all(&mut conn, b"hello");
+    });
+
+    let policy = base_policy()
+        .net_allow_host("127.0.0.1")
+        .net_connect_port(port)
+        .build()
+        .unwrap();
+
+    // The sandboxed process spawns a subprocess (grandchild) that does the
+    // actual TCP connect. This exercises dup_fd_from_pid(notif.pid, ...).
+    let script = format!(concat!(
+        "import subprocess, sys\n",
+        "child = subprocess.run([sys.executable, '-c', ",
+        "\"import socket\\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\\n",
+        "s.settimeout(5)\\n",
+        "s.connect(('127.0.0.1', {port}))\\n",
+        "data = s.recv(16)\\n",
+        "s.close()\\n",
+        "open('{out}', 'w').write(data.decode())\\n",
+        "\"])\n",
+        "sys.exit(child.returncode)\n",
+    ), out = out.display(), port = port);
+
+    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    assert_eq!(content, "hello", "grandchild should connect and read data");
+
+    srv.join().unwrap();
     let _ = std::fs::remove_file(&out);
 }
