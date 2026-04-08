@@ -123,20 +123,7 @@ pub(crate) async fn handle_cow_open(
             // Do the potentially-expensive copy on a blocking thread
             let upper_clone = upper.clone();
             let copy_result = tokio::task::spawn_blocking(move || {
-                match std::fs::copy(&lower, &upper_clone) {
-                    Ok(_) => {
-                        // Preserve permissions
-                        if let Ok(meta) = lower.metadata() {
-                            let _ = std::fs::set_permissions(&upper_clone, meta.permissions());
-                        }
-                        Ok(())
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                        // Can't read the lower file — create empty fallback
-                        std::fs::File::create(&upper_clone).map(|_| ())
-                    }
-                    Err(e) => Err(e),
-                }
+                crate::cow::seccomp::SeccompCowBranch::execute_copy(&upper_clone, &lower)
             }).await;
 
             match copy_result {
@@ -303,8 +290,62 @@ fn unlink_result(r: Result<bool, i32>) -> NotifAction {
     }
 }
 
+/// Determine which relative path (if any) needs a COW copy for this operation.
+/// Returns `(match_path, copy_rel)` where match_path is checked against
+/// `cow.matches()` and copy_rel is the relative path to pre-copy.
+fn cow_copy_rel<'a>(
+    op: &'a CowWriteOp,
+    cow: &crate::cow::seccomp::SeccompCowBranch,
+) -> Option<(&'a str, String)> {
+    let (match_path, copy_path) = match op {
+        // These ops call ensure_cow_copy internally — pre-copy the target
+        CowWriteOp::Chmod { ref path, .. }
+        | CowWriteOp::Chown { ref path, .. }
+        | CowWriteOp::Truncate { ref path, .. } => (path.as_str(), path.as_str()),
+        CowWriteOp::Rename { ref old_path, .. } => (old_path.as_str(), old_path.as_str()),
+        CowWriteOp::Link { ref old_path, ref new_path, .. } => (new_path.as_str(), old_path.as_str()),
+        // These ops don't need a pre-copy
+        _ => return None,
+    };
+    if !cow.matches(match_path) {
+        return None;
+    }
+    cow.safe_rel(copy_path)
+        .map(|rel| (match_path, rel))
+}
+
+/// Execute a deferred `CowCopyPlan::NeedsCopy` on a blocking thread.
+/// Returns the upper path on success, or rolls back quota on failure.
+async fn execute_deferred_copy(
+    cow_state: &Arc<Mutex<CowState>>,
+    upper: std::path::PathBuf,
+    lower: std::path::PathBuf,
+    file_size: u64,
+) -> Option<std::path::PathBuf> {
+    let upper_clone = upper.clone();
+    let copy_result = tokio::task::spawn_blocking(move || {
+        crate::cow::seccomp::SeccompCowBranch::execute_copy(&upper_clone, &lower)
+    }).await;
+    match copy_result {
+        Ok(Ok(())) => Some(upper),
+        _ => {
+            let mut st = cow_state.lock().await;
+            if let Some(cow) = st.branch.as_mut() {
+                cow.rollback_copy(file_size);
+            }
+            None
+        }
+    }
+}
+
 /// Handle all write-type syscalls: both *at variants (unlinkat, mkdirat, etc.)
 /// and legacy variants (unlink, rmdir, mkdir, etc.).
+///
+/// For operations that modify existing files (chmod, chown, rename, link,
+/// truncate), the handler uses a two-phase pattern: prepare the copy plan
+/// under the lock, execute the potentially expensive file copy outside the
+/// lock, then re-acquire the lock and run the actual operation (which finds
+/// the file already in upper).
 pub(crate) async fn handle_cow_write(
     notif: &SeccompNotif,
     cow_state: &Arc<Mutex<CowState>>,
@@ -315,6 +356,36 @@ pub(crate) async fn handle_cow_write(
         None => return NotifAction::Continue,
     };
 
+    // Phase 1: check if we need to pre-copy a file (under lock, no heavy I/O)
+    let copy_plan = {
+        let mut st = cow_state.lock().await;
+        let cow = match st.branch.as_mut() {
+            Some(c) => c,
+            None => return NotifAction::Continue,
+        };
+
+        match cow_copy_rel(&op, cow) {
+            Some((_match_path, ref rel)) => {
+                match cow.prepare_copy(rel) {
+                    Ok(plan) => Some(plan),
+                    Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
+                    Err(_) => return NotifAction::Continue,
+                }
+            }
+            None => None,
+        }
+    };
+    // Lock is released here
+
+    // Phase 2: execute the file copy outside the lock (if needed)
+    if let Some(crate::cow::seccomp::CowCopyPlan::NeedsCopy { upper, lower, file_size }) = copy_plan {
+        if execute_deferred_copy(cow_state, upper, lower, file_size).await.is_none() {
+            return NotifAction::Continue;
+        }
+    }
+
+    // Phase 3: execute the operation under lock (ensure_cow_copy is now a no-op
+    // for the pre-copied file since it's already in upper)
     let mut st = cow_state.lock().await;
     let cow = match st.branch.as_mut() {
         Some(c) => c,

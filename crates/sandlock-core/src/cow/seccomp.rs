@@ -20,6 +20,20 @@ const O_EXCL: u64 = 0o200;
 const O_DIRECTORY: u64 = 0o200000;
 const WRITE_FLAGS: u64 = O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND;
 
+/// Plan for a COW copy — returned by `prepare_copy()` to separate metadata
+/// updates (under lock) from potentially expensive file I/O (outside lock).
+#[derive(Debug)]
+pub enum CowCopyPlan {
+    /// File is already in upper (or was a symlink/dir handled immediately).
+    Ready(PathBuf),
+    /// Regular file needs copy from lower to upper (potentially large).
+    NeedsCopy {
+        upper: PathBuf,
+        lower: PathBuf,
+        file_size: u64,
+    },
+}
+
 /// Plan returned by `prepare_open` — describes what I/O to do after releasing the lock.
 #[derive(Debug)]
 pub enum CowOpenPlan {
@@ -182,8 +196,11 @@ impl SeccompCowBranch {
         self.disk_used = dir_size(&self.upper);
     }
 
-    /// Ensure a COW copy exists in upper. Returns the upper path.
-    pub fn ensure_cow_copy(&mut self, rel_path: &str) -> Result<PathBuf, BranchError> {
+    /// Prepare a COW copy: update metadata (deleted set, quota reservation)
+    /// and handle small items (symlinks, dirs) immediately, but defer large
+    /// file copies to the caller. This is the shared core used by both
+    /// `ensure_cow_copy` (synchronous) and the async two-phase dispatch.
+    pub fn prepare_copy(&mut self, rel_path: &str) -> Result<CowCopyPlan, BranchError> {
         self.deleted.remove(rel_path);
         self.has_changes = true;
 
@@ -191,7 +208,7 @@ impl SeccompCowBranch {
         let lower_file = self.workdir.join(rel_path);
 
         if upper_file.exists() || upper_file.is_symlink() {
-            return Ok(upper_file);
+            return Ok(CowCopyPlan::Ready(upper_file));
         }
 
         if let Some(parent) = upper_file.parent() {
@@ -199,50 +216,83 @@ impl SeccompCowBranch {
                 .map_err(|e| BranchError::Operation(format!("create parent: {}", e)))?;
         }
 
+        // Symlink — copy immediately (tiny, not worth deferring)
         if lower_file.is_symlink() {
-            self.check_quota(256)?; // symlinks are small
+            self.check_quota(256)?;
             let target = fs::read_link(&lower_file)
                 .map_err(|e| BranchError::Operation(format!("readlink: {}", e)))?;
             std::os::unix::fs::symlink(&target, &upper_file)
                 .map_err(|e| BranchError::Operation(format!("symlink: {}", e)))?;
             self.disk_used += 256;
-        } else if lower_file.is_dir() {
+            return Ok(CowCopyPlan::Ready(upper_file));
+        }
+
+        // Directory — create immediately (no data copy)
+        if lower_file.is_dir() {
             self.check_quota(4096)?;
             fs::create_dir_all(&upper_file)
                 .map_err(|e| BranchError::Operation(format!("create dir: {}", e)))?;
-            // Preserve permissions
             if let Ok(meta) = lower_file.metadata() {
                 let _ = fs::set_permissions(&upper_file, meta.permissions());
             }
             self.disk_used += 4096;
-        } else if lower_file.exists() {
+            return Ok(CowCopyPlan::Ready(upper_file));
+        }
+
+        // Regular file — defer the potentially expensive copy
+        if lower_file.exists() {
             let meta = lower_file.metadata()
                 .map_err(|e| BranchError::Operation(format!("metadata: {}", e)))?;
             let file_size = meta.len();
             self.check_quota(file_size)?;
-            match fs::copy(&lower_file, &upper_file) {
-                Ok(_) => {
-                    // Preserve permissions
-                    fs::set_permissions(&upper_file, meta.permissions())
-                        .map_err(|e| BranchError::Operation(format!("set permissions: {}", e)))?;
-                    self.disk_used += file_size;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                    // Can't read the lower file (e.g. root-owned 0640).
-                    // Create an empty file in upper so writes can proceed.
-                    fs::File::create(&upper_file)
-                        .map_err(|e| BranchError::Operation(format!("create fallback: {}", e)))?;
-                }
-                Err(e) => return Err(BranchError::Operation(format!("copy: {}", e))),
-            }
-        } else {
-            // New file (not in lower layer). We can't predict how much
-            // the child will write, but we must at least block creation
-            // when the quota is already exceeded.
-            self.check_quota(0)?;
+            self.disk_used += file_size;
+            return Ok(CowCopyPlan::NeedsCopy {
+                upper: upper_file,
+                lower: lower_file,
+                file_size,
+            });
         }
 
-        Ok(upper_file)
+        // New file (not in lower layer)
+        self.check_quota(0)?;
+        Ok(CowCopyPlan::Ready(upper_file))
+    }
+
+    /// Execute a file copy synchronously. Used by `ensure_cow_copy` and the
+    /// async dispatch (via `spawn_blocking`).
+    pub fn execute_copy(upper: &Path, lower: &Path) -> Result<(), std::io::Error> {
+        match fs::copy(lower, upper) {
+            Ok(_) => {
+                if let Ok(meta) = lower.metadata() {
+                    let _ = fs::set_permissions(upper, meta.permissions());
+                }
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                // Can't read the lower file (e.g. root-owned 0640).
+                // Create an empty file in upper so writes can proceed.
+                fs::File::create(upper)?;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Ensure a COW copy exists in upper (synchronous). Returns the upper path.
+    /// For callers that don't need async two-phase behavior.
+    pub fn ensure_cow_copy(&mut self, rel_path: &str) -> Result<PathBuf, BranchError> {
+        match self.prepare_copy(rel_path)? {
+            CowCopyPlan::Ready(upper) => Ok(upper),
+            CowCopyPlan::NeedsCopy { upper, lower, file_size } => {
+                match Self::execute_copy(&upper, &lower) {
+                    Ok(()) => Ok(upper),
+                    Err(e) => {
+                        self.rollback_copy(file_size);
+                        Err(BranchError::Operation(format!("copy: {}", e)))
+                    }
+                }
+            }
+        }
     }
 
     /// Resolve a read path: upper if modified, else lower.
@@ -379,70 +429,19 @@ impl SeccompCowBranch {
         }
     }
 
-    /// Prepare a COW copy — determine what I/O is needed without doing it.
-    ///
-    /// Updates metadata (deleted set, has_changes, quota reservation) but
-    /// defers the actual `fs::copy()` to the caller.
+    /// Prepare a COW copy for openat — wraps `prepare_copy` into `CowOpenPlan`.
     fn prepare_cow_copy(&mut self, rel_path: &str) -> Result<CowOpenPlan, BranchError> {
-        self.deleted.remove(rel_path);
-        self.has_changes = true;
-
-        let upper_file = self.upper.join(rel_path);
-        let lower_file = self.workdir.join(rel_path);
-
-        // Already in upper — no copy needed
-        if upper_file.exists() || upper_file.is_symlink() {
-            return Ok(CowOpenPlan::UpperReady { upper: upper_file });
-        }
-
-        // Create parent dirs in upper
-        if let Some(parent) = upper_file.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| BranchError::Operation(format!("create parent: {}", e)))?;
-        }
-
-        // Symlink — copy immediately (tiny, not worth spawn_blocking)
-        if lower_file.is_symlink() {
-            self.check_quota(256)?;
-            let target = fs::read_link(&lower_file)
-                .map_err(|e| BranchError::Operation(format!("readlink: {}", e)))?;
-            std::os::unix::fs::symlink(&target, &upper_file)
-                .map_err(|e| BranchError::Operation(format!("symlink: {}", e)))?;
-            self.disk_used += 256;
-            return Ok(CowOpenPlan::UpperReady { upper: upper_file });
-        }
-
-        // Directory — create immediately (no data copy)
-        if lower_file.is_dir() {
-            self.check_quota(4096)?;
-            fs::create_dir_all(&upper_file)
-                .map_err(|e| BranchError::Operation(format!("create dir: {}", e)))?;
-            if let Ok(meta) = lower_file.metadata() {
-                let _ = fs::set_permissions(&upper_file, meta.permissions());
+        match self.prepare_copy(rel_path)? {
+            CowCopyPlan::Ready(upper) => Ok(CowOpenPlan::UpperReady { upper }),
+            CowCopyPlan::NeedsCopy { upper, lower, file_size } => {
+                Ok(CowOpenPlan::NeedsCopy {
+                    upper,
+                    lower,
+                    file_size,
+                    rel_path: rel_path.to_string(),
+                })
             }
-            self.disk_used += 4096;
-            return Ok(CowOpenPlan::UpperReady { upper: upper_file });
         }
-
-        // Regular file that exists in lower — needs copy (potentially large)
-        if lower_file.exists() {
-            let meta = lower_file.metadata()
-                .map_err(|e| BranchError::Operation(format!("metadata: {}", e)))?;
-            let file_size = meta.len();
-            self.check_quota(file_size)?;
-            // Reserve the quota now; actual copy happens outside the lock
-            self.disk_used += file_size;
-            return Ok(CowOpenPlan::NeedsCopy {
-                upper: upper_file,
-                lower: lower_file,
-                file_size,
-                rel_path: rel_path.to_string(),
-            });
-        }
-
-        // New file (not in lower) — just a placeholder in upper
-        self.check_quota(0)?;
-        Ok(CowOpenPlan::UpperReady { upper: upper_file })
     }
 
     /// Roll back quota reservation if the copy failed.
