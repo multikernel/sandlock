@@ -341,6 +341,116 @@ async fn test_seccomp_cow_chdir_to_created_dir() {
     let _ = fs::remove_dir_all(&workdir);
 }
 
+/// Test that the legacy open() syscall works correctly with COW.
+///
+/// Regression test: handle_cow_open always read args in openat() layout
+/// (dirfd=args[0], path=args[1], flags=args[2]), but open() uses
+/// (path=args[0], flags=args[1], mode=args[2]). This caused COW to miss
+/// all legacy open() calls, falling through to the kernel.
+#[tokio::test]
+async fn test_seccomp_cow_legacy_open_syscall() {
+    let workdir = temp_dir("seccomp-legacy-open");
+    let out_file = std::env::temp_dir().join(format!(
+        "sandlock-test-legacy-open-{}", std::process::id()
+    ));
+
+    let policy = Policy::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc").fs_read("/dev")
+        .fs_write(&workdir).fs_write("/tmp")
+        .workdir(&workdir)
+        .cwd(&workdir)
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+
+    // Use raw SYS_open syscall (not openat) to create a file, then verify
+    // it's visible during the run but discarded on abort.
+    let script = format!(concat!(
+        "import ctypes, os\n",
+        "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
+        "SYS_open = 2\n",
+        "O_WRONLY = 1; O_CREAT = 64; O_TRUNC = 512\n",
+        "path = b'{wd}/newfile.txt'\n",
+        "fd = libc.syscall(SYS_open, path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)\n",
+        "err = ctypes.get_errno()\n",
+        "if fd >= 0:\n",
+        "    os.write(fd, b'created via SYS_open')\n",
+        "    os.close(fd)\n",
+        "    content = open('{wd}/newfile.txt').read()\n",
+        "    open('{out}', 'w').write(content)\n",
+        "else:\n",
+        "    open('{out}', 'w').write(f'FAILED:errno={{err}}')\n",
+    ), wd = workdir.display(), out = out_file.display());
+
+    let result = Sandbox::run(&policy, &["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "exit={:?}, stderr={}", result.code(), result.stderr_str().unwrap_or(""));
+    let content = fs::read_to_string(&out_file).unwrap_or_default();
+    assert_eq!(content, "created via SYS_open", "SYS_open should work with COW");
+    // After abort, the file should not exist on the real filesystem
+    assert!(!workdir.join("newfile.txt").exists(), "newfile.txt should not exist after abort");
+
+    let _ = fs::remove_dir_all(&workdir);
+    let _ = fs::remove_file(&out_file);
+}
+
+/// Test that O_CREAT|O_EXCL succeeds after unlink in COW mode.
+///
+/// Regression test: after unlink marked a file as deleted, the subsequent
+/// O_CREAT|O_EXCL open correctly identified the file as deleted and prepared
+/// a COW copy, but the supervisor's open() still had O_EXCL in the flags.
+/// Since the file was just copied to upper, the kernel's open() returned
+/// EEXIST. The fix strips O_EXCL from the supervisor's open flags.
+#[tokio::test]
+async fn test_seccomp_cow_excl_after_unlink() {
+    let workdir = temp_dir("seccomp-excl-unlink");
+    let out_file = std::env::temp_dir().join(format!(
+        "sandlock-test-excl-unlink-{}", std::process::id()
+    ));
+    fs::write(workdir.join("target.txt"), "original").unwrap();
+
+    let policy = Policy::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc").fs_read("/dev")
+        .fs_write(&workdir).fs_write("/tmp")
+        .workdir(&workdir)
+        .cwd(&workdir)
+        .on_exit(BranchAction::Commit)
+        .build()
+        .unwrap();
+
+    // Unlink the file, then recreate it with O_CREAT|O_EXCL via SYS_open
+    let script = format!(concat!(
+        "import ctypes, os\n",
+        "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
+        "path = b'{wd}/target.txt'\n",
+        "ret = libc.unlink(path)\n",
+        "if ret != 0:\n",
+        "    open('{out}', 'w').write(f'UNLINK_FAILED:{{ctypes.get_errno()}}')\n",
+        "    raise SystemExit(1)\n",
+        "O_WRONLY = 1; O_CREAT = 64; O_EXCL = 128\n",
+        "fd = libc.syscall(2, path, O_WRONLY | O_CREAT | O_EXCL, 0o644)\n",
+        "err = ctypes.get_errno()\n",
+        "if fd >= 0:\n",
+        "    os.write(fd, b'recreated')\n",
+        "    os.close(fd)\n",
+        "    open('{out}', 'w').write('OK')\n",
+        "else:\n",
+        "    open('{out}', 'w').write(f'OPEN_FAILED:{{err}}')\n",
+    ), wd = workdir.display(), out = out_file.display());
+
+    let result = Sandbox::run(&policy, &["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "exit={:?}, stderr={}", result.code(), result.stderr_str().unwrap_or(""));
+    let content = fs::read_to_string(&out_file).unwrap_or_default();
+    assert_eq!(content, "OK", "O_EXCL after unlink should succeed, got: {}", content);
+    // After commit, the file should contain the new content
+    let target = fs::read_to_string(workdir.join("target.txt")).unwrap_or_default();
+    assert_eq!(target, "recreated", "target.txt should have new content after commit");
+
+    let _ = fs::remove_dir_all(&workdir);
+    let _ = fs::remove_file(&out_file);
+}
+
 /// Test that seccomp COW read isolation works (reads original before any writes).
 #[tokio::test]
 async fn test_seccomp_cow_read_existing() {

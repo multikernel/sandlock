@@ -76,9 +76,15 @@ pub(crate) async fn handle_cow_open(
 ) -> NotifAction {
     use crate::cow::seccomp::CowOpenPlan;
 
-    let dirfd = notif.data.args[0] as i64;
-    let path_ptr = notif.data.args[1];
-    let flags = notif.data.args[2];
+    let nr = notif.data.nr as i64;
+
+    // open(path, flags, mode):     args[0]=path, args[1]=flags
+    // openat(dirfd, path, flags):  args[0]=dirfd, args[1]=path, args[2]=flags
+    let (path_ptr, dirfd, flags) = if nr == libc::SYS_open as i64 {
+        (notif.data.args[0], libc::AT_FDCWD as i64, notif.data.args[1])
+    } else {
+        (notif.data.args[1], notif.data.args[0] as i64, notif.data.args[2])
+    };
 
     let rel_path = match read_path(notif, path_ptr, notif_fd) {
         Some(p) => p,
@@ -141,11 +147,14 @@ pub(crate) async fn handle_cow_open(
     };
 
     // Phase 3: open the resolved path and inject fd
+    // Strip O_EXCL — the COW layer already verified exclusivity. Keeping it
+    // would fail because we may have just copied the file into upper.
+    let open_flags = (flags & !(libc::O_EXCL as u64)) as i32;
     let c_path = match std::ffi::CString::new(real_path.to_str().unwrap_or("")) {
         Ok(c) => c,
         Err(_) => return NotifAction::Continue,
     };
-    let fd = unsafe { libc::open(c_path.as_ptr(), flags as i32, 0o666) };
+    let fd = unsafe { libc::open(c_path.as_ptr(), open_flags, 0o666) };
     if fd < 0 {
         return NotifAction::Continue;
     }
