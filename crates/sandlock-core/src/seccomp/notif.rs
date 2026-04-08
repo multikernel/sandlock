@@ -70,12 +70,13 @@ pub(crate) fn is_path_denied_for_notif(
     }
 }
 
-/// Duplicate a file descriptor from an arbitrary process (by PID) into the supervisor.
-/// Opens a pidfd for the given PID, then calls pidfd_getfd.
+/// Duplicate a file descriptor from an arbitrary process (by PID/TID) into the supervisor.
+/// Uses PIDFD_THREAD so pidfd_open works for any thread, not just the group leader.
 pub(crate) fn dup_fd_from_pid(pid: u32, target_fd: i32) -> Result<OwnedFd, io::Error> {
     const SYS_PIDFD_OPEN: i64 = 434;
     const SYS_PIDFD_GETFD: i64 = 438;
-    let pidfd = unsafe { libc::syscall(SYS_PIDFD_OPEN, pid as i64, 0i64) };
+    const PIDFD_THREAD: i64 = libc::O_EXCL as i64; // Linux 6.9+
+    let pidfd = unsafe { libc::syscall(SYS_PIDFD_OPEN, pid as i64, PIDFD_THREAD) };
     if pidfd < 0 {
         return Err(io::Error::last_os_error());
     }
