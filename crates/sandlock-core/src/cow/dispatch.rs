@@ -780,6 +780,7 @@ pub(crate) async fn handle_cow_chdir(
         Some(p) => p,
         None => return NotifAction::Continue,
     };
+    let orig_path_buf_len = path.len() + 1; // NUL-terminated size in child memory
 
     // Resolve relative paths against the process's cwd.
     let abs_path = if std::path::Path::new(&path).is_absolute() {
@@ -851,8 +852,15 @@ pub(crate) async fn handle_cow_chdir(
         return NotifAction::Errno(libc::EIO);
     }
 
-    // Rewrite the path argument to /proc/self/fd/N.
+    // Rewrite the path argument to /proc/self/fd/N so the kernel chdir
+    // follows the injected fd.  The original buffer at path_ptr must be
+    // large enough — otherwise we'd corrupt adjacent child memory.
     let fd_path = format!("/proc/self/fd/{}\0", child_fd);
+    if orig_path_buf_len < fd_path.len() {
+        // Original path buffer too small for the rewrite.  The injected
+        // fd has O_CLOEXEC so it will be cleaned up on exit/exec.
+        return NotifAction::Errno(libc::ENOENT);
+    }
     if write_child_mem(notif_fd, notif.id, notif.pid, path_ptr, fd_path.as_bytes()).is_err() {
         return NotifAction::Errno(libc::EFAULT);
     }
