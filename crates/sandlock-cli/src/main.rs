@@ -126,8 +126,13 @@ enum Command {
     },
     /// Check kernel feature support
     Check,
-    /// Show network state of all running sandboxes
-    Network,
+    /// List all running sandboxes
+    List,
+    /// Kill a running sandbox by name
+    Kill {
+        /// Sandbox name (as shown by `sandlock list`)
+        name: String,
+    },
     /// Manage profiles
     Profile {
         #[command(subcommand)]
@@ -456,23 +461,48 @@ async fn main() -> Result<()> {
             std::process::exit(result.code().unwrap_or(1));
         }
 
-        Command::Network => {
+        Command::List => {
             match network_registry::list() {
                 Ok(reg) if reg.is_empty() => {
-                    println!("No running sandboxes with network state.");
+                    println!("No running sandboxes.");
                 }
                 Ok(reg) => {
-                    println!("{:<20} {:>6}  {}", "HOSTNAME", "PID", "PORTS");
-                    for (hostname, entry) in &reg {
+                    println!("{:<20} {:>6}  {}", "NAME", "PID", "PORTS");
+                    for (name, entry) in &reg {
                         let ports: Vec<String> = entry.ports.iter()
                             .map(|(v, r)| if v == r { format!("{}", v) } else { format!("{} -> {}", v, r) })
                             .collect();
                         let ports_str = if ports.is_empty() { "-".to_string() } else { ports.join(", ") };
-                        println!("{:<20} {:>6}  {}", hostname, entry.pid, ports_str);
+                        println!("{:<20} {:>6}  {}", name, entry.pid, ports_str);
                     }
                 }
                 Err(e) => {
-                    eprintln!("sandlock: failed to read network registry: {}", e);
+                    eprintln!("sandlock: failed to read registry: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Command::Kill { name } => {
+            match network_registry::list() {
+                Ok(reg) => {
+                    if let Some(entry) = reg.get(&name) {
+                        let ret = unsafe { libc::killpg(entry.pid, libc::SIGKILL) };
+                        if ret == 0 {
+                            let _ = network_registry::unregister(&name);
+                            println!("Killed sandbox '{}' (PID {})", name, entry.pid);
+                        } else {
+                            let err = std::io::Error::last_os_error();
+                            eprintln!("sandlock: failed to kill '{}' (PID {}): {}", name, entry.pid, err);
+                            std::process::exit(1);
+                        }
+                    } else {
+                        eprintln!("sandlock: no sandbox named '{}'", name);
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("sandlock: failed to read registry: {}", e);
                     std::process::exit(1);
                 }
             }

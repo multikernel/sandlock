@@ -133,8 +133,11 @@ sandlock run --port-remap --net-bind 6379 -r /usr -r /lib -r /etc -- redis-serve
 sandlock run --name api.local --port-remap --net-bind 8080 -r /usr -r /lib -r /etc -- python3 server.py
 sandlock run --name web.local --port-remap --net-bind 8080 -r /usr -r /lib -r /etc -- python3 server.py
 
-# Show network state of all running sandboxes
-sandlock network
+# List all running sandboxes
+sandlock list
+
+# Kill a running sandbox by name
+sandlock kill web.local
 
 # Chroot with per-sandbox mount (no kernel bind mount needed)
 sandlock run --chroot ./rootfs --fs-mount /work:/tmp/sandbox/work -- /bin/sh
@@ -480,19 +483,22 @@ of the child via `pidfd_getfd` (TOCTOU-safe). When a port conflicts, a
 different real port is allocated transparently. `/proc/net/tcp` is filtered
 to only show the sandbox's own ports.
 
-When `--port-remap` is enabled, the sandbox registers its
-network state in a shared registry (`/dev/shm`). Use `sandlock network`
-to discover all running sandboxes and their port mappings:
+When `--port-remap` is enabled, the sandbox registers its state in a
+shared registry (`/dev/shm`). Use `sandlock list` to see all running
+sandboxes and `sandlock kill` to stop them:
 
 ```
-$ sandlock network
-HOSTNAME                PID  PORTS
+$ sandlock list
+NAME                    PID  PORTS
 api.local            12345  8080
 web.local            12346  8080 -> 35299
+
+$ sandlock kill web.local
+Killed sandbox 'web.local' (PID 12346)
 ```
 
 This enables external reverse proxies (nginx, envoy) to route traffic
-by hostname to the correct real port.
+by name to the correct real port.
 
 ## Performance
 
