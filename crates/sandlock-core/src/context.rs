@@ -816,6 +816,9 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
     } else if let Some(ref chroot_root) = policy.chroot {
         // Default to chroot root
         Some(chroot_root.to_path_buf())
+    } else if let Some(ref workdir) = policy.workdir {
+        // Default to workdir when set (COW working directory)
+        Some(workdir.clone())
     } else {
         None
     };
