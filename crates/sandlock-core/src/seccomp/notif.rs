@@ -62,19 +62,46 @@ pub enum NetworkPolicy {
 /// For two-path syscalls (renameat2, linkat), checks both source and
 /// destination paths — a denied file must not be linked, renamed, or
 /// overwritten.
+///
+/// Each resolved path is checked both as-is (lexical normalization) and
+/// after following symlinks via `canonicalize`.  This prevents bypass via
+/// pre-existing symlinks, relative symlinks, or symlink chains that
+/// ultimately resolve to a denied path.
 pub(crate) fn is_path_denied_for_notif(
     policy_fn_state: &super::state::PolicyFnState,
     notif: &SeccompNotif,
     notif_fd: RawFd,
 ) -> bool {
     if let Some(path) = resolve_path_for_notif(notif, notif_fd) {
-        if policy_fn_state.is_path_denied(&path) {
+        if is_denied_with_symlink_resolve(policy_fn_state, &path) {
             return true;
         }
     }
     // For two-path syscalls, also check the second (destination) path.
     if let Some(path) = resolve_second_path_for_notif(notif, notif_fd) {
-        if policy_fn_state.is_path_denied(&path) {
+        if is_denied_with_symlink_resolve(policy_fn_state, &path) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check a path against denied entries, also resolving symlinks.
+///
+/// First checks the lexical path, then `canonicalize`s to follow symlinks
+/// and checks the real path.  This catches pre-existing symlinks, relative
+/// symlinks, and symlink chains that resolve to a denied file.
+fn is_denied_with_symlink_resolve(
+    policy_fn_state: &super::state::PolicyFnState,
+    path: &str,
+) -> bool {
+    // Check the literal (lexically normalized) path first.
+    if policy_fn_state.is_path_denied(path) {
+        return true;
+    }
+    // Follow symlinks and re-check against denied entries.
+    if let Ok(real) = std::fs::canonicalize(path) {
+        if policy_fn_state.is_path_denied(&real.to_string_lossy()) {
             return true;
         }
     }

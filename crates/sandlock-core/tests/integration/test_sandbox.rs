@@ -289,6 +289,62 @@ async fn test_denied_path_symlink_blocked() {
     );
 }
 
+/// Test that pre-existing symlinks to denied files are blocked.
+#[tokio::test]
+async fn test_denied_path_preexisting_symlink_blocked() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let secret = tmp.path().join("secret.txt");
+    std::fs::write(&secret, "TOP_SECRET").unwrap();
+
+    // Create symlink BEFORE sandbox starts
+    let link = tmp.path().join("preexisting_link");
+    std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+    let policy = Policy::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read("/lib64")
+        .fs_read("/bin").fs_read("/proc").fs_read("/etc")
+        .fs_read(tmp.path())
+        .fs_deny(&secret)
+        .build()
+        .unwrap();
+
+    let cmd = format!("cat {}", link.display());
+    let result = Sandbox::run(&policy, &["sh", "-c", &cmd]).await.unwrap();
+    assert!(
+        result.stdout_str().map_or(true, |s| !s.contains("TOP_SECRET")),
+        "pre-existing symlink bypass: read denied file through symlink created before sandbox"
+    );
+}
+
+/// Test that chained symlinks resolving to a denied file are blocked.
+#[tokio::test]
+async fn test_denied_path_chained_symlinks_blocked() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let secret = tmp.path().join("secret.txt");
+    std::fs::write(&secret, "TOP_SECRET").unwrap();
+
+    // chain: link2 -> link1 -> secret.txt
+    let link1 = tmp.path().join("link1");
+    let link2 = tmp.path().join("link2");
+    std::os::unix::fs::symlink("secret.txt", &link1).unwrap();
+    std::os::unix::fs::symlink("link1", &link2).unwrap();
+
+    let policy = Policy::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read("/lib64")
+        .fs_read("/bin").fs_read("/proc").fs_read("/etc")
+        .fs_read(tmp.path())
+        .fs_deny(&secret)
+        .build()
+        .unwrap();
+
+    let cmd = format!("cat {}", link2.display());
+    let result = Sandbox::run(&policy, &["sh", "-c", &cmd]).await.unwrap();
+    assert!(
+        result.stdout_str().map_or(true, |s| !s.contains("TOP_SECRET")),
+        "chained symlink bypass: read denied file through symlink chain"
+    );
+}
+
 /// Verify that normal writes still succeed when fs_denied is active (no false positives).
 #[tokio::test]
 async fn test_denied_path_allows_normal_writes() {
