@@ -220,7 +220,42 @@ async fn test_udp_allowed_by_default() {
 }
 
 // ------------------------------------------------------------------
-// 7. TCP always allowed even with no_raw_sockets + no_udp
+// 7. All AF_NETLINK sockets blocked (network topology leak)
+// ------------------------------------------------------------------
+#[tokio::test]
+async fn test_netlink_socket_blocked() {
+    let out = temp_out("netlink-blocked");
+    let script = format!(concat!(
+        "import socket\n",
+        "try:\n",
+        "  s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 0)\n",
+        "  s.close()\n",
+        "  result = 'ALLOWED'\n",
+        "except PermissionError:\n",
+        "  result = 'BLOCKED'\n",
+        "except OSError as e:\n",
+        "  result = f'ERROR:{{e.errno}}'\n",
+        "open('{out}', 'w').write(result)\n",
+    ), out = out.display());
+
+    let policy = base_policy().build().unwrap();
+    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+        .await
+        .unwrap();
+
+    let contents = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(
+        contents.trim(),
+        "BLOCKED",
+        "AF_NETLINK socket should be blocked, got: {}",
+        contents.trim()
+    );
+    assert!(result.success());
+}
+
+// ------------------------------------------------------------------
+// 8. TCP always allowed even with no_raw_sockets + no_udp
 // ------------------------------------------------------------------
 #[tokio::test]
 async fn test_tcp_always_allowed() {

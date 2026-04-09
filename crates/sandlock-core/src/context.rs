@@ -10,7 +10,7 @@ use crate::seccomp::bpf::{self, stmt, jump};
 use crate::sys::structs::{
     AF_INET, AF_INET6, AF_NETLINK,
     BPF_ABS, BPF_ALU, BPF_AND, BPF_JEQ, BPF_JSET, BPF_JMP, BPF_K, BPF_LD, BPF_RET, BPF_W,
-    CLONE_NS_FLAGS, DEFAULT_DENY_SYSCALLS, EPERM, NETLINK_SOCK_DIAG,
+    CLONE_NS_FLAGS, DEFAULT_DENY_SYSCALLS, EPERM,
     SECCOMP_RET_ALLOW, SECCOMP_RET_ERRNO,
     SOCK_DGRAM, SOCK_RAW, SOCK_TYPE_MASK, TIOCLINUX, TIOCSTI,
     PR_SET_DUMPABLE, PR_SET_SECUREBITS, PR_SET_PTRACER,
@@ -446,7 +446,7 @@ pub fn deny_syscall_numbers(policy: &Policy) -> Vec<u32> {
 ///   - clone: block namespace creation flags
 ///   - ioctl: block TIOCSTI, TIOCLINUX
 ///   - prctl: block PR_SET_DUMPABLE, PR_SET_SECUREBITS, PR_SET_PTRACER
-///   - socket: block NETLINK_SOCK_DIAG (with AF_NETLINK domain check)
+///   - socket: block all AF_NETLINK sockets (network topology enumeration)
 ///   - socket: block SOCK_RAW/SOCK_DGRAM on AF_INET/AF_INET6 (with type mask)
 pub fn arg_filters(policy: &Policy) -> Vec<SockFilter> {
     let ret_errno = SECCOMP_RET_ERRNO | EPERM as u32;
@@ -496,21 +496,20 @@ pub fn arg_filters(policy: &Policy) -> Vec<SockFilter> {
         insns.push(stmt(BPF_RET | BPF_K, ret_errno));
     }
 
-    // --- socket: block NETLINK_SOCK_DIAG (only on AF_NETLINK domain) ---
-    // 7 instructions:
+    // --- socket: block all AF_NETLINK sockets ---
+    // Netlink sockets allow network topology enumeration (interfaces, routes,
+    // ARP, etc.) which leaks host network configuration.  Block the entire
+    // AF_NETLINK family, not just NETLINK_SOCK_DIAG.
+    // 5 instructions:
     //   LD NR
-    //   JEQ socket → +0, skip 5
+    //   JEQ socket → +0, skip 3
     //   LD arg0 (domain)
-    //   JEQ AF_NETLINK → +0, skip 3
-    //   LD arg2 (protocol)
-    //   JEQ NETLINK_SOCK_DIAG → +0, skip 1
+    //   JEQ AF_NETLINK → +0, skip 1
     //   RET ERRNO
     insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR));
-    insns.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr_socket, 0, 5));
+    insns.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr_socket, 0, 3));
     insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARGS0_LO));
-    insns.push(jump(BPF_JMP | BPF_JEQ | BPF_K, AF_NETLINK, 0, 3));
-    insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARGS2_LO));
-    insns.push(jump(BPF_JMP | BPF_JEQ | BPF_K, NETLINK_SOCK_DIAG, 0, 1));
+    insns.push(jump(BPF_JMP | BPF_JEQ | BPF_K, AF_NETLINK, 0, 1));
     insns.push(stmt(BPF_RET | BPF_K, ret_errno));
 
     // --- socket: block SOCK_RAW and/or SOCK_DGRAM on AF_INET/AF_INET6 ---
@@ -1111,11 +1110,9 @@ mod tests {
         // Should contain JEQ for PR_SET_DUMPABLE
         assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
             && f.k == PR_SET_DUMPABLE));
-        // Should contain JEQ for socket + AF_NETLINK + NETLINK_SOCK_DIAG
+        // Should contain JEQ for socket + AF_NETLINK (all netlink blocked)
         assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
             && f.k == AF_NETLINK));
-        assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
-            && f.k == NETLINK_SOCK_DIAG));
     }
 
     #[test]
