@@ -12,7 +12,7 @@ description = "C ABI for sandlock process sandbox"
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
-sandlock-core = { version = "0.5.0", path = "../sandlock-core" }
+sandlock-core = { version = "0.6.0", path = "../sandlock-core" }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
