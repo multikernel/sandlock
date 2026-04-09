@@ -24,7 +24,7 @@ use crate::sys::structs::{SeccompNotif, AF_INET, AF_INET6};
 /// `virtual_to_real` maps the port the child thinks it bound to the actual
 /// port on the host. `real_to_virtual` is the reverse mapping, used to
 /// translate getsockname results back to the virtual port.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct PortMap {
     /// virtual port -> real port
     pub virtual_to_real: HashMap<u16, u16>,
@@ -32,6 +32,9 @@ pub struct PortMap {
     pub real_to_virtual: HashMap<u16, u16>,
     /// Set of ports actually bound on the host by this sandbox.
     pub bound_ports: std::collections::HashSet<u16>,
+    /// Optional callback invoked after each port bind with the current virtual_to_real map.
+    #[allow(clippy::type_complexity)]
+    pub on_bind: Option<Box<dyn Fn(&HashMap<u16, u16>) + Send + Sync>>,
 }
 
 impl PortMap {
@@ -45,6 +48,14 @@ impl PortMap {
         if virtual_port != real_port {
             self.virtual_to_real.insert(virtual_port, real_port);
             self.real_to_virtual.insert(real_port, virtual_port);
+        }
+        if let Some(ref cb) = self.on_bind {
+            // Report all bound ports: identity + remapped
+            let mut all: HashMap<u16, u16> = self.bound_ports.iter()
+                .map(|&p| (self.real_to_virtual.get(&p).copied().unwrap_or(p), p))
+                .collect();
+            all.extend(self.virtual_to_real.iter().map(|(&v, &r)| (v, r)));
+            cb(&all);
         }
     }
 

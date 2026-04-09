@@ -5,6 +5,8 @@ use sandlock_core::profile;
 use anyhow::{Result, anyhow};
 use std::time::SystemTime;
 
+mod network_registry;
+
 #[derive(Parser)]
 #[command(name = "sandlock", about = "Lightweight process sandbox", version)]
 struct Cli {
@@ -123,6 +125,8 @@ enum Command {
     },
     /// Check kernel feature support
     Check,
+    /// Show network state of all running sandboxes
+    Network,
     /// Manage profiles
     Profile {
         #[command(subcommand)]
@@ -383,6 +387,41 @@ async fn main() -> Result<()> {
                     }
                 }
                 dr.run_result
+            } else if policy.port_remap && policy.hostname.is_some() {
+                // Use spawn+wait so we can register/unregister network state.
+                let hostname = policy.hostname.as_ref().unwrap().clone();
+                let mut sb = Sandbox::new(&policy)?;
+
+                // Set up callback to update registry on each port bind.
+                let reg_hostname = hostname.clone();
+                sb.set_on_bind(move |ports| {
+                    let _ = network_registry::update_ports(&reg_hostname, ports.clone());
+                });
+
+                sb.spawn(&cmd_strs).await?;
+
+                let pid = sb.pid().unwrap_or(0);
+                if let Err(e) = network_registry::register(&hostname, pid, std::collections::HashMap::new()) {
+                    eprintln!("sandlock: network registry: {}", e);
+                }
+
+                let result = if let Some(secs) = timeout {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(secs),
+                        sb.wait()
+                    ).await {
+                        Ok(r) => r?,
+                        Err(_) => {
+                            let _ = network_registry::unregister(&hostname);
+                            eprintln!("sandlock: timeout after {}s", secs);
+                            std::process::exit(124);
+                        }
+                    }
+                } else {
+                    sb.wait().await?
+                };
+                let _ = network_registry::unregister(&hostname);
+                result
             } else if let Some(secs) = timeout {
                 tokio::time::timeout(
                     std::time::Duration::from_secs(secs),
@@ -414,6 +453,28 @@ async fn main() -> Result<()> {
             }
 
             std::process::exit(result.code().unwrap_or(1));
+        }
+
+        Command::Network => {
+            match network_registry::list() {
+                Ok(reg) if reg.is_empty() => {
+                    println!("No running sandboxes with network state.");
+                }
+                Ok(reg) => {
+                    println!("{:<20} {:>6}  {}", "HOSTNAME", "PID", "PORTS");
+                    for (hostname, entry) in &reg {
+                        let ports: Vec<String> = entry.ports.iter()
+                            .map(|(v, r)| if v == r { format!("{}", v) } else { format!("{} -> {}", v, r) })
+                            .collect();
+                        let ports_str = if ports.is_empty() { "-".to_string() } else { ports.join(", ") };
+                        println!("{:<20} {:>6}  {}", hostname, entry.pid, ports_str);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("sandlock: failed to read network registry: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
 
         Command::Check => {

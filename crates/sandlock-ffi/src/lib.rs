@@ -791,6 +791,27 @@ pub unsafe extern "C" fn sandlock_handle_wait_timeout(
     }
 }
 
+/// Get port mappings as a JSON string (e.g. `{"80":9001,"443":9002}`).
+/// Returns a C string that must be freed with `sandlock_string_free`.
+/// Returns null if port_remap is not active or no ports are mapped.
+///
+/// # Safety
+/// `h` must be a valid handle from `sandlock_spawn`.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_handle_port_mappings(
+    h: *const sandlock_handle_t,
+) -> *mut c_char {
+    if h.is_null() { return ptr::null_mut(); }
+    let h = &*h;
+    let map = h.runtime.block_on(h.sandbox.port_mappings());
+    if map.is_empty() { return ptr::null_mut(); }
+    let json = serde_json::to_string(&map).unwrap_or_default();
+    match CString::new(json) {
+        Ok(cs) => cs.into_raw(),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
 /// Free a sandbox handle. Kills the process if still running.
 ///
 /// # Safety

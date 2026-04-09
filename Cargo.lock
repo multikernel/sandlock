@@ -1599,6 +1599,7 @@ name = "sandlock-ffi"
 version = "0.5.0"
 dependencies = [
  "sandlock-core",
+ "serde_json",
  "tokio",
 ]
 

@@ -88,6 +88,8 @@ pub struct Sandbox {
     supervisor_resource: Option<Arc<Mutex<ResourceState>>>,
     /// Shared COW state for post-wait extraction.
     supervisor_cow: Option<Arc<Mutex<CowState>>>,
+    /// Shared network state for port mapping queries.
+    supervisor_network: Option<Arc<Mutex<NetworkState>>>,
     /// Control pipe for fork commands (parent end).
     ctrl_fd: Option<OwnedFd>,
     /// Stdout pipe read end (for fork clones — used by reduce).
@@ -100,6 +102,9 @@ pub struct Sandbox {
     io_overrides: Option<(Option<i32>, Option<i32>, Option<i32>)>,
     /// HTTP ACL proxy handle — kept alive so the proxy runs while the child is alive.
     http_acl_handle: Option<crate::http_acl::HttpAclProxyHandle>,
+    /// Optional callback invoked when a port bind is recorded.
+    #[allow(clippy::type_complexity)]
+    on_bind: Option<Box<dyn Fn(&std::collections::HashMap<u16, u16>) + Send + Sync>>,
 }
 
 impl Sandbox {
@@ -146,12 +151,14 @@ impl Sandbox {
             seccomp_cow: None,
             supervisor_resource: None,
             supervisor_cow: None,
+            supervisor_network: None,
             ctrl_fd: None,
             stdout_pipe: None,
             init_fn: None,
             work_fn: None,
             io_overrides: None,
             http_acl_handle: None,
+            on_bind: None,
         }
     }
 
@@ -513,6 +520,25 @@ impl Sandbox {
     /// Return the child PID, if spawned.
     pub fn pid(&self) -> Option<i32> {
         self.child_pid
+    }
+
+    /// Set a callback invoked whenever a port bind is recorded.
+    pub fn set_on_bind(&mut self, cb: impl Fn(&std::collections::HashMap<u16, u16>) + Send + Sync + 'static) {
+        self.on_bind = Some(Box::new(cb));
+    }
+
+    /// Return the current virtual-to-real port mappings.
+    ///
+    /// Returns a snapshot of all ports where the real (host) port differs from
+    /// the virtual port the sandbox requested. Empty if port_remap is disabled
+    /// or no ports have been remapped.
+    pub async fn port_mappings(&self) -> std::collections::HashMap<u16, u16> {
+        if let Some(ref net) = self.supervisor_network {
+            let ns = net.lock().await;
+            ns.port_map.virtual_to_real.clone()
+        } else {
+            std::collections::HashMap::new()
+        }
     }
 
     /// Return whether the child is currently running.
@@ -887,6 +913,9 @@ impl Sandbox {
             net_state.http_acl_addr = self.http_acl_handle.as_ref().map(|h| h.addr);
             net_state.http_acl_ports = self.policy.http_ports.iter().copied().collect();
             net_state.http_acl_orig_dest = self.http_acl_handle.as_ref().map(|h| h.orig_dest.clone());
+            if let Some(cb) = self.on_bind.take() {
+                net_state.port_map.on_bind = Some(cb);
+            }
 
             // ProcfsState
             let mut procfs_state = ProcfsState::new();
@@ -953,8 +982,10 @@ impl Sandbox {
             let cow_state = Arc::new(Mutex::new(cow_state));
             self.supervisor_cow = Some(Arc::clone(&cow_state));
 
-            let procfs_state = Arc::new(Mutex::new(procfs_state));
             let net_state = Arc::new(Mutex::new(net_state));
+            self.supervisor_network = Some(Arc::clone(&net_state));
+
+            let procfs_state = Arc::new(Mutex::new(procfs_state));
             let time_random_state = Arc::new(Mutex::new(time_random_state));
             let policy_fn_state = Arc::new(Mutex::new(policy_fn_state));
             let chroot_state = Arc::new(Mutex::new(chroot_state));

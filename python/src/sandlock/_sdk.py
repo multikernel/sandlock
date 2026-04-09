@@ -237,6 +237,9 @@ _lib.sandlock_handle_wait_timeout.argtypes = [_c_handle_p, ctypes.c_uint64]
 _lib.sandlock_handle_free.restype = None
 _lib.sandlock_handle_free.argtypes = [_c_handle_p]
 
+_lib.sandlock_handle_port_mappings.restype = ctypes.c_char_p
+_lib.sandlock_handle_port_mappings.argtypes = [_c_handle_p]
+
 # Result
 _lib.sandlock_result_exit_code.restype = ctypes.c_int
 _lib.sandlock_result_exit_code.argtypes = [_c_result_p]
@@ -952,6 +955,25 @@ class Sandbox:
         if self._handle is None:
             return None
         return _lib.sandlock_handle_pid(self._handle) or None
+
+    def ports(self) -> dict[int, int]:
+        """Return current port mappings {virtual_port: real_port}.
+
+        Only contains entries where the real port differs from the virtual
+        port (i.e., where a remap occurred). Empty if port_remap is disabled
+        or no ports have been remapped. Requires the sandbox to be running.
+        """
+        if self._handle is None:
+            return {}
+        c_str = _lib.sandlock_handle_port_mappings(self._handle)
+        if not c_str:
+            return {}
+        try:
+            import json
+            raw = json.loads(c_str.decode())
+            return {int(k): v for k, v in raw.items()}
+        finally:
+            _lib.sandlock_string_free(c_str)
 
     def pause(self) -> None:
         """Send SIGSTOP to the sandbox process group."""
