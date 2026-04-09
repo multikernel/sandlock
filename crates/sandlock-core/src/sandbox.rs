@@ -678,13 +678,14 @@ impl Sandbox {
         // 4. Create synchronization pipes
         let pipes = PipePair::new().map_err(SandboxError::Io)?;
 
-        // 4. Resolve net_allow_hosts to IPs (async, before fork)
-        let resolved_ips = if !self.policy.net_allow_hosts.is_empty() {
-            network::resolve_hosts(&self.policy.net_allow_hosts)
+        // 4. Resolve net_allow_hosts to IPs + build virtual /etc/hosts
+        let (resolved_ips, virtual_etc_hosts) = if !self.policy.net_allow_hosts.is_empty() {
+            let resolved = network::resolve_hosts(&self.policy.net_allow_hosts)
                 .await
-                .map_err(SandboxError::Io)?
+                .map_err(SandboxError::Io)?;
+            (resolved.ips, Some(resolved.etc_hosts))
         } else {
-            std::collections::HashSet::new()
+            (std::collections::HashSet::new(), None)
         };
 
         // 5. Spawn HTTP ACL proxy if rules are configured
@@ -891,6 +892,7 @@ impl Sandbox {
                 deterministic_dirs: self.policy.deterministic_dirs,
                 hostname: self.policy.hostname.clone(),
                 has_http_acl: !self.policy.http_allow.is_empty() || !self.policy.http_deny.is_empty(),
+                virtual_etc_hosts,
             };
 
             // Create domain states

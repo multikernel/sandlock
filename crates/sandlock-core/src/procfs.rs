@@ -558,6 +558,26 @@ pub(crate) fn handle_hostname_open(
     Some(inject_memfd(content.as_bytes()))
 }
 
+/// Intercept `openat("/etc/hosts")` and return a memfd with virtual content.
+///
+/// When `net_allow_hosts` is set, the supervisor pre-resolves allowed domains
+/// and builds a synthetic `/etc/hosts`.  This lets sandboxed processes resolve
+/// hostnames via glibc's `files` NSS backend without contacting a DNS server.
+pub(crate) fn handle_etc_hosts_open(
+    notif: &SeccompNotif,
+    etc_hosts_content: &str,
+    notif_fd: RawFd,
+) -> Option<NotifAction> {
+    let path_ptr = notif.data.args[1];
+    let path = read_path(notif, path_ptr, notif_fd)?;
+
+    if path != "/etc/hosts" {
+        return None;
+    }
+
+    Some(inject_memfd(etc_hosts_content.as_bytes()))
+}
+
 // ============================================================
 // Deterministic directory listing
 // ============================================================

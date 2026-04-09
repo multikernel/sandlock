@@ -407,7 +407,11 @@ async fn main() -> Result<()> {
                 sb.spawn(&cmd_strs).await?;
 
                 let pid = sb.pid().unwrap_or(0);
-                if let Err(e) = network_registry::register(&sandbox_name, pid, std::collections::HashMap::new()) {
+                if let Err(e) = network_registry::register(
+                    &sandbox_name, pid, std::collections::HashMap::new(),
+                    policy.net_allow_hosts.clone(),
+                    None, // virtual_etc_hosts populated by core at runtime
+                ) {
                     eprintln!("sandlock: network registry: {}", e);
                 }
 
@@ -467,13 +471,18 @@ async fn main() -> Result<()> {
                     println!("No running sandboxes.");
                 }
                 Ok(reg) => {
-                    println!("{:<20} {:>6}  {}", "NAME", "PID", "PORTS");
+                    println!("{:<20} {:>6}  {:<30} {}", "NAME", "PID", "PORTS", "ALLOWED HOSTS");
                     for (name, entry) in &reg {
                         let ports: Vec<String> = entry.ports.iter()
                             .map(|(v, r)| if v == r { format!("{}", v) } else { format!("{} -> {}", v, r) })
                             .collect();
                         let ports_str = if ports.is_empty() { "-".to_string() } else { ports.join(", ") };
-                        println!("{:<20} {:>6}  {}", name, entry.pid, ports_str);
+                        let hosts_str = if entry.allowed_hosts.is_empty() {
+                            "*".to_string()
+                        } else {
+                            entry.allowed_hosts.join(", ")
+                        };
+                        println!("{:<20} {:>6}  {:<30} {}", name, entry.pid, ports_str, hosts_str);
                     }
                 }
                 Err(e) => {

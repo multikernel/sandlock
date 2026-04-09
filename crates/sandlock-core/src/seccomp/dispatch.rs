@@ -282,6 +282,23 @@ pub fn build_dispatch_table(
     }
 
     // ------------------------------------------------------------------
+    // /etc/hosts virtualization (for net_allow_hosts)
+    // ------------------------------------------------------------------
+    if let Some(ref etc_hosts) = policy.virtual_etc_hosts {
+        let etc_hosts = etc_hosts.clone();
+        table.register(libc::SYS_openat, Box::new(move |notif, _ctx, notif_fd| {
+            let etc_hosts = etc_hosts.clone();
+            Box::pin(async move {
+                if let Some(action) = crate::procfs::handle_etc_hosts_open(&notif, &etc_hosts, notif_fd) {
+                    action
+                } else {
+                    NotifAction::Continue
+                }
+            })
+        }));
+    }
+
+    // ------------------------------------------------------------------
     // Deterministic directory listing
     // ------------------------------------------------------------------
     if policy.deterministic_dirs {

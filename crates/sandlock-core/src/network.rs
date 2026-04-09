@@ -557,16 +557,32 @@ pub(crate) async fn handle_net(
 // resolve_hosts — resolve domain names to IPs
 // ============================================================
 
+/// Result of resolving domain names: the IP allowlist and the `/etc/hosts`
+/// content to inject into the sandbox so that sandboxed processes can
+/// resolve allowed hostnames without contacting a DNS server.
+pub struct ResolvedHosts {
+    /// Set of allowed IPs (for the network allowlist).
+    pub ips: HashSet<IpAddr>,
+    /// Synthetic `/etc/hosts` content mapping allowed hostnames to their IPs.
+    pub etc_hosts: String,
+}
+
 /// Resolve a list of domain names to IP addresses.
 ///
 /// Always includes loopback addresses (127.0.0.1 and ::1).
 /// Uses tokio's async DNS resolver.
-pub async fn resolve_hosts(hosts: &[String]) -> io::Result<HashSet<IpAddr>> {
+///
+/// Returns both the IP allowlist and a synthetic `/etc/hosts` file so
+/// sandboxed processes can resolve allowed hostnames without DNS access.
+pub async fn resolve_hosts(hosts: &[String]) -> io::Result<ResolvedHosts> {
     let mut ips = HashSet::new();
 
     // Always allow loopback
     ips.insert(IpAddr::V4(Ipv4Addr::LOCALHOST));
     ips.insert(IpAddr::V6(Ipv6Addr::LOCALHOST));
+
+    // Build /etc/hosts content: start with loopback entries
+    let mut etc_hosts = String::from("127.0.0.1 localhost\n::1 localhost\n");
 
     for host in hosts {
         // Append a dummy port for lookup_host
@@ -575,7 +591,9 @@ pub async fn resolve_hosts(hosts: &[String]) -> io::Result<HashSet<IpAddr>> {
         match result {
             Ok(resolved) => {
                 for socket_addr in resolved {
-                    ips.insert(socket_addr.ip());
+                    let ip = socket_addr.ip();
+                    ips.insert(ip);
+                    etc_hosts.push_str(&format!("{} {}\n", ip, host));
                 }
             }
             Err(e) => {
@@ -588,7 +606,7 @@ pub async fn resolve_hosts(hosts: &[String]) -> io::Result<HashSet<IpAddr>> {
         }
     }
 
-    Ok(ips)
+    Ok(ResolvedHosts { ips, etc_hosts })
 }
 
 // ============================================================
@@ -601,19 +619,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_hosts_loopback() {
-        let ips = resolve_hosts(&[]).await.unwrap();
-        assert!(ips.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
-        assert!(ips.contains(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        let resolved = resolve_hosts(&[]).await.unwrap();
+        assert!(resolved.ips.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(resolved.ips.contains(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
     }
 
     #[tokio::test]
     async fn test_resolve_hosts_with_domain() {
         let hosts = vec!["localhost".to_string()];
-        let ips = resolve_hosts(&hosts).await.unwrap();
+        let resolved = resolve_hosts(&hosts).await.unwrap();
         // localhost should resolve to loopback
         assert!(
-            ips.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST))
-                || ips.contains(&IpAddr::V6(Ipv6Addr::LOCALHOST))
+            resolved.ips.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST))
+                || resolved.ips.contains(&IpAddr::V6(Ipv6Addr::LOCALHOST))
         );
+        // etc_hosts should contain localhost entry
+        assert!(resolved.etc_hosts.contains("localhost"));
     }
 }

@@ -14,6 +14,12 @@ use serde::{Deserialize, Serialize};
 pub struct NetworkEntry {
     pub pid: i32,
     pub ports: HashMap<u16, u16>,
+    /// Allowed hostnames (from `net_allow_hosts`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_hosts: Vec<String>,
+    /// Virtual `/etc/hosts` content injected into the sandbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_etc_hosts: Option<String>,
 }
 
 pub type Registry = HashMap<String, NetworkEntry>;
@@ -59,7 +65,13 @@ fn write_registry(file: &mut fs::File, registry: &Registry) -> io::Result<()> {
 
 /// Register a sandbox's network state. Returns an error if the hostname is
 /// already claimed by a live process.
-pub fn register(hostname: &str, pid: i32, ports: HashMap<u16, u16>) -> io::Result<()> {
+pub fn register(
+    hostname: &str,
+    pid: i32,
+    ports: HashMap<u16, u16>,
+    allowed_hosts: Vec<String>,
+    virtual_etc_hosts: Option<String>,
+) -> io::Result<()> {
     let mut file = open_locked()?;
     let mut reg = read_registry(&mut file);
     // Check for hostname conflict with a live process
@@ -71,7 +83,12 @@ pub fn register(hostname: &str, pid: i32, ports: HashMap<u16, u16>) -> io::Resul
             ));
         }
     }
-    reg.insert(hostname.to_string(), NetworkEntry { pid, ports });
+    reg.insert(hostname.to_string(), NetworkEntry {
+        pid,
+        ports,
+        allowed_hosts,
+        virtual_etc_hosts,
+    });
     write_registry(&mut file, &reg)
 }
 
