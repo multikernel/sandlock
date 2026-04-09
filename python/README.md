@@ -159,7 +159,6 @@ Set one or neither, not both.
 | `no_randomize_memory` | `bool` | `False` | Disable ASLR |
 | `no_huge_pages` | `bool` | `False` | Disable Transparent Huge Pages |
 | `deterministic_dirs` | `bool` | `False` | Sort directory entries lexicographically |
-| `hostname` | `str \| None` | `None` | Override hostname via uname() |
 
 #### Environment
 
@@ -194,12 +193,14 @@ Set one or neither, not both.
 ### Sandbox
 
 ```python
-sandlock.Sandbox(policy, policy_fn=None, init_fn=None, work_fn=None)
+sandlock.Sandbox(policy, policy_fn=None, init_fn=None, work_fn=None, name=None)
 ```
 
 Create a sandbox from a `Policy`.
 
 - `policy` -- a `Policy` instance.
+- `name` -- sandbox name (also sets UTS hostname inside the sandbox).
+  Auto-generated as `sandbox-{pid}` when omitted.
 - `policy_fn` -- optional callback for dynamic per-event decisions (see
   [Dynamic policy](#dynamic-policy)).
 - `init_fn` / `work_fn` -- callbacks for COW fork mode (see [Fork](#fork)).
@@ -237,9 +238,18 @@ for change in result.changes:
 
 Run with inherited stdio (no capture). Returns the exit code.
 
+#### `sandbox.name -> str | None`
+
+The sandbox name.
+
 #### `sandbox.pid -> int | None`
 
 The child PID while running, `None` otherwise.
+
+#### `sandbox.ports() -> dict[int, int]`
+
+Current port mappings `{virtual_port: real_port}` while running.
+Only contains entries where port remapping occurred. Requires `port_remap=True`.
 
 #### `sandbox.pause()` / `sandbox.resume()`
 
