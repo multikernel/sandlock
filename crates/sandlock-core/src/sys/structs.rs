@@ -295,6 +295,7 @@ pub const DEFAULT_DENY_SYSCALLS: &[&str] = &[
     "io_uring_setup",
     "io_uring_enter",
     "io_uring_register",
+    "personality",
 ];
 
 /// Deny list for --no-supervisor mode.

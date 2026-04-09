@@ -72,7 +72,43 @@ async fn test_ptrace_blocked() {
 }
 
 // ------------------------------------------------------------------
-// 3. Raw sockets blocked by default (no_raw_sockets defaults to true)
+// 3. personality() blocked (ASLR bypass prevention)
+// ------------------------------------------------------------------
+#[tokio::test]
+async fn test_personality_blocked() {
+    let out = temp_out("personality-blocked");
+    let script = format!(concat!(
+        "import ctypes\n",
+        "libc = ctypes.CDLL(None)\n",
+        "ADDR_NO_RANDOMIZE = 0x0040000\n",
+        "current = libc.syscall(135, 0xffffffff)\n",
+        "ret = libc.syscall(135, current | ADDR_NO_RANDOMIZE)\n",
+        "if ret == -1:\n",
+        "  result = 'BLOCKED'\n",
+        "else:\n",
+        "  new = libc.syscall(135, 0xffffffff)\n",
+        "  result = 'ESCAPED' if new & ADDR_NO_RANDOMIZE else 'BLOCKED'\n",
+        "open('{out}', 'w').write(result)\n",
+    ), out = out.display());
+
+    let policy = base_policy().build().unwrap();
+    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+        .await
+        .unwrap();
+
+    let contents = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(
+        contents.trim(),
+        "BLOCKED",
+        "personality(ADDR_NO_RANDOMIZE) should be blocked, got: {}",
+        contents.trim()
+    );
+    assert!(result.success());
+}
+
+// ------------------------------------------------------------------
+// 4. Raw sockets blocked by default (no_raw_sockets defaults to true)
 // ------------------------------------------------------------------
 #[tokio::test]
 async fn test_raw_socket_blocked() {

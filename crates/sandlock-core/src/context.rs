@@ -157,6 +157,7 @@ pub fn syscall_name_to_nr(name: &str) -> Option<u32> {
         "acct" => libc::SYS_acct,
         "lookup_dcookie" => libc::SYS_lookup_dcookie,
         // nfsservctl was removed in Linux 3.1; no libc constant — skip
+        "personality" => libc::SYS_personality,
         "io_uring_setup" => libc::SYS_io_uring_setup,
         "io_uring_enter" => libc::SYS_io_uring_enter,
         "io_uring_register" => libc::SYS_io_uring_register,
