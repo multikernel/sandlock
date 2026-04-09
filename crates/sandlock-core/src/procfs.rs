@@ -39,6 +39,17 @@ pub(crate) fn is_sensitive_proc(path: &str) -> bool {
         .any(|&sensitive| path == sensitive || path.starts_with(&format!("{}/", sensitive)))
 }
 
+/// Extract a numeric PID from a `/proc/{pid}/...` path.
+///
+/// Returns `None` for non-numeric components like `/proc/self/...`,
+/// `/proc/cpuinfo`, etc.  Those are handled elsewhere or are safe.
+fn extract_proc_pid(path: &str) -> Option<i32> {
+    let rest = path.strip_prefix("/proc/")?;
+    // Take the next path component (up to '/' or end of string).
+    let component = rest.split('/').next()?;
+    component.parse::<i32>().ok()
+}
+
 // ============================================================
 // /proc/cpuinfo generator
 // ============================================================
@@ -372,6 +383,17 @@ pub(crate) async fn handle_proc_open(
     // Block sensitive paths.
     if is_sensitive_proc(&path) {
         return NotifAction::Errno(EACCES);
+    }
+
+    // Block access to /proc/{pid}/ entries for PIDs outside the sandbox.
+    // This complements the getdents64 PID filtering — directory listings
+    // already hide non-sandbox PIDs, but without this check a process
+    // could still open /proc/{ppid}/cmdline (or any guessed PID) directly.
+    if let Some(pid) = extract_proc_pid(&path) {
+        let pfs = procfs.lock().await;
+        if !pfs.proc_pids.contains(&pid) {
+            return NotifAction::Errno(EACCES);
+        }
     }
 
     // Virtualize /proc/cpuinfo.
@@ -805,6 +827,19 @@ mod tests {
         assert!(!is_sensitive_proc("/proc/meminfo"));
         assert!(!is_sensitive_proc("/proc/1/status"));
         assert!(!is_sensitive_proc("/sys/class/net"));
+    }
+
+    #[test]
+    fn test_extract_proc_pid() {
+        assert_eq!(extract_proc_pid("/proc/123/cmdline"), Some(123));
+        assert_eq!(extract_proc_pid("/proc/1/status"), Some(1));
+        assert_eq!(extract_proc_pid("/proc/99999/fd"), Some(99999));
+        assert_eq!(extract_proc_pid("/proc/self/status"), None);
+        assert_eq!(extract_proc_pid("/proc/cpuinfo"), None);
+        assert_eq!(extract_proc_pid("/proc/meminfo"), None);
+        assert_eq!(extract_proc_pid("/proc/net/tcp"), None);
+        assert_eq!(extract_proc_pid("/etc/passwd"), None);
+        assert_eq!(extract_proc_pid("/proc/"), None);
     }
 
     #[test]

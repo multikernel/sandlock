@@ -174,6 +174,52 @@ async fn test_proc_self_mountinfo_virtualized() {
     assert!(!stdout.contains("/home"), "Should not leak host /home mount in mountinfo");
 }
 
+/// Test that /proc/{ppid}/ is blocked (non-sandbox PID isolation).
+#[tokio::test]
+async fn test_proc_parent_pid_blocked() {
+    let out = std::env::temp_dir().join(format!(
+        "sandlock-test-procparent-{}",
+        std::process::id()
+    ));
+
+    let policy = Policy::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin")
+        .fs_read("/etc").fs_read("/proc").fs_read("/dev")
+        .fs_write("/tmp")
+        .build()
+        .unwrap();
+
+    let script = format!(concat!(
+        "import os\n",
+        "ppid = os.getppid()\n",
+        "results = []\n",
+        "for entry in ['cmdline', 'status']:\n",
+        "  try:\n",
+        "    open(f'/proc/{{ppid}}/{{entry}}').read()\n",
+        "    results.append('LEAKED')\n",
+        "  except PermissionError:\n",
+        "    results.append('BLOCKED')\n",
+        "  except Exception as e:\n",
+        "    results.append(f'ERR:{{e}}')\n",
+        "# Verify /proc/self still works\n",
+        "try:\n",
+        "  open('/proc/self/status').read()\n",
+        "  results.append('SELF_OK')\n",
+        "except Exception:\n",
+        "  results.append('SELF_FAIL')\n",
+        "open('{out}', 'w').write(','.join(results))\n",
+    ), out = out.display());
+
+    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "script should exit 0");
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    let parts: Vec<&str> = content.split(',').collect();
+    assert_eq!(parts.get(0), Some(&"BLOCKED"), "/proc/ppid/cmdline should be blocked, got: {}", content);
+    assert_eq!(parts.get(1), Some(&"BLOCKED"), "/proc/ppid/status should be blocked, got: {}", content);
+    assert_eq!(parts.get(2), Some(&"SELF_OK"), "/proc/self/status should still work, got: {}", content);
+}
+
 /// Test that /proc/net/tcp hides host ports when sandbox has no bindings.
 #[tokio::test]
 async fn test_proc_net_tcp_hides_host_ports() {
