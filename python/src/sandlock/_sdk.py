@@ -705,13 +705,13 @@ class _NativePolicy:
         "uid",
         "random_seed", "time_start", "clean_env", "env",
         "deny_syscalls", "allow_syscalls", "max_open_files",
-        "no_randomize_memory", "no_huge_pages", "no_coredump", "deterministic_dirs", "hostname",
+        "no_randomize_memory", "no_huge_pages", "no_coredump", "deterministic_dirs",
         # Managed outside _build_from_policy:
         "notif_policy",
     }
 
     @staticmethod
-    def _build_from_policy(policy: PolicyDataclass):
+    def _build_from_policy(policy: PolicyDataclass, override_hostname=None):
         """Build a native builder from a Python Policy dataclass. Returns builder pointer."""
         from .policy import parse_memory_size, parse_ports
 
@@ -832,8 +832,8 @@ class _NativePolicy:
             b = _b_no_coredump(b, True)
         if policy.deterministic_dirs:
             b = _b_deterministic_dirs(b, True)
-        if policy.hostname is not None:
-            b = _b_hostname(b, policy.hostname.encode())
+        if override_hostname is not None:
+            b = _b_hostname(b, override_hostname.encode())
 
         # Guard: warn if any dataclass field was set to a non-default value
         # but is not in _HANDLED_FIELDS (i.e. silently dropped).
@@ -855,10 +855,10 @@ class _NativePolicy:
 
         return b
 
-    @staticmethod
-    def from_dataclass(policy: PolicyDataclass, policy_fn=None) -> _NativePolicy:
+    @classmethod
+    def from_dataclass(cls, policy: PolicyDataclass, policy_fn=None, override_hostname=None) -> _NativePolicy:
         """Build a native policy from a Python Policy dataclass."""
-        b = _NativePolicy._build_from_policy(policy)
+        b = _NativePolicy._build_from_policy(policy, override_hostname=override_hostname)
 
         # Store callback reference to prevent GC
         c_callback = None
@@ -932,13 +932,25 @@ class Sandbox:
     """
 
     def __init__(self, policy: PolicyDataclass, policy_fn=None,
-                 init_fn=None, work_fn=None):
+                 init_fn=None, work_fn=None, name: str | None = None):
         self._policy_dc = policy
         self._policy_fn = policy_fn
         self._init_fn = init_fn
         self._work_fn = work_fn
+        self._name = name
         self._native = _NativePolicy.from_dataclass(policy, policy_fn=policy_fn)
         self._handle = None  # live sandbox handle during run()
+
+    def _resolve_name(self):
+        """Resolve sandbox name: explicit > auto-generated."""
+        if self._name is not None:
+            return self._name
+        return f"sandbox-{os.getpid()}"
+
+    @property
+    def name(self) -> str | None:
+        """Sandbox name."""
+        return self._name
 
     def __enter__(self):
         return self
@@ -1030,6 +1042,13 @@ class Sandbox:
                 None means no timeout.
         """
         argv, argc = _make_argv(cmd)
+
+        # Resolve sandbox name and rebuild native policy with it
+        resolved_name = self._resolve_name()
+        self._native = _NativePolicy.from_dataclass(
+            self._policy_dc, policy_fn=self._policy_fn,
+            override_hostname=resolved_name,
+        )
 
         # Spawn (non-blocking) so PID is available for pause/resume
         self._handle = _lib.sandlock_spawn(self._native.ptr, argv, argc)

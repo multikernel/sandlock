@@ -90,8 +90,9 @@ enum Command {
         no_huge_pages: bool,
         #[arg(long)]
         deterministic_dirs: bool,
+        /// Sandbox name (also sets UTS hostname; auto-generated if omitted)
         #[arg(long)]
-        hostname: Option<String>,
+        name: Option<String>,
         #[arg(long)]
         no_coredump: bool,
         #[arg(long = "env", value_name = "KEY=VALUE")]
@@ -162,7 +163,7 @@ async fn main() -> Result<()> {
             max_cpu, max_open_files, chroot, uid, workdir, cwd,
             fs_isolation, fs_storage, max_disk, net_allow, net_deny,
             http_allow, http_deny, http_ports, https_ca, https_key,
-            port_remap, no_randomize_memory, no_huge_pages, deterministic_dirs, hostname, no_coredump,
+            port_remap, no_randomize_memory, no_huge_pages, deterministic_dirs, name, no_coredump,
             env_vars, exec_shell, interactive: _, fs_deny, fs_mount, cpu_cores, gpu_devices, image, dry_run, no_supervisor, cmd } =>
         {
             if no_supervisor {
@@ -171,7 +172,7 @@ async fn main() -> Result<()> {
                     &timeout, &net_allow_host, &net_bind, &net_connect,
                     &net_allow, &net_deny, &http_allow, &http_deny, &http_ports,
                     &num_cpus, &random_seed, &time_start, no_randomize_memory,
-                    no_huge_pages, deterministic_dirs, &hostname, &chroot,
+                    no_huge_pages, deterministic_dirs, &name, &chroot,
                     &image, &uid, &workdir, &cwd, &fs_isolation, &fs_storage,
                     &max_disk, port_remap, &cpu_cores, &gpu_devices, dry_run,
                     &status_fd, &fs_deny, &fs_mount,
@@ -321,7 +322,8 @@ async fn main() -> Result<()> {
             if no_randomize_memory { builder = builder.no_randomize_memory(true); }
             if no_huge_pages { builder = builder.no_huge_pages(true); }
             if deterministic_dirs { builder = builder.deterministic_dirs(true); }
-            if let Some(h) = hostname { builder = builder.hostname(h); }
+            let sandbox_name = name.clone().unwrap_or_else(|| network_registry::next_name());
+            builder = builder.hostname(&sandbox_name);
             if no_coredump { builder = builder.no_coredump(true); }
             for spec in &env_vars {
                 if let Some((k, v)) = spec.split_once('=') {
@@ -387,21 +389,20 @@ async fn main() -> Result<()> {
                     }
                 }
                 dr.run_result
-            } else if policy.port_remap && policy.hostname.is_some() {
+            } else if policy.port_remap {
                 // Use spawn+wait so we can register/unregister network state.
-                let hostname = policy.hostname.as_ref().unwrap().clone();
                 let mut sb = Sandbox::new(&policy)?;
 
                 // Set up callback to update registry on each port bind.
-                let reg_hostname = hostname.clone();
+                let reg_name = sandbox_name.clone();
                 sb.set_on_bind(move |ports| {
-                    let _ = network_registry::update_ports(&reg_hostname, ports.clone());
+                    let _ = network_registry::update_ports(&reg_name, ports.clone());
                 });
 
                 sb.spawn(&cmd_strs).await?;
 
                 let pid = sb.pid().unwrap_or(0);
-                if let Err(e) = network_registry::register(&hostname, pid, std::collections::HashMap::new()) {
+                if let Err(e) = network_registry::register(&sandbox_name, pid, std::collections::HashMap::new()) {
                     eprintln!("sandlock: network registry: {}", e);
                 }
 
@@ -412,7 +413,7 @@ async fn main() -> Result<()> {
                     ).await {
                         Ok(r) => r?,
                         Err(_) => {
-                            let _ = network_registry::unregister(&hostname);
+                            let _ = network_registry::unregister(&sandbox_name);
                             eprintln!("sandlock: timeout after {}s", secs);
                             std::process::exit(124);
                         }
@@ -420,7 +421,7 @@ async fn main() -> Result<()> {
                 } else {
                     sb.wait().await?
                 };
-                let _ = network_registry::unregister(&hostname);
+                let _ = network_registry::unregister(&sandbox_name);
                 result
             } else if let Some(secs) = timeout {
                 tokio::time::timeout(
@@ -552,7 +553,7 @@ fn validate_no_supervisor(
     no_randomize_memory: bool,
     no_huge_pages: bool,
     deterministic_dirs: bool,
-    hostname: &Option<String>,
+    name: &Option<String>,
     chroot: &Option<String>,
     image: &Option<String>,
     uid: &Option<u32>,
@@ -590,7 +591,7 @@ fn validate_no_supervisor(
     if no_randomize_memory { bad.push("--no-randomize-memory"); }
     if no_huge_pages { bad.push("--no-huge-pages"); }
     if deterministic_dirs { bad.push("--deterministic-dirs"); }
-    if hostname.is_some() { bad.push("--hostname"); }
+    if name.is_some() { bad.push("--name"); }
     if chroot.is_some() { bad.push("--chroot"); }
     if image.is_some() { bad.push("--image"); }
     if uid.is_some() { bad.push("--uid"); }

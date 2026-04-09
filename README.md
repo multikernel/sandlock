@@ -129,9 +129,9 @@ sandlock run --time-start "2000-01-01T00:00:00Z" --random-seed 42 -- ./build.sh
 # Port virtualization (multiple sandboxes can bind the same port)
 sandlock run --port-remap --net-bind 6379 -r /usr -r /lib -r /etc -- redis-server --port 6379
 
-# Port virtualization with hostname (enables network discovery)
-sandlock run --hostname api.local --port-remap --net-bind 8080 -r /usr -r /lib -r /etc -- python3 server.py
-sandlock run --hostname web.local --port-remap --net-bind 8080 -r /usr -r /lib -r /etc -- python3 server.py
+# Port virtualization with named sandboxes (enables network discovery)
+sandlock run --name api.local --port-remap --net-bind 8080 -r /usr -r /lib -r /etc -- python3 server.py
+sandlock run --name web.local --port-remap --net-bind 8080 -r /usr -r /lib -r /etc -- python3 server.py
 
 # Show network state of all running sandboxes
 sandlock network
@@ -192,7 +192,7 @@ chroot_policy = Policy(
 result = Sandbox(chroot_policy).run(["python3", "task.py"])
 
 # Port virtualization: query port mappings while sandbox is running
-sb = Sandbox(Policy(port_remap=True, fs_readable=["/usr", "/lib", "/etc"]))
+sb = Sandbox(Policy(port_remap=True, fs_readable=["/usr", "/lib", "/etc"]), name="api.local")
 # sb.ports() returns {virtual_port: real_port} while running
 
 # Confine the current process (Landlock filesystem only, irreversible)
@@ -480,7 +480,7 @@ of the child via `pidfd_getfd` (TOCTOU-safe). When a port conflicts, a
 different real port is allocated transparently. `/proc/net/tcp` is filtered
 to only show the sandbox's own ports.
 
-When `--hostname` is set with `--port-remap`, the sandbox registers its
+When `--port-remap` is enabled, the sandbox registers its
 network state in a shared registry (`/dev/shm`). Use `sandlock network`
 to discover all running sandboxes and their port mappings:
 
@@ -551,7 +551,7 @@ Policy(
     max_cpu=50,                    # CPU throttle (% of one core)
     max_open_files=256,            # fd limit
     port_remap=False,              # Virtual port space
-    hostname=None,                 # Sandbox hostname (UTS + network registry key)
+
 
     # Deterministic execution
     time_start="2000-01-01T00:00:00",  # Frozen time

@@ -96,7 +96,7 @@ if let Some(v) = sandbox.get("clean_env").and_then(|v| v.as_bool()) {
     if let Some(v) = sandbox.get("deterministic_dirs").and_then(|v| v.as_bool()) {
         builder = builder.deterministic_dirs(v);
     }
-    if let Some(v) = sandbox.get("hostname").and_then(|v| v.as_str()) {
+    if let Some(v) = sandbox.get("name").and_then(|v| v.as_str()) {
         builder = builder.hostname(v);
     }
     if let Some(v) = sandbox.get("workdir").and_then(|v| v.as_str()) {

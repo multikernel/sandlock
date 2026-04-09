@@ -94,6 +94,24 @@ pub fn unregister(hostname: &str) -> io::Result<()> {
     write_registry(&mut file, &reg)
 }
 
+/// Generate the next available sandbox name (sandbox-1, sandbox-2, ...).
+pub fn next_name() -> String {
+    let max_n = match open_locked() {
+        Ok(mut file) => {
+            let reg = read_registry(&mut file);
+            reg.keys()
+                .filter_map(|k| {
+                    k.strip_prefix("sandbox-")
+                        .and_then(|s| s.parse::<u64>().ok())
+                })
+                .max()
+                .unwrap_or(0)
+        }
+        Err(_) => 0,
+    };
+    format!("sandbox-{}", max_n + 1)
+}
+
 /// Read all entries, pruning dead PIDs.
 pub fn list() -> io::Result<Registry> {
     let mut file = match open_locked() {

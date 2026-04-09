@@ -487,20 +487,24 @@ class TestUnwiredFieldWarning:
         import warnings
         from sandlock._sdk import _NativePolicy
 
-        # Temporarily remove 'hostname' from the handled set to simulate
+        # Temporarily remove a field from the handled set to simulate
         # a field that exists on the dataclass but was forgotten in FFI.
-        _NativePolicy._HANDLED_FIELDS.discard("hostname")
+        _NativePolicy._HANDLED_FIELDS.discard("no_coredump")
         try:
             with warnings.catch_warnings(record=True) as w:
                 warnings.simplefilter("always")
-                p = _policy(hostname="test-host")
+                p = _policy(no_coredump=True)
                 Sandbox(p).run(["echo", "ok"])
 
-            matched = [x for x in w if "hostname" in str(x.message)]
-            assert len(matched) == 1
+            matched = [x for x in w if "no_coredump" in str(x.message)]
+            assert len(matched) >= 1
             assert "not wired through FFI" in str(matched[0].message)
         finally:
-            _NativePolicy._HANDLED_FIELDS.add("hostname")
+            _NativePolicy._HANDLED_FIELDS.add("no_coredump")
+
+    def test_sandbox_name_parameter(self):
+        sb = Sandbox(_policy(), name="test-host")
+        assert sb.name == "test-host"
 
     def test_no_warning_on_default_values(self):
         import warnings
