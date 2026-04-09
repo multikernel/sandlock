@@ -375,6 +375,12 @@ pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
             libc::SYS_open as u32,
             libc::SYS_execve as u32,
             libc::SYS_execveat as u32,
+            libc::SYS_linkat as u32,
+            libc::SYS_link as u32,
+            libc::SYS_renameat2 as u32,
+            libc::SYS_rename as u32,
+            libc::SYS_symlinkat as u32,
+            libc::SYS_symlink as u32,
         ]);
     }
 

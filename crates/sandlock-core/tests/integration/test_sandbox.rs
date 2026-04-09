@@ -198,6 +198,123 @@ async fn test_nested_sandbox_via_cli() {
     assert!(result.success(), "nested sandbox with shared paths should work");
 }
 
+/// Test that fs_denied blocks hardlink, rename, and symlink bypass attempts.
+///
+/// A sandboxed process must not be able to circumvent fs_denied by creating
+/// a hardlink, renaming, or symlinking a denied file to a new (non-denied) path.
+#[tokio::test]
+async fn test_denied_path_hardlink_blocked() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let secret = tmp.path().join("secret.txt");
+    std::fs::write(&secret, "TOP_SECRET").unwrap();
+
+    let policy = Policy::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read("/lib64")
+        .fs_read("/bin").fs_read("/proc").fs_read("/etc")
+        .fs_read(tmp.path())
+        .fs_write(tmp.path())
+        .fs_deny(&secret)
+        .build()
+        .unwrap();
+
+    // Attempt to hardlink the denied file to a new name, then read it.
+    let cmd = format!(
+        "ln {} {}/copy.txt 2>/dev/null && cat {}/copy.txt",
+        secret.display(),
+        tmp.path().display(),
+        tmp.path().display(),
+    );
+    let result = Sandbox::run(&policy, &["sh", "-c", &cmd]).await.unwrap();
+    assert!(
+        result.stdout_str().map_or(true, |s| !s.contains("TOP_SECRET")),
+        "hardlink bypass: sandbox allowed reading denied file via hardlink"
+    );
+}
+
+#[tokio::test]
+async fn test_denied_path_rename_blocked() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let secret = tmp.path().join("secret.txt");
+    std::fs::write(&secret, "TOP_SECRET").unwrap();
+
+    let policy = Policy::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read("/lib64")
+        .fs_read("/bin").fs_read("/proc").fs_read("/etc")
+        .fs_read(tmp.path())
+        .fs_write(tmp.path())
+        .fs_deny(&secret)
+        .build()
+        .unwrap();
+
+    // Attempt to rename the denied file, then read via the new name.
+    let cmd = format!(
+        "mv {} {}/renamed.txt 2>/dev/null && cat {}/renamed.txt",
+        secret.display(),
+        tmp.path().display(),
+        tmp.path().display(),
+    );
+    let result = Sandbox::run(&policy, &["sh", "-c", &cmd]).await.unwrap();
+    assert!(
+        result.stdout_str().map_or(true, |s| !s.contains("TOP_SECRET")),
+        "rename bypass: sandbox allowed reading denied file via rename"
+    );
+}
+
+#[tokio::test]
+async fn test_denied_path_symlink_blocked() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let secret = tmp.path().join("secret.txt");
+    std::fs::write(&secret, "TOP_SECRET").unwrap();
+
+    let policy = Policy::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read("/lib64")
+        .fs_read("/bin").fs_read("/proc").fs_read("/etc")
+        .fs_read(tmp.path())
+        .fs_write(tmp.path())
+        .fs_deny(&secret)
+        .build()
+        .unwrap();
+
+    // Attempt to symlink to the denied file, then read via the symlink.
+    let cmd = format!(
+        "ln -s {} {}/link && cat {}/link",
+        secret.display(),
+        tmp.path().display(),
+        tmp.path().display(),
+    );
+    let result = Sandbox::run(&policy, &["sh", "-c", &cmd]).await.unwrap();
+    assert!(
+        result.stdout_str().map_or(true, |s| !s.contains("TOP_SECRET")),
+        "symlink bypass: sandbox allowed reading denied file via symlink"
+    );
+}
+
+/// Verify that normal writes still succeed when fs_denied is active (no false positives).
+#[tokio::test]
+async fn test_denied_path_allows_normal_writes() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let secret = tmp.path().join("secret.txt");
+    std::fs::write(&secret, "TOP_SECRET").unwrap();
+
+    let policy = Policy::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read("/lib64")
+        .fs_read("/bin").fs_read("/proc").fs_read("/etc")
+        .fs_read(tmp.path())
+        .fs_write(tmp.path())
+        .fs_deny(&secret)
+        .build()
+        .unwrap();
+
+    // Normal file creation and linking of non-denied files should still work.
+    let cmd = format!(
+        "echo ok > {0}/a.txt && ln {0}/a.txt {0}/b.txt && cat {0}/b.txt",
+        tmp.path().display(),
+    );
+    let result = Sandbox::run(&policy, &["sh", "-c", &cmd]).await.unwrap();
+    assert!(result.success(), "normal write should succeed");
+    assert_eq!(result.stdout_str(), Some("ok"));
+}
+
 /// Test that chroot changes the root filesystem.
 #[tokio::test]
 async fn test_chroot() {

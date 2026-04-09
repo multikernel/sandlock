@@ -58,16 +58,27 @@ pub enum NetworkPolicy {
 }
 
 /// Check if a path-bearing notification targets a denied path.
+///
+/// For two-path syscalls (renameat2, linkat), checks both source and
+/// destination paths — a denied file must not be linked, renamed, or
+/// overwritten.
 pub(crate) fn is_path_denied_for_notif(
     policy_fn_state: &super::state::PolicyFnState,
     notif: &SeccompNotif,
     notif_fd: RawFd,
 ) -> bool {
     if let Some(path) = resolve_path_for_notif(notif, notif_fd) {
-        policy_fn_state.is_path_denied(&path)
-    } else {
-        false
+        if policy_fn_state.is_path_denied(&path) {
+            return true;
+        }
     }
+    // For two-path syscalls, also check the second (destination) path.
+    if let Some(path) = resolve_second_path_for_notif(notif, notif_fd) {
+        if policy_fn_state.is_path_denied(&path) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Duplicate a file descriptor from an arbitrary process (by PID/TID) into the supervisor.
@@ -506,6 +517,7 @@ fn resolve_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Option<Strin
     let nr = notif.data.nr as i64;
     match nr {
         n if n == libc::SYS_openat => {
+            // openat(dirfd, pathname, flags, mode)
             let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
             resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
         }
@@ -516,6 +528,72 @@ fn resolve_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Option<Strin
         n if n == libc::SYS_execveat => {
             let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
             resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
+        }
+        // linkat(olddirfd, oldpath, newdirfd, newpath, flags)
+        // Check the source (old) path — deny if it's a denied file being linked away.
+        n if n == libc::SYS_linkat => {
+            let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
+            resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
+        }
+        // renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
+        // Check the source (old) path — deny if a denied file is being renamed away.
+        n if n == libc::SYS_renameat2 => {
+            let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
+            resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
+        }
+        // symlinkat(target, newdirfd, linkpath)
+        // The target string is what the symlink points to; deny if it names a denied path.
+        n if n == libc::SYS_symlinkat => {
+            let target = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
+            // target may be absolute or relative to the process cwd
+            resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &target)
+        }
+        // link(oldpath, newpath) — legacy, AT_FDCWD implied for both
+        n if n == libc::SYS_link => {
+            let path = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
+            resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
+        }
+        // rename(oldpath, newpath) — legacy, AT_FDCWD implied for both
+        n if n == libc::SYS_rename => {
+            let path = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
+            resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
+        }
+        // symlink(target, linkpath) — legacy
+        n if n == libc::SYS_symlink => {
+            let target = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
+            resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &target)
+        }
+        _ => None,
+    }
+}
+
+/// Resolve the second (destination) path for two-path syscalls.
+///
+/// Returns `None` for syscalls that only have a single path argument.
+fn resolve_second_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Option<String> {
+    let nr = notif.data.nr as i64;
+    match nr {
+        // renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
+        n if n == libc::SYS_renameat2 => {
+            let path = read_path_for_event(notif, notif.data.args[3], notif_fd)?;
+            resolve_at_path_for_event(notif, notif.data.args[2] as i64, &path)
+        }
+        // linkat(olddirfd, oldpath, newdirfd, newpath, flags)
+        // Destination of a hardlink to a denied file should also be denied
+        // (prevents overwriting a denied file via linkat).
+        n if n == libc::SYS_linkat => {
+            let path = read_path_for_event(notif, notif.data.args[3], notif_fd)?;
+            resolve_at_path_for_event(notif, notif.data.args[2] as i64, &path)
+        }
+        // rename(oldpath, newpath) — legacy
+        n if n == libc::SYS_rename => {
+            let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
+            resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
+        }
+        // link(oldpath, newpath) — legacy
+        n if n == libc::SYS_link => {
+            let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
+            resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
         }
         _ => None,
     }
@@ -692,8 +770,12 @@ async fn handle_notification(
     let mut action = {
         let nr = notif.data.nr as i64;
         let should_precheck_denied = policy.chroot_root.is_none()
-            && [libc::SYS_openat, libc::SYS_open, libc::SYS_execve, libc::SYS_execveat]
-                .contains(&nr);
+            && [
+                libc::SYS_openat, libc::SYS_open, libc::SYS_execve, libc::SYS_execveat,
+                libc::SYS_linkat, libc::SYS_link,
+                libc::SYS_renameat2, libc::SYS_rename,
+                libc::SYS_symlinkat, libc::SYS_symlink,
+            ].contains(&nr);
         if should_precheck_denied {
             let pfs = ctx.policy_fn.lock().await;
             if is_path_denied_for_notif(&pfs, &notif, fd) {
