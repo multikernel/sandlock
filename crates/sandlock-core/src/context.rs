@@ -647,7 +647,7 @@ fn write_id_maps_overflow() {
 ///
 /// This function **never returns**: it calls `execvp` on success or
 /// `_exit(127)` on any error.
-pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, cow_config: Option<&ChildMountConfig>, nested: bool) -> ! {
+pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, cow_config: Option<&ChildMountConfig>, nested: bool, keep_fds: &[RawFd]) -> ! {
     // Helper: abort child on error. Includes the OS error automatically.
     macro_rules! fail {
         ($msg:expr) => {{
@@ -884,11 +884,11 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
     }
 
     // 12. Close all fds above stderr (always on for isolation)
+    let mut fds_to_keep: Vec<RawFd> = keep_fds.to_vec();
     if keep_fd >= 0 {
-        close_fds_above(2, &[keep_fd]);
-    } else {
-        close_fds_above(2, &[]);
+        fds_to_keep.push(keep_fd);
     }
+    close_fds_above(2, &fds_to_keep);
 
     // 13. Apply environment
     if policy.clean_env {

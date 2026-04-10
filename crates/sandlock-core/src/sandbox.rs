@@ -825,8 +825,11 @@ impl Sandbox {
             drop(stdout_r);
             drop(stderr_r);
 
+            // Collect target fds from gather that must survive close_fds_above
+            let gather_keep_fds: Vec<i32> = self.extra_fds.iter().map(|&(target, _)| target).collect();
+
             // This never returns.
-            context::confine_child(&self.policy, &c_cmd, &pipes, cow_config.as_ref(), nested);
+            context::confine_child(&self.policy, &c_cmd, &pipes, cow_config.as_ref(), nested, &gather_keep_fds);
         }
 
         // ===== PARENT PROCESS =====

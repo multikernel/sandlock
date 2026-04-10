@@ -7,7 +7,7 @@ import tempfile
 
 import pytest
 
-from sandlock import Sandbox, Policy, Stage, Pipeline
+from sandlock import Sandbox, Policy, Stage, Pipeline, NamedStage, Gather, GatherPipeline
 
 
 # --- Helpers ---
@@ -231,3 +231,112 @@ class TestXOA:
 
         # Executor tried to connect but was blocked
         assert not result.success
+
+
+# --- Gather ---
+
+class TestGather:
+    def test_as_returns_named_stage(self):
+        stage = Sandbox(_policy()).cmd(["echo", "hello"])
+        named = stage.as_("greeting")
+        assert isinstance(named, NamedStage)
+        assert named.name == "greeting"
+
+    def test_add_returns_gather(self):
+        a = Sandbox(_policy()).cmd(["echo", "a"]).as_("a")
+        b = Sandbox(_policy()).cmd(["echo", "b"]).as_("b")
+        g = a + b
+        assert isinstance(g, Gather)
+        assert len(g.sources) == 2
+
+    def test_gather_or_stage_returns_pipeline(self):
+        g = (
+            Sandbox(_policy()).cmd(["echo", "a"]).as_("a")
+            + Sandbox(_policy()).cmd(["echo", "b"]).as_("b")
+        )
+        gp = g | Sandbox(_policy()).cmd(["cat"])
+        assert isinstance(gp, GatherPipeline)
+
+    def test_gather_two_sources(self):
+        """Two producers pipe into one consumer via gather."""
+        result = (
+            Sandbox(_policy()).cmd(["echo", "hello"]).as_("greeting")
+            + Sandbox(_policy()).cmd(["echo", "world"]).as_("name")
+            | Sandbox(_policy()).cmd(
+                ["sh", "-c",
+                 'read name; greeting=$(cat <&3); echo "$greeting $name"']
+            )
+        ).run()
+        assert result.success, f"stderr={result.stderr}"
+        assert b"hello" in result.stdout
+        assert b"world" in result.stdout
+
+    def test_gather_with_python_inputs(self):
+        """Consumer reads gather inputs via sandlock.inputs."""
+        python_paths = [p for p in sys.path if p and os.path.isdir(p)]
+        policy = _policy(fs_readable=list(dict.fromkeys([
+            "/usr", "/lib", "/lib64", "/etc", "/bin", "/sbin",
+            "/home", _PYTHON_PREFIX,
+        ] + python_paths)))
+
+        result = (
+            Sandbox(policy).cmd(
+                [sys.executable, "-c", "print('DATA_CONTENT')"]
+            ).as_("data")
+            + Sandbox(policy).cmd(
+                [sys.executable, "-c", "print('CODE_CONTENT')"]
+            ).as_("code")
+            | Sandbox(policy).cmd(
+                [sys.executable, "-c",
+                 "from sandlock import inputs; "
+                 "print(f'code={inputs[\"code\"].strip()}'); "
+                 "print(f'data={inputs[\"data\"].strip()}')"]
+            )
+        ).run()
+        assert result.success, f"stderr={result.stderr}"
+        assert b"code=CODE_CONTENT" in result.stdout
+        assert b"data=DATA_CONTENT" in result.stdout
+
+    def test_gather_disjoint_policies(self):
+        """Sources have independent policies — data source can read
+        a file the code source cannot."""
+        with tempfile.TemporaryDirectory() as tmp:
+            secret = os.path.join(tmp, "secret.txt")
+            with open(secret, "w") as f:
+                f.write("sensitive data")
+
+            data_policy = _policy(fs_readable=list(dict.fromkeys([
+                tmp, "/usr", "/lib", "/lib64", "/etc", "/bin", "/sbin",
+                _PYTHON_PREFIX,
+            ])))
+            code_policy = _policy()
+            consumer_policy = _policy()
+
+            result = (
+                Sandbox(data_policy).cmd(["cat", secret]).as_("data")
+                + Sandbox(code_policy).cmd(
+                    ["echo", "tr a-z A-Z <&3"]
+                ).as_("code")
+                | Sandbox(consumer_policy).cmd(
+                    ["sh", "-c", 'eval "$(cat)"']
+                )
+            ).run()
+            assert result.success, f"stderr={result.stderr}"
+            assert b"SENSITIVE DATA" in result.stdout
+
+    def test_gather_three_sources(self):
+        """Three producers fan into one consumer."""
+        result = (
+            Sandbox(_policy()).cmd(["echo", "aaa"]).as_("a")
+            + Sandbox(_policy()).cmd(["echo", "bbb"]).as_("b")
+            + Sandbox(_policy()).cmd(["echo", "ccc"]).as_("c")
+            | Sandbox(_policy()).cmd(
+                ["sh", "-c",
+                 # c on stdin, a on fd 3, b on fd 4
+                 'read c; a=$(cat <&3); b=$(cat <&4); echo "$a $b $c"']
+            )
+        ).run()
+        assert result.success, f"stderr={result.stderr}"
+        assert b"aaa" in result.stdout
+        assert b"bbb" in result.stdout
+        assert b"ccc" in result.stdout
