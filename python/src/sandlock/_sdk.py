@@ -301,6 +301,30 @@ _lib.sandlock_pipeline_run.argtypes = [_c_pipeline_p, ctypes.c_uint64]
 _lib.sandlock_pipeline_free.restype = None
 _lib.sandlock_pipeline_free.argtypes = [_c_pipeline_p]
 
+# Gather
+_c_gather_p = ctypes.c_void_p
+
+_lib.sandlock_gather_new.restype = _c_gather_p
+_lib.sandlock_gather_new.argtypes = []
+
+_lib.sandlock_gather_add_source.restype = None
+_lib.sandlock_gather_add_source.argtypes = [
+    _c_gather_p, ctypes.c_char_p, _c_policy_p,
+    ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint,
+]
+
+_lib.sandlock_gather_set_consumer.restype = None
+_lib.sandlock_gather_set_consumer.argtypes = [
+    _c_gather_p, _c_policy_p,
+    ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint,
+]
+
+_lib.sandlock_gather_run.restype = _c_result_p
+_lib.sandlock_gather_run.argtypes = [_c_gather_p, ctypes.c_uint64]
+
+_lib.sandlock_gather_free.restype = None
+_lib.sandlock_gather_free.argtypes = [_c_gather_p]
+
 _lib.sandlock_string_free.restype = None
 _lib.sandlock_string_free.argtypes = [ctypes.c_char_p]
 
@@ -1264,6 +1288,10 @@ class Stage:
         self.sandbox = sandbox
         self.args = args
 
+    def as_(self, name: str) -> NamedStage:
+        """Label this stage's output for use in a gather pattern."""
+        return NamedStage(self, name)
+
     def run(self, timeout: float | None = None) -> Result:
         """Run this single stage."""
         return self.sandbox.run(self.args)
@@ -1272,6 +1300,110 @@ class Stage:
         if isinstance(other, Pipeline):
             return Pipeline([self] + other.stages)
         return Pipeline([self, other])
+
+
+class NamedStage:
+    """A Stage with a named output for gather patterns."""
+
+    def __init__(self, stage: Stage, name: str):
+        self.stage = stage
+        self.name = name
+
+    def __add__(self, other: NamedStage | Gather) -> Gather:
+        if isinstance(other, Gather):
+            return Gather([(self.name, self.stage)] + other.sources)
+        return Gather([(self.name, self.stage), (other.name, other.stage)])
+
+
+class Gather:
+    """A set of named stages to be gathered into a consumer.
+
+    Usage::
+
+        result = (
+            Sandbox(policy_a).cmd(["produce_code"]).as_("code")
+            + Sandbox(policy_b).cmd(["produce_data"]).as_("data")
+            | Sandbox(policy_c).cmd(["python3", "consume.py"])
+        ).run()
+
+    The consumer script imports ``from sandlock import inputs`` to read
+    producer outputs by name.
+    """
+
+    def __init__(self, sources: list[tuple[str, Stage]]):
+        self.sources = sources
+
+    def __add__(self, other: NamedStage | Gather) -> Gather:
+        if isinstance(other, Gather):
+            return Gather(self.sources + other.sources)
+        return Gather(self.sources + [(other.name, other.stage)])
+
+    def __or__(self, other: Stage) -> GatherPipeline:
+        return GatherPipeline(self.sources, other)
+
+
+class GatherPipeline:
+    """Fan-in pipeline: multiple producers → one consumer via pipes.
+
+    Producer outputs are available in the consumer via
+    ``from sandlock import inputs``.
+    """
+
+    def __init__(self, sources: list[tuple[str, Stage]], consumer: Stage):
+        self.sources = sources
+        self.consumer = consumer
+
+    def run(self, timeout: float | None = None) -> Result:
+        """Run all producers in parallel, pipe outputs to consumer.
+
+        Each producer's stdout is connected to the consumer via a Unix pipe.
+        The last source maps to stdin (fd 0), others to fd 3, 4, 5, ...
+        The consumer reads them via ``from sandlock import inputs``.
+        """
+        # Build the gather via FFI
+        gather_p = _lib.sandlock_gather_new()
+
+        for name, stage in self.sources:
+            name_b = name.encode("utf-8") + b"\x00"
+            argv, argc = _make_argv(stage.args)
+            _lib.sandlock_gather_add_source(
+                gather_p,
+                ctypes.c_char_p(name_b),
+                stage.sandbox._native.ptr,
+                argv, argc,
+            )
+
+        consumer_argv, consumer_argc = _make_argv(self.consumer.args)
+        _lib.sandlock_gather_set_consumer(
+            gather_p,
+            self.consumer.sandbox._native.ptr,
+            consumer_argv, consumer_argc,
+        )
+
+        timeout_ms = int(timeout * 1000) if timeout else 0
+        result_p = _lib.sandlock_gather_run(gather_p, timeout_ms)
+
+        if not result_p:
+            error = "Gather timed out" if timeout else "Gather failed"
+            return Result(success=False, exit_code=-1, error=error)
+
+        exit_code = _lib.sandlock_result_exit_code(result_p)
+        success = _lib.sandlock_result_success(result_p)
+        out_bytes = _read_result_bytes(result_p, _lib.sandlock_result_stdout_bytes)
+        stderr = _read_result_bytes(result_p, _lib.sandlock_result_stderr_bytes)
+        _lib.sandlock_result_free(result_p)
+
+        error = None
+        if exit_code == -1 and not success and timeout:
+            error = "Gather timed out"
+
+        return Result(
+            success=bool(success),
+            exit_code=exit_code,
+            stdout=out_bytes,
+            stderr=stderr,
+            error=error,
+        )
 
 
 class Pipeline:

@@ -1179,6 +1179,112 @@ pub unsafe extern "C" fn sandlock_pipeline_free(pipe: *mut sandlock_pipeline_t) 
 }
 
 // ----------------------------------------------------------------
+// Gather (fan-in)
+// ----------------------------------------------------------------
+
+#[allow(non_camel_case_types)]
+pub struct sandlock_gather_t {
+    sources: Vec<(String, sandlock_core::Policy, Vec<String>)>,
+    consumer: Option<(sandlock_core::Policy, Vec<String>)>,
+}
+
+/// Create a new empty gather.
+#[no_mangle]
+pub extern "C" fn sandlock_gather_new() -> *mut sandlock_gather_t {
+    Box::into_raw(Box::new(sandlock_gather_t {
+        sources: Vec::new(),
+        consumer: None,
+    }))
+}
+
+/// Add a named source to the gather.
+///
+/// # Safety
+/// All pointers must be valid. `name` must be a NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_gather_add_source(
+    g: *mut sandlock_gather_t,
+    name: *const c_char,
+    policy: *const sandlock_policy_t,
+    argv: *const *const c_char,
+    argc: c_uint,
+) {
+    if g.is_null() || name.is_null() || policy.is_null() || argv.is_null() { return; }
+    let name = CStr::from_ptr(name).to_str().unwrap_or("").to_string();
+    let policy = (*policy)._private.clone();
+    let args = read_argv(argv, argc);
+    (*g).sources.push((name, policy, args));
+}
+
+/// Set the consumer stage for the gather.
+///
+/// # Safety
+/// All pointers must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_gather_set_consumer(
+    g: *mut sandlock_gather_t,
+    policy: *const sandlock_policy_t,
+    argv: *const *const c_char,
+    argc: c_uint,
+) {
+    if g.is_null() || policy.is_null() || argv.is_null() { return; }
+    let policy = (*policy)._private.clone();
+    let args = read_argv(argv, argc);
+    (*g).consumer = Some((policy, args));
+}
+
+/// Run the gather. Consumes the gather handle.
+///
+/// # Safety
+/// `g` must be a valid gather pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_gather_run(
+    g: *mut sandlock_gather_t,
+    timeout_ms: u64,
+) -> *mut sandlock_result_t {
+    if g.is_null() { return ptr::null_mut(); }
+    let g = *Box::from_raw(g);
+
+    let (consumer_policy, consumer_args) = match g.consumer {
+        Some(c) => c,
+        None => return ptr::null_mut(),
+    };
+
+    let mut gather = sandlock_core::Gather::new();
+    for (name, policy, args) in g.sources {
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        gather = gather.source(&name, sandlock_core::Stage::new(&policy, &arg_refs));
+    }
+    let consumer_refs: Vec<&str> = consumer_args.iter().map(|s| s.as_str()).collect();
+    gather = gather.consumer(sandlock_core::Stage::new(&consumer_policy, &consumer_refs));
+
+    let timeout = if timeout_ms > 0 {
+        Some(Duration::from_millis(timeout_ms))
+    } else {
+        None
+    };
+
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    match rt.block_on(gather.run(timeout)) {
+        Ok(result) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Free a gather without running it.
+///
+/// # Safety
+/// `g` must be null or a valid gather pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_gather_free(g: *mut sandlock_gather_t) {
+    if !g.is_null() { drop(Box::from_raw(g)); }
+}
+
+// ----------------------------------------------------------------
 // Policy callback (policy_fn)
 // ----------------------------------------------------------------
 

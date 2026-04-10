@@ -100,6 +100,9 @@ pub struct Sandbox {
     work_fn: Option<Arc<dyn Fn(u32) + Send + Sync + 'static>>,
     /// Optional fd overrides for stdin/stdout/stderr (used by Pipeline).
     io_overrides: Option<(Option<i32>, Option<i32>, Option<i32>)>,
+    /// Extra fd mappings for the child: (target_fd, source_fd).
+    /// Each pair dup2's source_fd to target_fd in the child before exec.
+    extra_fds: Vec<(i32, i32)>,
     /// HTTP ACL proxy handle — kept alive so the proxy runs while the child is alive.
     http_acl_handle: Option<crate::http_acl::HttpAclProxyHandle>,
     /// Optional callback invoked when a port bind is recorded.
@@ -157,6 +160,7 @@ impl Sandbox {
             init_fn: None,
             work_fn: None,
             io_overrides: None,
+            extra_fds: Vec::new(),
             http_acl_handle: None,
             on_bind: None,
         }
@@ -635,6 +639,22 @@ impl Sandbox {
         self.do_spawn(cmd, false).await
     }
 
+    /// Like `spawn_with_io` but also maps extra fds into the child.
+    /// `extra_fds` is a list of (target_fd, source_fd) pairs.
+    #[doc(hidden)]
+    pub async fn spawn_with_gather_io(
+        &mut self,
+        cmd: &[&str],
+        stdin_fd: Option<std::os::unix::io::RawFd>,
+        stdout_fd: Option<std::os::unix::io::RawFd>,
+        stderr_fd: Option<std::os::unix::io::RawFd>,
+        extra_fds: Vec<(i32, i32)>,
+    ) -> Result<(), SandlockError> {
+        self.io_overrides = Some((stdin_fd, stdout_fd, stderr_fd));
+        self.extra_fds = extra_fds;
+        self.do_spawn(cmd, false).await
+    }
+
     /// Capture a checkpoint of the running sandbox.
     pub async fn checkpoint(&self) -> Result<crate::checkpoint::Checkpoint, SandlockError> {
         let pid = self.child_pid.ok_or(SandlockError::Sandbox(SandboxError::NotRunning))?;
@@ -786,6 +806,11 @@ impl Sandbox {
                 if let Some(fd) = stderr_fd {
                     unsafe { libc::dup2(fd, 2) };
                 }
+            }
+
+            // Apply extra fd mappings (from gather)
+            for &(target_fd, source_fd) in &self.extra_fds {
+                unsafe { libc::dup2(source_fd, target_fd) };
             }
 
             // Redirect stdout/stderr if capturing

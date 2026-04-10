@@ -219,3 +219,182 @@ fn read_fd_to_end(fd: OwnedFd) -> Vec<u8> {
     let _ = file.read_to_end(&mut buf);
     buf
 }
+
+// ============================================================
+// Gather — fan-in from multiple producers to one consumer
+// ============================================================
+
+/// A named producer stage.
+pub struct NamedStage {
+    pub name: String,
+    pub stage: Stage,
+}
+
+/// Fan-in pattern: multiple named producers pipe into one consumer.
+///
+/// Each producer runs in its own sandbox. Their stdout is connected to the
+/// consumer via Unix pipes. The last source maps to stdin (fd 0), others
+/// to fd 3, 4, 5, ... The consumer reads them via `sandlock.inputs` in
+/// Python or `os.fdopen(N)` directly.
+///
+/// The `_SANDLOCK_GATHER` env var is injected into the consumer with
+/// a comma-separated list of `name:fd` pairs.
+///
+/// ```ignore
+/// let result = Gather::new()
+///     .source("data", Stage::new(&search_policy, &["python3", "search.py"]))
+///     .source("code", Stage::new(&planner_policy, &["python3", "plan.py"]))
+///     .consumer(Stage::new(&executor_policy, &["python3", "run.py"]))
+///     .run(None)
+///     .await?;
+/// ```
+pub struct Gather {
+    sources: Vec<NamedStage>,
+    consumer: Option<Stage>,
+}
+
+impl Gather {
+    pub fn new() -> Self {
+        Self {
+            sources: Vec::new(),
+            consumer: None,
+        }
+    }
+
+    pub fn source(mut self, name: &str, stage: Stage) -> Self {
+        self.sources.push(NamedStage {
+            name: name.to_string(),
+            stage,
+        });
+        self
+    }
+
+    pub fn consumer(mut self, stage: Stage) -> Self {
+        self.consumer = Some(stage);
+        self
+    }
+
+    pub async fn run(self, timeout: Option<Duration>) -> Result<RunResult, SandlockError> {
+        let consumer = self.consumer.ok_or_else(|| {
+            SandlockError::Sandbox(SandboxError::Child("Gather requires a consumer".into()))
+        })?;
+        if self.sources.is_empty() {
+            return Err(SandlockError::Sandbox(SandboxError::Child(
+                "Gather requires at least one source".into(),
+            )));
+        }
+
+        if let Some(dur) = timeout {
+            match tokio::time::timeout(dur, run_gather(self.sources, consumer)).await {
+                Ok(result) => result,
+                Err(_) => Ok(RunResult {
+                    exit_status: ExitStatus::Timeout,
+                    stdout: None,
+                    stderr: None,
+                }),
+            }
+        } else {
+            run_gather(self.sources, consumer).await
+        }
+    }
+}
+
+/// Run the gather: spawn all producers and the consumer concurrently.
+async fn run_gather(
+    sources: Vec<NamedStage>,
+    consumer: Stage,
+) -> Result<RunResult, SandlockError> {
+    let n = sources.len();
+
+    // Create a pipe for each source: source stdout → consumer fd
+    // Last source → consumer stdin (fd 0), others → fd 3, 4, 5, ...
+    let mut source_pipes: Vec<(OwnedFd, OwnedFd)> = Vec::with_capacity(n);
+    for _ in 0..n {
+        source_pipes.push(make_pipe().map_err(SandboxError::Io)?);
+    }
+
+    // Assign consumer fds: last source → fd 0, others → fd 3, 4, ...
+    let mut fd_assignments: Vec<(String, i32)> = Vec::with_capacity(n);
+    let mut next_fd = 3i32;
+    for (i, ns) in sources.iter().enumerate() {
+        let target_fd = if i == n - 1 { 0 } else { let fd = next_fd; next_fd += 1; fd };
+        fd_assignments.push((ns.name.clone(), target_fd));
+    }
+
+    // Build _SANDLOCK_GATHER env var: "name1:3,name2:0"
+    let gather_env: String = fd_assignments
+        .iter()
+        .map(|(name, fd)| format!("{}:{}", name, fd))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    // Capture pipes for consumer stdout/stderr
+    let (cap_stdout_r, cap_stdout_w) = make_pipe().map_err(SandboxError::Io)?;
+    let (cap_stderr_r, cap_stderr_w) = make_pipe().map_err(SandboxError::Io)?;
+
+    // Spawn producers: each writes stdout to its pipe
+    let mut sandboxes: Vec<Sandbox> = Vec::with_capacity(n + 1);
+    for (i, ns) in sources.into_iter().enumerate() {
+        let mut sb = Sandbox::new(&ns.stage.policy)?;
+        let stdout_fd = source_pipes[i].1.as_raw_fd();
+        let cmd_refs: Vec<&str> = ns.stage.args.iter().map(|s| s.as_str()).collect();
+        sb.spawn_with_io(&cmd_refs, None, Some(stdout_fd), None).await?;
+        sandboxes.push(sb);
+    }
+
+    // Spawn consumer with extra fds from source pipes
+    let mut consumer_policy = consumer.policy.clone();
+    // Inject _SANDLOCK_GATHER env var
+    consumer_policy.env.insert("_SANDLOCK_GATHER".to_string(), gather_env);
+
+    let mut consumer_sb = Sandbox::new(&consumer_policy)?;
+    let stdin_fd = source_pipes[n - 1].0.as_raw_fd();
+
+    // Build extra fd mappings for non-stdin sources
+    let mut extra_fds = Vec::new();
+    for (i, (_, target_fd)) in fd_assignments.iter().enumerate() {
+        if i < n - 1 {
+            let read_fd = source_pipes[i].0.as_raw_fd();
+            // Clear O_CLOEXEC so these fds survive exec
+            unsafe {
+                let flags = libc::fcntl(read_fd, libc::F_GETFD);
+                libc::fcntl(read_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+            }
+            extra_fds.push((*target_fd, read_fd));
+        }
+    }
+
+    let cmd_refs: Vec<&str> = consumer.args.iter().map(|s| s.as_str()).collect();
+    consumer_sb.spawn_with_gather_io(
+        &cmd_refs,
+        Some(stdin_fd),
+        Some(cap_stdout_w.as_raw_fd()),
+        Some(cap_stderr_w.as_raw_fd()),
+        extra_fds,
+    ).await?;
+    sandboxes.push(consumer_sb);
+
+    // Close pipe ends in parent
+    drop(source_pipes);
+    drop(cap_stdout_w);
+    drop(cap_stderr_w);
+
+    // Wait for all
+    let total = sandboxes.len();
+    let mut last_result = RunResult {
+        exit_status: ExitStatus::Killed,
+        stdout: None,
+        stderr: None,
+    };
+    for (i, mut sb) in sandboxes.into_iter().enumerate() {
+        let result = sb.wait().await?;
+        if i == total - 1 {
+            last_result.exit_status = result.exit_status;
+        }
+    }
+
+    last_result.stdout = Some(read_fd_to_end(cap_stdout_r));
+    last_result.stderr = Some(read_fd_to_end(cap_stderr_r));
+
+    Ok(last_result)
+}

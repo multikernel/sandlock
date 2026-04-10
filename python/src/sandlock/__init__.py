@@ -8,8 +8,10 @@ without root or namespaces.
 from ._version import __version__
 from ._sdk import (
     Sandbox, Stage, Pipeline, Result, SyscallEvent, PolicyContext, Checkpoint,
+    NamedStage, Gather, GatherPipeline,
     landlock_abi_version, min_landlock_abi, confine,
 )
+from .inputs import inputs
 from .policy import Policy, FsIsolation, BranchAction, parse_ports, Change, DryRunResult
 from ._profile import load_profile, list_profiles
 from .exceptions import (
@@ -37,6 +39,10 @@ __all__ = [
     "SyscallEvent",
     "PolicyContext",
     "Checkpoint",
+    "NamedStage",
+    "Gather",
+    "GatherPipeline",
+    "inputs",
     "Policy",
     "FsIsolation",
     "BranchAction",

@@ -29,7 +29,7 @@ pub use checkpoint::Checkpoint;
 pub use policy::{Policy, PolicyBuilder};
 pub use result::{RunResult, ExitStatus};
 pub use sandbox::Sandbox;
-pub use pipeline::{Stage, Pipeline};
+pub use pipeline::{Stage, Pipeline, Gather};
 pub use dry_run::{Change, ChangeKind, DryRunResult};
 
 /// Query the Landlock ABI version supported by the running kernel.

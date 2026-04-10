@@ -182,7 +182,7 @@ def demo_no_sandbox(client: OpenAI, results: list[dict], data_path: str):
 
 def demo_xoa_sandboxed(client: OpenAI, data_path: str):
     print("=" * 60)
-    print("DEMO 2: WITH SANDLOCK XOA — LLM sees only the task")
+    print("DEMO 2: WITH SANDLOCK XOA GATHER — searcher + planner | executor")
     print("=" * 60)
     print()
 
@@ -192,34 +192,42 @@ def demo_xoa_sandboxed(client: OpenAI, data_path: str):
     ))
     python_paths = [p for p in sys.path if p and os.path.isdir(p)]
 
-    # Planner policy: can reach OpenAI, CANNOT read workspace
-    planner_policy = Policy(
-        fs_readable=list(dict.fromkeys([
-            "/usr", "/lib", "/lib64", "/etc", "/bin", "/sbin",
-            "/dev", python_prefix,
-        ] + python_paths)),
-        net_allow_hosts=["api.openai.com"],
-        clean_env=True,
-        env={"OPENAI_API_KEY": os.environ["OPENAI_API_KEY"]},
-    )
+    base_readable = list(dict.fromkeys([
+        "/usr", "/lib", "/lib64", "/etc", "/bin", "/sbin",
+        "/dev", python_prefix,
+    ] + python_paths))
 
-    # Executor policy: can read workspace, CANNOT reach network
-    executor_policy = Policy(
-        fs_readable=list(dict.fromkeys([
-            workspace, "/usr", "/lib", "/lib64", "/etc",
-            "/bin", "/sbin", python_prefix,
-        ] + python_paths)),
+    # Searcher policy: can read the data file, NO network
+    searcher_policy = Policy(
+        fs_readable=base_readable + [workspace],
         net_connect=[],
         clean_env=True,
         env={"DATA_FILE": data_path},
     )
 
+    # Planner policy: can reach OpenAI, CANNOT read workspace
+    planner_policy = Policy(
+        fs_readable=base_readable,
+        net_allow_hosts=["api.openai.com"],
+        clean_env=True,
+        env={"OPENAI_API_KEY": os.environ["OPENAI_API_KEY"]},
+    )
+
+    # Executor policy: NO network, NO direct filesystem data access
+    # (receives everything via pipes)
+    executor_policy = Policy(
+        fs_readable=base_readable + ["/home"],  # for sandlock imports
+        net_connect=[],
+        clean_env=True,
+    )
+
     # Planner prompt: task description only, no data
     planner_msg = (
-        "Write Python code (standard library only, use json module) "
-        "that reads a JSON file from the path in environment variable "
-        "DATA_FILE. The file contains an array of objects. "
-        "For each object, print all its fields in a readable format."
+        "Write Python code (standard library only, use json module). "
+        "A variable called `data` already exists in scope as a string "
+        "containing JSON. Do NOT define or assign `data` yourself. "
+        "Parse it with json.loads(data), then for each object in the "
+        "resulting array, print all its fields in a readable format."
     )
 
     planner_script = textwrap.dedent(f"""\
@@ -249,19 +257,31 @@ def demo_xoa_sandboxed(client: OpenAI, data_path: str):
         print(code)
     """)
 
-    print("[pipeline] Running XOA: planner | executor")
-    print(f"  planner:  fs=no workspace   net=api.openai.com only")
-    print(f"  executor: fs=read workspace  net=BLOCKED")
+    print("[gather] Running XOA with 3 sandboxes:")
+    print(f"  searcher: fs=read data       net=BLOCKED")
+    print(f"  planner:  fs=no data         net=api.openai.com only")
+    print(f"  executor: fs=no data         net=BLOCKED (receives via pipes)")
     print()
-    print("[planner] Calling LLM inside sandbox (only task, no data)...")
+    print("  searcher ──data──┐")
+    print("                    ├──▶ executor (runs code on data)")
+    print("  planner  ──code──┘")
     print()
 
     result = (
-        Sandbox(planner_policy).cmd(
+        Sandbox(searcher_policy).cmd(
+            [sys.executable, "-c",
+             "import os; print(open(os.environ['DATA_FILE']).read(), end='')"]
+        ).as_("data")
+        + Sandbox(planner_policy).cmd(
             [sys.executable, "-c", planner_script]
-        )
+        ).as_("code")
         | Sandbox(executor_policy).cmd(
-            [sys.executable, "-"]
+            [sys.executable, "-c", textwrap.dedent("""\
+                from sandlock import inputs
+                code = inputs["code"]
+                data = inputs["data"]
+                exec(compile(code, '<planner>', 'exec'), {'data': data})
+            """)]
         )
     ).run(timeout=30)
 
@@ -286,18 +306,16 @@ def demo_xoa_sandboxed(client: OpenAI, data_path: str):
         print("[BLOCKED] No data exfiltrated — attack structurally prevented.")
     print()
 
-    print("Why XOA works for web search:")
-    print("  1. The LLM only saw the task: 'read JSON, print fields'.")
-    print("     No search results, no snippets, no injection payload.")
-    print("     It generated generic code — not data-specific.")
-    print("  2. The executor processed the actual search results")
-    print("     but had net_connect=[] — even if the code tried")
-    print("     to exfiltrate, the kernel blocks it.")
-    print("  3. The injection text appears in the output above as")
-    print("     a printed string — NOT as executed code. Compare:")
-    print("     - Demo 1: LLM generated 'import socket' (EXECUTED)")
-    print("     - Demo 2: executor printed 'import socket...' (DATA)")
-    print("     The payload is inert text, not an instruction.")
+    print("Why XOA gather works for web search:")
+    print("  1. Three sandboxes, three policies, enforced by the kernel:")
+    print("     - Searcher reads data but has no network")
+    print("     - Planner calls LLM but cannot see the data")
+    print("     - Executor receives both via pipes but has no network")
+    print("  2. The injection payload in the search results never")
+    print("     reaches the LLM — planner and searcher run in")
+    print("     separate sandboxes connected only through the executor.")
+    print("  3. Even if injection text appears in output, it's just")
+    print("     data in a print() call — never interpreted as code.")
     print()
 
 
@@ -363,11 +381,11 @@ def main():
             print("  Without sandbox: LLM saw the snippet → interpreted")
             print("    it as an instruction → generated exfil code → ran it.")
             print()
-            print("  With XOA: LLM only saw the task ('read JSON, print")
-            print("    fields') — no data, no schema, no snippets. Generated")
-            print("    clean generic code. The executor printed the snippet")
-            print("    as a string (visible in output), but the payload was")
-            print("    never interpreted as code. Just text in print().")
+            print("  With XOA gather: three sandboxes enforce separation.")
+            print("    Searcher reads data (no network). Planner calls LLM")
+            print("    (no data access). Executor runs code on data (no")
+            print("    network). Data and code meet only inside the executor")
+            print("    via Unix pipes — the LLM never sees the injection.")
             print()
 
     finally:
