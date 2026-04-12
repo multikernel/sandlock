@@ -196,4 +196,28 @@ class TestCpuCores:
         assert p.cpu_cores == [0, 2, 3]
 
 
+class TestNetAllowHosts:
+    """Option-A tri-state semantics for net_allow_hosts.
+
+    * None           — unrestricted (default)
+    * [] (empty)     — deny all hosts
+    * ["host", ...]  — allowlist specific hosts
+    """
+
+    def test_default_is_none(self):
+        p = Policy()
+        assert p.net_allow_hosts is None
+
+    def test_empty_list_means_deny_all(self):
+        # Explicit empty list is distinguishable from None — it opts into
+        # restriction with zero allowed hosts.
+        p = Policy(net_allow_hosts=[])
+        assert p.net_allow_hosts == []
+        assert p.net_allow_hosts is not None
+
+    def test_populated_list_is_allowlist(self):
+        p = Policy(net_allow_hosts=["api.example.com", "example.org"])
+        assert list(p.net_allow_hosts) == ["api.example.com", "example.org"]
+
+
 

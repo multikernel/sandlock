@@ -235,7 +235,10 @@ async fn main() -> Result<()> {
                 for p in &base.fs_readable { b = b.fs_read(p); }
                 for p in &base.fs_writable { b = b.fs_write(p); }
                 for p in &base.fs_denied { b = b.fs_deny(p); }
-                for h in &base.net_allow_hosts { b = b.net_allow_host(h); }
+                if let Some(hosts) = &base.net_allow_hosts {
+                    b = b.net_restrict_hosts();
+                    for h in hosts { b = b.net_allow_host(h); }
+                }
                 for p in &base.net_bind { b = b.net_bind_port(*p); }
                 for p in &base.net_connect { b = b.net_connect_port(*p); }
                 for rule in &base.http_allow {
@@ -409,7 +412,7 @@ async fn main() -> Result<()> {
                 let pid = sb.pid().unwrap_or(0);
                 if let Err(e) = network_registry::register(
                     &sandbox_name, pid, std::collections::HashMap::new(),
-                    policy.net_allow_hosts.clone(),
+                    policy.net_allow_hosts.clone().unwrap_or_default(),
                     None, // virtual_etc_hosts populated by core at runtime
                 ) {
                     eprintln!("sandlock: network registry: {}", e);

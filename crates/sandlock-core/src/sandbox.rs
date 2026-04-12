@@ -699,13 +699,23 @@ impl Sandbox {
         let pipes = PipePair::new().map_err(SandboxError::Io)?;
 
         // 4. Resolve net_allow_hosts to IPs + build virtual /etc/hosts
-        let (resolved_ips, virtual_etc_hosts) = if !self.policy.net_allow_hosts.is_empty() {
-            let resolved = network::resolve_hosts(&self.policy.net_allow_hosts)
-                .await
-                .map_err(SandboxError::Io)?;
-            (resolved.ips, Some(resolved.etc_hosts))
-        } else {
-            (std::collections::HashSet::new(), None)
+        //
+        // Semantics:
+        //   None               -> unrestricted (no virtualization, no IP allowlist)
+        //   Some(empty)        -> deny all (empty virtual /etc/hosts, empty allowlist)
+        //   Some(nonempty)     -> resolve and allowlist
+        let (resolved_ips, virtual_etc_hosts) = match self.policy.net_allow_hosts.as_deref() {
+            None => (std::collections::HashSet::new(), None),
+            Some([]) => (
+                std::collections::HashSet::new(),
+                Some(String::new()),
+            ),
+            Some(hosts) => {
+                let resolved = network::resolve_hosts(hosts)
+                    .await
+                    .map_err(SandboxError::Io)?;
+                (resolved.ips, Some(resolved.etc_hosts))
+            }
         };
 
         // 5. Spawn HTTP ACL proxy if rules are configured
@@ -900,7 +910,7 @@ impl Sandbox {
                 max_memory_bytes: self.policy.max_memory.map(|m| m.0).unwrap_or(0),
                 max_processes: self.policy.max_processes,
                 has_memory_limit: self.policy.max_memory.is_some(),
-                has_net_allowlist: !self.policy.net_allow_hosts.is_empty()
+                has_net_allowlist: self.policy.net_allow_hosts.is_some()
                     || self.policy.policy_fn.is_some()
                     || !self.policy.http_allow.is_empty()
                     || !self.policy.http_deny.is_empty(),
@@ -935,10 +945,10 @@ impl Sandbox {
 
             // NetworkState
             let mut net_state = NetworkState::new();
-            net_state.network_policy = if self.policy.net_allow_hosts.is_empty() {
-                crate::seccomp::notif::NetworkPolicy::Unrestricted
-            } else {
+            net_state.network_policy = if self.policy.net_allow_hosts.is_some() {
                 crate::seccomp::notif::NetworkPolicy::AllowList(resolved_ips)
+            } else {
+                crate::seccomp::notif::NetworkPolicy::Unrestricted
             };
             net_state.http_acl_addr = self.http_acl_handle.as_ref().map(|h| h.addr);
             net_state.http_acl_ports = self.policy.http_ports.iter().copied().collect();

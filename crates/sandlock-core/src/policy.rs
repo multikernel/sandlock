@@ -257,7 +257,15 @@ pub struct Policy {
     pub allow_syscalls: Option<Vec<String>>,
 
     // Network
-    pub net_allow_hosts: Vec<String>,
+    /// Allowed domain names.
+    ///
+    /// * `None` — unrestricted: the real `/etc/hosts` is visible and DNS is
+    ///   not virtualized.
+    /// * `Some(empty)` — deny all: `/etc/hosts` is virtualized to an empty
+    ///   map and the IP allowlist is empty (no hosts resolvable).
+    /// * `Some(nonempty)` — allowlist: only these domains are resolved and
+    ///   their IPs placed in the allowlist.
+    pub net_allow_hosts: Option<Vec<String>>,
     pub net_bind: Vec<u16>,
     pub net_connect: Vec<u16>,
     pub no_raw_sockets: bool,
@@ -351,7 +359,7 @@ pub struct PolicyBuilder {
     deny_syscalls: Option<Vec<String>>,
     allow_syscalls: Option<Vec<String>>,
 
-    net_allow_hosts: Vec<String>,
+    net_allow_hosts: Option<Vec<String>>,
     net_bind: Vec<u16>,
     net_connect: Vec<u16>,
     no_raw_sockets: Option<bool>,
@@ -425,8 +433,20 @@ impl PolicyBuilder {
         self
     }
 
+    /// Add a host to the domain allowlist. Implicitly enables host
+    /// restriction (switches `net_allow_hosts` from `None` to `Some`).
     pub fn net_allow_host(mut self, host: impl Into<String>) -> Self {
-        self.net_allow_hosts.push(host.into());
+        self.net_allow_hosts
+            .get_or_insert_with(Vec::new)
+            .push(host.into());
+        self
+    }
+
+    /// Enable host restriction without adding any hosts. The resulting
+    /// sandbox has an empty `/etc/hosts` and no resolvable domains —
+    /// equivalent to "deny all hosts".
+    pub fn net_restrict_hosts(mut self) -> Self {
+        self.net_allow_hosts.get_or_insert_with(Vec::new);
         self
     }
 

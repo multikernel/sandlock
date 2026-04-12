@@ -143,10 +143,21 @@ class Policy:
     Stricter than deny_syscalls — unknown/new syscalls are denied by default."""
 
     # Network — domain allowlist (seccomp notif /etc/hosts virtualization)
-    net_allow_hosts: Sequence[str] = field(default_factory=list)
-    """Allowed domain names.  When set, /etc/hosts is virtualized to
-    contain only these domains (resolved at sandbox creation time).
-    Empty = unrestricted (real /etc/hosts is visible)."""
+    net_allow_hosts: Sequence[str] | None = None
+    """Allowed domain names.
+
+    * ``None`` (default) — unrestricted: the real ``/etc/hosts`` is visible
+      and DNS is not virtualized.
+    * ``[]`` (empty sequence) — deny all: ``/etc/hosts`` is virtualized to
+      an empty map and no hosts are resolvable.  Matches the empty-list =
+      deny-all convention of :attr:`net_bind` and :attr:`net_connect`.
+    * ``["example.com", ...]`` — allowlist: only these domains are
+      resolved (at sandbox creation time) and their IPs placed in the
+      allowlist.
+
+    Note: this field only controls host/DNS virtualization.  TCP-level
+    connectivity is still governed by :attr:`net_connect` / :attr:`net_bind`
+    (which default to empty = deny all)."""
 
     no_coredump: bool = False
     """Disable core dumps and restrict /proc/pid access from other

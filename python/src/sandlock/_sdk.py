@@ -89,6 +89,7 @@ _b_max_processes = _builder_fn("sandlock_policy_builder_max_processes", ctypes.c
 _b_max_cpu = _builder_fn("sandlock_policy_builder_max_cpu", ctypes.c_uint8)
 _b_num_cpus = _builder_fn("sandlock_policy_builder_num_cpus", ctypes.c_uint32)
 _b_net_allow_host = _builder_fn("sandlock_policy_builder_net_allow_host", ctypes.c_char_p)
+_b_net_restrict_hosts = _builder_fn("sandlock_policy_builder_net_restrict_hosts")
 _b_net_bind_port = _builder_fn("sandlock_policy_builder_net_bind_port", ctypes.c_uint16)
 _b_net_connect_port = _builder_fn("sandlock_policy_builder_net_connect_port", ctypes.c_uint16)
 _b_port_remap = _builder_fn("sandlock_policy_builder_port_remap", ctypes.c_bool)
@@ -804,8 +805,14 @@ class _NativePolicy:
             arr = (ctypes.c_uint32 * len(policy.cpu_cores))(*policy.cpu_cores)
             b = _b_cpu_cores(b, arr, len(policy.cpu_cores))
 
-        for host in (policy.net_allow_hosts or []):
-            b = _b_net_allow_host(b, _encode(str(host)))
+        # net_allow_hosts: None = unrestricted (skip entirely); any sequence
+        # (even empty) opts into host restriction.  An empty sequence means
+        # "deny all hosts" — we must still call restrict_hosts so the native
+        # builder flips the Option from None to Some(vec![]).
+        if policy.net_allow_hosts is not None:
+            b = _b_net_restrict_hosts(b)
+            for host in policy.net_allow_hosts:
+                b = _b_net_allow_host(b, _encode(str(host)))
         for port in parse_ports(policy.net_bind) if policy.net_bind else []:
             b = _b_net_bind_port(b, port)
         for port in parse_ports(policy.net_connect) if policy.net_connect else []:

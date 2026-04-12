@@ -246,7 +246,7 @@ pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
         nrs.push(libc::SYS_shmget as u32);
     }
 
-    if !policy.net_allow_hosts.is_empty()
+    if policy.net_allow_hosts.is_some()
         || policy.policy_fn.is_some()
         || !policy.http_allow.is_empty()
         || !policy.http_deny.is_empty()

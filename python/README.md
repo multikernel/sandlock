@@ -62,7 +62,7 @@ Unset fields mean "no restriction" unless noted otherwise.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `net_allow_hosts` | `list[str]` | `[]` | Allowed domain names (empty = unrestricted) |
+| `net_allow_hosts` | `list[str] \| None` | `None` | Allowed domains. `None` = unrestricted; `[]` = deny all; `["host", ...]` = allowlist |
 | `net_bind` | `list[int \| str]` | `[]` | TCP ports the sandbox may bind (empty = unrestricted) |
 | `net_connect` | `list[int \| str]` | `[]` | TCP ports the sandbox may connect to (empty = unrestricted) |
 | `port_remap` | `bool` | `False` | Transparent TCP port virtualization |

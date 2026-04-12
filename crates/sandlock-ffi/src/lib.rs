@@ -318,6 +318,27 @@ pub unsafe extern "C" fn sandlock_policy_builder_net_allow_host(
     Box::into_raw(Box::new(builder.net_allow_host(host)))
 }
 
+/// Enable `net_allow_hosts` restriction without adding any hosts.
+///
+/// After this call, the sandbox is configured with an empty host allowlist
+/// (deny all hosts — empty virtual `/etc/hosts`, empty IP allowlist). If
+/// hosts are subsequently added via `sandlock_policy_builder_net_allow_host`
+/// they extend the same allowlist.
+///
+/// This is the "empty list = deny all" form for the host filter, matching
+/// the semantics of `net_bind` / `net_connect`.
+///
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_net_restrict_hosts(
+    b: *mut PolicyBuilder,
+) -> *mut PolicyBuilder {
+    if b.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.net_restrict_hosts()))
+}
+
 /// # Safety
 /// `b` must be a valid builder pointer.
 #[no_mangle]

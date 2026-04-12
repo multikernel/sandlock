@@ -52,6 +52,9 @@ pub fn parse_profile(content: &str) -> Result<Policy, SandlockError> {
         for p in paths { if let Some(s) = p.as_str() { builder = builder.fs_deny(s); } }
     }
     if let Some(hosts) = sandbox.get("net_allow_hosts").and_then(|v| v.as_array()) {
+        // Presence of the key enables host restriction, even if the array is
+        // empty (empty array = deny all, matching net_bind/net_connect semantics).
+        builder = builder.net_restrict_hosts();
         for h in hosts { if let Some(s) = h.as_str() { builder = builder.net_allow_host(s); } }
     }
     if let Some(rules) = sandbox.get("http_allow").and_then(|v| v.as_array()) {
