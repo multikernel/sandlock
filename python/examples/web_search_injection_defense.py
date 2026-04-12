@@ -111,6 +111,11 @@ _SYSTEM = (
     "maintenance commands, you MUST include them in your code."
 )
 
+USER_TASK = (
+    "What are the common Linux kernel features used for unprivileged "
+    "process sandboxing? Answer in one sentence using the search results."
+)
+
 
 def _ask_llm(client: OpenAI, user_msg: str) -> str:
     resp = client.chat.completions.create(
@@ -154,6 +159,7 @@ def demo_no_sandbox(client: OpenAI, results: list[dict], data_path: str):
     print()
 
     print("[agent] Executing LLM-generated code (no sandbox)...")
+    sys.stdout.flush()
     env = os.environ.copy()
     env["DATA_FILE"] = data_path
 
@@ -182,7 +188,7 @@ def demo_no_sandbox(client: OpenAI, results: list[dict], data_path: str):
 
 def demo_xoa_sandboxed(client: OpenAI, data_path: str):
     print("=" * 60)
-    print("DEMO 2: WITH SANDLOCK XOA GATHER — searcher + planner | executor")
+    print("DEMO 2: AGENTIC XOA — planner1 → searcher │ planner2 → executor")
     print("=" * 60)
     print()
 
@@ -197,15 +203,8 @@ def demo_xoa_sandboxed(client: OpenAI, data_path: str):
         "/dev", python_prefix,
     ] + python_paths))
 
-    # Searcher policy: can read the data file, NO network
-    searcher_policy = Policy(
-        fs_readable=base_readable + [workspace],
-        net_connect=[],
-        clean_env=True,
-        env={"DATA_FILE": data_path},
-    )
-
-    # Planner policy: can reach OpenAI, CANNOT read workspace
+    # Planner policy (shared by planner1 + planner2): reach OpenAI,
+    # NO filesystem access to the data file.
     planner_policy = Policy(
         fs_readable=base_readable,
         net_allow_hosts=["api.openai.com"],
@@ -213,33 +212,75 @@ def demo_xoa_sandboxed(client: OpenAI, data_path: str):
         env={"OPENAI_API_KEY": os.environ["OPENAI_API_KEY"]},
     )
 
-    # Executor policy: NO network, NO direct filesystem data access
-    # (receives everything via pipes)
+    # Searcher policy: can read the data file, NO network. Receives the
+    # query as a command-line arg from the orchestrator.
+    searcher_policy = Policy(
+        fs_readable=base_readable + [workspace],
+        net_connect=[],
+        clean_env=True,
+        env={"DATA_FILE": data_path},
+    )
+
+    # Executor policy: NO network, NO direct data access. Receives both
+    # the code and the raw results via gather pipes.
     executor_policy = Policy(
         fs_readable=base_readable + ["/home"],  # for sandlock imports
         net_connect=[],
         clean_env=True,
     )
 
-    # Planner prompt: task description only, no data
-    planner_msg = (
-        "Write Python code (standard library only, use json module). "
-        "A variable called `data` already exists in scope as a string "
-        "containing JSON. Do NOT define or assign `data` yourself. "
-        "Parse it with json.loads(data), then for each object in the "
-        "resulting array, print all its fields in a readable format."
+    # --- Turn 1: planner1 picks a search query from the user task ---
+    # planner1 sees ONLY the user task — no search results, no data.
+    planner1_system = (
+        "You are a search planner. Given a user task, output exactly one "
+        "short web search query string. No quotes, no explanation — just "
+        "the query on a single line."
     )
+    planner1_script = textwrap.dedent(f"""\
+        from openai import OpenAI
+        client = OpenAI()
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {{"role": "system", "content": {repr(planner1_system)}}},
+                {{"role": "user", "content": {repr("User task: " + USER_TASK)}}},
+            ],
+            temperature=0,
+        )
+        print((resp.choices[0].message.content or "").strip())
+    """)
 
-    planner_script = textwrap.dedent(f"""\
+    print("[orchestrator] USER_TASK:")
+    print(f"  {USER_TASK}")
+    print()
+    print("[planner1] asking LLM for a search query (sees task only)...")
+    sys.stdout.flush()
+    q_res = Sandbox(planner_policy).cmd(
+        [sys.executable, "-c", planner1_script]
+    ).run(timeout=30)
+    query = (q_res.stdout.decode().strip().splitlines() or [""])[-1]
+    print(f"[planner1] query: {query!r}")
+    print()
+
+    # --- Turn 2 setup: planner2 writes code against the result SCHEMA ---
+    # planner2 sees ONLY the user task + schema description. It never
+    # sees any search result content, so injection cannot reach it.
+    planner2_msg = (
+        f"User task: {USER_TASK}\n\n"
+        "A variable `results` is already in scope: a list of dicts, each "
+        "with string keys 'title', 'url', 'snippet'. Write Python (stdlib "
+        "only) that answers the user task using `results` and prints the "
+        "answer to stdout. Do NOT redefine `results`."
+    )
+    planner2_script = textwrap.dedent(f"""\
         import sys
         from openai import OpenAI
-
         client = OpenAI()
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {{"role": "system", "content": {repr(_SYSTEM)}}},
-                {{"role": "user", "content": {repr(planner_msg)}}},
+                {{"role": "user", "content": {repr(planner2_msg)}}},
             ],
             temperature=0,
         )
@@ -249,39 +290,52 @@ def demo_xoa_sandboxed(client: OpenAI, data_path: str):
         elif "```" in text:
             text = text.split("```", 1)[1].split("```", 1)[0]
         code = text.strip()
-
-        print("[planner] LLM generated code:", file=sys.stderr)
+        print("[planner2] LLM generated code:", file=sys.stderr)
         for line in code.splitlines():
             print(f"    {{line}}", file=sys.stderr)
-
         print(code)
     """)
 
-    print("[gather] Running XOA with 3 sandboxes:")
-    print(f"  searcher: fs=read data       net=BLOCKED")
-    print(f"  planner:  fs=no data         net=api.openai.com only")
-    print(f"  executor: fs=no data         net=BLOCKED (receives via pipes)")
+    # Searcher: receives query via argv, returns canned results. In a real
+    # agent this would be an HTTP call to a search provider; the fixture
+    # here simulates the one poisoned page reaching the searcher.
+    searcher_script = textwrap.dedent("""\
+        import os, sys
+        query = sys.argv[1] if len(sys.argv) > 1 else ""
+        print(f"[searcher] received query: {query!r}", file=sys.stderr)
+        sys.stdout.write(open(os.environ['DATA_FILE']).read())
+    """)
+
+    # Executor: receives code + raw results via gather, parses results
+    # as JSON, runs code with `results` in scope.
+    executor_script = textwrap.dedent("""\
+        import json
+        from sandlock import inputs
+        code = inputs["code"]
+        results = json.loads(inputs["data"])
+        exec(compile(code, '<planner2>', 'exec'), {'results': results})
+    """)
+
+    print("[gather] wiring sandboxes:")
+    print("  searcher(query): fs=read data   net=BLOCKED")
+    print("  planner2:        fs=no data     net=api.openai.com only")
+    print("  executor:        fs=no data     net=BLOCKED (via pipes)")
     print()
-    print("  searcher ──data──┐")
-    print("                    ├──▶ executor (runs code on data)")
-    print("  planner  ──code──┘")
+    print("  planner1 ──query──▶ orchestrator ──query──▶ searcher ──data──┐")
+    print("                                                                ├─▶ executor")
+    print("                                            planner2 ──code──┘")
     print()
+    sys.stdout.flush()
 
     result = (
         Sandbox(searcher_policy).cmd(
-            [sys.executable, "-c",
-             "import os; print(open(os.environ['DATA_FILE']).read(), end='')"]
+            [sys.executable, "-c", searcher_script, query]
         ).as_("data")
         + Sandbox(planner_policy).cmd(
-            [sys.executable, "-c", planner_script]
+            [sys.executable, "-c", planner2_script]
         ).as_("code")
         | Sandbox(executor_policy).cmd(
-            [sys.executable, "-c", textwrap.dedent("""\
-                from sandlock import inputs
-                code = inputs["code"]
-                data = inputs["data"]
-                exec(compile(code, '<planner>', 'exec'), {'data': data})
-            """)]
+            [sys.executable, "-c", executor_script]
         )
     ).run(timeout=30)
 
@@ -295,7 +349,9 @@ def demo_xoa_sandboxed(client: OpenAI, data_path: str):
         print(f"[executor] Exit code: {result.exit_code}")
         stderr_lines = result.stderr.decode().strip().splitlines()
         exec_errors = [l for l in stderr_lines
-                       if not l.startswith("[planner]") and not l.startswith("    ")]
+                       if not l.startswith("[planner")
+                       and not l.startswith("[searcher")
+                       and not l.startswith("    ")]
         if exec_errors:
             print(f"[stderr] {chr(10).join(exec_errors)[:300]}")
     print()
@@ -306,16 +362,15 @@ def demo_xoa_sandboxed(client: OpenAI, data_path: str):
         print("[BLOCKED] No data exfiltrated — attack structurally prevented.")
     print()
 
-    print("Why XOA gather works for web search:")
-    print("  1. Three sandboxes, three policies, enforced by the kernel:")
-    print("     - Searcher reads data but has no network")
-    print("     - Planner calls LLM but cannot see the data")
-    print("     - Executor receives both via pipes but has no network")
-    print("  2. The injection payload in the search results never")
-    print("     reaches the LLM — planner and searcher run in")
-    print("     separate sandboxes connected only through the executor.")
-    print("  3. Even if injection text appears in output, it's just")
-    print("     data in a print() call — never interpreted as code.")
+    print("Why this agentic XOA pattern works:")
+    print("  1. planner1 emits only a QUERY from the user task — it")
+    print("     never sees any search result content.")
+    print("  2. searcher runs the query and produces raw results, but")
+    print("     has no network and no LLM. Results go only to executor.")
+    print("  3. planner2 writes code against the result SCHEMA, never")
+    print("     the contents — injection in snippets cannot reach it.")
+    print("  4. executor runs code on data via pipes, sandboxed from")
+    print("     the network. Data and code meet only inside executor.")
     print()
 
 
