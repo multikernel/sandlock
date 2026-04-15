@@ -21,6 +21,8 @@ pub struct SupervisorCtx {
     pub policy_fn: Arc<Mutex<PolicyFnState>>,
     /// Chroot-specific runtime state.
     pub chroot: Arc<Mutex<ChrootState>>,
+    /// NETLINK_ROUTE virtualization state.
+    pub netlink: Arc<crate::netlink::NetlinkState>,
     /// Immutable policy — no lock needed.
     pub policy: Arc<NotifPolicy>,
     /// pidfd for the child process (immutable after spawn).

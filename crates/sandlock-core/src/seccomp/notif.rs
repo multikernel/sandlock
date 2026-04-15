@@ -21,6 +21,26 @@ use crate::sys::structs::{
 // NotifAction — how the supervisor should respond
 // ============================================================
 
+/// A one-shot callback invoked with the child-side fd number returned by
+/// `SECCOMP_IOCTL_NOTIF_ADDFD` after a successful `InjectFdSendTracked`.
+/// Wraps a boxed closure with a manual `Debug` impl so that `NotifAction`
+/// can keep deriving `Debug`.  The closure is both `Send` and `Sync` so
+/// that `&NotifAction` remains `Send` (required because `NotifAction` is
+/// borrowed across `.await` points in the notifier loop).
+pub struct OnInjectSuccess(pub Box<dyn FnOnce(i32) + Send + Sync>);
+
+impl std::fmt::Debug for OnInjectSuccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OnInjectSuccess(<callback>)")
+    }
+}
+
+impl OnInjectSuccess {
+    pub fn new<F: FnOnce(i32) + Send + Sync + 'static>(f: F) -> Self {
+        Self(Box::new(f))
+    }
+}
+
 /// How the supervisor should respond to a notification.
 #[derive(Debug)]
 pub enum NotifAction {
@@ -35,6 +55,15 @@ pub enum NotifAction {
     /// The `OwnedFd` is closed automatically after the ioctl completes.
     /// `newfd_flags` controls flags on the injected fd (e.g. O_CLOEXEC).
     InjectFdSend { srcfd: OwnedFd, newfd_flags: u32 },
+    /// Like `InjectFdSend`, but also invokes `on_success` with the
+    /// child-side fd number that `SECCOMP_IOCTL_NOTIF_ADDFD` returned.
+    /// Used when the caller needs to track the exact fd number allocated
+    /// in the child (e.g. to key per-fd state without TOCTOU).
+    InjectFdSendTracked {
+        srcfd: OwnedFd,
+        newfd_flags: u32,
+        on_success: OnInjectSuccess,
+    },
     /// Synthetic return value (the child sees this as the syscall result).
     ReturnValue(i64),
     /// Don't respond — used for checkpoint/freeze.
@@ -395,6 +424,15 @@ fn send_response(fd: RawFd, id: u64, action: NotifAction) -> io::Result<()> {
             // srcfd (OwnedFd) is dropped at end of this arm, closing the fd.
             match inject_fd_and_send(fd, id, srcfd.as_raw_fd(), newfd_flags) {
                 Ok(_new_fd) => Ok(()),
+                Err(_) => respond_continue(fd, id),
+            }
+        }
+        NotifAction::InjectFdSendTracked { srcfd, newfd_flags, on_success } => {
+            match inject_fd_and_send(fd, id, srcfd.as_raw_fd(), newfd_flags) {
+                Ok(new_fd) => {
+                    (on_success.0)(new_fd);
+                    Ok(())
+                }
                 Err(_) => respond_continue(fd, id),
             }
         }

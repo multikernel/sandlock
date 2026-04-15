@@ -240,7 +240,6 @@ pub const PR_SET_PTRACER: u32 = 0x5961_6d61;
 
 pub const AF_INET: u32 = 2;
 pub const AF_INET6: u32 = 10;
-pub const AF_NETLINK: u32 = 16;
 pub const SOCK_RAW: u32 = 3;
 pub const SOCK_DGRAM: u32 = 2;
 pub const SOCK_TYPE_MASK: u32 = 0xFF;

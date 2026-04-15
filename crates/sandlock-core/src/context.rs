@@ -8,7 +8,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use crate::policy::{FsIsolation, Policy};
 use crate::seccomp::bpf::{self, stmt, jump};
 use crate::sys::structs::{
-    AF_INET, AF_INET6, AF_NETLINK,
+    AF_INET, AF_INET6,
     BPF_ABS, BPF_ALU, BPF_AND, BPF_JEQ, BPF_JSET, BPF_JMP, BPF_K, BPF_LD, BPF_RET, BPF_W,
     CLONE_NS_FLAGS, DEFAULT_DENY_SYSCALLS, EPERM,
     SECCOMP_RET_ALLOW, SECCOMP_RET_ERRNO,
@@ -280,6 +280,21 @@ pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
         libc::SYS_getdents64 as u32,
         libc::SYS_getdents as u32,
     ]);
+
+    // Netlink virtualization (always on):
+    //   socket, bind, getsockname — swap in a unix socketpair for AF_NETLINK
+    //   recvfrom, recvmsg         — zero msg_name so glibc accepts the reply
+    //                                (kernel only writes sun_family on unix
+    //                                 recvmsg, leaving nl_pid uninitialized)
+    //   close                     — unregister (pid, fd) so reuse doesn't
+    //                                collide with the cookie set
+    // Send traffic flows through the real socketpair untouched.
+    nrs.push(libc::SYS_socket as u32);
+    nrs.push(libc::SYS_bind as u32);
+    nrs.push(libc::SYS_getsockname as u32);
+    nrs.push(libc::SYS_recvfrom as u32);
+    nrs.push(libc::SYS_recvmsg as u32);
+    nrs.push(libc::SYS_close as u32);
     // Virtualize sched_getaffinity so nproc/sysconf agree with /proc/cpuinfo
     if policy.num_cpus.is_some() {
         nrs.push(libc::SYS_sched_getaffinity as u32);
@@ -447,7 +462,6 @@ pub fn deny_syscall_numbers(policy: &Policy) -> Vec<u32> {
 ///   - clone: block namespace creation flags
 ///   - ioctl: block TIOCSTI, TIOCLINUX
 ///   - prctl: block PR_SET_DUMPABLE, PR_SET_SECUREBITS, PR_SET_PTRACER
-///   - socket: block all AF_NETLINK sockets (network topology enumeration)
 ///   - socket: block SOCK_RAW/SOCK_DGRAM on AF_INET/AF_INET6 (with type mask)
 pub fn arg_filters(policy: &Policy) -> Vec<SockFilter> {
     let ret_errno = SECCOMP_RET_ERRNO | EPERM as u32;
@@ -496,22 +510,6 @@ pub fn arg_filters(policy: &Policy) -> Vec<SockFilter> {
         insns.push(jump(BPF_JMP | BPF_JEQ | BPF_K, op, 0, 1));
         insns.push(stmt(BPF_RET | BPF_K, ret_errno));
     }
-
-    // --- socket: block all AF_NETLINK sockets ---
-    // Netlink sockets allow network topology enumeration (interfaces, routes,
-    // ARP, etc.) which leaks host network configuration.  Block the entire
-    // AF_NETLINK family, not just NETLINK_SOCK_DIAG.
-    // 5 instructions:
-    //   LD NR
-    //   JEQ socket → +0, skip 3
-    //   LD arg0 (domain)
-    //   JEQ AF_NETLINK → +0, skip 1
-    //   RET ERRNO
-    insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR));
-    insns.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr_socket, 0, 3));
-    insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARGS0_LO));
-    insns.push(jump(BPF_JMP | BPF_JEQ | BPF_K, AF_NETLINK, 0, 1));
-    insns.push(stmt(BPF_RET | BPF_K, ret_errno));
 
     // --- socket: block SOCK_RAW and/or SOCK_DGRAM on AF_INET/AF_INET6 ---
     let mut blocked_types: Vec<u32> = Vec::new();
@@ -1114,9 +1112,6 @@ mod tests {
         // Should contain JEQ for PR_SET_DUMPABLE
         assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
             && f.k == PR_SET_DUMPABLE));
-        // Should contain JEQ for socket + AF_NETLINK (all netlink blocked)
-        assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
-            && f.k == AF_NETLINK));
     }
 
     #[test]

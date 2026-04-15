@@ -34,6 +34,9 @@ mod test_pipeline;
 #[path = "integration/test_network.rs"]
 mod test_network;
 
+#[path = "integration/test_netlink_virt.rs"]
+mod test_netlink_virt;
+
 #[path = "integration/test_policy_fn.rs"]
 mod test_policy_fn;
 
