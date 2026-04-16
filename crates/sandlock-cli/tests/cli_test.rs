@@ -40,10 +40,24 @@ fn test_run_exit_code() {
 #[test]
 fn test_run_denied_path() {
     let output = sandlock_bin()
-        .args(["run", "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "--", "cat", "/etc/hostname"])
+        .args(["run", "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "--", "cat", "/etc/passwd"])
         .output()
         .expect("failed to run");
     assert!(!output.status.success(), "Should fail without /etc readable");
+}
+
+#[test]
+fn test_run_hostname_virtualized() {
+    // /etc/hostname is virtualized by the supervisor, so it should be readable
+    // even when /etc is not in fs_read, and should return the sandbox hostname
+    // (not the host's).
+    let output = sandlock_bin()
+        .args(["run", "--name", "mybox", "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "--", "cat", "/etc/hostname"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success(), "virtualized /etc/hostname should be readable: stderr={}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), "mybox", "expected virtual hostname, got {:?}", stdout.trim());
 }
 
 #[test]
