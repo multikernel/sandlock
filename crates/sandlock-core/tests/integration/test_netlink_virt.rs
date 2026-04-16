@@ -93,6 +93,46 @@ async fn getaddrinfo_ai_addrconfig_returns_v4_and_v6() {
     assert!(result.success());
 }
 
+/// /proc/net/dev should be virtualized to show only loopback.
+#[tokio::test]
+async fn proc_net_dev_shows_only_lo() {
+    let out = temp_out("proc-net-dev");
+    let script = format!(concat!(
+        "lines = open('/proc/net/dev').readlines()\n",
+        "ifaces = [l.split(':')[0].strip() for l in lines[2:]]\n",
+        "open('{out}', 'w').write(','.join(ifaces))\n",
+    ), out = out.display());
+
+    let policy = base_policy().build().unwrap();
+    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+        .await.unwrap();
+
+    let contents = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(contents.trim(), "lo", "expected only lo in /proc/net/dev, got: {}", contents);
+    assert!(result.success());
+}
+
+/// /proc/net/if_inet6 should be virtualized to show only loopback.
+#[tokio::test]
+async fn proc_net_if_inet6_shows_only_lo() {
+    let out = temp_out("proc-net-if-inet6");
+    let script = format!(concat!(
+        "lines = open('/proc/net/if_inet6').readlines()\n",
+        "ifaces = [l.split()[-1] for l in lines if l.strip()]\n",
+        "open('{out}', 'w').write(','.join(ifaces))\n",
+    ), out = out.display());
+
+    let policy = base_policy().build().unwrap();
+    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+        .await.unwrap();
+
+    let contents = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(contents.trim(), "lo", "expected only lo in /proc/net/if_inet6, got: {}", contents);
+    assert!(result.success());
+}
+
 /// SIOCGIFCONF ioctl should be blocked by the BPF arg filter, returning EPERM.
 #[tokio::test]
 async fn ioctl_siocgifconf_blocked() {

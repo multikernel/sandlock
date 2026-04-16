@@ -253,6 +253,25 @@ pub(crate) fn generate_proc_mountinfo(
 }
 
 // ============================================================
+// /proc/net/dev and /proc/net/if_inet6 virtualization
+// ============================================================
+
+/// Generate a synthetic /proc/net/dev showing only the loopback interface.
+pub(crate) fn generate_proc_net_dev() -> Vec<u8> {
+    concat!(
+        "Inter-|   Receive                                                |  Transmit\n",
+        " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n",
+        "    lo:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0\n",
+    ).as_bytes().to_vec()
+}
+
+/// Generate a synthetic /proc/net/if_inet6 showing only loopback (::1).
+pub(crate) fn generate_proc_net_if_inet6() -> Vec<u8> {
+    // Format: address ifindex prefix_len scope flags ifname
+    b"00000000000000000000000000000001 01 80 10 80       lo\n".to_vec()
+}
+
+// ============================================================
 // /proc/net/tcp filtering
 // ============================================================
 
@@ -423,6 +442,14 @@ pub(crate) async fn handle_proc_open(
         let last_pid = pfs.proc_pids.iter().max().copied().unwrap_or(0);
         let content = generate_loadavg(&rs.load_avg, running, total, last_pid);
         return inject_memfd(&content);
+    }
+
+    // Virtualize /proc/net/dev and /proc/net/if_inet6 — show loopback only.
+    if path == "/proc/net/dev" {
+        return inject_memfd(&generate_proc_net_dev());
+    }
+    if path == "/proc/net/if_inet6" {
+        return inject_memfd(&generate_proc_net_if_inet6());
     }
 
     // Virtualize /proc/net/tcp and /proc/net/tcp6 when port_remap is active.
