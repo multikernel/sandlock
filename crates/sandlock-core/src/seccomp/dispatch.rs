@@ -313,6 +313,58 @@ pub fn build_dispatch_table(
     }
 
     // ------------------------------------------------------------------
+    // NETLINK_ROUTE virtualization (always on).
+    //
+    // Send/recv traffic flows through a `socketpair(AF_UNIX,
+    // SOCK_SEQPACKET)` whose supervisor-side end is driven by a tokio
+    // task spawned in `handle_socket`.  Only `socket`, `bind`,
+    // `getsockname`, `recvmsg`/`recvfrom`, and `close` need supervisor
+    // intercepts; send uses the kernel directly.
+    //
+    // Must register before `port_remap` so the netlink `bind` handler
+    // runs first and returns `Continue` for non-cookie fds.
+    // ------------------------------------------------------------------
+    {
+        table.register(libc::SYS_socket, Box::new(|notif, ctx, _fd| {
+            let state = Arc::clone(&ctx.netlink);
+            Box::pin(async move {
+                crate::netlink::handlers::handle_socket(&notif, &state).await
+            })
+        }));
+        table.register(libc::SYS_bind, Box::new(|notif, ctx, _fd| {
+            let state = Arc::clone(&ctx.netlink);
+            Box::pin(async move {
+                crate::netlink::handlers::handle_bind(&notif, &state).await
+            })
+        }));
+        table.register(libc::SYS_getsockname, Box::new(|notif, ctx, notif_fd| {
+            let state = Arc::clone(&ctx.netlink);
+            Box::pin(async move {
+                crate::netlink::handlers::handle_getsockname(&notif, &state, notif_fd).await
+            })
+        }));
+        // Zero the msg_name region on recv so glibc sees nl_pid=0
+        // (the kernel only writes sun_family on unix socketpair recvmsg,
+        //  leaving the rest of the buffer as stack garbage otherwise).
+        for &nr in &[libc::SYS_recvfrom, libc::SYS_recvmsg] {
+            table.register(nr, Box::new(|notif, ctx, notif_fd| {
+                let state = Arc::clone(&ctx.netlink);
+                Box::pin(async move {
+                    crate::netlink::handlers::handle_netlink_recvmsg(&notif, &state, notif_fd).await
+                })
+            }));
+        }
+        // Unregister on close so the (pid, fd) slot isn't left in the
+        // cookie set once the child reuses the fd for something else.
+        table.register(libc::SYS_close, Box::new(|notif, ctx, _fd| {
+            let state = Arc::clone(&ctx.netlink);
+            Box::pin(async move {
+                crate::netlink::handlers::handle_close(&notif, &state).await
+            })
+        }));
+    }
+
+    // ------------------------------------------------------------------
     // Bind — on-behalf
     // ------------------------------------------------------------------
     if policy.port_remap || policy.has_net_allowlist {

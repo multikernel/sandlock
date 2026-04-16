@@ -1038,6 +1038,7 @@ impl Sandbox {
                 time_random: Arc::clone(&time_random_state),
                 policy_fn: Arc::clone(&policy_fn_state),
                 chroot: Arc::clone(&chroot_state),
+                netlink: Arc::new(crate::netlink::NetlinkState::new()),
                 policy: Arc::new(notif_policy),
                 child_pidfd: child_pidfd_raw,
                 notif_fd: notif_raw_fd,
