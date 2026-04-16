@@ -13,6 +13,8 @@ use crate::sys::structs::{
     BPF_ABS, BPF_ALU, BPF_AND, BPF_JEQ, BPF_JSET, BPF_JMP, BPF_K, BPF_LD, BPF_RET, BPF_W,
     CLONE_NS_FLAGS, DEFAULT_DENY_SYSCALLS, EPERM,
     SECCOMP_RET_ALLOW, SECCOMP_RET_ERRNO,
+    SIOCETHTOOL, SIOCGIFADDR, SIOCGIFBRDADDR, SIOCGIFCONF, SIOCGIFDSTADDR,
+    SIOCGIFFLAGS, SIOCGIFHWADDR, SIOCGIFINDEX, SIOCGIFNAME, SIOCGIFNETMASK,
     SOCK_DGRAM, SOCK_RAW, SOCK_TYPE_MASK, TIOCLINUX, TIOCSTI,
     PR_SET_DUMPABLE, PR_SET_SECUREBITS, PR_SET_PTRACER,
     OFFSET_ARGS0_LO, OFFSET_ARGS1_LO, OFFSET_ARGS2_LO, OFFSET_ARGS3_LO, OFFSET_NR,
@@ -446,7 +448,7 @@ pub fn deny_syscall_numbers(policy: &Policy) -> Vec<u32> {
 ///
 /// Returns a `Vec<SockFilter>` containing self-contained BPF blocks for:
 ///   - clone: block namespace creation flags
-///   - ioctl: block TIOCSTI, TIOCLINUX
+///   - ioctl: block TIOCSTI, TIOCLINUX, SIOCGIF*, SIOCETHTOOL
 ///   - prctl: block PR_SET_DUMPABLE, PR_SET_SECUREBITS, PR_SET_PTRACER
 ///   - socket: block SOCK_RAW/SOCK_DGRAM on AF_INET/AF_INET6 (with type mask)
 pub fn arg_filters(policy: &Policy) -> Vec<SockFilter> {
@@ -471,9 +473,25 @@ pub fn arg_filters(policy: &Policy) -> Vec<SockFilter> {
     insns.push(jump(BPF_JMP | BPF_JSET | BPF_K, CLONE_NS_FLAGS as u32, 0, 1));
     insns.push(stmt(BPF_RET | BPF_K, ret_errno));
 
-    // --- ioctl: block dangerous commands (TIOCSTI, TIOCLINUX) ---
+    // --- ioctl: block dangerous commands ---
+    // Block terminal injection (TIOCSTI, TIOCLINUX) and network interface
+    // enumeration ioctls (SIOCGIF*, SIOCETHTOOL) to complement NETLINK_ROUTE
+    // virtualization.
     // Layout: LD NR, JEQ ioctl (skip 1 + N*2), LD arg1, [JEQ cmd, RET ERRNO] * N
-    let dangerous_ioctls: &[u32] = &[TIOCSTI as u32, TIOCLINUX as u32];
+    let dangerous_ioctls: &[u32] = &[
+        TIOCSTI as u32,
+        TIOCLINUX as u32,
+        SIOCGIFNAME as u32,
+        SIOCGIFCONF as u32,
+        SIOCGIFFLAGS as u32,
+        SIOCGIFADDR as u32,
+        SIOCGIFDSTADDR as u32,
+        SIOCGIFBRDADDR as u32,
+        SIOCGIFNETMASK as u32,
+        SIOCGIFHWADDR as u32,
+        SIOCGIFINDEX as u32,
+        SIOCETHTOOL as u32,
+    ];
     let n_ioctls = dangerous_ioctls.len();
     let skip_count = (1 + n_ioctls * 2) as u8;
     insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR));
@@ -1089,11 +1107,15 @@ mod tests {
         // Should contain JEQ for ioctl syscall nr
         assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
             && f.k == libc::SYS_ioctl as u32));
-        // Should contain JEQ for TIOCSTI and TIOCLINUX
+        // Should contain JEQ for TIOCSTI, TIOCLINUX, and SIOCGIF*/SIOCETHTOOL
         assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
             && f.k == TIOCSTI as u32));
         assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
             && f.k == TIOCLINUX as u32));
+        assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
+            && f.k == SIOCGIFCONF as u32));
+        assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
+            && f.k == SIOCETHTOOL as u32));
         // Should contain JEQ for prctl syscall nr
         assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
             && f.k == libc::SYS_prctl as u32));

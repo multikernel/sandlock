@@ -220,6 +220,18 @@ pub const CLONE_NS_FLAGS: u64 = CLONE_NEWNS
 pub const TIOCSTI: u64 = 0x5412;
 pub const TIOCLINUX: u64 = 0x541C;
 
+// Network interface ioctls (linux/sockios.h)
+pub const SIOCGIFNAME: u64 = 0x8910;
+pub const SIOCGIFCONF: u64 = 0x8912;
+pub const SIOCGIFFLAGS: u64 = 0x8913;
+pub const SIOCGIFADDR: u64 = 0x8915;
+pub const SIOCGIFDSTADDR: u64 = 0x8917;
+pub const SIOCGIFBRDADDR: u64 = 0x8919;
+pub const SIOCGIFNETMASK: u64 = 0x891B;
+pub const SIOCGIFHWADDR: u64 = 0x8927;
+pub const SIOCGIFINDEX: u64 = 0x8933;
+pub const SIOCETHTOOL: u64 = 0x8946;
+
 // ============================================================
 // Dangerous prctl options
 // ============================================================

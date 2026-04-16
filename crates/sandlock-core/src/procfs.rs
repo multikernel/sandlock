@@ -28,6 +28,7 @@ const SENSITIVE_PATHS: &[&str] = &[
     "/proc/keys",
     "/proc/key-users",
     "/proc/sysrq-trigger",
+    "/sys/class/net",
     "/sys/firmware",
     "/sys/kernel/security",
 ];
@@ -857,7 +858,8 @@ mod tests {
         assert!(!is_sensitive_proc("/proc/cpuinfo"));
         assert!(!is_sensitive_proc("/proc/meminfo"));
         assert!(!is_sensitive_proc("/proc/1/status"));
-        assert!(!is_sensitive_proc("/sys/class/net"));
+        assert!(is_sensitive_proc("/sys/class/net"));
+        assert!(is_sensitive_proc("/sys/class/net/eth0"));
     }
 
     #[test]
