@@ -333,7 +333,9 @@ class TestGather:
             | Sandbox(_policy()).cmd(
                 ["sh", "-c",
                  # c on stdin, a on fd 3, b on fd 4
-                 'read c; a=$(cat <&3); b=$(cat <&4); echo "$a $b $c"']
+                 # Use read builtin (no fork) instead of $(cat) to avoid
+                 # flaky kernel-level EAGAIN under concurrent load.
+                 'read c; read a <&3; read b <&4; echo "$a $b $c"']
             )
         ).run()
         assert result.success, f"stderr={result.stderr}"
