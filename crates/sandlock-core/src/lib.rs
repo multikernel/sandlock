@@ -3,6 +3,7 @@ pub mod policy;
 pub mod profile;
 pub mod result;
 pub mod sandbox;
+pub(crate) mod arch;
 pub(crate) mod sys;
 pub mod landlock;
 pub mod seccomp;

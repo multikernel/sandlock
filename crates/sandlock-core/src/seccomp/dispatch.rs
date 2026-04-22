@@ -13,6 +13,7 @@ use std::sync::Arc;
 use super::ctx::SupervisorCtx;
 use super::notif::{NotifAction, NotifPolicy};
 use super::state::ResourceState;
+use crate::arch;
 use crate::sys::structs::SeccompNotif;
 
 use tokio::sync::Mutex;
@@ -95,7 +96,11 @@ pub fn build_dispatch_table(
     // ------------------------------------------------------------------
     // Fork/clone family (always on)
     // ------------------------------------------------------------------
-    for &nr in &[libc::SYS_clone, libc::SYS_clone3, libc::SYS_vfork] {
+    let mut fork_nrs = vec![libc::SYS_clone, libc::SYS_clone3];
+    if let Some(vfork) = arch::SYS_VFORK {
+        fork_nrs.push(vfork);
+    }
+    for nr in fork_nrs {
         let policy = Arc::clone(policy);
         let resource = Arc::clone(resource);
         table.register(nr, Box::new(move |notif, ctx, _notif_fd| {
@@ -235,7 +240,11 @@ pub fn build_dispatch_table(
             })
         }));
     }
-    for &nr in &[libc::SYS_getdents64, libc::SYS_getdents as i64] {
+    let mut getdents_nrs = vec![libc::SYS_getdents64];
+    if let Some(getdents) = arch::SYS_GETDENTS {
+        getdents_nrs.push(getdents);
+    }
+    for nr in getdents_nrs {
         let policy = Arc::clone(policy);
         table.register(nr, Box::new(move |notif, ctx, notif_fd| {
             let policy = Arc::clone(&policy);
@@ -302,7 +311,11 @@ pub fn build_dispatch_table(
     // Deterministic directory listing
     // ------------------------------------------------------------------
     if policy.deterministic_dirs {
-        for &nr in &[libc::SYS_getdents64, libc::SYS_getdents as i64] {
+        let mut getdents_nrs = vec![libc::SYS_getdents64];
+        if let Some(getdents) = arch::SYS_GETDENTS {
+            getdents_nrs.push(getdents);
+        }
+        for nr in getdents_nrs {
             table.register(nr, Box::new(|notif, ctx, notif_fd| {
                 let procfs_inner = Arc::clone(&ctx.procfs);
                 Box::pin(async move {
@@ -444,8 +457,10 @@ fn register_chroot_handlers(table: &mut DispatchTable, policy: &Arc<NotifPolicy>
         crate::chroot::dispatch::handle_chroot_open));
 
     // open (legacy) — fallthrough if Continue
-    table.register(libc::SYS_open as i64, chroot_handler_fallthrough!(policy,
-        crate::chroot::dispatch::handle_chroot_legacy_open));
+    if let Some(open) = arch::SYS_OPEN {
+        table.register(open, chroot_handler_fallthrough!(policy,
+            crate::chroot::dispatch::handle_chroot_legacy_open));
+    }
 
     // execve, execveat — unconditional return
     for &nr in &[libc::SYS_execve, libc::SYS_execveat] {
@@ -464,25 +479,39 @@ fn register_chroot_handlers(table: &mut DispatchTable, policy: &Arc<NotifPolicy>
     }
 
     // Legacy write syscalls
-    table.register(libc::SYS_unlink as i64, chroot_handler!(policy,
-        crate::chroot::dispatch::handle_chroot_legacy_unlink));
-    table.register(libc::SYS_rmdir as i64, chroot_handler!(policy,
-        crate::chroot::dispatch::handle_chroot_legacy_rmdir));
-    table.register(libc::SYS_mkdir as i64, chroot_handler!(policy,
-        crate::chroot::dispatch::handle_chroot_legacy_mkdir));
-    table.register(libc::SYS_rename as i64, chroot_handler!(policy,
-        crate::chroot::dispatch::handle_chroot_legacy_rename));
-    table.register(libc::SYS_symlink as i64, chroot_handler!(policy,
-        crate::chroot::dispatch::handle_chroot_legacy_symlink));
-    table.register(libc::SYS_link as i64, chroot_handler!(policy,
-        crate::chroot::dispatch::handle_chroot_legacy_link));
-    table.register(libc::SYS_chmod as i64, chroot_handler!(policy,
-        crate::chroot::dispatch::handle_chroot_legacy_chmod));
+    if let Some(nr) = arch::SYS_UNLINK {
+        table.register(nr, chroot_handler!(policy,
+            crate::chroot::dispatch::handle_chroot_legacy_unlink));
+    }
+    if let Some(nr) = arch::SYS_RMDIR {
+        table.register(nr, chroot_handler!(policy,
+            crate::chroot::dispatch::handle_chroot_legacy_rmdir));
+    }
+    if let Some(nr) = arch::SYS_MKDIR {
+        table.register(nr, chroot_handler!(policy,
+            crate::chroot::dispatch::handle_chroot_legacy_mkdir));
+    }
+    if let Some(nr) = arch::SYS_RENAME {
+        table.register(nr, chroot_handler!(policy,
+            crate::chroot::dispatch::handle_chroot_legacy_rename));
+    }
+    if let Some(nr) = arch::SYS_SYMLINK {
+        table.register(nr, chroot_handler!(policy,
+            crate::chroot::dispatch::handle_chroot_legacy_symlink));
+    }
+    if let Some(nr) = arch::SYS_LINK {
+        table.register(nr, chroot_handler!(policy,
+            crate::chroot::dispatch::handle_chroot_legacy_link));
+    }
+    if let Some(nr) = arch::SYS_CHMOD {
+        table.register(nr, chroot_handler!(policy,
+            crate::chroot::dispatch::handle_chroot_legacy_chmod));
+    }
 
     // chown — non-follow
-    {
+    if let Some(chown) = arch::SYS_CHOWN {
         let policy = Arc::clone(policy);
-        table.register(libc::SYS_chown as i64, Box::new(move |notif, ctx, notif_fd| {
+        table.register(chown, Box::new(move |notif, ctx, notif_fd| {
             let policy = Arc::clone(&policy);
             Box::pin(async move {
                 let chroot_ctx = ChrootCtx {
@@ -498,9 +527,9 @@ fn register_chroot_handlers(table: &mut DispatchTable, policy: &Arc<NotifPolicy>
     }
 
     // lchown — follow
-    {
+    if let Some(lchown) = arch::SYS_LCHOWN {
         let policy = Arc::clone(policy);
-        table.register(libc::SYS_lchown as i64, Box::new(move |notif, ctx, notif_fd| {
+        table.register(lchown, Box::new(move |notif, ctx, notif_fd| {
             let policy = Arc::clone(&policy);
             Box::pin(async move {
                 let chroot_ctx = ChrootCtx {
@@ -526,12 +555,18 @@ fn register_chroot_handlers(table: &mut DispatchTable, policy: &Arc<NotifPolicy>
     }
 
     // Legacy stat
-    table.register(libc::SYS_stat as i64, chroot_handler!(policy,
-        crate::chroot::dispatch::handle_chroot_legacy_stat));
-    table.register(libc::SYS_lstat as i64, chroot_handler!(policy,
-        crate::chroot::dispatch::handle_chroot_legacy_lstat));
-    table.register(libc::SYS_access as i64, chroot_handler!(policy,
-        crate::chroot::dispatch::handle_chroot_legacy_access));
+    if let Some(nr) = arch::SYS_STAT {
+        table.register(nr, chroot_handler!(policy,
+            crate::chroot::dispatch::handle_chroot_legacy_stat));
+    }
+    if let Some(nr) = arch::SYS_LSTAT {
+        table.register(nr, chroot_handler!(policy,
+            crate::chroot::dispatch::handle_chroot_legacy_lstat));
+    }
+    if let Some(nr) = arch::SYS_ACCESS {
+        table.register(nr, chroot_handler!(policy,
+            crate::chroot::dispatch::handle_chroot_legacy_access));
+    }
 
     // statx
     table.register(libc::SYS_statx, chroot_handler!(policy,
@@ -540,11 +575,17 @@ fn register_chroot_handlers(table: &mut DispatchTable, policy: &Arc<NotifPolicy>
     // readlink
     table.register(libc::SYS_readlinkat, chroot_handler!(policy,
         crate::chroot::dispatch::handle_chroot_readlink));
-    table.register(libc::SYS_readlink as i64, chroot_handler!(policy,
-        crate::chroot::dispatch::handle_chroot_legacy_readlink));
+    if let Some(nr) = arch::SYS_READLINK {
+        table.register(nr, chroot_handler!(policy,
+            crate::chroot::dispatch::handle_chroot_legacy_readlink));
+    }
 
     // getdents
-    for &nr in &[libc::SYS_getdents64, libc::SYS_getdents as i64] {
+    let mut getdents_nrs = vec![libc::SYS_getdents64];
+    if let Some(getdents) = arch::SYS_GETDENTS {
+        getdents_nrs.push(getdents);
+    }
+    for nr in getdents_nrs {
         table.register(nr, chroot_handler!(policy,
             crate::chroot::dispatch::handle_chroot_getdents));
     }
@@ -566,16 +607,17 @@ fn register_chroot_handlers(table: &mut DispatchTable, policy: &Arc<NotifPolicy>
 
 fn register_cow_handlers(table: &mut DispatchTable) {
     // Write syscalls (*at variants + legacy)
-    for &nr in &[
+    let mut write_nrs = vec![
         libc::SYS_unlinkat, libc::SYS_mkdirat, libc::SYS_renameat2,
         libc::SYS_symlinkat, libc::SYS_linkat, libc::SYS_fchmodat,
         libc::SYS_fchownat, libc::SYS_truncate,
-        libc::SYS_unlink as i64, libc::SYS_rmdir as i64,
-        libc::SYS_mkdir as i64, libc::SYS_rename as i64,
-        libc::SYS_symlink as i64, libc::SYS_link as i64,
-        libc::SYS_chmod as i64, libc::SYS_chown as i64,
-        libc::SYS_lchown as i64,
-    ] {
+    ];
+    write_nrs.extend([
+        arch::SYS_UNLINK, arch::SYS_RMDIR, arch::SYS_MKDIR, arch::SYS_RENAME,
+        arch::SYS_SYMLINK, arch::SYS_LINK, arch::SYS_CHMOD, arch::SYS_CHOWN,
+        arch::SYS_LCHOWN,
+    ].into_iter().flatten());
+    for nr in write_nrs {
         table.register(nr, Box::new(|notif, ctx, notif_fd| {
             let cow = Arc::clone(&ctx.cow);
             Box::pin(async move {
@@ -593,11 +635,12 @@ fn register_cow_handlers(table: &mut DispatchTable) {
     }));
 
     // faccessat/access — fallthrough
-    for &nr in &[
+    let mut access_nrs = vec![
         libc::SYS_faccessat,
         crate::cow::dispatch::SYS_FACCESSAT2,
-        libc::SYS_access as i64,
-    ] {
+    ];
+    access_nrs.extend(arch::SYS_ACCESS);
+    for nr in access_nrs {
         table.register(nr, Box::new(|notif, ctx, notif_fd| {
             let cow = Arc::clone(&ctx.cow);
             Box::pin(async move {
@@ -607,7 +650,9 @@ fn register_cow_handlers(table: &mut DispatchTable) {
     }
 
     // openat/open — fallthrough
-    for &nr in &[libc::SYS_openat, libc::SYS_open as i64] {
+    let mut open_nrs = vec![libc::SYS_openat];
+    open_nrs.extend(arch::SYS_OPEN);
+    for nr in open_nrs {
         table.register(nr, Box::new(|notif, ctx, notif_fd| {
             let cow = Arc::clone(&ctx.cow);
             Box::pin(async move {
@@ -617,11 +662,11 @@ fn register_cow_handlers(table: &mut DispatchTable) {
     }
 
     // stat family — fallthrough
-    for &nr in &[
+    let mut stat_nrs = vec![
         libc::SYS_newfstatat, libc::SYS_faccessat,
-        libc::SYS_stat as i64, libc::SYS_lstat as i64,
-        libc::SYS_access as i64,
-    ] {
+    ];
+    stat_nrs.extend([arch::SYS_STAT, arch::SYS_LSTAT, arch::SYS_ACCESS].into_iter().flatten());
+    for nr in stat_nrs {
         table.register(nr, Box::new(|notif, ctx, notif_fd| {
             let cow = Arc::clone(&ctx.cow);
             Box::pin(async move {
@@ -639,7 +684,9 @@ fn register_cow_handlers(table: &mut DispatchTable) {
     }));
 
     // readlink — fallthrough
-    for &nr in &[libc::SYS_readlinkat, libc::SYS_readlink as i64] {
+    let mut readlink_nrs = vec![libc::SYS_readlinkat];
+    readlink_nrs.extend(arch::SYS_READLINK);
+    for nr in readlink_nrs {
         table.register(nr, Box::new(|notif, ctx, notif_fd| {
             let cow = Arc::clone(&ctx.cow);
             Box::pin(async move {
@@ -649,7 +696,9 @@ fn register_cow_handlers(table: &mut DispatchTable) {
     }
 
     // getdents — fallthrough
-    for &nr in &[libc::SYS_getdents64, libc::SYS_getdents as i64] {
+    let mut getdents_nrs = vec![libc::SYS_getdents64];
+    getdents_nrs.extend(arch::SYS_GETDENTS);
+    for nr in getdents_nrs {
         table.register(nr, Box::new(|notif, ctx, notif_fd| {
             let cow = Arc::clone(&ctx.cow);
             Box::pin(async move {

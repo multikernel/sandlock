@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
+use crate::arch;
 use crate::procfs::{build_dirent64, DT_DIR, DT_LNK, DT_REG};
 use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction};
 use crate::seccomp::state::CowState;
@@ -80,7 +81,7 @@ pub(crate) async fn handle_cow_open(
 
     // open(path, flags, mode):     args[0]=path, args[1]=flags
     // openat(dirfd, path, flags):  args[0]=dirfd, args[1]=path, args[2]=flags
-    let (path_ptr, dirfd, flags) = if nr == libc::SYS_open as i64 {
+    let (path_ptr, dirfd, flags) = if Some(nr) == arch::SYS_OPEN {
         (notif.data.args[0], libc::AT_FDCWD as i64, notif.data.args[1])
     } else {
         (notif.data.args[1], notif.data.args[0] as i64, notif.data.args[2])
@@ -239,35 +240,35 @@ fn parse_cow_write(notif: &SeccompNotif, notif_fd: RawFd) -> Option<CowWriteOp> 
     }
 
     // Legacy variants (path in args[0], no dirfd)
-    if nr == libc::SYS_unlink as i64 {
+    if Some(nr) == arch::SYS_UNLINK {
         return Some(CowWriteOp::Unlink { path: read_resolved(notif, 0, None, notif_fd)?, is_dir: false });
     }
-    if nr == libc::SYS_rmdir as i64 {
+    if Some(nr) == arch::SYS_RMDIR {
         return Some(CowWriteOp::Unlink { path: read_resolved(notif, 0, None, notif_fd)?, is_dir: true });
     }
-    if nr == libc::SYS_mkdir as i64 {
+    if Some(nr) == arch::SYS_MKDIR {
         return Some(CowWriteOp::Mkdir { path: read_resolved(notif, 0, None, notif_fd)? });
     }
-    if nr == libc::SYS_rename as i64 {
+    if Some(nr) == arch::SYS_RENAME {
         let old_path = read_resolved(notif, 0, None, notif_fd)?;
         let new_path = read_resolved(notif, 1, None, notif_fd)?;
         return Some(CowWriteOp::Rename { old_path, new_path });
     }
-    if nr == libc::SYS_symlink as i64 {
+    if Some(nr) == arch::SYS_SYMLINK {
         let target = read_path(notif, notif.data.args[0], notif_fd)?;
         let linkpath = read_resolved(notif, 1, None, notif_fd)?;
         return Some(CowWriteOp::Symlink { target, linkpath });
     }
-    if nr == libc::SYS_link as i64 {
+    if Some(nr) == arch::SYS_LINK {
         let old_path = read_resolved(notif, 0, None, notif_fd)?;
         let new_path = read_resolved(notif, 1, None, notif_fd)?;
         return Some(CowWriteOp::Link { old_path, new_path });
     }
-    if nr == libc::SYS_chmod as i64 {
+    if Some(nr) == arch::SYS_CHMOD {
         let path = read_resolved(notif, 0, None, notif_fd)?;
         return Some(CowWriteOp::Chmod { path, mode: (notif.data.args[1] & 0o7777) as u32 });
     }
-    if nr == libc::SYS_chown as i64 || nr == libc::SYS_lchown as i64 {
+    if Some(nr) == arch::SYS_CHOWN || Some(nr) == arch::SYS_LCHOWN {
         let path = read_resolved(notif, 0, None, notif_fd)?;
         return Some(CowWriteOp::Chown { path, uid: notif.data.args[1] as u32, gid: notif.data.args[2] as u32 });
     }
@@ -456,7 +457,7 @@ pub(crate) async fn handle_cow_access(
 
     // access(pathname, mode): args[0]=path, args[1]=mode
     // faccessat(dirfd, pathname, mode, flags): args[0]=dirfd, args[1]=path, args[2]=mode
-    let (path, mode) = if nr == libc::SYS_access as i64 {
+    let (path, mode) = if Some(nr) == arch::SYS_ACCESS {
         let p = match read_path(notif, notif.data.args[0], notif_fd) {
             Some(p) => p,
             None => return NotifAction::Continue,

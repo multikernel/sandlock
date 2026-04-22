@@ -30,7 +30,7 @@ pub(crate) async fn handle_fork(
     let args = &notif.data.args;
 
     // For clone/vfork: check namespace flags in args[0].
-    if nr == libc::SYS_clone || nr == libc::SYS_vfork {
+    if nr == libc::SYS_clone || Some(nr) == crate::arch::SYS_VFORK {
         if nr == libc::SYS_clone && (args[0] & CLONE_NS_FLAGS) != 0 {
             return NotifAction::Errno(EPERM);
         }

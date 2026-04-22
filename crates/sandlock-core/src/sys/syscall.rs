@@ -8,15 +8,16 @@ use super::structs::{
 };
 
 // ============================================================
-// Core raw syscall wrappers (x86_64 ABI)
+// Core raw syscall wrappers
 // ============================================================
 
-/// Raw 3-argument syscall using x86_64 ABI.
+/// Raw 3-argument syscall.
 ///
 /// # Safety
 /// Caller must ensure arguments are valid for the given syscall number.
 pub unsafe fn syscall3(nr: i64, a1: u64, a2: u64, a3: u64) -> io::Result<i64> {
     let ret: i64;
+    #[cfg(target_arch = "x86_64")]
     std::arch::asm!(
         "syscall",
         inlateout("rax") nr => ret,
@@ -25,6 +26,15 @@ pub unsafe fn syscall3(nr: i64, a1: u64, a2: u64, a3: u64) -> io::Result<i64> {
         in("rdx") a3,
         lateout("rcx") _,
         lateout("r11") _,
+        options(nostack),
+    );
+    #[cfg(target_arch = "aarch64")]
+    std::arch::asm!(
+        "svc #0",
+        inlateout("x8") nr => _,
+        inlateout("x0") a1 as i64 => ret,
+        in("x1") a2,
+        in("x2") a3,
         options(nostack),
     );
     if ret < 0 && ret >= -4095 {
@@ -104,8 +114,7 @@ pub fn landlock_restrict_self(ruleset_fd: &OwnedFd, flags: u32) -> io::Result<()
 
 /// Raw seccomp(2) syscall (syscall 317 on x86_64).
 pub fn seccomp(operation: u32, flags: u64, args: *const std::ffi::c_void) -> io::Result<i64> {
-    const SYS_SECCOMP: i64 = 317;
-    unsafe { syscall3(SYS_SECCOMP, operation as u64, flags, args as u64) }
+    unsafe { syscall3(crate::arch::SYS_SECCOMP, operation as u64, flags, args as u64) }
 }
 
 // ============================================================
@@ -114,18 +123,16 @@ pub fn seccomp(operation: u32, flags: u64, args: *const std::ffi::c_void) -> io:
 
 /// Open a pidfd for a process (syscall 434).
 pub fn pidfd_open(pid: u32, flags: u32) -> io::Result<OwnedFd> {
-    const SYS_PIDFD_OPEN: i64 = 434;
-    let fd = unsafe { syscall2(SYS_PIDFD_OPEN, pid as u64, flags as u64)? };
+    let fd = unsafe { syscall2(crate::arch::SYS_PIDFD_OPEN, pid as u64, flags as u64)? };
     Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
 }
 
 /// Duplicate a file descriptor from another process via pidfd (syscall 438).
 pub fn pidfd_getfd(pidfd: &OwnedFd, targetfd: i32, flags: u32) -> io::Result<OwnedFd> {
     use std::os::unix::io::AsRawFd;
-    const SYS_PIDFD_GETFD: i64 = 438;
     let fd = unsafe {
         syscall3(
-            SYS_PIDFD_GETFD,
+            crate::arch::SYS_PIDFD_GETFD,
             pidfd.as_raw_fd() as u64,
             targetfd as u64,
             flags as u64,

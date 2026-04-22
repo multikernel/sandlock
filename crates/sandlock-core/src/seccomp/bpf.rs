@@ -14,7 +14,6 @@
 use std::os::unix::io::{FromRawFd, OwnedFd};
 
 use crate::sys::structs::{
-    AUDIT_ARCH_X86_64,
     BPF_ABS, BPF_JEQ, BPF_JMP, BPF_K, BPF_LD, BPF_RET, BPF_W,
     EPERM,
     OFFSET_ARCH, OFFSET_NR,
@@ -71,7 +70,7 @@ pub fn assemble_filter(
     // ---- 1. Arch check block ----
     prog.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARCH));
     let arch_jf = (ret_kill_idx - 2) as u8;
-    prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 0, arch_jf));
+    prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, crate::arch::AUDIT_ARCH, 0, arch_jf));
 
     // ---- 2. Pre-built arg filter block ----
     prog.extend_from_slice(arg_block);
@@ -187,7 +186,7 @@ mod tests {
         // prog[1] is the JEQ arch check; jf should reach the KILL return.
         let arch_jeq = &prog[1];
         assert_eq!(arch_jeq.code, BPF_JMP | BPF_JEQ | BPF_K);
-        assert_eq!(arch_jeq.k, AUDIT_ARCH_X86_64);
+        assert_eq!(arch_jeq.k, crate::arch::AUDIT_ARCH);
         // The instruction following prog[1] is prog[2].
         // KILL is the last instruction.
         let kill_idx = prog.len() - 1;

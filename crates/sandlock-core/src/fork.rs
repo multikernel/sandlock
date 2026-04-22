@@ -19,8 +19,6 @@ use std::os::unix::io::RawFd;
 fn raw_fork() -> std::io::Result<i32> {
     #[cfg(target_arch = "x86_64")]
     const NR_FORK: i64 = 57;
-    #[cfg(target_arch = "aarch64")]
-    const NR_FORK: i64 = -1; // aarch64 has no fork — use clone with minimal flags
 
     #[cfg(target_arch = "x86_64")]
     {
