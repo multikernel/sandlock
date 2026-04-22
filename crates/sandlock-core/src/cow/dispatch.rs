@@ -4,6 +4,7 @@
 //! and injects results (fds, stat structs, readlink strings, dirents) back.
 
 use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -42,23 +43,49 @@ fn read_path(notif: &SeccompNotif, addr: u64, notif_fd: RawFd) -> Option<String>
 /// Resolve a path that may be relative to a dirfd.
 /// For AT_FDCWD (-100), returns the path as-is (assumed absolute or cwd-relative).
 /// For other dirfds, reads /proc/{pid}/fd/{dirfd} to get the base path.
-fn resolve_at_path(notif: &SeccompNotif, dirfd: i64, path: &str) -> String {
-    if std::path::Path::new(path).is_absolute() {
-        return path.to_string();
+fn normalize_path(path: PathBuf) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            Component::RootDir => out.push(Path::new("/")),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(part) => out.push(part),
+        }
+    }
+    out
+}
+
+fn resolve_at_path_with_virtual(
+    notif: &SeccompNotif,
+    dirfd: i64,
+    path: &str,
+    virtual_cwd: Option<&str>,
+) -> String {
+    if Path::new(path).is_absolute() {
+        return normalize_path(PathBuf::from(path)).to_string_lossy().into_owned();
     }
     // dirfd is stored as u64 in seccomp_data.args but AT_FDCWD is a negative i32.
     // Truncate to i32 for correct sign comparison.
     let dirfd32 = dirfd as i32;
     if dirfd32 == libc::AT_FDCWD {
+        if let Some(cwd) = virtual_cwd {
+            return normalize_path(Path::new(cwd).join(path))
+                .to_string_lossy()
+                .into_owned();
+        }
         // Relative to cwd — read /proc/{pid}/cwd
         if let Ok(cwd) = std::fs::read_link(format!("/proc/{}/cwd", notif.pid)) {
-            return format!("{}/{}", cwd.display(), path);
+            return normalize_path(cwd.join(path)).to_string_lossy().into_owned();
         }
         return path.to_string();
     }
     // Relative to dirfd
     if let Ok(base) = std::fs::read_link(format!("/proc/{}/fd/{}", notif.pid, dirfd)) {
-        format!("{}/{}", base.display(), path)
+        normalize_path(base.join(path)).to_string_lossy().into_owned()
     } else {
         path.to_string()
     }
@@ -91,7 +118,13 @@ pub(crate) async fn handle_cow_open(
         Some(p) => p,
         None => return NotifAction::Continue,
     };
-    let path = resolve_at_path(notif, dirfd, &rel_path);
+    let virtual_cwd = if (dirfd as i32) == libc::AT_FDCWD && !Path::new(&rel_path).is_absolute() {
+        let st = cow_state.lock().await;
+        st.virtual_cwds.get(&(notif.pid as i32)).cloned()
+    } else {
+        None
+    };
+    let path = resolve_at_path_with_virtual(notif, dirfd, &rel_path, virtual_cwd.as_deref());
 
     // Phase 1: determine plan under lock (no heavy I/O)
     let plan = {
@@ -197,89 +230,114 @@ fn read_resolved(
     path_arg: usize,
     dirfd_arg: Option<usize>,
     notif_fd: RawFd,
+    virtual_cwd: Option<&str>,
 ) -> Option<String> {
     let raw = read_path(notif, notif.data.args[path_arg], notif_fd)?;
     match dirfd_arg {
-        Some(i) => Some(resolve_at_path(notif, notif.data.args[i] as i64, &raw)),
-        None => Some(raw),
+        Some(i) => Some(resolve_at_path_with_virtual(
+            notif,
+            notif.data.args[i] as i64,
+            &raw,
+            virtual_cwd,
+        )),
+        None => Some(resolve_at_path_with_virtual(
+            notif,
+            libc::AT_FDCWD as i64,
+            &raw,
+            virtual_cwd,
+        )),
     }
 }
 
 /// Parse the syscall into a CowWriteOp, reading and resolving paths from child memory.
-fn parse_cow_write(notif: &SeccompNotif, notif_fd: RawFd) -> Option<CowWriteOp> {
+fn parse_cow_write(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+    virtual_cwd: Option<&str>,
+) -> Option<CowWriteOp> {
     let nr = notif.data.nr as i64;
 
     // *at variants (dirfd in args[0], path in args[1])
     if nr == libc::SYS_unlinkat {
-        let path = read_resolved(notif, 1, Some(0), notif_fd)?;
+        let path = read_resolved(notif, 1, Some(0), notif_fd, virtual_cwd)?;
         let is_dir = (notif.data.args[2] & libc::AT_REMOVEDIR as u64) != 0;
         return Some(CowWriteOp::Unlink { path, is_dir });
     }
     if nr == libc::SYS_mkdirat {
-        return Some(CowWriteOp::Mkdir { path: read_resolved(notif, 1, Some(0), notif_fd)? });
+        return Some(CowWriteOp::Mkdir {
+            path: read_resolved(notif, 1, Some(0), notif_fd, virtual_cwd)?,
+        });
     }
     if nr == libc::SYS_renameat2 {
-        let old_path = read_resolved(notif, 1, Some(0), notif_fd)?;
-        let new_path = read_resolved(notif, 3, Some(2), notif_fd)?;
+        let old_path = read_resolved(notif, 1, Some(0), notif_fd, virtual_cwd)?;
+        let new_path = read_resolved(notif, 3, Some(2), notif_fd, virtual_cwd)?;
         return Some(CowWriteOp::Rename { old_path, new_path });
     }
     if nr == libc::SYS_symlinkat {
         // symlinkat(target, newdirfd, linkpath): target is raw, linkpath is resolved
         let target = read_path(notif, notif.data.args[0], notif_fd)?;
-        let linkpath = read_resolved(notif, 2, Some(1), notif_fd)?;
+        let linkpath = read_resolved(notif, 2, Some(1), notif_fd, virtual_cwd)?;
         return Some(CowWriteOp::Symlink { target, linkpath });
     }
     if nr == libc::SYS_linkat {
-        let old_path = read_resolved(notif, 1, Some(0), notif_fd)?;
-        let new_path = read_resolved(notif, 3, Some(2), notif_fd)?;
+        let old_path = read_resolved(notif, 1, Some(0), notif_fd, virtual_cwd)?;
+        let new_path = read_resolved(notif, 3, Some(2), notif_fd, virtual_cwd)?;
         return Some(CowWriteOp::Link { old_path, new_path });
     }
     if nr == libc::SYS_fchmodat {
-        let path = read_resolved(notif, 1, Some(0), notif_fd)?;
+        let path = read_resolved(notif, 1, Some(0), notif_fd, virtual_cwd)?;
         return Some(CowWriteOp::Chmod { path, mode: (notif.data.args[2] & 0o7777) as u32 });
     }
     if nr == libc::SYS_fchownat {
-        let path = read_resolved(notif, 1, Some(0), notif_fd)?;
+        let path = read_resolved(notif, 1, Some(0), notif_fd, virtual_cwd)?;
         return Some(CowWriteOp::Chown { path, uid: notif.data.args[2] as u32, gid: notif.data.args[3] as u32 });
     }
 
     // Legacy variants (path in args[0], no dirfd)
     if Some(nr) == arch::SYS_UNLINK {
-        return Some(CowWriteOp::Unlink { path: read_resolved(notif, 0, None, notif_fd)?, is_dir: false });
+        return Some(CowWriteOp::Unlink {
+            path: read_resolved(notif, 0, None, notif_fd, virtual_cwd)?,
+            is_dir: false,
+        });
     }
     if Some(nr) == arch::SYS_RMDIR {
-        return Some(CowWriteOp::Unlink { path: read_resolved(notif, 0, None, notif_fd)?, is_dir: true });
+        return Some(CowWriteOp::Unlink {
+            path: read_resolved(notif, 0, None, notif_fd, virtual_cwd)?,
+            is_dir: true,
+        });
     }
     if Some(nr) == arch::SYS_MKDIR {
-        return Some(CowWriteOp::Mkdir { path: read_resolved(notif, 0, None, notif_fd)? });
+        return Some(CowWriteOp::Mkdir {
+            path: read_resolved(notif, 0, None, notif_fd, virtual_cwd)?,
+        });
     }
     if Some(nr) == arch::SYS_RENAME {
-        let old_path = read_resolved(notif, 0, None, notif_fd)?;
-        let new_path = read_resolved(notif, 1, None, notif_fd)?;
+        let old_path = read_resolved(notif, 0, None, notif_fd, virtual_cwd)?;
+        let new_path = read_resolved(notif, 1, None, notif_fd, virtual_cwd)?;
         return Some(CowWriteOp::Rename { old_path, new_path });
     }
     if Some(nr) == arch::SYS_SYMLINK {
         let target = read_path(notif, notif.data.args[0], notif_fd)?;
-        let linkpath = read_resolved(notif, 1, None, notif_fd)?;
+        let linkpath = read_resolved(notif, 1, None, notif_fd, virtual_cwd)?;
         return Some(CowWriteOp::Symlink { target, linkpath });
     }
     if Some(nr) == arch::SYS_LINK {
-        let old_path = read_resolved(notif, 0, None, notif_fd)?;
-        let new_path = read_resolved(notif, 1, None, notif_fd)?;
+        let old_path = read_resolved(notif, 0, None, notif_fd, virtual_cwd)?;
+        let new_path = read_resolved(notif, 1, None, notif_fd, virtual_cwd)?;
         return Some(CowWriteOp::Link { old_path, new_path });
     }
     if Some(nr) == arch::SYS_CHMOD {
-        let path = read_resolved(notif, 0, None, notif_fd)?;
+        let path = read_resolved(notif, 0, None, notif_fd, virtual_cwd)?;
         return Some(CowWriteOp::Chmod { path, mode: (notif.data.args[1] & 0o7777) as u32 });
     }
     if Some(nr) == arch::SYS_CHOWN || Some(nr) == arch::SYS_LCHOWN {
-        let path = read_resolved(notif, 0, None, notif_fd)?;
+        let path = read_resolved(notif, 0, None, notif_fd, virtual_cwd)?;
         return Some(CowWriteOp::Chown { path, uid: notif.data.args[1] as u32, gid: notif.data.args[2] as u32 });
     }
 
     // truncate (legacy only, path in args[0])
     if nr == libc::SYS_truncate {
-        let path = read_resolved(notif, 0, None, notif_fd)?;
+        let path = read_resolved(notif, 0, None, notif_fd, virtual_cwd)?;
         return Some(CowWriteOp::Truncate { path, length: notif.data.args[1] as i64 });
     }
 
@@ -365,7 +423,11 @@ pub(crate) async fn handle_cow_write(
     cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
 ) -> NotifAction {
-    let op = match parse_cow_write(notif, notif_fd) {
+    let virtual_cwd = {
+        let st = cow_state.lock().await;
+        st.virtual_cwds.get(&(notif.pid as i32)).cloned()
+    };
+    let op = match parse_cow_write(notif, notif_fd, virtual_cwd.as_deref()) {
         Some(op) => op,
         None => return NotifAction::Continue,
     };
@@ -462,15 +524,28 @@ pub(crate) async fn handle_cow_access(
     // access(pathname, mode): args[0]=path, args[1]=mode
     // faccessat(dirfd, pathname, mode, flags): args[0]=dirfd, args[1]=path, args[2]=mode
     let (path, mode) = if Some(nr) == arch::SYS_ACCESS {
+        let virtual_cwd = {
+            let st = cow_state.lock().await;
+            st.virtual_cwds.get(&(notif.pid as i32)).cloned()
+        };
         let p = match read_path(notif, notif.data.args[0], notif_fd) {
-            Some(p) => p,
+            Some(p) => resolve_at_path_with_virtual(
+                notif,
+                libc::AT_FDCWD as i64,
+                &p,
+                virtual_cwd.as_deref(),
+            ),
             None => return NotifAction::Continue,
         };
         (p, notif.data.args[1] as i32)
     } else {
         let dirfd = notif.data.args[0] as i64;
+        let virtual_cwd = {
+            let st = cow_state.lock().await;
+            st.virtual_cwds.get(&(notif.pid as i32)).cloned()
+        };
         let p = match read_path(notif, notif.data.args[1], notif_fd) {
-            Some(p) => resolve_at_path(notif, dirfd, &p),
+            Some(p) => resolve_at_path_with_virtual(notif, dirfd, &p, virtual_cwd.as_deref()),
             None => return NotifAction::Continue,
         };
         (p, notif.data.args[2] as i32)
@@ -521,8 +596,12 @@ pub(crate) async fn handle_cow_utimensat(
         return NotifAction::Continue;
     }
 
+    let virtual_cwd = {
+        let st = cow_state.lock().await;
+        st.virtual_cwds.get(&(notif.pid as i32)).cloned()
+    };
     let path = match read_path(notif, path_ptr, notif_fd) {
-        Some(p) => resolve_at_path(notif, dirfd, &p),
+        Some(p) => resolve_at_path_with_virtual(notif, dirfd, &p, virtual_cwd.as_deref()),
         None => return NotifAction::Continue,
     };
 
@@ -587,8 +666,12 @@ pub(crate) async fn handle_cow_stat(
     // newfstatat(dirfd, pathname, statbuf, flags)
     // faccessat(dirfd, pathname, mode, flags)
     let dirfd = notif.data.args[0] as i64;
+    let virtual_cwd = {
+        let st = cow_state.lock().await;
+        st.virtual_cwds.get(&(notif.pid as i32)).cloned()
+    };
     let path = match read_path(notif, notif.data.args[1], notif_fd) {
-        Some(p) => resolve_at_path(notif, dirfd, &p),
+        Some(p) => resolve_at_path_with_virtual(notif, dirfd, &p, virtual_cwd.as_deref()),
         None => return NotifAction::Continue,
     };
 
@@ -618,52 +701,30 @@ pub(crate) async fn handle_cow_stat(
         return NotifAction::Errno(libc::ENOENT);
     }
 
-    // newfstatat — stat the resolved path and write to child's buffer
+    // newfstatat — stat the resolved path and write the native libc layout
+    // back to the child. Do not hand-pack struct stat; its layout is
+    // architecture-specific.
     let statbuf_addr = notif.data.args[2];
-    let flags = notif.data.args[3];
-    let follow = (flags & libc::AT_SYMLINK_NOFOLLOW as u64) == 0;
-
-    let meta = if follow {
-        std::fs::metadata(&real_path)
-    } else {
-        std::fs::symlink_metadata(&real_path)
+    let flags = (notif.data.args[3] & 0xFFFF_FFFF) as i32;
+    let c_path = match std::ffi::CString::new(real_path.to_str().unwrap_or("")) {
+        Ok(c) => c,
+        Err(_) => return NotifAction::Continue,
+    };
+    let mut statbuf: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatat(libc::AT_FDCWD, c_path.as_ptr(), &mut statbuf, flags) } < 0 {
+        let errno = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO);
+        return NotifAction::Errno(errno);
+    }
+    let buf = unsafe {
+        std::slice::from_raw_parts(
+            &statbuf as *const libc::stat as *const u8,
+            std::mem::size_of::<libc::stat>(),
+        )
     };
 
-    let meta = match meta {
-        Ok(m) => m,
-        Err(_) => return NotifAction::Errno(libc::ENOENT),
-    };
-
-    // Pack struct stat (x86_64 layout, 144 bytes)
-    use std::os::unix::fs::MetadataExt;
-    let mut buf = vec![0u8; 144];
-    // struct stat { st_dev(8), st_ino(8), st_nlink(8), st_mode(4), st_uid(4), st_gid(4), __pad0(4),
-    //              st_rdev(8), st_size(8), st_blksize(8), st_blocks(8),
-    //              st_atime(8), st_atime_nsec(8), st_mtime(8), st_mtime_nsec(8),
-    //              st_ctime(8), st_ctime_nsec(8), __unused[3](24) }
-    let mut off = 0;
-    macro_rules! pack_u64 { ($v:expr) => { buf[off..off+8].copy_from_slice(&($v as u64).to_ne_bytes()); off += 8; } }
-    macro_rules! pack_u32 { ($v:expr) => { buf[off..off+4].copy_from_slice(&($v as u32).to_ne_bytes()); off += 4; } }
-    pack_u64!(meta.dev());
-    pack_u64!(meta.ino());
-    pack_u64!(meta.nlink());
-    pack_u32!(meta.mode());
-    pack_u32!(meta.uid());
-    pack_u32!(meta.gid());
-    pack_u32!(0u32); // __pad0
-    pack_u64!(meta.rdev());
-    pack_u64!(meta.size() as u64);
-    pack_u64!(meta.blksize());
-    pack_u64!(meta.blocks() as u64);
-    pack_u64!(meta.atime() as u64);
-    pack_u64!(meta.atime_nsec() as u64);
-    pack_u64!(meta.mtime() as u64);
-    pack_u64!(meta.mtime_nsec() as u64);
-    pack_u64!(meta.ctime() as u64);
-    pack_u64!(meta.ctime_nsec() as u64);
-    let _ = off;
-
-    if write_child_mem(notif_fd, notif.id, notif.pid, statbuf_addr, &buf).is_err() {
+    if write_child_mem(notif_fd, notif.id, notif.pid, statbuf_addr, buf).is_err() {
         return NotifAction::Continue;
     }
 
@@ -678,8 +739,12 @@ pub(crate) async fn handle_cow_statx(
 ) -> NotifAction {
     // statx(dirfd, pathname, flags, mask, statxbuf)
     let dirfd = notif.data.args[0] as i64;
+    let virtual_cwd = {
+        let st = cow_state.lock().await;
+        st.virtual_cwds.get(&(notif.pid as i32)).cloned()
+    };
     let path = match read_path(notif, notif.data.args[1], notif_fd) {
-        Some(p) => resolve_at_path(notif, dirfd, &p),
+        Some(p) => resolve_at_path_with_virtual(notif, dirfd, &p, virtual_cwd.as_deref()),
         None => return NotifAction::Continue,
     };
 
@@ -707,8 +772,12 @@ pub(crate) async fn handle_cow_readlink(
 ) -> NotifAction {
     // readlinkat(dirfd, pathname, buf, bufsiz)
     let dirfd = notif.data.args[0] as i64;
+    let virtual_cwd = {
+        let st = cow_state.lock().await;
+        st.virtual_cwds.get(&(notif.pid as i32)).cloned()
+    };
     let path = match read_path(notif, notif.data.args[1], notif_fd) {
-        Some(p) => resolve_at_path(notif, dirfd, &p),
+        Some(p) => resolve_at_path_with_virtual(notif, dirfd, &p, virtual_cwd.as_deref()),
         None => return NotifAction::Continue,
     };
     let buf_addr = notif.data.args[2];
@@ -765,9 +834,23 @@ pub(crate) async fn handle_cow_getdents(
         None => return NotifAction::Continue,
     };
 
-    if !cow.has_changes() || !cow.matches(&target) {
+    if !cow.has_changes() {
         return NotifAction::Continue;
     }
+
+    let target_path = Path::new(&target);
+    let rel_path = if cow.matches(&target) {
+        cow.safe_rel(&target).unwrap_or_else(|| ".".to_string())
+    } else if let Ok(rel) = target_path.strip_prefix(cow.upper_dir()) {
+        let rel = rel.to_string_lossy();
+        if rel.is_empty() {
+            ".".to_string()
+        } else {
+            rel.into_owned()
+        }
+    } else {
+        return NotifAction::Continue;
+    };
 
     // Build cache on first call; invalidate if fd was reused for a different dir.
     let cache_key = (pid as i32, child_fd);
@@ -783,7 +866,6 @@ pub(crate) async fn handle_cow_getdents(
     }
     if !st.dir_cache.contains_key(&cache_key) {
         let cow = st.branch.as_ref().unwrap();
-        let rel_path = cow.safe_rel(&target).unwrap_or_else(|| ".".to_string());
         let merged = cow.list_merged_dir(&rel_path);
 
         let upper_dir = cow.upper_dir().join(&rel_path);
@@ -867,17 +949,14 @@ pub(crate) async fn handle_cow_chdir(
     };
     let orig_path_buf_len = path.len() + 1; // NUL-terminated size in child memory
 
-    // Resolve relative paths against the process's cwd.
-    let abs_path = if std::path::Path::new(&path).is_absolute() {
-        path
-    } else {
-        match std::fs::read_link(format!("/proc/{}/cwd", notif.pid)) {
-            Ok(cwd) => cwd.join(&path).to_string_lossy().into_owned(),
-            Err(_) => return NotifAction::Continue,
-        }
-    };
-
     let st = cow_state.lock().await;
+    let virtual_cwd = st.virtual_cwds.get(&(notif.pid as i32)).cloned();
+    let abs_path = resolve_at_path_with_virtual(
+        notif,
+        libc::AT_FDCWD as i64,
+        &path,
+        virtual_cwd.as_deref(),
+    );
     let cow = match st.branch.as_ref() {
         Some(c) => c,
         None => return NotifAction::Continue,
@@ -950,5 +1029,51 @@ pub(crate) async fn handle_cow_chdir(
         return NotifAction::Errno(libc::EFAULT);
     }
 
+    let mut st = cow_state.lock().await;
+    st.virtual_cwds.insert(notif.pid as i32, abs_path);
+
     NotifAction::Continue
+}
+
+/// Handle getcwd after chdir into a COW-only directory.
+pub(crate) async fn handle_cow_getcwd(
+    notif: &SeccompNotif,
+    cow_state: &Arc<Mutex<CowState>>,
+    notif_fd: RawFd,
+) -> NotifAction {
+    let buf_addr = notif.data.args[0];
+    let buf_size = (notif.data.args[1] & 0xFFFF_FFFF) as usize;
+
+    let st = cow_state.lock().await;
+    let cow = match st.branch.as_ref() {
+        Some(c) => c,
+        None => return NotifAction::Continue,
+    };
+
+    let virtual_cwd = if let Some(cwd) = st.virtual_cwds.get(&(notif.pid as i32)) {
+        cwd.clone()
+    } else {
+        let cwd = match std::fs::read_link(format!("/proc/{}/cwd", notif.pid)) {
+            Ok(c) => c,
+            Err(_) => return NotifAction::Continue,
+        };
+        match cwd.strip_prefix(cow.upper_dir()) {
+            Ok(rel) => cow.workdir().join(rel).to_string_lossy().into_owned(),
+            Err(_) => return NotifAction::Continue,
+        }
+    };
+    drop(st);
+
+    let cwd_bytes = virtual_cwd.as_bytes();
+    if cwd_bytes.len() + 1 > buf_size {
+        return NotifAction::Errno(libc::ERANGE);
+    }
+
+    let mut write_buf = cwd_bytes.to_vec();
+    write_buf.push(0);
+
+    if write_child_mem(notif_fd, notif.id, notif.pid, buf_addr, &write_buf).is_err() {
+        return NotifAction::Continue;
+    }
+    NotifAction::ReturnValue(write_buf.len() as i64)
 }

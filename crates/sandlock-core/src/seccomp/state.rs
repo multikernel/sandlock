@@ -78,6 +78,8 @@ pub struct CowState {
     /// Getdents cache for COW directories.
     /// Value is (host_path, entries) to detect fd reuse and invalidate stale entries.
     pub dir_cache: HashMap<(i32, u32), (String, Vec<Vec<u8>>)>,
+    /// Logical cwd for processes that chdir into COW-only directories.
+    pub virtual_cwds: HashMap<i32, String>,
 }
 
 impl CowState {
@@ -85,6 +87,7 @@ impl CowState {
         Self {
             branch: None,
             dir_cache: HashMap::new(),
+            virtual_cwds: HashMap::new(),
         }
     }
 }

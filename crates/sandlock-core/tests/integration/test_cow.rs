@@ -261,7 +261,6 @@ async fn test_seccomp_cow_relative_path_commit() {
 /// O_DIRECTORY must resolve to the upper path.  Without this fix,
 /// prepare_open skipped O_DIRECTORY opens and the kernel returned ENOENT.
 #[tokio::test]
-#[cfg_attr(target_arch = "aarch64", ignore = "ARM64 COW directory fd injection needs follow-up")]
 async fn test_seccomp_cow_open_directory() {
     let workdir = temp_dir("seccomp-opendir");
     let out_file = workdir.join("opendir_ok.txt");
@@ -306,7 +305,6 @@ async fn test_seccomp_cow_open_directory() {
 /// chdir must be intercepted and redirected to the upper path.  Without
 /// this, the kernel returns ENOENT because it doesn't see the COW directory.
 #[tokio::test]
-#[cfg_attr(target_arch = "aarch64", ignore = "ARM64 COW chdir currently exposes /proc/self/fd cwd")]
 async fn test_seccomp_cow_chdir_to_created_dir() {
     let workdir = temp_dir("seccomp-chdir");
     let out_file = workdir.join("chdir_ok.txt");
@@ -322,8 +320,9 @@ async fn test_seccomp_cow_chdir_to_created_dir() {
         .unwrap();
 
     // mkdir creates the dir in COW upper only; cd must see it via interception.
+    // Use physical pwd so the assertion covers getcwd virtualization.
     let script = format!(
-        "mkdir -p subdir/deep && cd subdir/deep && pwd > {}",
+        "mkdir -p subdir/deep && cd subdir/deep && pwd -P > {}",
         out_file.display()
     );
     let result = Sandbox::run(&policy, &["sh", "-c", &script]).await;
@@ -343,14 +342,14 @@ async fn test_seccomp_cow_chdir_to_created_dir() {
     let _ = fs::remove_dir_all(&workdir);
 }
 
-/// Test that the legacy open() syscall works correctly with COW.
+/// Test that the raw open syscall ABI works correctly with COW.
 ///
 /// Regression test: handle_cow_open always read args in openat() layout
 /// (dirfd=args[0], path=args[1], flags=args[2]), but open() uses
 /// (path=args[0], flags=args[1], mode=args[2]). This caused COW to miss
-/// all legacy open() calls, falling through to the kernel.
+/// all legacy open() calls on x86_64, falling through to the kernel. ARM64
+/// does not provide SYS_open, so it uses the equivalent raw openat ABI.
 #[tokio::test]
-#[cfg_attr(target_arch = "aarch64", ignore = "ARM64 Linux does not provide the legacy SYS_open ABI")]
 async fn test_seccomp_cow_legacy_open_syscall() {
     let workdir = temp_dir("seccomp-legacy-open");
     let out_file = std::env::temp_dir().join(format!(
@@ -367,18 +366,21 @@ async fn test_seccomp_cow_legacy_open_syscall() {
         .build()
         .unwrap();
 
-    // Use raw SYS_open syscall (not openat) to create a file, then verify
-    // it's visible during the run but discarded on abort.
+    // Use raw syscall ABI to create a file, then verify it's visible during
+    // the run but discarded on abort. x86_64 uses legacy SYS_open; ARM64 uses
+    // the equivalent openat(AT_FDCWD, ...) ABI.
     let script = format!(concat!(
-        "import ctypes, os\n",
+        "import ctypes, os, platform\n",
         "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
-        "SYS_open = 2\n",
         "O_WRONLY = 1; O_CREAT = 64; O_TRUNC = 512\n",
         "path = b'{wd}/newfile.txt'\n",
-        "fd = libc.syscall(SYS_open, path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)\n",
+        "if platform.machine() == 'aarch64':\n",
+        "    fd = libc.syscall(56, -100, path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)\n",
+        "else:\n",
+        "    fd = libc.syscall(2, path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)\n",
         "err = ctypes.get_errno()\n",
         "if fd >= 0:\n",
-        "    os.write(fd, b'created via SYS_open')\n",
+        "    os.write(fd, b'created via raw open')\n",
         "    os.close(fd)\n",
         "    content = open('{wd}/newfile.txt').read()\n",
         "    open('{out}', 'w').write(content)\n",
@@ -389,7 +391,7 @@ async fn test_seccomp_cow_legacy_open_syscall() {
     let result = Sandbox::run(&policy, &["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}, stderr={}", result.code(), result.stderr_str().unwrap_or(""));
     let content = fs::read_to_string(&out_file).unwrap_or_default();
-    assert_eq!(content, "created via SYS_open", "SYS_open should work with COW");
+    assert_eq!(content, "created via raw open", "raw open ABI should work with COW");
     // After abort, the file should not exist on the real filesystem
     assert!(!workdir.join("newfile.txt").exists(), "newfile.txt should not exist after abort");
 
@@ -405,7 +407,6 @@ async fn test_seccomp_cow_legacy_open_syscall() {
 /// Since the file was just copied to upper, the kernel's open() returned
 /// EEXIST. The fix strips O_EXCL from the supervisor's open flags.
 #[tokio::test]
-#[cfg_attr(target_arch = "aarch64", ignore = "test uses legacy SYS_open, which ARM64 Linux does not provide")]
 async fn test_seccomp_cow_excl_after_unlink() {
     let workdir = temp_dir("seccomp-excl-unlink");
     let out_file = std::env::temp_dir().join(format!(
@@ -423,9 +424,9 @@ async fn test_seccomp_cow_excl_after_unlink() {
         .build()
         .unwrap();
 
-    // Unlink the file, then recreate it with O_CREAT|O_EXCL via SYS_open
+    // Unlink the file, then recreate it with O_CREAT|O_EXCL via raw open ABI.
     let script = format!(concat!(
-        "import ctypes, os\n",
+        "import ctypes, os, platform\n",
         "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
         "path = b'{wd}/target.txt'\n",
         "ret = libc.unlink(path)\n",
@@ -433,7 +434,10 @@ async fn test_seccomp_cow_excl_after_unlink() {
         "    open('{out}', 'w').write(f'UNLINK_FAILED:{{ctypes.get_errno()}}')\n",
         "    raise SystemExit(1)\n",
         "O_WRONLY = 1; O_CREAT = 64; O_EXCL = 128\n",
-        "fd = libc.syscall(2, path, O_WRONLY | O_CREAT | O_EXCL, 0o644)\n",
+        "if platform.machine() == 'aarch64':\n",
+        "    fd = libc.syscall(56, -100, path, O_WRONLY | O_CREAT | O_EXCL, 0o644)\n",
+        "else:\n",
+        "    fd = libc.syscall(2, path, O_WRONLY | O_CREAT | O_EXCL, 0o644)\n",
         "err = ctypes.get_errno()\n",
         "if fd >= 0:\n",
         "    os.write(fd, b'recreated')\n",

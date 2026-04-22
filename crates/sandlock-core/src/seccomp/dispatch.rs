@@ -714,4 +714,12 @@ fn register_cow_handlers(table: &mut DispatchTable) {
             crate::cow::dispatch::handle_cow_chdir(&notif, &cow, notif_fd).await
         })
     }));
+
+    // getcwd — return logical workdir path after chdir into a COW-only dir
+    table.register(libc::SYS_getcwd, Box::new(|notif, ctx, notif_fd| {
+        let cow = Arc::clone(&ctx.cow);
+        Box::pin(async move {
+            crate::cow::dispatch::handle_cow_getcwd(&notif, &cow, notif_fd).await
+        })
+    }));
 }

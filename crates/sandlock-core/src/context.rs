@@ -323,6 +323,7 @@ pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
             libc::SYS_readlinkat as u32,
             libc::SYS_getdents64 as u32,
             libc::SYS_chdir as u32,
+            libc::SYS_getcwd as u32,
         ]);
         for nr in [
             arch::SYS_OPEN, arch::SYS_UNLINK, arch::SYS_RMDIR, arch::SYS_MKDIR,
