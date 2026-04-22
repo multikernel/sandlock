@@ -102,21 +102,47 @@ fn ptrace_detach(pid: i32) -> io::Result<()> {
 fn ptrace_getregs(pid: i32) -> io::Result<Vec<u64>> {
     #[cfg(target_arch = "x86_64")]
     {
-    // user_regs_struct is 27 u64 fields on x86_64 (216 bytes)
-    let mut regs = vec![0u64; 27];
-    let ret = unsafe { libc::ptrace(libc::PTRACE_GETREGS, pid, 0, regs.as_mut_ptr()) };
-    if ret < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(regs)
+        // user_regs_struct is 27 u64 fields on x86_64 (216 bytes)
+        let mut regs = vec![0u64; 27];
+        let ret = unsafe { libc::ptrace(libc::PTRACE_GETREGS, pid, 0, regs.as_mut_ptr()) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(regs)
     }
 
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Linux arm64 exposes general-purpose registers through
+        // PTRACE_GETREGSET/NT_PRSTATUS. user_pt_regs is:
+        // x0-x30, sp, pc, pstate (34 u64 values).
+        const NT_PRSTATUS: libc::c_int = 1;
+        let mut regs = vec![0u64; 34];
+        let mut iov = libc::iovec {
+            iov_base: regs.as_mut_ptr() as *mut libc::c_void,
+            iov_len: regs.len() * std::mem::size_of::<u64>(),
+        };
+        let ret = unsafe {
+            libc::ptrace(
+                libc::PTRACE_GETREGSET,
+                pid,
+                NT_PRSTATUS as usize as *mut libc::c_void,
+                &mut iov as *mut libc::iovec as *mut libc::c_void,
+            )
+        };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        regs.truncate(iov.iov_len / std::mem::size_of::<u64>());
+        Ok(regs)
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         let _ = pid;
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "checkpoint register capture is only implemented on x86_64",
+            "checkpoint register capture is not implemented on this architecture",
         ))
     }
 }

@@ -87,7 +87,6 @@ async fn test_random_seed_different_seeds() {
 /// Test that time_start sets frozen time.
 /// The date command should show a year matching the frozen time.
 #[tokio::test]
-#[cfg_attr(target_arch = "aarch64", ignore = "ARM64 vDSO time patching is planned for stage 4")]
 async fn test_time_start_frozen() {
     // Freeze to 2000-06-15T00:00:00Z (mid-year avoids timezone boundary issues)
     let y2k = SystemTime::UNIX_EPOCH + Duration::from_secs(961027200);
@@ -147,9 +146,8 @@ async fn test_combined_determinism() {
 }
 
 /// Test that deterministic_dirs produces sorted directory listings.
-/// Run ls twice — output should match and be sorted.
+/// Run directory iteration twice — output should match and be sorted.
 #[tokio::test]
-#[cfg_attr(target_arch = "aarch64", ignore = "ARM64 deterministic getdents virtualization needs follow-up")]
 async fn test_deterministic_dirs() {
     let policy = Policy::builder()
         .fs_read("/usr")
@@ -162,11 +160,22 @@ async fn test_deterministic_dirs() {
         .build()
         .unwrap();
 
-    // Use ls -f -1 to preserve raw getdents order (no re-sorting by ls).
-    let r1 = Sandbox::run(&policy, &["ls", "-f", "-1", "/etc"]).await.unwrap();
-    let r2 = Sandbox::run(&policy, &["ls", "-f", "-1", "/etc"]).await.unwrap();
-    assert!(r1.success(), "First ls failed");
-    assert!(r2.success(), "Second ls failed");
+    // Read directory entries without userland sorting so the assertion covers
+    // the sandbox's getdents virtualization. Some minimal ls implementations
+    // do not support `-f`, so avoid depending on ls option support here.
+    let scan = "python3 - <<'PY'\nimport os\nprint('\\n'.join(e.name for e in os.scandir('/etc')))\nPY";
+    let r1 = Sandbox::run(&policy, &["sh", "-c", scan]).await.unwrap();
+    let r2 = Sandbox::run(&policy, &["sh", "-c", scan]).await.unwrap();
+    assert!(
+        r1.success(),
+        "First directory scan failed: {}",
+        String::from_utf8_lossy(r1.stderr.as_deref().unwrap_or_default())
+    );
+    assert!(
+        r2.success(),
+        "Second directory scan failed: {}",
+        String::from_utf8_lossy(r2.stderr.as_deref().unwrap_or_default())
+    );
 
     let out1 = String::from_utf8_lossy(r1.stdout.as_deref().unwrap_or_default());
     let out2 = String::from_utf8_lossy(r2.stdout.as_deref().unwrap_or_default());
@@ -176,10 +185,11 @@ async fn test_deterministic_dirs() {
     );
     assert_eq!(
         out1, out2,
-        "Two ls -f runs should produce identical output with deterministic_dirs"
+        "Two directory scans should produce identical output with deterministic_dirs"
     );
 
-    // Verify the output is actually sorted (skip . and .. entries from ls -f).
+    // Verify the output is actually sorted (skip dot entries when the runtime
+    // exposes them).
     let lines: Vec<&str> = out1.lines()
         .filter(|l| *l != "." && *l != "..")
         .collect();

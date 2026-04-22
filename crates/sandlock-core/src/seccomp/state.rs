@@ -50,9 +50,9 @@ impl ResourceState {
 pub struct ProcfsState {
     /// PIDs belonging to the sandbox (for /proc PID filtering).
     pub proc_pids: HashSet<i32>,
-    /// Cache of filtered dirent entries keyed by (pid, fd).
+    /// Cache of filtered dirent entries keyed by (pid, fd, directory target).
     /// Populated on first getdents64 call for a /proc directory, drained on subsequent calls.
-    pub getdents_cache: HashMap<(i32, u32), Vec<Vec<u8>>>,
+    pub getdents_cache: HashMap<(i32, u32, String), Vec<Vec<u8>>>,
     /// Base address of the last vDSO we patched (0 = not yet patched).
     pub vdso_patched_addr: u64,
 }

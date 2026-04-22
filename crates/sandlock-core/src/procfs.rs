@@ -592,24 +592,40 @@ pub(crate) async fn handle_sorted_getdents(
     let buf_addr = notif.data.args[1];
     let buf_size = (notif.data.args[2] & 0xFFFF_FFFF) as usize;
 
-    let cache_key = (pid as i32, child_fd);
+    let link_path = format!("/proc/{}/fd/{}", pid, child_fd);
+    let dir_path = match std::fs::read_link(&link_path) {
+        Ok(t) => t,
+        Err(_) => return NotifAction::Continue,
+    };
+    let cache_key = (
+        pid as i32,
+        child_fd,
+        dir_path.to_string_lossy().into_owned(),
+    );
     let mut pfs = procfs.lock().await;
 
-    // Build and cache sorted entries on first call for this (pid, fd) pair.
-    // An empty Vec means "already fully consumed" — return 0 (EOF).
+    // Build and cache sorted entries on first call for this open directory.
+    // Remove an empty cache on EOF so later fd reuse can rebuild entries.
     if !pfs.getdents_cache.contains_key(&cache_key) {
-        let link_path = format!("/proc/{}/fd/{}", pid, child_fd);
-        let dir_path = match std::fs::read_link(&link_path) {
-            Ok(t) => t,
-            Err(_) => return NotifAction::Continue,
-        };
-
         let dir = match std::fs::read_dir(&dir_path) {
             Ok(d) => d,
             Err(_) => return NotifAction::Continue,
         };
 
-        let mut names: Vec<_> = dir
+        let mut names: Vec<_> = Vec::new();
+        {
+            use std::os::unix::fs::MetadataExt;
+            let dot_ino = std::fs::symlink_metadata(&dir_path).map(|m| m.ino()).unwrap_or(0);
+            let dotdot_ino = dir_path
+                .parent()
+                .and_then(|p| std::fs::symlink_metadata(p).ok())
+                .map(|m| m.ino())
+                .unwrap_or(dot_ino);
+            names.push((".".to_string(), DT_DIR, dot_ino));
+            names.push(("..".to_string(), DT_DIR, dotdot_ino));
+        }
+
+        names.extend(dir
             .filter_map(|e| e.ok())
             .map(|e| {
                 let name = e.file_name().to_string_lossy().into_owned();
@@ -623,8 +639,7 @@ pub(crate) async fn handle_sorted_getdents(
                     e.metadata().map(|m| m.st_ino()).unwrap_or(0)
                 };
                 (name, d_type, d_ino)
-            })
-            .collect();
+            }));
 
         names.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -636,7 +651,7 @@ pub(crate) async fn handle_sorted_getdents(
             })
             .collect();
 
-        pfs.getdents_cache.insert(cache_key, entries);
+        pfs.getdents_cache.insert(cache_key.clone(), entries);
     }
 
     let entries = match pfs.getdents_cache.get_mut(&cache_key) {
@@ -646,6 +661,7 @@ pub(crate) async fn handle_sorted_getdents(
 
     // Empty cache = already fully drained on a prior call → return 0 (EOF).
     if entries.is_empty() {
+        pfs.getdents_cache.remove(&cache_key);
         return NotifAction::ReturnValue(0);
     }
 
@@ -770,13 +786,13 @@ pub(crate) async fn handle_getdents(
         return NotifAction::Continue;
     }
 
-    let cache_key = (pid as i32, child_fd);
+    let cache_key = (pid as i32, child_fd, target.to_string_lossy().into_owned());
     let mut pfs = procfs.lock().await;
 
     // Build and cache entries on first call for this (pid, fd) pair.
     if !pfs.getdents_cache.contains_key(&cache_key) {
         let entries = build_filtered_dirents(&pfs.proc_pids);
-        pfs.getdents_cache.insert(cache_key, entries);
+        pfs.getdents_cache.insert(cache_key.clone(), entries);
     }
 
     let entries = match pfs.getdents_cache.get_mut(&cache_key) {
@@ -797,6 +813,7 @@ pub(crate) async fn handle_getdents(
 
     // Empty cache = already fully drained on a prior call → return 0 (EOF).
     if entries.is_empty() {
+        pfs.getdents_cache.remove(&cache_key);
         return NotifAction::ReturnValue(0);
     }
 
