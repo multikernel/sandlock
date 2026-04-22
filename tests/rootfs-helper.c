@@ -224,6 +224,14 @@ static int cmd_access(int argc, char **argv) {
 
 /* ── legacy syscall wrappers (for testing chroot handler) ──── */
 
+#if defined(SYS_stat) && defined(SYS_lstat) && defined(SYS_open) && \
+    defined(SYS_access) && defined(SYS_readlink) && defined(SYS_mkdir) && \
+    defined(SYS_rmdir) && defined(SYS_unlink) && defined(SYS_rename) && \
+    defined(SYS_symlink) && defined(SYS_chmod)
+#define HAVE_LEGACY_PATH_SYSCALLS 1
+#endif
+
+#ifdef HAVE_LEGACY_PATH_SYSCALLS
 static int cmd_legacy_stat(int argc, char **argv) {
     if (argc < 1) return 1;
     struct stat st;
@@ -357,6 +365,14 @@ static int cmd_legacy_chmod(int argc, char **argv) {
     printf("OK\n");
     return 0;
 }
+#else
+static int cmd_legacy_unsupported(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    printf("ERR %d\n", ENOSYS);
+    return 1;
+}
+#endif
 
 /* ── dispatch ───────────────────────────────────────────────── */
 
@@ -386,6 +402,7 @@ static int dispatch(const char *cmd, int argc, char **argv) {
     if (strcmp(cmd, "false") == 0)          return 1;
 
     /* Legacy syscall variants */
+#ifdef HAVE_LEGACY_PATH_SYSCALLS
     if (strcmp(cmd, "legacy-stat") == 0)    return cmd_legacy_stat(argc, argv);
     if (strcmp(cmd, "legacy-lstat") == 0)   return cmd_legacy_lstat(argc, argv);
     if (strcmp(cmd, "legacy-open") == 0)    return cmd_legacy_open(argc, argv);
@@ -397,6 +414,9 @@ static int dispatch(const char *cmd, int argc, char **argv) {
     if (strcmp(cmd, "legacy-rename") == 0)  return cmd_legacy_rename(argc, argv);
     if (strcmp(cmd, "legacy-symlink") == 0) return cmd_legacy_symlink(argc, argv);
     if (strcmp(cmd, "legacy-chmod") == 0)   return cmd_legacy_chmod(argc, argv);
+#else
+    if (strncmp(cmd, "legacy-", 7) == 0)    return cmd_legacy_unsupported(argc, argv);
+#endif
 
     fprintf(stderr, "rootfs-helper: unknown command '%s'\n", cmd);
     return 127;
