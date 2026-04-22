@@ -4,6 +4,7 @@
 mod imp {
     pub const AUDIT_ARCH: u32 = 0xC000_003E;
     pub const SYS_SECCOMP: i64 = 317;
+    pub const SYS_MEMFD_CREATE: i64 = 319;
     pub const SYS_PIDFD_OPEN: i64 = 434;
     pub const SYS_PIDFD_GETFD: i64 = 438;
 
@@ -34,6 +35,7 @@ mod imp {
 mod imp {
     pub const AUDIT_ARCH: u32 = 0xC000_00B7;
     pub const SYS_SECCOMP: i64 = 277;
+    pub const SYS_MEMFD_CREATE: i64 = 279;
     pub const SYS_PIDFD_OPEN: i64 = 434;
     pub const SYS_PIDFD_GETFD: i64 = 438;
 

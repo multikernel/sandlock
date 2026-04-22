@@ -107,7 +107,11 @@ pub(crate) async fn handle_cow_open(
 
         // Read-only opens don't need interception unless the file was
         // modified or deleted in the COW layer.
-        const WRITE_FLAGS: u64 = 0o1 | 0o2 | 0o100 | 0o1000 | 0o2000;
+        const WRITE_FLAGS: u64 = (libc::O_WRONLY
+            | libc::O_RDWR
+            | libc::O_CREAT
+            | libc::O_TRUNC
+            | libc::O_APPEND) as u64;
         let is_write = flags & WRITE_FLAGS != 0;
         if !is_write && !cow.needs_read_intercept(&path) {
             return NotifAction::Continue;

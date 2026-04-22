@@ -388,6 +388,38 @@ pub(crate) fn read_child_mem(
     Ok(result)
 }
 
+/// Read a NUL-terminated string from child memory without crossing unmapped
+/// page boundaries in a single `process_vm_readv` call.
+pub(crate) fn read_child_cstr(
+    notif_fd: RawFd,
+    id: u64,
+    pid: u32,
+    addr: u64,
+    max_len: usize,
+) -> Option<String> {
+    if addr == 0 || max_len == 0 {
+        return None;
+    }
+
+    const PAGE_SIZE: u64 = 4096;
+    let mut result = Vec::with_capacity(max_len.min(256));
+    let mut cur = addr;
+    while result.len() < max_len {
+        let page_remaining = PAGE_SIZE - (cur % PAGE_SIZE);
+        let remaining = max_len - result.len();
+        let to_read = page_remaining.min(remaining as u64) as usize;
+        let bytes = read_child_mem(notif_fd, id, pid, cur, to_read).ok()?;
+        if let Some(nul) = bytes.iter().position(|&b| b == 0) {
+            result.extend_from_slice(&bytes[..nul]);
+            return String::from_utf8(result).ok();
+        }
+        result.extend_from_slice(&bytes);
+        cur += to_read as u64;
+    }
+
+    String::from_utf8(result).ok()
+}
+
 /// Write bytes to a child process via process_vm_writev.
 ///
 /// Performs TOCTOU validation by calling `id_valid` before and after

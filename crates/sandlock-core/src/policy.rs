@@ -418,6 +418,15 @@ impl PolicyBuilder {
         self
     }
 
+    pub fn fs_read_if_exists(self, path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        if path.exists() {
+            self.fs_read(path)
+        } else {
+            self
+        }
+    }
+
     pub fn fs_deny(mut self, path: impl Into<PathBuf>) -> Self {
         self.fs_denied.push(path.into());
         self

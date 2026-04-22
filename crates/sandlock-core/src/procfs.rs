@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction, NotifPolicy};
+use crate::seccomp::notif::{read_child_cstr, write_child_mem, NotifAction, NotifPolicy};
 use crate::seccomp::state::{NetworkState, ProcfsState};
 use crate::sys::structs::{SeccompNotif, EACCES};
 use crate::sys::syscall;
@@ -346,13 +346,7 @@ fn inject_memfd(content: &[u8]) -> NotifAction {
 
 /// Read a NUL-terminated path string from child memory.
 fn read_path(notif: &SeccompNotif, addr: u64, notif_fd: RawFd) -> Option<String> {
-    if addr == 0 {
-        return None;
-    }
-    // Read up to 256 bytes — enough for any /proc path we care about.
-    let bytes = read_child_mem(notif_fd, notif.id, notif.pid, addr, 256).ok()?;
-    let nul_pos = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    String::from_utf8(bytes[..nul_pos].to_vec()).ok()
+    read_child_cstr(notif_fd, notif.id, notif.pid, addr, 4096)
 }
 
 // ============================================================

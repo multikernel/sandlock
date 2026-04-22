@@ -743,6 +743,8 @@ class _NativePolicy:
         b = _lib.sandlock_policy_builder_new()
 
         for p in (policy.fs_readable or []):
+            if str(p) == "/lib64" and not os.path.exists("/lib64"):
+                continue
             b = _b_fs_read(b, _encode(str(p)))
         for p in (policy.fs_writable or []):
             b = _b_fs_write(b, _encode(str(p)))
@@ -1484,5 +1486,4 @@ class Pipeline:
             stderr=stderr,
             error=error,
         )
-
 
