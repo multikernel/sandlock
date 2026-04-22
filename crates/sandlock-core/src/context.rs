@@ -1132,17 +1132,29 @@ mod tests {
 
     #[test]
     fn test_syscall_name_to_nr_covers_defaults() {
-        // Every name in DEFAULT_DENY_SYSCALLS except nfsservctl should resolve
+        // Every name in DEFAULT_DENY_SYSCALLS should resolve unless the
+        // running architecture does not expose that syscall.
+        let expected_unresolved: &[&str] = &[
+            "nfsservctl",
+            #[cfg(target_arch = "aarch64")]
+            "ioperm",
+            #[cfg(target_arch = "aarch64")]
+            "iopl",
+        ];
         let mut skipped = 0;
         for name in DEFAULT_DENY_SYSCALLS {
             match syscall_name_to_nr(name) {
                 Some(_) => {}
                 None => {
-                    assert_eq!(*name, "nfsservctl", "unexpected unresolved syscall: {}", name);
+                    assert!(
+                        expected_unresolved.contains(name),
+                        "unexpected unresolved syscall: {}",
+                        name
+                    );
                     skipped += 1;
                 }
             }
         }
-        assert_eq!(skipped, 1); // only nfsservctl
+        assert_eq!(skipped, expected_unresolved.len());
     }
 }

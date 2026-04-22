@@ -200,7 +200,8 @@ mod tests {
         // Should find at least clock_gettime
         assert!(
             symbols.contains_key("clock_gettime")
-                || symbols.contains_key("__vdso_clock_gettime"),
+                || symbols.contains_key("__vdso_clock_gettime")
+                || symbols.contains_key("__kernel_clock_gettime"),
             "Expected clock_gettime in vDSO symbols, found: {:?}",
             symbols.keys().collect::<Vec<_>>()
         );
