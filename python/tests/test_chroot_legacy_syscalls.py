@@ -8,12 +8,19 @@ handles them correctly.
 """
 
 import os
+import platform
 import shutil
 from pathlib import Path
 
 import pytest
 
 from sandlock import Policy, Sandbox
+
+
+pytestmark = pytest.mark.skipif(
+    platform.machine() == "aarch64",
+    reason="ARM64 Linux does not provide legacy non-*at path syscalls",
+)
 
 
 # ── helpers ──────────────────────────────────────────────────────

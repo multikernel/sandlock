@@ -3,7 +3,7 @@ use sandlock_core::{Policy, Sandbox};
 
 fn base_policy() -> sandlock_core::PolicyBuilder {
     Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
         .fs_read("/bin").fs_read("/etc").fs_read("/proc")
         .fs_read("/dev").fs_write("/tmp")
 }

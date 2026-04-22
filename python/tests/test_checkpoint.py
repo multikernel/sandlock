@@ -2,12 +2,19 @@
 """Tests for sandlock.Checkpoint (save_fn / restore_fn / persistence)."""
 
 import json
+import platform
 import sys
 
 import pytest
 
 from sandlock import Sandbox, Policy, Checkpoint
 from sandlock._sdk import _lib, _make_argv
+
+
+pytestmark = pytest.mark.skipif(
+    platform.machine() == "aarch64",
+    reason="ARM64 checkpoint register capture is planned for stage 4",
+)
 
 
 _PYTHON_READABLE = list(dict.fromkeys([

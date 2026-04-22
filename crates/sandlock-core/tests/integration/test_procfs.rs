@@ -7,7 +7,7 @@ async fn test_num_cpus_virtualization() {
     let policy = Policy::builder()
         .fs_read("/usr")
         .fs_read("/lib")
-        .fs_read("/lib64")
+        .fs_read_if_exists("/lib64")
         .fs_read("/bin")
         .fs_read("/etc")
         .fs_read("/proc")
@@ -34,7 +34,7 @@ async fn test_meminfo_virtualization() {
     let policy = Policy::builder()
         .fs_read("/usr")
         .fs_read("/lib")
-        .fs_read("/lib64")
+        .fs_read_if_exists("/lib64")
         .fs_read("/bin")
         .fs_read("/etc")
         .fs_read("/proc")
@@ -59,7 +59,7 @@ async fn test_sensitive_proc_blocked() {
     let policy = Policy::builder()
         .fs_read("/usr")
         .fs_read("/lib")
-        .fs_read("/lib64")
+        .fs_read_if_exists("/lib64")
         .fs_read("/bin")
         .fs_read("/etc")
         .fs_read("/proc")
@@ -78,7 +78,7 @@ async fn test_no_proc_virt_still_works() {
     let policy = Policy::builder()
         .fs_read("/usr")
         .fs_read("/lib")
-        .fs_read("/lib64")
+        .fs_read_if_exists("/lib64")
         .fs_read("/bin")
         .fs_read("/etc")
         .fs_read("/proc")
@@ -103,7 +103,7 @@ async fn test_proc_net_tcp_filtered() {
     drop(listener);
 
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
         .fs_read("/etc").fs_read("/proc").fs_read("/dev")
         .fs_write("/tmp")
         .net_bind_port(port)
@@ -142,7 +142,7 @@ async fn test_proc_net_tcp_filtered() {
 #[tokio::test]
 async fn test_proc_mounts_virtualized() {
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
         .fs_read("/etc").fs_read("/proc").fs_read("/dev")
         .build()
         .unwrap();
@@ -161,7 +161,7 @@ async fn test_proc_mounts_virtualized() {
 #[tokio::test]
 async fn test_proc_self_mountinfo_virtualized() {
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
         .fs_read("/etc").fs_read("/proc").fs_read("/dev")
         .build()
         .unwrap();
@@ -183,7 +183,7 @@ async fn test_proc_parent_pid_blocked() {
     ));
 
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
         .fs_read("/etc").fs_read("/proc").fs_read("/dev")
         .fs_write("/tmp")
         .build()
@@ -229,7 +229,7 @@ async fn test_proc_net_tcp_hides_host_ports() {
     ));
 
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
         .fs_read("/etc").fs_read("/proc").fs_read("/dev")
         .fs_write("/tmp")
         .port_remap(true)

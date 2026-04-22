@@ -3,6 +3,7 @@
 
 import json
 import os
+import platform
 import socket
 import sys
 import threading
@@ -386,6 +387,10 @@ class TestDryRun:
 class TestNewPolicyFields:
     """Tests for newly wired FFI policy fields."""
 
+    @pytest.mark.skipif(
+        platform.machine() == "aarch64",
+        reason="ARM64 vDSO time patching is planned for stage 4",
+    )
     def test_time_start(self):
         from datetime import datetime, timezone
         # Freeze time to 2000-06-15

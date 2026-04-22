@@ -12,7 +12,7 @@ from sandlock import Sandbox, Policy, Stage, Pipeline, NamedStage, Gather, Gathe
 
 # --- Helpers ---
 
-_PYTHON_PREFIX = os.path.dirname(os.path.dirname(os.path.realpath(sys.executable)))
+_PYTHON_PREFIX = sys.prefix
 
 def _policy(**overrides):
     """Minimal policy for testing."""
