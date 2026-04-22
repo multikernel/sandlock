@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::arch;
+use crate::cow::seccomp::SeccompCowBranch;
 use crate::procfs::{build_dirent64, DT_DIR, DT_LNK, DT_REG};
 use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction};
 use crate::seccomp::state::CowState;
@@ -91,6 +92,14 @@ fn resolve_at_path_with_virtual(
     }
 }
 
+fn map_cow_upper_path(cow: &SeccompCowBranch, path: &str) -> String {
+    let path = PathBuf::from(path);
+    if let Ok(rel) = path.strip_prefix(cow.upper_dir()) {
+        return normalize_path(cow.workdir().join(rel)).to_string_lossy().into_owned();
+    }
+    normalize_path(path).to_string_lossy().into_owned()
+}
+
 // ============================================================
 // openat handler
 // ============================================================
@@ -124,7 +133,7 @@ pub(crate) async fn handle_cow_open(
     } else {
         None
     };
-    let path = resolve_at_path_with_virtual(notif, dirfd, &rel_path, virtual_cwd.as_deref());
+    let mut path = resolve_at_path_with_virtual(notif, dirfd, &rel_path, virtual_cwd.as_deref());
 
     // Phase 1: determine plan under lock (no heavy I/O)
     let plan = {
@@ -134,6 +143,7 @@ pub(crate) async fn handle_cow_open(
             None => return NotifAction::Continue,
         };
 
+        path = map_cow_upper_path(cow, &path);
         if !cow.matches(&path) {
             return NotifAction::Continue;
         }
@@ -221,6 +231,28 @@ enum CowWriteOp {
     Chmod { path: String, mode: u32 },
     Chown { path: String, uid: u32, gid: u32 },
     Truncate { path: String, length: i64 },
+}
+
+impl CowWriteOp {
+    fn remap_upper_paths(&mut self, cow: &SeccompCowBranch) {
+        match self {
+            CowWriteOp::Unlink { path, .. }
+            | CowWriteOp::Mkdir { path }
+            | CowWriteOp::Chmod { path, .. }
+            | CowWriteOp::Chown { path, .. }
+            | CowWriteOp::Truncate { path, .. } => {
+                *path = map_cow_upper_path(cow, path);
+            }
+            CowWriteOp::Rename { old_path, new_path }
+            | CowWriteOp::Link { old_path, new_path } => {
+                *old_path = map_cow_upper_path(cow, old_path);
+                *new_path = map_cow_upper_path(cow, new_path);
+            }
+            CowWriteOp::Symlink { linkpath, .. } => {
+                *linkpath = map_cow_upper_path(cow, linkpath);
+            }
+        }
+    }
 }
 
 /// Read and resolve a path argument. For *at syscalls, pass the dirfd arg index;
@@ -427,7 +459,7 @@ pub(crate) async fn handle_cow_write(
         let st = cow_state.lock().await;
         st.virtual_cwds.get(&(notif.pid as i32)).cloned()
     };
-    let op = match parse_cow_write(notif, notif_fd, virtual_cwd.as_deref()) {
+    let mut op = match parse_cow_write(notif, notif_fd, virtual_cwd.as_deref()) {
         Some(op) => op,
         None => return NotifAction::Continue,
     };
@@ -440,6 +472,7 @@ pub(crate) async fn handle_cow_write(
             None => return NotifAction::Continue,
         };
 
+        op.remap_upper_paths(cow);
         match cow_copy_rel(&op, cow) {
             Some((_match_path, ref rel)) => {
                 match cow.prepare_copy(rel) {
@@ -562,6 +595,7 @@ pub(crate) async fn handle_cow_access(
         None => return NotifAction::Continue,
     };
 
+    let path = map_cow_upper_path(cow, &path);
     if !cow.matches(&path) {
         return NotifAction::Continue;
     }
@@ -569,7 +603,7 @@ pub(crate) async fn handle_cow_access(
     // Path is under workdir and W_OK was requested — writes will be
     // redirected to the COW upper layer, so report success.
     // Check the path actually exists on the real filesystem.
-    if std::path::Path::new(&path).exists() {
+    if std::path::Path::new(&path).exists() || cow.handle_stat(&path).is_some() {
         return NotifAction::ReturnValue(0);
     }
 
@@ -611,6 +645,7 @@ pub(crate) async fn handle_cow_utimensat(
             Some(c) => c,
             None => return NotifAction::Continue,
         };
+        let path = map_cow_upper_path(cow, &path);
         if !cow.matches(&path) {
             return NotifAction::Continue;
         }
@@ -681,6 +716,7 @@ pub(crate) async fn handle_cow_stat(
         None => return NotifAction::Continue,
     };
 
+    let path = map_cow_upper_path(cow, &path);
     if !cow.has_changes() || !cow.matches(&path) {
         return NotifAction::Continue;
     }
@@ -754,6 +790,7 @@ pub(crate) async fn handle_cow_statx(
         None => return NotifAction::Continue,
     };
 
+    let path = map_cow_upper_path(cow, &path);
     if !cow.has_changes() || !cow.matches(&path) {
         return NotifAction::Continue;
     }
@@ -789,6 +826,7 @@ pub(crate) async fn handle_cow_readlink(
         None => return NotifAction::Continue,
     };
 
+    let path = map_cow_upper_path(cow, &path);
     if !cow.has_changes() || !cow.matches(&path) {
         return NotifAction::Continue;
     }
@@ -962,6 +1000,7 @@ pub(crate) async fn handle_cow_chdir(
         None => return NotifAction::Continue,
     };
 
+    let abs_path = map_cow_upper_path(cow, &abs_path);
     if !cow.matches(&abs_path) {
         return NotifAction::Continue;
     }

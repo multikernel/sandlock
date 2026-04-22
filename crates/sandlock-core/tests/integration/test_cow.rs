@@ -319,10 +319,18 @@ async fn test_seccomp_cow_chdir_to_created_dir() {
         .build()
         .unwrap();
 
-    // mkdir creates the dir in COW upper only; cd must see it via interception.
+    // Create a nested directory through a dirfd so the COW handler must map the
+    // upper-layer fd target back to the logical workdir before mkdirat.
     // Use physical pwd so the assertion covers getcwd virtualization.
     let script = format!(
-        "mkdir -p subdir/deep && cd subdir/deep && pwd -P > {}",
+        concat!(
+            "mkdir -p subdir && python3 -c \"",
+            "import os; ",
+            "fd = os.open('subdir', os.O_RDONLY | os.O_DIRECTORY); ",
+            "os.mkdir('deep', dir_fd=fd); ",
+            "os.close(fd)\" && ",
+            "cd subdir/deep && pwd -P > {}"
+        ),
         out_file.display()
     );
     let result = Sandbox::run(&policy, &["sh", "-c", &script]).await;
