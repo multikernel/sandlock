@@ -13,7 +13,7 @@ use crate::arch;
 use crate::cow::seccomp::SeccompCowBranch;
 use crate::procfs::{build_dirent64, DT_DIR, DT_LNK, DT_REG};
 use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction};
-use crate::seccomp::state::CowState;
+use crate::seccomp::state::{CowState, PidKey};
 use crate::sys::structs::SeccompNotif;
 
 /// Read a NUL-terminated path from child memory (up to 4096 bytes for filesystem paths).
@@ -100,6 +100,29 @@ fn map_cow_upper_path(cow: &SeccompCowBranch, path: &str) -> String {
     normalize_path(path).to_string_lossy().into_owned()
 }
 
+fn read_pid_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    let rest = stat.rsplit_once(") ")?.1;
+    // starttime is field 22; after "pid (comm)" the first token is field 3.
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+fn cow_pid_key(pid: u32) -> Option<PidKey> {
+    Some(PidKey {
+        pid: i32::try_from(pid).ok()?,
+        start_time: read_pid_start_time(pid)?,
+    })
+}
+
+fn current_virtual_cwd(st: &mut CowState, pid: u32) -> Option<String> {
+    if st.virtual_cwds.is_empty() {
+        return None;
+    }
+    let pid_key = cow_pid_key(pid)?;
+    st.prune_reused_pid(pid_key);
+    st.virtual_cwds.get(&pid_key).cloned()
+}
+
 // ============================================================
 // openat handler
 // ============================================================
@@ -128,8 +151,8 @@ pub(crate) async fn handle_cow_open(
         None => return NotifAction::Continue,
     };
     let virtual_cwd = if (dirfd as i32) == libc::AT_FDCWD && !Path::new(&rel_path).is_absolute() {
-        let st = cow_state.lock().await;
-        st.virtual_cwds.get(&(notif.pid as i32)).cloned()
+        let mut st = cow_state.lock().await;
+        current_virtual_cwd(&mut st, notif.pid)
     } else {
         None
     };
@@ -456,8 +479,8 @@ pub(crate) async fn handle_cow_write(
     notif_fd: RawFd,
 ) -> NotifAction {
     let virtual_cwd = {
-        let st = cow_state.lock().await;
-        st.virtual_cwds.get(&(notif.pid as i32)).cloned()
+        let mut st = cow_state.lock().await;
+        current_virtual_cwd(&mut st, notif.pid)
     };
     let mut op = match parse_cow_write(notif, notif_fd, virtual_cwd.as_deref()) {
         Some(op) => op,
@@ -558,8 +581,8 @@ pub(crate) async fn handle_cow_access(
     // faccessat(dirfd, pathname, mode, flags): args[0]=dirfd, args[1]=path, args[2]=mode
     let (path, mode) = if Some(nr) == arch::SYS_ACCESS {
         let virtual_cwd = {
-            let st = cow_state.lock().await;
-            st.virtual_cwds.get(&(notif.pid as i32)).cloned()
+            let mut st = cow_state.lock().await;
+            current_virtual_cwd(&mut st, notif.pid)
         };
         let p = match read_path(notif, notif.data.args[0], notif_fd) {
             Some(p) => resolve_at_path_with_virtual(
@@ -574,8 +597,8 @@ pub(crate) async fn handle_cow_access(
     } else {
         let dirfd = notif.data.args[0] as i64;
         let virtual_cwd = {
-            let st = cow_state.lock().await;
-            st.virtual_cwds.get(&(notif.pid as i32)).cloned()
+            let mut st = cow_state.lock().await;
+            current_virtual_cwd(&mut st, notif.pid)
         };
         let p = match read_path(notif, notif.data.args[1], notif_fd) {
             Some(p) => resolve_at_path_with_virtual(notif, dirfd, &p, virtual_cwd.as_deref()),
@@ -631,8 +654,8 @@ pub(crate) async fn handle_cow_utimensat(
     }
 
     let virtual_cwd = {
-        let st = cow_state.lock().await;
-        st.virtual_cwds.get(&(notif.pid as i32)).cloned()
+        let mut st = cow_state.lock().await;
+        current_virtual_cwd(&mut st, notif.pid)
     };
     let path = match read_path(notif, path_ptr, notif_fd) {
         Some(p) => resolve_at_path_with_virtual(notif, dirfd, &p, virtual_cwd.as_deref()),
@@ -702,8 +725,8 @@ pub(crate) async fn handle_cow_stat(
     // faccessat(dirfd, pathname, mode, flags)
     let dirfd = notif.data.args[0] as i64;
     let virtual_cwd = {
-        let st = cow_state.lock().await;
-        st.virtual_cwds.get(&(notif.pid as i32)).cloned()
+        let mut st = cow_state.lock().await;
+        current_virtual_cwd(&mut st, notif.pid)
     };
     let path = match read_path(notif, notif.data.args[1], notif_fd) {
         Some(p) => resolve_at_path_with_virtual(notif, dirfd, &p, virtual_cwd.as_deref()),
@@ -776,8 +799,8 @@ pub(crate) async fn handle_cow_statx(
     // statx(dirfd, pathname, flags, mask, statxbuf)
     let dirfd = notif.data.args[0] as i64;
     let virtual_cwd = {
-        let st = cow_state.lock().await;
-        st.virtual_cwds.get(&(notif.pid as i32)).cloned()
+        let mut st = cow_state.lock().await;
+        current_virtual_cwd(&mut st, notif.pid)
     };
     let path = match read_path(notif, notif.data.args[1], notif_fd) {
         Some(p) => resolve_at_path_with_virtual(notif, dirfd, &p, virtual_cwd.as_deref()),
@@ -810,8 +833,8 @@ pub(crate) async fn handle_cow_readlink(
     // readlinkat(dirfd, pathname, buf, bufsiz)
     let dirfd = notif.data.args[0] as i64;
     let virtual_cwd = {
-        let st = cow_state.lock().await;
-        st.virtual_cwds.get(&(notif.pid as i32)).cloned()
+        let mut st = cow_state.lock().await;
+        current_virtual_cwd(&mut st, notif.pid)
     };
     let path = match read_path(notif, notif.data.args[1], notif_fd) {
         Some(p) => resolve_at_path_with_virtual(notif, dirfd, &p, virtual_cwd.as_deref()),
@@ -858,6 +881,10 @@ pub(crate) async fn handle_cow_getdents(
     let child_fd = (notif.data.args[0] & 0xFFFFFFFF) as u32;
     let buf_addr = notif.data.args[1];
     let buf_size = (notif.data.args[2] & 0xFFFFFFFF) as usize;
+    let pid_key = match cow_pid_key(pid) {
+        Some(key) => key,
+        None => return NotifAction::Continue,
+    };
 
     // Check if fd points to a COW-managed directory
     let link_path = format!("/proc/{}/fd/{}", pid, child_fd);
@@ -867,6 +894,7 @@ pub(crate) async fn handle_cow_getdents(
     };
 
     let mut st = cow_state.lock().await;
+    st.prune_reused_pid(pid_key);
     let cow = match st.branch.as_ref() {
         Some(c) => c,
         None => return NotifAction::Continue,
@@ -891,7 +919,7 @@ pub(crate) async fn handle_cow_getdents(
     };
 
     // Build cache on first call; invalidate if fd was reused for a different dir.
-    let cache_key = (pid as i32, child_fd);
+    let cache_key = (pid_key, child_fd);
     if let Some((cached_target, entries)) = st.dir_cache.get(&cache_key) {
         if *cached_target != target {
             // fd reused for a different directory — rebuild.
@@ -987,8 +1015,8 @@ pub(crate) async fn handle_cow_chdir(
     };
     let orig_path_buf_len = path.len() + 1; // NUL-terminated size in child memory
 
-    let st = cow_state.lock().await;
-    let virtual_cwd = st.virtual_cwds.get(&(notif.pid as i32)).cloned();
+    let mut st = cow_state.lock().await;
+    let virtual_cwd = current_virtual_cwd(&mut st, notif.pid);
     let abs_path = resolve_at_path_with_virtual(
         notif,
         libc::AT_FDCWD as i64,
@@ -1068,8 +1096,11 @@ pub(crate) async fn handle_cow_chdir(
         return NotifAction::Errno(libc::EFAULT);
     }
 
-    let mut st = cow_state.lock().await;
-    st.virtual_cwds.insert(notif.pid as i32, abs_path);
+    if let Some(pid_key) = cow_pid_key(notif.pid) {
+        let mut st = cow_state.lock().await;
+        st.prune_reused_pid(pid_key);
+        st.virtual_cwds.insert(pid_key, abs_path);
+    }
 
     NotifAction::Continue
 }
@@ -1083,14 +1114,15 @@ pub(crate) async fn handle_cow_getcwd(
     let buf_addr = notif.data.args[0];
     let buf_size = (notif.data.args[1] & 0xFFFF_FFFF) as usize;
 
-    let st = cow_state.lock().await;
+    let mut st = cow_state.lock().await;
+    let cached_virtual_cwd = current_virtual_cwd(&mut st, notif.pid);
     let cow = match st.branch.as_ref() {
         Some(c) => c,
         None => return NotifAction::Continue,
     };
 
-    let virtual_cwd = if let Some(cwd) = st.virtual_cwds.get(&(notif.pid as i32)) {
-        cwd.clone()
+    let virtual_cwd = if let Some(cwd) = cached_virtual_cwd {
+        cwd
     } else {
         let cwd = match std::fs::read_link(format!("/proc/{}/cwd", notif.pid)) {
             Ok(c) => c,
