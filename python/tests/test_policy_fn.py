@@ -189,7 +189,8 @@ class TestPolicyFnVerdict:
             f"s.close()\n"
         ])
         assert result.success
-        content = open(out).read()
+        with open(out) as f:
+            content = f.read()
         assert content == "ERR:13", f"expected EACCES (13), got: {content}"
         os.unlink(out)
 
@@ -243,7 +244,8 @@ class TestPolicyFnVerdict:
             ]
         )
         assert result.success
-        content = open(out).read()
+        with open(out) as f:
+            content = f.read()
         assert content == "BLOCKED", f"expected BLOCKED, got: {content}"
         os.unlink(out)
 
