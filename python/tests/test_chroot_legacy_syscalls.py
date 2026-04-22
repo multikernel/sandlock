@@ -1,26 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for chroot interception of legacy (non-*at) syscalls.
+"""Tests for chroot interception of raw path syscall ABIs.
 
 musl libc uses stat/lstat/open/access/readlink instead of their *at
 variants (newfstatat/openat/etc.).  These tests invoke the legacy
-syscalls via the rootfs-helper binary to verify the chroot dispatcher
-handles them correctly.
+syscalls via the rootfs-helper binary on architectures that provide
+them. On ARM64 the helper uses equivalent raw *at syscalls, because
+Linux ARM64 does not expose the legacy non-*at path syscall ABI.
 """
 
 import os
-import platform
 import shutil
 from pathlib import Path
 
 import pytest
 
 from sandlock import Policy, Sandbox
-
-
-pytestmark = pytest.mark.skipif(
-    platform.machine() == "aarch64",
-    reason="ARM64 Linux does not provide legacy non-*at path syscalls",
-)
 
 
 # ── helpers ──────────────────────────────────────────────────────
