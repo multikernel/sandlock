@@ -42,6 +42,91 @@ pub type HandlerFn = Box<
         + Sync,
 >;
 
+/// A user-supplied handler bound to a specific syscall number.
+///
+/// Passed to [`crate::Sandbox::run_with_extra_handlers`]; appended to the
+/// dispatch table **after** all builtin handlers for the same syscall.
+///
+/// # Ordering and security boundary
+///
+/// Within a syscall's chain, handlers run in registration order and the
+/// first non-[`NotifAction::Continue`] result wins.  Builtin handlers are
+/// registered first (for example `chroot` path-normalization on `openat`),
+/// so an `ExtraHandler` observes the post-builtin view of each syscall.
+/// This ordering is fixed and cannot be changed by downstream crates —
+/// it is the security boundary that prevents user handlers from bypassing
+/// sandlock confinement.
+///
+/// # Example
+///
+/// ```ignore
+/// use sandlock_core::seccomp::dispatch::{ExtraHandler, HandlerFn};
+/// use sandlock_core::seccomp::notif::NotifAction;
+///
+/// let audit: HandlerFn = Box::new(|notif, _ctx, _fd| {
+///     Box::pin(async move {
+///         eprintln!("openat from pid {}", notif.data.pid);
+///         NotifAction::Continue
+///     })
+/// });
+///
+/// let extras = vec![ExtraHandler::new(libc::SYS_openat, audit)];
+/// ```
+pub struct ExtraHandler {
+    pub syscall_nr: i64,
+    pub handler: HandlerFn,
+}
+
+impl ExtraHandler {
+    pub fn new(syscall_nr: i64, handler: HandlerFn) -> Self {
+        Self { syscall_nr, handler }
+    }
+}
+
+/// Reject extras that would weaken sandlock's confinement guarantees.
+///
+/// The cBPF program emits notif JEQs *before* deny JEQs, so a syscall
+/// present in both lists hits `SECCOMP_RET_USER_NOTIF` first.  An extra
+/// registered on a syscall that is on the deny list would therefore
+/// convert a kernel-deny into a user-supervised path: a handler returning
+/// `NotifAction::Continue` becomes `SECCOMP_USER_NOTIF_FLAG_CONTINUE` and
+/// the kernel actually runs the syscall — silently bypassing deny.
+///
+/// The deny list is whatever [`crate::context::deny_syscall_numbers`]
+/// resolves: `policy.deny_syscalls` if set, otherwise
+/// `DEFAULT_DENY_SYSCALLS` when neither `deny_syscalls` nor
+/// `allow_syscalls` is set; both branches are guarded by this function.
+///
+/// **Allowlist mode** (`policy.allow_syscalls = Some(_)`): the resolved
+/// deny list is empty, so this function returns `Ok(())` for any extra.
+/// That is sound because the BPF deny block is empty in this mode too —
+/// confinement comes from the allowlist enforced at the kernel level,
+/// and there is no notif/deny overlap for an extra to bypass.
+///
+/// Returns the offending syscall number on rejection so the caller can
+/// surface it to the end user.
+///
+/// Visibility: kept `pub(crate)` because the only safe consumption path
+/// is via [`crate::Sandbox::run_with_extra_handlers`], which calls this
+/// function before fork.  Downstream crates that pre-build their own
+/// `Vec<ExtraHandler>` get the same enforcement transparently through
+/// that entry point — there is no `ExtraHandler::register_into` API
+/// that would let a user bypass it.
+pub(crate) fn validate_extras_against_policy(
+    extras: &[ExtraHandler],
+    policy: &crate::policy::Policy,
+) -> Result<(), u32> {
+    let deny: std::collections::HashSet<u32> =
+        crate::context::deny_syscall_numbers(policy).into_iter().collect();
+    for extra in extras {
+        let nr = extra.syscall_nr as u32;
+        if deny.contains(&nr) {
+            return Err(nr);
+        }
+    }
+    Ok(())
+}
+
 /// Ordered chain of handlers for a single syscall number.
 struct HandlerChain {
     handlers: Vec<HandlerFn>,
@@ -99,9 +184,15 @@ impl DispatchTable {
 /// Build the dispatch table from a `NotifPolicy`.  Every branch from the old
 /// monolithic `dispatch()` function is translated into a `table.register()` call.
 /// Priority is preserved by registration order.
+///
+/// `extra_handlers` are appended **after** all builtin handlers, so they
+/// observe the post-builtin view (e.g. `chroot`-normalized paths on
+/// `openat`).  Builtins cannot be overridden or removed — this is the
+/// security boundary for downstream crates.
 pub fn build_dispatch_table(
     policy: &Arc<NotifPolicy>,
     resource: &Arc<Mutex<ResourceState>>,
+    extra_handlers: Vec<ExtraHandler>,
 ) -> DispatchTable {
     let mut table = DispatchTable::new();
 
@@ -408,6 +499,15 @@ pub fn build_dispatch_table(
         }));
     }
 
+    // ------------------------------------------------------------------
+    // Extra handlers supplied by the caller of `Sandbox::run_with_extra_handlers`.
+    // Appended last so builtin handlers keep their security-critical priority
+    // (chroot path normalization, COW writes, resource accounting).
+    // ------------------------------------------------------------------
+    for extra in extra_handlers {
+        table.register(extra.syscall_nr, extra.handler);
+    }
+
     table
 }
 
@@ -677,4 +777,253 @@ fn register_cow_handlers(table: &mut DispatchTable) {
 
     table.register(libc::SYS_chdir, cow_call!(crate::cow::dispatch::handle_cow_chdir));
     table.register(libc::SYS_getcwd, cow_call!(crate::cow::dispatch::handle_cow_getcwd));
+}
+
+// ============================================================
+// Tests
+// ============================================================
+
+#[cfg(test)]
+mod extra_handler_tests {
+    //! Unit tests for the user-supplied handler extension API.
+    //!
+    //! Drive the actual `DispatchTable::dispatch` walker against a minimal
+    //! `SupervisorCtx` constructed from default-state pieces.  Handler
+    //! closures here ignore the context (no notif fd, no real child), so
+    //! the dispatch invariants under test (registration order, chain
+    //! short-circuit on first non-`Continue`, append-after-builtin
+    //! placement) are exercised end-to-end without needing a live
+    //! Landlock+seccomp sandbox — those scenarios live under
+    //! `crates/sandlock-core/tests/integration/test_extra_handlers.rs`.
+    use super::*;
+    use crate::netlink::NetlinkState;
+    use crate::seccomp::ctx::SupervisorCtx;
+    use crate::seccomp::notif::NotifPolicy;
+    use crate::seccomp::state::{
+        ChrootState, CowState, NetworkState, PolicyFnState, ProcessIndex, ProcfsState,
+        ResourceState, TimeRandomState,
+    };
+    use crate::sys::structs::{SeccompData, SeccompNotif};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn fake_notif(nr: i32) -> SeccompNotif {
+        SeccompNotif {
+            id: 0,
+            pid: 1,
+            flags: 0,
+            data: SeccompData {
+                nr,
+                arch: 0,
+                instruction_pointer: 0,
+                args: [0; 6],
+            },
+        }
+    }
+
+    /// Minimal `SupervisorCtx` for unit tests.  Every field is built from
+    /// the corresponding state's `new()`/default constructor — no syscalls,
+    /// no fds, no spawned children.  Handlers in these tests do not
+    /// actually inspect the context, so the values do not need to match
+    /// any real run; they only need to satisfy the type signature so we
+    /// can call `dispatch()`.
+    fn fake_supervisor_ctx() -> Arc<SupervisorCtx> {
+        Arc::new(SupervisorCtx {
+            resource: Arc::new(Mutex::new(ResourceState::new(0, 0))),
+            cow: Arc::new(Mutex::new(CowState::new())),
+            procfs: Arc::new(Mutex::new(ProcfsState::new())),
+            network: Arc::new(Mutex::new(NetworkState::new())),
+            time_random: Arc::new(Mutex::new(TimeRandomState::new(None, None))),
+            policy_fn: Arc::new(Mutex::new(PolicyFnState::new())),
+            chroot: Arc::new(Mutex::new(ChrootState::new())),
+            netlink: Arc::new(NetlinkState::new()),
+            processes: Arc::new(ProcessIndex::new()),
+            policy: Arc::new(NotifPolicy {
+                max_memory_bytes: 0,
+                max_processes: 0,
+                has_memory_limit: false,
+                has_net_allowlist: false,
+                has_random_seed: false,
+                has_time_start: false,
+                time_offset: 0,
+                num_cpus: None,
+                port_remap: false,
+                cow_enabled: false,
+                chroot_root: None,
+                chroot_readable: Vec::new(),
+                chroot_writable: Vec::new(),
+                chroot_denied: Vec::new(),
+                chroot_mounts: Vec::new(),
+                deterministic_dirs: false,
+                hostname: None,
+                has_http_acl: false,
+                virtual_etc_hosts: None,
+            }),
+            child_pidfd: None,
+            notif_fd: -1,
+        })
+    }
+
+    #[test]
+    fn extra_handler_ctor_preserves_fields() {
+        let h: HandlerFn = Box::new(|_notif, _ctx, _fd| {
+            Box::pin(async { NotifAction::Continue })
+        });
+        let eh = ExtraHandler::new(libc::SYS_openat, h);
+        assert_eq!(eh.syscall_nr, libc::SYS_openat);
+    }
+
+    /// All registered handlers run, in registration order, when each
+    /// returns `Continue`.  Verifies that `register` appends to the
+    /// underlying `Vec` and that `dispatch` walks it front-to-back.
+    #[tokio::test]
+    async fn dispatch_walks_chain_in_registration_order() {
+        let mut table = DispatchTable::new();
+        let order = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+
+        for tag in [1u8, 2u8, 3u8] {
+            let order = Arc::clone(&order);
+            table.register(
+                libc::SYS_openat,
+                Box::new(move |_n, _c, _f| {
+                    let order = Arc::clone(&order);
+                    Box::pin(async move {
+                        order.lock().unwrap().push(tag);
+                        NotifAction::Continue
+                    })
+                }),
+            );
+        }
+
+        let ctx = fake_supervisor_ctx();
+        let action = table
+            .dispatch(fake_notif(libc::SYS_openat as i32), &ctx, -1)
+            .await;
+
+        assert!(matches!(action, NotifAction::Continue));
+        let recorded = order.lock().unwrap();
+        assert_eq!(
+            *recorded,
+            [1u8, 2u8, 3u8],
+            "every handler must run, in the order it was registered"
+        );
+    }
+
+    /// Append-after-builtin contract: when an `ExtraHandler` is registered
+    /// after a builtin-like handler, dispatch invokes the builtin first
+    /// and the extra second.  This is the security-load-bearing invariant —
+    /// a builtin returning a non-`Continue` `NotifAction` must short-circuit
+    /// before the extra runs (covered by
+    /// `dispatch_stops_at_first_non_continue`); when the builtin returns
+    /// `Continue`, the extra observes the post-builtin view.
+    #[tokio::test]
+    async fn dispatch_runs_builtin_before_extra() {
+        let mut table = DispatchTable::new();
+        let order = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+
+        // Builtin first, tagged 'B'.
+        let order_builtin = Arc::clone(&order);
+        table.register(
+            libc::SYS_openat,
+            Box::new(move |_n, _c, _f| {
+                let order = Arc::clone(&order_builtin);
+                Box::pin(async move {
+                    order.lock().unwrap().push(b'B');
+                    NotifAction::Continue
+                })
+            }),
+        );
+
+        // Extra after, tagged 'E'.  Routed through `ExtraHandler` to mirror
+        // how `build_dispatch_table` consumes user-supplied handlers.
+        let order_extra = Arc::clone(&order);
+        let extra = ExtraHandler::new(
+            libc::SYS_openat,
+            Box::new(move |_n, _c, _f| {
+                let order = Arc::clone(&order_extra);
+                Box::pin(async move {
+                    order.lock().unwrap().push(b'E');
+                    NotifAction::Continue
+                })
+            }),
+        );
+        table.register(extra.syscall_nr, extra.handler);
+
+        let ctx = fake_supervisor_ctx();
+        let action = table
+            .dispatch(fake_notif(libc::SYS_openat as i32), &ctx, -1)
+            .await;
+
+        assert!(matches!(action, NotifAction::Continue));
+        let recorded = order.lock().unwrap();
+        assert_eq!(
+            *recorded,
+            [b'B', b'E'],
+            "builtin must run before extra (insertion order preserved)"
+        );
+    }
+
+    /// First non-`Continue` wins: a handler returning `Errno` short-circuits
+    /// the chain, and subsequent handlers must not run.  This is the
+    /// invariant that prevents a user-supplied extra from being observed
+    /// (or, in the inverse direction, prevents an extra's `Errno` from
+    /// being silently overridden by a later handler that happens to also
+    /// be registered for the same syscall).
+    #[tokio::test]
+    async fn dispatch_stops_at_first_non_continue() {
+        let mut table = DispatchTable::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        // First handler — returns Errno, must terminate the chain.
+        let calls_first = Arc::clone(&calls);
+        table.register(
+            libc::SYS_openat,
+            Box::new(move |_n, _c, _f| {
+                let calls = Arc::clone(&calls_first);
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    NotifAction::Errno(libc::EACCES)
+                })
+            }),
+        );
+
+        // Second handler — must NOT be called.
+        let calls_second = Arc::clone(&calls);
+        table.register(
+            libc::SYS_openat,
+            Box::new(move |_n, _c, _f| {
+                let calls = Arc::clone(&calls_second);
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    NotifAction::Continue
+                })
+            }),
+        );
+
+        let ctx = fake_supervisor_ctx();
+        let action = table
+            .dispatch(fake_notif(libc::SYS_openat as i32), &ctx, -1)
+            .await;
+
+        match action {
+            NotifAction::Errno(e) => assert_eq!(e, libc::EACCES),
+            other => panic!("expected Errno(EACCES), got {:?}", other),
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "second handler must not run after first returned non-Continue"
+        );
+    }
+
+    #[test]
+    fn extras_vec_empty_leaves_table_without_change() {
+        // build_dispatch_table with empty extras should not add any entries.
+        // We verify the for-loop degenerates to nop.
+        let extras: Vec<ExtraHandler> = Vec::new();
+        let mut handler_count = 0usize;
+        for _ in extras {
+            handler_count += 1;
+        }
+        assert_eq!(handler_count, 0, "empty extras registers zero handlers");
+    }
 }

@@ -645,11 +645,40 @@ fn write_id_maps_overflow() {
 // Child-side confinement (never returns)
 // ============================================================
 
+/// Arguments threaded from the parent's `do_spawn` into the child-side
+/// `confine_child`.  Packed into a struct because `confine_child` historically
+/// grew to seven positional parameters and a struct keeps the call site
+/// readable when new flags get added (e.g. `extra_syscalls` for user
+/// handlers).  Lifetimes tie everything to the parent's stack frame — the
+/// child never outlives the fork point because `confine_child` either execs
+/// or exits.
+pub(crate) struct ChildSpawnArgs<'a> {
+    pub policy: &'a Policy,
+    pub cmd: &'a [CString],
+    pub pipes: &'a PipePair,
+    pub cow_config: Option<&'a ChildMountConfig>,
+    pub nested: bool,
+    pub keep_fds: &'a [RawFd],
+    /// Syscall numbers for which the parent registered `ExtraHandler`s.
+    /// Merged into the child's BPF notif list so the kernel actually
+    /// raises USER_NOTIF for them.
+    pub extra_syscalls: &'a [u32],
+}
+
 /// Apply irreversible confinement (Landlock + seccomp) then exec the command.
 ///
 /// This function **never returns**: it calls `execvp` on success or
 /// `_exit(127)` on any error.
-pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, cow_config: Option<&ChildMountConfig>, nested: bool, keep_fds: &[RawFd]) -> ! {
+pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
+    let ChildSpawnArgs {
+        policy,
+        cmd,
+        pipes,
+        cow_config,
+        nested,
+        keep_fds,
+        extra_syscalls,
+    } = args;
     // Helper: abort child on error. Includes the OS error automatically.
     macro_rules! fail {
         ($msg:expr) => {{
@@ -866,7 +895,18 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
         }
     } else {
         // First-level sandbox: notif + deny filter with NEW_LISTENER.
-        let notif = notif_syscalls(policy);
+        //
+        // Caller-supplied extra handlers must have their syscalls registered in
+        // the BPF filter, otherwise the kernel never raises a notification for
+        // them and the handler silently never fires.  We merge `extra_syscalls`
+        // into the notif list and dedup so each syscall produces exactly one
+        // JEQ in the assembled program.
+        let mut notif = notif_syscalls(policy);
+        if !extra_syscalls.is_empty() {
+            notif.extend_from_slice(extra_syscalls);
+            notif.sort_unstable();
+            notif.dedup();
+        }
         let filter = match bpf::assemble_filter(&notif, &deny, &args) {
             Ok(f) => f,
             Err(e) => fail!(format!("seccomp assemble: {}", e)),
