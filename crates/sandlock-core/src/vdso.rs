@@ -5,8 +5,8 @@ use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 
 use crate::error::SandlockError;
 
-/// Find the base address of the vDSO mapping for a given process.
-pub(crate) fn find_vdso_base(pid: i32) -> io::Result<u64> {
+/// Find the base address and size of the vDSO mapping for a given process.
+pub(crate) fn find_vdso_range(pid: i32) -> io::Result<(u64, u64)> {
     let path = format!("/proc/{}/maps", pid);
     let file = File::open(&path)?;
     let reader = BufReader::new(file);
@@ -15,12 +15,16 @@ pub(crate) fn find_vdso_base(pid: i32) -> io::Result<u64> {
         let line = line?;
         if line.ends_with("[vdso]") {
             // Line format: "7ffd1234000-7ffd1235000 r-xp ... [vdso]"
-            if let Some(dash_pos) = line.find('-') {
-                let start_hex = &line[..dash_pos];
-                let addr = u64::from_str_radix(start_hex, 16).map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidData, format!("bad vDSO address: {}", e))
+            let space = line.find(' ').unwrap_or(line.len());
+            let range = &line[..space];
+            if let Some(dash_pos) = range.find('-') {
+                let start = u64::from_str_radix(&range[..dash_pos], 16).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("bad vDSO start: {}", e))
                 })?;
-                return Ok(addr);
+                let end = u64::from_str_radix(&range[dash_pos + 1..], 16).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("bad vDSO end: {}", e))
+                })?;
+                return Ok((start, end - start));
             }
         }
     }
@@ -29,6 +33,11 @@ pub(crate) fn find_vdso_base(pid: i32) -> io::Result<u64> {
         io::ErrorKind::NotFound,
         "vDSO mapping not found",
     ))
+}
+
+/// Find the base address of the vDSO mapping for a given process.
+pub(crate) fn find_vdso_base(pid: i32) -> io::Result<u64> {
+    find_vdso_range(pid).map(|(base, _)| base)
 }
 
 /// Read `len` bytes from `/proc/{pid}/mem` at the given address.
@@ -62,6 +71,41 @@ fn parse_vdso_symbols(vdso_bytes: &[u8]) -> HashMap<String, u64> {
 #[cfg(target_arch = "aarch64")]
 fn push_insn(stub: &mut Vec<u8>, insn: u32) {
     stub.extend_from_slice(&insn.to_le_bytes());
+}
+
+/// Encode an arm64 unconditional `B target` instruction located at `from`.
+/// `imm26` is signed and scaled by 4, so the reachable range is ±128 MiB.
+#[cfg(target_arch = "aarch64")]
+fn arm64_b_insn(from: u64, to: u64) -> Result<u32, SandlockError> {
+    let delta = to as i64 - from as i64;
+    if delta % 4 != 0 {
+        return Err(SandlockError::MemoryProtect(format!(
+            "arm64 B target {:#x} not 4-byte aligned from {:#x}",
+            to, from
+        )));
+    }
+    let offset = delta / 4;
+    if !(-(1i64 << 25)..(1i64 << 25)).contains(&offset) {
+        return Err(SandlockError::MemoryProtect(format!(
+            "arm64 B {:#x}->{:#x} out of ±128 MiB range",
+            from, to
+        )));
+    }
+    Ok(0x14000000u32 | ((offset as u32) & 0x03FF_FFFF))
+}
+
+/// Compute the offset within the vDSO mapping where the trampoline area starts —
+/// just past the last symbol, rounded up to a 16-byte boundary.
+#[cfg(target_arch = "aarch64")]
+fn vdso_tramp_start(vdso_bytes: &[u8]) -> Option<u64> {
+    let elf = goblin::elf::Elf::parse(vdso_bytes).ok()?;
+    let highest_end = elf
+        .dynsyms
+        .iter()
+        .filter(|s| s.st_value != 0)
+        .map(|s| s.st_value + s.st_size)
+        .max()?;
+    Some((highest_end + 15) & !15)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -218,11 +262,12 @@ pub(crate) fn patch(
     time_offset_secs: Option<i64>,
     _patch_for_random: bool,
 ) -> Result<(), SandlockError> {
-    let base = find_vdso_base(pid).map_err(|e| {
-        SandlockError::MemoryProtect(format!("failed to find vDSO base: {}", e))
+    let (base, mapping_size) = find_vdso_range(pid).map_err(|e| {
+        SandlockError::MemoryProtect(format!("failed to find vDSO range: {}", e))
     })?;
 
-    let vdso_bytes = read_proc_mem(pid, base, 0x2000).map_err(|e| {
+    let read_size = std::cmp::min(mapping_size as usize, 0x4000);
+    let vdso_bytes = read_proc_mem(pid, base, read_size).map_err(|e| {
         SandlockError::MemoryProtect(format!("failed to read vDSO memory: {}", e))
     })?;
 
@@ -235,26 +280,76 @@ pub(crate) fn patch(
             SandlockError::MemoryProtect(format!("failed to open /proc/{}/mem: {}", pid, e))
         })?;
 
+    // arm64: place full stubs in slack space at the tail of the vDSO mapping and
+    // patch each function entry with a single 4-byte B that jumps to its stub.
+    // x86_64: stubs are short and inter-symbol gaps are wide; patch inline.
+    #[cfg(target_arch = "aarch64")]
+    let mut tramp_offset = vdso_tramp_start(&vdso_bytes).unwrap_or(0);
+
     for (name, alt_name, syscall_nr) in vdso_targets() {
         if let Some(&offset) = symbols.get(name).or_else(|| symbols.get(alt_name)) {
-            let addr = base + offset;
+            let entry_addr = base + offset;
             let stub = match (time_offset_secs, name) {
                 (Some(off), "clock_gettime") => offset_stub_clock_gettime(off),
                 (Some(off), "gettimeofday") => offset_stub_gettimeofday(off),
                 _ => simple_stub(syscall_nr),
             };
-            mem.seek(SeekFrom::Start(addr)).map_err(|e| {
-                SandlockError::MemoryProtect(format!(
-                    "failed to seek to {} at {:#x}: {}",
-                    name, addr, e
-                ))
-            })?;
-            mem.write_all(&stub).map_err(|e| {
-                SandlockError::MemoryProtect(format!(
-                    "failed to write {} stub at {:#x}: {}",
-                    name, addr, e
-                ))
-            })?;
+
+            #[cfg(target_arch = "x86_64")]
+            {
+                mem.seek(SeekFrom::Start(entry_addr)).map_err(|e| {
+                    SandlockError::MemoryProtect(format!(
+                        "failed to seek to {} at {:#x}: {}",
+                        name, entry_addr, e
+                    ))
+                })?;
+                mem.write_all(&stub).map_err(|e| {
+                    SandlockError::MemoryProtect(format!(
+                        "failed to write {} stub at {:#x}: {}",
+                        name, entry_addr, e
+                    ))
+                })?;
+            }
+
+            #[cfg(target_arch = "aarch64")]
+            {
+                if tramp_offset + stub.len() as u64 > mapping_size {
+                    return Err(SandlockError::MemoryProtect(format!(
+                        "vDSO trampoline area exhausted: need {} bytes at offset {:#x}, mapping ends at {:#x}",
+                        stub.len(), tramp_offset, mapping_size
+                    )));
+                }
+                let tramp_addr = base + tramp_offset;
+
+                mem.seek(SeekFrom::Start(tramp_addr)).map_err(|e| {
+                    SandlockError::MemoryProtect(format!(
+                        "failed to seek to {} trampoline at {:#x}: {}",
+                        name, tramp_addr, e
+                    ))
+                })?;
+                mem.write_all(&stub).map_err(|e| {
+                    SandlockError::MemoryProtect(format!(
+                        "failed to write {} trampoline at {:#x}: {}",
+                        name, tramp_addr, e
+                    ))
+                })?;
+
+                let b_insn = arm64_b_insn(entry_addr, tramp_addr)?;
+                mem.seek(SeekFrom::Start(entry_addr)).map_err(|e| {
+                    SandlockError::MemoryProtect(format!(
+                        "failed to seek to {} entry at {:#x}: {}",
+                        name, entry_addr, e
+                    ))
+                })?;
+                mem.write_all(&b_insn.to_le_bytes()).map_err(|e| {
+                    SandlockError::MemoryProtect(format!(
+                        "failed to write {} branch at {:#x}: {}",
+                        name, entry_addr, e
+                    ))
+                })?;
+
+                tramp_offset = (tramp_offset + stub.len() as u64 + 3) & !3;
+            }
         }
     }
 
