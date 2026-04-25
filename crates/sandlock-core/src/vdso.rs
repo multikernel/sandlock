@@ -288,6 +288,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn test_simple_stub_size() {
         let stub = simple_stub(228);
         assert_eq!(stub.len(), 8);
@@ -295,11 +296,43 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_simple_stub_size() {
+        let stub = simple_stub(228);
+        // movz x8, #228 / svc #0 / ret — three 4-byte instructions.
+        assert_eq!(stub.len(), 12);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
     fn test_offset_stub_contains_offset() {
         let offset: i64 = -86400; // one day back
         let stub = offset_stub_clock_gettime(offset);
-        // Should contain the offset bytes somewhere
+        // x86_64 encodes the offset as a single movabs imm64, so the 8 bytes
+        // appear contiguously in the stub.
         let offset_bytes = offset.to_le_bytes();
         assert!(stub.windows(8).any(|w| w == offset_bytes));
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_offset_stub_contains_offset() {
+        let offset: i64 = -86400;
+        let stub = offset_stub_clock_gettime(offset);
+        // arm64 splits a 64-bit immediate across movz/movk instructions, so the
+        // bytes are not contiguous. Verify each 16-bit chunk is encoded as a
+        // movz/movk imm16 field (bits 5..21 of the 32-bit instruction).
+        let raw = offset as u64;
+        for shift in 0..4 {
+            let chunk = ((raw >> (shift * 16)) & 0xFFFF) as u32;
+            if chunk == 0 {
+                continue; // a zero imm16 collides with too many other instructions to assert on
+            }
+            let found = stub.chunks_exact(4).any(|insn| {
+                let word = u32::from_le_bytes(insn.try_into().unwrap());
+                ((word >> 5) & 0xFFFF) == chunk
+            });
+            assert!(found, "chunk {:#06x} for shift {} not encoded in stub", chunk, shift);
+        }
     }
 }
