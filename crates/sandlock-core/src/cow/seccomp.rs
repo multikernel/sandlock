@@ -10,14 +10,14 @@ use std::path::{Path, PathBuf};
 
 use crate::error::BranchError;
 
-/// O_* flags for detecting writes.
-const O_WRONLY: u64 = 0o1;
-const O_RDWR: u64 = 0o2;
-const O_CREAT: u64 = 0o100;
-const O_TRUNC: u64 = 0o1000;
-const O_APPEND: u64 = 0o2000;
-const O_EXCL: u64 = 0o200;
-const O_DIRECTORY: u64 = 0o200000;
+/// O_* flags for detecting writes. These differ across Linux architectures.
+const O_WRONLY: u64 = libc::O_WRONLY as u64;
+const O_RDWR: u64 = libc::O_RDWR as u64;
+const O_CREAT: u64 = libc::O_CREAT as u64;
+const O_TRUNC: u64 = libc::O_TRUNC as u64;
+const O_APPEND: u64 = libc::O_APPEND as u64;
+const O_EXCL: u64 = libc::O_EXCL as u64;
+const O_DIRECTORY: u64 = libc::O_DIRECTORY as u64;
 const WRITE_FLAGS: u64 = O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND;
 
 /// Plan for a COW copy — returned by `prepare_copy()` to separate metadata

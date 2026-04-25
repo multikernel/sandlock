@@ -5,7 +5,7 @@ async fn test_echo() {
     let policy = Policy::builder()
         .fs_read("/usr")
         .fs_read("/lib")
-        .fs_read("/lib64")
+        .fs_read_if_exists("/lib64")
         .fs_read("/bin")
         .fs_read("/etc")
         .fs_read("/proc")
@@ -21,7 +21,7 @@ async fn test_exit_code() {
     let policy = Policy::builder()
         .fs_read("/usr")
         .fs_read("/lib")
-        .fs_read("/lib64")
+        .fs_read_if_exists("/lib64")
         .fs_read("/bin")
         .fs_read("/proc")
         .build()
@@ -36,7 +36,7 @@ async fn test_denied_path() {
     let policy = Policy::builder()
         .fs_read("/usr")
         .fs_read("/lib")
-        .fs_read("/lib64")
+        .fs_read_if_exists("/lib64")
         .fs_read("/bin")
         .fs_read("/proc")
         .build()
@@ -50,7 +50,7 @@ async fn test_denied_syscall() {
     let policy = Policy::builder()
         .fs_read("/usr")
         .fs_read("/lib")
-        .fs_read("/lib64")
+        .fs_read_if_exists("/lib64")
         .fs_read("/bin")
         .fs_read("/etc")
         .fs_read("/proc")
@@ -95,7 +95,7 @@ async fn test_default_policy_runs_ls() {
     let policy = Policy::builder()
         .fs_read("/usr")
         .fs_read("/lib")
-        .fs_read("/lib64")
+        .fs_read_if_exists("/lib64")
         .fs_read("/bin")
         .fs_read("/proc")
         .fs_read("/etc")
@@ -117,7 +117,7 @@ async fn test_default_policy_runs_ls() {
 async fn test_nested_sandbox() {
     // Outer: allows /etc
     let outer = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
         .fs_read("/etc").fs_read("/proc").fs_read("/dev")
         .fs_write("/tmp")
         .build()
@@ -125,7 +125,7 @@ async fn test_nested_sandbox() {
 
     // Inner: does NOT allow /etc — run cat /etc/hostname, should fail
     let inner = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
         .fs_read("/proc")
         .build()
         .unwrap();
@@ -168,10 +168,15 @@ async fn test_nested_sandbox_via_cli() {
         }
     };
     let bin = sandlock_bin.to_str().unwrap();
+    let lib64_arg = if std::path::Path::new("/lib64").exists() {
+        " -r /lib64"
+    } else {
+        ""
+    };
 
     // Outer allows /etc + sandlock binary; inner does not allow /etc
     let outer = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
         .fs_read("/etc").fs_read("/proc").fs_read("/dev")
         .fs_read(sandlock_bin.parent().unwrap())
         .fs_write("/tmp")
@@ -179,8 +184,8 @@ async fn test_nested_sandbox_via_cli() {
         .unwrap();
 
     let inner_cmd = format!(
-        "{} run -r /usr -r /lib -r /lib64 -r /bin -r /proc -- cat /etc/hostname",
-        bin
+        "{} run -r /usr -r /lib{} -r /bin -r /proc -- cat /etc/hostname",
+        bin, lib64_arg
     );
     let result = Sandbox::run_interactive(
         &outer, &["sh", "-c", &inner_cmd],
@@ -189,8 +194,8 @@ async fn test_nested_sandbox_via_cli() {
 
     // Inner with /etc allowed — should succeed
     let inner_cmd = format!(
-        "{} run -r /usr -r /lib -r /lib64 -r /bin -r /etc -r /proc -- echo nested-ok",
-        bin
+        "{} run -r /usr -r /lib{} -r /bin -r /etc -r /proc -- echo nested-ok",
+        bin, lib64_arg
     );
     let result = Sandbox::run_interactive(
         &outer, &["sh", "-c", &inner_cmd],
@@ -209,7 +214,7 @@ async fn test_denied_path_hardlink_blocked() {
     std::fs::write(&secret, "TOP_SECRET").unwrap();
 
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
         .fs_read("/bin").fs_read("/proc").fs_read("/etc")
         .fs_read(tmp.path())
         .fs_write(tmp.path())
@@ -238,7 +243,7 @@ async fn test_denied_path_rename_blocked() {
     std::fs::write(&secret, "TOP_SECRET").unwrap();
 
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
         .fs_read("/bin").fs_read("/proc").fs_read("/etc")
         .fs_read(tmp.path())
         .fs_write(tmp.path())
@@ -267,7 +272,7 @@ async fn test_denied_path_symlink_blocked() {
     std::fs::write(&secret, "TOP_SECRET").unwrap();
 
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
         .fs_read("/bin").fs_read("/proc").fs_read("/etc")
         .fs_read(tmp.path())
         .fs_write(tmp.path())
@@ -301,7 +306,7 @@ async fn test_denied_path_preexisting_symlink_blocked() {
     std::os::unix::fs::symlink(&secret, &link).unwrap();
 
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
         .fs_read("/bin").fs_read("/proc").fs_read("/etc")
         .fs_read(tmp.path())
         .fs_deny(&secret)
@@ -330,7 +335,7 @@ async fn test_denied_path_chained_symlinks_blocked() {
     std::os::unix::fs::symlink("link1", &link2).unwrap();
 
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
         .fs_read("/bin").fs_read("/proc").fs_read("/etc")
         .fs_read(tmp.path())
         .fs_deny(&secret)
@@ -353,7 +358,7 @@ async fn test_denied_path_allows_normal_writes() {
     std::fs::write(&secret, "TOP_SECRET").unwrap();
 
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
         .fs_read("/bin").fs_read("/proc").fs_read("/etc")
         .fs_read(tmp.path())
         .fs_write(tmp.path())

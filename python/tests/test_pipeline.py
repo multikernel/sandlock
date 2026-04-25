@@ -12,7 +12,7 @@ from sandlock import Sandbox, Policy, Stage, Pipeline, NamedStage, Gather, Gathe
 
 # --- Helpers ---
 
-_PYTHON_PREFIX = os.path.dirname(os.path.dirname(os.path.realpath(sys.executable)))
+_PYTHON_PREFIX = sys.prefix
 
 def _policy(**overrides):
     """Minimal policy for testing."""
@@ -315,10 +315,18 @@ class TestGather:
             result = (
                 Sandbox(data_policy).cmd(["cat", secret]).as_("data")
                 + Sandbox(code_policy).cmd(
-                    ["echo", "tr a-z A-Z <&3"]
+                    ["echo", "upper"]
                 ).as_("code")
                 | Sandbox(consumer_policy).cmd(
-                    ["sh", "-c", 'eval "$(cat)"']
+                    [sys.executable, "-c",
+                     "import os, sys\n"
+                     "code = sys.stdin.read().strip()\n"
+                     "with os.fdopen(3) as data_fd:\n"
+                     "    data = data_fd.read()\n"
+                     "if code == 'upper':\n"
+                     "    sys.stdout.write(data.upper())\n"
+                     "else:\n"
+                     "    sys.stdout.write(data)\n"]
                 )
             ).run()
             assert result.success, f"stderr={result.stderr}"

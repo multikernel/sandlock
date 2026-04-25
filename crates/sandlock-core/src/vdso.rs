@@ -59,7 +59,31 @@ fn parse_vdso_symbols(vdso_bytes: &[u8]) -> HashMap<String, u64> {
     symbols
 }
 
+#[cfg(target_arch = "aarch64")]
+fn push_insn(stub: &mut Vec<u8>, insn: u32) {
+    stub.extend_from_slice(&insn.to_le_bytes());
+}
+
+#[cfg(target_arch = "aarch64")]
+fn movz_x(reg: u32, imm16: u16, shift: u32) -> u32 {
+    0xD280_0000 | (((shift / 16) & 0x3) << 21) | ((imm16 as u32) << 5) | reg
+}
+
+#[cfg(target_arch = "aarch64")]
+fn movk_x(reg: u32, imm16: u16, shift: u32) -> u32 {
+    0xF280_0000 | (((shift / 16) & 0x3) << 21) | ((imm16 as u32) << 5) | reg
+}
+
+#[cfg(target_arch = "aarch64")]
+fn load_imm64(stub: &mut Vec<u8>, reg: u32, value: u64) {
+    push_insn(stub, movz_x(reg, (value & 0xffff) as u16, 0));
+    push_insn(stub, movk_x(reg, ((value >> 16) & 0xffff) as u16, 16));
+    push_insn(stub, movk_x(reg, ((value >> 32) & 0xffff) as u16, 32));
+    push_insn(stub, movk_x(reg, ((value >> 48) & 0xffff) as u16, 48));
+}
+
 /// Generate a simple stub that forces a real syscall (replacing the vDSO fast path).
+#[cfg(target_arch = "x86_64")]
 /// Layout: mov eax, imm32 / syscall / ret — 8 bytes total.
 fn simple_stub(syscall_nr: u32) -> Vec<u8> {
     let mut stub = Vec::new();
@@ -70,9 +94,19 @@ fn simple_stub(syscall_nr: u32) -> Vec<u8> {
     stub // 8 bytes total
 }
 
+#[cfg(target_arch = "aarch64")]
+fn simple_stub(syscall_nr: u32) -> Vec<u8> {
+    let mut stub = Vec::new();
+    push_insn(&mut stub, movz_x(8, syscall_nr as u16, 0)); // mov x8, syscall_nr
+    push_insn(&mut stub, 0xD400_0001); // svc #0
+    push_insn(&mut stub, 0xD65F_03C0); // ret
+    stub
+}
+
 /// Generate an offset stub for clock_gettime that forces a real syscall,
 /// then adds a time offset to the result for CLOCK_REALTIME and CLOCK_REALTIME_COARSE.
 ///
+#[cfg(target_arch = "x86_64")]
 /// Layout (x86-64):
 ///   push rdi / push rsi
 ///   mov eax, 228 / syscall          ; do the real syscall
@@ -109,8 +143,28 @@ fn offset_stub_clock_gettime(offset_secs: i64) -> Vec<u8> {
     stub
 }
 
+#[cfg(target_arch = "aarch64")]
+fn offset_stub_clock_gettime(offset_secs: i64) -> Vec<u8> {
+    let mut stub = Vec::new();
+    push_insn(&mut stub, 0xAA00_03E9); // mov x9, x0 (clock id)
+    push_insn(&mut stub, 0xAA01_03EA); // mov x10, x1 (timespec*)
+    push_insn(&mut stub, movz_x(8, libc::SYS_clock_gettime as u16, 0));
+    push_insn(&mut stub, 0xD400_0001); // svc #0
+    push_insn(&mut stub, 0x7100_013F); // cmp w9, #0 (CLOCK_REALTIME)
+    push_insn(&mut stub, 0x5400_0060); // b.eq +3 instructions
+    push_insn(&mut stub, 0x7100_153F); // cmp w9, #5 (CLOCK_REALTIME_COARSE)
+    push_insn(&mut stub, 0x5400_0101); // b.ne +8 instructions, to ret
+    load_imm64(&mut stub, 11, offset_secs as u64); // x11 = offset
+    push_insn(&mut stub, 0xF940_014C); // ldr x12, [x10]
+    push_insn(&mut stub, 0x8B0B_018C); // add x12, x12, x11
+    push_insn(&mut stub, 0xF900_014C); // str x12, [x10]
+    push_insn(&mut stub, 0xD65F_03C0); // ret
+    stub
+}
+
 /// Generate an offset stub for gettimeofday that forces a real syscall,
 /// then adds a time offset to tv_sec.
+#[cfg(target_arch = "x86_64")]
 fn offset_stub_gettimeofday(offset_secs: i64) -> Vec<u8> {
     let mut stub = Vec::new();
     stub.extend_from_slice(&[0x57, 0x56]); // push rdi, push rsi
@@ -122,6 +176,38 @@ fn offset_stub_gettimeofday(offset_secs: i64) -> Vec<u8> {
     stub.extend_from_slice(&[0x48, 0x01, 0x0E]); // add [rsi], rcx (tv_sec)
     stub.push(0xC3); // ret
     stub
+}
+
+#[cfg(target_arch = "aarch64")]
+fn offset_stub_gettimeofday(offset_secs: i64) -> Vec<u8> {
+    let mut stub = Vec::new();
+    push_insn(&mut stub, 0xAA00_03EA); // mov x10, x0 (timeval*)
+    push_insn(&mut stub, movz_x(8, libc::SYS_gettimeofday as u16, 0));
+    push_insn(&mut stub, 0xD400_0001); // svc #0
+    push_insn(&mut stub, 0xB400_010A); // cbz x10, +8 instructions, to ret
+    load_imm64(&mut stub, 11, offset_secs as u64); // x11 = offset
+    push_insn(&mut stub, 0xF940_014C); // ldr x12, [x10]
+    push_insn(&mut stub, 0x8B0B_018C); // add x12, x12, x11
+    push_insn(&mut stub, 0xF900_014C); // str x12, [x10]
+    push_insn(&mut stub, 0xD65F_03C0); // ret
+    stub
+}
+
+#[cfg(target_arch = "x86_64")]
+fn vdso_targets() -> Vec<(&'static str, &'static str, u32)> {
+    vec![
+        ("clock_gettime", "__vdso_clock_gettime", libc::SYS_clock_gettime as u32),
+        ("gettimeofday", "__vdso_gettimeofday", libc::SYS_gettimeofday as u32),
+        ("time", "__vdso_time", libc::SYS_time as u32),
+    ]
+}
+
+#[cfg(target_arch = "aarch64")]
+fn vdso_targets() -> Vec<(&'static str, &'static str, u32)> {
+    vec![
+        ("clock_gettime", "__kernel_clock_gettime", libc::SYS_clock_gettime as u32),
+        ("gettimeofday", "__kernel_gettimeofday", libc::SYS_gettimeofday as u32),
+    ]
 }
 
 /// Patch the vDSO of a target process to force real syscalls (interceptable by seccomp).
@@ -149,19 +235,13 @@ pub(crate) fn patch(
             SandlockError::MemoryProtect(format!("failed to open /proc/{}/mem: {}", pid, e))
         })?;
 
-    let targets = [
-        ("clock_gettime", "__vdso_clock_gettime", 228u32),
-        ("gettimeofday", "__vdso_gettimeofday", 96u32),
-        ("time", "__vdso_time", 201u32),
-    ];
-
-    for (name, alt_name, syscall_nr) in &targets {
-        if let Some(&offset) = symbols.get(*name).or_else(|| symbols.get(*alt_name)) {
+    for (name, alt_name, syscall_nr) in vdso_targets() {
+        if let Some(&offset) = symbols.get(name).or_else(|| symbols.get(alt_name)) {
             let addr = base + offset;
-            let stub = match (time_offset_secs, *name) {
+            let stub = match (time_offset_secs, name) {
                 (Some(off), "clock_gettime") => offset_stub_clock_gettime(off),
                 (Some(off), "gettimeofday") => offset_stub_gettimeofday(off),
-                _ => simple_stub(*syscall_nr),
+                _ => simple_stub(syscall_nr),
             };
             mem.seek(SeekFrom::Start(addr)).map_err(|e| {
                 SandlockError::MemoryProtect(format!(
@@ -200,7 +280,8 @@ mod tests {
         // Should find at least clock_gettime
         assert!(
             symbols.contains_key("clock_gettime")
-                || symbols.contains_key("__vdso_clock_gettime"),
+                || symbols.contains_key("__vdso_clock_gettime")
+                || symbols.contains_key("__kernel_clock_gettime"),
             "Expected clock_gettime in vDSO symbols, found: {:?}",
             symbols.keys().collect::<Vec<_>>()
         );

@@ -4,7 +4,7 @@ use sandlock_core::{Policy, Sandbox, Checkpoint};
 #[tokio::test]
 async fn test_checkpoint_save_load() {
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc")
         .build().unwrap();
 
@@ -53,7 +53,7 @@ async fn test_checkpoint_save_load() {
 #[tokio::test]
 async fn test_checkpoint_memory_maps() {
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc")
         .build().unwrap();
 
@@ -80,7 +80,7 @@ async fn test_checkpoint_memory_maps() {
 #[tokio::test]
 async fn test_checkpoint_app_state_roundtrip() {
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc")
         .build().unwrap();
 
@@ -113,7 +113,7 @@ async fn test_checkpoint_app_state_roundtrip() {
 #[tokio::test]
 async fn test_checkpoint_no_app_state_file() {
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc")
         .build().unwrap();
 
@@ -140,7 +140,7 @@ async fn test_checkpoint_no_app_state_file() {
 #[tokio::test]
 async fn test_checkpoint_process_info() {
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc")
         .build().unwrap();
 

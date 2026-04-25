@@ -4,7 +4,7 @@ use std::time::Duration;
 
 fn base_policy() -> Policy {
     Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
         .fs_read("/etc").fs_read("/proc").fs_read("/dev")
         .fs_write("/tmp")
         .build()
@@ -79,7 +79,7 @@ async fn test_disjoint_policies() {
 
     // Stage 1: can read the temp dir
     let reader_policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
         .fs_read("/etc").fs_read("/proc").fs_read("/dev")
         .fs_read(&tmp)
         .build()
@@ -173,7 +173,7 @@ async fn test_xoa_data_flow() {
 
     // Executor: can read workspace
     let executor_policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
         .fs_read("/etc").fs_read("/proc").fs_read("/dev")
         .fs_read(&tmp)
         .build()
@@ -245,7 +245,7 @@ async fn test_gather_disjoint_policies() {
 
     // Data source: can read the file
     let data_policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
         .fs_read("/etc").fs_read("/proc").fs_read("/dev")
         .fs_read(&tmp)
         .build()

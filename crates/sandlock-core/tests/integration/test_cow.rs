@@ -17,7 +17,7 @@ async fn test_overlayfs_basic_commands() {
     fs::write(workdir.join("hello.txt"), "original").unwrap();
 
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc")
         .fs_write(&workdir)
         .fs_isolation(FsIsolation::OverlayFs)
@@ -45,7 +45,7 @@ async fn test_overlayfs_write_isolation() {
     fs::write(workdir.join("data.txt"), "original").unwrap();
 
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc")
         .fs_write(&workdir)
         .fs_isolation(FsIsolation::OverlayFs)
@@ -79,7 +79,7 @@ async fn test_overlayfs_commit() {
     fs::write(workdir.join("data.txt"), "original").unwrap();
 
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc")
         .fs_write(&workdir)
         .fs_isolation(FsIsolation::OverlayFs)
@@ -124,7 +124,7 @@ async fn test_seccomp_cow_create_file() {
     fs::write(workdir.join("existing.txt"), "hello").unwrap();
 
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc")
         .fs_write(&workdir)
         .workdir(&workdir)  // FsIsolation::None is default → seccomp COW
@@ -154,7 +154,7 @@ async fn test_seccomp_cow_abort() {
     fs::write(workdir.join("existing.txt"), "original").unwrap();
 
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc")
         .fs_write(&workdir)
         .workdir(&workdir)
@@ -191,7 +191,7 @@ async fn test_seccomp_cow_relative_path_abort() {
     fs::write(workdir.join("orig.txt"), "original\n").unwrap();
 
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc").fs_read("/dev")
         .fs_write(&workdir)
         .workdir(&workdir)
@@ -226,7 +226,7 @@ async fn test_seccomp_cow_relative_path_commit() {
     fs::write(workdir.join("orig.txt"), "original\n").unwrap();
 
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc").fs_read("/dev")
         .fs_write(&workdir)
         .workdir(&workdir)
@@ -266,7 +266,7 @@ async fn test_seccomp_cow_open_directory() {
     let out_file = workdir.join("opendir_ok.txt");
 
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc").fs_read("/dev")
         .fs_write(&workdir)
         .workdir(&workdir)
@@ -310,7 +310,7 @@ async fn test_seccomp_cow_chdir_to_created_dir() {
     let out_file = workdir.join("chdir_ok.txt");
 
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc").fs_read("/dev")
         .fs_write(&workdir)
         .workdir(&workdir)
@@ -319,9 +319,18 @@ async fn test_seccomp_cow_chdir_to_created_dir() {
         .build()
         .unwrap();
 
-    // mkdir creates the dir in COW upper only; cd must see it via interception.
+    // Create a nested directory through a dirfd so the COW handler must map the
+    // upper-layer fd target back to the logical workdir before mkdirat.
+    // Use physical pwd so the assertion covers getcwd virtualization.
     let script = format!(
-        "mkdir -p subdir/deep && cd subdir/deep && pwd > {}",
+        concat!(
+            "mkdir -p subdir && python3 -c \"",
+            "import os; ",
+            "fd = os.open('subdir', os.O_RDONLY | os.O_DIRECTORY); ",
+            "os.mkdir('deep', dir_fd=fd); ",
+            "os.close(fd)\" && ",
+            "cd subdir/deep && pwd -P > {}"
+        ),
         out_file.display()
     );
     let result = Sandbox::run(&policy, &["sh", "-c", &script]).await;
@@ -341,12 +350,13 @@ async fn test_seccomp_cow_chdir_to_created_dir() {
     let _ = fs::remove_dir_all(&workdir);
 }
 
-/// Test that the legacy open() syscall works correctly with COW.
+/// Test that the raw open syscall ABI works correctly with COW.
 ///
 /// Regression test: handle_cow_open always read args in openat() layout
 /// (dirfd=args[0], path=args[1], flags=args[2]), but open() uses
 /// (path=args[0], flags=args[1], mode=args[2]). This caused COW to miss
-/// all legacy open() calls, falling through to the kernel.
+/// all legacy open() calls on x86_64, falling through to the kernel. ARM64
+/// does not provide SYS_open, so it uses the equivalent raw openat ABI.
 #[tokio::test]
 async fn test_seccomp_cow_legacy_open_syscall() {
     let workdir = temp_dir("seccomp-legacy-open");
@@ -355,7 +365,7 @@ async fn test_seccomp_cow_legacy_open_syscall() {
     ));
 
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc").fs_read("/dev")
         .fs_write(&workdir).fs_write("/tmp")
         .workdir(&workdir)
@@ -364,18 +374,21 @@ async fn test_seccomp_cow_legacy_open_syscall() {
         .build()
         .unwrap();
 
-    // Use raw SYS_open syscall (not openat) to create a file, then verify
-    // it's visible during the run but discarded on abort.
+    // Use raw syscall ABI to create a file, then verify it's visible during
+    // the run but discarded on abort. x86_64 uses legacy SYS_open; ARM64 uses
+    // the equivalent openat(AT_FDCWD, ...) ABI.
     let script = format!(concat!(
-        "import ctypes, os\n",
+        "import ctypes, os, platform\n",
         "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
-        "SYS_open = 2\n",
         "O_WRONLY = 1; O_CREAT = 64; O_TRUNC = 512\n",
         "path = b'{wd}/newfile.txt'\n",
-        "fd = libc.syscall(SYS_open, path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)\n",
+        "if platform.machine() == 'aarch64':\n",
+        "    fd = libc.syscall(56, -100, path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)\n",
+        "else:\n",
+        "    fd = libc.syscall(2, path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)\n",
         "err = ctypes.get_errno()\n",
         "if fd >= 0:\n",
-        "    os.write(fd, b'created via SYS_open')\n",
+        "    os.write(fd, b'created via raw open')\n",
         "    os.close(fd)\n",
         "    content = open('{wd}/newfile.txt').read()\n",
         "    open('{out}', 'w').write(content)\n",
@@ -386,7 +399,7 @@ async fn test_seccomp_cow_legacy_open_syscall() {
     let result = Sandbox::run(&policy, &["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}, stderr={}", result.code(), result.stderr_str().unwrap_or(""));
     let content = fs::read_to_string(&out_file).unwrap_or_default();
-    assert_eq!(content, "created via SYS_open", "SYS_open should work with COW");
+    assert_eq!(content, "created via raw open", "raw open ABI should work with COW");
     // After abort, the file should not exist on the real filesystem
     assert!(!workdir.join("newfile.txt").exists(), "newfile.txt should not exist after abort");
 
@@ -410,7 +423,7 @@ async fn test_seccomp_cow_excl_after_unlink() {
     fs::write(workdir.join("target.txt"), "original").unwrap();
 
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc").fs_read("/dev")
         .fs_write(&workdir).fs_write("/tmp")
         .workdir(&workdir)
@@ -419,9 +432,9 @@ async fn test_seccomp_cow_excl_after_unlink() {
         .build()
         .unwrap();
 
-    // Unlink the file, then recreate it with O_CREAT|O_EXCL via SYS_open
+    // Unlink the file, then recreate it with O_CREAT|O_EXCL via raw open ABI.
     let script = format!(concat!(
-        "import ctypes, os\n",
+        "import ctypes, os, platform\n",
         "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
         "path = b'{wd}/target.txt'\n",
         "ret = libc.unlink(path)\n",
@@ -429,7 +442,10 @@ async fn test_seccomp_cow_excl_after_unlink() {
         "    open('{out}', 'w').write(f'UNLINK_FAILED:{{ctypes.get_errno()}}')\n",
         "    raise SystemExit(1)\n",
         "O_WRONLY = 1; O_CREAT = 64; O_EXCL = 128\n",
-        "fd = libc.syscall(2, path, O_WRONLY | O_CREAT | O_EXCL, 0o644)\n",
+        "if platform.machine() == 'aarch64':\n",
+        "    fd = libc.syscall(56, -100, path, O_WRONLY | O_CREAT | O_EXCL, 0o644)\n",
+        "else:\n",
+        "    fd = libc.syscall(2, path, O_WRONLY | O_CREAT | O_EXCL, 0o644)\n",
         "err = ctypes.get_errno()\n",
         "if fd >= 0:\n",
         "    os.write(fd, b'recreated')\n",
@@ -458,7 +474,7 @@ async fn test_seccomp_cow_read_existing() {
     fs::write(workdir.join("data.txt"), "hello world").unwrap();
 
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc")
         .fs_write(&workdir)
         .workdir(&workdir)

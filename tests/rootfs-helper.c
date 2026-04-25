@@ -224,6 +224,14 @@ static int cmd_access(int argc, char **argv) {
 
 /* ── legacy syscall wrappers (for testing chroot handler) ──── */
 
+#if defined(SYS_stat) && defined(SYS_lstat) && defined(SYS_open) && \
+    defined(SYS_access) && defined(SYS_readlink) && defined(SYS_mkdir) && \
+    defined(SYS_rmdir) && defined(SYS_unlink) && defined(SYS_rename) && \
+    defined(SYS_symlink) && defined(SYS_chmod)
+#define HAVE_LEGACY_PATH_SYSCALLS 1
+#endif
+
+#ifdef HAVE_LEGACY_PATH_SYSCALLS
 static int cmd_legacy_stat(int argc, char **argv) {
     if (argc < 1) return 1;
     struct stat st;
@@ -357,6 +365,141 @@ static int cmd_legacy_chmod(int argc, char **argv) {
     printf("OK\n");
     return 0;
 }
+#else
+static int cmd_legacy_stat(int argc, char **argv) {
+    if (argc < 1) return 1;
+    struct stat st;
+    long ret = syscall(SYS_newfstatat, AT_FDCWD, argv[0], &st, 0);
+    if (ret < 0) {
+        printf("ERR %d\n", errno);
+        return 1;
+    }
+    printf("OK size=%ld mode=%o\n", (long)st.st_size, st.st_mode & 07777);
+    return 0;
+}
+
+static int cmd_legacy_lstat(int argc, char **argv) {
+    if (argc < 1) return 1;
+    struct stat st;
+    long ret = syscall(SYS_newfstatat, AT_FDCWD, argv[0], &st, AT_SYMLINK_NOFOLLOW);
+    if (ret < 0) {
+        printf("ERR %d\n", errno);
+        return 1;
+    }
+    printf("OK size=%ld mode=%o type=%s\n", (long)st.st_size, st.st_mode & 07777,
+           S_ISDIR(st.st_mode) ? "dir" : S_ISLNK(st.st_mode) ? "link" : "file");
+    return 0;
+}
+
+static int cmd_legacy_open(int argc, char **argv) {
+    if (argc < 1) return 1;
+    int fd = (int)syscall(SYS_openat, AT_FDCWD, argv[0], O_RDONLY);
+    if (fd < 0) {
+        printf("ERR %d\n", errno);
+        return 1;
+    }
+    char buf[4096];
+    ssize_t n = read(fd, buf, sizeof(buf));
+    close(fd);
+    printf("OK ");
+    if (n > 0) {
+        write(STDOUT_FILENO, buf, n);
+    }
+    return 0;
+}
+
+static int cmd_legacy_access(int argc, char **argv) {
+    if (argc < 1) return 1;
+    long ret = syscall(SYS_faccessat, AT_FDCWD, argv[0], F_OK, 0);
+    if (ret < 0) {
+        printf("ERR %d\n", errno);
+        return 1;
+    }
+    printf("OK\n");
+    return 0;
+}
+
+static int cmd_legacy_readlink(int argc, char **argv) {
+    if (argc < 1) return 1;
+    char buf[4096];
+    long n = syscall(SYS_readlinkat, AT_FDCWD, argv[0], buf, sizeof(buf) - 1);
+    if (n < 0) {
+        printf("ERR %d\n", errno);
+        return 1;
+    }
+    buf[n] = '\0';
+    printf("OK %s\n", buf);
+    return 0;
+}
+
+static int cmd_legacy_mkdir(int argc, char **argv) {
+    if (argc < 1) return 1;
+    long ret = syscall(SYS_mkdirat, AT_FDCWD, argv[0], 0755);
+    if (ret < 0) {
+        printf("ERR %d\n", errno);
+        return 1;
+    }
+    printf("OK\n");
+    return 0;
+}
+
+static int cmd_legacy_rmdir(int argc, char **argv) {
+    if (argc < 1) return 1;
+    long ret = syscall(SYS_unlinkat, AT_FDCWD, argv[0], AT_REMOVEDIR);
+    if (ret < 0) {
+        printf("ERR %d\n", errno);
+        return 1;
+    }
+    printf("OK\n");
+    return 0;
+}
+
+static int cmd_legacy_unlink(int argc, char **argv) {
+    if (argc < 1) return 1;
+    long ret = syscall(SYS_unlinkat, AT_FDCWD, argv[0], 0);
+    if (ret < 0) {
+        printf("ERR %d\n", errno);
+        return 1;
+    }
+    printf("OK\n");
+    return 0;
+}
+
+static int cmd_legacy_rename(int argc, char **argv) {
+    if (argc < 2) return 1;
+    long ret = syscall(SYS_renameat2, AT_FDCWD, argv[0], AT_FDCWD, argv[1], 0);
+    if (ret < 0) {
+        printf("ERR %d\n", errno);
+        return 1;
+    }
+    printf("OK\n");
+    return 0;
+}
+
+static int cmd_legacy_symlink(int argc, char **argv) {
+    if (argc < 2) return 1;
+    long ret = syscall(SYS_symlinkat, argv[0], AT_FDCWD, argv[1]);
+    if (ret < 0) {
+        printf("ERR %d\n", errno);
+        return 1;
+    }
+    printf("OK\n");
+    return 0;
+}
+
+static int cmd_legacy_chmod(int argc, char **argv) {
+    if (argc < 2) return 1;
+    unsigned mode;
+    if (sscanf(argv[0], "%o", &mode) != 1) return 1;
+    long ret = syscall(SYS_fchmodat, AT_FDCWD, argv[1], mode, 0);
+    if (ret < 0) {
+        printf("ERR %d\n", errno);
+        return 1;
+    }
+    printf("OK\n");
+    return 0;
+}
+#endif
 
 /* ── dispatch ───────────────────────────────────────────────── */
 
@@ -385,7 +528,7 @@ static int dispatch(const char *cmd, int argc, char **argv) {
     if (strcmp(cmd, "true") == 0)           return 0;
     if (strcmp(cmd, "false") == 0)          return 1;
 
-    /* Legacy syscall variants */
+    /* Legacy syscall variants on x86_64; equivalent raw *at ABI elsewhere. */
     if (strcmp(cmd, "legacy-stat") == 0)    return cmd_legacy_stat(argc, argv);
     if (strcmp(cmd, "legacy-lstat") == 0)   return cmd_legacy_lstat(argc, argv);
     if (strcmp(cmd, "legacy-open") == 0)    return cmd_legacy_open(argc, argv);

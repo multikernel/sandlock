@@ -15,7 +15,7 @@ async fn test_dry_run_reports_added_file() {
     fs::write(workdir.join("existing.txt"), "hello").unwrap();
 
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc").fs_read("/dev")
         .fs_write(&workdir)
         .workdir(&workdir)
@@ -46,7 +46,7 @@ async fn test_dry_run_reports_modified_file() {
     fs::write(workdir.join("data.txt"), "original").unwrap();
 
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc").fs_read("/dev")
         .fs_write(&workdir)
         .workdir(&workdir)
@@ -77,7 +77,7 @@ async fn test_dry_run_reports_deleted_file() {
     fs::write(workdir.join("victim.txt"), "delete me").unwrap();
 
     let policy = Policy::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc").fs_read("/dev")
         .fs_write(&workdir)
         .workdir(&workdir)

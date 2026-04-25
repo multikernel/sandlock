@@ -9,6 +9,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 use crate::error::NotifError;
+use crate::arch;
 use crate::sys::structs::{
     SeccompNotif, SeccompNotifAddfd, SeccompNotifResp,
     SECCOMP_ADDFD_FLAG_SEND, SECCOMP_IOCTL_NOTIF_ADDFD, SECCOMP_IOCTL_NOTIF_ID_VALID, SECCOMP_IOCTL_NOTIF_RECV,
@@ -387,6 +388,38 @@ pub(crate) fn read_child_mem(
     Ok(result)
 }
 
+/// Read a NUL-terminated string from child memory without crossing unmapped
+/// page boundaries in a single `process_vm_readv` call.
+pub(crate) fn read_child_cstr(
+    notif_fd: RawFd,
+    id: u64,
+    pid: u32,
+    addr: u64,
+    max_len: usize,
+) -> Option<String> {
+    if addr == 0 || max_len == 0 {
+        return None;
+    }
+
+    const PAGE_SIZE: u64 = 4096;
+    let mut result = Vec::with_capacity(max_len.min(256));
+    let mut cur = addr;
+    while result.len() < max_len {
+        let page_remaining = PAGE_SIZE - (cur % PAGE_SIZE);
+        let remaining = max_len - result.len();
+        let to_read = page_remaining.min(remaining as u64) as usize;
+        let bytes = read_child_mem(notif_fd, id, pid, cur, to_read).ok()?;
+        if let Some(nul) = bytes.iter().position(|&b| b == 0) {
+            result.extend_from_slice(&bytes[..nul]);
+            return String::from_utf8(result).ok();
+        }
+        result.extend_from_slice(&bytes);
+        cur += to_read as u64;
+    }
+
+    String::from_utf8(result).ok()
+}
+
 /// Write bytes to a child process via process_vm_writev.
 ///
 /// Performs TOCTOU validation by calling `id_valid` before and after
@@ -480,7 +513,7 @@ fn syscall_name(nr: i64) -> &'static str {
         n if n == libc::SYS_bind => "bind",
         n if n == libc::SYS_clone => "clone",
         n if n == libc::SYS_clone3 => "clone3",
-        n if n == libc::SYS_vfork => "vfork",
+        n if Some(n) == arch::SYS_VFORK => "vfork",
         n if n == libc::SYS_execve => "execve",
         n if n == libc::SYS_execveat => "execveat",
         n if n == libc::SYS_mmap => "mmap",
@@ -504,12 +537,12 @@ fn syscall_category(nr: i64) -> crate::policy_fn::SyscallCategory {
             || n == libc::SYS_truncate || n == libc::SYS_readlinkat
             || n == libc::SYS_newfstatat || n == libc::SYS_statx
             || n == libc::SYS_faccessat || n == libc::SYS_getdents64
-            || n == libc::SYS_getdents => SyscallCategory::File,
+            || Some(n) == arch::SYS_GETDENTS => SyscallCategory::File,
         n if n == libc::SYS_connect || n == libc::SYS_sendto
             || n == libc::SYS_sendmsg || n == libc::SYS_bind
             || n == libc::SYS_getsockname => SyscallCategory::Network,
         n if n == libc::SYS_clone || n == libc::SYS_clone3
-            || n == libc::SYS_vfork || n == libc::SYS_execve
+            || Some(n) == arch::SYS_VFORK || n == libc::SYS_execve
             || n == libc::SYS_execveat => SyscallCategory::Process,
         n if n == libc::SYS_mmap || n == libc::SYS_munmap
             || n == libc::SYS_brk || n == libc::SYS_mremap
@@ -590,7 +623,7 @@ fn resolve_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Option<Strin
             let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
             resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
         }
-        n if n == libc::SYS_open || n == libc::SYS_execve => {
+        n if Some(n) == arch::SYS_OPEN || n == libc::SYS_execve => {
             let path = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
             resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
         }
@@ -618,17 +651,17 @@ fn resolve_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Option<Strin
             resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &target)
         }
         // link(oldpath, newpath) — legacy, AT_FDCWD implied for both
-        n if n == libc::SYS_link => {
+        n if Some(n) == arch::SYS_LINK => {
             let path = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
             resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
         }
         // rename(oldpath, newpath) — legacy, AT_FDCWD implied for both
-        n if n == libc::SYS_rename => {
+        n if Some(n) == arch::SYS_RENAME => {
             let path = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
             resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
         }
         // symlink(target, linkpath) — legacy
-        n if n == libc::SYS_symlink => {
+        n if Some(n) == arch::SYS_SYMLINK => {
             let target = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
             resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &target)
         }
@@ -655,12 +688,12 @@ fn resolve_second_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Optio
             resolve_at_path_for_event(notif, notif.data.args[2] as i64, &path)
         }
         // rename(oldpath, newpath) — legacy
-        n if n == libc::SYS_rename => {
+        n if Some(n) == arch::SYS_RENAME => {
             let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
             resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
         }
         // link(oldpath, newpath) — legacy
-        n if n == libc::SYS_link => {
+        n if Some(n) == arch::SYS_LINK => {
             let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
             resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
         }
@@ -747,7 +780,7 @@ async fn emit_policy_event(
     let mut size = None;
     let mut argv = None;
 
-    if nr == libc::SYS_openat || nr == libc::SYS_execve || nr == libc::SYS_execveat {
+    if nr == libc::SYS_openat || Some(nr) == arch::SYS_OPEN || nr == libc::SYS_execve || nr == libc::SYS_execveat {
         // openat(dirfd, pathname, ...): args[1] = path ptr
         // execve(pathname, argv, envp): args[0] = path ptr, args[1] = argv ptr
         let path_ptr = if nr == libc::SYS_openat {
@@ -838,13 +871,15 @@ async fn handle_notification(
     // Check dynamic path denials before dispatch
     let mut action = {
         let nr = notif.data.nr as i64;
+        let mut path_check_nrs = vec![
+            libc::SYS_openat, libc::SYS_execve, libc::SYS_execveat,
+            libc::SYS_linkat, libc::SYS_renameat2, libc::SYS_symlinkat,
+        ];
+        path_check_nrs.extend([
+            arch::SYS_OPEN, arch::SYS_LINK, arch::SYS_RENAME, arch::SYS_SYMLINK,
+        ].into_iter().flatten());
         let should_precheck_denied = policy.chroot_root.is_none()
-            && [
-                libc::SYS_openat, libc::SYS_open, libc::SYS_execve, libc::SYS_execveat,
-                libc::SYS_linkat, libc::SYS_link,
-                libc::SYS_renameat2, libc::SYS_rename,
-                libc::SYS_symlinkat, libc::SYS_symlink,
-            ].contains(&nr);
+            && path_check_nrs.contains(&nr);
         if should_precheck_denied {
             let pfs = ctx.policy_fn.lock().await;
             if is_path_denied_for_notif(&pfs, &notif, fd) {

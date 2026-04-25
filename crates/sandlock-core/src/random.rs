@@ -8,7 +8,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::RawFd;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 
-use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction};
+use crate::seccomp::notif::{read_child_cstr, write_child_mem, NotifAction};
 use crate::sys::structs::SeccompNotif;
 use crate::sys::syscall;
 
@@ -56,12 +56,9 @@ pub(crate) fn handle_random_open(
         return None;
     }
 
-    // Read the path from child memory.
-    let bytes = read_child_mem(notif_fd, notif.id, notif.pid, path_ptr, 256).ok()?;
-    let nul_pos = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    let path = std::str::from_utf8(&bytes[..nul_pos]).ok()?;
+    let path = read_child_cstr(notif_fd, notif.id, notif.pid, path_ptr, 4096)?;
 
-    if path != "/dev/urandom" && path != "/dev/random" {
+    if path.as_str() != "/dev/urandom" && path.as_str() != "/dev/random" {
         return None;
     }
 

@@ -26,7 +26,7 @@ from ..policy import Policy
 # Resolve the Python interpreter's installation prefix so that sandboxed
 # processes can always exec the current interpreter, even when it lives
 # outside the standard system paths (e.g. /opt on CI, virtualenvs, etc.).
-_PYTHON_PREFIX = os.path.dirname(os.path.dirname(os.path.realpath(sys.executable)))
+_PYTHON_PREFIX = sys.prefix
 
 
 _POLICY_FIELDS = frozenset(f.name for f in fields(Policy))

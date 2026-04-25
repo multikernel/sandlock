@@ -50,9 +50,9 @@ impl ResourceState {
 pub struct ProcfsState {
     /// PIDs belonging to the sandbox (for /proc PID filtering).
     pub proc_pids: HashSet<i32>,
-    /// Cache of filtered dirent entries keyed by (pid, fd).
+    /// Cache of filtered dirent entries keyed by (pid, fd, directory target).
     /// Populated on first getdents64 call for a /proc directory, drained on subsequent calls.
-    pub getdents_cache: HashMap<(i32, u32), Vec<Vec<u8>>>,
+    pub getdents_cache: HashMap<(i32, u32, String), Vec<Vec<u8>>>,
     /// Base address of the last vDSO we patched (0 = not yet patched).
     pub vdso_patched_addr: u64,
 }
@@ -71,13 +71,24 @@ impl ProcfsState {
 // CowState — copy-on-write filesystem state
 // ============================================================
 
+/// Stable process identity for per-process COW state.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct PidKey {
+    /// Numeric PID observed by seccomp notification.
+    pub pid: i32,
+    /// Process start time from /proc/<pid>/stat field 22.
+    pub start_time: u64,
+}
+
 /// Copy-on-write filesystem state.
 pub struct CowState {
     /// Seccomp-based COW branch (None if COW disabled).
     pub branch: Option<crate::cow::seccomp::SeccompCowBranch>,
     /// Getdents cache for COW directories.
     /// Value is (host_path, entries) to detect fd reuse and invalidate stale entries.
-    pub dir_cache: HashMap<(i32, u32), (String, Vec<Vec<u8>>)>,
+    pub dir_cache: HashMap<(PidKey, u32), (String, Vec<Vec<u8>>)>,
+    /// Logical cwd for processes that chdir into COW-only directories.
+    pub virtual_cwds: HashMap<PidKey, String>,
 }
 
 impl CowState {
@@ -85,7 +96,41 @@ impl CowState {
         Self {
             branch: None,
             dir_cache: HashMap::new(),
+            virtual_cwds: HashMap::new(),
         }
+    }
+
+    /// Drop COW per-process entries for an older process that used the same numeric PID.
+    pub(crate) fn prune_reused_pid(&mut self, current: PidKey) {
+        self.virtual_cwds
+            .retain(|key, _| key.pid != current.pid || *key == current);
+        self.dir_cache
+            .retain(|(key, _), _| key.pid != current.pid || *key == current);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cow_state_prunes_entries_for_reused_pid() {
+        let old = PidKey { pid: 42, start_time: 1 };
+        let current = PidKey { pid: 42, start_time: 2 };
+        let other = PidKey { pid: 43, start_time: 1 };
+        let mut state = CowState::new();
+
+        state.virtual_cwds.insert(old, "/old".to_string());
+        state.virtual_cwds.insert(other, "/other".to_string());
+        state.dir_cache.insert((old, 7), ("/old".to_string(), Vec::new()));
+        state.dir_cache.insert((other, 7), ("/other".to_string(), Vec::new()));
+
+        state.prune_reused_pid(current);
+
+        assert!(!state.virtual_cwds.contains_key(&old));
+        assert!(!state.dir_cache.contains_key(&(old, 7)));
+        assert_eq!(state.virtual_cwds.get(&other), Some(&"/other".to_string()));
+        assert!(state.dir_cache.contains_key(&(other, 7)));
     }
 }
 
