@@ -8,8 +8,12 @@ on:
 
 jobs:
   rust:
-    name: Rust tests
-    runs-on: ubuntu-latest
+    name: Rust tests (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
     steps:
       - uses: actions/checkout@v4
 
@@ -29,11 +33,13 @@ jobs:
         run: cargo test --release --test integration -- --test-threads=1
 
   python:
-    name: Python tests (py${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    name: Python tests (${{ matrix.runner }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.runner }}
     needs: rust
     strategy:
+      fail-fast: false
       matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
         python-version: ["3.10", "3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
