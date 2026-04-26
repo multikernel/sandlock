@@ -950,8 +950,30 @@ pub async fn supervisor(
         }
     });
 
+    // Spawn a low-frequency GC task that prunes per-process COW state for
+    // children that have exited.  prune_reused_pid only fires when a new
+    // process recycles a PID, so without this sweep `virtual_cwds` and
+    // `dir_cache` would grow with the number of distinct child PIDs over
+    // the lifetime of the supervisor.
+    let gc = tokio::spawn(cow_state_gc(Arc::clone(&ctx.cow)));
+
     while let Some(notif) = rx.recv().await {
         handle_notification(notif, &ctx, &dispatch_table, fd).await;
+    }
+
+    gc.abort();
+}
+
+/// Periodic sweep that drops `CowState` entries belonging to exited PIDs.
+async fn cow_state_gc(cow: Arc<tokio::sync::Mutex<super::state::CowState>>) {
+    let interval = std::time::Duration::from_secs(30);
+    loop {
+        tokio::time::sleep(interval).await;
+        let mut st = cow.lock().await;
+        if st.virtual_cwds.is_empty() && st.dir_cache.is_empty() {
+            continue;
+        }
+        st.prune_dead_pids();
     }
 }
 

@@ -80,6 +80,17 @@ pub struct PidKey {
     pub start_time: u64,
 }
 
+/// Read the process start time (field 22 of /proc/<pid>/stat) for `pid`.
+/// Returns None if the process is gone or /proc is not readable.
+pub(crate) fn read_pid_start_time(pid: i32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    // Skip past "pid (comm)" — comm may contain spaces and parens, but the
+    // last ") " in the line ends the comm field.
+    let rest = stat.rsplit_once(") ")?.1;
+    // The first token after "(comm) " is field 3; field 22 is therefore nth(19).
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
 /// Copy-on-write filesystem state.
 pub struct CowState {
     /// Seccomp-based COW branch (None if COW disabled).
@@ -107,11 +118,95 @@ impl CowState {
         self.dir_cache
             .retain(|(key, _), _| key.pid != current.pid || *key == current);
     }
+
+    /// Drop COW per-process entries for processes that have exited.
+    ///
+    /// Walks the unique PIDs in `virtual_cwds` and `dir_cache`, reading
+    /// each PID's start_time from /proc/<pid>/stat once. Entries for PIDs
+    /// whose process is gone, or whose start_time no longer matches the
+    /// stored PidKey, are removed. Intended to be called periodically by
+    /// a supervisor-side GC task; runs in O(unique_pids) per sweep.
+    pub fn prune_dead_pids(&mut self) {
+        let mut pids: HashSet<i32> = HashSet::new();
+        pids.extend(self.virtual_cwds.keys().map(|k| k.pid));
+        pids.extend(self.dir_cache.keys().map(|(k, _)| k.pid));
+
+        let mut alive_keys: HashSet<PidKey> = HashSet::with_capacity(pids.len());
+        for pid in pids {
+            if let Some(start_time) = read_pid_start_time(pid) {
+                alive_keys.insert(PidKey { pid, start_time });
+            }
+        }
+
+        self.virtual_cwds.retain(|key, _| alive_keys.contains(key));
+        self.dir_cache
+            .retain(|(key, _), _| alive_keys.contains(key));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cow_state_prunes_entries_for_exited_pids() {
+        // Spawn /bin/true and wait for it to exit so we know its PID is gone.
+        let mut child = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("failed to spawn /bin/true");
+        let dead_pid = child.id() as i32;
+        let dead_start = read_pid_start_time(dead_pid)
+            .expect("failed to read start_time before child exits");
+        let _ = child.wait();
+        // Wait until /proc/<pid> actually disappears.  Reaping can lag
+        // on some kernels even after wait() returns.
+        for _ in 0..100 {
+            if read_pid_start_time(dead_pid).is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // Self is definitely alive.
+        let live_pid = unsafe { libc::getpid() };
+        let live_start = read_pid_start_time(live_pid)
+            .expect("self should have a readable start_time");
+
+        let dead = PidKey { pid: dead_pid, start_time: dead_start };
+        let live = PidKey { pid: live_pid, start_time: live_start };
+
+        let mut state = CowState::new();
+        state.virtual_cwds.insert(dead, "/dead".to_string());
+        state.virtual_cwds.insert(live, "/live".to_string());
+        state.dir_cache.insert((dead, 3), ("/dead".to_string(), Vec::new()));
+        state.dir_cache.insert((live, 3), ("/live".to_string(), Vec::new()));
+
+        state.prune_dead_pids();
+
+        assert!(!state.virtual_cwds.contains_key(&dead));
+        assert!(!state.dir_cache.contains_key(&(dead, 3)));
+        assert_eq!(state.virtual_cwds.get(&live), Some(&"/live".to_string()));
+        assert!(state.dir_cache.contains_key(&(live, 3)));
+    }
+
+    #[test]
+    fn cow_state_prunes_entries_for_recycled_pid() {
+        // Same numeric PID with a different start_time means the original
+        // process has gone and a new one took its slot.  Stale entries
+        // must be dropped even if a process at that PID currently exists.
+        let live_pid = unsafe { libc::getpid() };
+        let live_start = read_pid_start_time(live_pid).unwrap();
+        let stale = PidKey { pid: live_pid, start_time: live_start.wrapping_sub(1) };
+
+        let mut state = CowState::new();
+        state.virtual_cwds.insert(stale, "/stale".to_string());
+        state.dir_cache.insert((stale, 5), ("/stale".to_string(), Vec::new()));
+
+        state.prune_dead_pids();
+
+        assert!(!state.virtual_cwds.contains_key(&stale));
+        assert!(!state.dir_cache.contains_key(&(stale, 5)));
+    }
 
     #[test]
     fn cow_state_prunes_entries_for_reused_pid() {

@@ -13,7 +13,7 @@ use crate::arch;
 use crate::cow::seccomp::SeccompCowBranch;
 use crate::procfs::{build_dirent64, DT_DIR, DT_LNK, DT_REG};
 use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction};
-use crate::seccomp::state::{CowState, PidKey};
+use crate::seccomp::state::{read_pid_start_time, CowState, PidKey};
 use crate::sys::structs::SeccompNotif;
 
 /// Read a NUL-terminated path from child memory (up to 4096 bytes for filesystem paths).
@@ -100,16 +100,10 @@ fn map_cow_upper_path(cow: &SeccompCowBranch, path: &str) -> String {
     normalize_path(path).to_string_lossy().into_owned()
 }
 
-fn read_pid_start_time(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
-    let rest = stat.rsplit_once(") ")?.1;
-    // starttime is field 22; after "pid (comm)" the first token is field 3.
-    rest.split_whitespace().nth(19)?.parse().ok()
-}
-
 fn cow_pid_key(pid: u32) -> Option<PidKey> {
+    let pid = i32::try_from(pid).ok()?;
     Some(PidKey {
-        pid: i32::try_from(pid).ok()?,
+        pid,
         start_time: read_pid_start_time(pid)?,
     })
 }
