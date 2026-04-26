@@ -957,9 +957,8 @@ impl Sandbox {
                 net_state.port_map.on_bind = Some(cb);
             }
 
-            // ProcfsState
-            let mut procfs_state = ProcfsState::new();
-            procfs_state.proc_pids.insert(pid);
+            // ProcfsState (sandbox membership lives in ProcessIndex now).
+            let procfs_state = ProcfsState::new();
 
             // ResourceState
             let mut res_state = ResourceState::new(
@@ -1029,6 +1028,9 @@ impl Sandbox {
             let time_random_state = Arc::new(Mutex::new(time_random_state));
             let policy_fn_state = Arc::new(Mutex::new(policy_fn_state));
             let chroot_state = Arc::new(Mutex::new(chroot_state));
+            // Root child is registered (with watcher) on its first
+            // notification, the same path grandchildren take.
+            let processes = Arc::new(crate::seccomp::state::ProcessIndex::new());
 
             let ctx = Arc::new(SupervisorCtx {
                 resource: Arc::clone(&res_state),
@@ -1039,6 +1041,7 @@ impl Sandbox {
                 policy_fn: Arc::clone(&policy_fn_state),
                 chroot: Arc::clone(&chroot_state),
                 netlink: Arc::new(crate::netlink::NetlinkState::new()),
+                processes: Arc::clone(&processes),
                 policy: Arc::new(notif_policy),
                 child_pidfd: child_pidfd_raw,
                 notif_fd: notif_raw_fd,

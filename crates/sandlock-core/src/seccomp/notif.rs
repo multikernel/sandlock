@@ -862,6 +862,12 @@ async fn handle_notification(
 ) {
     let policy = &ctx.policy;
 
+    // Ensure every pid that produces a notification is tracked in the
+    // ProcessIndex with an exit watcher. The fork handler runs on the
+    // *parent* pid (the child doesn't exist yet at clone-time), so the
+    // child gets registered the first time it issues its own syscall.
+    crate::resource::register_child_if_new(ctx, notif.pid as i32).await;
+
     // Re-patch vDSO if needed (exec replaces it with a fresh copy).
     if policy.has_time_start || policy.has_random_seed {
         let mut pfs = ctx.procfs.lock().await;
@@ -950,9 +956,79 @@ pub async fn supervisor(
         }
     });
 
+    // Periodic sweep as a defensive backstop in case pidfd-based
+    // lifecycle cleanup misses an entry (e.g. pidfd_open failed for a
+    // child on an old kernel, or its watcher panicked). At 5 minutes
+    // this is cheap enough to leave on; the primary cleanup path is
+    // still per-child pidfd readiness in `spawn_pid_watcher`.
+    let gc = tokio::spawn(process_index_gc(Arc::clone(&ctx.processes)));
+
     while let Some(notif) = rx.recv().await {
         handle_notification(notif, &ctx, &dispatch_table, fd).await;
     }
+
+    gc.abort();
+}
+
+/// Periodic sweep that drops `ProcessIndex` entries for exited PIDs.
+/// Per-process state hangs off these entries via `Arc`, so dropping
+/// them releases everything in one step.
+async fn process_index_gc(processes: Arc<super::state::ProcessIndex>) {
+    let interval = std::time::Duration::from_secs(300);
+    loop {
+        tokio::time::sleep(interval).await;
+        if processes.len() == 0 {
+            continue;
+        }
+        processes.prune_dead();
+    }
+}
+
+/// Spawn a per-child task that awaits the pidfd becoming readable
+/// (process exit) and then runs unified cleanup across every
+/// per-process supervisor map.
+///
+/// The watcher *owns* the pidfd via `AsyncFd<OwnedFd>` — the kernel
+/// fd stays alive for as long as tokio's IO driver has it registered,
+/// and is closed exactly once when the watcher task ends. This avoids
+/// a TOCTOU where dropping the fd from a separate map could let a
+/// recycled fd be deregistered from epoll.
+pub(crate) fn spawn_pid_watcher(
+    ctx: Arc<super::ctx::SupervisorCtx>,
+    key: super::state::PidKey,
+    pidfd: std::os::unix::io::OwnedFd,
+) {
+    tokio::spawn(async move {
+        let async_fd = match tokio::io::unix::AsyncFd::with_interest(
+            pidfd,
+            tokio::io::Interest::READABLE,
+        ) {
+            Ok(f) => f,
+            Err(_) => {
+                // AsyncFd registration failed (extremely unusual);
+                // fall back to immediate cleanup so we don't leak the
+                // index entry. The OwnedFd we passed in is consumed
+                // by `with_interest`'s Err return and will close on
+                // drop here.
+                cleanup_pid(&ctx, key).await;
+                return;
+            }
+        };
+        // pidfd becomes readable when the process exits; we don't
+        // read any data, so `readable()` is just an await point.
+        let _ = async_fd.readable().await;
+        cleanup_pid(&ctx, key).await;
+        // async_fd drops here, closing the pidfd.
+    });
+}
+
+/// Drop the supervisor's per-process state for `key`. With every
+/// per-process map living inside `PerProcessState` (owned by
+/// `ProcessIndex`), this is a single unregister — the entry's `Arc`
+/// drops here, and remaining clones held by in-flight handlers will
+/// drop with their tasks, freeing `PerProcessState` automatically.
+pub(crate) async fn cleanup_pid(ctx: &super::ctx::SupervisorCtx, key: super::state::PidKey) {
+    ctx.processes.unregister(key);
 }
 
 // ============================================================
@@ -997,7 +1073,6 @@ mod tests {
         assert_eq!(rs.mem_used, 0);
         assert_eq!(rs.max_memory_bytes, 1024 * 1024);
         assert_eq!(rs.max_processes, 10);
-        assert!(rs.brk_bases.is_empty());
         assert!(!rs.hold_forks);
         assert!(rs.held_notif_ids.is_empty());
     }

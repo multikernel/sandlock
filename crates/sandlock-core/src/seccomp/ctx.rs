@@ -3,7 +3,10 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use super::notif::NotifPolicy;
-use super::state::{ChrootState, CowState, NetworkState, PolicyFnState, ProcfsState, ResourceState, TimeRandomState};
+use super::state::{
+    ChrootState, CowState, NetworkState, PolicyFnState, ProcessIndex, ProcfsState, ResourceState,
+    TimeRandomState,
+};
 
 /// Holds all supervisor state and policy. Passed to every handler.
 pub struct SupervisorCtx {
@@ -23,6 +26,11 @@ pub struct SupervisorCtx {
     pub chroot: Arc<Mutex<ChrootState>>,
     /// NETLINK_ROUTE virtualization state.
     pub netlink: Arc<crate::netlink::NetlinkState>,
+    /// Per-process registry: pid → PidKey. Source of truth for
+    /// "which processes are in the sandbox" and the anchor for
+    /// unified per-process state cleanup. Wraps an internal RwLock,
+    /// so handlers can query it synchronously without `.await`.
+    pub processes: Arc<ProcessIndex>,
     /// Immutable policy — no lock needed.
     pub policy: Arc<NotifPolicy>,
     /// pidfd for the child process (immutable after spawn).

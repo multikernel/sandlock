@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::seccomp::notif::{read_child_cstr, write_child_mem, NotifAction, NotifPolicy};
-use crate::seccomp::state::{NetworkState, ProcfsState};
+use crate::seccomp::state::{NetworkState, ProcessIndex};
 use crate::sys::structs::{SeccompNotif, EACCES};
 use crate::sys::syscall;
 
@@ -380,7 +380,7 @@ fn read_path(notif: &SeccompNotif, addr: u64, notif_fd: RawFd) -> Option<String>
 /// - Lets everything else through.
 pub(crate) async fn handle_proc_open(
     notif: &SeccompNotif,
-    procfs: &Arc<Mutex<ProcfsState>>,
+    processes: &Arc<ProcessIndex>,
     resource: &Arc<Mutex<crate::seccomp::state::ResourceState>>,
     network: &Arc<Mutex<NetworkState>>,
     policy: &NotifPolicy,
@@ -404,8 +404,7 @@ pub(crate) async fn handle_proc_open(
     // already hide non-sandbox PIDs, but without this check a process
     // could still open /proc/{ppid}/cmdline (or any guessed PID) directly.
     if let Some(pid) = extract_proc_pid(&path) {
-        let pfs = procfs.lock().await;
-        if !pfs.proc_pids.contains(&pid) {
+        if !processes.contains(pid) {
             return NotifAction::Errno(EACCES);
         }
     }
@@ -435,11 +434,10 @@ pub(crate) async fn handle_proc_open(
 
     // Virtualize /proc/loadavg when proc virtualization is active.
     if path == "/proc/loadavg" {
-        let pfs = procfs.lock().await;
+        let total = processes.len() as u32;
+        let last_pid = processes.max_pid().unwrap_or(0);
         let rs = resource.lock().await;
-        let total = pfs.proc_pids.len() as u32;
         let running = rs.proc_count;
-        let last_pid = pfs.proc_pids.iter().max().copied().unwrap_or(0);
         let content = generate_loadavg(&rs.load_avg, running, total, last_pid);
         return inject_memfd(&content);
     }
@@ -612,7 +610,7 @@ pub(crate) fn handle_etc_hosts_open(
 /// regardless of filesystem internals.
 pub(crate) async fn handle_sorted_getdents(
     notif: &SeccompNotif,
-    procfs: &Arc<Mutex<ProcfsState>>,
+    processes: &Arc<ProcessIndex>,
     notif_fd: RawFd,
 ) -> NotifAction {
     let pid = notif.pid;
@@ -625,16 +623,17 @@ pub(crate) async fn handle_sorted_getdents(
         Ok(t) => t,
         Err(_) => return NotifAction::Continue,
     };
-    let cache_key = (
-        pid as i32,
-        child_fd,
-        dir_path.to_string_lossy().into_owned(),
-    );
-    let mut pfs = procfs.lock().await;
+
+    let entry = match processes.entry_for(pid as i32) {
+        Some(e) => e,
+        None => return NotifAction::Continue,
+    };
+    let cache_key = (child_fd, dir_path.to_string_lossy().into_owned());
+    let mut perproc = entry.1.lock().await;
 
     // Build and cache sorted entries on first call for this open directory.
     // Remove an empty cache on EOF so later fd reuse can rebuild entries.
-    if !pfs.getdents_cache.contains_key(&cache_key) {
+    if !perproc.procfs_dir_cache.contains_key(&cache_key) {
         let dir = match std::fs::read_dir(&dir_path) {
             Ok(d) => d,
             Err(_) => return NotifAction::Continue,
@@ -679,17 +678,17 @@ pub(crate) async fn handle_sorted_getdents(
             })
             .collect();
 
-        pfs.getdents_cache.insert(cache_key.clone(), entries);
+        perproc.procfs_dir_cache.insert(cache_key.clone(), entries);
     }
 
-    let entries = match pfs.getdents_cache.get_mut(&cache_key) {
+    let entries = match perproc.procfs_dir_cache.get_mut(&cache_key) {
         Some(e) => e,
         None => return NotifAction::Continue,
     };
 
     // Empty cache = already fully drained on a prior call → return 0 (EOF).
     if entries.is_empty() {
-        pfs.getdents_cache.remove(&cache_key);
+        perproc.procfs_dir_cache.remove(&cache_key);
         return NotifAction::ReturnValue(0);
     }
 
@@ -708,7 +707,7 @@ pub(crate) async fn handle_sorted_getdents(
         entries.drain(..consumed);
     }
 
-    drop(pfs);
+    drop(perproc);
 
     if !result.is_empty() {
         if write_child_mem(notif_fd, notif.id, pid, buf_addr, &result).is_err() {
@@ -795,7 +794,7 @@ fn build_filtered_dirents(sandbox_pids: &HashSet<i32>) -> Vec<Vec<u8>> {
 /// set of entries that hides PIDs not belonging to the sandbox.
 pub(crate) async fn handle_getdents(
     notif: &SeccompNotif,
-    procfs: &Arc<Mutex<ProcfsState>>,
+    processes: &Arc<ProcessIndex>,
     _policy: &NotifPolicy,
     notif_fd: RawFd,
 ) -> NotifAction {
@@ -814,16 +813,24 @@ pub(crate) async fn handle_getdents(
         return NotifAction::Continue;
     }
 
-    let cache_key = (pid as i32, child_fd, target.to_string_lossy().into_owned());
-    let mut pfs = procfs.lock().await;
+    let entry = match processes.entry_for(pid as i32) {
+        Some(e) => e,
+        None => return NotifAction::Continue,
+    };
+    let cache_key = (child_fd, target.to_string_lossy().into_owned());
+    let mut perproc = entry.1.lock().await;
 
-    // Build and cache entries on first call for this (pid, fd) pair.
-    if !pfs.getdents_cache.contains_key(&cache_key) {
-        let entries = build_filtered_dirents(&pfs.proc_pids);
-        pfs.getdents_cache.insert(cache_key.clone(), entries);
+    // Build and cache entries on first call for this (fd, target) pair.
+    if !perproc.procfs_dir_cache.contains_key(&cache_key) {
+        // Snapshot sandbox PIDs without holding the per-process lock
+        // any longer than needed — pids_snapshot only takes the
+        // ProcessIndex read lock briefly.
+        let snapshot = processes.pids_snapshot();
+        let entries = build_filtered_dirents(&snapshot);
+        perproc.procfs_dir_cache.insert(cache_key.clone(), entries);
     }
 
-    let entries = match pfs.getdents_cache.get_mut(&cache_key) {
+    let entries = match perproc.procfs_dir_cache.get_mut(&cache_key) {
         Some(e) => e,
         None => return NotifAction::Continue,
     };
@@ -841,7 +848,7 @@ pub(crate) async fn handle_getdents(
 
     // Empty cache = already fully drained on a prior call → return 0 (EOF).
     if entries.is_empty() {
-        pfs.getdents_cache.remove(&cache_key);
+        perproc.procfs_dir_cache.remove(&cache_key);
         return NotifAction::ReturnValue(0);
     }
 
@@ -849,7 +856,7 @@ pub(crate) async fn handle_getdents(
         entries.drain(..consumed);
     }
 
-    drop(pfs);
+    drop(perproc);
 
     // Write the result into the child's buffer and return the byte count.
     if !result.is_empty() {
