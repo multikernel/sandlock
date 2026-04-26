@@ -11,9 +11,12 @@ permissions:
 
 jobs:
   # Build Rust binaries and shared library
+  # Pinned to ubuntu-22.04 (glibc 2.35) so release binaries run on older
+  # distros (Ubuntu 22.04+, Debian 12+, RHEL 9+). ubuntu-latest tracks the
+  # newest glibc and would exclude those hosts.
   build:
     name: Build (${{ matrix.target }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
