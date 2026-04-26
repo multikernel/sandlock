@@ -853,7 +853,10 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
     if nested {
         // Nested sandbox: deny-only filter (no supervisor — parent handles it).
         // BPF filters are ANDed by the kernel, so each level can only tighten.
-        let filter = bpf::assemble_filter(&[], &deny, &args);
+        let filter = match bpf::assemble_filter(&[], &deny, &args) {
+            Ok(f) => f,
+            Err(e) => fail!(format!("seccomp assemble: {}", e)),
+        };
         if let Err(e) = bpf::install_deny_filter(&filter) {
             fail!(format!("seccomp deny filter: {}", e));
         }
@@ -864,7 +867,10 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
     } else {
         // First-level sandbox: notif + deny filter with NEW_LISTENER.
         let notif = notif_syscalls(policy);
-        let filter = bpf::assemble_filter(&notif, &deny, &args);
+        let filter = match bpf::assemble_filter(&notif, &deny, &args) {
+            Ok(f) => f,
+            Err(e) => fail!(format!("seccomp assemble: {}", e)),
+        };
         let notif_fd = match bpf::install_filter(&filter) {
             Ok(fd) => fd,
             Err(e) => fail!(format!("seccomp install: {}", e)),
