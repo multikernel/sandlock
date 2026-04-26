@@ -148,28 +148,30 @@ pub(crate) async fn handle_memory(
             return NotifAction::Continue;
         }
 
-        // Translate notif.pid → canonical PidKey via the process
-        // index. If the child wasn't registered (e.g. pidfd_open
-        // failed at fork on an old kernel), fall through without
-        // tracking — this is a no-op, not a leak.
-        let pid_key = match ctx.processes.key_for(notif.pid as i32) {
-            Some(k) => k,
+        // Per-process brk base is in PerProcessState. Drop the global
+        // ResourceState lock first to avoid lock ordering issues with
+        // the per-process lock acquired below (per-process first,
+        // then global, when both are needed).
+        drop(st);
+        let entry = match ctx.processes.entry_for(notif.pid as i32) {
+            Some(e) => e,
             None => return NotifAction::Continue,
         };
+        let mut perproc = entry.1.lock().await;
+        let mut st = ctx.resource.lock().await;
 
-        let base = *st.brk_bases.entry(pid_key).or_insert(new_brk);
-
+        let base = *perproc.brk_base.get_or_insert(new_brk);
         if new_brk > base {
             let delta = new_brk - base;
             if st.mem_used.saturating_add(delta) > limit {
                 return kill;
             }
             st.mem_used += delta;
-            st.brk_bases.insert(pid_key, new_brk);
+            perproc.brk_base = Some(new_brk);
         } else if new_brk < base {
             let delta = base - new_brk;
             st.mem_used = st.mem_used.saturating_sub(delta);
-            st.brk_bases.insert(pid_key, new_brk);
+            perproc.brk_base = Some(new_brk);
         }
     } else if nr == libc::SYS_mremap {
         // args[1] = old_len, args[2] = new_len

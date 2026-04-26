@@ -245,10 +245,9 @@ pub fn build_dispatch_table(
         let policy = Arc::clone(policy);
         table.register(nr, Box::new(move |notif, ctx, notif_fd| {
             let policy = Arc::clone(&policy);
-            let procfs_inner = Arc::clone(&ctx.procfs);
             let processes = Arc::clone(&ctx.processes);
             Box::pin(async move {
-                crate::procfs::handle_getdents(&notif, &procfs_inner, &processes, &policy, notif_fd).await
+                crate::procfs::handle_getdents(&notif, &processes, &policy, notif_fd).await
             })
         }));
     }
@@ -315,9 +314,9 @@ pub fn build_dispatch_table(
         }
         for nr in getdents_nrs {
             table.register(nr, Box::new(|notif, ctx, notif_fd| {
-                let procfs_inner = Arc::clone(&ctx.procfs);
+                let processes = Arc::clone(&ctx.processes);
                 Box::pin(async move {
-                    crate::procfs::handle_sorted_getdents(&notif, &procfs_inner, notif_fd).await
+                    crate::procfs::handle_sorted_getdents(&notif, &processes, notif_fd).await
                 })
             }));
         }
@@ -604,6 +603,17 @@ fn register_chroot_handlers(table: &mut DispatchTable, policy: &Arc<NotifPolicy>
 // ============================================================
 
 fn register_cow_handlers(table: &mut DispatchTable) {
+    // Helper to grab cow + processes from ctx in one place.
+    macro_rules! cow_call {
+        ($handler:expr) => {
+            Box::new(|notif, ctx, notif_fd| {
+                let cow = Arc::clone(&ctx.cow);
+                let processes = Arc::clone(&ctx.processes);
+                Box::pin(async move { $handler(&notif, &cow, &processes, notif_fd).await })
+            })
+        };
+    }
+
     // Write syscalls (*at variants + legacy)
     let mut write_nrs = vec![
         libc::SYS_unlinkat, libc::SYS_mkdirat, libc::SYS_renameat2,
@@ -616,108 +626,43 @@ fn register_cow_handlers(table: &mut DispatchTable) {
         arch::SYS_LCHOWN,
     ].into_iter().flatten());
     for nr in write_nrs {
-        table.register(nr, Box::new(|notif, ctx, notif_fd| {
-            let cow = Arc::clone(&ctx.cow);
-            Box::pin(async move {
-                crate::cow::dispatch::handle_cow_write(&notif, &cow, notif_fd).await
-            })
-        }));
+        table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_write));
     }
 
-    // utimensat — unconditional return
-    table.register(libc::SYS_utimensat, Box::new(|notif, ctx, notif_fd| {
-        let cow = Arc::clone(&ctx.cow);
-        Box::pin(async move {
-            crate::cow::dispatch::handle_cow_utimensat(&notif, &cow, notif_fd).await
-        })
-    }));
+    table.register(libc::SYS_utimensat, cow_call!(crate::cow::dispatch::handle_cow_utimensat));
 
-    // faccessat/access — fallthrough
-    let mut access_nrs = vec![
-        libc::SYS_faccessat,
-        crate::cow::dispatch::SYS_FACCESSAT2,
-    ];
+    let mut access_nrs = vec![libc::SYS_faccessat, crate::cow::dispatch::SYS_FACCESSAT2];
     access_nrs.extend(arch::SYS_ACCESS);
     for nr in access_nrs {
-        table.register(nr, Box::new(|notif, ctx, notif_fd| {
-            let cow = Arc::clone(&ctx.cow);
-            Box::pin(async move {
-                crate::cow::dispatch::handle_cow_access(&notif, &cow, notif_fd).await
-            })
-        }));
+        table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_access));
     }
 
-    // openat/open — fallthrough
     let mut open_nrs = vec![libc::SYS_openat];
     open_nrs.extend(arch::SYS_OPEN);
     for nr in open_nrs {
-        table.register(nr, Box::new(|notif, ctx, notif_fd| {
-            let cow = Arc::clone(&ctx.cow);
-            Box::pin(async move {
-                crate::cow::dispatch::handle_cow_open(&notif, &cow, notif_fd).await
-            })
-        }));
+        table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_open));
     }
 
-    // stat family — fallthrough
-    let mut stat_nrs = vec![
-        libc::SYS_newfstatat, libc::SYS_faccessat,
-    ];
+    let mut stat_nrs = vec![libc::SYS_newfstatat, libc::SYS_faccessat];
     stat_nrs.extend([arch::SYS_STAT, arch::SYS_LSTAT, arch::SYS_ACCESS].into_iter().flatten());
     for nr in stat_nrs {
-        table.register(nr, Box::new(|notif, ctx, notif_fd| {
-            let cow = Arc::clone(&ctx.cow);
-            Box::pin(async move {
-                crate::cow::dispatch::handle_cow_stat(&notif, &cow, notif_fd).await
-            })
-        }));
+        table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_stat));
     }
 
-    // statx — fallthrough
-    table.register(libc::SYS_statx, Box::new(|notif, ctx, notif_fd| {
-        let cow = Arc::clone(&ctx.cow);
-        Box::pin(async move {
-            crate::cow::dispatch::handle_cow_statx(&notif, &cow, notif_fd).await
-        })
-    }));
+    table.register(libc::SYS_statx, cow_call!(crate::cow::dispatch::handle_cow_statx));
 
-    // readlink — fallthrough
     let mut readlink_nrs = vec![libc::SYS_readlinkat];
     readlink_nrs.extend(arch::SYS_READLINK);
     for nr in readlink_nrs {
-        table.register(nr, Box::new(|notif, ctx, notif_fd| {
-            let cow = Arc::clone(&ctx.cow);
-            Box::pin(async move {
-                crate::cow::dispatch::handle_cow_readlink(&notif, &cow, notif_fd).await
-            })
-        }));
+        table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_readlink));
     }
 
-    // getdents — fallthrough
     let mut getdents_nrs = vec![libc::SYS_getdents64];
     getdents_nrs.extend(arch::SYS_GETDENTS);
     for nr in getdents_nrs {
-        table.register(nr, Box::new(|notif, ctx, notif_fd| {
-            let cow = Arc::clone(&ctx.cow);
-            Box::pin(async move {
-                crate::cow::dispatch::handle_cow_getdents(&notif, &cow, notif_fd).await
-            })
-        }));
+        table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_getdents));
     }
 
-    // chdir — redirect to upper dir if target was created by COW
-    table.register(libc::SYS_chdir, Box::new(|notif, ctx, notif_fd| {
-        let cow = Arc::clone(&ctx.cow);
-        Box::pin(async move {
-            crate::cow::dispatch::handle_cow_chdir(&notif, &cow, notif_fd).await
-        })
-    }));
-
-    // getcwd — return logical workdir path after chdir into a COW-only dir
-    table.register(libc::SYS_getcwd, Box::new(|notif, ctx, notif_fd| {
-        let cow = Arc::clone(&ctx.cow);
-        Box::pin(async move {
-            crate::cow::dispatch::handle_cow_getcwd(&notif, &cow, notif_fd).await
-        })
-    }));
+    table.register(libc::SYS_chdir, cow_call!(crate::cow::dispatch::handle_cow_chdir));
+    table.register(libc::SYS_getcwd, cow_call!(crate::cow::dispatch::handle_cow_getcwd));
 }

@@ -961,7 +961,7 @@ pub async fn supervisor(
     // child on an old kernel, or its watcher panicked). At 5 minutes
     // this is cheap enough to leave on; the primary cleanup path is
     // still per-child pidfd readiness in `spawn_pid_watcher`.
-    let gc = tokio::spawn(cow_state_gc(Arc::clone(&ctx.cow)));
+    let gc = tokio::spawn(process_index_gc(Arc::clone(&ctx.processes)));
 
     while let Some(notif) = rx.recv().await {
         handle_notification(notif, &ctx, &dispatch_table, fd).await;
@@ -970,16 +970,17 @@ pub async fn supervisor(
     gc.abort();
 }
 
-/// Periodic sweep that drops `CowState` entries belonging to exited PIDs.
-async fn cow_state_gc(cow: Arc<tokio::sync::Mutex<super::state::CowState>>) {
+/// Periodic sweep that drops `ProcessIndex` entries for exited PIDs.
+/// Per-process state hangs off these entries via `Arc`, so dropping
+/// them releases everything in one step.
+async fn process_index_gc(processes: Arc<super::state::ProcessIndex>) {
     let interval = std::time::Duration::from_secs(300);
     loop {
         tokio::time::sleep(interval).await;
-        let mut st = cow.lock().await;
-        if st.virtual_cwds.is_empty() && st.dir_cache.is_empty() {
+        if processes.len() == 0 {
             continue;
         }
-        st.prune_dead_pids();
+        processes.prune_dead();
     }
 }
 
@@ -1021,23 +1022,12 @@ pub(crate) fn spawn_pid_watcher(
     });
 }
 
-/// Drop every supervisor map entry that pertains to `key`. Called
-/// from the per-child pidfd watcher and from the supervisor on its
-/// own shutdown path.
+/// Drop the supervisor's per-process state for `key`. With every
+/// per-process map living inside `PerProcessState` (owned by
+/// `ProcessIndex`), this is a single unregister — the entry's `Arc`
+/// drops here, and remaining clones held by in-flight handlers will
+/// drop with their tasks, freeing `PerProcessState` automatically.
 pub(crate) async fn cleanup_pid(ctx: &super::ctx::SupervisorCtx, key: super::state::PidKey) {
-    {
-        let mut st = ctx.cow.lock().await;
-        st.virtual_cwds.retain(|k, _| *k != key);
-        st.dir_cache.retain(|(k, _), _| *k != key);
-    }
-    {
-        let mut st = ctx.procfs.lock().await;
-        st.getdents_cache.retain(|(p, _, _), _| *p != key.pid);
-    }
-    {
-        let mut st = ctx.resource.lock().await;
-        st.brk_bases.remove(&key);
-    }
     ctx.processes.unregister(key);
 }
 
@@ -1083,7 +1073,6 @@ mod tests {
         assert_eq!(rs.mem_used, 0);
         assert_eq!(rs.max_memory_bytes, 1024 * 1024);
         assert_eq!(rs.max_processes, 10);
-        assert!(rs.brk_bases.is_empty());
         assert!(!rs.hold_forks);
         assert!(rs.held_notif_ids.is_empty());
     }

@@ -1,7 +1,11 @@
 // Domain-specific state structs — each domain is locked independently so
-// handlers only contend on the state they actually need.
+// handlers only contend on the state they actually need. Per-process
+// state is bundled into a single `PerProcessState` owned by
+// `ProcessIndex`; cleanup on exit is just dropping the entry's `Arc`.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use tokio::sync::Mutex as AsyncMutex;
 
 /// Resource-limit runtime state shared across notification handlers.
 pub struct ResourceState {
@@ -13,10 +17,6 @@ pub struct ResourceState {
     pub mem_used: u64,
     /// Maximum allowed anonymous memory (bytes).
     pub max_memory_bytes: u64,
-    /// Per-process brk base addresses for memory tracking. Keyed by
-    /// PidKey so a recycled numeric pid never inherits the previous
-    /// process's brk base.
-    pub brk_bases: HashMap<PidKey, u64>,
     /// Whether fork notifications should be held (checkpoint/freeze).
     pub hold_forks: bool,
     /// Notification IDs held during a checkpoint freeze.
@@ -35,7 +35,6 @@ impl ResourceState {
             max_processes,
             mem_used: 0,
             max_memory_bytes,
-            brk_bases: HashMap::new(),
             hold_forks: false,
             held_notif_ids: Vec::new(),
             load_avg: crate::procfs::LoadAvg::new(),
@@ -48,16 +47,11 @@ impl ResourceState {
 // ProcfsState — /proc virtualization state
 // ============================================================
 
-/// /proc virtualization runtime state.
-///
-/// Sandbox membership (the set of "our" pids) lives in
-/// `ProcessIndex`, not here — there used to be a denormalized mirror
-/// here that had to be hand-synced. /proc handlers query
-/// `ctx.processes` directly.
+/// /proc virtualization runtime state. Sandbox membership lives in
+/// `ProcessIndex`; per-process getdents caches live in
+/// `PerProcessState::procfs_dir_cache`. This struct only holds
+/// truly global virtualization state.
 pub struct ProcfsState {
-    /// Cache of filtered dirent entries keyed by (pid, fd, directory target).
-    /// Populated on first getdents64 call for a /proc directory, drained on subsequent calls.
-    pub getdents_cache: HashMap<(i32, u32, String), Vec<Vec<u8>>>,
     /// Base address of the last vDSO we patched (0 = not yet patched).
     pub vdso_patched_addr: u64,
 }
@@ -65,17 +59,18 @@ pub struct ProcfsState {
 impl ProcfsState {
     pub fn new() -> Self {
         Self {
-            getdents_cache: HashMap::new(),
             vdso_patched_addr: 0,
         }
     }
 }
 
 // ============================================================
-// CowState — copy-on-write filesystem state
+// PidKey — stable per-process identity
 // ============================================================
 
-/// Stable process identity for per-process COW state.
+/// Stable process identity. Numeric pid plus the start_time that
+/// distinguishes a specific process instance from any future recycle
+/// of the same pid slot.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct PidKey {
     /// Numeric PID observed by seccomp notification.
@@ -95,15 +90,46 @@ pub(crate) fn read_pid_start_time(pid: i32) -> Option<u64> {
     rest.split_whitespace().nth(19)?.parse().ok()
 }
 
+// ============================================================
+// PerProcessState — bundled per-process supervisor state
+// ============================================================
+
+/// All per-process supervisor state for one tracked child. One
+/// instance lives per `PidKey`, owned by `ProcessIndex` behind an
+/// `Arc<AsyncMutex<…>>`. Cleanup on process exit is one operation:
+/// `ProcessIndex::unregister` drops the index's `Arc`, and the
+/// supervisor's per-handler clones drop along with their tasks.
+#[derive(Default)]
+pub struct PerProcessState {
+    /// Logical cwd while the process is chdir'd into a COW-only
+    /// directory. None means "use kernel-reported cwd".
+    pub virtual_cwd: Option<String>,
+    /// Recorded brk base for memory accounting. None until first brk.
+    pub brk_base: Option<u64>,
+    /// COW directory dirent cache. Keyed by child's fd; value is
+    /// (host target path, sorted dirent bytes left to return).
+    /// Entries are invalidated when the fd is reused for a different
+    /// directory.
+    pub cow_dir_cache: HashMap<u32, (String, Vec<Vec<u8>>)>,
+    /// /proc directory dirent cache. Keyed by (child fd, target
+    /// path); same drain-on-EOF semantics as cow_dir_cache.
+    pub procfs_dir_cache: HashMap<(u32, String), Vec<Vec<u8>>>,
+}
+
+// ============================================================
+// ProcessIndex — sandbox membership + per-process state
+// ============================================================
+
 /// Source-of-truth registry for processes inside the sandbox.
 ///
-/// Holds the canonical `pid → PidKey` mapping plus everything any
-/// handler needs to ask about sandbox membership. Kept behind an
-/// internal `std::sync::RwLock` so the read-mostly hot paths
-/// (`key_for`, `contains`, `/proc` virtualization) don't have to take
-/// an async mutex on every notification — and so ProcessIndex doesn't
-/// need its own `Mutex` wrapper in `SupervisorCtx`. Lock guards are
-/// `!Send` and the compiler will reject holding one across an
+/// Maps the kernel's numeric `pid` (the value that arrives in seccomp
+/// notifications) to the canonical `PidKey` plus an
+/// `Arc<AsyncMutex<PerProcessState>>` holding everything per-process.
+/// Held behind an internal `std::sync::RwLock` so the read-mostly hot
+/// paths (`key_for`, `contains`, `entry_for`, `/proc` virtualization)
+/// avoid an async mutex on every notification, and so `ProcessIndex`
+/// doesn't need its own outer wrapper in `SupervisorCtx`. Lock guards
+/// are `!Send` and the compiler will reject holding one across an
 /// `.await`, which keeps callers honest.
 ///
 /// Ownership of each child's pidfd lives with the per-child watcher
@@ -112,7 +138,13 @@ pub(crate) fn read_pid_start_time(pid: i32) -> Option<u64> {
 /// and avoids a race where dropping the fd from the index could
 /// deregister a recycled fd from epoll.
 pub struct ProcessIndex {
-    inner: std::sync::RwLock<HashMap<i32, PidKey>>,
+    inner: std::sync::RwLock<HashMap<i32, ProcessEntry>>,
+}
+
+#[derive(Clone)]
+struct ProcessEntry {
+    key: PidKey,
+    state: Arc<AsyncMutex<PerProcessState>>,
 }
 
 impl ProcessIndex {
@@ -123,14 +155,18 @@ impl ProcessIndex {
     }
 
     /// Register a process by reading its start_time once and
-    /// inserting the canonical PidKey. Returns the key, or None if
-    /// the process is already gone. The caller is responsible for
-    /// keeping the pidfd alive — the per-child watcher task does
-    /// this via `AsyncFd<OwnedFd>`.
+    /// allocating its `PerProcessState`. Returns the canonical key,
+    /// or None if the process is already gone. The caller is
+    /// responsible for keeping the pidfd alive — the per-child
+    /// watcher task does this via `AsyncFd<OwnedFd>`.
     pub fn register(&self, pid: i32) -> Option<PidKey> {
         let start_time = read_pid_start_time(pid)?;
         let key = PidKey { pid, start_time };
-        self.inner.write().ok()?.insert(pid, key);
+        let entry = ProcessEntry {
+            key,
+            state: Arc::new(AsyncMutex::new(PerProcessState::default())),
+        };
+        self.inner.write().ok()?.insert(pid, entry);
         Some(key)
     }
 
@@ -138,7 +174,18 @@ impl ProcessIndex {
     /// Returns None if this pid was never registered (e.g. pidfd_open
     /// failed at fork) — callers should fall back to a no-op.
     pub fn key_for(&self, pid: i32) -> Option<PidKey> {
-        self.inner.read().ok()?.get(&pid).copied()
+        self.inner.read().ok()?.get(&pid).map(|e| e.key)
+    }
+
+    /// Look up both the PidKey and the per-process state handle for
+    /// `pid`. Returns None if the pid isn't tracked. The caller locks
+    /// the returned `Arc<AsyncMutex<…>>` to read or mutate.
+    pub fn entry_for(&self, pid: i32) -> Option<(PidKey, Arc<AsyncMutex<PerProcessState>>)> {
+        self.inner
+            .read()
+            .ok()?
+            .get(&pid)
+            .map(|e| (e.key, Arc::clone(&e.state)))
     }
 
     /// Cheap membership test — used by /proc virtualization to gate
@@ -170,15 +217,46 @@ impl ProcessIndex {
             .unwrap_or_default()
     }
 
-    /// Remove a process from the index. Called from the per-child
-    /// watcher task once the process has exited.
+    /// Remove a process from the index. The per-process state's
+    /// `Arc` reference held by the index drops here; remaining clones
+    /// (e.g. a handler that's mid-execution for that pid) will drop
+    /// when they go out of scope, and the inner `PerProcessState`
+    /// frees automatically.
     pub fn unregister(&self, key: PidKey) {
         if let Ok(mut g) = self.inner.write() {
             // Only clear if the entry still points at this key. A PID
             // recycled with a fresh start_time may already have
             // overwritten the entry via register(); we must not stomp it.
-            if g.get(&key.pid) == Some(&key) {
+            if g.get(&key.pid).map(|e| e.key) == Some(key) {
                 g.remove(&key.pid);
+            }
+        }
+    }
+
+    /// Defensive sweep: drop entries whose process is gone (or whose
+    /// start_time has changed). Called from a low-frequency backstop
+    /// task in case a pidfd watcher failed to spawn or the kernel
+    /// didn't deliver the readability event.
+    pub fn prune_dead(&self) {
+        let candidates: Vec<(i32, PidKey)> = match self.inner.read() {
+            Ok(g) => g.iter().map(|(p, e)| (*p, e.key)).collect(),
+            Err(_) => return,
+        };
+        let mut dead = Vec::new();
+        for (pid, key) in candidates {
+            match read_pid_start_time(pid) {
+                Some(st) if st == key.start_time => continue,
+                _ => dead.push(key),
+            }
+        }
+        if dead.is_empty() {
+            return;
+        }
+        if let Ok(mut g) = self.inner.write() {
+            for key in dead {
+                if g.get(&key.pid).map(|e| e.key) == Some(key) {
+                    g.remove(&key.pid);
+                }
             }
         }
     }
@@ -190,211 +268,20 @@ impl Default for ProcessIndex {
     }
 }
 
-/// Copy-on-write filesystem state.
+// ============================================================
+// CowState — copy-on-write filesystem state (global only)
+// ============================================================
+
+/// Global COW state. Per-process COW state (virtual cwd, dir cache)
+/// lives in `PerProcessState`.
 pub struct CowState {
     /// Seccomp-based COW branch (None if COW disabled).
     pub branch: Option<crate::cow::seccomp::SeccompCowBranch>,
-    /// Getdents cache for COW directories.
-    /// Value is (host_path, entries) to detect fd reuse and invalidate stale entries.
-    pub dir_cache: HashMap<(PidKey, u32), (String, Vec<Vec<u8>>)>,
-    /// Logical cwd for processes that chdir into COW-only directories.
-    pub virtual_cwds: HashMap<PidKey, String>,
 }
 
 impl CowState {
     pub fn new() -> Self {
-        Self {
-            branch: None,
-            dir_cache: HashMap::new(),
-            virtual_cwds: HashMap::new(),
-        }
-    }
-
-    /// Drop COW per-process entries for an older process that used the same numeric PID.
-    pub(crate) fn prune_reused_pid(&mut self, current: PidKey) {
-        self.virtual_cwds
-            .retain(|key, _| key.pid != current.pid || *key == current);
-        self.dir_cache
-            .retain(|(key, _), _| key.pid != current.pid || *key == current);
-    }
-
-    /// Drop COW per-process entries for processes that have exited.
-    ///
-    /// Walks the unique PIDs in `virtual_cwds` and `dir_cache`, reading
-    /// each PID's start_time from /proc/<pid>/stat once. Entries for PIDs
-    /// whose process is gone, or whose start_time no longer matches the
-    /// stored PidKey, are removed. Intended to be called periodically by
-    /// a supervisor-side GC task; runs in O(unique_pids) per sweep.
-    pub fn prune_dead_pids(&mut self) {
-        let mut pids: HashSet<i32> = HashSet::new();
-        pids.extend(self.virtual_cwds.keys().map(|k| k.pid));
-        pids.extend(self.dir_cache.keys().map(|(k, _)| k.pid));
-
-        let mut alive_keys: HashSet<PidKey> = HashSet::with_capacity(pids.len());
-        for pid in pids {
-            if let Some(start_time) = read_pid_start_time(pid) {
-                alive_keys.insert(PidKey { pid, start_time });
-            }
-        }
-
-        self.virtual_cwds.retain(|key, _| alive_keys.contains(key));
-        self.dir_cache
-            .retain(|(key, _), _| alive_keys.contains(key));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cow_state_prunes_entries_for_exited_pids() {
-        // Spawn /bin/true and wait for it to exit so we know its PID is gone.
-        let mut child = std::process::Command::new("/bin/true")
-            .spawn()
-            .expect("failed to spawn /bin/true");
-        let dead_pid = child.id() as i32;
-        let dead_start = read_pid_start_time(dead_pid)
-            .expect("failed to read start_time before child exits");
-        let _ = child.wait();
-        // Wait until /proc/<pid> actually disappears.  Reaping can lag
-        // on some kernels even after wait() returns.
-        for _ in 0..100 {
-            if read_pid_start_time(dead_pid).is_none() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-
-        // Self is definitely alive.
-        let live_pid = unsafe { libc::getpid() };
-        let live_start = read_pid_start_time(live_pid)
-            .expect("self should have a readable start_time");
-
-        let dead = PidKey { pid: dead_pid, start_time: dead_start };
-        let live = PidKey { pid: live_pid, start_time: live_start };
-
-        let mut state = CowState::new();
-        state.virtual_cwds.insert(dead, "/dead".to_string());
-        state.virtual_cwds.insert(live, "/live".to_string());
-        state.dir_cache.insert((dead, 3), ("/dead".to_string(), Vec::new()));
-        state.dir_cache.insert((live, 3), ("/live".to_string(), Vec::new()));
-
-        state.prune_dead_pids();
-
-        assert!(!state.virtual_cwds.contains_key(&dead));
-        assert!(!state.dir_cache.contains_key(&(dead, 3)));
-        assert_eq!(state.virtual_cwds.get(&live), Some(&"/live".to_string()));
-        assert!(state.dir_cache.contains_key(&(live, 3)));
-    }
-
-    #[test]
-    fn cow_state_prunes_entries_for_recycled_pid() {
-        // Same numeric PID with a different start_time means the original
-        // process has gone and a new one took its slot.  Stale entries
-        // must be dropped even if a process at that PID currently exists.
-        let live_pid = unsafe { libc::getpid() };
-        let live_start = read_pid_start_time(live_pid).unwrap();
-        let stale = PidKey { pid: live_pid, start_time: live_start.wrapping_sub(1) };
-
-        let mut state = CowState::new();
-        state.virtual_cwds.insert(stale, "/stale".to_string());
-        state.dir_cache.insert((stale, 5), ("/stale".to_string(), Vec::new()));
-
-        state.prune_dead_pids();
-
-        assert!(!state.virtual_cwds.contains_key(&stale));
-        assert!(!state.dir_cache.contains_key(&(stale, 5)));
-    }
-
-    #[test]
-    fn cow_state_prunes_entries_for_reused_pid() {
-        let old = PidKey { pid: 42, start_time: 1 };
-        let current = PidKey { pid: 42, start_time: 2 };
-        let other = PidKey { pid: 43, start_time: 1 };
-        let mut state = CowState::new();
-
-        state.virtual_cwds.insert(old, "/old".to_string());
-        state.virtual_cwds.insert(other, "/other".to_string());
-        state.dir_cache.insert((old, 7), ("/old".to_string(), Vec::new()));
-        state.dir_cache.insert((other, 7), ("/other".to_string(), Vec::new()));
-
-        state.prune_reused_pid(current);
-
-        assert!(!state.virtual_cwds.contains_key(&old));
-        assert!(!state.dir_cache.contains_key(&(old, 7)));
-        assert_eq!(state.virtual_cwds.get(&other), Some(&"/other".to_string()));
-        assert!(state.dir_cache.contains_key(&(other, 7)));
-    }
-
-    #[test]
-    fn process_index_register_lookup_unregister() {
-        let self_pid = unsafe { libc::getpid() };
-        let idx = ProcessIndex::new();
-        let key = idx
-            .register(self_pid)
-            .expect("register should succeed for live pid");
-        assert_eq!(key.pid, self_pid);
-
-        assert_eq!(idx.key_for(self_pid), Some(key));
-        assert!(idx.contains(self_pid));
-        assert_eq!(idx.key_for(self_pid + 999_999), None);
-        assert!(!idx.contains(self_pid + 999_999));
-        assert_eq!(idx.len(), 1);
-        assert_eq!(idx.max_pid(), Some(self_pid));
-
-        idx.unregister(key);
-        assert_eq!(idx.key_for(self_pid), None);
-        assert!(!idx.contains(self_pid));
-        assert_eq!(idx.len(), 0);
-        assert_eq!(idx.max_pid(), None);
-    }
-
-    #[test]
-    fn process_index_register_overwrites_stale_entry_for_recycled_pid() {
-        // Forge a stale entry via the public register() path, then
-        // simulate recycle by re-registering — start_time will differ
-        // because pid/comm gets a fresh stat read.
-        let self_pid = unsafe { libc::getpid() };
-        let stale_key = PidKey { pid: self_pid, start_time: 0 };
-        let idx = ProcessIndex::new();
-        idx.inner.write().unwrap().insert(self_pid, stale_key);
-
-        let new_key = idx.register(self_pid).unwrap();
-        assert_ne!(new_key, stale_key);
-        assert_eq!(idx.key_for(self_pid), Some(new_key));
-
-        // Unregistering by the stale key must NOT clobber the fresh
-        // registration; only an exact-match unregister wins.
-        idx.unregister(stale_key);
-        assert_eq!(idx.key_for(self_pid), Some(new_key));
-    }
-
-    #[test]
-    fn process_index_pids_snapshot_is_independent() {
-        let self_pid = unsafe { libc::getpid() };
-        let idx = ProcessIndex::new();
-        let key = idx.register(self_pid).unwrap();
-        let snap = idx.pids_snapshot();
-        idx.unregister(key);
-        // The snapshot is a copy — unregister doesn't mutate it.
-        assert!(snap.contains(&self_pid));
-        assert!(!idx.contains(self_pid));
-    }
-
-    #[test]
-    fn brk_bases_keyed_by_pidkey_distinguishes_recycled_pids() {
-        // ResourceState::brk_bases is keyed by PidKey, so a recycled
-        // numeric pid with a different start_time is treated as a
-        // different process and doesn't inherit the previous brk base.
-        let mut rs = ResourceState::new(0, 0);
-        let pid = 100i32;
-        let original = PidKey { pid, start_time: 1000 };
-        let recycled = PidKey { pid, start_time: 2000 };
-        rs.brk_bases.insert(original, 0xdead_beef);
-
-        assert_eq!(rs.brk_bases.get(&original), Some(&0xdead_beef));
-        assert_eq!(rs.brk_bases.get(&recycled), None);
+        Self { branch: None }
     }
 }
 
@@ -440,13 +327,11 @@ impl NetworkState {
         pid: u32,
         live_policy: Option<&std::sync::Arc<std::sync::RwLock<crate::policy_fn::LivePolicy>>>,
     ) -> crate::seccomp::notif::NetworkPolicy {
-        // Per-PID override takes priority
         if let Ok(overrides) = self.pid_ip_overrides.read() {
             if let Some(ips) = overrides.get(&pid) {
                 return crate::seccomp::notif::NetworkPolicy::AllowList(ips.clone());
             }
         }
-        // Live policy (dynamic updates from policy_fn)
         if let Some(lp) = live_policy {
             if let Ok(live) = lp.read() {
                 if !live.allowed_ips.is_empty() {
@@ -454,7 +339,6 @@ impl NetworkState {
                 }
             }
         }
-        // Global policy
         self.network_policy.clone()
     }
 }
@@ -525,5 +409,117 @@ pub struct ChrootState {
 impl ChrootState {
     pub fn new() -> Self {
         Self { chroot_exe: None }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_index_register_lookup_unregister() {
+        let self_pid = unsafe { libc::getpid() };
+        let idx = ProcessIndex::new();
+        let key = idx
+            .register(self_pid)
+            .expect("register should succeed for live pid");
+        assert_eq!(key.pid, self_pid);
+
+        assert_eq!(idx.key_for(self_pid), Some(key));
+        assert!(idx.contains(self_pid));
+        assert_eq!(idx.key_for(self_pid + 999_999), None);
+        assert!(!idx.contains(self_pid + 999_999));
+        assert_eq!(idx.len(), 1);
+        assert_eq!(idx.max_pid(), Some(self_pid));
+
+        idx.unregister(key);
+        assert_eq!(idx.key_for(self_pid), None);
+        assert!(!idx.contains(self_pid));
+        assert_eq!(idx.len(), 0);
+        assert_eq!(idx.max_pid(), None);
+    }
+
+    #[test]
+    fn process_index_register_overwrites_stale_entry_for_recycled_pid() {
+        let self_pid = unsafe { libc::getpid() };
+        let idx = ProcessIndex::new();
+        // Forge a stale entry by direct insertion under the lock.
+        {
+            let stale_key = PidKey { pid: self_pid, start_time: 0 };
+            let stale = ProcessEntry {
+                key: stale_key,
+                state: Arc::new(AsyncMutex::new(PerProcessState::default())),
+            };
+            idx.inner.write().unwrap().insert(self_pid, stale);
+        }
+
+        let new_key = idx.register(self_pid).unwrap();
+        assert_ne!(new_key.start_time, 0);
+        assert_eq!(idx.key_for(self_pid), Some(new_key));
+
+        // Unregistering by the stale key must NOT clobber the fresh
+        // registration; only an exact-match unregister wins.
+        let stale_key = PidKey { pid: self_pid, start_time: 0 };
+        idx.unregister(stale_key);
+        assert_eq!(idx.key_for(self_pid), Some(new_key));
+    }
+
+    #[tokio::test]
+    async fn process_index_entry_for_returns_shared_handle() {
+        let self_pid = unsafe { libc::getpid() };
+        let idx = ProcessIndex::new();
+        let key = idx.register(self_pid).unwrap();
+
+        let (k1, s1) = idx.entry_for(self_pid).unwrap();
+        let (k2, s2) = idx.entry_for(self_pid).unwrap();
+        assert_eq!(k1, key);
+        assert_eq!(k2, key);
+
+        // Two clones of the same Arc — writes through one are visible
+        // through the other.
+        s1.lock().await.brk_base = Some(0xdead_beef);
+        assert_eq!(s2.lock().await.brk_base, Some(0xdead_beef));
+
+        // After unregister, entry_for returns None but existing Arc
+        // clones stay valid (kept alive by callers).
+        idx.unregister(key);
+        assert!(idx.entry_for(self_pid).is_none());
+        assert_eq!(s1.lock().await.brk_base, Some(0xdead_beef));
+    }
+
+    #[test]
+    fn process_index_pids_snapshot_is_independent() {
+        let self_pid = unsafe { libc::getpid() };
+        let idx = ProcessIndex::new();
+        let key = idx.register(self_pid).unwrap();
+        let snap = idx.pids_snapshot();
+        idx.unregister(key);
+        assert!(snap.contains(&self_pid));
+        assert!(!idx.contains(self_pid));
+    }
+
+    #[test]
+    fn process_index_prune_dead_drops_recycled_entries() {
+        let self_pid = unsafe { libc::getpid() };
+        let idx = ProcessIndex::new();
+        // Insert a stale entry for self with a wrong start_time.
+        let stale_key = PidKey { pid: self_pid, start_time: 0 };
+        let stale = ProcessEntry {
+            key: stale_key,
+            state: Arc::new(AsyncMutex::new(PerProcessState::default())),
+        };
+        idx.inner.write().unwrap().insert(self_pid, stale);
+
+        idx.prune_dead();
+        assert!(!idx.contains(self_pid));
+    }
+
+    #[test]
+    fn process_index_prune_dead_keeps_live_entries() {
+        let self_pid = unsafe { libc::getpid() };
+        let idx = ProcessIndex::new();
+        let key = idx.register(self_pid).unwrap();
+        idx.prune_dead();
+        assert_eq!(idx.key_for(self_pid), Some(key));
     }
 }
