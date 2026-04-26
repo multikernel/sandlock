@@ -93,6 +93,140 @@ async fn getaddrinfo_ai_addrconfig_returns_v4_and_v6() {
     assert!(result.success());
 }
 
+/// /proc/net/dev should be virtualized to show only loopback.
+#[tokio::test]
+async fn proc_net_dev_shows_only_lo() {
+    let out = temp_out("proc-net-dev");
+    let script = format!(concat!(
+        "lines = open('/proc/net/dev').readlines()\n",
+        "ifaces = [l.split(':')[0].strip() for l in lines[2:]]\n",
+        "open('{out}', 'w').write(','.join(ifaces))\n",
+    ), out = out.display());
+
+    let policy = base_policy().build().unwrap();
+    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+        .await.unwrap();
+
+    let contents = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(contents.trim(), "lo", "expected only lo in /proc/net/dev, got: {}", contents);
+    assert!(result.success());
+}
+
+/// /proc/net/if_inet6 should be virtualized to show only loopback.
+#[tokio::test]
+async fn proc_net_if_inet6_shows_only_lo() {
+    let out = temp_out("proc-net-if-inet6");
+    let script = format!(concat!(
+        "lines = open('/proc/net/if_inet6').readlines()\n",
+        "ifaces = [l.split()[-1] for l in lines if l.strip()]\n",
+        "open('{out}', 'w').write(','.join(ifaces))\n",
+    ), out = out.display());
+
+    let policy = base_policy().build().unwrap();
+    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+        .await.unwrap();
+
+    let contents = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(contents.trim(), "lo", "expected only lo in /proc/net/if_inet6, got: {}", contents);
+    assert!(result.success());
+}
+
+/// SIOCGIFCONF ioctl should be blocked by the BPF arg filter, returning EPERM.
+#[tokio::test]
+async fn ioctl_siocgifconf_blocked() {
+    let out = temp_out("ioctl-siocgifconf");
+    let script = format!(concat!(
+        "import fcntl, struct, socket, errno\n",
+        "SIOCGIFCONF = 0x8912\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+        "buf = b'\\x00' * 4096\n",
+        "ifc = struct.pack('iP', len(buf), 0)\n",
+        "try:\n",
+        "  fcntl.ioctl(s.fileno(), SIOCGIFCONF, ifc)\n",
+        "  result = 'ALLOWED'\n",
+        "except OSError as e:\n",
+        "  result = f'BLOCKED:{{e.errno}}'\n",
+        "finally:\n",
+        "  s.close()\n",
+        "open('{out}', 'w').write(result)\n",
+    ), out = out.display());
+
+    let policy = base_policy().build().unwrap();
+    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+        .await.unwrap();
+
+    let contents = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(
+        contents.trim(),
+        &format!("BLOCKED:{}", libc::EPERM),
+        "SIOCGIFCONF should be blocked with EPERM, got: {}", contents
+    );
+    assert!(result.success());
+}
+
+/// SIOCETHTOOL ioctl should be blocked by the BPF arg filter.
+#[tokio::test]
+async fn ioctl_siocethtool_blocked() {
+    let out = temp_out("ioctl-siocethtool");
+    let script = format!(concat!(
+        "import fcntl, struct, socket\n",
+        "SIOCETHTOOL = 0x8946\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+        "ifr = struct.pack('16sP', b'eth0', 0)\n",
+        "try:\n",
+        "  fcntl.ioctl(s.fileno(), SIOCETHTOOL, ifr)\n",
+        "  result = 'ALLOWED'\n",
+        "except OSError as e:\n",
+        "  result = f'BLOCKED:{{e.errno}}'\n",
+        "finally:\n",
+        "  s.close()\n",
+        "open('{out}', 'w').write(result)\n",
+    ), out = out.display());
+
+    let policy = base_policy().build().unwrap();
+    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+        .await.unwrap();
+
+    let contents = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(
+        contents.trim(),
+        &format!("BLOCKED:{}", libc::EPERM),
+        "SIOCETHTOOL should be blocked with EPERM, got: {}", contents
+    );
+    assert!(result.success());
+}
+
+/// /sys/class/net should be blocked as a sensitive path.
+#[tokio::test]
+async fn sys_class_net_blocked() {
+    let out = temp_out("sys-class-net");
+    let script = format!(concat!(
+        "import os\n",
+        "try:\n",
+        "  entries = os.listdir('/sys/class/net')\n",
+        "  result = 'ALLOWED:' + ','.join(entries)\n",
+        "except OSError as e:\n",
+        "  result = f'BLOCKED:{{e.errno}}'\n",
+        "open('{out}', 'w').write(result)\n",
+    ), out = out.display());
+
+    let policy = base_policy().build().unwrap();
+    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+        .await.unwrap();
+
+    let contents = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert!(
+        contents.starts_with("BLOCKED:"),
+        "/sys/class/net should be blocked, got: {}", contents
+    );
+    assert!(result.success());
+}
+
 #[tokio::test]
 async fn non_route_netlink_still_blocked() {
     let out = temp_out("netlink-audit-blocked");
