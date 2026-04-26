@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::seccomp::notif::{read_child_cstr, write_child_mem, NotifAction, NotifPolicy};
-use crate::seccomp::state::{NetworkState, ProcfsState};
+use crate::seccomp::state::{NetworkState, ProcessIndex, ProcfsState};
 use crate::sys::structs::{SeccompNotif, EACCES};
 use crate::sys::syscall;
 
@@ -380,7 +380,7 @@ fn read_path(notif: &SeccompNotif, addr: u64, notif_fd: RawFd) -> Option<String>
 /// - Lets everything else through.
 pub(crate) async fn handle_proc_open(
     notif: &SeccompNotif,
-    procfs: &Arc<Mutex<ProcfsState>>,
+    processes: &Arc<ProcessIndex>,
     resource: &Arc<Mutex<crate::seccomp::state::ResourceState>>,
     network: &Arc<Mutex<NetworkState>>,
     policy: &NotifPolicy,
@@ -404,8 +404,7 @@ pub(crate) async fn handle_proc_open(
     // already hide non-sandbox PIDs, but without this check a process
     // could still open /proc/{ppid}/cmdline (or any guessed PID) directly.
     if let Some(pid) = extract_proc_pid(&path) {
-        let pfs = procfs.lock().await;
-        if !pfs.proc_pids.contains(&pid) {
+        if !processes.contains(pid) {
             return NotifAction::Errno(EACCES);
         }
     }
@@ -435,11 +434,10 @@ pub(crate) async fn handle_proc_open(
 
     // Virtualize /proc/loadavg when proc virtualization is active.
     if path == "/proc/loadavg" {
-        let pfs = procfs.lock().await;
+        let total = processes.len() as u32;
+        let last_pid = processes.max_pid().unwrap_or(0);
         let rs = resource.lock().await;
-        let total = pfs.proc_pids.len() as u32;
         let running = rs.proc_count;
-        let last_pid = pfs.proc_pids.iter().max().copied().unwrap_or(0);
         let content = generate_loadavg(&rs.load_avg, running, total, last_pid);
         return inject_memfd(&content);
     }
@@ -796,6 +794,7 @@ fn build_filtered_dirents(sandbox_pids: &HashSet<i32>) -> Vec<Vec<u8>> {
 pub(crate) async fn handle_getdents(
     notif: &SeccompNotif,
     procfs: &Arc<Mutex<ProcfsState>>,
+    processes: &Arc<ProcessIndex>,
     _policy: &NotifPolicy,
     notif_fd: RawFd,
 ) -> NotifAction {
@@ -819,7 +818,8 @@ pub(crate) async fn handle_getdents(
 
     // Build and cache entries on first call for this (pid, fd) pair.
     if !pfs.getdents_cache.contains_key(&cache_key) {
-        let entries = build_filtered_dirents(&pfs.proc_pids);
+        let snapshot = processes.pids_snapshot();
+        let entries = build_filtered_dirents(&snapshot);
         pfs.getdents_cache.insert(cache_key.clone(), entries);
     }
 

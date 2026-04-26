@@ -1090,6 +1090,15 @@ pub(crate) async fn handle_cow_chdir(
         return NotifAction::Errno(libc::EFAULT);
     }
 
+    // We insert the virtual cwd here, before returning Continue and
+    // letting the kernel run the rewritten chdir. We can't observe
+    // the kernel's verdict without polling, but at this point we've
+    // verified upper_path is a directory, the addfd ioctl succeeded,
+    // and write_child_mem rewrote the path argument — so a kernel
+    // chdir to /proc/self/fd/N is essentially guaranteed. If it does
+    // somehow fail, the per-child pidfd watcher will drop this entry
+    // when the process exits, so the inconsistency is bounded by
+    // process lifetime.
     if let Some(pid_key) = cow_pid_key(notif.pid) {
         let mut st = cow_state.lock().await;
         st.prune_reused_pid(pid_key);

@@ -103,12 +103,11 @@ pub fn build_dispatch_table(
     for nr in fork_nrs {
         let policy = Arc::clone(policy);
         let resource = Arc::clone(resource);
-        table.register(nr, Box::new(move |notif, ctx, _notif_fd| {
+        table.register(nr, Box::new(move |notif, _ctx, _notif_fd| {
             let policy = Arc::clone(&policy);
             let resource = Arc::clone(&resource);
-            let procfs_inner = Arc::clone(&ctx.procfs);
             Box::pin(async move {
-                crate::resource::handle_fork(&notif, &resource, &procfs_inner, &policy).await
+                crate::resource::handle_fork(&notif, &resource, &policy).await
             })
         }));
     }
@@ -135,12 +134,10 @@ pub fn build_dispatch_table(
             libc::SYS_mremap, libc::SYS_shmget,
         ] {
             let policy = Arc::clone(policy);
-            let resource = Arc::clone(resource);
-            table.register(nr, Box::new(move |notif, _ctx, _notif_fd| {
+            table.register(nr, Box::new(move |notif, ctx, _notif_fd| {
                 let policy = Arc::clone(&policy);
-                let resource = Arc::clone(&resource);
                 Box::pin(async move {
-                    crate::resource::handle_memory(&notif, &resource, &policy).await
+                    crate::resource::handle_memory(&notif, &ctx, &policy).await
                 })
             }));
         }
@@ -233,10 +230,10 @@ pub fn build_dispatch_table(
         table.register(libc::SYS_openat, Box::new(move |notif, ctx, notif_fd| {
             let policy = Arc::clone(&policy);
             let resource = Arc::clone(&resource);
-            let procfs_inner = Arc::clone(&ctx.procfs);
+            let processes = Arc::clone(&ctx.processes);
             let network = Arc::clone(&ctx.network);
             Box::pin(async move {
-                crate::procfs::handle_proc_open(&notif, &procfs_inner, &resource, &network, &policy, notif_fd).await
+                crate::procfs::handle_proc_open(&notif, &processes, &resource, &network, &policy, notif_fd).await
             })
         }));
     }
@@ -249,8 +246,9 @@ pub fn build_dispatch_table(
         table.register(nr, Box::new(move |notif, ctx, notif_fd| {
             let policy = Arc::clone(&policy);
             let procfs_inner = Arc::clone(&ctx.procfs);
+            let processes = Arc::clone(&ctx.processes);
             Box::pin(async move {
-                crate::procfs::handle_getdents(&notif, &procfs_inner, &policy, notif_fd).await
+                crate::procfs::handle_getdents(&notif, &procfs_inner, &processes, &policy, notif_fd).await
             })
         }));
     }

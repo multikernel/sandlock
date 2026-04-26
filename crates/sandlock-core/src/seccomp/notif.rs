@@ -862,6 +862,12 @@ async fn handle_notification(
 ) {
     let policy = &ctx.policy;
 
+    // Ensure every pid that produces a notification is tracked in the
+    // ProcessIndex with an exit watcher. The fork handler runs on the
+    // *parent* pid (the child doesn't exist yet at clone-time), so the
+    // child gets registered the first time it issues its own syscall.
+    crate::resource::register_child_if_new(ctx, notif.pid as i32).await;
+
     // Re-patch vDSO if needed (exec replaces it with a fresh copy).
     if policy.has_time_start || policy.has_random_seed {
         let mut pfs = ctx.procfs.lock().await;
@@ -950,11 +956,11 @@ pub async fn supervisor(
         }
     });
 
-    // Spawn a low-frequency GC task that prunes per-process COW state for
-    // children that have exited.  prune_reused_pid only fires when a new
-    // process recycles a PID, so without this sweep `virtual_cwds` and
-    // `dir_cache` would grow with the number of distinct child PIDs over
-    // the lifetime of the supervisor.
+    // Periodic sweep as a defensive backstop in case pidfd-based
+    // lifecycle cleanup misses an entry (e.g. pidfd_open failed for a
+    // child on an old kernel, or its watcher panicked). At 5 minutes
+    // this is cheap enough to leave on; the primary cleanup path is
+    // still per-child pidfd readiness in `spawn_pid_watcher`.
     let gc = tokio::spawn(cow_state_gc(Arc::clone(&ctx.cow)));
 
     while let Some(notif) = rx.recv().await {
@@ -966,7 +972,7 @@ pub async fn supervisor(
 
 /// Periodic sweep that drops `CowState` entries belonging to exited PIDs.
 async fn cow_state_gc(cow: Arc<tokio::sync::Mutex<super::state::CowState>>) {
-    let interval = std::time::Duration::from_secs(30);
+    let interval = std::time::Duration::from_secs(300);
     loop {
         tokio::time::sleep(interval).await;
         let mut st = cow.lock().await;
@@ -975,6 +981,64 @@ async fn cow_state_gc(cow: Arc<tokio::sync::Mutex<super::state::CowState>>) {
         }
         st.prune_dead_pids();
     }
+}
+
+/// Spawn a per-child task that awaits the pidfd becoming readable
+/// (process exit) and then runs unified cleanup across every
+/// per-process supervisor map.
+///
+/// The watcher *owns* the pidfd via `AsyncFd<OwnedFd>` — the kernel
+/// fd stays alive for as long as tokio's IO driver has it registered,
+/// and is closed exactly once when the watcher task ends. This avoids
+/// a TOCTOU where dropping the fd from a separate map could let a
+/// recycled fd be deregistered from epoll.
+pub(crate) fn spawn_pid_watcher(
+    ctx: Arc<super::ctx::SupervisorCtx>,
+    key: super::state::PidKey,
+    pidfd: std::os::unix::io::OwnedFd,
+) {
+    tokio::spawn(async move {
+        let async_fd = match tokio::io::unix::AsyncFd::with_interest(
+            pidfd,
+            tokio::io::Interest::READABLE,
+        ) {
+            Ok(f) => f,
+            Err(_) => {
+                // AsyncFd registration failed (extremely unusual);
+                // fall back to immediate cleanup so we don't leak the
+                // index entry. The OwnedFd we passed in is consumed
+                // by `with_interest`'s Err return and will close on
+                // drop here.
+                cleanup_pid(&ctx, key).await;
+                return;
+            }
+        };
+        // pidfd becomes readable when the process exits; we don't
+        // read any data, so `readable()` is just an await point.
+        let _ = async_fd.readable().await;
+        cleanup_pid(&ctx, key).await;
+        // async_fd drops here, closing the pidfd.
+    });
+}
+
+/// Drop every supervisor map entry that pertains to `key`. Called
+/// from the per-child pidfd watcher and from the supervisor on its
+/// own shutdown path.
+pub(crate) async fn cleanup_pid(ctx: &super::ctx::SupervisorCtx, key: super::state::PidKey) {
+    {
+        let mut st = ctx.cow.lock().await;
+        st.virtual_cwds.retain(|k, _| *k != key);
+        st.dir_cache.retain(|(k, _), _| *k != key);
+    }
+    {
+        let mut st = ctx.procfs.lock().await;
+        st.getdents_cache.retain(|(p, _, _), _| *p != key.pid);
+    }
+    {
+        let mut st = ctx.resource.lock().await;
+        st.brk_bases.remove(&key);
+    }
+    ctx.processes.unregister(key);
 }
 
 // ============================================================

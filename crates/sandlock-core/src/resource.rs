@@ -3,8 +3,9 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::seccomp::notif::{NotifAction, NotifPolicy};
-use crate::seccomp::state::{ProcfsState, ResourceState};
+use crate::seccomp::ctx::SupervisorCtx;
+use crate::seccomp::notif::{spawn_pid_watcher, NotifAction, NotifPolicy};
+use crate::seccomp::state::ResourceState;
 use crate::sys::structs::{
     SeccompNotif, CLONE_NS_FLAGS, EAGAIN, EPERM,
 };
@@ -17,13 +18,17 @@ const MAP_ANONYMOUS: u64 = 0x20;
 
 /// Handle fork/clone/vfork notifications.
 ///
-/// Enforces namespace creation ban, process limits, and checkpoint hold.
-/// Needs both `ResourceState` (for proc_count, hold_forks, etc.) and
-/// `ProcfsState` (for proc_pids).
+/// Enforces namespace creation ban and process limits, registers the
+/// new child in `ProcessIndex` (with an owned pidfd), and spawns a
+/// per-child pidfd watcher that runs unified cleanup on exit.
+///
+/// Note: `notif.pid` here is the *parent* (the task issuing
+/// clone/fork). The kernel hasn't run the syscall yet, so we don't
+/// know the child's pid. The child is discovered and registered later,
+/// on its first own seccomp notification, via `register_child_if_new`.
 pub(crate) async fn handle_fork(
     notif: &SeccompNotif,
     resource: &Arc<Mutex<ResourceState>>,
-    procfs: &Arc<Mutex<ProcfsState>>,
     _policy: &NotifPolicy,
 ) -> NotifAction {
     let nr = notif.data.nr as i64;
@@ -55,12 +60,39 @@ pub(crate) async fn handle_fork(
     }
 
     rs.proc_count += 1;
-    drop(rs);
-
-    let mut pfs = procfs.lock().await;
-    pfs.proc_pids.insert(notif.pid as i32);
-
     NotifAction::Continue
+}
+
+/// If `notif.pid` is not yet tracked in the ProcessIndex, register
+/// it: open a pidfd, record the canonical PidKey, and spawn the exit
+/// watcher. Called from the supervisor's notification dispatcher
+/// before per-syscall handlers run, so handlers can rely on
+/// `ProcessIndex::key_for(notif.pid)` returning a fresh PidKey.
+///
+/// The fast path is a single `RwLock` read: if the pid is already
+/// tracked, we trust the entry. PID-identity correctness comes from
+/// the per-child pidfd watcher — a process can't issue notifications
+/// after it has exited, and the kernel won't recycle a PID until the
+/// parent has waited (which we observe), so a stale entry has no
+/// window in which to be hit. We deliberately do *not* re-stat
+/// /proc/<pid>/stat on every notification.
+pub(crate) async fn register_child_if_new(ctx: &Arc<SupervisorCtx>, pid: i32) {
+    if ctx.processes.contains(pid) {
+        return;
+    }
+
+    let pidfd = match crate::sys::syscall::pidfd_open(pid as u32, 0) {
+        Ok(fd) => fd,
+        Err(_) => return, // old kernel or process gone — GC backstop will clean up
+    };
+
+    let key = match ctx.processes.register(pid) {
+        Some(k) => k,
+        None => return, // process exited between pidfd_open and stat read
+    };
+
+    // Hand the pidfd to the watcher; it owns the fd's lifetime now.
+    spawn_pid_watcher(Arc::clone(ctx), key, pidfd);
 }
 
 /// Handle wait4/waitid notifications — decrement the concurrent process count.
@@ -82,14 +114,14 @@ pub(crate) async fn handle_wait(
 /// Tracks anonymous memory usage and enforces the configured memory limit.
 pub(crate) async fn handle_memory(
     notif: &SeccompNotif,
-    resource: &Arc<Mutex<ResourceState>>,
+    ctx: &Arc<SupervisorCtx>,
     policy: &NotifPolicy,
 ) -> NotifAction {
     let nr = notif.data.nr as i64;
     let args = &notif.data.args;
     let limit = policy.max_memory_bytes;
 
-    let mut st = resource.lock().await;
+    let mut st = ctx.resource.lock().await;
 
     let kill = NotifAction::Kill { sig: libc::SIGKILL, pgid: notif.pid as i32 };
 
@@ -110,14 +142,22 @@ pub(crate) async fn handle_memory(
     } else if nr == libc::SYS_brk {
         // args[0] = new_brk
         let new_brk = args[0];
-        let pid = notif.pid as i32;
 
         if new_brk == 0 {
             // Query: return Continue, kernel handles it.
             return NotifAction::Continue;
         }
 
-        let base = *st.brk_bases.entry(pid).or_insert(new_brk);
+        // Translate notif.pid → canonical PidKey via the process
+        // index. If the child wasn't registered (e.g. pidfd_open
+        // failed at fork on an old kernel), fall through without
+        // tracking — this is a no-op, not a leak.
+        let pid_key = match ctx.processes.key_for(notif.pid as i32) {
+            Some(k) => k,
+            None => return NotifAction::Continue,
+        };
+
+        let base = *st.brk_bases.entry(pid_key).or_insert(new_brk);
 
         if new_brk > base {
             let delta = new_brk - base;
@@ -125,11 +165,11 @@ pub(crate) async fn handle_memory(
                 return kill;
             }
             st.mem_used += delta;
-            st.brk_bases.insert(pid, new_brk);
+            st.brk_bases.insert(pid_key, new_brk);
         } else if new_brk < base {
             let delta = base - new_brk;
             st.mem_used = st.mem_used.saturating_sub(delta);
-            st.brk_bases.insert(pid, new_brk);
+            st.brk_bases.insert(pid_key, new_brk);
         }
     } else if nr == libc::SYS_mremap {
         // args[1] = old_len, args[2] = new_len

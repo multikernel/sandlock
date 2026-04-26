@@ -13,8 +13,10 @@ pub struct ResourceState {
     pub mem_used: u64,
     /// Maximum allowed anonymous memory (bytes).
     pub max_memory_bytes: u64,
-    /// Per-PID brk base addresses for memory tracking.
-    pub brk_bases: HashMap<i32, u64>,
+    /// Per-process brk base addresses for memory tracking. Keyed by
+    /// PidKey so a recycled numeric pid never inherits the previous
+    /// process's brk base.
+    pub brk_bases: HashMap<PidKey, u64>,
     /// Whether fork notifications should be held (checkpoint/freeze).
     pub hold_forks: bool,
     /// Notification IDs held during a checkpoint freeze.
@@ -47,9 +49,12 @@ impl ResourceState {
 // ============================================================
 
 /// /proc virtualization runtime state.
+///
+/// Sandbox membership (the set of "our" pids) lives in
+/// `ProcessIndex`, not here — there used to be a denormalized mirror
+/// here that had to be hand-synced. /proc handlers query
+/// `ctx.processes` directly.
 pub struct ProcfsState {
-    /// PIDs belonging to the sandbox (for /proc PID filtering).
-    pub proc_pids: HashSet<i32>,
     /// Cache of filtered dirent entries keyed by (pid, fd, directory target).
     /// Populated on first getdents64 call for a /proc directory, drained on subsequent calls.
     pub getdents_cache: HashMap<(i32, u32, String), Vec<Vec<u8>>>,
@@ -60,7 +65,6 @@ pub struct ProcfsState {
 impl ProcfsState {
     pub fn new() -> Self {
         Self {
-            proc_pids: HashSet::new(),
             getdents_cache: HashMap::new(),
             vdso_patched_addr: 0,
         }
@@ -89,6 +93,101 @@ pub(crate) fn read_pid_start_time(pid: i32) -> Option<u64> {
     let rest = stat.rsplit_once(") ")?.1;
     // The first token after "(comm) " is field 3; field 22 is therefore nth(19).
     rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// Source-of-truth registry for processes inside the sandbox.
+///
+/// Holds the canonical `pid → PidKey` mapping plus everything any
+/// handler needs to ask about sandbox membership. Kept behind an
+/// internal `std::sync::RwLock` so the read-mostly hot paths
+/// (`key_for`, `contains`, `/proc` virtualization) don't have to take
+/// an async mutex on every notification — and so ProcessIndex doesn't
+/// need its own `Mutex` wrapper in `SupervisorCtx`. Lock guards are
+/// `!Send` and the compiler will reject holding one across an
+/// `.await`, which keeps callers honest.
+///
+/// Ownership of each child's pidfd lives with the per-child watcher
+/// task, not with this index. That keeps the kernel fd alive for as
+/// long as the `AsyncFd` registration in the tokio IO driver does,
+/// and avoids a race where dropping the fd from the index could
+/// deregister a recycled fd from epoll.
+pub struct ProcessIndex {
+    inner: std::sync::RwLock<HashMap<i32, PidKey>>,
+}
+
+impl ProcessIndex {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Register a process by reading its start_time once and
+    /// inserting the canonical PidKey. Returns the key, or None if
+    /// the process is already gone. The caller is responsible for
+    /// keeping the pidfd alive — the per-child watcher task does
+    /// this via `AsyncFd<OwnedFd>`.
+    pub fn register(&self, pid: i32) -> Option<PidKey> {
+        let start_time = read_pid_start_time(pid)?;
+        let key = PidKey { pid, start_time };
+        self.inner.write().ok()?.insert(pid, key);
+        Some(key)
+    }
+
+    /// Look up the canonical PidKey for a notification's raw pid.
+    /// Returns None if this pid was never registered (e.g. pidfd_open
+    /// failed at fork) — callers should fall back to a no-op.
+    pub fn key_for(&self, pid: i32) -> Option<PidKey> {
+        self.inner.read().ok()?.get(&pid).copied()
+    }
+
+    /// Cheap membership test — used by /proc virtualization to gate
+    /// access to `/proc/<pid>/...` paths and by getdents filtering.
+    pub fn contains(&self, pid: i32) -> bool {
+        self.inner
+            .read()
+            .map(|g| g.contains_key(&pid))
+            .unwrap_or(false)
+    }
+
+    /// Number of tracked processes (for /proc/loadavg total).
+    pub fn len(&self) -> usize {
+        self.inner.read().map(|g| g.len()).unwrap_or(0)
+    }
+
+    /// Largest tracked pid (for /proc/loadavg last_pid).
+    pub fn max_pid(&self) -> Option<i32> {
+        self.inner.read().ok()?.keys().copied().max()
+    }
+
+    /// Snapshot the set of tracked pids. Used by getdents filtering
+    /// where the caller needs O(1) lookups inside a loop and would
+    /// otherwise have to re-acquire the read lock per entry.
+    pub fn pids_snapshot(&self) -> HashSet<i32> {
+        self.inner
+            .read()
+            .map(|g| g.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Remove a process from the index. Called from the per-child
+    /// watcher task once the process has exited.
+    pub fn unregister(&self, key: PidKey) {
+        if let Ok(mut g) = self.inner.write() {
+            // Only clear if the entry still points at this key. A PID
+            // recycled with a fresh start_time may already have
+            // overwritten the entry via register(); we must not stomp it.
+            if g.get(&key.pid) == Some(&key) {
+                g.remove(&key.pid);
+            }
+        }
+    }
+}
+
+impl Default for ProcessIndex {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Copy-on-write filesystem state.
@@ -226,6 +325,76 @@ mod tests {
         assert!(!state.dir_cache.contains_key(&(old, 7)));
         assert_eq!(state.virtual_cwds.get(&other), Some(&"/other".to_string()));
         assert!(state.dir_cache.contains_key(&(other, 7)));
+    }
+
+    #[test]
+    fn process_index_register_lookup_unregister() {
+        let self_pid = unsafe { libc::getpid() };
+        let idx = ProcessIndex::new();
+        let key = idx
+            .register(self_pid)
+            .expect("register should succeed for live pid");
+        assert_eq!(key.pid, self_pid);
+
+        assert_eq!(idx.key_for(self_pid), Some(key));
+        assert!(idx.contains(self_pid));
+        assert_eq!(idx.key_for(self_pid + 999_999), None);
+        assert!(!idx.contains(self_pid + 999_999));
+        assert_eq!(idx.len(), 1);
+        assert_eq!(idx.max_pid(), Some(self_pid));
+
+        idx.unregister(key);
+        assert_eq!(idx.key_for(self_pid), None);
+        assert!(!idx.contains(self_pid));
+        assert_eq!(idx.len(), 0);
+        assert_eq!(idx.max_pid(), None);
+    }
+
+    #[test]
+    fn process_index_register_overwrites_stale_entry_for_recycled_pid() {
+        // Forge a stale entry via the public register() path, then
+        // simulate recycle by re-registering — start_time will differ
+        // because pid/comm gets a fresh stat read.
+        let self_pid = unsafe { libc::getpid() };
+        let stale_key = PidKey { pid: self_pid, start_time: 0 };
+        let idx = ProcessIndex::new();
+        idx.inner.write().unwrap().insert(self_pid, stale_key);
+
+        let new_key = idx.register(self_pid).unwrap();
+        assert_ne!(new_key, stale_key);
+        assert_eq!(idx.key_for(self_pid), Some(new_key));
+
+        // Unregistering by the stale key must NOT clobber the fresh
+        // registration; only an exact-match unregister wins.
+        idx.unregister(stale_key);
+        assert_eq!(idx.key_for(self_pid), Some(new_key));
+    }
+
+    #[test]
+    fn process_index_pids_snapshot_is_independent() {
+        let self_pid = unsafe { libc::getpid() };
+        let idx = ProcessIndex::new();
+        let key = idx.register(self_pid).unwrap();
+        let snap = idx.pids_snapshot();
+        idx.unregister(key);
+        // The snapshot is a copy — unregister doesn't mutate it.
+        assert!(snap.contains(&self_pid));
+        assert!(!idx.contains(self_pid));
+    }
+
+    #[test]
+    fn brk_bases_keyed_by_pidkey_distinguishes_recycled_pids() {
+        // ResourceState::brk_bases is keyed by PidKey, so a recycled
+        // numeric pid with a different start_time is treated as a
+        // different process and doesn't inherit the previous brk base.
+        let mut rs = ResourceState::new(0, 0);
+        let pid = 100i32;
+        let original = PidKey { pid, start_time: 1000 };
+        let recycled = PidKey { pid, start_time: 2000 };
+        rs.brk_bases.insert(original, 0xdead_beef);
+
+        assert_eq!(rs.brk_bases.get(&original), Some(&0xdead_beef));
+        assert_eq!(rs.brk_bases.get(&recycled), None);
     }
 }
 
