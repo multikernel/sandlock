@@ -63,7 +63,10 @@ pub(crate) fn handle_random_open(
     }
 
     // Create a memfd filled with deterministic PRNG bytes.
-    let memfd = match syscall::memfd_create("sandlock-random", 0) {
+    let memfd = match syscall::memfd_create(
+        "sandlock-random",
+        (libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) as u32,
+    ) {
         Ok(fd) => fd,
         Err(_) => return Some(NotifAction::Continue),
     };
@@ -79,6 +82,11 @@ pub(crate) fn handle_random_open(
         }
         std::mem::forget(file);
     }
+
+    // Seal the memfd — the child gets a fd to the same RW description and
+    // could otherwise overwrite the deterministic stream. Best-effort.
+    let seals = libc::F_SEAL_SEAL | libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK;
+    unsafe { libc::fcntl(raw, libc::F_ADD_SEALS, seals) };
 
     // Move the OwnedFd into InjectFdSend — send_response will close it after the ioctl.
     Some(NotifAction::InjectFdSend { srcfd: memfd, newfd_flags: libc::O_CLOEXEC as u32 })

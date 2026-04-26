@@ -300,7 +300,10 @@ impl Sandbox {
 
             let deny = crate::context::deny_syscall_numbers(&policy);
             let args = crate::context::arg_filters(&policy);
-            let filter = crate::seccomp::bpf::assemble_filter(&[], &deny, &args);
+            let filter = match crate::seccomp::bpf::assemble_filter(&[], &deny, &args) {
+                Ok(f) => f,
+                Err(_) => unsafe { libc::_exit(1) },
+            };
             let _ = crate::seccomp::bpf::install_deny_filter(&filter);
 
             CONFINED.store(true, std::sync::atomic::Ordering::Relaxed);
