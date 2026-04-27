@@ -921,14 +921,23 @@ async fn handle_notification(
 /// Async event loop that processes seccomp notifications.
 ///
 /// Runs until the notification fd is closed (child exits or filter is removed).
+///
+/// `extra_handlers` are user-supplied syscall handlers registered after all
+/// builtin handlers (see [`super::dispatch::ExtraHandler`]).  For the default
+/// behaviour without any custom handlers pass an empty `Vec`.
 pub async fn supervisor(
     notif_fd: OwnedFd,
     ctx: Arc<super::ctx::SupervisorCtx>,
+    extra_handlers: Vec<super::dispatch::ExtraHandler>,
 ) {
     let fd = notif_fd.as_raw_fd();
 
     // Build the dispatch table once at startup.
-    let dispatch_table = Arc::new(super::dispatch::build_dispatch_table(&ctx.policy, &ctx.resource));
+    let dispatch_table = Arc::new(super::dispatch::build_dispatch_table(
+        &ctx.policy,
+        &ctx.resource,
+        extra_handlers,
+    ));
 
     // Try to enable sync wakeup (Linux 6.7+, ignore error on older kernels).
     try_set_sync_wakeup(fd);

@@ -108,6 +108,9 @@ pub struct Sandbox {
     /// Optional callback invoked when a port bind is recorded.
     #[allow(clippy::type_complexity)]
     on_bind: Option<Box<dyn Fn(&std::collections::HashMap<u16, u16>) + Send + Sync>>,
+    /// User-supplied extra syscall handlers. Taken on spawn and
+    /// appended to the dispatch table after all builtin handlers.
+    extra_handlers: Vec<crate::seccomp::dispatch::ExtraHandler>,
 }
 
 impl Sandbox {
@@ -163,21 +166,82 @@ impl Sandbox {
             extra_fds: Vec::new(),
             http_acl_handle: None,
             on_bind: None,
+            extra_handlers: Vec::new(),
         }
     }
 
     /// One-shot: spawn a sandboxed process, wait for it to exit, and return
     /// the result. Stdout and stderr are captured.
     pub async fn run(policy: &Policy, cmd: &[&str]) -> Result<RunResult, SandlockError> {
-        let mut sb = Self::new(policy)?;
-        sb.do_spawn(cmd, true).await?;
-        sb.wait().await
+        Self::run_with_extra_handlers(policy, cmd, Vec::new()).await
     }
 
     /// Run a sandboxed process with inherited stdio (interactive mode).
     pub async fn run_interactive(policy: &Policy, cmd: &[&str]) -> Result<RunResult, SandlockError> {
         let mut sb = Self::new(policy)?;
         sb.do_spawn(cmd, false).await?;
+        sb.wait().await
+    }
+
+    /// One-shot run with user-supplied syscall handlers.
+    ///
+    /// `extra_handlers` are registered in the dispatch table **after** all
+    /// builtin handlers for the same syscall.  They observe the post-builtin
+    /// view (e.g. [`chroot`]-normalized paths on `openat`) and cannot be used
+    /// to bypass builtin confinement.  See
+    /// [`crate::seccomp::dispatch::ExtraHandler`] for the ordering contract.
+    ///
+    /// When called with an empty vector, this function is identical to
+    /// [`Self::run`].
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use sandlock_core::{Policy, Sandbox};
+    /// use sandlock_core::seccomp::dispatch::{ExtraHandler, HandlerFn};
+    /// use sandlock_core::seccomp::notif::NotifAction;
+    ///
+    /// # tokio_test::block_on(async {
+    /// let policy = Policy::builder().fs_read("/usr").build().unwrap();
+    ///
+    /// let audit: HandlerFn = Box::new(|notif, _ctx, _fd| {
+    ///     Box::pin(async move {
+    ///         eprintln!("openat from pid {}", notif.data.pid);
+    ///         NotifAction::Continue
+    ///     })
+    /// });
+    ///
+    /// let result = Sandbox::run_with_extra_handlers(
+    ///     &policy,
+    ///     &["/usr/bin/true"],
+    ///     vec![ExtraHandler::new(libc::SYS_openat, audit)],
+    /// ).await.unwrap();
+    /// # });
+    /// ```
+    pub async fn run_with_extra_handlers(
+        policy: &Policy,
+        cmd: &[&str],
+        extra_handlers: Vec<crate::seccomp::dispatch::ExtraHandler>,
+    ) -> Result<RunResult, SandlockError> {
+        // Reject extras that would weaken confinement (e.g. one registered
+        // on a default-deny syscall).  See
+        // [`crate::seccomp::dispatch::validate_extras_against_policy`] for the
+        // rationale.  Done before fork so the caller gets a clear error
+        // instead of a silently-broken sandbox.
+        if let Err(nr) =
+            crate::seccomp::dispatch::validate_extras_against_policy(&extra_handlers, policy)
+        {
+            return Err(SandboxError::Child(format!(
+                "ExtraHandler on syscall {} conflicts with the default-deny list and \
+                 would let user code bypass it via SECCOMP_USER_NOTIF_FLAG_CONTINUE",
+                nr
+            ))
+            .into());
+        }
+
+        let mut sb = Self::new(policy)?;
+        sb.extra_handlers = extra_handlers;
+        sb.do_spawn(cmd, true).await?;
         sb.wait().await
     }
 
@@ -838,8 +902,29 @@ impl Sandbox {
             // Collect target fds from gather that must survive close_fds_above
             let gather_keep_fds: Vec<i32> = self.extra_fds.iter().map(|&(target, _)| target).collect();
 
+            // Collect extra-handler syscall numbers for the BPF filter the child
+            // is about to install.  This must be a plain `Vec<u32>` because the
+            // child does not need (and cannot use after exec) the heap-allocated
+            // closures stored in `self.extra_handlers` — only the registered
+            // syscall numbers must be added to the BPF notif list so the kernel
+            // raises notifications for them.  The supervisor in the parent owns
+            // the closures themselves.
+            let extra_syscalls: Vec<u32> = self
+                .extra_handlers
+                .iter()
+                .map(|h| h.syscall_nr as u32)
+                .collect();
+
             // This never returns.
-            context::confine_child(&self.policy, &c_cmd, &pipes, cow_config.as_ref(), nested, &gather_keep_fds);
+            context::confine_child(context::ChildSpawnArgs {
+                policy: &self.policy,
+                cmd: &c_cmd,
+                pipes: &pipes,
+                cow_config: cow_config.as_ref(),
+                nested,
+                keep_fds: &gather_keep_fds,
+                extra_syscalls: &extra_syscalls,
+            });
         }
 
         // ===== PARENT PROCESS =====
@@ -1047,9 +1132,11 @@ impl Sandbox {
                 notif_fd: notif_raw_fd,
             });
 
-            // Spawn notif supervisor
+            // Spawn notif supervisor.  `extra_handlers` is consumed here
+            // (moved into the supervisor task) because HandlerFn is not Clone.
+            let extra_handlers = std::mem::take(&mut self.extra_handlers);
             self.notif_handle = Some(tokio::spawn(
-                notif::supervisor(notif_fd, ctx),
+                notif::supervisor(notif_fd, ctx, extra_handlers),
             ));
 
             // Spawn load average sampling task (every 5s, like the kernel)
