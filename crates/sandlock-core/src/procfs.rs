@@ -338,7 +338,10 @@ fn parse_proc_net_tcp_port(line: &str) -> Option<u16> {
 /// robust design would store it in an arena, but leaking is acceptable for
 /// the supervisor's lifetime.
 fn inject_memfd(content: &[u8]) -> NotifAction {
-    let memfd = match syscall::memfd_create("sandlock", 0) {
+    let memfd = match syscall::memfd_create(
+        "sandlock",
+        (libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) as u32,
+    ) {
         Ok(fd) => fd,
         Err(_) => return NotifAction::Continue, // fallback: let real open proceed
     };
@@ -355,6 +358,14 @@ fn inject_memfd(content: &[u8]) -> NotifAction {
         // Forget the File so it doesn't close the fd — memfd (OwnedFd) still owns it.
         std::mem::forget(file);
     }
+
+    // Lock the memfd: the child gets an injected fd to the same description
+    // (memfd_create returns RW), so without sealing they could overwrite the
+    // synthesised /proc content. Best-effort — if F_ADD_SEALS fails (very old
+    // kernel without sealing support), we still inject the fd, since the child
+    // is still bounded by everything else in the policy.
+    let seals = libc::F_SEAL_SEAL | libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK;
+    unsafe { libc::fcntl(raw, libc::F_ADD_SEALS, seals) };
 
     // Move the OwnedFd into InjectFdSend — send_response will close it after the ioctl.
     NotifAction::InjectFdSend { srcfd: memfd, newfd_flags: libc::O_CLOEXEC as u32 }
@@ -673,7 +684,7 @@ pub(crate) async fn handle_sorted_getdents(
         let entries: Vec<Vec<u8>> = names
             .iter()
             .enumerate()
-            .map(|(i, (name, d_type, d_ino))| {
+            .filter_map(|(i, (name, d_type, d_ino))| {
                 build_dirent64(*d_ino, (i + 1) as i64, *d_type, name)
             })
             .collect();
@@ -729,8 +740,16 @@ pub(crate) const DT_LNK: u8 = 10;
 /// Build a single linux_dirent64 entry.
 /// struct linux_dirent64 { u64 d_ino; s64 d_off; u16 d_reclen; u8 d_type; char d_name[]; }
 /// d_reclen is 8-byte aligned.
-pub(crate) fn build_dirent64(d_ino: u64, d_off: i64, d_type: u8, name: &str) -> Vec<u8> {
+///
+/// Returns `None` if `name` exceeds the Linux NAME_MAX limit (255 bytes) —
+/// such names can't appear in a real dirent stream, and accepting them would
+/// produce a record whose `d_reclen` overflows the u16 field.
+pub(crate) fn build_dirent64(d_ino: u64, d_off: i64, d_type: u8, name: &str) -> Option<Vec<u8>> {
+    const NAME_MAX: usize = 255;
     let name_bytes = name.as_bytes();
+    if name_bytes.len() > NAME_MAX {
+        return None;
+    }
     let reclen = ((19 + name_bytes.len() + 1) + 7) & !7; // +1 NUL, align to 8
     let mut buf = vec![0u8; reclen];
     buf[0..8].copy_from_slice(&d_ino.to_ne_bytes());
@@ -738,7 +757,7 @@ pub(crate) fn build_dirent64(d_ino: u64, d_off: i64, d_type: u8, name: &str) -> 
     buf[16..18].copy_from_slice(&(reclen as u16).to_ne_bytes());
     buf[18] = d_type;
     buf[19..19 + name_bytes.len()].copy_from_slice(name_bytes);
-    buf
+    Some(buf)
 }
 
 /// Build a filtered list of dirent64 entries for /proc, hiding PIDs not in the sandbox.
@@ -779,7 +798,9 @@ fn build_filtered_dirents(sandbox_pids: &HashSet<i32>) -> Vec<Vec<u8>> {
             entry.metadata().map(|m| m.st_ino()).unwrap_or(0)
         };
 
-        entries.push(build_dirent64(d_ino, d_off, d_type, &name_str));
+        if let Some(rec) = build_dirent64(d_ino, d_off, d_type, &name_str) {
+            entries.push(rec);
+        }
     }
     entries
 }
@@ -1111,7 +1132,7 @@ mod tests {
 
     #[test]
     fn test_build_dirent64() {
-        let entry = build_dirent64(12345, 1, DT_DIR, "1234");
+        let entry = build_dirent64(12345, 1, DT_DIR, "1234").unwrap();
         assert_eq!(entry.len(), 24); // 19 + 5 = 24, already aligned
         let d_ino = u64::from_ne_bytes(entry[0..8].try_into().unwrap());
         assert_eq!(d_ino, 12345);
@@ -1124,9 +1145,15 @@ mod tests {
 
     #[test]
     fn test_build_dirent64_alignment() {
-        let entry = build_dirent64(1, 1, DT_REG, "ab");
+        let entry = build_dirent64(1, 1, DT_REG, "ab").unwrap();
         // 19 + 3 = 22, padded to 24
         assert_eq!(entry.len(), 24);
+    }
+
+    #[test]
+    fn test_build_dirent64_rejects_oversize_name() {
+        let name = "x".repeat(256);
+        assert!(build_dirent64(1, 1, DT_REG, &name).is_none());
     }
 
     #[test]

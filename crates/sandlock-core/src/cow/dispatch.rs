@@ -954,7 +954,9 @@ pub(crate) async fn handle_cow_getdents(
                 let d_ino = std::fs::symlink_metadata(check)
                     .map(|m| m.ino())
                     .unwrap_or(0);
-                out.push(build_dirent64(d_ino, d_off, d_type, name));
+                if let Some(rec) = build_dirent64(d_ino, d_off, d_type, name) {
+                    out.push(rec);
+                }
             }
             out
         };
