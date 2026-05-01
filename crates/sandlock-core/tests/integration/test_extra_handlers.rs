@@ -56,10 +56,17 @@ fn read_path_from_child(pid: u32, addr: u64) -> Option<String> {
 }
 
 fn base_policy() -> sandlock_core::PolicyBuilder {
+    // `fs_read_if_exists` for `/lib64` because aarch64 hosts (Ubuntu CI
+    // arm64 runner) do not have it — the dynamic linker lives under
+    // `/lib/aarch64-linux-gnu/`.  A strict `fs_read` here makes Landlock
+    // refuse to add the rule and the child exits before completing
+    // confinement, surfacing as `pipe closed before 4 bytes read`
+    // in the parent.  Mirrors the convention used in upstream
+    // `test_dry_run`, `test_fork`, `test_netlink_virt`, `test_landlock`.
     Policy::builder()
         .fs_read("/usr")
         .fs_read("/lib")
-        .fs_read("/lib64")
+        .fs_read_if_exists("/lib64")
         .fs_read("/bin")
         .fs_read("/etc")
         .fs_read("/proc")
