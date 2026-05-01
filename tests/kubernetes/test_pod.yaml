@@ -1,0 +1,69 @@
+# Test Pod using the sandlock RuntimeClass.
+# This pod runs in the sandlock OCI runtime instead of runc/containerd-shim.
+#
+# Usage:
+#   kubectl apply -f runtimeclass.yaml
+#   kubectl apply -f test_pod.yaml
+#   kubectl logs sandlock-test-pod   # should print "sandlock-pod-ok"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sandlock-test-pod
+  labels:
+    app: sandlock-test
+    component: oci-runtime-test
+spec:
+  # Use the sandlock OCI runtime
+  runtimeClassName: sandlock
+  restartPolicy: Never
+  containers:
+    - name: test-container
+      image: busybox:latest
+      imagePullPolicy: IfNotPresent
+      command:
+        - sh
+        - -c
+        - |
+          echo "sandlock-pod-ok"
+          echo "PID: $$"
+          echo "Hostname: $(hostname)"
+          echo "Landlock sandbox active"
+          sleep 5
+      resources:
+        limits:
+          memory: "64Mi"
+          cpu: "100m"
+        requests:
+          memory: "32Mi"
+          cpu: "50m"
+---
+# Job-based test: verify the process exits cleanly
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sandlock-test-job
+spec:
+  ttlSecondsAfterFinished: 60
+  template:
+    spec:
+      runtimeClassName: sandlock
+      restartPolicy: Never
+      containers:
+        - name: test
+          image: busybox:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              echo "Job running in sandlock runtime"
+              # Verify we can do basic operations
+              ls /tmp
+              echo "42" > /tmp/test.txt
+              cat /tmp/test.txt
+              echo "job-complete"
+          resources:
+            limits:
+              memory: "32Mi"
+              cpu: "100m"
