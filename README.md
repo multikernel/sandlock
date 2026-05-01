@@ -284,7 +284,7 @@ positive int = deny with errno, `"audit"`/`-2` = allow + flag.
 **Event fields:** `syscall`, `category` (file/network/process/memory),
 `pid`, `parent_pid`, `host`, `port`, `argv`, `denied`.
 
-> **TOCTOU note (issue #27).** Per `seccomp_unotify(2)`, the kernel
+> **TOCTOU NOTE ** Per `seccomp_unotify(2)`, the kernel
 > re-reads user-memory pointers after `Continue`. Sandlock handles this
 > in two places:
 >
