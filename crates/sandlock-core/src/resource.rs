@@ -1,4 +1,15 @@
 // Resource limit handlers — memory and process limit enforcement.
+//
+// Continue safety (issue #27): every `Continue` in this module is safe.
+// All decisions here are on scalar register args (clone flags, mmap len,
+// brk address, etc.) which are copied into the seccomp_notif struct at
+// notification time — they are *not* pointers into racy user memory.
+// The kernel's re-read of the syscall args after Continue comes from the
+// suspended calling thread's saved registers, which a sibling thread
+// cannot mutate. So even though we return Continue after taking a
+// security-relevant action (e.g., counting an allocation against the
+// memory limit), there is no TOCTOU substitution window for the values
+// we examined.
 
 use std::sync::Arc;
 use tokio::sync::Mutex;

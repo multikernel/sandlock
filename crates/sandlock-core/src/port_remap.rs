@@ -3,6 +3,18 @@
 // Intercepts bind and getsockname syscalls to track and remap ports.
 // When a sandbox binds to a port that conflicts with another sandbox,
 // the supervisor can transparently remap it to an available port.
+//
+// Continue safety (issue #27):
+//   - handle_bind performs the bind on-behalf via pidfd_getfd (kernel
+//     object, not racy user-memory string) and returns ReturnValue/Errno.
+//     No security decision returns Continue.
+//   - handle_getsockname returns Continue at the end so the kernel
+//     performs the real getsockname; the supervisor only translates the
+//     port number afterwards. The remaining Continues guard early-exit
+//     conditions (NULL pointers, undersized addrlen, read failures).
+//     None of these involve approving access based on user-memory
+//     contents — port-remap is naming, not authorization. Network
+//     allowlisting lives in network.rs and is on-behalf there.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};

@@ -2,6 +2,42 @@
 //!
 //! Intercepts path-resolving syscalls, rewrites paths via the resolve module,
 //! and performs on-behalf operations. Composes with COW when active.
+//!
+//! # Continue safety (issue #27)
+//!
+//! Per `seccomp_unotify(2)`, returning `Continue` lets the kernel re-read
+//! user-memory pointers after the supervisor's decision, which is racy in a
+//! multi-threaded child. The handlers in this module fall into four
+//! categories:
+//!
+//! 1. **On-behalf with injected fd** (handle_chroot_open's primary path):
+//!    the supervisor opens via `openat2(RESOLVE_IN_ROOT)` and returns
+//!    `InjectFdSend` — the kernel does not re-read the path string at all.
+//!    TOCTOU-safe.
+//!
+//! 2. **On-behalf result writes** (stat/statx/readlink/getcwd/statfs):
+//!    the supervisor performs the underlying syscall against the
+//!    chroot-resolved host path and writes the result into the child's
+//!    output buffer. The decision returned is `ReturnValue`/`Errno`,
+//!    not `Continue` — TOCTOU-safe.
+//!
+//! 3. **Soft fall-through on read failure**: many handlers `return
+//!    Continue` if `read_path` or `write_child_mem` fails. The kernel's
+//!    own re-read will fail the same way and the syscall surfaces an
+//!    EFAULT/-style error to the child. No security decision was made
+//!    on contents we couldn't read, so this is safe.
+//!
+//! 4. **Path-rewrite-then-Continue** (handle_chroot_exec, handle_chroot_chdir):
+//!    the supervisor rewrites `path_ptr` to `/proc/self/fd/N` and returns
+//!    `Continue` because the kernel must execute the syscall (execve
+//!    replaces the address space; chdir requires the kernel's per-task
+//!    fs_struct update). The TOCTOU window is real here — a racing
+//!    sibling thread can substitute a different path string between our
+//!    write and the kernel's read. The bound is Landlock: a racing path
+//!    is still subject to `landlock_restrict_self`. See per-site comments
+//!    in `handle_chroot_exec` and `handle_chroot_chdir`. The planned
+//!    mitigation is opt-in `CLONE_THREAD` deny in the BPF filter, which
+//!    eliminates the racer entirely.
 
 use std::ffi::CString;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -1322,6 +1358,18 @@ pub(crate) async fn handle_chroot_chdir(
         return NotifAction::Errno(libc::EFAULT);
     }
 
+    // KNOWN TOCTOU LIMITATION (issue #27, same class as case 2):
+    //
+    // We've written "/proc/self/fd/N" into the child's path_ptr and
+    // returned Continue.  The kernel will re-read path_ptr to perform
+    // the actual chdir.  A multi-threaded child can race this read
+    // and substitute a different path.
+    //
+    // chdir cannot be on-behalf'd: the kernel must update the calling
+    // task's fs_struct (per-task cwd), which the supervisor cannot do
+    // for the child.  The race window is bounded by Landlock — a
+    // racing path is still subject to landlock_restrict_self.  The
+    // planned mitigation is opt-in CLONE_THREAD deny.
     NotifAction::Continue
 }
 

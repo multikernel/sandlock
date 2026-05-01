@@ -1,6 +1,13 @@
 // Deterministic random handler — intercepts getrandom() syscall and reads
 // from /dev/urandom or /dev/random, returning seeded PRNG bytes instead of
 // kernel-provided random bytes.
+//
+// Continue safety (issue #27): every `Continue` here is a fallback when
+// the supervisor cannot provide deterministic bytes (memfd_create failed,
+// write_child_mem failed). Falling through means the child gets real
+// kernel entropy instead of our seeded stream — a determinism failure,
+// not a security failure. No access-control decision is being made on
+// user-memory contents, so the seccomp_unotify TOCTOU class doesn't apply.
 
 use rand::RngCore;
 use rand_chacha::ChaCha8Rng;
