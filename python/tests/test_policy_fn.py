@@ -43,20 +43,24 @@ class TestSyscallEvent:
 
     def test_defaults(self):
         e = SyscallEvent(syscall="clone", category="process", pid=1)
-        assert e.path is None
         assert e.host is None
         assert e.port == 0
         assert e.parent_pid == 0
+        assert e.argv is None
         assert e.denied is False
 
-    def test_path_contains(self):
-        e = SyscallEvent(syscall="openat", category="file", pid=1, path="/usr/bin/python3")
-        assert e.path_contains("python")
-        assert not e.path_contains("ruby")
+    def test_argv_contains(self):
+        e = SyscallEvent(
+            syscall="execve", category="process", pid=1,
+            argv=("python3", "-c", "print(1)"),
+        )
+        assert e.argv_contains("python3")
+        assert e.argv_contains("-c")
+        assert not e.argv_contains("ruby")
 
-    def test_path_contains_none(self):
-        e = SyscallEvent(syscall="clone", category="process", pid=1)
-        assert not e.path_contains("anything")
+    def test_argv_contains_none(self):
+        e = SyscallEvent(syscall="openat", category="file", pid=1)
+        assert not e.argv_contains("anything")
 
 
 # ---------------------------------------------------------------------------

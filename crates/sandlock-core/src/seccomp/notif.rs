@@ -729,15 +729,15 @@ fn read_sockaddr_for_event(notif: &SeccompNotif, addr: u64, len: usize, notif_fd
     (ip, if port > 0 { Some(port) } else { None })
 }
 
-/// Read argv (array of string pointers) from child memory for execve.
-/// execve(path, argv, envp): argv is a NULL-terminated array of char* pointers.
+/// Read argv (NULL-terminated array of char* in child memory) for execve.
+/// Capped at 64 entries × 256 bytes/entry as a safety bound.
 fn read_argv_for_event(notif: &SeccompNotif, argv_ptr: u64, notif_fd: RawFd) -> Option<Vec<String>> {
     if argv_ptr == 0 { return None; }
     let mut args = Vec::new();
     let ptr_size = std::mem::size_of::<u64>();
 
-    for i in 0..64 { // safety limit
-        let ptr_addr = argv_ptr + (i * ptr_size) as u64;
+    for i in 0..64u64 {
+        let ptr_addr = argv_ptr + i * ptr_size as u64;
         let ptr_bytes = read_child_mem(notif_fd, notif.id, notif.pid, ptr_addr, ptr_size).ok()?;
         let str_ptr = u64::from_ne_bytes(ptr_bytes[..8].try_into().ok()?);
         if str_ptr == 0 { break; } // NULL terminator
@@ -773,27 +773,34 @@ async fn emit_policy_event(
     let category = syscall_category(nr);
     let parent_pid = read_ppid(notif.pid);
 
-    // Extract metadata based on syscall type
-    let mut path = None;
+    // Extract metadata based on syscall type.
+    //
+    // Path strings are deliberately NOT extracted: the kernel re-reads
+    // user-memory pointers after Continue, so any path-string-based
+    // decision is racy (issue #27). Path-based access control belongs
+    // in static Landlock rules.
+    //
+    // argv IS extracted for execve/execveat: the supervisor freezes
+    // sibling threads before returning Continue (sibling_freeze module),
+    // so the post-Continue re-read sees the same memory we read here.
+    //
+    // Network fields are TOCTOU-safe because connect/sendto/bind are
+    // performed on-behalf via pidfd_getfd; the kernel never re-reads
+    // child memory for those syscalls.
     let mut host = None;
     let mut port = None;
     let mut size = None;
     let mut argv = None;
 
-    if nr == libc::SYS_openat || Some(nr) == arch::SYS_OPEN || nr == libc::SYS_execve || nr == libc::SYS_execveat {
-        // openat(dirfd, pathname, ...): args[1] = path ptr
-        // execve(pathname, argv, envp): args[0] = path ptr, args[1] = argv ptr
-        let path_ptr = if nr == libc::SYS_openat {
-            notif.data.args[1]
+    if nr == libc::SYS_execve || nr == libc::SYS_execveat {
+        // execve(pathname, argv, envp):       args[1] = argv ptr
+        // execveat(dirfd, pathname, argv, ..): args[2] = argv ptr
+        let argv_ptr = if nr == libc::SYS_execveat {
+            notif.data.args[2]
         } else {
-            notif.data.args[0]
+            notif.data.args[1]
         };
-        path = read_path_for_event(notif, path_ptr, notif_fd);
-
-        // Extract argv for execve/execveat
-        if nr == libc::SYS_execve || nr == libc::SYS_execveat {
-            argv = read_argv_for_event(notif, notif.data.args[1], notif_fd);
-        }
+        argv = read_argv_for_event(notif, argv_ptr, notif_fd);
     }
 
     if nr == libc::SYS_connect || nr == libc::SYS_sendto || nr == libc::SYS_bind {
@@ -815,7 +822,6 @@ async fn emit_policy_event(
         category,
         pid: notif.pid,
         parent_pid,
-        path,
         host,
         port,
         size,
@@ -908,6 +914,26 @@ async fn handle_notification(
             Verdict::Audit => { /* allow, but could log here */ }
             Verdict::Allow => {}
         }
+    }
+
+    // TOCTOU-close for execve (issue #27): freeze sibling threads of
+    // the calling tid before the kernel re-reads pathname/argv from
+    // child memory.  Cheap because the kernel's de_thread step in
+    // execve kills the siblings anyway — we're just stopping them
+    // moments earlier, closing the race window for the supervisor's
+    // argv inspection in policy_fn.
+    //
+    // Only relevant when we're sending Continue: a denial response
+    // (Errno) means the kernel never re-reads, so no freeze needed.
+    let nr = notif.data.nr as i64;
+    if matches!(action, NotifAction::Continue)
+        && crate::sibling_freeze::requires_freeze_on_continue(nr)
+    {
+        // Best-effort: on failure (e.g. YAMA blocks ptrace), the
+        // pre-existing Landlock bound on execve paths still applies,
+        // so the supervisor degrades to the prior safety story rather
+        // than refusing the syscall.
+        let _ = crate::sibling_freeze::freeze_siblings_for_execve(notif.pid as i32);
     }
 
     // Ignore error — child may have exited between recv and response.

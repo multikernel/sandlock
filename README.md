@@ -243,28 +243,29 @@ result = (
 ### Dynamic Policy (policy_fn)
 
 Inspect syscall events at runtime and adjust permissions on the fly.
-Each event includes rich metadata: path, host, port, argv, category,
-parent PID. The callback returns a verdict to allow, deny, or audit.
+Events carry syscall name, category, PID, network destination (for
+`connect`/`sendto`/`bind`), and `argv` (for `execve`). The callback
+returns a verdict to allow, deny, or audit.
 
 ```python
 from sandlock import Sandbox, Policy
 import errno
 
 def on_event(event, ctx):
-    # Block download tools
+    # Block download tools by argv
     if event.syscall == "execve" and event.argv_contains("curl"):
         return True  # deny
 
-    # Custom errno for sensitive files
-    if event.category == "file" and event.path_contains("/secret"):
+    # Deny connections to a specific IP
+    if event.syscall == "connect" and event.host == "10.0.0.5":
         return errno.EACCES
 
-    # Restrict network after setup phase
-    if event.syscall == "execve" and event.path_contains("untrusted"):
-        ctx.restrict_network([])
-        ctx.deny_path("/etc/shadow")
+    # Lock down once the program has finished starting up
+    if event.syscall == "execve":
+        ctx.restrict_network([])           # block all network
+        ctx.deny_path("/etc/shadow")       # dynamic fs deny
 
-    # Audit file access (allow but flag)
+    # Audit every file access (allow but flag)
     if event.category == "file":
         return "audit"
 
@@ -281,7 +282,22 @@ result = Sandbox(policy, policy_fn=on_event).run(["python3", "agent.py"])
 positive int = deny with errno, `"audit"`/`-2` = allow + flag.
 
 **Event fields:** `syscall`, `category` (file/network/process/memory),
-`pid`, `parent_pid`, `path`, `host`, `port`, `argv`, `denied`.
+`pid`, `parent_pid`, `host`, `port`, `argv`, `denied`.
+
+> **TOCTOU note (issue #27).** Per `seccomp_unotify(2)`, the kernel
+> re-reads user-memory pointers after `Continue`. Sandlock handles this
+> in two places:
+>
+> - **Path strings are not exposed on events.** Path-based access control
+>   belongs in static Landlock rules (`fs_readable` / `fs_writable` /
+>   `fs_denied`) — kernel-enforced and TOCTOU-immune. Use
+>   `ctx.deny_path()` for runtime additions.
+> - **`event.argv` is exposed and TOCTOU-safe.** Before returning
+>   `Continue` for an `execve`, the supervisor `PTRACE_SEIZE` +
+>   `PTRACE_INTERRUPT`s every sibling thread of the calling tid so the
+>   kernel's re-read happens with no other writer running. The pause
+>   has no observable cost: `execve`'s `de_thread` step kills sibling
+>   threads anyway.
 
 **Context methods:**
 - `ctx.restrict_network(ips)` / `ctx.grant_network(ips)` — network control

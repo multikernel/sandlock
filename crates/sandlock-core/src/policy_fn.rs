@@ -8,12 +8,24 @@
 //!     .fs_read("/usr").fs_read("/lib")
 //!     .net_allow_host("127.0.0.1")
 //!     .policy_fn(|event, ctx| {
-//!         if event.syscall == "execve" && event.path_contains("untrusted") {
-//!             ctx.restrict_network(&[]);  // block all network
+//!         if event.syscall == "connect" && event.host == Some("10.0.0.5".parse().unwrap()) {
+//!             return Verdict::Deny;
 //!         }
+//!         Verdict::Allow
 //!     })
 //!     .build()?;
 //! ```
+//!
+//! # TOCTOU and string-typed fields
+//!
+//! Path and argv strings the kernel will re-read after a `Continue`
+//! response (per `seccomp_unotify(2)`) are not exposed on this event.
+//! Path-based access control belongs in static Landlock rules
+//! (`fs_read`/`fs_write`/`fs_deny`), which the kernel enforces directly
+//! and which are not subject to user-memory races. Network fields
+//! (`host`, `port`) are TOCTOU-safe because the supervisor performs
+//! `connect`/`sendto`/`bind` on-behalf via `pidfd_getfd` and the kernel
+//! never re-reads child memory for those syscalls.
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -41,6 +53,26 @@ pub enum SyscallCategory {
 // ============================================================
 
 /// An intercepted syscall event observed by the seccomp supervisor.
+///
+/// # TOCTOU and string-typed fields
+///
+/// Path strings are deliberately absent. Per `seccomp_unotify(2)`, the
+/// kernel re-reads user-memory pointers after a `Continue` response, so
+/// any path-string-based decision is racy in a multi-threaded child.
+/// Path-based access control belongs in static Landlock rules
+/// (`fs_read` / `fs_write` / `fs_deny`); see issue #27.
+///
+/// `argv` *is* exposed for `execve`/`execveat` and is TOCTOU-safe by
+/// construction: before the supervisor returns `Continue` for an
+/// execve, it `PTRACE_SEIZE`+`PTRACE_INTERRUPT`s every sibling thread
+/// of the calling tid so the kernel's post-Continue re-read sees the
+/// same memory the supervisor inspected. Siblings are killed by the
+/// kernel during execve's `de_thread` step anyway, so the pause has
+/// no observable cost. See `crate::sibling_freeze`.
+///
+/// Network fields (`host`, `port`) are TOCTOU-safe because the
+/// supervisor performs `connect`/`sendto`/`bind` on-behalf via
+/// `pidfd_getfd` and the kernel never re-reads child memory for those.
 #[derive(Debug, Clone)]
 pub struct SyscallEvent {
     /// Syscall name (e.g., "connect", "openat", "execve", "clone").
@@ -51,27 +83,22 @@ pub struct SyscallEvent {
     pub pid: u32,
     /// Parent PID (read from /proc/{pid}/stat).
     pub parent_pid: Option<u32>,
-    /// Resolved filesystem path (for openat, execve, etc.).
-    pub path: Option<String>,
-    /// Destination IP address (for connect, sendto).
+    /// Destination IP address (for connect, sendto). TOCTOU-safe.
     pub host: Option<IpAddr>,
-    /// Destination port (for connect, sendto, bind).
+    /// Destination port (for connect, sendto, bind). TOCTOU-safe.
     pub port: Option<u16>,
     /// Size argument (for mmap, brk).
     pub size: Option<u64>,
-    /// Command arguments (for execve/execveat).
+    /// Command arguments for execve/execveat. TOCTOU-safe: sibling
+    /// threads are frozen before the kernel re-reads.
     pub argv: Option<Vec<String>>,
     /// Whether the supervisor denied this syscall.
     pub denied: bool,
 }
 
 impl SyscallEvent {
-    /// Check if the path contains a substring.
-    pub fn path_contains(&self, s: &str) -> bool {
-        self.path.as_ref().map_or(false, |p| p.contains(s))
-    }
-
-    /// Check if any argv element contains a substring.
+    /// Returns true if any argv element contains the given substring.
+    /// Only meaningful for execve/execveat events (where argv is populated).
     pub fn argv_contains(&self, s: &str) -> bool {
         self.argv.as_ref().map_or(false, |args| args.iter().any(|a| a.contains(s)))
     }
@@ -434,13 +461,12 @@ mod tests {
     }
 
     #[test]
-    fn test_event_path_contains() {
+    fn test_event_argv_contains() {
         let event = SyscallEvent {
             syscall: "execve".to_string(),
             category: SyscallCategory::Process,
             pid: 1,
             parent_pid: Some(0),
-            path: Some("/usr/bin/python3".to_string()),
             host: None,
             port: None,
             size: None,
@@ -451,7 +477,21 @@ mod tests {
         assert!(event.argv_contains("-c"));
         assert!(!event.argv_contains("ruby"));
         assert_eq!(event.category, SyscallCategory::Process);
-        assert!(event.path_contains("python"));
-        assert!(!event.path_contains("ruby"));
+    }
+
+    #[test]
+    fn test_event_argv_contains_none() {
+        let event = SyscallEvent {
+            syscall: "openat".to_string(),
+            category: SyscallCategory::File,
+            pid: 1,
+            parent_pid: None,
+            host: None,
+            port: None,
+            size: None,
+            argv: None,
+            denied: false,
+        };
+        assert!(!event.argv_contains("anything"));
     }
 }
