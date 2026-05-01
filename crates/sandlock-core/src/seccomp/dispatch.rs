@@ -884,7 +884,7 @@ mod extra_handler_tests {
             let order = Arc::clone(&order);
             table.register(
                 libc::SYS_openat,
-                Box::new(move |_n, _c, _f| {
+                Box::new(move |_notif, _ctx, _fd| {
                     let order = Arc::clone(&order);
                     Box::pin(async move {
                         order.lock().unwrap().push(tag);
@@ -924,7 +924,7 @@ mod extra_handler_tests {
         let order_builtin = Arc::clone(&order);
         table.register(
             libc::SYS_openat,
-            Box::new(move |_n, _c, _f| {
+            Box::new(move |_notif, _ctx, _fd| {
                 let order = Arc::clone(&order_builtin);
                 Box::pin(async move {
                     order.lock().unwrap().push(b'B');
@@ -938,7 +938,7 @@ mod extra_handler_tests {
         let order_extra = Arc::clone(&order);
         let extra = ExtraHandler::new(
             libc::SYS_openat,
-            Box::new(move |_n, _c, _f| {
+            Box::new(move |_notif, _ctx, _fd| {
                 let order = Arc::clone(&order_extra);
                 Box::pin(async move {
                     order.lock().unwrap().push(b'E');
@@ -977,7 +977,7 @@ mod extra_handler_tests {
         let calls_first = Arc::clone(&calls);
         table.register(
             libc::SYS_openat,
-            Box::new(move |_n, _c, _f| {
+            Box::new(move |_notif, _ctx, _fd| {
                 let calls = Arc::clone(&calls_first);
                 Box::pin(async move {
                     calls.fetch_add(1, Ordering::SeqCst);
@@ -990,7 +990,7 @@ mod extra_handler_tests {
         let calls_second = Arc::clone(&calls);
         table.register(
             libc::SYS_openat,
-            Box::new(move |_n, _c, _f| {
+            Box::new(move |_notif, _ctx, _fd| {
                 let calls = Arc::clone(&calls_second);
                 Box::pin(async move {
                     calls.fetch_add(1, Ordering::SeqCst);
@@ -1050,7 +1050,7 @@ mod extra_handler_tests {
             .build()
             .expect("policy builds");
         let handler: HandlerFn =
-            Box::new(|_n, _c, _f| Box::pin(async { NotifAction::Continue }));
+            Box::new(|_notif, _ctx, _fd| Box::pin(async { NotifAction::Continue }));
         let extras = vec![ExtraHandler::new(libc::SYS_mremap, handler)];
 
         let result = validate_extras_against_policy(&extras, &policy);
