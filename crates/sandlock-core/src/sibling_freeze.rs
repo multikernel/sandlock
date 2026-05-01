@@ -25,19 +25,23 @@
 //! during execve, and ptrace records associated with them are reaped
 //! by the kernel.
 //!
-//! # Failure modes
+//! # Failure modes (strict)
 //!
-//! - `PTRACE_SEIZE` returns `EPERM` if the supervisor lacks the right
-//!   to trace (YAMA `ptrace_scope` >= 2 with the supervisor not in the
-//!   child's parent chain). Sandlock's supervisor is always the parent,
-//!   so this is rare in practice but documented.
-//! - `PTRACE_SEIZE` returns `ESRCH` if the sibling already exited
-//!   between enumeration and seize. Treated as success (nothing to
-//!   freeze).
-//! - On any other failure, the supervisor returns Continue without the
-//!   freeze. The fallback is the existing Landlock bound on execve
-//!   paths (the racing thread can only swap to a Landlock-allowed
-//!   path), which was the pre-fix behavior.
+//! The freeze is an invariant: if the supervisor exposed argv to
+//! `policy_fn` and the callback returned Allow, the kernel must re-read
+//! the same memory the supervisor inspected. We refuse to silently
+//! degrade — if the freeze cannot be established, the supervisor
+//! denies the execve with `EPERM` rather than letting it proceed
+//! without TOCTOU protection.
+//!
+//! - `PTRACE_SEIZE` returns `ESRCH` for a sibling that exited between
+//!   enumeration and seize. Treated as success: there is no thread to
+//!   race.
+//! - Any other ptrace failure (YAMA `ptrace_scope` >= 2 outside the
+//!   parent chain, another tracer attached, kernel resource limits)
+//!   produces an error; siblings already frozen during the partial
+//!   attempt are detached so they resume normally; the caller fails
+//!   the syscall closed.
 
 use std::fs;
 use std::io;
@@ -69,28 +73,35 @@ fn list_siblings(caller_tid: i32) -> io::Result<Vec<i32>> {
 }
 
 /// `PTRACE_SEIZE` + `PTRACE_INTERRUPT` a single tid and wait for the
-/// resulting group-stop. Returns Ok(()) if the tid is now stopped (or
-/// has already exited — ESRCH is treated as success).
-fn seize_and_interrupt(tid: i32) -> io::Result<()> {
+/// resulting group-stop. Returns `Ok(true)` if the tid is now stopped,
+/// `Ok(false)` if the tid had already exited (ESRCH; nothing to do),
+/// or an error if ptrace refused.
+///
+/// On a partial-progress failure (PTRACE_SEIZE succeeded but
+/// PTRACE_INTERRUPT did not), the function detaches itself before
+/// returning so the caller doesn't have to track partial state.
+fn seize_and_interrupt(tid: i32) -> io::Result<bool> {
     let ret = unsafe {
         libc::ptrace(libc::PTRACE_SEIZE as libc::c_uint, tid, 0, 0)
     };
     if ret < 0 {
         let err = io::Error::last_os_error();
-        // ESRCH: tid already exited. Nothing to freeze.
         if err.raw_os_error() == Some(libc::ESRCH) {
-            return Ok(());
+            return Ok(false); // already exited — nothing to freeze
         }
         return Err(err);
     }
+    // PTRACE_SEIZE succeeded; from here, any error path must DETACH
+    // before returning so we don't leave the sibling traced-but-running.
 
     let ret = unsafe {
         libc::ptrace(libc::PTRACE_INTERRUPT as libc::c_uint, tid, 0, 0)
     };
     if ret < 0 {
         let err = io::Error::last_os_error();
+        let _ = unsafe { libc::ptrace(libc::PTRACE_DETACH, tid, 0, 0) };
         if err.raw_os_error() == Some(libc::ESRCH) {
-            return Ok(());
+            return Ok(false);
         }
         return Err(err);
     }
@@ -101,37 +112,44 @@ fn seize_and_interrupt(tid: i32) -> io::Result<()> {
     // traditional fork sense) and waitpid(2) by default ignores them.
     let mut status: i32 = 0;
     let _ = unsafe { libc::waitpid(tid, &mut status, libc::__WALL) };
-    Ok(())
+    Ok(true)
 }
 
-/// Freeze all sibling threads of `caller_tid` so the kernel's
-/// post-Continue re-read of execve arguments cannot race with sibling
-/// writes.
+/// Detach a previously-frozen sibling. Used to roll back partial
+/// progress when a later sibling refuses to be frozen.
+fn detach(tid: i32) {
+    let _ = unsafe { libc::ptrace(libc::PTRACE_DETACH, tid, 0, 0) };
+}
+
+/// Freeze all sibling threads of `caller_tid`.
 ///
-/// On success, returns the number of siblings frozen. On any failure
-/// (typically YAMA blocking ptrace), logs a warning and returns the
-/// underlying error — callers fall back to sending Continue without
-/// the freeze.
+/// Strict semantics: if any sibling refuses to be frozen, all
+/// successfully-frozen siblings are detached (so they resume normally)
+/// and the error is propagated. The caller is expected to deny the
+/// execve with EPERM, preserving the invariant that exposed argv is
+/// always TOCTOU-safe.
 ///
-/// The supervisor does not detach: siblings die during execve's
-/// `de_thread`, and the kernel reaps the ptrace state automatically.
+/// On success, returns the number of siblings frozen. The supervisor
+/// does not actively detach on the success path — siblings die during
+/// execve's `de_thread`, and the kernel reaps the ptrace state.
 pub(crate) fn freeze_siblings_for_execve(caller_tid: i32) -> io::Result<usize> {
     let siblings = list_siblings(caller_tid)?;
-    let mut frozen = 0;
-    for tid in &siblings {
-        if let Err(e) = seize_and_interrupt(*tid) {
-            // One sibling failed; we still want to keep the rest frozen
-            // for the duration of this syscall. Log and continue.
-            eprintln!(
-                "sandlock: sibling-freeze: PTRACE_SEIZE tid {} failed: {} \
-                 (execve TOCTOU window remains open for this thread)",
-                tid, e
-            );
-            continue;
+    let mut frozen: Vec<i32> = Vec::with_capacity(siblings.len());
+    for tid in siblings {
+        match seize_and_interrupt(tid) {
+            Ok(true) => frozen.push(tid),
+            Ok(false) => continue, // already exited — fine
+            Err(e) => {
+                // Roll back: detach everything we already froze so they
+                // resume normally, then fail.
+                for ftid in &frozen {
+                    detach(*ftid);
+                }
+                return Err(e);
+            }
         }
-        frozen += 1;
     }
-    Ok(frozen)
+    Ok(frozen.len())
 }
 
 /// Helper called from the dispatch hot path. Returns true if the

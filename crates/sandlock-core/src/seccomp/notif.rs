@@ -925,15 +925,22 @@ async fn handle_notification(
     //
     // Only relevant when we're sending Continue: a denial response
     // (Errno) means the kernel never re-reads, so no freeze needed.
+    //
+    // Strict on failure: if we cannot freeze the siblings, we cannot
+    // uphold the argv-safety invariant, so we deny the execve with
+    // EPERM rather than letting it through unprotected.
     let nr = notif.data.nr as i64;
     if matches!(action, NotifAction::Continue)
         && crate::sibling_freeze::requires_freeze_on_continue(nr)
     {
-        // Best-effort: on failure (e.g. YAMA blocks ptrace), the
-        // pre-existing Landlock bound on execve paths still applies,
-        // so the supervisor degrades to the prior safety story rather
-        // than refusing the syscall.
-        let _ = crate::sibling_freeze::freeze_siblings_for_execve(notif.pid as i32);
+        if let Err(e) = crate::sibling_freeze::freeze_siblings_for_execve(notif.pid as i32) {
+            eprintln!(
+                "sandlock: argv-safety freeze failed for pid {}: {} \
+                 — denying execve to preserve TOCTOU invariant",
+                notif.pid, e
+            );
+            action = NotifAction::Errno(libc::EPERM);
+        }
     }
 
     // Ignore error — child may have exited between recv and response.

@@ -297,7 +297,9 @@ positive int = deny with errno, `"audit"`/`-2` = allow + flag.
 >   `PTRACE_INTERRUPT`s every sibling thread of the calling tid so the
 >   kernel's re-read happens with no other writer running. The pause
 >   has no observable cost: `execve`'s `de_thread` step kills sibling
->   threads anyway.
+>   threads anyway. If the freeze cannot be established (e.g., YAMA
+>   blocks ptrace), the execve is denied with `EPERM` — the safety
+>   invariant is never silently relaxed.
 
 **Context methods:**
 - `ctx.restrict_network(ips)` / `ctx.grant_network(ips)` — network control
