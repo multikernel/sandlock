@@ -403,9 +403,16 @@ async fn sendmsg_on_behalf(
     // 1. Read full msghdr struct (56 bytes on x86_64):
     //   msg_name(8) + msg_namelen(4) + pad(4) + msg_iov(8) + msg_iovlen(8)
     //   + msg_control(8) + msg_controllen(8) + msg_flags(4) + pad(4)
+    //
+    // If we cannot read the msghdr, fail the syscall with EFAULT instead
+    // of falling through to Continue.  Continue would let the kernel
+    // re-read child memory and (for a racing thread that just remapped
+    // it back) potentially execute the sendmsg without the IP allowlist
+    // check this handler exists to enforce.  EFAULT matches what the
+    // kernel itself would return for an unreadable msghdr pointer.
     let msghdr_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, msghdr_ptr, 56) {
         Ok(b) if b.len() >= 56 => b,
-        _ => return NotifAction::Continue,
+        _ => return NotifAction::Errno(libc::EFAULT),
     };
 
     let msg_name_ptr = u64::from_ne_bytes(msghdr_bytes[0..8].try_into().unwrap());
@@ -546,11 +553,12 @@ async fn sendmsg_on_behalf(
 ///      moot.
 ///   3. The fall-through case below — only reachable if the BPF filter
 ///      mis-routes a syscall; the kernel handles it normally.
-/// One weak spot: sendmsg_on_behalf falls through to Continue when the
-/// supervisor cannot read the msghdr struct from child memory. A racing
-/// thread could in principle force this by remapping the address, but
-/// the kernel's own re-read would then EFAULT too. Tightening this to
-/// Errno(EFAULT) would be safer; see issue #27 follow-up.
+/// In sendmsg_on_behalf, the msghdr read failure path returns
+/// Errno(EFAULT) rather than Continue: a racing thread that briefly
+/// unmaps the msghdr could otherwise force a fall-through that lets the
+/// kernel execute sendmsg without the allowlist check. Sub-buffer read
+/// failures (sockaddr/iovec/control) already return Errno(EIO) and so
+/// don't bypass the check either.
 pub(crate) async fn handle_net(
     notif: &SeccompNotif,
     ctx: &Arc<SupervisorCtx>,
