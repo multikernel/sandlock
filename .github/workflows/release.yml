@@ -10,17 +10,22 @@ permissions:
   contents: read
 
 jobs:
-  # Build Rust binaries and shared library
-  # Pinned to ubuntu-22.04 (glibc 2.35) so release binaries run on older
-  # distros (Ubuntu 22.04+, Debian 12+, RHEL 9+). ubuntu-latest tracks the
-  # newest glibc and would exclude those hosts.
+  # Build Rust binaries and shared library.
+  # x86_64 is pinned to ubuntu-22.04 (glibc 2.35) so release binaries run on
+  # older distros (Ubuntu 22.04+, Debian 12+, RHEL 9+). aarch64 builds on
+  # ubuntu-24.04-arm (glibc 2.39) — the runner matches the rest of CI; older
+  # aarch64 distros can build from source until a 22.04-arm runner is wired in.
   build:
     name: Build (${{ matrix.target }})
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.runs-on }}
     strategy:
       fail-fast: false
       matrix:
-        target: [x86_64-unknown-linux-gnu]
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runs-on: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
@@ -69,10 +74,20 @@ jobs:
           name: sdist
           path: python/dist/*.tar.gz
 
-  # Build pre-compiled wheels so users don't need a Rust toolchain
+  # Build pre-compiled wheels so users don't need a Rust toolchain.
+  # Each arch builds natively (x86_64 on ubuntu-latest, aarch64 on the ARM
+  # runner) — avoids QEMU emulation, which is ~5–10× slower for Rust builds.
   wheels:
-    name: Build wheels
-    runs-on: ubuntu-latest
+    name: Build wheels (${{ matrix.arch }})
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runs-on: ubuntu-latest
+          - arch: aarch64
+            runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
@@ -83,7 +98,7 @@ jobs:
           output-dir: wheelhouse
         env:
           CIBW_BUILD: "cp310-manylinux* cp311-manylinux* cp312-manylinux* cp313-manylinux*"
-          CIBW_ARCHS_LINUX: x86_64
+          CIBW_ARCHS_LINUX: ${{ matrix.arch }}
           CIBW_BEFORE_ALL_LINUX: >
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y &&
             echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.bashrc
@@ -92,7 +107,7 @@ jobs:
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
-          name: wheels
+          name: wheels-${{ matrix.arch }}
           path: wheelhouse/*.whl
 
   # Test
@@ -158,8 +173,9 @@ jobs:
       - name: Download wheels
         uses: actions/download-artifact@v4
         with:
-          name: wheels
+          pattern: wheels-*
           path: dist/
+          merge-multiple: true
 
       - name: Publish to PyPI
         env:
