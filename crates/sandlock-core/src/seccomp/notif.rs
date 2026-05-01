@@ -2,7 +2,7 @@
 // notifications from the kernel, dispatches them to handler functions, and
 // sends responses.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::IpAddr;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -78,13 +78,52 @@ pub enum NotifAction {
 // NetworkPolicy — network access policy enum
 // ============================================================
 
+/// Per-IP port allowlist. `Any` is used by `policy_fn` IP-only
+/// overrides (legacy `restrict_network(ips)` API where the user
+/// restricts the destination IP set but not ports).
+#[derive(Debug, Clone)]
+pub enum PortAllow {
+    /// Any port permitted to this IP.
+    Any,
+    /// Only these ports permitted to this IP.
+    Specific(HashSet<u16>),
+}
+
 /// Global network policy for the sandbox.
 #[derive(Debug, Clone)]
 pub enum NetworkPolicy {
-    /// All IPs allowed (no net_allow_hosts configured).
+    /// No IP-level restriction (no `--net-allow` configured and no
+    /// `policy_fn` override). The Landlock direct path enforces ports.
     Unrestricted,
-    /// Only these IPs are allowed (from resolved net_allow_hosts).
-    AllowList(HashSet<IpAddr>),
+    /// Endpoint-level allowlist: a connection is permitted iff the
+    /// destination IP and port match at least one entry below.
+    AllowList {
+        /// Per-IP port rules. From `--net-allow host:ports` after
+        /// hostname resolution, or from `policy_fn` overrides.
+        per_ip: HashMap<IpAddr, PortAllow>,
+        /// Ports permitted for any IP (from `--net-allow :port` /
+        /// `*:port`).
+        any_ip_ports: HashSet<u16>,
+    },
+}
+
+impl NetworkPolicy {
+    /// True iff a connection to (ip, port) should be permitted.
+    pub fn allows(&self, ip: IpAddr, port: u16) -> bool {
+        match self {
+            NetworkPolicy::Unrestricted => true,
+            NetworkPolicy::AllowList { per_ip, any_ip_ports } => {
+                if any_ip_ports.contains(&port) {
+                    return true;
+                }
+                match per_ip.get(&ip) {
+                    Some(PortAllow::Any) => true,
+                    Some(PortAllow::Specific(s)) => s.contains(&port),
+                    None => false,
+                }
+            }
+        }
+    }
 }
 
 /// Check if a path-bearing notification targets a denied path.

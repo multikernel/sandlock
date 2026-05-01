@@ -70,10 +70,10 @@ pub fn confine_current_process(policy: &Policy) -> Result<(), SandlockError> {
 
     // Build a stripped policy with only Landlock-native fields that
     // confine_current_process supports: filesystem + IPC + signals.
-    // Network port rules are excluded — they require the full sandbox.
+    // Network rules are excluded — they require the full sandbox.
     let mut stripped = policy.clone();
     stripped.net_bind.clear();
-    stripped.net_connect.clear();
+    stripped.net_allow.clear();
 
     // Apply Landlock rules
     landlock::confine(&stripped)

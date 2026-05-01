@@ -142,22 +142,19 @@ class Policy:
     """Syscall names to allow (allowlist mode). Everything else is blocked.
     Stricter than deny_syscalls — unknown/new syscalls are denied by default."""
 
-    # Network — domain allowlist (seccomp notif /etc/hosts virtualization)
-    net_allow_hosts: Sequence[str] | None = None
-    """Allowed domain names.
+    # Network — endpoint allowlist (IP × port via seccomp on-behalf path)
+    net_allow: Sequence[str] = field(default_factory=list)
+    """Outbound TCP endpoint rules. Each entry is a string of the form:
 
-    * ``None`` (default) — unrestricted: the real ``/etc/hosts`` is visible
-      and DNS is not virtualized.
-    * ``[]`` (empty sequence) — deny all: ``/etc/hosts`` is virtualized to
-      an empty map and no hosts are resolvable.  Matches the empty-list =
-      deny-all convention of :attr:`net_bind` and :attr:`net_connect`.
-    * ``["example.com", ...]`` — allowlist: only these domains are
-      resolved (at sandbox creation time) and their IPs placed in the
-      allowlist.
+    * ``"host:port"`` — restrict to one host on one port (e.g. ``"api.openai.com:443"``)
+    * ``"host:port,port,..."`` — multiple ports for one host (e.g. ``"github.com:22,443"``)
+    * ``":port"`` or ``"*:port"`` — any IP on this port
 
-    Note: this field only controls host/DNS virtualization.  TCP-level
-    connectivity is still governed by :attr:`net_connect` / :attr:`net_bind`
-    (which default to empty = deny all)."""
+    Hostnames are resolved at sandbox-creation time and pinned via a
+    synthetic ``/etc/hosts``. Empty = deny all outbound TCP (Landlock
+    rejects on the direct path; no on-behalf path is enabled). HTTP
+    rules with concrete hosts auto-add a matching entry on
+    :attr:`http_ports`. See README "Network Model" for details."""
 
     no_coredump: bool = False
     """Disable core dumps and restrict /proc/pid access from other
@@ -167,10 +164,6 @@ class Policy:
     # Network (Landlock ABI v4+, TCP only)
     net_bind: Sequence[int | str] = field(default_factory=list)
     """TCP ports the sandbox may bind.  Empty = deny all.
-    Each entry is a port number or a ``"lo-hi"`` range string."""
-
-    net_connect: Sequence[int | str] = field(default_factory=list)
-    """TCP ports the sandbox may connect to.  Empty = deny all.
     Each entry is a port number or a ``"lo-hi"`` range string."""
 
     # Socket type restrictions (seccomp-enforced)
@@ -338,10 +331,6 @@ class Policy:
     def bind_ports(self) -> list[int]:
         """Return parsed bind port list, or empty if unrestricted."""
         return parse_ports(self.net_bind) if self.net_bind else []
-
-    def connect_ports(self) -> list[int]:
-        """Return parsed connect port list, or empty if unrestricted."""
-        return parse_ports(self.net_connect) if self.net_connect else []
 
     def memory_bytes(self) -> int | None:
         """Return max_memory as bytes, or None if unset."""

@@ -9,8 +9,7 @@ Example::
 
     policy = policy_for_tool(workspace="/tmp/work", capabilities={
         "fs_writable": ["/tmp/work"],
-        "net_connect": [443],
-        "net_allow_hosts": ["api.google.com"],
+        "net_allow": ["api.google.com:443"],
     })
 """
 
@@ -53,7 +52,7 @@ def policy_for_tool(
         capabilities: Grants keyed by Policy field name.  Common keys:
 
             - ``fs_writable: ["/tmp/workspace"]``
-            - ``net_allow_hosts: ["api.example.com"]``
+            - ``net_allow: ["api.example.com:443"]``
             - ``env: {"KEY": "value"}``
             - ``max_memory: "256M"``
 
@@ -70,7 +69,7 @@ def policy_for_tool(
             _PYTHON_PREFIX,
         ])),
         "net_bind": [],
-        "net_connect": [],
+        "net_allow": [],
         "no_raw_sockets": True,
         "no_udp": True,
         "clean_env": True,
@@ -80,10 +79,6 @@ def policy_for_tool(
         for key, value in capabilities.items():
             if key in _POLICY_FIELDS and key not in _ENFORCED:
                 kwargs[key] = value
-
-        # net_allow_hosts implies net_connect: [80, 443] unless explicit
-        if "net_allow_hosts" in capabilities and "net_connect" not in capabilities:
-            kwargs["net_connect"] = [80, 443]
 
     return Policy(**kwargs)
 

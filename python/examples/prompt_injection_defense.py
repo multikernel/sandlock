@@ -235,7 +235,7 @@ def demo_xoa_sandboxed(client: OpenAI, csv_path: str, exfil_port: int):
             "/usr", "/lib", "/lib64", "/etc", "/bin", "/sbin",
             "/dev", python_prefix,
         ] + python_paths)),
-        net_allow_hosts=["api.openai.com"],  # only OpenAI API
+        net_allow=["api.openai.com:443"],  # only OpenAI HTTPS
         clean_env=True,
         env={"OPENAI_API_KEY": os.environ["OPENAI_API_KEY"]},
         # NO workspace in fs_readable — planner cannot see data files
@@ -246,14 +246,14 @@ def demo_xoa_sandboxed(client: OpenAI, csv_path: str, exfil_port: int):
             workspace, "/usr", "/lib", "/lib64", "/etc",
             "/bin", "/sbin", python_prefix,
         ] + python_paths)),
-        net_connect=[],          # No network at all
+        net_allow=[],            # No network at all
         clean_env=True,
         env={"DATA_FILE": csv_path},
     )
 
     print("[pipeline] Running XOA: planner | executor")
-    print(f"  planner:  fs=no workspace   net=api.openai.com only")
-    print(f"  executor: fs=read workspace  net=BLOCKED (net_connect=[])")
+    print(f"  planner:  fs=no workspace   net=api.openai.com:443 only")
+    print(f"  executor: fs=read workspace  net=BLOCKED (net_allow=[])")
     print()
 
     # The planner script runs inside the sandbox: calls the LLM,
@@ -333,7 +333,7 @@ def demo_xoa_sandboxed(client: OpenAI, csv_path: str, exfil_port: int):
     print("  1. The LLM (planner) never saw the CSV contents,")
     print("     so the injection payload never reached the LLM.")
     print("  2. Even if the LLM *had* been tricked, the executor")
-    print("     sandbox has net_connect=[] — network is blocked")
+    print("     sandbox has net_allow=[] — network is blocked")
     print("     at the kernel level (Landlock + seccomp).")
     print("  3. This is not a filter or prompt guard — it's an")
     print("     architectural constraint that cannot be bypassed")

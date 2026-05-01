@@ -249,7 +249,7 @@ pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
         nrs.push(libc::SYS_shmget as u32);
     }
 
-    if policy.net_allow_hosts.is_some()
+    if !policy.net_allow.is_empty()
         || policy.policy_fn.is_some()
         || !policy.http_allow.is_empty()
         || !policy.http_deny.is_empty()
@@ -1027,7 +1027,7 @@ mod tests {
     #[test]
     fn test_notif_syscalls_net() {
         let policy = Policy::builder()
-            .net_allow_host("example.com")
+            .net_allow("example.com:443")
             .build()
             .unwrap();
         let nrs = notif_syscalls(&policy);

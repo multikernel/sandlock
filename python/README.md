@@ -62,9 +62,8 @@ Unset fields mean "no restriction" unless noted otherwise.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `net_allow_hosts` | `list[str] \| None` | `None` | Allowed domains. `None` = unrestricted; `[]` = deny all; `["host", ...]` = allowlist |
-| `net_bind` | `list[int \| str]` | `[]` | TCP ports the sandbox may bind (empty = unrestricted) |
-| `net_connect` | `list[int \| str]` | `[]` | TCP ports the sandbox may connect to (empty = unrestricted) |
+| `net_allow` | `list[str]` | `[]` | Outbound TCP endpoint rules. Each entry is `"host:port[,port,...]"`, `":port"`, or `"*:port"`. Empty = deny all. |
+| `net_bind` | `list[int \| str]` | `[]` | TCP ports the sandbox may bind (empty = deny all) |
 | `port_remap` | `bool` | `False` | Transparent TCP port virtualization |
 | `no_raw_sockets` | `bool` | `True` | Block raw IP sockets |
 | `no_udp` | `bool` | `False` | Block UDP sockets |
@@ -509,8 +508,7 @@ permissions explicitly:
 | Capability | Example | Description |
 |------------|---------|-------------|
 | `fs_writable` | `["/tmp/agent"]` | Paths the tool can write to |
-| `net_connect` | `[443]` | TCP ports the tool can connect to |
-| `net_allow_hosts` | `["api.example.com"]` | Allowed domains (implies ports 80, 443) |
+| `net_allow` | `["api.example.com:443"]` | Outbound TCP endpoints (`host:port`, `:port`, or `*:port`) |
 | `env` | `{"KEY": "val"}` | Environment variables to pass |
 | `max_memory` | `"256M"` | Memory limit |
 

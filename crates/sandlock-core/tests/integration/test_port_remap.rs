@@ -56,8 +56,7 @@ async fn test_port_remap_loopback() {
 
     let policy = base_policy()
         .net_bind_port(port)
-        .net_connect_port(port)
-        .net_allow_host("127.0.0.1")
+        .net_allow(format!("127.0.0.1:{}", port))
         .port_remap(true)
         .build()
         .unwrap();

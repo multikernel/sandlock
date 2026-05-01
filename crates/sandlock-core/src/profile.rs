@@ -51,11 +51,8 @@ pub fn parse_profile(content: &str) -> Result<Policy, SandlockError> {
     if let Some(paths) = sandbox.get("fs_denied").and_then(|v| v.as_array()) {
         for p in paths { if let Some(s) = p.as_str() { builder = builder.fs_deny(s); } }
     }
-    if let Some(hosts) = sandbox.get("net_allow_hosts").and_then(|v| v.as_array()) {
-        // Presence of the key enables host restriction, even if the array is
-        // empty (empty array = deny all, matching net_bind/net_connect semantics).
-        builder = builder.net_restrict_hosts();
-        for h in hosts { if let Some(s) = h.as_str() { builder = builder.net_allow_host(s); } }
+    if let Some(specs) = sandbox.get("net_allow").and_then(|v| v.as_array()) {
+        for s in specs { if let Some(spec) = s.as_str() { builder = builder.net_allow(spec); } }
     }
     if let Some(rules) = sandbox.get("http_allow").and_then(|v| v.as_array()) {
         for r in rules { if let Some(s) = r.as_str() { builder = builder.http_allow(s); } }
@@ -111,9 +108,6 @@ if let Some(v) = sandbox.get("clean_env").and_then(|v| v.as_bool()) {
     // Parse port arrays
     if let Some(ports) = sandbox.get("net_bind").and_then(|v| v.as_array()) {
         for p in ports { if let Some(n) = p.as_integer() { builder = builder.net_bind_port(n as u16); } }
-    }
-    if let Some(ports) = sandbox.get("net_connect").and_then(|v| v.as_array()) {
-        for p in ports { if let Some(n) = p.as_integer() { builder = builder.net_connect_port(n as u16); } }
     }
 
     // Parse syscall lists

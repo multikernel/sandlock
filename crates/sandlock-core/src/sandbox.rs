@@ -701,25 +701,17 @@ impl Sandbox {
         // 4. Create synchronization pipes
         let pipes = PipePair::new().map_err(SandboxError::Io)?;
 
-        // 4. Resolve net_allow_hosts to IPs + build virtual /etc/hosts
-        //
-        // Semantics:
-        //   None               -> unrestricted (no virtualization, no IP allowlist)
-        //   Some(empty)        -> deny all (empty virtual /etc/hosts, empty allowlist)
-        //   Some(nonempty)     -> resolve and allowlist
-        let (resolved_ips, virtual_etc_hosts) = match self.policy.net_allow_hosts.as_deref() {
-            None => (std::collections::HashSet::new(), None),
-            Some([]) => (
-                std::collections::HashSet::new(),
-                Some(String::new()),
-            ),
-            Some(hosts) => {
-                let resolved = network::resolve_hosts(hosts)
-                    .await
-                    .map_err(SandboxError::Io)?;
-                (resolved.ips, Some(resolved.etc_hosts))
-            }
-        };
+        // 4. Resolve --net-allow rules into the runtime endpoint allowlist.
+        // The resolved form contains:
+        //   - per_ip: HashMap<IpAddr, HashSet<u16>>  (concrete-host rules)
+        //   - any_ip_ports: HashSet<u16>             (`:port` rules)
+        //   - all_ports: HashSet<u16>                (union — for Landlock)
+        //   - etc_hosts: Option<String>              (synthetic when any
+        //                                             concrete host present)
+        let resolved_net_allow = network::resolve_net_allow(&self.policy.net_allow)
+            .await
+            .map_err(SandboxError::Io)?;
+        let virtual_etc_hosts = resolved_net_allow.etc_hosts.clone();
 
         // 5. Spawn HTTP ACL proxy if rules are configured
         if !self.policy.http_allow.is_empty() || !self.policy.http_deny.is_empty() {
@@ -913,7 +905,7 @@ impl Sandbox {
                 max_memory_bytes: self.policy.max_memory.map(|m| m.0).unwrap_or(0),
                 max_processes: self.policy.max_processes,
                 has_memory_limit: self.policy.max_memory.is_some(),
-                has_net_allowlist: self.policy.net_allow_hosts.is_some()
+                has_net_allowlist: !self.policy.net_allow.is_empty()
                     || self.policy.policy_fn.is_some()
                     || !self.policy.http_allow.is_empty()
                     || !self.policy.http_deny.is_empty(),
@@ -948,10 +940,19 @@ impl Sandbox {
 
             // NetworkState
             let mut net_state = NetworkState::new();
-            net_state.network_policy = if self.policy.net_allow_hosts.is_some() {
-                crate::seccomp::notif::NetworkPolicy::AllowList(resolved_ips)
-            } else {
+            net_state.network_policy = if self.policy.net_allow.is_empty() {
                 crate::seccomp::notif::NetworkPolicy::Unrestricted
+            } else {
+                use crate::seccomp::notif::PortAllow;
+                let per_ip = resolved_net_allow
+                    .per_ip
+                    .iter()
+                    .map(|(ip, ports)| (*ip, PortAllow::Specific(ports.clone())))
+                    .collect();
+                crate::seccomp::notif::NetworkPolicy::AllowList {
+                    per_ip,
+                    any_ip_ports: resolved_net_allow.any_ip_ports.clone(),
+                }
             };
             net_state.http_acl_addr = self.http_acl_handle.as_ref().map(|h| h.addr);
             net_state.http_acl_ports = self.policy.http_ports.iter().copied().collect();
@@ -992,11 +993,20 @@ impl Sandbox {
             }
 
             if let Some(ref callback) = self.policy.policy_fn {
+                // The dynamic-policy "live" view is IP-only — derive it
+                // from per_ip keys (each represents an IP that some
+                // endpoint rule mentions). The any_ip case has no IPs to
+                // expose to the callback.
+                let allowed_ips = match &net_state.network_policy {
+                    crate::seccomp::notif::NetworkPolicy::AllowList { per_ip, .. } => {
+                        per_ip.keys().copied().collect()
+                    }
+                    crate::seccomp::notif::NetworkPolicy::Unrestricted => {
+                        std::collections::HashSet::new()
+                    }
+                };
                 let live = crate::policy_fn::LivePolicy {
-                    allowed_ips: match &net_state.network_policy {
-                        crate::seccomp::notif::NetworkPolicy::AllowList(ips) => ips.clone(),
-                        crate::seccomp::notif::NetworkPolicy::Unrestricted => std::collections::HashSet::new(),
-                    },
+                    allowed_ips,
                     max_memory_bytes: notif_policy.max_memory_bytes,
                     max_processes: notif_policy.max_processes,
                 };

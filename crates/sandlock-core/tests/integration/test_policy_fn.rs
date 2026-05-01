@@ -49,7 +49,7 @@ async fn test_policy_fn_deny_connect() {
     let out = temp_file("deny-connect");
 
     let policy = base_policy()
-        .net_allow_host("127.0.0.1")
+        .net_allow("127.0.0.1:443")
         .policy_fn(move |event, _ctx| {
             // Deny all connect attempts
             if event.syscall == "connect" {
@@ -87,7 +87,7 @@ async fn test_policy_fn_restrict_network_takes_effect() {
     let out = temp_file("restrict-net-effect");
 
     let policy = base_policy()
-        .net_allow_host("127.0.0.1")
+        .net_allow("127.0.0.1:443")
         .policy_fn(move |event, ctx| {
             if event.syscall == "execve" {
                 ctx.restrict_network(&[]); // block all
@@ -238,7 +238,7 @@ async fn test_policy_fn_connect_metadata() {
     let events_clone = events.clone();
 
     let policy = base_policy()
-        .net_allow_host("127.0.0.1")
+        .net_allow("127.0.0.1:443")
         .policy_fn(move |event, _ctx| {
             if event.syscall == "connect" {
                 events_clone.lock().unwrap().push((event.host, event.port));
@@ -274,7 +274,7 @@ async fn test_policy_fn_event_categories() {
     let cats_clone = categories.clone();
 
     let policy = base_policy()
-        .net_allow_host("127.0.0.1")
+        .net_allow("127.0.0.1:443")
         .policy_fn(move |event, _ctx| {
             cats_clone.lock().unwrap().push((event.syscall.clone(), event.category));
             Verdict::Allow
@@ -338,7 +338,7 @@ async fn test_policy_fn_deny_with_eacces() {
     let out = temp_file("deny-eacces");
 
     let policy = base_policy()
-        .net_allow_host("127.0.0.1")
+        .net_allow("127.0.0.1:443")
         .policy_fn(move |event, _ctx| {
             if event.syscall == "connect" {
                 return Verdict::DenyWith(libc::EACCES);

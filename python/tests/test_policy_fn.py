@@ -134,7 +134,7 @@ class TestPolicyFnRestrict:
                 ctx.restrict_network([])
 
         result = Sandbox(
-            _policy(net_allow_hosts=["127.0.0.1"]),
+            _policy(net_allow=["127.0.0.1:443"]),
             policy_fn=on_event,
         ).run(["python3", "-c", "print('restricted')"])
         assert result.success
@@ -180,7 +180,7 @@ class TestPolicyFnVerdict:
             return 0
 
         result = Sandbox(
-            _policy(net_allow_hosts=["127.0.0.1"]),
+            _policy(net_allow=["127.0.0.1:443"]),
             policy_fn=on_event,
         ).run(["python3", "-c",
             f"import socket\n"
@@ -218,7 +218,7 @@ class TestPolicyFnVerdict:
             return False
 
         result = Sandbox(
-            _policy(net_allow_hosts=["127.0.0.1"]),
+            _policy(net_allow=["127.0.0.1:443"]),
             policy_fn=on_event,
         ).run(["python3", "-c",
             "import socket; s=socket.socket(); s.settimeout(0.5); "
@@ -262,6 +262,6 @@ class TestPolicyFnPerPid:
                 ctx.restrict_pid_network(event.pid, ["127.0.0.1"])
 
         result = Sandbox(
-            _policy(net_allow_hosts=["127.0.0.1"]),
+            _policy(net_allow=["127.0.0.1:443"]),
             policy_fn=on_event,
         ).run(["echo", "ok"])

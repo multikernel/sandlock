@@ -26,12 +26,27 @@ fn test_builder_fs_paths() {
 fn test_builder_network() {
     let policy = Policy::builder()
         .net_bind_port(8080)
-        .net_connect_port(443)
-        .net_connect_port(80)
+        .net_allow("api.example.com:443,80")
         .build()
         .unwrap();
     assert_eq!(policy.net_bind, vec![8080]);
-    assert_eq!(policy.net_connect, vec![443, 80]);
+    assert_eq!(policy.net_allow.len(), 1);
+    let rule = &policy.net_allow[0];
+    assert_eq!(rule.host.as_deref(), Some("api.example.com"));
+    assert_eq!(rule.ports, vec![443, 80]);
+}
+
+#[test]
+fn test_net_allow_parse_grammar() {
+    use sandlock_core::policy::NetAllow;
+    assert!(NetAllow::parse("foo.com:443").is_ok());
+    assert!(NetAllow::parse("foo.com:22,443").is_ok());
+    assert!(NetAllow::parse(":8080").is_ok());
+    assert!(NetAllow::parse("*:8080").is_ok());
+    assert!(NetAllow::parse("foo.com").is_err()); // missing port
+    assert!(NetAllow::parse("foo.com:abc").is_err()); // bad port
+    assert!(NetAllow::parse("foo.com:0").is_err()); // port 0 reserved
+    assert!(NetAllow::parse("foo.com:").is_err()); // empty port list
 }
 
 #[test]
