@@ -1026,4 +1026,38 @@ mod extra_handler_tests {
         }
         assert_eq!(handler_count, 0, "empty extras registers zero handlers");
     }
+
+    /// `validate_extras_against_policy` must reject extras whose syscall is in
+    /// the policy's user-specified `deny_syscalls` list, with the same
+    /// rationale as DEFAULT_DENY: the BPF program emits notif JEQs before
+    /// deny JEQs, so a user handler returning `Continue` would translate into
+    /// `SECCOMP_USER_NOTIF_FLAG_CONTINUE` and silently bypass the kernel-level
+    /// deny.
+    ///
+    /// Uses `mremap` because it is in `syscall_name_to_nr` but not in
+    /// `DEFAULT_DENY_SYSCALLS` — putting it into `deny_syscalls` is the only
+    /// way it ends up on the deny list, so the test isolates the user-supplied
+    /// path of `deny_syscall_numbers` from the default branch covered by
+    /// `extra_handler_on_default_deny_syscall_is_rejected`.
+    ///
+    /// Pure-logic counterpart to the integration test of the same name —
+    /// runs without a live sandbox so the contract is enforced even on
+    /// hosts where seccomp integration tests are skipped.
+    #[test]
+    fn validate_extras_rejects_user_specified_deny() {
+        let policy = crate::policy::Policy::builder()
+            .deny_syscalls(vec!["mremap".into()])
+            .build()
+            .expect("policy builds");
+        let handler: HandlerFn =
+            Box::new(|_n, _c, _f| Box::pin(async { NotifAction::Continue }));
+        let extras = vec![ExtraHandler::new(libc::SYS_mremap, handler)];
+
+        let result = validate_extras_against_policy(&extras, &policy);
+        assert_eq!(
+            result,
+            Err(libc::SYS_mremap as u32),
+            "extras on user-specified deny must be rejected, naming the offending syscall"
+        );
+    }
 }
