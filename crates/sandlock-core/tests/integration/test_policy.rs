@@ -127,9 +127,9 @@ fn test_env_var() {
 }
 
 #[test]
-fn test_no_udp_default_false() {
+fn test_no_udp_default_true() {
     let p = Policy::builder().build().unwrap();
-    assert!(!p.no_udp, "no_udp should default to false");
+    assert!(p.no_udp, "UDP is denied by default; opt in via .no_udp(false)");
 }
 
 #[test]

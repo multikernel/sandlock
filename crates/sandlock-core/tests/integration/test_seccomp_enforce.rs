@@ -221,11 +221,11 @@ async fn test_udp_blocked_when_enabled() {
 }
 
 // ------------------------------------------------------------------
-// 6. UDP allowed by default (no no_udp flag)
+// 6. UDP denied by default; opt in via no_udp(false)
 // ------------------------------------------------------------------
 #[tokio::test]
-async fn test_udp_allowed_by_default() {
-    let out = temp_out("udp-allowed");
+async fn test_udp_denied_by_default() {
+    let out = temp_out("udp-denied");
     let script = format!(concat!(
         "import socket\n",
         "try:\n",
@@ -248,8 +248,8 @@ async fn test_udp_allowed_by_default() {
     let _ = std::fs::remove_file(&out);
     assert_eq!(
         contents.trim(),
-        "ALLOWED",
-        "UDP socket should be allowed by default, got: {}",
+        "BLOCKED",
+        "UDP should be denied by default; got: {}",
         contents.trim()
     );
     assert!(result.success());

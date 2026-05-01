@@ -67,12 +67,16 @@ enum Command {
         fs_storage: Option<String>,
         #[arg(long = "max-disk")]
         max_disk: Option<String>,
-        /// Enable a non-TCP protocol. Currently: `icmp` (allows raw sockets).
-        #[arg(long = "net-allow-proto", value_name = "PROTO")]
-        net_allow_proto: Vec<String>,
-        /// Disable a non-TCP protocol. Currently: `raw` (raw sockets), `udp`.
-        #[arg(long = "net-deny-proto", value_name = "PROTO")]
-        net_deny_proto: Vec<String>,
+        /// Allow UDP socket creation. UDP is denied by default; this
+        /// turns it back on. Outbound UDP destinations are still
+        /// gated by `--net-allow` (the same endpoint allowlist used
+        /// for TCP).
+        #[arg(long = "allow-udp")]
+        allow_udp: bool,
+        /// Allow raw IP sockets (e.g. for ICMP / ping). Raw sockets
+        /// are denied by default.
+        #[arg(long = "allow-icmp")]
+        allow_icmp: bool,
         #[arg(long = "http-allow", value_name = "RULE")]
         http_allow: Vec<String>,
         #[arg(long = "http-deny", value_name = "RULE")]
@@ -170,7 +174,7 @@ async fn main() -> Result<()> {
             net_allow, net_bind, time_start, random_seed,
             clean_env, num_cpus, profile: profile_name, status_fd,
             max_cpu, max_open_files, chroot, uid, workdir, cwd,
-            fs_isolation, fs_storage, max_disk, net_allow_proto, net_deny_proto,
+            fs_isolation, fs_storage, max_disk, allow_udp, allow_icmp,
             http_allow, http_deny, http_ports, https_ca, https_key,
             port_remap, no_randomize_memory, no_huge_pages, deterministic_dirs, name, no_coredump,
             env_vars, exec_shell, interactive: _, fs_deny, fs_mount, cpu_cores, gpu_devices, image, dry_run, no_supervisor, cmd } =>
@@ -179,7 +183,7 @@ async fn main() -> Result<()> {
                 validate_no_supervisor(
                     &max_memory, &max_processes, &max_cpu, &max_open_files,
                     &timeout, &net_allow, &net_bind,
-                    &net_allow_proto, &net_deny_proto, &http_allow, &http_deny, &http_ports,
+                    allow_udp, allow_icmp, &http_allow, &http_deny, &http_ports,
                     &num_cpus, &random_seed, &time_start, no_randomize_memory,
                     no_huge_pages, deterministic_dirs, &name, &chroot,
                     &image, &uid, &workdir, &cwd, &fs_isolation, &fs_storage,
@@ -310,19 +314,8 @@ async fn main() -> Result<()> {
             }
             if let Some(ref path) = fs_storage { builder = builder.fs_storage(path); }
             if let Some(ref s) = max_disk { builder = builder.max_disk(ByteSize::parse(s)?); }
-            for proto in &net_allow_proto {
-                match proto.as_str() {
-                    "icmp" => { builder = builder.no_raw_sockets(false); }
-                    other => return Err(anyhow!("unknown --net-allow-proto: {}", other)),
-                }
-            }
-            for proto in &net_deny_proto {
-                match proto.as_str() {
-                    "raw" => { builder = builder.no_raw_sockets(true); }
-                    "udp" => { builder = builder.no_udp(true); }
-                    other => return Err(anyhow!("unknown --net-deny-proto: {}", other)),
-                }
-            }
+            if allow_udp { builder = builder.no_udp(false); }
+            if allow_icmp { builder = builder.no_raw_sockets(false); }
             for rule in &http_allow { builder = builder.http_allow(rule); }
             for rule in &http_deny { builder = builder.http_deny(rule); }
             for port in &http_ports { builder = builder.http_port(*port); }
@@ -592,8 +585,8 @@ fn validate_no_supervisor(
     timeout: &Option<u64>,
     net_allow: &[String],
     net_bind: &[u16],
-    net_allow_proto: &[String],
-    net_deny_proto: &[String],
+    allow_udp: bool,
+    allow_icmp: bool,
     http_allow: &[String],
     http_deny: &[String],
     http_ports: &[u16],
@@ -629,8 +622,8 @@ fn validate_no_supervisor(
     if timeout.is_some() { bad.push("--timeout"); }
     if !net_allow.is_empty() { bad.push("--net-allow"); }
     if !net_bind.is_empty() { bad.push("--net-bind"); }
-    if !net_allow_proto.is_empty() { bad.push("--net-allow-proto"); }
-    if !net_deny_proto.is_empty() { bad.push("--net-deny-proto"); }
+    if allow_udp { bad.push("--allow-udp"); }
+    if allow_icmp { bad.push("--allow-icmp"); }
     if !http_allow.is_empty() { bad.push("--http-allow"); }
     if !http_deny.is_empty() { bad.push("--http-deny"); }
     if !http_ports.is_empty() { bad.push("--http-port"); }

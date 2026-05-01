@@ -418,7 +418,7 @@ pub struct PolicyBuilder {
     net_allow: Vec<String>,
     net_bind: Vec<u16>,
     no_raw_sockets: Option<bool>,
-    no_udp: bool,
+    no_udp: Option<bool>,
 
     http_allow: Vec<String>,
     http_deny: Vec<String>,
@@ -521,7 +521,7 @@ impl PolicyBuilder {
     }
 
     pub fn no_udp(mut self, v: bool) -> Self {
-        self.no_udp = v;
+        self.no_udp = Some(v);
         self
     }
 
@@ -790,7 +790,7 @@ impl PolicyBuilder {
             net_allow,
             net_bind: self.net_bind,
             no_raw_sockets: self.no_raw_sockets.unwrap_or(true),
-            no_udp: self.no_udp,
+            no_udp: self.no_udp.unwrap_or(true),
             http_allow,
             http_deny,
             http_ports,

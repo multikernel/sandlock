@@ -552,9 +552,16 @@ no content inspection.
 governs server-side `bind()`. Landlock enforces it; `--port-remap` adds
 on-behalf virtualization for binding.
 
-**UDP, raw, unix.** Governed separately: `no_udp`, `no_raw_sockets`,
-and Landlock's `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`. The TCP model
-above does not apply to them.
+**UDP, ICMP, unix.** Default-deny, opt in via dedicated flags:
+
+  * `--allow-udp` enables UDP socket creation. Outbound UDP
+    destinations are then gated by the same `--net-allow` allowlist
+    used for TCP — the seccomp on-behalf path also covers `sendto` /
+    `sendmsg`.
+  * `--allow-icmp` enables raw IP sockets (needed for `ping` and other
+    ICMP tools).
+  * AF_UNIX sockets are governed by Landlock's
+    `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`.
 
 ### Port Virtualization
 
@@ -629,8 +636,8 @@ Policy(
     https_key="ca-key.pem",        # CA key for HTTPS MITM
 
     # Socket restrictions
-    no_raw_sockets=True,           # Block SOCK_RAW (default)
-    no_udp=False,                  # Block SOCK_DGRAM
+    no_raw_sockets=True,           # Block SOCK_RAW (default; CLI: --allow-icmp to flip)
+    no_udp=True,                   # Block SOCK_DGRAM (default; CLI: --allow-udp to flip)
 
     # Resources
     max_memory="512M",             # Memory limit

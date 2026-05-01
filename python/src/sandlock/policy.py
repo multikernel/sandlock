@@ -172,10 +172,13 @@ class Policy:
     allow packet sniffing and ICMP crafting — almost never needed by
     sandboxed programs.  Enforced via seccomp BPF."""
 
-    no_udp: bool = False
-    """Block UDP sockets (SOCK_DGRAM on AF_INET/AF_INET6).  Only affects
-    IP-family sockets — AF_UNIX datagrams are unaffected.  Useful when
-    only TCP connectivity is desired.  Enforced via seccomp BPF."""
+    no_udp: bool = True
+    """Block UDP sockets (SOCK_DGRAM on AF_INET/AF_INET6). Default deny
+    matches the deny-by-default posture of every other protocol; flip
+    to ``False`` (CLI: ``--allow-udp``) to enable UDP. Outbound UDP
+    destinations are still gated by :attr:`net_allow` — same endpoint
+    allowlist used for TCP. AF_UNIX datagrams are unaffected.
+    Enforced via seccomp BPF."""
 
     # HTTP ACL
     http_allow: Sequence[str] = field(default_factory=list)
