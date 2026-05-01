@@ -17,15 +17,12 @@ fn base_policy() -> sandlock_core::PolicyBuilder {
 /// Test that the policy callback receives events with metadata.
 #[tokio::test]
 async fn test_policy_fn_receives_events_with_metadata() {
-    let events: Arc<Mutex<Vec<(String, Option<String>)>>> = Arc::new(Mutex::new(Vec::new()));
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let events_clone = events.clone();
 
     let policy = base_policy()
         .policy_fn(move |event, _ctx| {
-            events_clone.lock().unwrap().push((
-                event.syscall.clone(),
-                event.path.clone(),
-            ));
+            events_clone.lock().unwrap().push(event.syscall.clone());
             Verdict::Allow
         })
         .build()
@@ -39,9 +36,11 @@ async fn test_policy_fn_receives_events_with_metadata() {
     let captured = events.lock().unwrap();
     assert!(!captured.is_empty(), "should receive events");
 
-    // Should have at least one openat with a path
-    let has_path = captured.iter().any(|(name, path)| name == "openat" && path.is_some());
-    assert!(has_path, "openat events should include path, got: {:?}", &captured[..captured.len().min(5)]);
+    // Should have at least one openat (file syscall) and one execve.
+    assert!(captured.iter().any(|n| n == "openat"),
+        "should include openat, got: {:?}", &captured[..captured.len().min(5)]);
+    assert!(captured.iter().any(|n| n == "execve"),
+        "should include execve, got: {:?}", &captured[..captured.len().min(5)]);
 }
 
 /// Test that Verdict::Deny blocks a connect syscall.
@@ -181,7 +180,7 @@ async fn test_policy_fn_passthrough() {
     assert!(count > 0, "callback should have been called at least once, got {}", count);
 }
 
-/// Test execve events include argv.
+/// Test execve events include argv (TOCTOU-safe via sibling freeze).
 #[tokio::test]
 async fn test_policy_fn_execve_argv() {
     let argvs: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -206,19 +205,17 @@ async fn test_policy_fn_execve_argv() {
 
     let captured = argvs.lock().unwrap();
     assert!(!captured.is_empty(), "should have captured execve argv");
-    // At least one argv should contain "python3"
     let has_python = captured.iter().any(|args| args.iter().any(|a| a.contains("python3")));
     assert!(has_python, "argv should contain python3, got: {:?}", *captured);
 }
 
-/// Test argv_contains helper.
+/// Test argv_contains-based denial. The supervisor freezes sibling
+/// threads of the calling tid before Continue, so the policy_fn's
+/// argv inspection binds to what the kernel will run.
 #[tokio::test]
 async fn test_policy_fn_deny_by_argv() {
-    let _out = temp_file("deny-argv");
-
     let policy = base_policy()
         .policy_fn(move |event, _ctx| {
-            // Deny execve if argv contains "malicious"
             if event.syscall == "execve" && event.argv_contains("malicious") {
                 return Verdict::Deny;
             }
@@ -227,11 +224,9 @@ async fn test_policy_fn_deny_by_argv() {
         .build()
         .unwrap();
 
-    // Run something with "malicious" in argv — should be denied
     let result = Sandbox::run_interactive(
         &policy, &["echo", "malicious"],
     ).await.unwrap();
-    // echo's execve has "malicious" in argv[1], should be denied
     assert!(!result.success(), "execve with 'malicious' in argv should be denied");
 }
 
@@ -376,41 +371,6 @@ async fn test_policy_fn_deny_with_eacces() {
     let _ = std::fs::remove_file(&out);
 }
 
-/// Test Verdict::DenyWith(ENOENT) on openat.
-#[tokio::test]
-async fn test_policy_fn_deny_with_enoent() {
-    let out = temp_file("deny-enoent");
-
-    let policy = base_policy()
-        .policy_fn(move |event, _ctx| {
-            // Deny opening /etc/hostname with ENOENT (pretend it doesn't exist)
-            if event.syscall == "openat" && event.path_contains("/etc/hostname") {
-                return Verdict::DenyWith(libc::ENOENT);
-            }
-            Verdict::Allow
-        })
-        .build()
-        .unwrap();
-
-    let script = format!(concat!(
-        "try:\n",
-        "  open('/etc/hostname').read()\n",
-        "  open('{out}', 'w').write('READ')\n",
-        "except FileNotFoundError:\n",
-        "  open('{out}', 'w').write('ENOENT')\n",
-        "except PermissionError:\n",
-        "  open('{out}', 'w').write('EPERM')\n",
-    ), out = out.display());
-
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script]).await.unwrap();
-    assert!(result.success());
-
-    let content = std::fs::read_to_string(&out).unwrap_or_default();
-    assert_eq!(content, "ENOENT", "should get FileNotFoundError, got: {}", content);
-
-    let _ = std::fs::remove_file(&out);
-}
-
 // ============================================================
 // Audit tests
 // ============================================================
@@ -424,7 +384,7 @@ async fn test_policy_fn_audit() {
     let policy = base_policy()
         .policy_fn(move |event, _ctx| {
             if event.category == SyscallCategory::File {
-                audited_clone.lock().unwrap().push(event.path.clone().unwrap_or_default());
+                audited_clone.lock().unwrap().push(event.syscall.clone());
                 return Verdict::Audit;
             }
             Verdict::Allow
@@ -450,13 +410,11 @@ async fn test_policy_fn_restrict_pid_network_without_allowlist() {
     // but policy_fn can still restrict specific PIDs.
     let policy = base_policy()
         .policy_fn(move |event, ctx| {
-            // On execve of the connect script, restrict that PID to no IPs
+            // On any execve, restrict that PID's network to nothing.
+            // (Previously gated on path-substring; path strings were
+            // dropped from events for TOCTOU reasons — issue #27.)
             if event.syscall == "execve" {
-                if let Some(ref path) = event.path {
-                    if path.contains("connect_test") {
-                        ctx.restrict_pid_network(event.pid, &[]);
-                    }
-                }
+                ctx.restrict_pid_network(event.pid, &[]);
             }
             Verdict::Allow
         })

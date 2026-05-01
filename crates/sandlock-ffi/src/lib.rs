@@ -1310,6 +1310,10 @@ pub unsafe extern "C" fn sandlock_gather_free(g: *mut sandlock_gather_t) {
 // ----------------------------------------------------------------
 
 /// C-compatible syscall event passed to the policy callback.
+///
+/// Path strings are intentionally absent (issue #27); use static Landlock
+/// rules for path-based access control. argv is exposed for execve only
+/// and is TOCTOU-safe via sibling-thread freeze before Continue.
 #[repr(C)]
 pub struct sandlock_event_t {
     pub syscall: *const c_char,
@@ -1317,7 +1321,6 @@ pub struct sandlock_event_t {
     pub category: u8,
     pub pid: u32,
     pub parent_pid: u32, // 0 if unknown
-    pub path: *const c_char,   // NULL if not applicable
     pub host: *const c_char,   // NULL if not applicable
     pub port: u16,
     pub denied: bool,
@@ -1357,10 +1360,9 @@ pub unsafe extern "C" fn sandlock_policy_builder_policy_fn(
     let cb_fn = move |event: sandlock_core::policy_fn::SyscallEvent,
                       ctx: &mut sandlock_core::policy_fn::PolicyContext| {
         let syscall_c = CString::new(event.syscall.as_str()).unwrap_or_default();
-        let path_c = event.path.as_deref().and_then(|s| CString::new(s).ok());
         let host_c = event.host.map(|ip| CString::new(ip.to_string()).unwrap_or_default());
 
-        // Convert argv to C string array
+        // Convert argv to C string array. CStrings live until end of closure.
         let argv_c: Vec<CString> = event.argv.as_ref()
             .map(|args| args.iter().filter_map(|s| CString::new(s.as_str()).ok()).collect())
             .unwrap_or_default();
@@ -1379,7 +1381,6 @@ pub unsafe extern "C" fn sandlock_policy_builder_policy_fn(
             category,
             pid: event.pid,
             parent_pid: event.parent_pid.unwrap_or(0),
-            path: path_c.as_ref().map_or(ptr::null(), |c| c.as_ptr()),
             host: host_c.as_ref().map_or(ptr::null(), |c| c.as_ptr()),
             port: event.port.unwrap_or(0),
             denied: event.denied,

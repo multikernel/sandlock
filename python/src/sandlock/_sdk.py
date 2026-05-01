@@ -115,14 +115,15 @@ _b_deterministic_dirs = _builder_fn("sandlock_policy_builder_deterministic_dirs"
 _b_hostname = _builder_fn("sandlock_policy_builder_hostname", ctypes.c_char_p)
 _b_cpu_cores = _builder_fn("sandlock_policy_builder_cpu_cores", ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32)
 
-# Policy callback (policy_fn)
+# Policy callback (policy_fn).
+# Path strings absent (issue #27 — path-based control belongs in Landlock).
+# argv is populated for execve only; TOCTOU-safe via sibling freeze.
 class _CEvent(ctypes.Structure):
     _fields_ = [
         ("syscall", ctypes.c_char_p),
         ("category", ctypes.c_uint8),
         ("pid", ctypes.c_uint32),
         ("parent_pid", ctypes.c_uint32),
-        ("path", ctypes.c_char_p),
         ("host", ctypes.c_char_p),
         ("port", ctypes.c_uint16),
         ("denied", ctypes.c_bool),
@@ -395,21 +396,34 @@ _lib.sandlock_checkpoint_free.argtypes = [_c_checkpoint_p]
 
 @dataclass(frozen=True)
 class SyscallEvent:
-    """An intercepted syscall event."""
+    """An intercepted syscall event.
+
+    Path strings are intentionally absent: the kernel re-reads user-memory
+    pointers after a Continue response, so any path-string-based decision
+    is racy (issue #27). Path-based access control belongs in static
+    Landlock rules (``fs_readable``, ``fs_writable``, ``fs_denied``).
+
+    ``argv`` *is* exposed for execve/execveat events and is TOCTOU-safe:
+    the supervisor freezes the calling process's sibling threads via
+    PTRACE_INTERRUPT before returning Continue, so the kernel's re-read
+    sees the same memory the supervisor inspected. Siblings die during
+    execve's de_thread step regardless, so the freeze has no observable
+    cost.
+    """
     syscall: str
     category: str  # "file", "network", "process", "memory"
     pid: int
     parent_pid: int = 0
-    path: str | None = None
     host: str | None = None
     port: int = 0
     argv: tuple[str, ...] | None = None
     denied: bool = False
 
-    def path_contains(self, s: str) -> bool:
-        return self.path is not None and s in self.path
-
     def argv_contains(self, s: str) -> bool:
+        """Returns True if any argv element contains ``s``.
+
+        Only meaningful for execve/execveat events.
+        """
         return self.argv is not None and any(s in a for a in self.argv)
 
 
@@ -898,7 +912,6 @@ class _NativePolicy:
         if policy_fn is not None:
             def _c_callback(event_p, ctx_p):
                 ev = event_p.contents
-                # Extract argv
                 py_argv = None
                 if ev.argv and ev.argc > 0:
                     py_argv = tuple(
@@ -912,7 +925,6 @@ class _NativePolicy:
                     category=_CATEGORIES.get(ev.category, "file"),
                     pid=ev.pid,
                     parent_pid=ev.parent_pid,
-                    path=ev.path.decode("utf-8") if ev.path else None,
                     host=ev.host.decode("utf-8") if ev.host else None,
                     port=ev.port,
                     argv=py_argv,
