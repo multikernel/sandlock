@@ -781,8 +781,9 @@ async fn emit_policy_event(
     // in static Landlock rules.
     //
     // argv IS extracted for execve/execveat: the supervisor freezes
-    // sibling threads before returning Continue (sibling_freeze module),
-    // so the post-Continue re-read sees the same memory we read here.
+    // every task in the sandbox (siblings + peers) before returning
+    // Continue (sandbox_freeze module), so the post-Continue re-read
+    // sees the same memory we read here.
     //
     // Network fields are TOCTOU-safe because connect/sendto/bind are
     // performed on-behalf via pidfd_getfd; the kernel never re-reads
@@ -916,35 +917,57 @@ async fn handle_notification(
         }
     }
 
-    // TOCTOU-close for execve (issue #27): freeze sibling threads of
-    // the calling tid before the kernel re-reads pathname/argv from
-    // child memory.  Cheap because the kernel's de_thread step in
-    // execve kills the siblings anyway — we're just stopping them
-    // moments earlier, closing the race window for the supervisor's
-    // argv inspection in policy_fn.
+    // TOCTOU-close for execve (issue #27): freeze every sandbox task
+    // that could mutate argv before the kernel re-reads it after
+    // Continue. This covers two distinct writer classes:
+    //   1. Sibling threads of the calling tid (same TGID, share mm).
+    //   2. Peer processes in other TGIDs that alias argv pages via
+    //      MAP_SHARED mappings or share mm via clone(CLONE_VM).
+    // Sibling-thread freeze alone closed (1) but not (2), as raised
+    // by Changaco on issue #27.
     //
-    // Only relevant when we're sending Continue: a denial response
-    // (Errno) means the kernel never re-reads, so no freeze needed.
+    // Only relevant when sending Continue: a denial (Errno) means the
+    // kernel never re-reads, so no freeze is needed.
     //
-    // Strict on failure: if we cannot freeze the siblings, we cannot
+    // Strict on failure: if we cannot establish the freeze, we cannot
     // uphold the argv-safety invariant, so we deny the execve with
     // EPERM rather than letting it through unprotected.
+    //
+    // Sibling threads die in execve's de_thread; the kernel reaps
+    // their ptrace state. Peer threads survive — we detach them after
+    // NOTIF_SEND so they resume normally.
     let nr = notif.data.nr as i64;
+    let mut peer_tids_to_detach: Vec<i32> = Vec::new();
     if matches!(action, NotifAction::Continue)
-        && crate::sibling_freeze::requires_freeze_on_continue(nr)
+        && crate::sandbox_freeze::requires_freeze_on_continue(nr)
     {
-        if let Err(e) = crate::sibling_freeze::freeze_siblings_for_execve(notif.pid as i32) {
-            eprintln!(
-                "sandlock: argv-safety freeze failed for pid {}: {} \
-                 — denying execve to preserve TOCTOU invariant",
-                notif.pid, e
-            );
-            action = NotifAction::Errno(libc::EPERM);
+        match crate::sandbox_freeze::freeze_sandbox_for_execve(
+            &ctx.processes,
+            notif.pid as i32,
+        ) {
+            Ok(outcome) => {
+                peer_tids_to_detach = outcome.peer_tids;
+            }
+            Err(e) => {
+                eprintln!(
+                    "sandlock: argv-safety freeze failed for pid {}: {} \
+                     — denying execve to preserve TOCTOU invariant",
+                    notif.pid, e
+                );
+                action = NotifAction::Errno(libc::EPERM);
+            }
         }
     }
 
     // Ignore error — child may have exited between recv and response.
     let _ = send_response(fd, notif.id, action);
+
+    // Detach peer processes after NOTIF_SEND so they resume. Siblings
+    // of the caller's TGID are intentionally not detached: they die in
+    // execve's de_thread and the kernel reaps the ptrace state.
+    if !peer_tids_to_detach.is_empty() {
+        crate::sandbox_freeze::detach_peers(&peer_tids_to_detach);
+    }
 }
 
 // ============================================================

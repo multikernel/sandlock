@@ -64,11 +64,15 @@ pub enum SyscallCategory {
 ///
 /// `argv` *is* exposed for `execve`/`execveat` and is TOCTOU-safe by
 /// construction: before the supervisor returns `Continue` for an
-/// execve, it `PTRACE_SEIZE`+`PTRACE_INTERRUPT`s every sibling thread
-/// of the calling tid so the kernel's post-Continue re-read sees the
-/// same memory the supervisor inspected. Siblings are killed by the
-/// kernel during execve's `de_thread` step anyway, so the pause has
-/// no observable cost. See `crate::sibling_freeze`.
+/// execve, it `PTRACE_SEIZE`+`PTRACE_INTERRUPT`s every task in the
+/// sandbox — both sibling threads of the calling tid (same TGID, share
+/// `mm_struct`) and peer threads in other TGIDs that may alias argv
+/// pages via `MAP_SHARED` mappings or share `mm_struct` via
+/// `clone(CLONE_VM)`. The kernel's post-Continue re-read therefore
+/// sees the same memory the supervisor inspected. Siblings are killed
+/// by the kernel during execve's `de_thread` step; peer threads are
+/// detached after `NOTIF_SEND` and resume normally. See
+/// `crate::sandbox_freeze`.
 ///
 /// Network fields (`host`, `port`) are TOCTOU-safe because the
 /// supervisor performs `connect`/`sendto`/`bind` on-behalf via
@@ -89,8 +93,9 @@ pub struct SyscallEvent {
     pub port: Option<u16>,
     /// Size argument (for mmap, brk).
     pub size: Option<u64>,
-    /// Command arguments for execve/execveat. TOCTOU-safe: sibling
-    /// threads are frozen before the kernel re-reads.
+    /// Command arguments for execve/execveat. TOCTOU-safe: every task
+    /// in the sandbox (caller's siblings and peer processes) is frozen
+    /// before the kernel re-reads argv from child memory.
     pub argv: Option<Vec<String>>,
     /// Whether the supervisor denied this syscall.
     pub denied: bool,
