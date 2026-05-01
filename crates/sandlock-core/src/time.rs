@@ -36,6 +36,14 @@ pub(crate) fn calculate_time_offset(time_start: SystemTime) -> i64 {
 /// For absolute monotonic timers, the child computed the deadline using a
 /// vDSO-shifted clock (offset was added). We subtract the offset here so the
 /// kernel receives the correct real deadline.
+///
+/// Continue safety (issue #27): every `Continue` in this function is safe.
+/// This handler does virtual-time correctness, not access control — it never
+/// denies a syscall based on user memory, so the seccomp_unotify TOCTOU
+/// re-read does not apply. A racing thread could rewrite the timespec
+/// between our adjustment and the kernel's read, but the only effect is
+/// that virtual-time bookkeeping is bypassed for that one call. No
+/// security boundary depends on the value we read or wrote.
 pub(crate) fn handle_timer(
     notif: &SeccompNotif,
     time_offset: i64,

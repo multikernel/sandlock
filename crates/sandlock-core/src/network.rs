@@ -535,6 +535,22 @@ async fn sendmsg_on_behalf(
 /// from child memory, validates the destination, duplicates the socket via
 /// pidfd_getfd, and performs the syscall itself. The child's memory is never
 /// re-read by the kernel after validation.
+///
+/// Continue safety (issue #27): the on-behalf paths don't return Continue
+/// at all (they return ReturnValue/Errno after performing the syscall in
+/// the supervisor). The Continue cases in this module are:
+///   1. Non-IP families (AF_UNIX etc.) — the IP allowlist doesn't apply;
+///      Landlock IPC scoping is the enforcement boundary.
+///   2. Connected sockets with addr_ptr == 0 — the address was already
+///      validated at connect time, so the kernel re-read of (nothing) is
+///      moot.
+///   3. The fall-through case below — only reachable if the BPF filter
+///      mis-routes a syscall; the kernel handles it normally.
+/// One weak spot: sendmsg_on_behalf falls through to Continue when the
+/// supervisor cannot read the msghdr struct from child memory. A racing
+/// thread could in principle force this by remapping the address, but
+/// the kernel's own re-read would then EFAULT too. Tightening this to
+/// Errno(EFAULT) would be safer; see issue #27 follow-up.
 pub(crate) async fn handle_net(
     notif: &SeccompNotif,
     ctx: &Arc<SupervisorCtx>,

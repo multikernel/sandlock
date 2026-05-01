@@ -3,6 +3,18 @@
 // Each syscall number maps to an ordered chain of handlers.  The chain is walked
 // until a handler returns a non-Continue action (or the chain is exhausted, in
 // which case Continue is returned).
+//
+// Continue safety (issue #27):
+//   - The chain walker treats Continue as "this handler did not intervene,
+//     try the next one." A final Continue (no handler intervened, or chain
+//     exhausted) means the syscall passes through to the kernel as-issued.
+//     The kernel still enforces Landlock and the BPF filter on the
+//     untouched syscall, so dispatch-level Continue is not a security
+//     decision — it's the absence of one.
+//   - The conditional shim closures (random/hostname/etc_hosts opens) that
+//     wrap an Option-returning helper translate `None` into Continue,
+//     which is the same "not my path, next handler" semantics. None of
+//     them approve a syscall based on user-memory contents.
 
 use std::collections::HashMap;
 use std::future::Future;

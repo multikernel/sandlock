@@ -1,3 +1,16 @@
+//! Netlink virtualization handlers — interpose AF_NETLINK sockets as
+//! unix socketpairs driven by a synthesized NETLINK_ROUTE responder.
+//!
+//! Continue safety (issue #27): every Continue here is dispatch routing
+//! based on register args (socket domain, fd number) or a fall-through
+//! after harmless cosmetic adjustments (recvmsg pre-zeroing). Decisions
+//! that require security enforcement (non-NETLINK_ROUTE protocol) return
+//! Errno; substitution returns InjectFdSendTracked. The fd-cookie check
+//! (`state.is_cookie(tgid, fd)`) examines a register arg, not user memory,
+//! so the seccomp_unotify TOCTOU class doesn't apply: a racing thread
+//! cannot change the fd number stored in another thread's syscall
+//! registers.
+
 use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 

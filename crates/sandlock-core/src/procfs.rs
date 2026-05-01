@@ -3,6 +3,20 @@
 // Intercepts openat syscalls that target sensitive /proc paths or virtual
 // files (/proc/cpuinfo, /proc/meminfo). For virtual files, creates a memfd
 // with fake content and injects it into the child's fd table.
+//
+// Continue safety (issue #27):
+//   - Sensitive-path denials use Errno(EACCES) — TOCTOU-safe: the seccomp
+//     response *is* the answer; the kernel does not re-read user memory.
+//   - Virtualized paths (cpuinfo, meminfo, mounts, /proc/net/*, hostname,
+//     etc.) use InjectFdSend with a sealed memfd — the child's fd table
+//     ends up with our memfd, and the kernel never re-resolves the path
+//     string after injection.
+//   - Continue is reserved for fall-through cases: read_path failed (kernel
+//     will re-read and EFAULT identically), the path doesn't match any
+//     virtualized entry, or supervisor-side I/O on /proc/<pid>/fd/<n>
+//     read_link returned an error. None of these cases involve the
+//     supervisor approving a syscall based on user-controlled string
+//     contents, so the seccomp_unotify TOCTOU class doesn't apply.
 
 use std::collections::HashSet;
 use std::io::{Seek, SeekFrom, Write};

@@ -2,6 +2,27 @@
 //!
 //! Reads paths from child memory, delegates to SeccompCowBranch,
 //! and injects results (fds, stat structs, readlink strings, dirents) back.
+//!
+//! # Continue safety (issue #27)
+//!
+//! Every `Continue` in this module is a *fall-through* — the COW layer
+//! decided the syscall is outside its scope, so it lets the kernel handle
+//! the original syscall normally. No COW path was modified or rewritten
+//! when we return Continue, so the kernel's re-read sees exactly what the
+//! child originally passed. The fall-through happens when:
+//!
+//!   * No COW branch is active (`cow_state.branch == None`).
+//!   * The path doesn't match the COW prefix (`!cow.matches(path)`).
+//!   * `read_path` / `read_child_mem` / `CString::new` failed.
+//!   * The supervisor's own open/copy attempt failed and we want the
+//!     kernel to surface its own error.
+//!
+//! Because Continue means "we didn't intervene," the seccomp_unotify
+//! TOCTOU concern doesn't apply: we're not making a security decision
+//! whose validity depends on the kernel re-reading the same memory we
+//! read. Path-based security enforcement for these fall-throughs is
+//! provided by Landlock (or by the chroot dispatcher, when chroot mode
+//! is active and runs before COW).
 
 use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
 use std::path::{Component, Path, PathBuf};
