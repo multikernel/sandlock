@@ -166,19 +166,20 @@ class Policy:
     """TCP ports the sandbox may bind.  Empty = deny all.
     Each entry is a port number or a ``"lo-hi"`` range string."""
 
-    # Socket type restrictions (seccomp-enforced)
-    no_raw_sockets: bool = True
-    """Block raw IP sockets (SOCK_RAW on AF_INET/AF_INET6).  Raw sockets
-    allow packet sniffing and ICMP crafting — almost never needed by
-    sandboxed programs.  Enforced via seccomp BPF."""
+    # Socket type restrictions (seccomp-enforced).
+    # Raw sockets and UDP are denied by default; opt in via the flags below.
+    allow_udp: bool = False
+    """Permit UDP sockets (SOCK_DGRAM on AF_INET/AF_INET6). UDP is denied
+    by default. When ``True``, outbound UDP destinations are still gated
+    by :attr:`net_allow` — same endpoint allowlist used for TCP. AF_UNIX
+    datagrams are unaffected. CLI: ``--allow-udp``. Enforced via seccomp BPF."""
 
-    no_udp: bool = True
-    """Block UDP sockets (SOCK_DGRAM on AF_INET/AF_INET6). Default deny
-    matches the deny-by-default posture of every other protocol; flip
-    to ``False`` (CLI: ``--allow-udp``) to enable UDP. Outbound UDP
-    destinations are still gated by :attr:`net_allow` — same endpoint
-    allowlist used for TCP. AF_UNIX datagrams are unaffected.
-    Enforced via seccomp BPF."""
+    allow_icmp: bool = False
+    """Narrow ICMP raw socket carve-out: permit
+    ``socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)`` and the IPv6 equivalent
+    only. All other raw socket types remain denied. Useful for ``ping``
+    without granting full packet-crafting capability.
+    CLI: ``--allow-icmp``. Enforced via seccomp BPF."""
 
     # HTTP ACL
     http_allow: Sequence[str] = field(default_factory=list)

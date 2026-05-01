@@ -635,9 +635,9 @@ Policy(
     https_ca="ca.pem",             # CA cert for HTTPS MITM (adds port 443)
     https_key="ca-key.pem",        # CA key for HTTPS MITM
 
-    # Socket restrictions
-    no_raw_sockets=True,           # Block SOCK_RAW (default; CLI: --allow-icmp to flip)
-    no_udp=True,                   # Block SOCK_DGRAM (default; CLI: --allow-udp to flip)
+    # Socket restrictions (raw sockets and UDP denied by default)
+    allow_udp=False,               # CLI: --allow-udp; outbound UDP still gated by net_allow
+    allow_icmp=False,              # CLI: --allow-icmp; permits ICMP raw only (AF_INET/AF_INET6 + SOCK_RAW + IPPROTO_ICMP[V6])
 
     # Resources
     max_memory="512M",             # Memory limit

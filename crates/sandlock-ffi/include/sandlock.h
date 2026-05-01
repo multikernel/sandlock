@@ -46,8 +46,11 @@ sandlock_builder_t *sandlock_policy_builder_num_cpus(sandlock_builder_t *b, uint
 sandlock_builder_t *sandlock_policy_builder_net_allow(sandlock_builder_t *b, const char *spec);
 sandlock_builder_t *sandlock_policy_builder_net_bind_port(sandlock_builder_t *b, uint16_t port);
 sandlock_builder_t *sandlock_policy_builder_port_remap(sandlock_builder_t *b, bool v);
-sandlock_builder_t *sandlock_policy_builder_no_raw_sockets(sandlock_builder_t *b, bool v);
-sandlock_builder_t *sandlock_policy_builder_no_udp(sandlock_builder_t *b, bool v);
+/* UDP socket creation. Denied by default; opt in with v=true. */
+sandlock_builder_t *sandlock_policy_builder_allow_udp(sandlock_builder_t *b, bool v);
+/* Permit ICMP raw sockets only (AF_INET/AF_INET6 + SOCK_RAW + IPPROTO_ICMP[V6]).
+ * All other raw socket types remain denied. */
+sandlock_builder_t *sandlock_policy_builder_allow_icmp(sandlock_builder_t *b, bool v);
 
 /* Mode */
 sandlock_builder_t *sandlock_policy_builder_privileged(sandlock_builder_t *b, bool v);

@@ -73,8 +73,10 @@ enum Command {
         /// for TCP).
         #[arg(long = "allow-udp")]
         allow_udp: bool,
-        /// Allow raw IP sockets (e.g. for ICMP / ping). Raw sockets
-        /// are denied by default.
+        /// Allow ICMP raw sockets only — `socket(AF_INET, SOCK_RAW,
+        /// IPPROTO_ICMP)` and the IPv6 equivalent. Other `SOCK_RAW`
+        /// types stay denied. Useful for `ping` without granting full
+        /// packet-crafting capability.
         #[arg(long = "allow-icmp")]
         allow_icmp: bool,
         #[arg(long = "http-allow", value_name = "RULE")]
@@ -266,8 +268,8 @@ async fn main() -> Result<()> {
                 if let Some(cpu) = base.max_cpu { b = b.max_cpu(cpu); }
                 if let Some(seed) = base.random_seed { b = b.random_seed(seed); }
                 if let Some(n) = base.num_cpus { b = b.num_cpus(n); }
-                b = b.no_raw_sockets(base.no_raw_sockets);
-                b = b.no_udp(base.no_udp);
+                b = b.allow_udp(base.allow_udp);
+                b = b.allow_icmp(base.allow_icmp);
                 b = b.clean_env(base.clean_env);
                 if let Some(ref w) = base.workdir { b = b.workdir(w); }
                 if let Some(ref c) = base.cwd { b = b.cwd(c); }
@@ -314,8 +316,12 @@ async fn main() -> Result<()> {
             }
             if let Some(ref path) = fs_storage { builder = builder.fs_storage(path); }
             if let Some(ref s) = max_disk { builder = builder.max_disk(ByteSize::parse(s)?); }
-            if allow_udp { builder = builder.no_udp(false); }
-            if allow_icmp { builder = builder.no_raw_sockets(false); }
+            if allow_udp { builder = builder.allow_udp(true); }
+            // --allow-icmp narrowly permits ICMP raw sockets; arbitrary
+            // raw sockets stay denied. The seccomp filter inspects the
+            // protocol arg of `socket()` so non-ICMP `SOCK_RAW` is
+            // still rejected.
+            if allow_icmp { builder = builder.allow_icmp(true); }
             for rule in &http_allow { builder = builder.http_allow(rule); }
             for rule in &http_deny { builder = builder.http_deny(rule); }
             for port in &http_ports { builder = builder.http_port(*port); }

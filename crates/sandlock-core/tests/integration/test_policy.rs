@@ -4,7 +4,8 @@ use sandlock_core::policy::{ByteSize, FsIsolation, BranchAction, Policy};
 fn test_default_policy() {
     let policy = Policy::builder().build().unwrap();
     assert_eq!(policy.max_processes, 64);
-    assert!(policy.no_raw_sockets);
+    assert!(!policy.allow_udp, "UDP is denied by default");
+    assert!(!policy.allow_icmp, "ICMP raw is denied by default");
     assert!(policy.uid.is_none());
     assert!(policy.fs_writable.is_empty());
     assert!(policy.fs_readable.is_empty());
@@ -127,15 +128,15 @@ fn test_env_var() {
 }
 
 #[test]
-fn test_no_udp_default_true() {
+fn test_allow_udp_default_false() {
     let p = Policy::builder().build().unwrap();
-    assert!(p.no_udp, "UDP is denied by default; opt in via .no_udp(false)");
+    assert!(!p.allow_udp, "UDP is denied by default; opt in via .allow_udp(true)");
 }
 
 #[test]
-fn test_no_raw_sockets_default_true() {
+fn test_allow_icmp_default_false() {
     let p = Policy::builder().build().unwrap();
-    assert!(p.no_raw_sockets, "no_raw_sockets should default to true");
+    assert!(!p.allow_icmp, "ICMP raw is denied by default; opt in via .allow_icmp(true)");
 }
 
 #[test]

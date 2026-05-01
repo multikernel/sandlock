@@ -70,8 +70,6 @@ def policy_for_tool(
         ])),
         "net_bind": [],
         "net_allow": [],
-        "no_raw_sockets": True,
-        "no_udp": True,
         "clean_env": True,
     }
 

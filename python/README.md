@@ -65,8 +65,8 @@ Unset fields mean "no restriction" unless noted otherwise.
 | `net_allow` | `list[str]` | `[]` | Outbound TCP endpoint rules. Each entry is `"host:port[,port,...]"`, `":port"`, or `"*:port"`. Empty = deny all. |
 | `net_bind` | `list[int \| str]` | `[]` | TCP ports the sandbox may bind (empty = deny all) |
 | `port_remap` | `bool` | `False` | Transparent TCP port virtualization |
-| `no_raw_sockets` | `bool` | `True` | Block raw IP sockets (set `False` to allow ICMP / `ping`) |
-| `no_udp` | `bool` | `True` | Block UDP sockets (set `False` to allow; outbound destinations still gated by `net_allow`) |
+| `allow_udp` | `bool` | `False` | Permit UDP sockets (outbound destinations still gated by `net_allow`) |
+| `allow_icmp` | `bool` | `False` | Permit `socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)` and IPv6 equivalent only — useful for `ping`. Other raw socket types stay denied. |
 
 #### HTTP ACL
 

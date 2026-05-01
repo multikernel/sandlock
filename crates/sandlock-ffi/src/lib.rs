@@ -344,26 +344,32 @@ pub unsafe extern "C" fn sandlock_policy_builder_port_remap(
     Box::into_raw(Box::new(builder.port_remap(v)))
 }
 
+/// Permit UDP socket creation. UDP is denied by default; outbound
+/// destinations remain gated by `net_allow` if any rules are set.
+///
 /// # Safety
 /// `b` must be a valid builder pointer.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_policy_builder_no_raw_sockets(
+pub unsafe extern "C" fn sandlock_policy_builder_allow_udp(
     b: *mut PolicyBuilder, v: bool,
 ) -> *mut PolicyBuilder {
     if b.is_null() { return b; }
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.no_raw_sockets(v)))
+    Box::into_raw(Box::new(builder.allow_udp(v)))
 }
 
+/// Permit `socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)` and the IPv6
+/// equivalent only. All other raw socket types remain denied.
+///
 /// # Safety
 /// `b` must be a valid builder pointer.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_policy_builder_no_udp(
+pub unsafe extern "C" fn sandlock_policy_builder_allow_icmp(
     b: *mut PolicyBuilder, v: bool,
 ) -> *mut PolicyBuilder {
     if b.is_null() { return b; }
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.no_udp(v)))
+    Box::into_raw(Box::new(builder.allow_icmp(v)))
 }
 
 /// # Safety

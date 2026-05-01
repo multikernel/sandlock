@@ -84,11 +84,11 @@ pub fn parse_profile(content: &str) -> Result<Policy, SandlockError> {
     }
 
     // Parse booleans
-    if let Some(v) = sandbox.get("no_raw_sockets").and_then(|v| v.as_bool()) {
-        builder = builder.no_raw_sockets(v);
+    if let Some(v) = sandbox.get("allow_udp").and_then(|v| v.as_bool()) {
+        builder = builder.allow_udp(v);
     }
-    if let Some(v) = sandbox.get("no_udp").and_then(|v| v.as_bool()) {
-        builder = builder.no_udp(v);
+    if let Some(v) = sandbox.get("allow_icmp").and_then(|v| v.as_bool()) {
+        builder = builder.allow_icmp(v);
     }
 if let Some(v) = sandbox.get("clean_env").and_then(|v| v.as_bool()) {
         builder = builder.clean_env(v);

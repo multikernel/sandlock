@@ -15,7 +15,7 @@ use crate::sys::structs::{
     SECCOMP_RET_ALLOW, SECCOMP_RET_ERRNO,
     SIOCETHTOOL, SIOCGIFADDR, SIOCGIFBRDADDR, SIOCGIFCONF, SIOCGIFDSTADDR,
     SIOCGIFFLAGS, SIOCGIFHWADDR, SIOCGIFINDEX, SIOCGIFNAME, SIOCGIFNETMASK,
-    SOCK_DGRAM, SOCK_RAW, SOCK_TYPE_MASK, TIOCLINUX, TIOCSTI,
+    SOCK_DGRAM, SOCK_RAW, SOCK_TYPE_MASK, IPPROTO_ICMP, IPPROTO_ICMPV6, TIOCLINUX, TIOCSTI,
     PR_SET_DUMPABLE, PR_SET_SECUREBITS, PR_SET_PTRACER,
     OFFSET_ARGS0_LO, OFFSET_ARGS1_LO, OFFSET_ARGS2_LO, OFFSET_ARGS3_LO, OFFSET_NR,
     SockFilter,
@@ -516,11 +516,18 @@ pub fn arg_filters(policy: &Policy) -> Vec<SockFilter> {
     }
 
     // --- socket: block SOCK_RAW and/or SOCK_DGRAM on AF_INET/AF_INET6 ---
+    //
+    // Raw sockets are always denied by default. The narrow `allow_icmp`
+    // carve-out permits only `socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)`
+    // and the IPv6 equivalent — handled by a separate `socket()` filter
+    // further down. When `allow_icmp` is set, SOCK_RAW is excluded from
+    // the simple blocked_types list so the carve-out can decide.
+    let raw_narrow = policy.allow_icmp;
     let mut blocked_types: Vec<u32> = Vec::new();
-    if policy.no_raw_sockets {
+    if !policy.allow_icmp {
         blocked_types.push(SOCK_RAW);
     }
-    if policy.no_udp {
+    if !policy.allow_udp {
         blocked_types.push(SOCK_DGRAM);
     }
 
@@ -553,6 +560,44 @@ pub fn arg_filters(policy: &Policy) -> Vec<SockFilter> {
         }
         // Deny return (reached by any matching JEQ)
         insns.push(stmt(BPF_RET | BPF_K, ret_errno));
+    }
+
+    // --- socket: ICMP-only carve-out for SOCK_RAW ---
+    // Active when raw sockets are otherwise denied AND --allow-icmp is set.
+    // Permits `socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)` and
+    // `socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6)`; denies every other
+    // SOCK_RAW. The block has 14 instructions; offsets reference the
+    // post-block instruction count (skip-to-end).
+    if raw_narrow {
+        // INST 0: LD NR
+        insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR));
+        // INST 1: JEQ socket → fall through (jt=0); not socket → skip 12
+        insns.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr_socket, 0, 12));
+        // INST 2-3: LD type, AND TYPE_MASK
+        insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARGS1_LO));
+        insns.push(stmt(BPF_ALU | BPF_AND | BPF_K, SOCK_TYPE_MASK));
+        // INST 4: JEQ SOCK_RAW → fall through; not raw → skip 9 (allow)
+        insns.push(jump(BPF_JMP | BPF_JEQ | BPF_K, SOCK_RAW, 0, 9));
+        // INST 5: LD domain
+        insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARGS0_LO));
+        // INST 6: JEQ AF_INET → fall to v4 proto check; else skip 3 to v6 check at INST 10
+        insns.push(jump(BPF_JMP | BPF_JEQ | BPF_K, AF_INET, 0, 3));
+        // INST 7: LD proto (arg2)
+        insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARGS2_LO));
+        // INST 8: JEQ IPPROTO_ICMP → skip 5 to end (allow); else fall to RET errno
+        insns.push(jump(BPF_JMP | BPF_JEQ | BPF_K, IPPROTO_ICMP, 5, 0));
+        // INST 9: RET errno (v4 SOCK_RAW with non-ICMP proto)
+        insns.push(stmt(BPF_RET | BPF_K, ret_errno));
+        // INST 10: JEQ AF_INET6 → fall to v6 proto check; else skip 2 to RET errno
+        // (other AF + SOCK_RAW, e.g. AF_PACKET/AF_NETLINK, must be denied)
+        insns.push(jump(BPF_JMP | BPF_JEQ | BPF_K, AF_INET6, 0, 2));
+        // INST 11: LD proto
+        insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARGS2_LO));
+        // INST 12: JEQ IPPROTO_ICMPV6 → skip 1 past RET (allow); else fall to RET errno
+        insns.push(jump(BPF_JMP | BPF_JEQ | BPF_K, IPPROTO_ICMPV6, 1, 0));
+        // INST 13: RET errno (v6 SOCK_RAW with non-ICMPv6 proto)
+        insns.push(stmt(BPF_RET | BPF_K, ret_errno));
+        // (post-block — fall through to wait4 block below)
     }
 
     // --- wait4: skip notification for WNOHANG/WNOWAIT (non-blocking) ---
@@ -1133,7 +1178,8 @@ mod tests {
     #[test]
     fn test_arg_filters_raw_sockets() {
         use crate::sys::structs::{BPF_ALU, BPF_AND, BPF_JEQ, BPF_JMP, BPF_K};
-        let policy = Policy::builder().no_raw_sockets(true).build().unwrap();
+        // Raw sockets are blocked by default; allow_icmp is false.
+        let policy = Policy::builder().build().unwrap();
         let filters = arg_filters(&policy);
         // Should have AF_INET check
         assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
@@ -1150,9 +1196,10 @@ mod tests {
     }
 
     #[test]
-    fn test_arg_filters_no_udp() {
+    fn test_arg_filters_udp_denied_by_default() {
         use crate::sys::structs::{BPF_JEQ, BPF_JMP, BPF_K};
-        let policy = Policy::builder().no_udp(true).build().unwrap();
+        // UDP is denied by default; allow_udp(false) is the default state.
+        let policy = Policy::builder().build().unwrap();
         let filters = arg_filters(&policy);
         // Should have JEQ SOCK_DGRAM
         assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)

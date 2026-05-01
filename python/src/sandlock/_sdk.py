@@ -91,8 +91,8 @@ _b_num_cpus = _builder_fn("sandlock_policy_builder_num_cpus", ctypes.c_uint32)
 _b_net_allow = _builder_fn("sandlock_policy_builder_net_allow", ctypes.c_char_p)
 _b_net_bind_port = _builder_fn("sandlock_policy_builder_net_bind_port", ctypes.c_uint16)
 _b_port_remap = _builder_fn("sandlock_policy_builder_port_remap", ctypes.c_bool)
-_b_no_raw_sockets = _builder_fn("sandlock_policy_builder_no_raw_sockets", ctypes.c_bool)
-_b_no_udp = _builder_fn("sandlock_policy_builder_no_udp", ctypes.c_bool)
+_b_allow_udp = _builder_fn("sandlock_policy_builder_allow_udp", ctypes.c_bool)
+_b_allow_icmp = _builder_fn("sandlock_policy_builder_allow_icmp", ctypes.c_bool)
 _b_http_allow = _builder_fn("sandlock_policy_builder_http_allow", ctypes.c_char_p)
 _b_http_deny = _builder_fn("sandlock_policy_builder_http_deny", ctypes.c_char_p)
 _b_http_port = _builder_fn("sandlock_policy_builder_http_port", ctypes.c_uint16)
@@ -737,7 +737,7 @@ class _NativePolicy:
         "max_memory", "max_disk", "max_processes", "max_cpu", "num_cpus",
         "cpu_cores", "gpu_devices",
         "net_allow", "net_bind",
-        "port_remap", "no_raw_sockets", "no_udp",
+        "port_remap", "allow_udp", "allow_icmp",
         "http_allow", "http_deny", "http_ports", "https_ca", "https_key",
         "uid",
         "random_seed", "time_start", "clean_env", "env",
@@ -840,9 +840,10 @@ class _NativePolicy:
 
         if policy.port_remap:
             b = _b_port_remap(b, True)
-        b = _b_no_raw_sockets(b, policy.no_raw_sockets)
-        if policy.no_udp:
-            b = _b_no_udp(b, True)
+        if policy.allow_udp:
+            b = _b_allow_udp(b, True)
+        if policy.allow_icmp:
+            b = _b_allow_icmp(b, True)
 
         if policy.uid is not None:
             b = _b_uid(b, policy.uid)

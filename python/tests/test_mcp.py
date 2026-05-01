@@ -16,8 +16,8 @@ class TestDenyByDefault:
         assert "/tmp/ws" in policy.fs_readable
         assert policy.net_allow == []
         assert policy.net_bind == []
-        assert policy.no_udp is True
-        assert policy.no_raw_sockets is True
+        assert policy.allow_udp is False
+        assert policy.allow_icmp is False
 
     def test_empty_capabilities(self):
         policy = policy_for_tool(workspace="/tmp/ws", capabilities={})

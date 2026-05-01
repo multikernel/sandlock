@@ -323,8 +323,15 @@ pub struct Policy {
     /// with wildcard hosts auto-add `(None, [80])` instead.
     pub net_allow: Vec<NetAllow>,
     pub net_bind: Vec<u16>,
-    pub no_raw_sockets: bool,
-    pub no_udp: bool,
+    /// Permit UDP socket creation (`socket(_, SOCK_DGRAM, _)`). UDP is
+    /// denied by default; outbound destinations remain gated by the
+    /// `net_allow` endpoint allowlist when set.
+    pub allow_udp: bool,
+    /// Narrow ICMP carve-out: permit `socket(AF_INET, SOCK_RAW,
+    /// IPPROTO_ICMP)` and the IPv6 equivalent. All other raw socket
+    /// types remain denied. Useful for `ping` without granting full
+    /// packet-crafting capability.
+    pub allow_icmp: bool,
 
     // HTTP ACL
     pub http_allow: Vec<HttpRule>,
@@ -417,8 +424,8 @@ pub struct PolicyBuilder {
     /// Raw `--net-allow` specs; parsed in `build()` to surface errors.
     net_allow: Vec<String>,
     net_bind: Vec<u16>,
-    no_raw_sockets: Option<bool>,
-    no_udp: Option<bool>,
+    allow_udp: bool,
+    allow_icmp: bool,
 
     http_allow: Vec<String>,
     http_deny: Vec<String>,
@@ -515,13 +522,17 @@ impl PolicyBuilder {
         self
     }
 
-    pub fn no_raw_sockets(mut self, v: bool) -> Self {
-        self.no_raw_sockets = Some(v);
+    /// Permit UDP socket creation. UDP is denied by default;
+    /// outbound destinations remain gated by `net_allow` if set.
+    pub fn allow_udp(mut self, v: bool) -> Self {
+        self.allow_udp = v;
         self
     }
 
-    pub fn no_udp(mut self, v: bool) -> Self {
-        self.no_udp = Some(v);
+    /// Permit `socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)` and the IPv6
+    /// equivalent only. Other raw socket types stay denied.
+    pub fn allow_icmp(mut self, v: bool) -> Self {
+        self.allow_icmp = v;
         self
     }
 
@@ -789,8 +800,8 @@ impl PolicyBuilder {
             allow_syscalls: self.allow_syscalls,
             net_allow,
             net_bind: self.net_bind,
-            no_raw_sockets: self.no_raw_sockets.unwrap_or(true),
-            no_udp: self.no_udp.unwrap_or(true),
+            allow_udp: self.allow_udp,
+            allow_icmp: self.allow_icmp,
             http_allow,
             http_deny,
             http_ports,
