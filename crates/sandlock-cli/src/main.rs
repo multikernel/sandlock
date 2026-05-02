@@ -28,10 +28,12 @@ enum Command {
         max_processes: Option<u32>,
         #[arg(short = 't', long)]
         timeout: Option<u64>,
-        /// Outbound TCP endpoint allow rule. Repeatable. Each value is
+        /// Outbound endpoint allow rule (TCP, plus UDP when
+        /// `--allow-udp` is set). Repeatable. Each value is
         /// `host:port[,port,...]` (IP-restricted), `:port` or `*:port`
         /// (any IP). Examples: `api.openai.com:443`,
-        /// `github.com:22,443`, `:8080`. See README "Network Model".
+        /// `github.com:22,443`, `:8080`, `1.1.1.1:53`.
+        /// See README "Network Model".
         #[arg(long = "net-allow", value_name = "SPEC")]
         net_allow: Vec<String>,
         #[arg(long = "net-bind")]

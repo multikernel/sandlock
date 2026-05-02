@@ -820,8 +820,9 @@ class _NativePolicy:
             b = _b_cpu_cores(b, arr, len(policy.cpu_cores))
 
         # net_allow: list of endpoint specs (`host:port[,port,...]`,
-        # `:port`, `*:port`). Empty = deny all outbound TCP. Validation
-        # of each spec happens in the native build().
+        # `:port`, `*:port`). Empty = deny all outbound. Applies to TCP
+        # and to UDP (when allow_udp is set). Validation of each spec
+        # happens in the native build().
         for spec in (policy.net_allow or []):
             b = _b_net_allow(b, _encode(str(spec)))
         for port in parse_ports(policy.net_bind) if policy.net_bind else []:

@@ -308,14 +308,16 @@ pub struct Policy {
     pub allow_syscalls: Option<Vec<String>>,
 
     // Network
-    /// Outbound TCP allowlist as a list of `(host?, ports)` endpoint rules.
+    /// Outbound endpoint allowlist as a list of `(host?, ports)` rules.
+    /// Applies to TCP `connect()` and to UDP `sendto`/`sendmsg`
+    /// destinations when `allow_udp` is set.
     ///
-    /// Empty `net_allow` and empty `http_allow`/`http_deny` together mean
-    /// "deny all outbound TCP" (Landlock direct path denies, no on-behalf
-    /// path is enabled). Otherwise, the on-behalf path enforces these
-    /// rules: a connection is permitted iff any rule matches both the
-    /// destination IP (or has `host: None` = any IP) and the
-    /// destination port.
+    /// Empty `net_allow` and empty `http_allow`/`http_deny` together
+    /// mean "deny all outbound" (Landlock direct path denies, no
+    /// on-behalf path is enabled). Otherwise, the on-behalf path
+    /// enforces these rules: a destination is permitted iff any rule
+    /// matches both the destination IP (or has `host: None` = any IP)
+    /// and the destination port — same check for TCP and UDP.
     ///
     /// HTTP rules with concrete hosts auto-add a matching `(host, [80])`
     /// (and `(host, [443])` when `--https-ca` is set) entry at build

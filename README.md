@@ -100,12 +100,16 @@ sandlock run -i -r /usr -r /lib -r /lib64 -r /bin -r /etc -w /tmp -- /bin/sh
 # Resource limits + timeout
 sandlock run -m 512M -P 20 -t 30 -- ./compute.sh
 
-# Outbound TCP allowlist — restrict to one host on one port
+# Outbound allowlist — restrict to one host on one port
 sandlock run --net-allow api.openai.com:443 -r /usr -r /lib -r /etc -- python3 agent.py
 
 # Multiple ports for one host, plus a separate any-IP port
 sandlock run --net-allow github.com:22,443 --net-allow :8080 \
   -r /usr -r /lib -r /etc -- python3 agent.py
+
+# UDP — opt in to UDP and allowlist the destination (e.g. DNS)
+sandlock run --allow-udp --net-allow 1.1.1.1:53 --net-allow :443 \
+  -r /usr -r /lib -r /etc -- ./client
 
 # HTTP-level ACL (method + host + path rules via transparent proxy)
 # HTTP rules with concrete hosts auto-extend --net-allow with host:80,443
@@ -502,20 +506,23 @@ Landlock + seccomp confinement. `CLONE_ID=0..N-1` is set automatically.
 
 ### Network Model
 
-Outbound TCP is gated by a single endpoint allowlist. Each `--net-allow`
-rule names a `(host, ports)` pair, multiple rules are OR'd, and a
-connection is permitted iff the destination `(IP, port)` matches at
-least one rule.
+Outbound traffic is gated by a single endpoint allowlist. Each
+`--net-allow` rule names a `(host, ports)` pair, multiple rules are
+OR'd, and a destination is permitted iff `(IP, port)` matches at least
+one rule. The same allowlist applies to TCP `connect()` and to UDP
+`sendto` / `sendmsg` destinations — the latter only relevant when
+`--allow-udp` is set, since UDP socket creation is denied by default.
 
 ```
---net-allow <spec>          repeatable; no rules = deny all outbound TCP
+--net-allow <spec>          repeatable; no rules = deny all outbound
                             <spec> = host:port[,port,...]   (IP-restricted)
                                    | :port  | *:port        (any IP)
 ```
 
 **Defaults.** With no `--net-allow` and no HTTP ACL flags, Landlock
-denies every TCP `connect()`. There is no "allow-all networking"
-mode — opt in with explicit endpoints.
+denies every TCP `connect()`, UDP and raw socket creation are denied
+at the seccomp layer, and there is no on-behalf path active. There is
+no "allow-all networking" mode — opt in with explicit endpoints.
 
 **Resolution.** Concrete hostnames are resolved once at sandbox start
 and pinned in a synthetic `/etc/hosts`. The synthetic file replaces
@@ -530,12 +537,14 @@ for `:port`).
 **Implementation.** Two enforcement paths:
 
   * **Direct path** — pure `:port` policies (no concrete host) and no
-    HTTP ACL. Landlock enforces the port allowlist at the kernel level;
-    no per-syscall overhead.
-  * **On-behalf path** — any concrete host or any HTTP ACL rule. Seccomp
-    traps `connect()`; the supervisor checks the `(ip, port)` against
-    the resolved allowlist and performs the syscall. The HTTP/HTTPS
-    proxy redirect (when configured) happens here too.
+    HTTP ACL. Landlock enforces the TCP port allowlist at the kernel
+    level; no per-syscall overhead. UDP is not covered by Landlock and
+    therefore always uses the on-behalf path when allowed.
+  * **On-behalf path** — any concrete host, any HTTP ACL rule, or
+    `--allow-udp`. Seccomp traps `connect()`, `sendto()`, and
+    `sendmsg()`; the supervisor checks the `(ip, port)` against the
+    resolved allowlist and performs the syscall. The HTTP/HTTPS proxy
+    redirect (when configured) happens here too.
 
 **HTTP / HTTPS interception.** `--http-allow` / `--http-deny` route
 matching ports through a transparent proxy. Each rule with a concrete
@@ -557,9 +566,10 @@ on-behalf virtualization for binding.
   * `--allow-udp` enables UDP socket creation. Outbound UDP
     destinations are then gated by the same `--net-allow` allowlist
     used for TCP — the seccomp on-behalf path also covers `sendto` /
-    `sendmsg`.
-  * `--allow-icmp` enables raw IP sockets (needed for `ping` and other
-    ICMP tools).
+    `sendmsg`. Example: `--allow-udp --net-allow 1.1.1.1:53` for DNS.
+  * `--allow-icmp` narrowly permits `socket(AF_INET, SOCK_RAW,
+    IPPROTO_ICMP)` and the IPv6 equivalent only — enough for `ping`.
+    Other raw socket types stay denied.
   * AF_UNIX sockets are governed by Landlock's
     `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`.
 
@@ -624,7 +634,8 @@ Policy(
     allow_syscalls=None,           # Allowlist mode (stricter)
 
     # Network — see "Network Model" above. Each entry is `host:port[,port,...]`,
-    # `:port`, or `*:port`. Empty list = deny all outbound TCP.
+    # `:port`, or `*:port`. Empty list = deny all outbound. Same allowlist
+    # gates UDP destinations when allow_udp=True (e.g. `:53` for DNS).
     net_allow=["api.example.com:443", "github.com:22,443", ":8080"],
     net_bind=[8080],               # TCP bind ports (Landlock; ABI v4+)
 

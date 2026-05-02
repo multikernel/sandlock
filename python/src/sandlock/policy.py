@@ -144,27 +144,32 @@ class Policy:
 
     # Network — endpoint allowlist (IP × port via seccomp on-behalf path)
     net_allow: Sequence[str] = field(default_factory=list)
-    """Outbound TCP endpoint rules. Each entry is a string of the form:
+    """Outbound endpoint rules. Applies to TCP and to UDP (when
+    :attr:`allow_udp` is set). Each entry is a string of the form:
 
     * ``"host:port"`` — restrict to one host on one port (e.g. ``"api.openai.com:443"``)
     * ``"host:port,port,..."`` — multiple ports for one host (e.g. ``"github.com:22,443"``)
-    * ``":port"`` or ``"*:port"`` — any IP on this port
+    * ``":port"`` or ``"*:port"`` — any IP on this port (e.g. ``":53"`` for DNS)
 
     Hostnames are resolved at sandbox-creation time and pinned via a
-    synthetic ``/etc/hosts``. Empty = deny all outbound TCP (Landlock
-    rejects on the direct path; no on-behalf path is enabled). HTTP
-    rules with concrete hosts auto-add a matching entry on
-    :attr:`http_ports`. See README "Network Model" for details."""
+    synthetic ``/etc/hosts``. Empty = deny all outbound (Landlock
+    rejects TCP on the direct path; no on-behalf path is enabled, so
+    UDP `sendto`/`sendmsg` are also untrapped — but UDP socket creation
+    itself is denied unless :attr:`allow_udp` is set). HTTP rules with
+    concrete hosts auto-add a matching entry on :attr:`http_ports`.
+    See README "Network Model" for details."""
 
     no_coredump: bool = False
     """Disable core dumps and restrict /proc/pid access from other
     processes.  Applied via prctl(PR_SET_DUMPABLE, 0).  Prevents
     leaking sandbox memory contents but breaks gdb/strace/perf."""
 
-    # Network (Landlock ABI v4+, TCP only)
+    # Network — bind allowlist (Landlock ABI v4+, TCP only)
     net_bind: Sequence[int | str] = field(default_factory=list)
-    """TCP ports the sandbox may bind.  Empty = deny all.
-    Each entry is a port number or a ``"lo-hi"`` range string."""
+    """TCP ports the sandbox may bind. Empty = deny all. Each entry is
+    a port number or a ``"lo-hi"`` range string. UDP bind is gated by
+    :attr:`allow_udp` rather than this list — Landlock's port hooks
+    are TCP-only."""
 
     # Socket type restrictions (seccomp-enforced).
     # Raw sockets and UDP are denied by default; opt in via the flags below.

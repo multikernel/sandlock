@@ -62,7 +62,7 @@ Unset fields mean "no restriction" unless noted otherwise.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `net_allow` | `list[str]` | `[]` | Outbound TCP endpoint rules. Each entry is `"host:port[,port,...]"`, `":port"`, or `"*:port"`. Empty = deny all. |
+| `net_allow` | `list[str]` | `[]` | Outbound endpoint rules (TCP; UDP too when `allow_udp=True`). Each entry is `"host:port[,port,...]"`, `":port"`, or `"*:port"`. Empty = deny all. |
 | `net_bind` | `list[int \| str]` | `[]` | TCP ports the sandbox may bind (empty = deny all) |
 | `port_remap` | `bool` | `False` | Transparent TCP port virtualization |
 | `allow_udp` | `bool` | `False` | Permit UDP sockets (outbound destinations still gated by `net_allow`) |
@@ -508,7 +508,7 @@ permissions explicitly:
 | Capability | Example | Description |
 |------------|---------|-------------|
 | `fs_writable` | `["/tmp/agent"]` | Paths the tool can write to |
-| `net_allow` | `["api.example.com:443"]` | Outbound TCP endpoints (`host:port`, `:port`, or `*:port`) |
+| `net_allow` | `["api.example.com:443"]` | Outbound endpoints (`host:port`, `:port`, or `*:port`) — TCP, plus UDP when `allow_udp=True` |
 | `env` | `{"KEY": "val"}` | Environment variables to pass |
 | `max_memory` | `"256M"` | Memory limit |
 
