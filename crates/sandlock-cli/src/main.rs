@@ -28,12 +28,16 @@ enum Command {
         max_processes: Option<u32>,
         #[arg(short = 't', long)]
         timeout: Option<u64>,
-        #[arg(long = "net-allow-host")]
-        net_allow_host: Vec<String>,
+        /// Outbound endpoint allow rule (TCP, plus UDP when
+        /// `--allow-udp` is set). Repeatable. Each value is
+        /// `host:port[,port,...]` (IP-restricted), `:port` or `*:port`
+        /// (any IP). Examples: `api.openai.com:443`,
+        /// `github.com:22,443`, `:8080`, `1.1.1.1:53`.
+        /// See README "Network Model".
+        #[arg(long = "net-allow", value_name = "SPEC")]
+        net_allow: Vec<String>,
         #[arg(long = "net-bind")]
         net_bind: Vec<u16>,
-        #[arg(long = "net-connect")]
-        net_connect: Vec<u16>,
         #[arg(long)]
         time_start: Option<String>,
         #[arg(long)]
@@ -65,10 +69,18 @@ enum Command {
         fs_storage: Option<String>,
         #[arg(long = "max-disk")]
         max_disk: Option<String>,
-        #[arg(long = "net-allow", value_name = "PROTO")]
-        net_allow: Vec<String>,
-        #[arg(long = "net-deny", value_name = "PROTO")]
-        net_deny: Vec<String>,
+        /// Allow UDP socket creation. UDP is denied by default; this
+        /// turns it back on. Outbound UDP destinations are still
+        /// gated by `--net-allow` (the same endpoint allowlist used
+        /// for TCP).
+        #[arg(long = "allow-udp")]
+        allow_udp: bool,
+        /// Allow ICMP raw sockets only — `socket(AF_INET, SOCK_RAW,
+        /// IPPROTO_ICMP)` and the IPv6 equivalent. Other `SOCK_RAW`
+        /// types stay denied. Useful for `ping` without granting full
+        /// packet-crafting capability.
+        #[arg(long = "allow-icmp")]
+        allow_icmp: bool,
         #[arg(long = "http-allow", value_name = "RULE")]
         http_allow: Vec<String>,
         #[arg(long = "http-deny", value_name = "RULE")]
@@ -163,10 +175,10 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Run { fs_read, fs_write, max_memory, max_processes, timeout,
-            net_allow_host, net_bind, net_connect, time_start, random_seed,
+            net_allow, net_bind, time_start, random_seed,
             clean_env, num_cpus, profile: profile_name, status_fd,
             max_cpu, max_open_files, chroot, uid, workdir, cwd,
-            fs_isolation, fs_storage, max_disk, net_allow, net_deny,
+            fs_isolation, fs_storage, max_disk, allow_udp, allow_icmp,
             http_allow, http_deny, http_ports, https_ca, https_key,
             port_remap, no_randomize_memory, no_huge_pages, deterministic_dirs, name, no_coredump,
             env_vars, exec_shell, interactive: _, fs_deny, fs_mount, cpu_cores, gpu_devices, image, dry_run, no_supervisor, cmd } =>
@@ -174,8 +186,8 @@ async fn main() -> Result<()> {
             if no_supervisor {
                 validate_no_supervisor(
                     &max_memory, &max_processes, &max_cpu, &max_open_files,
-                    &timeout, &net_allow_host, &net_bind, &net_connect,
-                    &net_allow, &net_deny, &http_allow, &http_deny, &http_ports,
+                    &timeout, &net_allow, &net_bind,
+                    allow_udp, allow_icmp, &http_allow, &http_deny, &http_ports,
                     &num_cpus, &random_seed, &time_start, no_randomize_memory,
                     no_huge_pages, deterministic_dirs, &name, &chroot,
                     &image, &uid, &workdir, &cwd, &fs_isolation, &fs_storage,
@@ -235,12 +247,13 @@ async fn main() -> Result<()> {
                 for p in &base.fs_readable { b = b.fs_read(p); }
                 for p in &base.fs_writable { b = b.fs_write(p); }
                 for p in &base.fs_denied { b = b.fs_deny(p); }
-                if let Some(hosts) = &base.net_allow_hosts {
-                    b = b.net_restrict_hosts();
-                    for h in hosts { b = b.net_allow_host(h); }
+                for rule in &base.net_allow {
+                    let port_csv: Vec<String> = rule.ports.iter().map(|p| p.to_string()).collect();
+                    let host_part = rule.host.as_deref().unwrap_or("");
+                    let spec = format!("{}:{}", host_part, port_csv.join(","));
+                    b = b.net_allow(spec);
                 }
                 for p in &base.net_bind { b = b.net_bind_port(*p); }
-                for p in &base.net_connect { b = b.net_connect_port(*p); }
                 for rule in &base.http_allow {
                     let s = format!("{} {}{}", rule.method, rule.host, rule.path);
                     b = b.http_allow(&s);
@@ -257,8 +270,8 @@ async fn main() -> Result<()> {
                 if let Some(cpu) = base.max_cpu { b = b.max_cpu(cpu); }
                 if let Some(seed) = base.random_seed { b = b.random_seed(seed); }
                 if let Some(n) = base.num_cpus { b = b.num_cpus(n); }
-                b = b.no_raw_sockets(base.no_raw_sockets);
-                b = b.no_udp(base.no_udp);
+                b = b.allow_udp(base.allow_udp);
+                b = b.allow_icmp(base.allow_icmp);
                 b = b.clean_env(base.clean_env);
                 if let Some(ref w) = base.workdir { b = b.workdir(w); }
                 if let Some(ref c) = base.cwd { b = b.cwd(c); }
@@ -272,9 +285,8 @@ async fn main() -> Result<()> {
             for p in &fs_write { builder = builder.fs_write(p); }
             if let Some(ref m) = max_memory { builder = builder.max_memory(ByteSize::parse(m)?); }
             if let Some(n) = max_processes { builder = builder.max_processes(n); }
-            for h in &net_allow_host { builder = builder.net_allow_host(h); }
+            for spec in &net_allow { builder = builder.net_allow(spec); }
             for p in &net_bind { builder = builder.net_bind_port(*p); }
-            for p in &net_connect { builder = builder.net_connect_port(*p); }
             if let Some(seed) = random_seed { builder = builder.random_seed(seed); }
             if clean_env { builder = builder.clean_env(true); }
             if let Some(n) = num_cpus { builder = builder.num_cpus(n); }
@@ -306,19 +318,12 @@ async fn main() -> Result<()> {
             }
             if let Some(ref path) = fs_storage { builder = builder.fs_storage(path); }
             if let Some(ref s) = max_disk { builder = builder.max_disk(ByteSize::parse(s)?); }
-            for proto in &net_allow {
-                match proto.as_str() {
-                    "icmp" => { builder = builder.no_raw_sockets(false); }
-                    other => return Err(anyhow!("unknown --net-allow protocol: {}", other)),
-                }
-            }
-            for proto in &net_deny {
-                match proto.as_str() {
-                    "raw" => { builder = builder.no_raw_sockets(true); }
-                    "udp" => { builder = builder.no_udp(true); }
-                    other => return Err(anyhow!("unknown --net-deny protocol: {}", other)),
-                }
-            }
+            if allow_udp { builder = builder.allow_udp(true); }
+            // --allow-icmp narrowly permits ICMP raw sockets; arbitrary
+            // raw sockets stay denied. The seccomp filter inspects the
+            // protocol arg of `socket()` so non-ICMP `SOCK_RAW` is
+            // still rejected.
+            if allow_icmp { builder = builder.allow_icmp(true); }
             for rule in &http_allow { builder = builder.http_allow(rule); }
             for rule in &http_deny { builder = builder.http_deny(rule); }
             for port in &http_ports { builder = builder.http_port(*port); }
@@ -410,9 +415,14 @@ async fn main() -> Result<()> {
                 sb.spawn(&cmd_strs).await?;
 
                 let pid = sb.pid().unwrap_or(0);
+                let registered_hosts: Vec<String> = policy
+                    .net_allow
+                    .iter()
+                    .filter_map(|r| r.host.clone())
+                    .collect();
                 if let Err(e) = network_registry::register(
                     &sandbox_name, pid, std::collections::HashMap::new(),
-                    policy.net_allow_hosts.clone().unwrap_or_default(),
+                    registered_hosts,
                     None, // virtual_etc_hosts populated by core at runtime
                 ) {
                     eprintln!("sandlock: network registry: {}", e);
@@ -581,11 +591,10 @@ fn validate_no_supervisor(
     max_cpu: &Option<u8>,
     max_open_files: &Option<u32>,
     timeout: &Option<u64>,
-    net_allow_host: &[String],
-    net_bind: &[u16],
-    net_connect: &[u16],
     net_allow: &[String],
-    net_deny: &[String],
+    net_bind: &[u16],
+    allow_udp: bool,
+    allow_icmp: bool,
     http_allow: &[String],
     http_deny: &[String],
     http_ports: &[u16],
@@ -619,11 +628,10 @@ fn validate_no_supervisor(
     if max_cpu.is_some() { bad.push("--max-cpu"); }
     if max_open_files.is_some() { bad.push("--max-open-files"); }
     if timeout.is_some() { bad.push("--timeout"); }
-    if !net_allow_host.is_empty() { bad.push("--net-allow-host"); }
-    if !net_bind.is_empty() { bad.push("--net-bind"); }
-    if !net_connect.is_empty() { bad.push("--net-connect"); }
     if !net_allow.is_empty() { bad.push("--net-allow"); }
-    if !net_deny.is_empty() { bad.push("--net-deny"); }
+    if !net_bind.is_empty() { bad.push("--net-bind"); }
+    if allow_udp { bad.push("--allow-udp"); }
+    if allow_icmp { bad.push("--allow-icmp"); }
     if !http_allow.is_empty() { bad.push("--http-allow"); }
     if !http_deny.is_empty() { bad.push("--http-deny"); }
     if !http_ports.is_empty() { bad.push("--http-port"); }

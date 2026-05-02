@@ -14,15 +14,15 @@ class TestDenyByDefault:
         policy = policy_for_tool(workspace="/tmp/ws")
         assert policy.fs_writable == []
         assert "/tmp/ws" in policy.fs_readable
-        assert policy.net_connect == []
+        assert policy.net_allow == []
         assert policy.net_bind == []
-        assert policy.no_udp is True
-        assert policy.no_raw_sockets is True
+        assert policy.allow_udp is False
+        assert policy.allow_icmp is False
 
     def test_empty_capabilities(self):
         policy = policy_for_tool(workspace="/tmp/ws", capabilities={})
         assert policy.fs_writable == []
-        assert policy.net_connect == []
+        assert policy.net_allow == []
 
 
 class TestCapabilities:
@@ -34,19 +34,12 @@ class TestCapabilities:
         )
         assert "/tmp/ws" in policy.fs_writable
 
-    def test_net_connect(self):
+    def test_net_allow(self):
         policy = policy_for_tool(
             workspace="/tmp/ws",
-            capabilities={"net_connect": [443]},
+            capabilities={"net_allow": ["api.google.com:443"]},
         )
-        assert 443 in policy.net_connect
-
-    def test_net_allow_hosts(self):
-        policy = policy_for_tool(
-            workspace="/tmp/ws",
-            capabilities={"net_allow_hosts": ["api.google.com"]},
-        )
-        assert "api.google.com" in policy.net_allow_hosts
+        assert "api.google.com:443" in policy.net_allow
 
     def test_max_memory(self):
         policy = policy_for_tool(
@@ -60,33 +53,14 @@ class TestCapabilities:
             workspace="/tmp/ws",
             capabilities={
                 "fs_writable": ["/data"],
-                "net_connect": [443, 8080],
+                "net_allow": ["api.example.com:443", ":8080"],
                 "max_memory": "256M",
             },
         )
         assert policy.fs_writable == ["/data"]
-        assert 443 in policy.net_connect
-        assert 8080 in policy.net_connect
+        assert "api.example.com:443" in policy.net_allow
+        assert ":8080" in policy.net_allow
         assert policy.max_memory == "256M"
-
-    def test_net_allow_hosts_implies_net_connect(self):
-        policy = policy_for_tool(
-            workspace="/tmp/ws",
-            capabilities={"net_allow_hosts": ["example.com"]},
-        )
-        assert "example.com" in policy.net_allow_hosts
-        assert 80 in policy.net_connect
-        assert 443 in policy.net_connect
-
-    def test_net_allow_hosts_with_explicit_net_connect(self):
-        policy = policy_for_tool(
-            workspace="/tmp/ws",
-            capabilities={
-                "net_allow_hosts": ["example.com"],
-                "net_connect": [8443],
-            },
-        )
-        assert policy.net_connect == [8443]  # explicit wins
 
     def test_unknown_field_ignored(self):
         policy = policy_for_tool(
@@ -105,9 +79,9 @@ class TestCapabilitiesFromMcpTool:
         return t
 
     def test_from_annotations(self):
-        tool = self._tool({"sandlock:net_connect": [443]})
+        tool = self._tool({"sandlock:net_allow": ["api.example.com:443"]})
         caps = capabilities_from_mcp_tool(tool)
-        assert caps == {"net_connect": [443]}
+        assert caps == {"net_allow": ["api.example.com:443"]}
 
     def test_from_meta(self):
         tool = self._tool(meta={"sandlock:max_memory": "128M"})
@@ -141,8 +115,8 @@ class TestCapabilitiesFromMcpTool:
     def test_meta_overrides_annotations(self):
         """meta wins over annotations for same key."""
         tool = self._tool(
-            {"sandlock:net_connect": [80]},
-            {"sandlock:net_connect": [443]},
+            {"sandlock:net_allow": ["foo.com:80"]},
+            {"sandlock:net_allow": ["foo.com:443"]},
         )
         caps = capabilities_from_mcp_tool(tool)
-        assert caps == {"net_connect": [443]}
+        assert caps == {"net_allow": ["foo.com:443"]}

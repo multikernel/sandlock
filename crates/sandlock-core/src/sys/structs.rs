@@ -249,6 +249,8 @@ pub const AF_INET6: u32 = 10;
 pub const SOCK_RAW: u32 = 3;
 pub const SOCK_DGRAM: u32 = 2;
 pub const SOCK_TYPE_MASK: u32 = 0xFF;
+pub const IPPROTO_ICMP: u32 = 1;
+pub const IPPROTO_ICMPV6: u32 = 58;
 
 // ============================================================
 // Errno values

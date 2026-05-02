@@ -74,6 +74,57 @@ pub enum BranchAction {
     Keep,
 }
 
+/// A network endpoint allow rule.
+///
+/// Each rule permits TCP `connect()` to one host (or any IP, for the
+/// `:port` form) on a specific set of ports. Multiple rules are OR'd:
+/// a connection is permitted if any rule matches both the destination
+/// IP and the destination port.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct NetAllow {
+    /// Hostname; `None` means "any IP" (the `:port` form).
+    pub host: Option<String>,
+    /// Permitted ports. Must be non-empty.
+    pub ports: Vec<u16>,
+}
+
+impl NetAllow {
+    /// Parse a `host:port[,port,...]` / `:port` / `*:port` spec.
+    pub fn parse(s: &str) -> Result<Self, PolicyError> {
+        let (host_part, port_part) = s.rsplit_once(':').ok_or_else(|| {
+            PolicyError::Invalid(format!(
+                "--net-allow: expected `host:port` or `:port`, got `{}`",
+                s
+            ))
+        })?;
+        let host = match host_part {
+            "" | "*" => None,
+            h => Some(h.to_string()),
+        };
+        let mut ports = Vec::new();
+        for p in port_part.split(',') {
+            let p = p.trim();
+            let n: u16 = p.parse().map_err(|_| {
+                PolicyError::Invalid(format!("--net-allow: invalid port `{}` in `{}`", p, s))
+            })?;
+            if n == 0 {
+                return Err(PolicyError::Invalid(format!(
+                    "--net-allow: port 0 is not valid in `{}`",
+                    s
+                )));
+            }
+            ports.push(n);
+        }
+        if ports.is_empty() {
+            return Err(PolicyError::Invalid(format!(
+                "--net-allow: at least one port required in `{}`",
+                s
+            )));
+        }
+        Ok(NetAllow { host, ports })
+    }
+}
+
 /// An HTTP access control rule.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct HttpRule {
@@ -257,19 +308,32 @@ pub struct Policy {
     pub allow_syscalls: Option<Vec<String>>,
 
     // Network
-    /// Allowed domain names.
+    /// Outbound endpoint allowlist as a list of `(host?, ports)` rules.
+    /// Applies to TCP `connect()` and to UDP `sendto`/`sendmsg`
+    /// destinations when `allow_udp` is set.
     ///
-    /// * `None` — unrestricted: the real `/etc/hosts` is visible and DNS is
-    ///   not virtualized.
-    /// * `Some(empty)` — deny all: `/etc/hosts` is virtualized to an empty
-    ///   map and the IP allowlist is empty (no hosts resolvable).
-    /// * `Some(nonempty)` — allowlist: only these domains are resolved and
-    ///   their IPs placed in the allowlist.
-    pub net_allow_hosts: Option<Vec<String>>,
+    /// Empty `net_allow` and empty `http_allow`/`http_deny` together
+    /// mean "deny all outbound" (Landlock direct path denies, no
+    /// on-behalf path is enabled). Otherwise, the on-behalf path
+    /// enforces these rules: a destination is permitted iff any rule
+    /// matches both the destination IP (or has `host: None` = any IP)
+    /// and the destination port — same check for TCP and UDP.
+    ///
+    /// HTTP rules with concrete hosts auto-add a matching `(host, [80])`
+    /// (and `(host, [443])` when `--https-ca` is set) entry at build
+    /// time so the proxy's intercept ports remain reachable. HTTP rules
+    /// with wildcard hosts auto-add `(None, [80])` instead.
+    pub net_allow: Vec<NetAllow>,
     pub net_bind: Vec<u16>,
-    pub net_connect: Vec<u16>,
-    pub no_raw_sockets: bool,
-    pub no_udp: bool,
+    /// Permit UDP socket creation (`socket(_, SOCK_DGRAM, _)`). UDP is
+    /// denied by default; outbound destinations remain gated by the
+    /// `net_allow` endpoint allowlist when set.
+    pub allow_udp: bool,
+    /// Narrow ICMP carve-out: permit `socket(AF_INET, SOCK_RAW,
+    /// IPPROTO_ICMP)` and the IPv6 equivalent. All other raw socket
+    /// types remain denied. Useful for `ping` without granting full
+    /// packet-crafting capability.
+    pub allow_icmp: bool,
 
     // HTTP ACL
     pub http_allow: Vec<HttpRule>,
@@ -359,11 +423,11 @@ pub struct PolicyBuilder {
     deny_syscalls: Option<Vec<String>>,
     allow_syscalls: Option<Vec<String>>,
 
-    net_allow_hosts: Option<Vec<String>>,
+    /// Raw `--net-allow` specs; parsed in `build()` to surface errors.
+    net_allow: Vec<String>,
     net_bind: Vec<u16>,
-    net_connect: Vec<u16>,
-    no_raw_sockets: Option<bool>,
-    no_udp: bool,
+    allow_udp: bool,
+    allow_icmp: bool,
 
     http_allow: Vec<String>,
     http_deny: Vec<String>,
@@ -442,20 +506,16 @@ impl PolicyBuilder {
         self
     }
 
-    /// Add a host to the domain allowlist. Implicitly enables host
-    /// restriction (switches `net_allow_hosts` from `None` to `Some`).
-    pub fn net_allow_host(mut self, host: impl Into<String>) -> Self {
-        self.net_allow_hosts
-            .get_or_insert_with(Vec::new)
-            .push(host.into());
-        self
-    }
-
-    /// Enable host restriction without adding any hosts. The resulting
-    /// sandbox has an empty `/etc/hosts` and no resolvable domains —
-    /// equivalent to "deny all hosts".
-    pub fn net_restrict_hosts(mut self) -> Self {
-        self.net_allow_hosts.get_or_insert_with(Vec::new);
+    /// Add a network endpoint rule. Spec is `host:port[,port,...]`,
+    /// `:port`, or `*:port`. Validated at `build()` time so callers
+    /// receive parse errors via the standard `PolicyBuilder` flow.
+    ///
+    /// Examples:
+    /// - `.net_allow("api.openai.com:443")` — HTTPS to OpenAI only
+    /// - `.net_allow("github.com:22,443")` — SSH and HTTPS to GitHub
+    /// - `.net_allow(":8080")` — any IP on port 8080
+    pub fn net_allow(mut self, spec: impl Into<String>) -> Self {
+        self.net_allow.push(spec.into());
         self
     }
 
@@ -464,18 +524,17 @@ impl PolicyBuilder {
         self
     }
 
-    pub fn net_connect_port(mut self, port: u16) -> Self {
-        self.net_connect.push(port);
+    /// Permit UDP socket creation. UDP is denied by default;
+    /// outbound destinations remain gated by `net_allow` if set.
+    pub fn allow_udp(mut self, v: bool) -> Self {
+        self.allow_udp = v;
         self
     }
 
-    pub fn no_raw_sockets(mut self, v: bool) -> Self {
-        self.no_raw_sockets = Some(v);
-        self
-    }
-
-    pub fn no_udp(mut self, v: bool) -> Self {
-        self.no_udp = v;
+    /// Permit `socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)` and the IPv6
+    /// equivalent only. Other raw socket types stay denied.
+    pub fn allow_icmp(mut self, v: bool) -> Self {
+        self.allow_icmp = v;
         self
     }
 
@@ -491,11 +550,6 @@ impl PolicyBuilder {
 
     pub fn http_port(mut self, port: u16) -> Self {
         self.http_ports.push(port);
-        // HTTP ACL intercepts TCP connections on this port, so it must be
-        // in the Landlock net_connect allowlist too.
-        if !self.net_connect.contains(&port) {
-            self.net_connect.push(port);
-        }
         self
     }
 
@@ -696,6 +750,44 @@ impl PolicyBuilder {
             self.http_ports
         };
 
+        // Parse user-supplied --net-allow specs.
+        let mut net_allow: Vec<NetAllow> = self
+            .net_allow
+            .iter()
+            .map(|s| NetAllow::parse(s))
+            .collect::<Result<_, _>>()?;
+
+        // Auto-merge HTTP rules into the network allowlist so the proxy's
+        // intercept ports remain reachable. A rule with a concrete host
+        // tightens the IP allowlist (only that host on http_ports);
+        // wildcard hosts add a `:port` (any IP) rule. This mirrors the
+        // intent of the old `http_port → net_connect` merge but at the
+        // endpoint level so HTTP and net_allow stay aligned.
+        if !http_ports.is_empty() {
+            let mut wildcard_seen = false;
+            let mut concrete_hosts: Vec<String> = Vec::new();
+            for rule in http_allow.iter().chain(http_deny.iter()) {
+                if rule.host == "*" {
+                    wildcard_seen = true;
+                } else if !concrete_hosts.iter().any(|h| h.eq_ignore_ascii_case(&rule.host)) {
+                    concrete_hosts.push(rule.host.clone());
+                }
+            }
+            if wildcard_seen || (http_allow.is_empty() && http_deny.is_empty()) {
+                // Fallback: explicit --http-port without rules, or wildcard rules.
+                net_allow.push(NetAllow {
+                    host: None,
+                    ports: http_ports.clone(),
+                });
+            }
+            for h in concrete_hosts {
+                net_allow.push(NetAllow {
+                    host: Some(h),
+                    ports: http_ports.clone(),
+                });
+            }
+        }
+
         // Validate: fs_isolation != None requires workdir
         let fs_isolation = self.fs_isolation.unwrap_or_default();
         if fs_isolation != FsIsolation::None && self.workdir.is_none() {
@@ -708,11 +800,10 @@ impl PolicyBuilder {
             fs_denied: self.fs_denied,
             deny_syscalls: self.deny_syscalls,
             allow_syscalls: self.allow_syscalls,
-            net_allow_hosts: self.net_allow_hosts,
+            net_allow,
             net_bind: self.net_bind,
-            net_connect: self.net_connect,
-            no_raw_sockets: self.no_raw_sockets.unwrap_or(true),
-            no_udp: self.no_udp,
+            allow_udp: self.allow_udp,
+            allow_icmp: self.allow_icmp,
             http_allow,
             http_deny,
             http_ports,

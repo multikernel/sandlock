@@ -108,7 +108,7 @@ async fn test_personality_blocked() {
 }
 
 // ------------------------------------------------------------------
-// 4. Raw sockets blocked by default (no_raw_sockets defaults to true)
+// 4. Raw sockets blocked by default (allow_icmp defaults to false)
 // ------------------------------------------------------------------
 #[tokio::test]
 async fn test_raw_socket_blocked() {
@@ -143,11 +143,12 @@ async fn test_raw_socket_blocked() {
 }
 
 // ------------------------------------------------------------------
-// 4. Raw sockets allowed when no_raw_sockets(false)
+// 4b. allow_icmp(true) permits AF_INET + SOCK_RAW + IPPROTO_ICMP
+//     while other raw socket types remain denied.
 // ------------------------------------------------------------------
 #[tokio::test]
-async fn test_raw_socket_allowed_when_permitted() {
-    let out = temp_out("raw-socket-allowed");
+async fn test_allow_icmp_permits_icmp_raw() {
+    let out = temp_out("allow-icmp-permits-icmp");
     let script = format!(concat!(
         "import socket\n",
         "try:\n",
@@ -162,7 +163,7 @@ async fn test_raw_socket_allowed_when_permitted() {
     ), out = out.display());
 
     let policy = base_policy()
-        .no_raw_sockets(false)
+        .allow_icmp(true)
         .build()
         .unwrap();
     let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
@@ -171,23 +172,66 @@ async fn test_raw_socket_allowed_when_permitted() {
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
-    // When seccomp allows it, the OS may still deny if not running as root.
-    // Accept ALLOWED (root) or BLOCKED/ERROR (non-root OS-level denial).
+    // seccomp must permit it; the kernel may still deny without CAP_NET_RAW
+    // (errno 1 = EPERM). Accept ALLOWED (root) or BLOCKED/ERROR:1 (non-root
+    // capability denial).
     let trimmed = contents.trim();
     assert!(
-        trimmed == "ALLOWED" || trimmed == "BLOCKED" || trimmed.starts_with("ERROR:"),
-        "unexpected result when raw sockets permitted: {}",
+        trimmed == "ALLOWED" || trimmed == "BLOCKED" || trimmed == "ERROR:1",
+        "ICMP raw socket should be permitted by seccomp under allow_icmp; got: {}",
         trimmed
     );
     assert!(result.success());
 }
 
 // ------------------------------------------------------------------
-// 5. UDP blocked when no_udp(true)
+// 4c. allow_icmp(true) still blocks SOCK_RAW with non-ICMP protocol
+//     (verifies the BPF arg2 protocol check)
 // ------------------------------------------------------------------
 #[tokio::test]
-async fn test_udp_blocked_when_enabled() {
-    let out = temp_out("udp-blocked");
+async fn test_allow_icmp_still_blocks_other_raw() {
+    let out = temp_out("allow-icmp-blocks-tcp-raw");
+    // AF_INET + SOCK_RAW + IPPROTO_TCP must still be denied by seccomp.
+    let script = format!(concat!(
+        "import socket\n",
+        "try:\n",
+        "  s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)\n",
+        "  s.close()\n",
+        "  result = 'ALLOWED'\n",
+        "except PermissionError:\n",
+        "  result = 'BLOCKED'\n",
+        "except OSError as e:\n",
+        "  result = f'ERROR:{{e.errno}}'\n",
+        "open('{out}', 'w').write(result)\n",
+    ), out = out.display());
+
+    let policy = base_policy()
+        .allow_icmp(true)
+        .build()
+        .unwrap();
+    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+        .await
+        .unwrap();
+
+    let contents = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    let trimmed = contents.trim();
+    // Must be denied — either via seccomp (BLOCKED) or the kernel (EPERM).
+    // Critically must NOT be ALLOWED.
+    assert_ne!(
+        trimmed, "ALLOWED",
+        "non-ICMP raw socket must remain denied under allow_icmp; got: {}",
+        trimmed
+    );
+    assert!(result.success());
+}
+
+// ------------------------------------------------------------------
+// 5. UDP allowed when allow_udp(true)
+// ------------------------------------------------------------------
+#[tokio::test]
+async fn test_udp_allowed_when_opted_in() {
+    let out = temp_out("udp-allowed");
     let script = format!(concat!(
         "import socket\n",
         "try:\n",
@@ -202,7 +246,7 @@ async fn test_udp_blocked_when_enabled() {
     ), out = out.display());
 
     let policy = base_policy()
-        .no_udp(true)
+        .allow_udp(true)
         .build()
         .unwrap();
     let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
@@ -213,19 +257,19 @@ async fn test_udp_blocked_when_enabled() {
     let _ = std::fs::remove_file(&out);
     assert_eq!(
         contents.trim(),
-        "BLOCKED",
-        "UDP socket should be blocked with no_udp(true), got: {}",
+        "ALLOWED",
+        "UDP socket should be allowed with allow_udp(true), got: {}",
         contents.trim()
     );
     assert!(result.success());
 }
 
 // ------------------------------------------------------------------
-// 6. UDP allowed by default (no no_udp flag)
+// 6. UDP denied by default
 // ------------------------------------------------------------------
 #[tokio::test]
-async fn test_udp_allowed_by_default() {
-    let out = temp_out("udp-allowed");
+async fn test_udp_denied_by_default() {
+    let out = temp_out("udp-denied");
     let script = format!(concat!(
         "import socket\n",
         "try:\n",
@@ -248,15 +292,15 @@ async fn test_udp_allowed_by_default() {
     let _ = std::fs::remove_file(&out);
     assert_eq!(
         contents.trim(),
-        "ALLOWED",
-        "UDP socket should be allowed by default, got: {}",
+        "BLOCKED",
+        "UDP should be denied by default; got: {}",
         contents.trim()
     );
     assert!(result.success());
 }
 
 // ------------------------------------------------------------------
-// 8. TCP always allowed even with no_raw_sockets + no_udp
+// 8. TCP always allowed (default deny posture for raw + UDP)
 // ------------------------------------------------------------------
 #[tokio::test]
 async fn test_tcp_always_allowed() {
@@ -275,8 +319,6 @@ async fn test_tcp_always_allowed() {
     ), out = out.display());
 
     let policy = base_policy()
-        .no_raw_sockets(true)
-        .no_udp(true)
         .build()
         .unwrap();
     let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])

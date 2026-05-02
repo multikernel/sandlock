@@ -190,7 +190,7 @@ class TestXOA:
                     workspace, "/usr", "/lib", "/lib64", "/etc", "/bin", "/sbin",
                     _PYTHON_PREFIX,
                 ])),
-                net_connect=[],
+                net_allow=[],
             )
 
             # Planner emits a script that reads the data file.
@@ -216,7 +216,7 @@ class TestXOA:
 
     def test_xoa_executor_no_network(self):
         """Executor cannot reach the network."""
-        executor_policy = _policy(net_connect=[])
+        executor_policy = _policy(net_allow=[])
 
         result = (
             Sandbox(_policy()).cmd(

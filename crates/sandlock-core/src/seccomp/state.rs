@@ -291,11 +291,12 @@ impl CowState {
 
 /// Network policy and port-remapping state.
 pub struct NetworkState {
-    /// Global network policy: unrestricted or limited to a set of IPs.
+    /// Global network policy: endpoint-level allowlist or unrestricted.
     pub network_policy: crate::seccomp::notif::NetworkPolicy,
     /// Port binding and remapping tracker.
     pub port_map: crate::port_remap::PortMap,
-    /// Per-PID network overrides from policy_fn.
+    /// Per-PID network overrides from policy_fn (IP-only via the legacy
+    /// `restrict_network(ips)` API; any port is permitted to listed IPs).
     pub pid_ip_overrides: std::sync::Arc<std::sync::RwLock<HashMap<u32, HashSet<std::net::IpAddr>>>>,
     /// HTTP ACL proxy address (None if HTTP ACL not active).
     pub http_acl_addr: Option<std::net::SocketAddr>,
@@ -320,22 +321,30 @@ impl NetworkState {
     /// Get the effective network policy for a PID.
     ///
     /// Priority: per-PID override > live policy (from PolicyFnState) > global network_policy.
-    /// The `live_policy` parameter allows checking the live policy without needing
-    /// to lock the PolicyFnState mutex.
+    /// PID/live overrides are IP-only — any port is permitted to listed
+    /// IPs (legacy `policy_fn` semantics).
     pub fn effective_network_policy(
         &self,
         pid: u32,
         live_policy: Option<&std::sync::Arc<std::sync::RwLock<crate::policy_fn::LivePolicy>>>,
     ) -> crate::seccomp::notif::NetworkPolicy {
+        use crate::seccomp::notif::{NetworkPolicy, PortAllow};
+        let ip_only_allow = |ips: &HashSet<std::net::IpAddr>| {
+            let per_ip = ips.iter().map(|&ip| (ip, PortAllow::Any)).collect();
+            NetworkPolicy::AllowList {
+                per_ip,
+                any_ip_ports: HashSet::new(),
+            }
+        };
         if let Ok(overrides) = self.pid_ip_overrides.read() {
             if let Some(ips) = overrides.get(&pid) {
-                return crate::seccomp::notif::NetworkPolicy::AllowList(ips.clone());
+                return ip_only_allow(ips);
             }
         }
         if let Some(lp) = live_policy {
             if let Ok(live) = lp.read() {
                 if !live.allowed_ips.is_empty() {
-                    return crate::seccomp::notif::NetworkPolicy::AllowList(live.allowed_ips.clone());
+                    return ip_only_allow(&live.allowed_ips);
                 }
             }
         }

@@ -47,11 +47,10 @@ class TestPolicyFromDict:
     def test_net_ports(self):
         p = policy_from_dict({
             "net_bind": ["8080"],
-            "net_connect": [80, 443],
+            "net_allow": ["api.example.com:443", ":8080"],
         })
         assert p.net_bind == ["8080"]
-        # Integers in port lists get coerced to strings
-        assert p.net_connect == ["80", "443"]
+        assert list(p.net_allow) == ["api.example.com:443", ":8080"]
 
     def test_fs_isolation_enum(self):
         p = policy_from_dict({"fs_isolation": "branchfs"})

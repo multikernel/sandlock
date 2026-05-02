@@ -4,7 +4,8 @@ use sandlock_core::policy::{ByteSize, FsIsolation, BranchAction, Policy};
 fn test_default_policy() {
     let policy = Policy::builder().build().unwrap();
     assert_eq!(policy.max_processes, 64);
-    assert!(policy.no_raw_sockets);
+    assert!(!policy.allow_udp, "UDP is denied by default");
+    assert!(!policy.allow_icmp, "ICMP raw is denied by default");
     assert!(policy.uid.is_none());
     assert!(policy.fs_writable.is_empty());
     assert!(policy.fs_readable.is_empty());
@@ -26,12 +27,27 @@ fn test_builder_fs_paths() {
 fn test_builder_network() {
     let policy = Policy::builder()
         .net_bind_port(8080)
-        .net_connect_port(443)
-        .net_connect_port(80)
+        .net_allow("api.example.com:443,80")
         .build()
         .unwrap();
     assert_eq!(policy.net_bind, vec![8080]);
-    assert_eq!(policy.net_connect, vec![443, 80]);
+    assert_eq!(policy.net_allow.len(), 1);
+    let rule = &policy.net_allow[0];
+    assert_eq!(rule.host.as_deref(), Some("api.example.com"));
+    assert_eq!(rule.ports, vec![443, 80]);
+}
+
+#[test]
+fn test_net_allow_parse_grammar() {
+    use sandlock_core::policy::NetAllow;
+    assert!(NetAllow::parse("foo.com:443").is_ok());
+    assert!(NetAllow::parse("foo.com:22,443").is_ok());
+    assert!(NetAllow::parse(":8080").is_ok());
+    assert!(NetAllow::parse("*:8080").is_ok());
+    assert!(NetAllow::parse("foo.com").is_err()); // missing port
+    assert!(NetAllow::parse("foo.com:abc").is_err()); // bad port
+    assert!(NetAllow::parse("foo.com:0").is_err()); // port 0 reserved
+    assert!(NetAllow::parse("foo.com:").is_err()); // empty port list
 }
 
 #[test]
@@ -112,15 +128,15 @@ fn test_env_var() {
 }
 
 #[test]
-fn test_no_udp_default_false() {
+fn test_allow_udp_default_false() {
     let p = Policy::builder().build().unwrap();
-    assert!(!p.no_udp, "no_udp should default to false");
+    assert!(!p.allow_udp, "UDP is denied by default; opt in via .allow_udp(true)");
 }
 
 #[test]
-fn test_no_raw_sockets_default_true() {
+fn test_allow_icmp_default_false() {
     let p = Policy::builder().build().unwrap();
-    assert!(p.no_raw_sockets, "no_raw_sockets should default to true");
+    assert!(!p.allow_icmp, "ICMP raw is denied by default; opt in via .allow_icmp(true)");
 }
 
 #[test]

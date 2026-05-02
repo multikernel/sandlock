@@ -52,7 +52,7 @@ class TestPolicy:
         assert p.fs_denied == []
         assert p.deny_syscalls is None
         assert p.net_bind == []
-        assert p.net_connect == []
+        assert p.net_allow == []
         assert p.max_memory is None
         assert p.max_processes == 64
         assert p.max_cpu is None
@@ -144,14 +144,10 @@ class TestNetPolicy:
         p = Policy(net_bind=[80, "443", "8000-8002"])
         assert p.bind_ports() == [80, 443, 8000, 8001, 8002]
 
-    def test_connect_ports(self):
-        p = Policy(net_connect=["1-1024"])
-        assert p.connect_ports() == list(range(1, 1025))
-
     def test_unrestricted_by_default(self):
         p = Policy()
         assert p.bind_ports() == []
-        assert p.connect_ports() == []
+        assert p.net_allow == []
 
 
 class TestEnvControl:
@@ -196,28 +192,24 @@ class TestCpuCores:
         assert p.cpu_cores == [0, 2, 3]
 
 
-class TestNetAllowHosts:
-    """Option-A tri-state semantics for net_allow_hosts.
+class TestNetAllow:
+    """Endpoint allowlist semantics for `net_allow`.
 
-    * None           — unrestricted (default)
-    * [] (empty)     — deny all hosts
-    * ["host", ...]  — allowlist specific hosts
+    Each entry is a string spec parsed by the native build:
+    `host:port[,port,...]`, `:port`, or `*:port`. Empty list = deny all.
     """
 
-    def test_default_is_none(self):
+    def test_default_is_empty(self):
         p = Policy()
-        assert p.net_allow_hosts is None
+        assert p.net_allow == []
 
-    def test_empty_list_means_deny_all(self):
-        # Explicit empty list is distinguishable from None — it opts into
-        # restriction with zero allowed hosts.
-        p = Policy(net_allow_hosts=[])
-        assert p.net_allow_hosts == []
-        assert p.net_allow_hosts is not None
-
-    def test_populated_list_is_allowlist(self):
-        p = Policy(net_allow_hosts=["api.example.com", "example.org"])
-        assert list(p.net_allow_hosts) == ["api.example.com", "example.org"]
+    def test_specs_preserved_as_strings(self):
+        p = Policy(net_allow=["api.example.com:443", "github.com:22,443", ":8080"])
+        assert list(p.net_allow) == [
+            "api.example.com:443",
+            "github.com:22,443",
+            ":8080",
+        ]
 
 
 

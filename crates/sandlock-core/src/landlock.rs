@@ -280,7 +280,22 @@ pub fn confine(policy: &Policy) -> Result<(), SandlockError> {
             SandlockError::Sandbox(crate::error::SandboxError::Confinement(e))
         })?;
     }
-    for &port in &policy.net_connect {
+    // For TCP connect, Landlock is the only enforcer on the direct path.
+    // The on-behalf path (when enabled) re-checks (ip, port) against the
+    // resolved allowlist, but Landlock must already permit the port or
+    // the kernel rejects before seccomp gets a chance to dispatch. Allow
+    // every port that any --net-allow rule mentions, plus every HTTP
+    // intercept port; the on-behalf check ensures the IP also matches.
+    let mut connect_ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    for rule in &policy.net_allow {
+        for &p in &rule.ports {
+            connect_ports.insert(p);
+        }
+    }
+    for &p in &policy.http_ports {
+        connect_ports.insert(p);
+    }
+    for port in connect_ports {
         add_net_rule(&ruleset_fd, port, LANDLOCK_ACCESS_NET_CONNECT_TCP).map_err(|e| {
             SandlockError::Sandbox(crate::error::SandboxError::Confinement(e))
         })?;

@@ -100,10 +100,19 @@ sandlock run -i -r /usr -r /lib -r /lib64 -r /bin -r /etc -w /tmp -- /bin/sh
 # Resource limits + timeout
 sandlock run -m 512M -P 20 -t 30 -- ./compute.sh
 
-# Domain-based network isolation
-sandlock run --net-allow-host api.openai.com -r /usr -r /lib -r /etc -- python3 agent.py
+# Outbound allowlist — restrict to one host on one port
+sandlock run --net-allow api.openai.com:443 -r /usr -r /lib -r /etc -- python3 agent.py
+
+# Multiple ports for one host, plus a separate any-IP port
+sandlock run --net-allow github.com:22,443 --net-allow :8080 \
+  -r /usr -r /lib -r /etc -- python3 agent.py
+
+# UDP — opt in to UDP and allowlist the destination (e.g. DNS)
+sandlock run --allow-udp --net-allow 1.1.1.1:53 --net-allow :443 \
+  -r /usr -r /lib -r /etc -- ./client
 
 # HTTP-level ACL (method + host + path rules via transparent proxy)
+# HTTP rules with concrete hosts auto-extend --net-allow with host:80,443
 sandlock run \
   --http-allow "GET docs.python.org/*" \
   --http-allow "POST api.openai.com/v1/chat/completions" \
@@ -111,13 +120,15 @@ sandlock run \
   -r /usr -r /lib -r /etc -- python3 agent.py
 
 # HTTPS MITM with user-provided CA (enables ACL on port 443)
+# Generate a CA, add the cert to the sandbox's trust store
+# (e.g. /etc/ssl/certs/), then pass both files here.
 sandlock run \
   --http-allow "POST api.openai.com/v1/*" \
   --https-ca ca.pem --https-key ca-key.pem \
   -r /usr -r /lib -r /etc -- python3 agent.py
 
-# TCP port restrictions (Landlock)
-sandlock run --net-bind 8080 --net-connect 443 -r /usr -r /lib -r /etc -- python3 server.py
+# Server listening on a port (Landlock --net-bind, separate from --net-allow)
+sandlock run --net-bind 8080 -r /usr -r /lib -r /etc -- python3 server.py
 
 # Clean environment
 sandlock run --clean-env --env CC=gcc \
@@ -273,7 +284,7 @@ def on_event(event, ctx):
 
 policy = Policy(
     fs_readable=["/usr", "/lib", "/etc"],
-    net_allow_hosts=["api.example.com"],
+    net_allow=["api.example.com:443"],
 )
 result = Sandbox(policy, policy_fn=on_event).run(["python3", "agent.py"])
 ```
@@ -493,6 +504,75 @@ Map and reduce run in separate sandboxes with independent policies —
 the mapper has data access, the reducer doesn't. Each clone inherits
 Landlock + seccomp confinement. `CLONE_ID=0..N-1` is set automatically.
 
+### Network Model
+
+Outbound traffic is gated by a single endpoint allowlist. Each
+`--net-allow` rule names a `(host, ports)` pair, multiple rules are
+OR'd, and a destination is permitted iff `(IP, port)` matches at least
+one rule. The same allowlist applies to TCP `connect()` and to UDP
+`sendto` / `sendmsg` destinations — the latter only relevant when
+`--allow-udp` is set, since UDP socket creation is denied by default.
+
+```
+--net-allow <spec>          repeatable; no rules = deny all outbound
+                            <spec> = host:port[,port,...]   (IP-restricted)
+                                   | :port  | *:port        (any IP)
+```
+
+**Defaults.** With no `--net-allow` and no HTTP ACL flags, Landlock
+denies every TCP `connect()`, UDP and raw socket creation are denied
+at the seccomp layer, and there is no on-behalf path active. There is
+no "allow-all networking" mode — opt in with explicit endpoints.
+
+**Resolution.** Concrete hostnames are resolved once at sandbox start
+and pinned in a synthetic `/etc/hosts`. The synthetic file replaces
+the real one only when `--net-allow` includes at least one concrete
+host; pure `:port` rules leave the real `/etc/hosts` and DNS visible.
+
+**Wildcards.** Hostnames are matched literally. `--net-allow
+*.example.com:443` is **not** supported — list each domain you need.
+The `*` form is only valid as the host part of a `*:port` rule (alias
+for `:port`).
+
+**Implementation.** Two enforcement paths:
+
+  * **Direct path** — pure `:port` policies (no concrete host) and no
+    HTTP ACL. Landlock enforces the TCP port allowlist at the kernel
+    level; no per-syscall overhead. UDP is not covered by Landlock and
+    therefore always uses the on-behalf path when allowed.
+  * **On-behalf path** — any concrete host, any HTTP ACL rule, or
+    `--allow-udp`. Seccomp traps `connect()`, `sendto()`, and
+    `sendmsg()`; the supervisor checks the `(ip, port)` against the
+    resolved allowlist and performs the syscall. The HTTP/HTTPS proxy
+    redirect (when configured) happens here too.
+
+**HTTP / HTTPS interception.** `--http-allow` / `--http-deny` route
+matching ports through a transparent proxy. Each rule with a concrete
+host auto-extends `--net-allow` with `host:80` (and `host:443` when
+`--https-ca` is set) so the proxy's intercept ports are reachable;
+wildcard hosts auto-add `:80` / `:443` (any IP). HTTPS MITM is opt-in:
+pass `--https-ca <cert>` and `--https-key <key>` for a CA *you generate*
+and trust inside the sandbox (typically install the cert into the
+workload's `/etc/ssl/certs/`). Without `--https-ca`, port 443 is not
+intercepted — `--net-allow host:443` permits raw TLS to the host with
+no content inspection.
+
+**Bind.** `--net-bind <port>` is independent from `--net-allow` and
+governs server-side `bind()`. Landlock enforces it; `--port-remap` adds
+on-behalf virtualization for binding.
+
+**UDP, ICMP, unix.** Default-deny, opt in via dedicated flags:
+
+  * `--allow-udp` enables UDP socket creation. Outbound UDP
+    destinations are then gated by the same `--net-allow` allowlist
+    used for TCP — the seccomp on-behalf path also covers `sendto` /
+    `sendmsg`. Example: `--allow-udp --net-allow 1.1.1.1:53` for DNS.
+  * `--allow-icmp` narrowly permits `socket(AF_INET, SOCK_RAW,
+    IPPROTO_ICMP)` and the IPv6 equivalent only — enough for `ping`.
+    Other raw socket types stay denied.
+  * AF_UNIX sockets are governed by Landlock's
+    `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`.
+
 ### Port Virtualization
 
 Each sandbox gets a full virtual port space. Multiple sandboxes can bind
@@ -553,10 +633,11 @@ Policy(
     deny_syscalls=None,            # None = default blocklist
     allow_syscalls=None,           # Allowlist mode (stricter)
 
-    # Network
-    net_allow_hosts=["api.example.com"],  # Domain allowlist
-    net_bind=[8080],               # TCP bind ports (Landlock ABI v4+)
-    net_connect=[443],             # TCP connect ports
+    # Network — see "Network Model" above. Each entry is `host:port[,port,...]`,
+    # `:port`, or `*:port`. Empty list = deny all outbound. Same allowlist
+    # gates UDP destinations when allow_udp=True (e.g. `:53` for DNS).
+    net_allow=["api.example.com:443", "github.com:22,443", ":8080"],
+    net_bind=[8080],               # TCP bind ports (Landlock; ABI v4+)
 
     # HTTP ACL (transparent proxy)
     http_allow=["POST api.openai.com/v1/*"],  # Allow rules (METHOD host/path)
@@ -565,9 +646,9 @@ Policy(
     https_ca="ca.pem",             # CA cert for HTTPS MITM (adds port 443)
     https_key="ca-key.pem",        # CA key for HTTPS MITM
 
-    # Socket restrictions
-    no_raw_sockets=True,           # Block SOCK_RAW (default)
-    no_udp=False,                  # Block SOCK_DGRAM
+    # Socket restrictions (raw sockets and UDP denied by default)
+    allow_udp=False,               # CLI: --allow-udp; outbound UDP still gated by net_allow
+    allow_icmp=False,              # CLI: --allow-icmp; permits ICMP raw only (AF_INET/AF_INET6 + SOCK_RAW + IPPROTO_ICMP[V6])
 
     # Resources
     max_memory="512M",             # Memory limit

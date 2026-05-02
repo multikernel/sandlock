@@ -3,7 +3,7 @@
 // Intercepts connect/sendto/sendmsg syscalls, extracts the destination IP from
 // the child's memory, and checks it against an allowlist of resolved IPs.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -96,22 +96,33 @@ async fn connect_on_behalf(
             Err(_) => return NotifAction::Errno(libc::EIO),
         };
 
-    // 2. Check IP against allowlist
+    // 2. Check destination (ip, port) against the endpoint allowlist.
+    // The on-behalf supervisor performs the connect outside Landlock,
+    // so this check is the only port enforcement on this path.
     if let Some(ip) = parse_ip_from_sockaddr(&addr_bytes) {
+        let dest_port = parse_port_from_sockaddr(&addr_bytes);
         let ns = ctx.network.lock().await;
         let live_policy = {
             let pfs = ctx.policy_fn.lock().await;
             pfs.live_policy.clone()
         };
-        if let crate::seccomp::notif::NetworkPolicy::AllowList(ref allowed) =
-            ns.effective_network_policy(notif.pid, live_policy.as_ref())
-        {
-            if !allowed.contains(&ip) {
+        let effective = ns.effective_network_policy(notif.pid, live_policy.as_ref());
+        match (effective, dest_port) {
+            (crate::seccomp::notif::NetworkPolicy::Unrestricted, _) => {
+                // No allowlist active — Landlock direct path enforces ports.
+                // (Reachable when on-behalf is enabled solely by HTTP ACL.)
+            }
+            (policy, Some(p)) => {
+                if !policy.allows(ip, p) {
+                    return NotifAction::Errno(ECONNREFUSED);
+                }
+            }
+            (_, None) => {
+                // Couldn't parse port from sockaddr — fail closed.
                 return NotifAction::Errno(ECONNREFUSED);
             }
         }
         // Check for HTTP ACL redirect
-        let dest_port = parse_port_from_sockaddr(&addr_bytes);
         let http_acl_addr = ns.http_acl_addr;
         let http_acl_intercept = dest_port.map_or(false, |p| ns.http_acl_ports.contains(&p));
         let http_acl_orig_dest = ns.http_acl_orig_dest.clone();
@@ -327,18 +338,22 @@ async fn sendto_on_behalf(
             Err(_) => return NotifAction::Errno(libc::EIO),
         };
 
-    // 2. Check IP against allowlist
+    // 2. Check (ip, port) against the endpoint allowlist.
     if let Some(ip) = parse_ip_from_sockaddr(&addr_bytes) {
+        let dest_port = parse_port_from_sockaddr(&addr_bytes);
         let ns = ctx.network.lock().await;
         let live_policy = {
             let pfs = ctx.policy_fn.lock().await;
             pfs.live_policy.clone()
         };
-        if let crate::seccomp::notif::NetworkPolicy::AllowList(ref allowed) =
-            ns.effective_network_policy(notif.pid, live_policy.as_ref())
-        {
-            if !allowed.contains(&ip) {
-                return NotifAction::Errno(ECONNREFUSED);
+        let effective = ns.effective_network_policy(notif.pid, live_policy.as_ref());
+        if !matches!(effective, crate::seccomp::notif::NetworkPolicy::Unrestricted) {
+            match dest_port {
+                Some(p) if !effective.allows(ip, p) => {
+                    return NotifAction::Errno(ECONNREFUSED);
+                }
+                None => return NotifAction::Errno(ECONNREFUSED),
+                Some(_) => {}
             }
         }
         drop(ns);
@@ -434,22 +449,26 @@ async fn sendmsg_on_behalf(
         Err(_) => return NotifAction::Errno(libc::EIO),
     };
 
-    // 3. Check IP against allowlist
+    // 3. Check (ip, port) against the endpoint allowlist.
     let ip = match parse_ip_from_sockaddr(&addr_bytes) {
         Some(ip) => ip,
         None => return NotifAction::Continue, // Non-IP family — allow through
     };
+    let dest_port = parse_port_from_sockaddr(&addr_bytes);
 
     let ns = ctx.network.lock().await;
     let live_policy = {
         let pfs = ctx.policy_fn.lock().await;
         pfs.live_policy.clone()
     };
-    if let crate::seccomp::notif::NetworkPolicy::AllowList(ref allowed) =
-        ns.effective_network_policy(notif.pid, live_policy.as_ref())
-    {
-        if !allowed.contains(&ip) {
-            return NotifAction::Errno(ECONNREFUSED);
+    let effective = ns.effective_network_policy(notif.pid, live_policy.as_ref());
+    if !matches!(effective, crate::seccomp::notif::NetworkPolicy::Unrestricted) {
+        match dest_port {
+            Some(p) if !effective.allows(ip, p) => {
+                return NotifAction::Errno(ECONNREFUSED);
+            }
+            None => return NotifAction::Errno(ECONNREFUSED),
+            Some(_) => {}
         }
     }
     drop(ns);
@@ -578,59 +597,64 @@ pub(crate) async fn handle_net(
 }
 
 // ============================================================
-// resolve_hosts — resolve domain names to IPs
+// resolve_net_allow — resolve --net-allow rules to runtime allowlist
 // ============================================================
 
-/// Result of resolving domain names: the IP allowlist and the `/etc/hosts`
-/// content to inject into the sandbox so that sandboxed processes can
-/// resolve allowed hostnames without contacting a DNS server.
-pub struct ResolvedHosts {
-    /// Set of allowed IPs (for the network allowlist).
-    pub ips: HashSet<IpAddr>,
-    /// Synthetic `/etc/hosts` content mapping allowed hostnames to their IPs.
-    pub etc_hosts: String,
+/// Resolved form of `Policy::net_allow`, ready for the on-behalf path.
+pub struct ResolvedNetAllow {
+    /// Per-IP port rules (each concrete-host entry resolves to one or
+    /// more IPs).
+    pub per_ip: HashMap<IpAddr, HashSet<u16>>,
+    /// Ports permitted to any IP (the `:port` form).
+    pub any_ip_ports: HashSet<u16>,
+    /// Synthetic `/etc/hosts` content for any concrete hostnames.
+    /// `None` when no concrete hostnames are present (real `/etc/hosts`
+    /// stays visible).
+    pub etc_hosts: Option<String>,
 }
 
-/// Resolve a list of domain names to IP addresses.
-///
-/// Always includes loopback addresses (127.0.0.1 and ::1).
-/// Uses tokio's async DNS resolver.
-///
-/// Returns both the IP allowlist and a synthetic `/etc/hosts` file so
-/// sandboxed processes can resolve allowed hostnames without DNS access.
-pub async fn resolve_hosts(hosts: &[String]) -> io::Result<ResolvedHosts> {
-    let mut ips = HashSet::new();
-
-    // Always allow loopback
-    ips.insert(IpAddr::V4(Ipv4Addr::LOCALHOST));
-    ips.insert(IpAddr::V6(Ipv6Addr::LOCALHOST));
-
-    // Build /etc/hosts content: start with loopback entries
+/// Resolve `--net-allow` rules into the runtime allowlist.
+pub async fn resolve_net_allow(
+    rules: &[crate::policy::NetAllow],
+) -> io::Result<ResolvedNetAllow> {
+    let mut per_ip: HashMap<IpAddr, HashSet<u16>> = HashMap::new();
+    let mut any_ip_ports: HashSet<u16> = HashSet::new();
     let mut etc_hosts = String::from("127.0.0.1 localhost\n::1 localhost\n");
+    let mut has_concrete_host = false;
 
-    for host in hosts {
-        // Append a dummy port for lookup_host
-        let addr = format!("{}:0", host);
-        let result = tokio::net::lookup_host(addr.as_str()).await;
-        match result {
-            Ok(resolved) => {
-                for socket_addr in resolved {
-                    let ip = socket_addr.ip();
-                    ips.insert(ip);
-                    etc_hosts.push_str(&format!("{} {}\n", ip, host));
+    for rule in rules {
+        match &rule.host {
+            None => {
+                for &p in &rule.ports {
+                    any_ip_ports.insert(p);
                 }
             }
-            Err(e) => {
-                // Return error on DNS failure to avoid silently skipping hosts
-                return Err(io::Error::new(
-                    e.kind(),
-                    format!("failed to resolve host '{}': {}", host, e),
-                ));
+            Some(host) => {
+                has_concrete_host = true;
+                let addr = format!("{}:0", host);
+                let resolved = tokio::net::lookup_host(addr.as_str()).await.map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!("failed to resolve host '{}': {}", host, e),
+                    )
+                })?;
+                for socket_addr in resolved {
+                    let ip = socket_addr.ip();
+                    let entry = per_ip.entry(ip).or_default();
+                    for &p in &rule.ports {
+                        entry.insert(p);
+                    }
+                    etc_hosts.push_str(&format!("{} {}\n", ip, host));
+                }
             }
         }
     }
 
-    Ok(ResolvedHosts { ips, etc_hosts })
+    Ok(ResolvedNetAllow {
+        per_ip,
+        any_ip_ports,
+        etc_hosts: if has_concrete_host { Some(etc_hosts) } else { None },
+    })
 }
 
 // ============================================================
@@ -640,24 +664,38 @@ pub async fn resolve_hosts(hosts: &[String]) -> io::Result<ResolvedHosts> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::NetAllow;
 
     #[tokio::test]
-    async fn test_resolve_hosts_loopback() {
-        let resolved = resolve_hosts(&[]).await.unwrap();
-        assert!(resolved.ips.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
-        assert!(resolved.ips.contains(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    async fn test_resolve_net_allow_empty() {
+        let resolved = resolve_net_allow(&[]).await.unwrap();
+        assert!(resolved.per_ip.is_empty());
+        assert!(resolved.any_ip_ports.is_empty());
+        assert!(resolved.etc_hosts.is_none());
     }
 
     #[tokio::test]
-    async fn test_resolve_hosts_with_domain() {
-        let hosts = vec!["localhost".to_string()];
-        let resolved = resolve_hosts(&hosts).await.unwrap();
-        // localhost should resolve to loopback
-        assert!(
-            resolved.ips.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST))
-                || resolved.ips.contains(&IpAddr::V6(Ipv6Addr::LOCALHOST))
-        );
-        // etc_hosts should contain localhost entry
-        assert!(resolved.etc_hosts.contains("localhost"));
+    async fn test_resolve_net_allow_concrete_host() {
+        let rules = vec![NetAllow {
+            host: Some("localhost".to_string()),
+            ports: vec![80, 443],
+        }];
+        let resolved = resolve_net_allow(&rules).await.unwrap();
+        // localhost should resolve to at least one loopback addr.
+        assert!(!resolved.per_ip.is_empty());
+        for ports in resolved.per_ip.values() {
+            assert!(ports.contains(&80));
+            assert!(ports.contains(&443));
+        }
+        assert!(resolved.etc_hosts.as_deref().unwrap_or("").contains("localhost"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_net_allow_any_ip() {
+        let rules = vec![NetAllow { host: None, ports: vec![8080] }];
+        let resolved = resolve_net_allow(&rules).await.unwrap();
+        assert!(resolved.per_ip.is_empty());
+        assert!(resolved.any_ip_ports.contains(&8080));
+        assert!(resolved.etc_hosts.is_none());
     }
 }

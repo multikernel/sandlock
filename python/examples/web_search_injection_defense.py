@@ -207,7 +207,7 @@ def demo_xoa_sandboxed(client: OpenAI, data_path: str):
     # NO filesystem access to the data file.
     planner_policy = Policy(
         fs_readable=base_readable,
-        net_allow_hosts=["api.openai.com"],
+        net_allow=["api.openai.com:443"],
         clean_env=True,
         env={"OPENAI_API_KEY": os.environ["OPENAI_API_KEY"]},
     )
@@ -216,7 +216,7 @@ def demo_xoa_sandboxed(client: OpenAI, data_path: str):
     # query as a command-line arg from the orchestrator.
     searcher_policy = Policy(
         fs_readable=base_readable + [workspace],
-        net_connect=[],
+        net_allow=[],
         clean_env=True,
         env={"DATA_FILE": data_path},
     )
@@ -225,7 +225,7 @@ def demo_xoa_sandboxed(client: OpenAI, data_path: str):
     # the code and the raw results via gather pipes.
     executor_policy = Policy(
         fs_readable=base_readable + ["/home"],  # for sandlock imports
-        net_connect=[],
+        net_allow=[],
         clean_env=True,
     )
 

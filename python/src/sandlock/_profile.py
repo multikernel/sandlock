@@ -31,11 +31,10 @@ _SIMPLE_FIELDS: dict[str, type] = {
     "deny_syscalls": list,
     "allow_syscalls": list,
     # Network
-    "net_allow_hosts": list,
+    "net_allow": list,
     "net_bind": list,
-    "net_connect": list,
-    "no_raw_sockets": bool,
-    "no_udp": bool,
+    "allow_udp": bool,
+    "allow_icmp": bool,
     # Resources
     "max_memory": str,
     "max_processes": int,
@@ -158,7 +157,7 @@ def policy_from_dict(data: dict, source: str = "<dict>") -> Policy:
             )
 
         # Coerce TOML integers in lists to strings for port specs
-        if key in ("net_bind", "net_connect") and isinstance(value, list):
+        if key in ("net_bind",) and isinstance(value, list):
             value = [str(v) if isinstance(v, int) else v for v in value]
 
         kwargs[key] = value
