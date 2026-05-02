@@ -410,11 +410,16 @@ fn write_child_mem_vm(pid: u32, addr: u64, data: &[u8]) -> Result<(), NotifError
     }
 }
 
-/// Read bytes from a child process via process_vm_readv.
+/// Read bytes from a child process via `process_vm_readv` with TOCTOU validation.
 ///
-/// Performs TOCTOU validation by calling `id_valid` before and after
-/// the read to ensure the notification is still live.
-pub(crate) fn read_child_mem(
+/// Calls `id_valid` before and after the read to ensure the notification is
+/// still live (kernel did not abort or release the trapped syscall while the
+/// supervisor was reading guest memory).
+///
+/// Public — used by downstream `ExtraHandler`s (sandbox-sber/vfs-engine etc.)
+/// to read syscall arguments that the kernel passes by pointer (paths in
+/// `openat`, buffers in `write`/`writev`).
+pub fn read_child_mem(
     notif_fd: RawFd,
     id: u64,
     pid: u32,
@@ -459,11 +464,12 @@ pub(crate) fn read_child_cstr(
     String::from_utf8(result).ok()
 }
 
-/// Write bytes to a child process via process_vm_writev.
+/// Write bytes to a child process via `process_vm_writev` with TOCTOU validation.
 ///
-/// Performs TOCTOU validation by calling `id_valid` before and after
-/// the write to ensure the notification is still live.
-pub(crate) fn write_child_mem(
+/// Same TOCTOU contract as [`read_child_mem`]. Public for downstream
+/// `ExtraHandler`s that synthesise syscall results into guest memory
+/// (e.g. fake `getdents64` listings populated from a virtual tree-index).
+pub fn write_child_mem(
     notif_fd: RawFd,
     id: u64,
     pid: u32,
@@ -1016,14 +1022,23 @@ async fn handle_notification(
 /// Async event loop that processes seccomp notifications.
 ///
 /// Runs until the notification fd is closed (child exits or filter is removed).
+///
+/// `extra_handlers` are user-supplied syscall handlers registered after all
+/// builtin handlers (see [`super::dispatch::ExtraHandler`]).  For the default
+/// behaviour without any custom handlers pass an empty `Vec`.
 pub async fn supervisor(
     notif_fd: OwnedFd,
     ctx: Arc<super::ctx::SupervisorCtx>,
+    extra_handlers: Vec<super::dispatch::ExtraHandler>,
 ) {
     let fd = notif_fd.as_raw_fd();
 
     // Build the dispatch table once at startup.
-    let dispatch_table = Arc::new(super::dispatch::build_dispatch_table(&ctx.policy, &ctx.resource));
+    let dispatch_table = Arc::new(super::dispatch::build_dispatch_table(
+        &ctx.policy,
+        &ctx.resource,
+        extra_handlers,
+    ));
 
     // Try to enable sync wakeup (Linux 6.7+, ignore error on older kernels).
     try_set_sync_wakeup(fd);
