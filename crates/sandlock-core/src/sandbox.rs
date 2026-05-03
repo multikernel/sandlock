@@ -300,7 +300,7 @@ impl Sandbox {
     /// Create N COW clones of this sandbox.
     ///
     /// Requires `new_with_fns()`. Forks a confined child, runs `init_fn`,
-    /// then forks N times using raw `fork()` (bypasses seccomp). Each
+    /// then forks N times using raw `fork()`. Each
     /// clone gets `CLONE_ID=0..N-1` and runs `work_fn(clone_id)`.
     ///
     /// Memory pages from `init_fn` are shared copy-on-write across all
@@ -997,6 +997,16 @@ impl Sandbox {
                     || !self.policy.http_deny.is_empty(),
                 has_random_seed: self.policy.random_seed.is_some(),
                 has_time_start: self.policy.time_start.is_some(),
+                // True if any consumer can inspect argv on execve:
+                // the policy_fn callback or an extra handler bound to
+                // execve/execveat (which can use read_child_mem). Both
+                // require the freeze + fork-event tracking to keep
+                // argv reads TOCTOU-safe.
+                argv_safety_required: self.policy.policy_fn.is_some()
+                    || self.extra_handlers.iter().any(|h| {
+                        h.syscall_nr == libc::SYS_execve
+                            || h.syscall_nr == libc::SYS_execveat
+                    }),
                 time_offset: time_offset_val,
                 num_cpus: self.policy.num_cpus,
                 port_remap: self.policy.port_remap,
@@ -1047,7 +1057,7 @@ impl Sandbox {
                 net_state.port_map.on_bind = Some(cb);
             }
 
-            // ProcfsState (sandbox membership lives in ProcessIndex now).
+            // ProcfsState (per-notification process state lives in ProcessIndex).
             let procfs_state = ProcfsState::new();
 
             // ResourceState
@@ -1127,8 +1137,10 @@ impl Sandbox {
             let time_random_state = Arc::new(Mutex::new(time_random_state));
             let policy_fn_state = Arc::new(Mutex::new(policy_fn_state));
             let chroot_state = Arc::new(Mutex::new(chroot_state));
-            // Root child is registered (with watcher) on its first
-            // notification, the same path grandchildren take.
+            // Root child gets per-process state (with watcher) on its
+            // first notification. When policy_fn is active, fork-like
+            // syscalls are traced at creation time so descendants are
+            // registered before they can run user code.
             let processes = Arc::new(crate::seccomp::state::ProcessIndex::new());
 
             let ctx = Arc::new(SupervisorCtx {

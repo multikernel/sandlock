@@ -1,4 +1,4 @@
-//! Freeze sandbox threads of an execve caller before returning Continue.
+//! Freeze sandbox threads of an execve caller before exposing argv.
 //!
 //! # Why
 //!
@@ -18,20 +18,22 @@
 //!    that share the calling task's `mm_struct` via
 //!    `clone(CLONE_VM)` without `CLONE_THREAD`.
 //!
-//! `freeze_sandbox_for_execve` closes both classes. It enumerates every
-//! TGID tracked in `ProcessIndex` (the canonical sandbox membership
-//! set), walks `/proc/<tgid>/task` per TGID, and `PTRACE_SEIZE` +
-//! `PTRACE_INTERRUPT` every TID. Together with the supervisor's
-//! sequential notification dispatch (which prevents new clone/fork
-//! notifications from being processed while the freeze is in flight),
-//! every entity that could mutate argv is paused before the kernel
-//! re-reads.
+//! `freeze_sandbox_for_execve` closes both classes. When `policy_fn`
+//! is active, every fork-like syscall is traced for one ptrace
+//! fork/clone/vfork event and the child is registered in
+//! `ProcessIndex` before it can run user code. The exec freeze can
+//! therefore enumerate every tracked TGID, walk `/proc/<tgid>/task`,
+//! and `PTRACE_SEIZE` + `PTRACE_INTERRUPT` every TID that could mutate
+//! argv.
 //!
 //! # Sibling vs peer cleanup
 //!
 //! Sibling threads (same TGID as the caller) are killed by the kernel
-//! during execve's `de_thread` step, so the supervisor never has to
-//! detach them — their ptrace state is reaped along with the threads.
+//! during execve's `de_thread` step when execve is allowed, so the
+//! supervisor does not detach them on the allow path — their ptrace
+//! state is reaped along with the threads. If the policy callback
+//! denies execve after argv inspection, the supervisor detaches both
+//! siblings and peers because `de_thread` will not run.
 //!
 //! Peer threads (different TGID) survive execve. The supervisor must
 //! `PTRACE_DETACH` them after `NOTIF_SEND` so they can resume normal
@@ -187,46 +189,45 @@ fn read_tgid_of_tid(tid: i32) -> io::Result<i32> {
     ))
 }
 
-/// Outcome of a sandbox-wide freeze. The supervisor must call
-/// `detach_peers(&outcome.peer_tids)` after `NOTIF_SEND` to let the
-/// peer processes resume.
+/// Outcome of a sandbox-wide freeze.
 #[derive(Debug, Default)]
 pub(crate) struct SandboxFreeze {
+    /// Sibling TIDs in the caller's TGID. These die in `de_thread` if
+    /// execve is allowed, but must be detached if execve is denied
+    /// after `policy_fn` inspected argv.
+    pub sibling_tids: Vec<i32>,
     /// TIDs in *other* TGIDs that were ptrace-stopped. These survive
     /// execve and must be detached so they can resume normal
-    /// execution. Siblings of `caller_tid` are deliberately not in
-    /// this list — execve's `de_thread` kills them and the kernel
-    /// reaps their ptrace state automatically.
+    /// execution.
     pub peer_tids: Vec<i32>,
 }
 
 /// Freeze every sandbox thread that could mutate execve argv before
-/// the kernel re-reads it.
+/// the supervisor reads it for `policy_fn` and before the kernel
+/// re-reads it.
 ///
-/// Walks every TGID in `processes` (and defensively the caller's own
-/// TGID), enumerates each TGID's threads via `/proc/<tgid>/task/`,
-/// and `PTRACE_SEIZE` + `PTRACE_INTERRUPT` every TID except
-/// `caller_tid`. Sibling threads of `caller_tid` and peer threads in
-/// other TGIDs are both covered.
+/// Walks every TGID in `processes`, enumerates each TGID's threads via
+/// `/proc/<tgid>/task/`, and `PTRACE_SEIZE` + `PTRACE_INTERRUPT`s
+/// every TID except `caller_tid`. Sibling threads of `caller_tid` and
+/// peer threads in other TGIDs are both covered. `processes` is
+/// complete for `policy_fn` runs because fork-like syscalls are tracked
+/// before new children can run.
 ///
 /// Strict semantics: if any task refuses to be frozen, every
 /// already-frozen task is detached and the error is propagated. The
 /// caller is expected to deny the execve with `EPERM`, preserving the
 /// invariant that exposed argv is always TOCTOU-safe.
 ///
-/// On success, returns the list of *peer* TIDs that survive execve and
-/// must be detached after `NOTIF_SEND`. Sibling TIDs are not returned
-/// because they die in `de_thread`.
+/// On success, returns the sibling and peer TIDs that were frozen. The
+/// caller detaches peers after an allowed execve, or detaches all TIDs
+/// after a denied execve.
 pub(crate) fn freeze_sandbox_for_execve(
     processes: &crate::seccomp::state::ProcessIndex,
     caller_tid: i32,
 ) -> io::Result<SandboxFreeze> {
     let caller_tgid = read_tgid_of_tid(caller_tid)?;
-
-    // ProcessIndex is the canonical sandbox membership set. The
-    // supervisor's `register_child_if_new` runs before per-syscall
-    // handlers, so the caller's TGID is guaranteed to be present.
-    let tgids: HashSet<i32> = processes.pids_snapshot();
+    let mut tgids: HashSet<i32> = processes.pids_snapshot();
+    tgids.insert(caller_tgid);
 
     let mut sibling_tids: Vec<i32> = Vec::new();
     let mut peer_tids: Vec<i32> = Vec::new();
@@ -266,7 +267,10 @@ pub(crate) fn freeze_sandbox_for_execve(
         }
     }
 
-    Ok(SandboxFreeze { peer_tids })
+    Ok(SandboxFreeze {
+        sibling_tids,
+        peer_tids,
+    })
 }
 
 /// Detach peer TIDs after the kernel has re-read execve argv. Errors
@@ -274,6 +278,17 @@ pub(crate) fn freeze_sandbox_for_execve(
 /// harmless.
 pub(crate) fn detach_peers(peer_tids: &[i32]) {
     for tid in peer_tids {
+        detach(*tid);
+    }
+}
+
+/// Detach every task in a freeze after execve was denied or the
+/// notification response could not be sent.
+pub(crate) fn detach_all(freeze: &SandboxFreeze) {
+    for tid in &freeze.sibling_tids {
+        detach(*tid);
+    }
+    for tid in &freeze.peer_tids {
         detach(*tid);
     }
 }
@@ -311,14 +326,44 @@ mod tests {
     /// issue #27 (Changaco): a peer process in the sandbox — different
     /// TGID, possibly aliasing argv pages via shared memory — must also
     /// be frozen before the kernel re-reads execve argv. Sibling-thread
-    /// freeze alone (`freeze_siblings_for_execve`) does not cover this.
+    /// freeze alone does not cover this. In real policy_fn runs,
+    /// fork-like syscall tracking registers peer processes before they
+    /// can run; this unit test mirrors that completed registration.
     ///
-    /// This test registers a peer process in `ProcessIndex` and verifies
-    /// that `freeze_sandbox_for_execve` puts it in ptrace-stop, the same
-    /// way `freeze_siblings_for_execve` does for siblings.
+    /// # Why we spawn a separate "caller" process
+    ///
+    /// In production, `freeze_sandbox_for_execve` runs in the supervisor
+    /// process and `caller_tid` is the sandboxed child's tid — i.e. the
+    /// supervisor and the execve caller are in *different* TGIDs, and
+    /// every TID the freeze walks is a descendant of the supervisor.
+    /// Under YAMA `ptrace_scope=1` (the Ubuntu/Debian default), that
+    /// descendant relationship is exactly what makes PTRACE_SEIZE
+    /// permitted without any privilege.
+    ///
+    /// If this test instead used the test thread's own tid as
+    /// `caller_tid`, `caller_tgid` would be the cargo test binary's
+    /// TGID, the freeze would walk the test binary's sibling threads
+    /// (libtest workers, runtime helpers), and PTRACE_SEIZE would be
+    /// rejected with EPERM by YAMA — sibling threads are not
+    /// descendants of each other. That would force the test to require
+    /// privileges sandlock itself does not require. So we spawn a
+    /// dedicated "caller" sleep to play the sandboxed-process role,
+    /// matching production topology.
     #[test]
     fn freeze_sandbox_includes_peer_process() {
         use std::process::{Command, Stdio};
+
+        // The "execve caller" — stands in for the sandboxed process.
+        // Its tid is a descendant of the test process (the parent), so
+        // ptracing into its TGID is YAMA-allowed under ptrace_scope=1.
+        let mut caller = Command::new("/bin/sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn caller sleep");
+        let caller_tid = caller.id() as i32;
 
         let mut peer = Command::new("/bin/sleep")
             .arg("60")
@@ -329,23 +374,19 @@ mod tests {
             .expect("spawn peer sleep");
         let peer_pid = peer.id() as i32;
 
-        // Give the peer a moment to actually be running.
+        // Give both children a moment to actually be running.
         std::thread::sleep(std::time::Duration::from_millis(50));
 
-        // Register the peer in a fresh ProcessIndex (mirrors what the
-        // supervisor's clone/fork notification handler would do).
         let processes = ProcessIndex::new();
         processes
             .register(peer_pid)
             .expect("register peer in ProcessIndex");
 
-        let our_tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
-
-        let outcome = freeze_sandbox_for_execve(&processes, our_tid)
+        let outcome = freeze_sandbox_for_execve(&processes, caller_tid)
             .expect("freeze_sandbox_for_execve");
 
         // Peer's TID is its own TGID (single-threaded sleep), and it's
-        // a different TGID from ours, so it should be in peer_tids.
+        // a different TGID from the execve caller, so it should be in peer_tids.
         assert!(
             outcome.peer_tids.contains(&peer_pid),
             "peer pid {} should be in peer_tids: {:?}",
@@ -370,5 +411,7 @@ mod tests {
         detach_peers(&outcome.peer_tids);
         let _ = peer.kill();
         let _ = peer.wait();
+        let _ = caller.kill();
+        let _ = caller.wait();
     }
 }

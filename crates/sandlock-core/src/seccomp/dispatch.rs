@@ -203,6 +203,9 @@ pub fn build_dispatch_table(
     if let Some(vfork) = arch::SYS_VFORK {
         fork_nrs.push(vfork);
     }
+    if let Some(fork) = arch::SYS_FORK {
+        fork_nrs.push(fork);
+    }
     for nr in fork_nrs {
         let policy = Arc::clone(policy);
         let resource = Arc::clone(resource);
@@ -844,6 +847,7 @@ mod extra_handler_tests {
                 has_net_allowlist: false,
                 has_random_seed: false,
                 has_time_start: false,
+                argv_safety_required: false,
                 time_offset: 0,
                 num_cpus: None,
                 port_remap: false,

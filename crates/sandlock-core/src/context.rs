@@ -240,6 +240,15 @@ pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
         libc::SYS_waitid as u32,
     ];
     arch::push_optional_syscall(&mut nrs, arch::SYS_VFORK);
+    // Bare fork(2) carries none of the namespace/process-limit risk of
+    // clone/clone3 and was historically left out of the BPF filter so
+    // hot fork-loops (COW map-reduce) bypass the supervisor entirely.
+    // It only needs interception when policy_fn is active, so the
+    // supervisor can register the new child via ptrace fork events
+    // before it can run user code (argv-safety invariant).
+    if policy.policy_fn.is_some() {
+        arch::push_optional_syscall(&mut nrs, arch::SYS_FORK);
+    }
 
     if policy.max_memory.is_some() {
         nrs.push(libc::SYS_mmap as u32);
@@ -949,9 +958,21 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         let mut notif = notif_syscalls(policy);
         if !extra_syscalls.is_empty() {
             notif.extend_from_slice(extra_syscalls);
-            notif.sort_unstable();
-            notif.dedup();
         }
+        // Argv-safety gate (companion to the policy_fn case in
+        // notif_syscalls): an extra handler bound to execve/execveat
+        // can call `read_child_mem` to inspect argv, so the supervisor
+        // must register newly forked children before they can run user
+        // code — same invariant policy_fn relies on. Bare fork(2)
+        // therefore needs to be intercepted here too.
+        let exec_extra = extra_syscalls.iter().any(|&n| {
+            n == libc::SYS_execve as u32 || n == libc::SYS_execveat as u32
+        });
+        if exec_extra {
+            arch::push_optional_syscall(&mut notif, arch::SYS_FORK);
+        }
+        notif.sort_unstable();
+        notif.dedup();
         let filter = match bpf::assemble_filter(&notif, &deny, &args) {
             Ok(f) => f,
             Err(e) => fail!(format!("seccomp assemble: {}", e)),
@@ -1093,6 +1114,24 @@ mod tests {
         if let Some(vfork) = arch::SYS_VFORK {
             assert!(nrs.contains(&(vfork as u32)));
         }
+        // Bare fork(2) is intercepted only when policy_fn is active —
+        // see notif_syscalls. The default policy has no policy_fn, so
+        // fork stays out of the BPF filter and hot fork-loops keep
+        // bypassing the supervisor.
+        if let Some(fork) = arch::SYS_FORK {
+            assert!(!nrs.contains(&(fork as u32)));
+        }
+    }
+
+    #[test]
+    fn test_notif_syscalls_fork_gated_on_policy_fn() {
+        let Some(fork) = arch::SYS_FORK else { return };
+        let policy = Policy::builder()
+            .policy_fn(|_event, _ctx| crate::policy_fn::Verdict::Allow)
+            .build()
+            .unwrap();
+        let nrs = notif_syscalls(&policy);
+        assert!(nrs.contains(&(fork as u32)));
     }
 
     #[test]
