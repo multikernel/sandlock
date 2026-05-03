@@ -294,6 +294,20 @@ fn syscall_stop_kind(tid: i32) -> io::Result<u8> {
     Ok(info.op)
 }
 
+#[cfg(test)]
+static CHILD_REGISTERED_HOOK: std::sync::Mutex<
+    Option<Box<dyn Fn(i32) + Send + 'static>>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn child_registered_for_test(child_pid: i32) {
+    if let Ok(guard) = CHILD_REGISTERED_HOOK.lock() {
+        if let Some(hook) = guard.as_ref() {
+            hook(child_pid);
+        }
+    }
+}
+
 /// Complete one-shot process-creation tracking after `Continue`.
 ///
 /// Runs the blocking `waitpid` on a tokio blocking-pool thread so the
@@ -393,6 +407,8 @@ fn finish_process_creation_event(
             format!("failed to register new child pid {child_pid}"),
         ));
     }
+    #[cfg(test)]
+    child_registered_for_test(child_pid);
 
     // Wait for the child's birth-traced ptrace-stop, then detach so it
     // can run. Result ignored: the child may have already proceeded
@@ -538,4 +554,292 @@ pub(crate) async fn handle_memory(
     }
 
     NotifAction::Continue
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::netlink::NetlinkState;
+    use crate::seccomp::state::{
+        ChrootState, CowState, NetworkState, PolicyFnState, ProcessIndex, ProcfsState,
+        TimeRandomState,
+    };
+    use crate::sys::structs::{SeccompData, SeccompNotif};
+    use std::ptr;
+
+    const GO: isize = 0;
+    const CHILD_RAN: isize = 1;
+    const REGISTERED_BEFORE_RUN: isize = 2;
+    const REGISTERED_PID: isize = 3;
+    const DONE: isize = 4;
+    const FORK_FAILED: isize = 5;
+    const FLAGS_LEN: usize = 4096;
+
+    fn fake_notif(nr: i64, arg0: u64) -> SeccompNotif {
+        SeccompNotif {
+            id: 0,
+            pid: 1,
+            flags: 0,
+            data: SeccompData {
+                nr: nr as i32,
+                arch: 0,
+                instruction_pointer: 0,
+                args: [arg0, 0, 0, 0, 0, 0],
+            },
+        }
+    }
+
+    fn fake_policy(argv_safety_required: bool) -> NotifPolicy {
+        NotifPolicy {
+            max_memory_bytes: 0,
+            max_processes: 0,
+            has_memory_limit: false,
+            has_net_allowlist: false,
+            has_random_seed: false,
+            has_time_start: false,
+            argv_safety_required,
+            time_offset: 0,
+            num_cpus: None,
+            port_remap: false,
+            cow_enabled: false,
+            chroot_root: None,
+            chroot_readable: Vec::new(),
+            chroot_writable: Vec::new(),
+            chroot_denied: Vec::new(),
+            chroot_mounts: Vec::new(),
+            deterministic_dirs: false,
+            hostname: None,
+            has_http_acl: false,
+            virtual_etc_hosts: None,
+        }
+    }
+
+    fn fake_supervisor_ctx(argv_safety_required: bool) -> Arc<SupervisorCtx> {
+        Arc::new(SupervisorCtx {
+            resource: Arc::new(Mutex::new(ResourceState::new(0, 0))),
+            cow: Arc::new(Mutex::new(CowState::new())),
+            procfs: Arc::new(Mutex::new(ProcfsState::new())),
+            network: Arc::new(Mutex::new(NetworkState::new())),
+            time_random: Arc::new(Mutex::new(TimeRandomState::new(None, None))),
+            policy_fn: Arc::new(Mutex::new(PolicyFnState::new())),
+            chroot: Arc::new(Mutex::new(ChrootState::new())),
+            netlink: Arc::new(NetlinkState::new()),
+            processes: Arc::new(ProcessIndex::new()),
+            policy: Arc::new(fake_policy(argv_safety_required)),
+            child_pidfd: None,
+            notif_fd: -1,
+        })
+    }
+
+    #[test]
+    fn process_creation_tracking_predicates_follow_argv_safety_gate() {
+        let no_argv_safety = fake_policy(false);
+        let argv_safety = fake_policy(true);
+        let clone_proc = fake_notif(libc::SYS_clone, 0);
+        let clone_thread = fake_notif(libc::SYS_clone, CLONE_THREAD);
+        let clone3 = fake_notif(libc::SYS_clone3, 0);
+        let openat = fake_notif(libc::SYS_openat, 0);
+
+        assert!(fork_counted_on_continue(&clone_proc));
+        assert!(!fork_counted_on_continue(&clone_thread));
+        assert!(fork_counted_on_continue(&clone3));
+        assert!(!fork_counted_on_continue(&openat));
+
+        assert!(!requires_process_creation_tracking(&clone_proc, &no_argv_safety));
+        assert!(requires_process_creation_tracking(&clone_proc, &argv_safety));
+        assert!(!requires_process_creation_tracking(&clone_thread, &argv_safety));
+        assert!(requires_process_creation_tracking(&clone3, &argv_safety));
+        assert!(!requires_process_creation_tracking(&openat, &argv_safety));
+
+        if let Some(fork_nr) = crate::arch::SYS_FORK {
+            let fork = fake_notif(fork_nr, 0);
+            assert!(fork_counted_on_continue(&fork));
+            assert!(requires_process_creation_tracking(&fork, &argv_safety));
+        }
+        if let Some(vfork_nr) = crate::arch::SYS_VFORK {
+            let vfork = fake_notif(vfork_nr, 0);
+            assert!(fork_counted_on_continue(&vfork));
+            assert!(requires_process_creation_tracking(&vfork, &argv_safety));
+        }
+    }
+
+    struct SharedFlags {
+        ptr: *mut i32,
+    }
+
+    impl SharedFlags {
+        fn new() -> Self {
+            let ptr = unsafe {
+                libc::mmap(
+                    ptr::null_mut(),
+                    FLAGS_LEN,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(ptr, libc::MAP_FAILED, "mmap shared flags");
+            Self {
+                ptr: ptr.cast::<i32>(),
+            }
+        }
+
+        fn read(&self, slot: isize) -> i32 {
+            unsafe { ptr::read_volatile(self.ptr.offset(slot)) }
+        }
+
+        fn write(&self, slot: isize, value: i32) {
+            unsafe { ptr::write_volatile(self.ptr.offset(slot), value) };
+        }
+
+        fn addr(&self) -> usize {
+            self.ptr as usize
+        }
+    }
+
+    impl Drop for SharedFlags {
+        fn drop(&mut self) {
+            unsafe {
+                libc::munmap(self.ptr.cast(), FLAGS_LEN);
+            }
+        }
+    }
+
+    struct HookReset;
+
+    impl Drop for HookReset {
+        fn drop(&mut self) {
+            if let Ok(mut hook) = CHILD_REGISTERED_HOOK.lock() {
+                *hook = None;
+            }
+        }
+    }
+
+    struct CallerGuard {
+        pid: i32,
+        flags_addr: usize,
+    }
+
+    impl CallerGuard {
+        fn new(pid: i32, flags: &SharedFlags) -> Self {
+            Self {
+                pid,
+                flags_addr: flags.addr(),
+            }
+        }
+
+        fn disarm(&mut self) {
+            self.pid = 0;
+        }
+    }
+
+    impl Drop for CallerGuard {
+        fn drop(&mut self) {
+            if self.pid <= 0 {
+                return;
+            }
+            let flags = self.flags_addr as *mut i32;
+            unsafe {
+                ptr::write_volatile(flags.offset(GO), 1);
+                ptr::write_volatile(flags.offset(DONE), 1);
+                libc::kill(self.pid, libc::SIGKILL);
+                let mut status = 0;
+                let _ = libc::waitpid(self.pid, &mut status, 0);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn caller_wait_then_raw_fork(flags: *mut i32) -> ! {
+        while ptr::read_volatile(flags.offset(GO)) == 0 {
+            core::hint::spin_loop();
+        }
+
+        let pid = libc::syscall(libc::SYS_fork) as i32;
+        if pid == 0 {
+            ptr::write_volatile(flags.offset(CHILD_RAN), 1);
+            while ptr::read_volatile(flags.offset(DONE)) == 0 {
+                core::hint::spin_loop();
+            }
+            libc::_exit(0);
+        }
+        if pid > 0 {
+            let mut status = 0;
+            let _ = libc::waitpid(pid, &mut status, 0);
+            libc::_exit(0);
+        }
+
+        ptr::write_volatile(flags.offset(FORK_FAILED), 1);
+        libc::_exit(1);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn process_creation_tracking_registers_child_before_user_code_runs() {
+        let flags = SharedFlags::new();
+        let flags_addr = flags.addr();
+
+        let caller = unsafe { libc::fork() };
+        assert!(caller >= 0, "fork caller");
+        if caller == 0 {
+            unsafe { caller_wait_then_raw_fork(flags.ptr) };
+        }
+        let mut caller_guard = CallerGuard::new(caller, &flags);
+
+        let _hook_reset = HookReset;
+        {
+            let mut hook = CHILD_REGISTERED_HOOK.lock().expect("hook lock");
+            *hook = Some(Box::new(move |child_pid| {
+                let flags = flags_addr as *mut i32;
+                unsafe {
+                    let child_ran = ptr::read_volatile(flags.offset(CHILD_RAN));
+                    ptr::write_volatile(flags.offset(REGISTERED_PID), child_pid);
+                    ptr::write_volatile(
+                        flags.offset(REGISTERED_BEFORE_RUN),
+                        if child_ran == 0 { 1 } else { -1 },
+                    );
+                }
+            }));
+        }
+
+        let ctx = fake_supervisor_ctx(true);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("tokio runtime");
+        let trace = match rt.block_on(prepare_process_creation_tracking(caller)) {
+            Ok(trace) => trace,
+            Err(e) if matches!(e.raw_os_error(), Some(libc::EPERM | libc::EACCES)) => {
+                eprintln!("skipping ptrace fork-event test: ptrace denied: {e}");
+                return;
+            }
+            Err(e) => panic!("prepare process-creation tracking: {e}"),
+        };
+
+        flags.write(GO, 1);
+        let created = rt
+            .block_on(finish_process_creation_tracking(&ctx, trace))
+            .expect("finish process-creation tracking");
+        assert!(created, "raw fork should produce a ptrace fork event");
+
+        let registered_pid = flags.read(REGISTERED_PID);
+        assert!(registered_pid > 0, "child pid should be captured by hook");
+        assert!(
+            ctx.processes.contains(registered_pid),
+            "child should be registered in ProcessIndex"
+        );
+        assert_eq!(
+            flags.read(REGISTERED_BEFORE_RUN),
+            1,
+            "child should still be ptrace-stopped when registered"
+        );
+
+        flags.write(DONE, 1);
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(caller, &mut status, 0) };
+        assert_eq!(waited, caller, "wait caller");
+        assert_eq!(flags.read(FORK_FAILED), 0, "raw fork failed in caller");
+        caller_guard.disarm();
+    }
 }
