@@ -199,14 +199,7 @@ pub fn build_dispatch_table(
     // ------------------------------------------------------------------
     // Fork/clone family (always on)
     // ------------------------------------------------------------------
-    let mut fork_nrs = vec![libc::SYS_clone, libc::SYS_clone3];
-    if let Some(vfork) = arch::SYS_VFORK {
-        fork_nrs.push(vfork);
-    }
-    if let Some(fork) = arch::SYS_FORK {
-        fork_nrs.push(fork);
-    }
-    for nr in fork_nrs {
+    for &nr in arch::FORK_LIKE_SYSCALLS {
         let policy = Arc::clone(policy);
         let resource = Arc::clone(resource);
         table.register(nr, Box::new(move |notif, _ctx, notif_fd| {

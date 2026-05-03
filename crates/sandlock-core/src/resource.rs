@@ -204,11 +204,7 @@ impl Drop for ProcessCreationTrace {
 }
 
 fn is_process_creation_notif(notif: &SeccompNotif) -> bool {
-    let nr = notif.data.nr as i64;
-    nr == libc::SYS_clone
-        || nr == libc::SYS_clone3
-        || Some(nr) == crate::arch::SYS_VFORK
-        || Some(nr) == crate::arch::SYS_FORK
+    crate::arch::FORK_LIKE_SYSCALLS.contains(&(notif.data.nr as i64))
 }
 
 /// True when `handle_fork` would have incremented the concurrent
