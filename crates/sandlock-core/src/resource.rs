@@ -1,23 +1,25 @@
 // Resource limit handlers — memory and process limit enforcement.
 //
 // Continue safety (issue #27): every `Continue` in this module is safe.
-// All decisions here are on scalar register args (clone flags, mmap len,
-// brk address, etc.) which are copied into the seccomp_notif struct at
-// notification time — they are *not* pointers into racy user memory.
-// The kernel's re-read of the syscall args after Continue comes from the
-// suspended calling thread's saved registers, which a sibling thread
-// cannot mutate. So even though we return Continue after taking a
-// security-relevant action (e.g., counting an allocation against the
-// memory limit), there is no TOCTOU substitution window for the values
-// we examined.
+// Most decisions here are on scalar register args (clone flags, mmap
+// len, brk address, etc.) which are copied into the seccomp_notif
+// struct at notification time — they are *not* pointers into racy user
+// memory. The one exception is `clone3`, whose flags live in a
+// `clone_args` struct that the supervisor reads from child memory; see
+// `clone_flags` for the TOCTOU rationale. The reader is used only for
+// resource accounting, not for any kernel-enforced security boundary.
+// The kernel's re-read of the syscall args after Continue comes from
+// the suspended calling thread's saved registers, which a sibling
+// thread cannot mutate.
 
 use std::io;
 use std::mem;
+use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::seccomp::ctx::SupervisorCtx;
-use crate::seccomp::notif::{spawn_pid_watcher, NotifAction, NotifPolicy};
+use crate::seccomp::notif::{read_child_mem, spawn_pid_watcher, NotifAction, NotifPolicy};
 use crate::seccomp::state::ResourceState;
 use crate::sys::structs::{
     SeccompNotif, CLONE_NS_FLAGS, EAGAIN, EPERM,
@@ -28,6 +30,49 @@ const CLONE_THREAD: u64 = 0x0001_0000;
 
 /// MAP_ANONYMOUS flag — only anonymous mappings count toward memory limit.
 const MAP_ANONYMOUS: u64 = 0x20;
+
+/// Effective clone flags for a fork-like notification.
+///
+/// `clone(2)` exposes flags directly in `args[0]`. `clone3(2)` instead
+/// passes a pointer to a `clone_args` struct in `args[0]` (size in
+/// `args[1]`); its `flags` field is the first u64. `fork`/`vfork`
+/// have no flags. Anything else returns `None`.
+///
+/// TOCTOU note: the `clone3` read is from racy user memory — a sibling
+/// thread could mutate the struct between this read and the kernel's
+/// re-read after `Continue`. Callers use this only for resource
+/// accounting (`proc_count`, fork-event tracking gate), never as a
+/// security boundary, so a misread can throttle incorrectly but cannot
+/// bypass any kernel-enforced deny.
+fn clone_flags(notif: &SeccompNotif, notif_fd: RawFd) -> Option<u64> {
+    let args = &notif.data.args;
+    let nr = notif.data.nr as i64;
+    if nr == libc::SYS_clone {
+        return Some(args[0]);
+    }
+    if nr == libc::SYS_clone3 {
+        let ptr = args[0];
+        let size = args[1] as usize;
+        if ptr == 0 || size < 8 {
+            return None;
+        }
+        let buf = read_child_mem(notif_fd, notif.id, notif.pid, ptr, 8).ok()?;
+        let arr: [u8; 8] = buf.as_slice().try_into().ok()?;
+        return Some(u64::from_ne_bytes(arr));
+    }
+    if Some(nr) == crate::arch::SYS_VFORK || Some(nr) == crate::arch::SYS_FORK {
+        return Some(0);
+    }
+    None
+}
+
+/// True when the fork-like notification creates a thread (CLONE_THREAD
+/// set), i.e. it should not bump the process count. Returns false for
+/// non-fork notifs and for clone3 calls whose `clone_args` cannot be
+/// read (fail-safe: count as a process rather than silently uncount).
+fn is_thread_create(notif: &SeccompNotif, notif_fd: RawFd) -> bool {
+    matches!(clone_flags(notif, notif_fd), Some(f) if f & CLONE_THREAD != 0)
+}
 
 /// Handle fork/clone/vfork notifications.
 ///
@@ -40,23 +85,23 @@ const MAP_ANONYMOUS: u64 = 0x20;
 /// and registers the new child before it can run user code.
 pub(crate) async fn handle_fork(
     notif: &SeccompNotif,
+    notif_fd: RawFd,
     resource: &Arc<Mutex<ResourceState>>,
     _policy: &NotifPolicy,
 ) -> NotifAction {
     let nr = notif.data.nr as i64;
     let args = &notif.data.args;
 
-    // For clone/vfork: check namespace flags in args[0].
-    if nr == libc::SYS_clone || Some(nr) == crate::arch::SYS_VFORK {
-        if nr == libc::SYS_clone && (args[0] & CLONE_NS_FLAGS) != 0 {
-            return NotifAction::Errno(EPERM);
-        }
-        // For clone: if CLONE_THREAD is set, it's a thread — don't count, allow.
-        if nr == libc::SYS_clone && (args[0] & CLONE_THREAD) != 0 {
-            return NotifAction::Continue;
-        }
+    // Namespace flags are denied for clone (clone3's are caught by the
+    // BPF arg filter; vfork takes no flags).
+    if nr == libc::SYS_clone && (args[0] & CLONE_NS_FLAGS) != 0 {
+        return NotifAction::Errno(EPERM);
     }
-    // For clone3: BPF arg filter handles dangerous cases; proceed to limit check.
+
+    // Threads share their parent's process slot — don't count, allow.
+    if is_thread_create(notif, notif_fd) {
+        return NotifAction::Continue;
+    }
 
     let mut rs = resource.lock().await;
 
@@ -168,21 +213,23 @@ fn is_process_creation_notif(notif: &SeccompNotif) -> bool {
 
 /// True when `handle_fork` would have incremented the concurrent
 /// process count for this notification if it returned `Continue`.
-pub(crate) fn fork_counted_on_continue(notif: &SeccompNotif) -> bool {
-    if !is_process_creation_notif(notif) {
-        return false;
-    }
-    let nr = notif.data.nr as i64;
-    !(nr == libc::SYS_clone && (notif.data.args[0] & CLONE_THREAD) != 0)
+///
+/// Mirrors the thread-vs-process decision in `handle_fork`: a clone or
+/// clone3 with `CLONE_THREAD` does not bump the count, so a later
+/// rollback would be wrong. The clone3 flag check involves a racy read
+/// from child memory — see `clone_flags`.
+pub(crate) fn fork_counted_on_continue(notif: &SeccompNotif, notif_fd: RawFd) -> bool {
+    is_process_creation_notif(notif) && !is_thread_create(notif, notif_fd)
 }
 
 /// True when this notification can create a new task that must be in
 /// `ProcessIndex` before it can race a later execve argv decision.
 pub(crate) fn requires_process_creation_tracking(
     notif: &SeccompNotif,
+    notif_fd: RawFd,
     policy: &NotifPolicy,
 ) -> bool {
-    policy.argv_safety_required && fork_counted_on_continue(notif)
+    policy.argv_safety_required && fork_counted_on_continue(notif, notif_fd)
 }
 
 /// Arm ptrace fork-event tracking on the syscall's calling task.
@@ -640,26 +687,31 @@ mod tests {
         let clone3 = fake_notif(libc::SYS_clone3, 0);
         let openat = fake_notif(libc::SYS_openat, 0);
 
-        assert!(fork_counted_on_continue(&clone_proc));
-        assert!(!fork_counted_on_continue(&clone_thread));
-        assert!(fork_counted_on_continue(&clone3));
-        assert!(!fork_counted_on_continue(&openat));
+        // notif_fd = -1: clone3's user-memory read fails (id_valid),
+        // which fail-safes to "not a thread" → counted as process.
+        // Matches the synthetic clone3 notif's expected accounting.
+        let fd = -1;
 
-        assert!(!requires_process_creation_tracking(&clone_proc, &no_argv_safety));
-        assert!(requires_process_creation_tracking(&clone_proc, &argv_safety));
-        assert!(!requires_process_creation_tracking(&clone_thread, &argv_safety));
-        assert!(requires_process_creation_tracking(&clone3, &argv_safety));
-        assert!(!requires_process_creation_tracking(&openat, &argv_safety));
+        assert!(fork_counted_on_continue(&clone_proc, fd));
+        assert!(!fork_counted_on_continue(&clone_thread, fd));
+        assert!(fork_counted_on_continue(&clone3, fd));
+        assert!(!fork_counted_on_continue(&openat, fd));
+
+        assert!(!requires_process_creation_tracking(&clone_proc, fd, &no_argv_safety));
+        assert!(requires_process_creation_tracking(&clone_proc, fd, &argv_safety));
+        assert!(!requires_process_creation_tracking(&clone_thread, fd, &argv_safety));
+        assert!(requires_process_creation_tracking(&clone3, fd, &argv_safety));
+        assert!(!requires_process_creation_tracking(&openat, fd, &argv_safety));
 
         if let Some(fork_nr) = crate::arch::SYS_FORK {
             let fork = fake_notif(fork_nr, 0);
-            assert!(fork_counted_on_continue(&fork));
-            assert!(requires_process_creation_tracking(&fork, &argv_safety));
+            assert!(fork_counted_on_continue(&fork, fd));
+            assert!(requires_process_creation_tracking(&fork, fd, &argv_safety));
         }
         if let Some(vfork_nr) = crate::arch::SYS_VFORK {
             let vfork = fake_notif(vfork_nr, 0);
-            assert!(fork_counted_on_continue(&vfork));
-            assert!(requires_process_creation_tracking(&vfork, &argv_safety));
+            assert!(fork_counted_on_continue(&vfork, fd));
+            assert!(requires_process_creation_tracking(&vfork, fd, &argv_safety));
         }
     }
 

@@ -208,6 +208,43 @@ async fn test_process_limit_allows_sequential_reuse() {
 }
 
 #[tokio::test]
+async fn test_threads_do_not_count_toward_process_limit_clone3() {
+    // Regression: handle_fork only checked CLONE_THREAD on SYS_clone, not
+    // SYS_clone3 (whose flags live in a clone_args struct in user memory).
+    // glibc 2.34+ implements pthread_create via clone3, so spawning many
+    // Python threads under a tight max_processes would over-count and the
+    // thread creations would fail with EAGAIN once the limit was hit.
+    let out = temp_path("clone3-threads");
+
+    let script = format!(concat!(
+        "import threading, time\n",
+        "barrier = threading.Barrier(11)\n",  // 10 threads + main
+        "def worker():\n",
+        "  barrier.wait()\n",
+        "ts = [threading.Thread(target=worker) for _ in range(10)]\n",
+        "for t in ts: t.start()\n",
+        "barrier.wait()\n",  // every thread reached this point => all 10 alive together
+        "for t in ts: t.join()\n",
+        "open('{out}', 'w').write('ok')\n",
+    ), out = out.display());
+
+    // max_processes=2 leaves zero headroom for child *processes*, so any
+    // pre-fix bug that counted threads as processes would block thread
+    // creation immediately.
+    let policy = base_policy().max_processes(2).build().unwrap();
+    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script]).await.unwrap();
+    assert!(
+        matches!(result.exit_status, ExitStatus::Code(0)),
+        "python should exit 0; got {:?}",
+        result.exit_status,
+    );
+    let content = std::fs::read_to_string(&out).expect("temp file should exist");
+    assert_eq!(content, "ok", "all 10 threads should have started concurrently");
+
+    let _ = std::fs::remove_file(&out);
+}
+
+#[tokio::test]
 async fn test_memory_limit_enforced() {
     let out = temp_path("mem-limit");
 

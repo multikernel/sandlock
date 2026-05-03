@@ -209,11 +209,11 @@ pub fn build_dispatch_table(
     for nr in fork_nrs {
         let policy = Arc::clone(policy);
         let resource = Arc::clone(resource);
-        table.register(nr, Box::new(move |notif, _ctx, _notif_fd| {
+        table.register(nr, Box::new(move |notif, _ctx, notif_fd| {
             let policy = Arc::clone(&policy);
             let resource = Arc::clone(&resource);
             Box::pin(async move {
-                crate::resource::handle_fork(&notif, &resource, &policy).await
+                crate::resource::handle_fork(&notif, notif_fd, &resource, &policy).await
             })
         }));
     }
