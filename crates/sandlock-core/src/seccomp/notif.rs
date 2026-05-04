@@ -1087,12 +1087,14 @@ async fn handle_notification(
 /// Runs until the notification fd is closed (child exits or filter is removed).
 ///
 /// `extra_handlers` are user-supplied syscall handlers registered after all
-/// builtin handlers (see [`super::dispatch::ExtraHandler`]).  For the default
-/// behaviour without any custom handlers pass an empty `Vec`.
+/// builtin handlers (see [`super::dispatch::Handler`]).  Each entry is a
+/// `(syscall_nr, Arc<dyn Handler>)` pair already validated against the
+/// policy.  For the default behaviour without any custom handlers pass
+/// an empty `Vec`.
 pub async fn supervisor(
     notif_fd: OwnedFd,
     ctx: Arc<super::ctx::SupervisorCtx>,
-    extra_handlers: Vec<super::dispatch::ExtraHandler>,
+    extra_handlers: Vec<(i64, Arc<dyn super::dispatch::Handler>)>,
 ) {
     let fd = notif_fd.as_raw_fd();
 
