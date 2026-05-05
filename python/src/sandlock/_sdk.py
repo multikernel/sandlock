@@ -207,10 +207,20 @@ def confine(policy: "PolicyDataclass") -> None:
 
 
 _lib.sandlock_policy_build.restype = _c_policy_p
-_lib.sandlock_policy_build.argtypes = [_c_builder_p, ctypes.POINTER(ctypes.c_int)]
+_lib.sandlock_policy_build.argtypes = [
+    _c_builder_p,
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.POINTER(ctypes.c_char_p),
+]
 
 _lib.sandlock_policy_free.restype = None
 _lib.sandlock_policy_free.argtypes = [_c_policy_p]
+
+# String-out-param release. The FFI returns CString::into_raw pointers
+# for error messages from sandlock_policy_build; we must free them via
+# this function rather than ctypes' own deallocator.
+_lib.sandlock_string_free.restype = None
+_lib.sandlock_string_free.argtypes = [ctypes.c_char_p]
 
 # Run
 _lib.sandlock_run.restype = _c_result_p
@@ -947,9 +957,17 @@ class _NativePolicy:
             b = _lib.sandlock_policy_builder_policy_fn(b, c_callback)
 
         err = ctypes.c_int(0)
-        ptr = _lib.sandlock_policy_build(b, ctypes.byref(err))
+        err_msg = ctypes.c_char_p()
+        ptr = _lib.sandlock_policy_build(b, ctypes.byref(err), ctypes.byref(err_msg))
         if not ptr or err.value != 0:
-            raise RuntimeError("Failed to build policy")
+            # err_msg.value is a copy of the C string's bytes; the
+            # underlying allocation still needs releasing afterwards.
+            # When the FFI leaves err_msg null (e.g. internal binding
+            # bug), raise without a message rather than inventing one.
+            msg = err_msg.value.decode("utf-8", "replace") if err_msg.value else None
+            if err_msg.value:
+                _lib.sandlock_string_free(err_msg)
+            raise RuntimeError(msg) if msg else RuntimeError()
         native = _NativePolicy(ptr)
         native._c_callback = c_callback  # prevent GC
         return native

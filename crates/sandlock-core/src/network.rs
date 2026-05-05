@@ -603,10 +603,20 @@ pub(crate) async fn handle_net(
 /// Resolved form of `Policy::net_allow`, ready for the on-behalf path.
 pub struct ResolvedNetAllow {
     /// Per-IP port rules (each concrete-host entry resolves to one or
-    /// more IPs).
+    /// more IPs). An IP appearing here with an empty port set means
+    /// "all ports for this IP" (from a `host:*` rule).
     pub per_ip: HashMap<IpAddr, HashSet<u16>>,
+    /// IPs permitted on every port (from `host:*` rules after host
+    /// resolution). The on-behalf path treats these the same as
+    /// `PortAllow::Any` — the entry in `per_ip` is kept as a
+    /// placeholder for diagnostic / `/etc/hosts` purposes.
+    pub per_ip_all_ports: HashSet<IpAddr>,
     /// Ports permitted to any IP (the `:port` form).
     pub any_ip_ports: HashSet<u16>,
+    /// Any-host any-port wildcard (`:*` / `*:*`). When true, the
+    /// sandbox is fully unrestricted on outbound TCP/UDP and the
+    /// on-behalf path is bypassed (`NetworkPolicy::Unrestricted`).
+    pub any_ip_all_ports: bool,
     /// Synthetic `/etc/hosts` content for any concrete hostnames.
     /// `None` when no concrete hostnames are present (real `/etc/hosts`
     /// stays visible).
@@ -618,15 +628,21 @@ pub async fn resolve_net_allow(
     rules: &[crate::policy::NetAllow],
 ) -> io::Result<ResolvedNetAllow> {
     let mut per_ip: HashMap<IpAddr, HashSet<u16>> = HashMap::new();
+    let mut per_ip_all_ports: HashSet<IpAddr> = HashSet::new();
     let mut any_ip_ports: HashSet<u16> = HashSet::new();
+    let mut any_ip_all_ports = false;
     let mut etc_hosts = String::from("127.0.0.1 localhost\n::1 localhost\n");
     let mut has_concrete_host = false;
 
     for rule in rules {
         match &rule.host {
             None => {
-                for &p in &rule.ports {
-                    any_ip_ports.insert(p);
+                if rule.all_ports {
+                    any_ip_all_ports = true;
+                } else {
+                    for &p in &rule.ports {
+                        any_ip_ports.insert(p);
+                    }
                 }
             }
             Some(host) => {
@@ -640,9 +656,17 @@ pub async fn resolve_net_allow(
                 })?;
                 for socket_addr in resolved {
                     let ip = socket_addr.ip();
-                    let entry = per_ip.entry(ip).or_default();
-                    for &p in &rule.ports {
-                        entry.insert(p);
+                    if rule.all_ports {
+                        per_ip_all_ports.insert(ip);
+                        // Keep an entry in per_ip so callers iterating
+                        // resolved hosts still see this IP. The runtime
+                        // policy honors per_ip_all_ports first.
+                        per_ip.entry(ip).or_default();
+                    } else {
+                        let entry = per_ip.entry(ip).or_default();
+                        for &p in &rule.ports {
+                            entry.insert(p);
+                        }
                     }
                     etc_hosts.push_str(&format!("{} {}\n", ip, host));
                 }
@@ -652,7 +676,9 @@ pub async fn resolve_net_allow(
 
     Ok(ResolvedNetAllow {
         per_ip,
+        per_ip_all_ports,
         any_ip_ports,
+        any_ip_all_ports,
         etc_hosts: if has_concrete_host { Some(etc_hosts) } else { None },
     })
 }
@@ -679,6 +705,7 @@ mod tests {
         let rules = vec![NetAllow {
             host: Some("localhost".to_string()),
             ports: vec![80, 443],
+            all_ports: false,
         }];
         let resolved = resolve_net_allow(&rules).await.unwrap();
         // localhost should resolve to at least one loopback addr.
@@ -692,10 +719,64 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_net_allow_any_ip() {
-        let rules = vec![NetAllow { host: None, ports: vec![8080] }];
+        let rules = vec![NetAllow { host: None, ports: vec![8080], all_ports: false }];
         let resolved = resolve_net_allow(&rules).await.unwrap();
         assert!(resolved.per_ip.is_empty());
         assert!(resolved.any_ip_ports.contains(&8080));
+        assert!(!resolved.any_ip_all_ports);
         assert!(resolved.etc_hosts.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_net_allow_any_ip_all_ports() {
+        // `:*` — fully unrestricted egress.
+        let rules = vec![NetAllow { host: None, ports: vec![], all_ports: true }];
+        let resolved = resolve_net_allow(&rules).await.unwrap();
+        assert!(resolved.any_ip_all_ports);
+        assert!(resolved.per_ip.is_empty());
+        assert!(resolved.per_ip_all_ports.is_empty());
+        assert!(resolved.any_ip_ports.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_net_allow_concrete_host_all_ports() {
+        // `localhost:*` — every port to localhost only.
+        let rules = vec![NetAllow {
+            host: Some("localhost".to_string()),
+            ports: vec![],
+            all_ports: true,
+        }];
+        let resolved = resolve_net_allow(&rules).await.unwrap();
+        assert!(!resolved.any_ip_all_ports);
+        assert!(!resolved.per_ip_all_ports.is_empty(),
+            "localhost should resolve to at least one IP marked as any-port");
+        // per_ip has placeholder entries for the same IPs (so callers
+        // iterating per_ip still see them).
+        for ip in resolved.per_ip_all_ports.iter() {
+            assert!(resolved.per_ip.contains_key(ip));
+        }
+        // /etc/hosts is synthesized for concrete hosts.
+        assert!(resolved.etc_hosts.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_net_allow_mixed_wildcard_and_concrete() {
+        // Wildcard rule alongside concrete: wildcard sets the global
+        // any-host any-port flag; concrete rule still resolves into
+        // per_ip (the runtime layer chooses Unrestricted, ignoring the
+        // concrete entries — that's a runtime-policy concern, not a
+        // resolver concern).
+        let rules = vec![
+            NetAllow { host: None, ports: vec![], all_ports: true },
+            NetAllow {
+                host: Some("localhost".to_string()),
+                ports: vec![22],
+                all_ports: false,
+            },
+        ];
+        let resolved = resolve_net_allow(&rules).await.unwrap();
+        assert!(resolved.any_ip_all_ports);
+        // Concrete entries still present in per_ip.
+        assert!(!resolved.per_ip.is_empty());
     }
 }

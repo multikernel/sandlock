@@ -1036,14 +1036,30 @@ impl Sandbox {
 
             // NetworkState
             let mut net_state = NetworkState::new();
-            net_state.network_policy = if self.policy.net_allow.is_empty() {
+            net_state.network_policy = if self.policy.net_allow.is_empty()
+                || resolved_net_allow.any_ip_all_ports
+            {
+                // Empty net_allow leaves only Landlock to enforce
+                // (kernel-level deny-all-connect by default). The
+                // `:*` wildcard explicitly opens egress, so the
+                // on-behalf path becomes a no-op.
                 crate::seccomp::notif::NetworkPolicy::Unrestricted
             } else {
                 use crate::seccomp::notif::PortAllow;
                 let per_ip = resolved_net_allow
                     .per_ip
                     .iter()
-                    .map(|(ip, ports)| (*ip, PortAllow::Specific(ports.clone())))
+                    .map(|(ip, ports)| {
+                        // `host:*` resolves into per_ip_all_ports; for those
+                        // IPs we use PortAllow::Any regardless of the (empty)
+                        // port set in per_ip.
+                        let allow = if resolved_net_allow.per_ip_all_ports.contains(ip) {
+                            PortAllow::Any
+                        } else {
+                            PortAllow::Specific(ports.clone())
+                        };
+                        (*ip, allow)
+                    })
                     .collect();
                 crate::seccomp::notif::NetworkPolicy::AllowList {
                     per_ip,

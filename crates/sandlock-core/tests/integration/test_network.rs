@@ -226,3 +226,92 @@ async fn test_grandchild_network_connect() {
     srv.join().unwrap();
     let _ = std::fs::remove_file(&out);
 }
+
+/// `--net-allow :*` opens egress to every host and port. Verifies
+/// that both the Landlock side (CONNECT_TCP unhandled) and the
+/// on-behalf side (NetworkPolicy::Unrestricted) cooperate to allow a
+/// connection to a port that no concrete rule mentions. Issue #32.
+#[tokio::test]
+async fn test_net_allow_wildcard_any_host_any_port() {
+    let out = temp_file("wildcard-any");
+
+    // Stand up a server on a port nothing else mentions.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let srv = std::thread::spawn(move || {
+        let (mut conn, _) = listener.accept().unwrap();
+        let _ = std::io::Write::write_all(&mut conn, b"ok");
+    });
+
+    let policy = base_policy().net_allow(":*").build().unwrap();
+
+    let script = format!(concat!(
+        "import socket\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+        "s.settimeout(5)\n",
+        "s.connect(('127.0.0.1', {port}))\n",
+        "data = s.recv(16)\n",
+        "s.close()\n",
+        "open('{out}', 'w').write(data.decode())\n",
+    ), out = out.display(), port = port);
+
+    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    assert_eq!(content, "ok", "wildcard :* should permit arbitrary egress");
+
+    srv.join().unwrap();
+    let _ = std::fs::remove_file(&out);
+}
+
+/// `--net-allow host:*` permits every port to the host but still
+/// blocks other hosts. Verifies the Landlock-unhandled + on-behalf
+/// per_ip_all_ports path keeps the IP allowlist intact.
+#[tokio::test]
+async fn test_net_allow_wildcard_host_only() {
+    let out = temp_file("wildcard-host");
+
+    // Server on localhost; a non-localhost connect must still be blocked.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let srv = std::thread::spawn(move || {
+        let (mut conn, _) = listener.accept().unwrap();
+        let _ = std::io::Write::write_all(&mut conn, b"ok");
+    });
+
+    let policy = base_policy().net_allow("localhost:*").build().unwrap();
+
+    let script = format!(concat!(
+        "import socket\n",
+        "results = []\n",
+        // localhost any port — should connect
+        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+        "s.settimeout(5)\n",
+        "try:\n",
+        "  s.connect(('127.0.0.1', {port}))\n",
+        "  results.append('local:ok')\n",
+        "  s.close()\n",
+        "except OSError as e:\n",
+        "  results.append(f'local:err{{e.errno}}')\n",
+        // non-localhost — should be blocked
+        "s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+        "s2.settimeout(2)\n",
+        "try:\n",
+        "  s2.connect(('1.1.1.1', 80))\n",
+        "  results.append('remote:ALLOWED')\n",
+        "  s2.close()\n",
+        "except (OSError, socket.timeout):\n",
+        "  results.append('remote:blocked')\n",
+        "open('{out}', 'w').write(','.join(results))\n",
+    ), out = out.display(), port = port);
+
+    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(content.contains("local:ok"), "localhost should connect; got: {}", content);
+    assert!(content.contains("remote:blocked"),
+        "remote host must remain blocked under host:* wildcard; got: {}", content);
+
+    srv.join().unwrap();
+    let _ = std::fs::remove_file(&out);
+}

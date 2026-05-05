@@ -195,9 +195,21 @@ pub fn confine(policy: &Policy) -> Result<(), SandlockError> {
     // Step 2 -- build handled_access_fs / handled_access_net / scoped.
     let handled_access_fs = base_fs_access(abi);
 
-    // Always restrict TCP bind/connect via Landlock.  Empty net_bind/net_connect
-    // means deny all — same semantics as fs_readable/fs_writable.
-    let handled_access_net = LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP;
+    // Restrict TCP bind/connect via Landlock by default. When any
+    // `--net-allow` rule has the all-ports wildcard (`host:*` or
+    // `:*`), Landlock cannot express "every port" without enumerating
+    // 65535 rules, so we drop CONNECT_TCP from the handled set —
+    // unhandled access is unrestricted by Landlock. The on-behalf
+    // path (seccomp notif on connect/sendto/sendmsg) still enforces
+    // the per-rule IP allowlist when the rule is `host:*`. For `:*`
+    // the on-behalf path becomes `NetworkPolicy::Unrestricted` (no
+    // additional check). Bind enforcement is unaffected.
+    let net_wildcard = policy.net_allow.iter().any(|r| r.all_ports);
+    let handled_access_net = if net_wildcard {
+        LANDLOCK_ACCESS_NET_BIND_TCP
+    } else {
+        LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP
+    };
 
     // IPC and signal isolation are always enabled.
     let scoped = LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET | LANDLOCK_SCOPE_SIGNAL;
@@ -286,19 +298,25 @@ pub fn confine(policy: &Policy) -> Result<(), SandlockError> {
     // the kernel rejects before seccomp gets a chance to dispatch. Allow
     // every port that any --net-allow rule mentions, plus every HTTP
     // intercept port; the on-behalf check ensures the IP also matches.
-    let mut connect_ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
-    for rule in &policy.net_allow {
-        for &p in &rule.ports {
+    //
+    // When `net_wildcard` is set we already excluded CONNECT_TCP from
+    // `handled_access_net`, so adding rules here would fail with EINVAL.
+    // Skip — the on-behalf path is the sole enforcer.
+    if !net_wildcard {
+        let mut connect_ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
+        for rule in &policy.net_allow {
+            for &p in &rule.ports {
+                connect_ports.insert(p);
+            }
+        }
+        for &p in &policy.http_ports {
             connect_ports.insert(p);
         }
-    }
-    for &p in &policy.http_ports {
-        connect_ports.insert(p);
-    }
-    for port in connect_ports {
-        add_net_rule(&ruleset_fd, port, LANDLOCK_ACCESS_NET_CONNECT_TCP).map_err(|e| {
-            SandlockError::Sandbox(crate::error::SandboxError::Confinement(e))
-        })?;
+        for port in connect_ports {
+            add_net_rule(&ruleset_fd, port, LANDLOCK_ACCESS_NET_CONNECT_TCP).map_err(|e| {
+                SandlockError::Sandbox(crate::error::SandboxError::Confinement(e))
+            })?;
+        }
     }
 
     // Step 6 — enforce (irreversible).
