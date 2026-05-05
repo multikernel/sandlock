@@ -47,10 +47,19 @@ use tokio::sync::Mutex;
 /// invocation.
 ///
 /// State lives on the implementor — no `Arc::clone` ladders, no
-/// `Box::pin(async move {...})` ceremony at registration time.
-#[async_trait::async_trait]
+/// closure ceremony at registration time.
+///
+/// `handle` returns a boxed `Future` so the trait stays dyn-compatible
+/// (the supervisor stores user handlers as `Vec<Arc<dyn Handler>>`,
+/// keyed by syscall number).  Returning `impl Future` directly via
+/// RPITIT would be more efficient but is not object-safe, and changing
+/// the storage to a non-erased shape would force a generic dispatch
+/// chain incompatible with arbitrary user handler types.
 pub trait Handler: Send + Sync + 'static {
-    async fn handle(&self, cx: &HandlerCtx<'_>) -> NotifAction;
+    fn handle<'a>(
+        &'a self,
+        cx: &'a HandlerCtx<'_>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = NotifAction> + Send + 'a>>;
 }
 
 /// Borrowed context passed to `Handler::handle`.
@@ -73,14 +82,16 @@ pub struct HandlerCtx<'a> {
 // Lets lightweight closure-style handlers work without ceremony at the
 // call site.  Handlers that need state should use `struct + explicit
 // impl Handler` instead.
-#[async_trait::async_trait]
 impl<F, Fut> Handler for F
 where
     F: Fn(&HandlerCtx<'_>) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = NotifAction> + Send + 'static,
 {
-    async fn handle(&self, cx: &HandlerCtx<'_>) -> NotifAction {
-        (self)(cx).await
+    fn handle<'a>(
+        &'a self,
+        cx: &'a HandlerCtx<'_>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = NotifAction> + Send + 'a>> {
+        Box::pin((self)(cx))
     }
 }
 
@@ -95,17 +106,21 @@ where
 // `<H: Handler + ?Sized>` blankets to avoid coherence overlap with the
 // `impl<F, Fut> Handler for F where F: Fn(&HandlerCtx<'_>) -> Fut` blanket
 // above.
-#[async_trait::async_trait]
 impl Handler for Box<dyn Handler> {
-    async fn handle(&self, cx: &HandlerCtx<'_>) -> NotifAction {
-        (**self).handle(cx).await
+    fn handle<'a>(
+        &'a self,
+        cx: &'a HandlerCtx<'_>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = NotifAction> + Send + 'a>> {
+        (**self).handle(cx)
     }
 }
 
-#[async_trait::async_trait]
 impl Handler for std::sync::Arc<dyn Handler> {
-    async fn handle(&self, cx: &HandlerCtx<'_>) -> NotifAction {
-        (**self).handle(cx).await
+    fn handle<'a>(
+        &'a self,
+        cx: &'a HandlerCtx<'_>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = NotifAction> + Send + 'a>> {
+        (**self).handle(cx)
     }
 }
 
@@ -1198,11 +1213,15 @@ mod extra_handler_tests {
             calls: AtomicU64,
         }
 
-        #[async_trait::async_trait]
         impl Handler for StructHandler {
-            async fn handle(&self, _cx: &HandlerCtx<'_>) -> NotifAction {
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                NotifAction::Continue
+            fn handle<'a>(
+                &'a self,
+                _cx: &'a HandlerCtx<'_>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = NotifAction> + Send + 'a>> {
+                Box::pin(async move {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    NotifAction::Continue
+                })
             }
         }
 

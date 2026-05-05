@@ -324,15 +324,19 @@ async fn chain_of_extras_runs_in_insertion_order() {
         action: NotifAction,
     }
 
-    #[async_trait::async_trait]
     impl Handler for Counter {
-        async fn handle(&self, _cx: &HandlerCtx<'_>) -> NotifAction {
-            self.c.fetch_add(1, Ordering::SeqCst);
-            match self.action {
-                NotifAction::Continue => NotifAction::Continue,
-                NotifAction::Errno(e) => NotifAction::Errno(e),
-                _ => unreachable!("test only uses Continue / Errno"),
-            }
+        fn handle<'a>(
+            &'a self,
+            _cx: &'a HandlerCtx<'_>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = NotifAction> + Send + 'a>> {
+            Box::pin(async move {
+                self.c.fetch_add(1, Ordering::SeqCst);
+                match self.action {
+                    NotifAction::Continue => NotifAction::Continue,
+                    NotifAction::Errno(e) => NotifAction::Errno(e),
+                    _ => unreachable!("test only uses Continue / Errno"),
+                }
+            })
         }
     }
 
@@ -528,11 +532,15 @@ async fn struct_handler_state_persists_across_sandbox_calls() {
         calls: Arc<AtomicUsize>,
     }
 
-    #[async_trait::async_trait]
     impl Handler for UnameCounter {
-        async fn handle(&self, _cx: &HandlerCtx<'_>) -> NotifAction {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            NotifAction::Errno(libc::EPERM)
+        fn handle<'a>(
+            &'a self,
+            _cx: &'a HandlerCtx<'_>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = NotifAction> + Send + 'a>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                NotifAction::Errno(libc::EPERM)
+            })
         }
     }
 
@@ -618,15 +626,19 @@ async fn run_with_extra_handlers_preserves_insertion_order_in_sandbox_chain() {
         action: NotifAction,
     }
 
-    #[async_trait::async_trait]
     impl Handler for OrderTracker {
-        async fn handle(&self, _cx: &HandlerCtx<'_>) -> NotifAction {
-            self.order.lock().unwrap().push(self.id);
-            match self.action {
-                NotifAction::Continue => NotifAction::Continue,
-                NotifAction::Errno(e) => NotifAction::Errno(e),
-                _ => unreachable!("test only uses Continue / Errno"),
-            }
+        fn handle<'a>(
+            &'a self,
+            _cx: &'a HandlerCtx<'_>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = NotifAction> + Send + 'a>> {
+            Box::pin(async move {
+                self.order.lock().unwrap().push(self.id);
+                match self.action {
+                    NotifAction::Continue => NotifAction::Continue,
+                    NotifAction::Errno(e) => NotifAction::Errno(e),
+                    _ => unreachable!("test only uses Continue / Errno"),
+                }
+            })
         }
     }
 

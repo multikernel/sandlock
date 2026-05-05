@@ -9,7 +9,6 @@ readme = "../../README.md"
 description = "Lightweight process sandbox using Landlock, seccomp-bpf, and seccomp user notification"
 
 [dependencies]
-async-trait = "0.1"
 libc = "0.2"
 nix = { version = "0.29", features = ["process", "signal", "fs", "ioctl", "poll"] }
 tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros", "io-util"] }
