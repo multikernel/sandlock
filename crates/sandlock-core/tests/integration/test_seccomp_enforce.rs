@@ -300,6 +300,83 @@ async fn test_udp_denied_by_default() {
 }
 
 // ------------------------------------------------------------------
+// 7. SysV IPC (shmget) denied by default — sandlock has no IPC
+//    namespace, so the deny is the only thing isolating shm
+//    keyspaces between sandboxes.
+// ------------------------------------------------------------------
+#[tokio::test]
+async fn test_sysv_shmget_denied_by_default() {
+    let out = temp_out("shmget-denied");
+    // shmget(IPC_PRIVATE, 4096, IPC_CREAT|0600) — should return EPERM.
+    let script = format!(concat!(
+        "import ctypes, errno\n",
+        "libc = ctypes.CDLL(None)\n",
+        "ret = libc.shmget(0, 4096, 0o1000 | 0o600)\n",
+        "if ret == -1:\n",
+        "  e = ctypes.get_errno()\n",
+        "  result = 'EPERM' if e == errno.EPERM else f'ERROR:{{e}}'\n",
+        "else:\n",
+        "  libc.shmctl(ret, 0, None)\n",
+        "  result = 'ALLOWED'\n",
+        "open('{out}', 'w').write(result)\n",
+    ), out = out.display());
+
+    let policy = base_policy().build().unwrap();
+    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+        .await
+        .unwrap();
+
+    let contents = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    let trimmed = contents.trim();
+    // ctypes does not propagate errno from libc by default; the call
+    // itself returning -1 is the signal that the seccomp deny fired.
+    assert!(
+        trimmed != "ALLOWED",
+        "shmget must be denied by default (sandlock has no IPC ns); got: {}",
+        trimmed
+    );
+    assert!(result.success());
+}
+
+// ------------------------------------------------------------------
+// 7b. allow_sysv_ipc(true) restores SysV shm.
+// ------------------------------------------------------------------
+#[tokio::test]
+async fn test_sysv_shmget_allowed_when_opted_in() {
+    let out = temp_out("shmget-allowed");
+    let script = format!(concat!(
+        "import ctypes\n",
+        "libc = ctypes.CDLL(None)\n",
+        "ret = libc.shmget(0, 4096, 0o1000 | 0o600)\n",
+        "if ret == -1:\n",
+        "  result = 'BLOCKED'\n",
+        "else:\n",
+        "  libc.shmctl(ret, 0, None)\n",
+        "  result = 'ALLOWED'\n",
+        "open('{out}', 'w').write(result)\n",
+    ), out = out.display());
+
+    let policy = base_policy()
+        .allow_sysv_ipc(true)
+        .build()
+        .unwrap();
+    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+        .await
+        .unwrap();
+
+    let contents = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(
+        contents.trim(),
+        "ALLOWED",
+        "shmget should be permitted under --allow-sysv-ipc; got: {}",
+        contents.trim()
+    );
+    assert!(result.success());
+}
+
+// ------------------------------------------------------------------
 // 8. TCP always allowed (default deny posture for raw + UDP)
 // ------------------------------------------------------------------
 #[tokio::test]

@@ -334,6 +334,14 @@ pub struct Policy {
     /// types remain denied. Useful for `ping` without granting full
     /// packet-crafting capability.
     pub allow_icmp: bool,
+    /// Permit SysV IPC syscalls: shared memory (`shmget`/`shmat`/
+    /// `shmdt`/`shmctl`), message queues (`msgget`/`msgsnd`/`msgrcv`/
+    /// `msgctl`), and semaphores (`semget`/`semop`/`semctl`/
+    /// `semtimedop`). Denied by default because sandlock does not use
+    /// IPC namespaces; without this denial, two sandboxes on the same
+    /// host share a SysV IPC keyspace and can rendezvous via a
+    /// well-known key.
+    pub allow_sysv_ipc: bool,
 
     // HTTP ACL
     pub http_allow: Vec<HttpRule>,
@@ -428,6 +436,7 @@ pub struct PolicyBuilder {
     net_bind: Vec<u16>,
     allow_udp: bool,
     allow_icmp: bool,
+    allow_sysv_ipc: bool,
 
     http_allow: Vec<String>,
     http_deny: Vec<String>,
@@ -535,6 +544,14 @@ impl PolicyBuilder {
     /// equivalent only. Other raw socket types stay denied.
     pub fn allow_icmp(mut self, v: bool) -> Self {
         self.allow_icmp = v;
+        self
+    }
+
+    /// Permit SysV IPC syscalls (shm/msg/sem). Denied by default
+    /// because sandlock does not use IPC namespaces — without this
+    /// denial, sandboxes on the same host share a SysV keyspace.
+    pub fn allow_sysv_ipc(mut self, v: bool) -> Self {
+        self.allow_sysv_ipc = v;
         self
     }
 
@@ -804,6 +821,7 @@ impl PolicyBuilder {
             net_bind: self.net_bind,
             allow_udp: self.allow_udp,
             allow_icmp: self.allow_icmp,
+            allow_sysv_ipc: self.allow_sysv_ipc,
             http_allow,
             http_deny,
             http_ports,

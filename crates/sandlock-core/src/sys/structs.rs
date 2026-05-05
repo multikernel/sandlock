@@ -266,6 +266,30 @@ pub const ECONNREFUSED: i32 = 111;
 // Default deny syscall list
 // ============================================================
 
+/// SysV IPC syscalls. Appended to the kernel-level deny list when
+/// `policy.allow_sysv_ipc` is false. Sandlock does not use an IPC
+/// namespace, so without these denials two sandboxes on the same host
+/// share a SysV keyspace and can rendezvous via a well-known key.
+///
+/// POSIX shared memory (`shm_open`) is intentionally not here — it is
+/// just `open("/dev/shm/<name>")`, gated by Landlock filesystem rules.
+/// POSIX message queues (`mq_open` and friends) are also out of scope
+/// for this flag.
+pub const SYSV_IPC_DENY_SYSCALLS: &[&str] = &[
+    "shmget",
+    "shmat",
+    "shmdt",
+    "shmctl",
+    "msgget",
+    "msgsnd",
+    "msgrcv",
+    "msgctl",
+    "semget",
+    "semop",
+    "semctl",
+    "semtimedop",
+];
+
 pub const DEFAULT_DENY_SYSCALLS: &[&str] = &[
     "mount",
     "umount2",

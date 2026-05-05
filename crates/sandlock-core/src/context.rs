@@ -11,7 +11,7 @@ use crate::seccomp::bpf::{self, stmt, jump};
 use crate::sys::structs::{
     AF_INET, AF_INET6,
     BPF_ABS, BPF_ALU, BPF_AND, BPF_JEQ, BPF_JSET, BPF_JMP, BPF_K, BPF_LD, BPF_RET, BPF_W,
-    CLONE_NS_FLAGS, DEFAULT_DENY_SYSCALLS, EPERM,
+    CLONE_NS_FLAGS, DEFAULT_DENY_SYSCALLS, EPERM, SYSV_IPC_DENY_SYSCALLS,
     SECCOMP_RET_ALLOW, SECCOMP_RET_ERRNO,
     SIOCETHTOOL, SIOCGIFADDR, SIOCGIFBRDADDR, SIOCGIFCONF, SIOCGIFDSTADDR,
     SIOCGIFFLAGS, SIOCGIFHWADDR, SIOCGIFINDEX, SIOCGIFNAME, SIOCGIFNETMASK,
@@ -222,6 +222,19 @@ pub fn syscall_name_to_nr(name: &str) -> Option<u32> {
         "readlink" => arch::SYS_READLINK?,
         "futimesat" => arch::SYS_FUTIMESAT?,
         "fork" => arch::SYS_FORK?,
+        // SysV IPC (gated by --allow-sysv-ipc; denied by default)
+        "shmget" => libc::SYS_shmget,
+        "shmat" => libc::SYS_shmat,
+        "shmdt" => libc::SYS_shmdt,
+        "shmctl" => libc::SYS_shmctl,
+        "msgget" => libc::SYS_msgget,
+        "msgsnd" => libc::SYS_msgsnd,
+        "msgrcv" => libc::SYS_msgrcv,
+        "msgctl" => libc::SYS_msgctl,
+        "semget" => libc::SYS_semget,
+        "semop" => libc::SYS_semop,
+        "semctl" => libc::SYS_semctl,
+        "semtimedop" => libc::SYS_semtimedop,
         _ => return None,
     };
     Some(nr as u32)
@@ -255,7 +268,14 @@ pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
         nrs.push(libc::SYS_munmap as u32);
         nrs.push(libc::SYS_brk as u32);
         nrs.push(libc::SYS_mremap as u32);
-        nrs.push(libc::SYS_shmget as u32);
+        // shmget is in notif only when SysV IPC is allowed. The BPF
+        // layout puts notif JEQs before deny JEQs, so a syscall on
+        // both lists would notify (RET_USER_NOTIF) and silently
+        // bypass the kernel-level deny. When --allow-sysv-ipc is
+        // unset, shmget belongs only on the deny list.
+        if policy.allow_sysv_ipc {
+            nrs.push(libc::SYS_shmget as u32);
+        }
     }
 
     if !policy.net_allow.is_empty()
@@ -422,21 +442,38 @@ pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
     nrs
 }
 
-/// Resolve `NO_SUPERVISOR_DENY_SYSCALLS` names to numbers.
-pub fn no_supervisor_deny_syscall_numbers() -> Vec<u32> {
+/// Resolve `NO_SUPERVISOR_DENY_SYSCALLS` names to numbers, plus
+/// SysV IPC syscalls when `policy.allow_sysv_ipc` is false.
+pub fn no_supervisor_deny_syscall_numbers(policy: &Policy) -> Vec<u32> {
     use crate::sys::structs::NO_SUPERVISOR_DENY_SYSCALLS;
-    NO_SUPERVISOR_DENY_SYSCALLS
+    let mut nrs: Vec<u32> = NO_SUPERVISOR_DENY_SYSCALLS
         .iter()
         .filter_map(|n| syscall_name_to_nr(n))
-        .collect()
+        .collect();
+    if !policy.allow_sysv_ipc {
+        for name in SYSV_IPC_DENY_SYSCALLS {
+            if let Some(nr) = syscall_name_to_nr(name) {
+                if !nrs.contains(&nr) {
+                    nrs.push(nr);
+                }
+            }
+        }
+    }
+    nrs
 }
 
 /// Resolve `deny_syscalls` names to numbers.
 ///
 /// If both `deny_syscalls` and `allow_syscalls` are `None`, returns the
 /// numbers for `DEFAULT_DENY_SYSCALLS`.
+///
+/// SysV IPC syscalls are appended to the resolved deny list when
+/// `policy.allow_sysv_ipc` is false — both for the default branch and
+/// the user-supplied `deny_syscalls` branch. They are not appended in
+/// allowlist mode (`allow_syscalls = Some(_)`); a user enumerating the
+/// exact set of permitted syscalls is already in control.
 pub fn deny_syscall_numbers(policy: &Policy) -> Vec<u32> {
-    if let Some(ref names) = policy.deny_syscalls {
+    let mut nrs: Vec<u32> = if let Some(ref names) = policy.deny_syscalls {
         names
             .iter()
             .filter_map(|n| syscall_name_to_nr(n))
@@ -448,8 +485,18 @@ pub fn deny_syscall_numbers(policy: &Policy) -> Vec<u32> {
             .collect()
     } else {
         // allow_syscalls is set — no deny list
-        Vec::new()
+        return Vec::new();
+    };
+    if !policy.allow_sysv_ipc {
+        for name in SYSV_IPC_DENY_SYSCALLS {
+            if let Some(nr) = syscall_name_to_nr(name) {
+                if !nrs.contains(&nr) {
+                    nrs.push(nr);
+                }
+            }
+        }
     }
+    nrs
 }
 
 /// Build argument-level seccomp filter instructions matching the Python
@@ -1136,8 +1183,13 @@ mod tests {
 
     #[test]
     fn test_notif_syscalls_memory() {
+        // shmget only appears in notif when SysV IPC is allowed —
+        // otherwise it is on the kernel deny list and notifying would
+        // bypass the deny (notif JEQs precede deny JEQs in the BPF
+        // layout).
         let policy = Policy::builder()
             .max_memory(crate::policy::ByteSize::mib(256))
+            .allow_sysv_ipc(true)
             .build()
             .unwrap();
         let nrs = notif_syscalls(&policy);
@@ -1146,6 +1198,23 @@ mod tests {
         assert!(nrs.contains(&(libc::SYS_brk as u32)));
         assert!(nrs.contains(&(libc::SYS_mremap as u32)));
         assert!(nrs.contains(&(libc::SYS_shmget as u32)));
+    }
+
+    #[test]
+    fn test_notif_syscalls_memory_excludes_shmget_when_sysv_ipc_denied() {
+        // With max_memory but allow_sysv_ipc=false (the default),
+        // shmget must NOT be in notif: if it were, the BPF filter
+        // would route it to RET_USER_NOTIF before reaching the deny
+        // JEQ, silently bypassing the kernel-level deny.
+        let policy = Policy::builder()
+            .max_memory(crate::policy::ByteSize::mib(256))
+            .build()
+            .unwrap();
+        let nrs = notif_syscalls(&policy);
+        assert!(!nrs.contains(&(libc::SYS_shmget as u32)));
+        // Other memory syscalls remain notified — they are not denied.
+        assert!(nrs.contains(&(libc::SYS_mmap as u32)));
+        assert!(nrs.contains(&(libc::SYS_brk as u32)));
     }
 
     #[test]
@@ -1195,6 +1264,11 @@ mod tests {
         assert!(nrs.contains(&(libc::SYS_mount as u32)));
         assert!(nrs.contains(&(libc::SYS_ptrace as u32)));
         assert!(nrs.contains(&(libc::SYS_bpf as u32)));
+        // SysV IPC denied by default (no IPC namespace in sandlock)
+        assert!(nrs.contains(&(libc::SYS_shmget as u32)));
+        assert!(nrs.contains(&(libc::SYS_shmat as u32)));
+        assert!(nrs.contains(&(libc::SYS_msgget as u32)));
+        assert!(nrs.contains(&(libc::SYS_semget as u32)));
         // nfsservctl has no libc constant, so it is skipped
         assert!(!nrs.is_empty());
     }
@@ -1206,9 +1280,26 @@ mod tests {
             .build()
             .unwrap();
         let nrs = deny_syscall_numbers(&policy);
+        // User-supplied deny list still gets SysV IPC appended
+        // (allow_sysv_ipc defaults to false).
+        assert!(nrs.contains(&(libc::SYS_mount as u32)));
+        assert!(nrs.contains(&(libc::SYS_ptrace as u32)));
+        assert!(nrs.contains(&(libc::SYS_shmget as u32)));
+    }
+
+    #[test]
+    fn test_deny_syscall_numbers_custom_with_sysv_ipc_allowed() {
+        let policy = Policy::builder()
+            .deny_syscalls(vec!["mount".into(), "ptrace".into()])
+            .allow_sysv_ipc(true)
+            .build()
+            .unwrap();
+        let nrs = deny_syscall_numbers(&policy);
+        // Exactly the user-supplied two — no SysV IPC append.
         assert_eq!(nrs.len(), 2);
         assert!(nrs.contains(&(libc::SYS_mount as u32)));
         assert!(nrs.contains(&(libc::SYS_ptrace as u32)));
+        assert!(!nrs.contains(&(libc::SYS_shmget as u32)));
     }
 
     #[test]
@@ -1218,7 +1309,45 @@ mod tests {
             .build()
             .unwrap();
         let nrs = deny_syscall_numbers(&policy);
+        // Allowlist mode: user enumerated exactly what is permitted —
+        // we do not append SysV IPC denials (the absence of those
+        // syscalls in allow_syscalls already denies them).
         assert!(nrs.is_empty());
+    }
+
+    #[test]
+    fn test_deny_syscall_numbers_default_with_sysv_ipc_allowed() {
+        let policy = Policy::builder()
+            .allow_sysv_ipc(true)
+            .build()
+            .unwrap();
+        let nrs = deny_syscall_numbers(&policy);
+        // Default deny list still present, but SysV IPC is permitted.
+        assert!(nrs.contains(&(libc::SYS_mount as u32)));
+        assert!(!nrs.contains(&(libc::SYS_shmget as u32)));
+        assert!(!nrs.contains(&(libc::SYS_msgget as u32)));
+        assert!(!nrs.contains(&(libc::SYS_semget as u32)));
+    }
+
+    #[test]
+    fn test_no_supervisor_deny_includes_sysv_ipc_by_default() {
+        let policy = Policy::builder().build().unwrap();
+        let nrs = no_supervisor_deny_syscall_numbers(&policy);
+        assert!(nrs.contains(&(libc::SYS_shmget as u32)));
+        assert!(nrs.contains(&(libc::SYS_msgget as u32)));
+        assert!(nrs.contains(&(libc::SYS_semget as u32)));
+    }
+
+    #[test]
+    fn test_no_supervisor_deny_excludes_sysv_ipc_when_allowed() {
+        let policy = Policy::builder()
+            .allow_sysv_ipc(true)
+            .build()
+            .unwrap();
+        let nrs = no_supervisor_deny_syscall_numbers(&policy);
+        assert!(!nrs.contains(&(libc::SYS_shmget as u32)));
+        assert!(!nrs.contains(&(libc::SYS_msgget as u32)));
+        assert!(!nrs.contains(&(libc::SYS_semget as u32)));
     }
 
     #[test]

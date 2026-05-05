@@ -90,6 +90,9 @@ pub fn parse_profile(content: &str) -> Result<Policy, SandlockError> {
     if let Some(v) = sandbox.get("allow_icmp").and_then(|v| v.as_bool()) {
         builder = builder.allow_icmp(v);
     }
+    if let Some(v) = sandbox.get("allow_sysv_ipc").and_then(|v| v.as_bool()) {
+        builder = builder.allow_sysv_ipc(v);
+    }
 if let Some(v) = sandbox.get("clean_env").and_then(|v| v.as_bool()) {
         builder = builder.clean_env(v);
     }

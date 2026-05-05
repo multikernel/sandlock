@@ -81,6 +81,14 @@ enum Command {
         /// packet-crafting capability.
         #[arg(long = "allow-icmp")]
         allow_icmp: bool,
+        /// Allow SysV IPC syscalls (shared memory, message queues,
+        /// semaphores). Denied by default: sandlock does not use IPC
+        /// namespaces, so without this denial two sandboxes on the
+        /// same host share a SysV keyspace and can rendezvous via a
+        /// well-known key. Enable only when running software that
+        /// requires SysV IPC (e.g. Oracle, Sybase, MPI intra-node).
+        #[arg(long = "allow-sysv-ipc")]
+        allow_sysv_ipc: bool,
         #[arg(long = "http-allow", value_name = "RULE")]
         http_allow: Vec<String>,
         #[arg(long = "http-deny", value_name = "RULE")]
@@ -178,7 +186,7 @@ async fn main() -> Result<()> {
             net_allow, net_bind, time_start, random_seed,
             clean_env, num_cpus, profile: profile_name, status_fd,
             max_cpu, max_open_files, chroot, uid, workdir, cwd,
-            fs_isolation, fs_storage, max_disk, allow_udp, allow_icmp,
+            fs_isolation, fs_storage, max_disk, allow_udp, allow_icmp, allow_sysv_ipc,
             http_allow, http_deny, http_ports, https_ca, https_key,
             port_remap, no_randomize_memory, no_huge_pages, deterministic_dirs, name, no_coredump,
             env_vars, exec_shell, interactive: _, fs_deny, fs_mount, cpu_cores, gpu_devices, image, dry_run, no_supervisor, cmd } =>
@@ -207,6 +215,7 @@ async fn main() -> Result<()> {
                     let mut b = Policy::builder();
                     for p in &base.fs_readable { b = b.fs_read(p); }
                     for p in &base.fs_writable { b = b.fs_write(p); }
+                    b = b.allow_sysv_ipc(base.allow_sysv_ipc);
                     b
                 } else {
                     Policy::builder()
@@ -215,6 +224,7 @@ async fn main() -> Result<()> {
                 for p in &fs_read { builder = builder.fs_read(p); }
                 for p in &fs_write { builder = builder.fs_write(p); }
                 for p in &fs_deny { builder = builder.fs_deny(p); }
+                if allow_sysv_ipc { builder = builder.allow_sysv_ipc(true); }
                 if clean_env { builder = builder.clean_env(true); }
                 for spec in &env_vars {
                     if let Some((k, v)) = spec.split_once('=') {
@@ -272,6 +282,7 @@ async fn main() -> Result<()> {
                 if let Some(n) = base.num_cpus { b = b.num_cpus(n); }
                 b = b.allow_udp(base.allow_udp);
                 b = b.allow_icmp(base.allow_icmp);
+                b = b.allow_sysv_ipc(base.allow_sysv_ipc);
                 b = b.clean_env(base.clean_env);
                 if let Some(ref w) = base.workdir { b = b.workdir(w); }
                 if let Some(ref c) = base.cwd { b = b.cwd(c); }
@@ -324,6 +335,7 @@ async fn main() -> Result<()> {
             // protocol arg of `socket()` so non-ICMP `SOCK_RAW` is
             // still rejected.
             if allow_icmp { builder = builder.allow_icmp(true); }
+            if allow_sysv_ipc { builder = builder.allow_sysv_ipc(true); }
             for rule in &http_allow { builder = builder.http_allow(rule); }
             for rule in &http_deny { builder = builder.http_deny(rule); }
             for port in &http_ports { builder = builder.http_port(*port); }
@@ -678,7 +690,7 @@ fn no_supervisor_exec(policy: &Policy, cmd: &[&str]) -> Result<()> {
         .map_err(|e| anyhow!("Landlock confinement failed: {}", e))?;
 
     // 2. Install deny-only seccomp filter (blocks dangerous syscalls without supervisor)
-    let deny_nrs = sandlock_core::context::no_supervisor_deny_syscall_numbers();
+    let deny_nrs = sandlock_core::context::no_supervisor_deny_syscall_numbers(policy);
     let filter = sandlock_core::seccomp::bpf::assemble_filter(&[], &deny_nrs, &[])
         .map_err(|e| anyhow!("seccomp assemble failed: {}", e))?;
     sandlock_core::seccomp::bpf::install_deny_filter(&filter)
