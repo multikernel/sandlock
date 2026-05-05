@@ -146,9 +146,8 @@ policy = Policy(
 |-----------|------|---------|-------------|
 | `syscall_policy` | `SyscallPolicy` | `DEFAULT_DENY` | Syscall filtering mode |
 | `deny_syscalls` | `list[str]` | `[]` | Syscall names used when `syscall_policy=DENY` |
-| `allow_syscalls` | `list[str]` | `[]` | Syscall names used when `syscall_policy=ALLOW` |
 
-Use `SyscallPolicy.DEFAULT_DENY`, `DENY`, `ALLOW`, or `NONE`.
+Use `SyscallPolicy.DEFAULT_DENY`, `DENY`, or `NONE`.
 
 #### Deterministic execution
 

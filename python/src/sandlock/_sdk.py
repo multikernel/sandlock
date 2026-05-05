@@ -104,7 +104,6 @@ _b_clean_env = _builder_fn("sandlock_policy_builder_clean_env", ctypes.c_bool)
 _b_env_var = _builder_fn("sandlock_policy_builder_env_var", ctypes.c_char_p, ctypes.c_char_p)
 _b_time_start = _builder_fn("sandlock_policy_builder_time_start", ctypes.c_uint64)
 _b_deny_syscalls = _builder_fn("sandlock_policy_builder_deny_syscalls", ctypes.c_char_p)
-_b_allow_syscalls = _builder_fn("sandlock_policy_builder_allow_syscalls", ctypes.c_char_p)
 _b_no_syscall_policy = _builder_fn("sandlock_policy_builder_no_syscall_policy")
 _b_max_open_files = _builder_fn("sandlock_policy_builder_max_open_files", ctypes.c_uint32)
 _b_no_randomize_memory = _builder_fn("sandlock_policy_builder_no_randomize_memory", ctypes.c_bool)
@@ -752,7 +751,7 @@ class _NativePolicy:
         "http_allow", "http_deny", "http_ports", "https_ca", "https_key",
         "uid",
         "random_seed", "time_start", "clean_env", "env",
-        "syscall_policy", "deny_syscalls", "allow_syscalls", "max_open_files",
+        "syscall_policy", "deny_syscalls", "max_open_files",
         "no_randomize_memory", "no_huge_pages", "no_coredump", "deterministic_dirs",
         # Managed outside _build_from_policy:
         "notif_policy",
@@ -873,12 +872,8 @@ class _NativePolicy:
         syscall_policy = policy.syscall_policy.value if hasattr(policy.syscall_policy, "value") else str(policy.syscall_policy)
         if policy.deny_syscalls and syscall_policy != "deny":
             raise ValueError("deny_syscalls requires syscall_policy=SyscallPolicy.DENY")
-        if policy.allow_syscalls and syscall_policy != "allow":
-            raise ValueError("allow_syscalls requires syscall_policy=SyscallPolicy.ALLOW")
         if syscall_policy == "deny":
             b = _b_deny_syscalls(b, _encode(",".join(policy.deny_syscalls or [])))
-        elif syscall_policy == "allow":
-            b = _b_allow_syscalls(b, _encode(",".join(policy.allow_syscalls or [])))
         elif syscall_policy == "none":
             b = _b_no_syscall_policy(b)
         elif syscall_policy != "default_deny":

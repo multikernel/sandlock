@@ -650,9 +650,8 @@ Policy(
     fs_denied=["/proc/kcore"],     # Explicitly denied
 
     # Syscall filtering (seccomp)
-    syscall_policy="default_deny", # default_deny | deny | allow | none
+    syscall_policy="default_deny", # default_deny | deny | none
     deny_syscalls=[],              # used when syscall_policy="deny"
-    allow_syscalls=[],             # used when syscall_policy="allow"
 
     # Network — see "Network Model" above. Each entry is `host:port[,port,...]`,
     # `:port`, `*:port`, `host:*`, or `:*` / `*:*`. Empty list = deny all

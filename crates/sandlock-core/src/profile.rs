@@ -119,20 +119,9 @@ if let Some(v) = sandbox.get("clean_env").and_then(|v| v.as_bool()) {
     // Parse syscall policy.
     let syscall_mode = sandbox.get("syscall_policy").and_then(|v| v.as_str());
     let has_deny_syscalls = sandbox.get("deny_syscalls").is_some();
-    let has_allow_syscalls = sandbox.get("allow_syscalls").is_some();
-    if has_deny_syscalls && has_allow_syscalls {
-        return Err(SandlockError::Policy(crate::error::PolicyError::Invalid(
-            "deny_syscalls and allow_syscalls cannot both be set".into(),
-        )));
-    }
     if has_deny_syscalls && !matches!(syscall_mode, None | Some("deny")) {
         return Err(SandlockError::Policy(crate::error::PolicyError::Invalid(
             "deny_syscalls requires syscall_policy = \"deny\"".into(),
-        )));
-    }
-    if has_allow_syscalls && !matches!(syscall_mode, None | Some("allow")) {
-        return Err(SandlockError::Policy(crate::error::PolicyError::Invalid(
-            "allow_syscalls requires syscall_policy = \"allow\"".into(),
         )));
     }
 
@@ -140,7 +129,6 @@ if let Some(v) = sandbox.get("clean_env").and_then(|v| v.as_bool()) {
         builder = match mode {
             "default_deny" => builder.syscalls(SyscallPolicy::DefaultDeny),
             "deny" => builder.deny_syscalls(Vec::new()),
-            "allow" => builder.allow_syscalls(Vec::new()),
             "none" => builder.syscalls(SyscallPolicy::None),
             other => {
                 return Err(SandlockError::Policy(crate::error::PolicyError::Invalid(
@@ -152,10 +140,6 @@ if let Some(v) = sandbox.get("clean_env").and_then(|v| v.as_bool()) {
     if let Some(syscalls) = sandbox.get("deny_syscalls").and_then(|v| v.as_array()) {
         let names: Vec<String> = syscalls.iter().filter_map(|v| v.as_str().map(String::from)).collect();
         builder = builder.deny_syscalls(names);
-    }
-    if let Some(syscalls) = sandbox.get("allow_syscalls").and_then(|v| v.as_array()) {
-        let names: Vec<String> = syscalls.iter().filter_map(|v| v.as_str().map(String::from)).collect();
-        builder = builder.allow_syscalls(names);
     }
 
     builder.build().map_err(|e| SandlockError::Policy(e))

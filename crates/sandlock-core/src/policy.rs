@@ -66,8 +66,6 @@ pub enum SyscallPolicy {
     DefaultDeny,
     /// Deny exactly these syscall names, plus SysV IPC when not allowed.
     Deny(Vec<String>),
-    /// Allow exactly these syscall names. Everything else is denied.
-    Allow(Vec<String>),
     /// Do not install a syscall deny/allow policy beyond built-in arg filters.
     None,
 }
@@ -581,7 +579,7 @@ fn validate_syscall_names(names: &[String]) -> Result<(), PolicyError> {
 fn validate_syscall_policy(policy: &SyscallPolicy) -> Result<(), PolicyError> {
     match policy {
         SyscallPolicy::DefaultDeny | SyscallPolicy::None => Ok(()),
-        SyscallPolicy::Deny(names) | SyscallPolicy::Allow(names) => validate_syscall_names(names),
+        SyscallPolicy::Deny(names) => validate_syscall_names(names),
     }
 }
 
@@ -674,11 +672,6 @@ impl PolicyBuilder {
 
     pub fn deny_syscalls(mut self, calls: Vec<String>) -> Self {
         self.syscall_policy = Some(SyscallPolicy::Deny(calls));
-        self
-    }
-
-    pub fn allow_syscalls(mut self, calls: Vec<String>) -> Self {
-        self.syscall_policy = Some(SyscallPolicy::Allow(calls));
         self
     }
 

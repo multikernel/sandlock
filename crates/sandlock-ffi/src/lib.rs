@@ -516,19 +516,6 @@ pub unsafe extern "C" fn sandlock_policy_builder_deny_syscalls(
 }
 
 /// # Safety
-/// `b` must be a valid builder pointer. `names` is a comma-separated NUL-terminated string.
-#[no_mangle]
-pub unsafe extern "C" fn sandlock_policy_builder_allow_syscalls(
-    b: *mut PolicyBuilder, names: *const c_char,
-) -> *mut PolicyBuilder {
-    if b.is_null() || names.is_null() { return b; }
-    let builder = *Box::from_raw(b);
-    let s = CStr::from_ptr(names).to_str().unwrap_or("");
-    let calls: Vec<String> = s.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-    Box::into_raw(Box::new(builder.allow_syscalls(calls)))
-}
-
-/// # Safety
 /// `b` must be a valid builder pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_policy_builder_no_syscall_policy(

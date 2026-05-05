@@ -222,11 +222,6 @@ pub fn syscall_name_to_nr(name: &str) -> Option<u32> {
         "readlink" => arch::SYS_READLINK?,
         "futimesat" => arch::SYS_FUTIMESAT?,
         "fork" => arch::SYS_FORK?,
-        "read" => libc::SYS_read,
-        "write" => libc::SYS_write,
-        "close" => libc::SYS_close,
-        "exit" => libc::SYS_exit,
-        "exit_group" => libc::SYS_exit_group,
         // SysV IPC (gated by --allow-sysv-ipc; denied by default)
         "shmget" => libc::SYS_shmget,
         "shmat" => libc::SYS_shmat,
@@ -474,8 +469,7 @@ pub fn no_supervisor_deny_syscall_numbers(policy: &Policy) -> Vec<u32> {
 ///
 /// SysV IPC syscalls are appended to the resolved deny list when
 /// `policy.allow_sysv_ipc` is false in deny/default-deny modes. They
-/// are not appended in allowlist mode; a user enumerating the exact set
-/// of permitted syscalls is already in control.
+/// are not appended when syscall filtering is disabled.
 pub fn deny_syscall_numbers(policy: &Policy) -> Vec<u32> {
     let mut nrs: Vec<u32> = match &policy.syscall_policy {
         SyscallPolicy::Deny(names) => names
@@ -486,7 +480,7 @@ pub fn deny_syscall_numbers(policy: &Policy) -> Vec<u32> {
             .iter()
             .filter_map(|n| syscall_name_to_nr(n))
             .collect(),
-        SyscallPolicy::Allow(_) | SyscallPolicy::None => return Vec::new(),
+        SyscallPolicy::None => return Vec::new(),
     };
     if !policy.allow_sysv_ipc {
         for name in SYSV_IPC_DENY_SYSCALLS {
@@ -1313,19 +1307,6 @@ mod tests {
         assert!(nrs.contains(&(libc::SYS_mount as u32)));
         assert!(nrs.contains(&(libc::SYS_ptrace as u32)));
         assert!(!nrs.contains(&(libc::SYS_shmget as u32)));
-    }
-
-    #[test]
-    fn test_deny_syscall_numbers_empty_when_allow_set() {
-        let policy = Policy::builder()
-            .allow_syscalls(vec!["read".into(), "write".into()])
-            .build()
-            .unwrap();
-        let nrs = deny_syscall_numbers(&policy);
-        // Allowlist mode: user enumerated exactly what is permitted —
-        // we do not append SysV IPC denials (the absence of those
-        // syscalls in allow_syscalls already denies them).
-        assert!(nrs.is_empty());
     }
 
     #[test]

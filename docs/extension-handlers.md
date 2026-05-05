@@ -448,9 +448,8 @@ and covers both the default-deny branch (`DEFAULT_DENY_SYSCALLS`) and the user-s
 `run_with_extra_handlers_rejects_negative_syscall`,
 `run_with_extra_handlers_rejects_arch_unknown_syscall`).
 
-In allowlist mode (`SyscallPolicy::Allow(_)`) the resolved deny list is empty and the guard is
-a no-op — but so is the BPF deny block, and confinement comes entirely from the kernel-enforced
-allowlist, so there is no overlap to bypass.
+When syscall filtering is disabled (`SyscallPolicy::None`) the resolved deny list is empty and
+the guard is a no-op — but so is the BPF deny block, so there is no notif/deny overlap to bypass.
 
 ## Panics
 

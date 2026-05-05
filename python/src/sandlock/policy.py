@@ -98,7 +98,6 @@ class SyscallPolicy(Enum):
 
     DEFAULT_DENY = "default_deny"
     DENY = "deny"
-    ALLOW = "allow"
     NONE = "none"
 
 
@@ -145,14 +144,10 @@ class Policy:
 
     # Syscall filtering (seccomp)
     syscall_policy: SyscallPolicy = SyscallPolicy.DEFAULT_DENY
-    """Syscall filtering mode: DEFAULT_DENY, DENY, ALLOW, or NONE."""
+    """Syscall filtering mode: DEFAULT_DENY, DENY, or NONE."""
 
     deny_syscalls: Sequence[str] = field(default_factory=list)
     """Syscall names used when syscall_policy is DENY."""
-
-    allow_syscalls: Sequence[str] = field(default_factory=list)
-    """Syscall names to allow (allowlist mode). Everything else is blocked.
-    Used when syscall_policy is ALLOW."""
 
     # Network — endpoint allowlist (IP × port via seccomp on-behalf path)
     net_allow: Sequence[str] = field(default_factory=list)

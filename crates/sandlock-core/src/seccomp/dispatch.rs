@@ -153,11 +153,9 @@ pub enum HandlerError {
 /// The deny list is whatever [`crate::context::deny_syscall_numbers`]
 /// resolves from the policy's explicit [`crate::policy::SyscallPolicy`].
 ///
-/// **Allowlist mode** (`SyscallPolicy::Allow(_)`): the resolved deny list
-/// is empty, so this function returns `Ok(())` for any syscall.
-/// That is sound because the BPF deny block is empty in this mode too —
-/// confinement comes from the allowlist enforced at the kernel level,
-/// and there is no notif/deny overlap to bypass.
+/// **No syscall policy** (`SyscallPolicy::None`): the resolved deny list is
+/// empty, so this function returns `Ok(())` for any syscall. There is no BPF
+/// deny block in this mode, so there is no notif/deny overlap to bypass.
 ///
 /// Takes only the syscall numbers because that's all it needs to check.
 /// Called from the `run_with_extra_handlers` entry points before any
