@@ -1,6 +1,6 @@
 pub mod bpf;
-pub mod ctx;
+pub(crate) mod ctx;
 pub mod dispatch;
 pub mod notif;
-pub mod state;
+pub(crate) mod state;
 pub mod syscall;

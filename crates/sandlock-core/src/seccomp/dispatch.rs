@@ -58,22 +58,23 @@ use tokio::sync::Mutex;
 pub trait Handler: Send + Sync + 'static {
     fn handle<'a>(
         &'a self,
-        cx: &'a HandlerCtx<'_>,
+        cx: &'a HandlerCtx,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = NotifAction> + Send + 'a>>;
 }
 
-/// Borrowed context passed to `Handler::handle`.
+/// Context passed to `Handler::handle`.
 ///
-/// `notif` is owned by value (it's a small `repr(C)` kernel struct,
-/// cheap to copy); `sup` is borrowed from the supervisor's
-/// `Arc<SupervisorCtx>` and exposed as `&Arc<...>` so handlers that
-/// need to spawn additional tasks holding the supervisor context can
-/// `Arc::clone` it without unsafe; `notif_fd` is the supervisor's
+/// `notif` is the kernel notification (owned by value — it's a small
+/// `repr(C)` struct, cheap to copy).  `notif_fd` is the supervisor's
 /// seccomp listener fd, used by helpers like `read_child_mem` /
-/// `write_child_mem` for TOCTOU-safe child memory access.
-pub struct HandlerCtx<'a> {
+/// `write_child_mem` / `read_child_cstr` for TOCTOU-safe child memory
+/// access.
+///
+/// Handler state lives on the implementor (`&self`).  Supervisor-internal
+/// state is intentionally not exposed here so the `SupervisorCtx`
+/// internal fields are not part of the downstream extension contract.
+pub struct HandlerCtx {
     pub notif: SeccompNotif,
-    pub sup: &'a std::sync::Arc<SupervisorCtx>,
     pub notif_fd: RawFd,
 }
 
@@ -84,12 +85,12 @@ pub struct HandlerCtx<'a> {
 // impl Handler` instead.
 impl<F, Fut> Handler for F
 where
-    F: Fn(&HandlerCtx<'_>) -> Fut + Send + Sync + 'static,
+    F: Fn(&HandlerCtx) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = NotifAction> + Send + 'static,
 {
     fn handle<'a>(
         &'a self,
-        cx: &'a HandlerCtx<'_>,
+        cx: &'a HandlerCtx,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = NotifAction> + Send + 'a>> {
         Box::pin((self)(cx))
     }
@@ -104,12 +105,12 @@ where
 //
 // These are concrete `Box<dyn Handler>` / `Arc<dyn Handler>` rather than
 // `<H: Handler + ?Sized>` blankets to avoid coherence overlap with the
-// `impl<F, Fut> Handler for F where F: Fn(&HandlerCtx<'_>) -> Fut` blanket
+// `impl<F, Fut> Handler for F where F: Fn(&HandlerCtx) -> Fut` blanket
 // above.
 impl Handler for Box<dyn Handler> {
     fn handle<'a>(
         &'a self,
-        cx: &'a HandlerCtx<'_>,
+        cx: &'a HandlerCtx,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = NotifAction> + Send + 'a>> {
         (**self).handle(cx)
     }
@@ -118,7 +119,7 @@ impl Handler for Box<dyn Handler> {
 impl Handler for std::sync::Arc<dyn Handler> {
     fn handle<'a>(
         &'a self,
-        cx: &'a HandlerCtx<'_>,
+        cx: &'a HandlerCtx,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = NotifAction> + Send + 'a>> {
         (**self).handle(cx)
     }
@@ -227,15 +228,14 @@ impl DispatchTable {
     }
 
     /// Dispatch a notification through the handler chain for its syscall number.
-    pub async fn dispatch(
+    pub(crate) async fn dispatch(
         &self,
         notif: SeccompNotif,
-        ctx: &std::sync::Arc<SupervisorCtx>,
         notif_fd: RawFd,
     ) -> NotifAction {
         let nr = notif.data.nr as i64;
         if let Some(chain) = self.chains.get(&nr) {
-            let handler_ctx = HandlerCtx { notif, sup: ctx, notif_fd };
+            let handler_ctx = HandlerCtx { notif, notif_fd };
             for handler in &chain.handlers {
                 let action = handler.handle(&handler_ctx).await;
                 if !matches!(action, NotifAction::Continue) {
@@ -259,9 +259,10 @@ impl DispatchTable {
 /// observe the post-builtin view (e.g. `chroot`-normalized paths on
 /// `openat`).  Builtins cannot be overridden or removed — this is the
 /// security boundary for downstream crates.
-pub fn build_dispatch_table(
+pub(crate) fn build_dispatch_table(
     policy: &Arc<NotifPolicy>,
     resource: &Arc<Mutex<ResourceState>>,
+    ctx: &Arc<SupervisorCtx>,
     pending_handlers: Vec<(i64, std::sync::Arc<dyn Handler>)>,
 ) -> DispatchTable {
     let mut table = DispatchTable::new();
@@ -272,7 +273,7 @@ pub fn build_dispatch_table(
     for &nr in arch::FORK_LIKE_SYSCALLS {
         let policy_for_fork = Arc::clone(policy);
         let resource_for_fork = Arc::clone(resource);
-        table.register(nr, move |cx: &HandlerCtx<'_>| {
+        table.register(nr, move |cx: &HandlerCtx| {
             let notif = cx.notif;
             let notif_fd = cx.notif_fd;
             let policy = Arc::clone(&policy_for_fork);
@@ -288,7 +289,8 @@ pub fn build_dispatch_table(
     // ------------------------------------------------------------------
     for &nr in &[libc::SYS_wait4, libc::SYS_waitid] {
         let resource_for_wait = Arc::clone(resource);
-        table.register(nr, move |cx: &HandlerCtx<'_>| {
+        let __sup = Arc::clone(ctx);
+        table.register(nr, move |cx: &HandlerCtx| {
             let notif = cx.notif;
             let resource = Arc::clone(&resource_for_wait);
             async move {
@@ -306,9 +308,10 @@ pub fn build_dispatch_table(
             libc::SYS_mremap, libc::SYS_shmget,
         ] {
             let policy_for_mem = Arc::clone(policy);
-            table.register(nr, move |cx: &HandlerCtx<'_>| {
+            let __sup = Arc::clone(ctx);
+            table.register(nr, move |cx: &HandlerCtx| {
                 let notif = cx.notif;
-                let sup = std::sync::Arc::clone(cx.sup);
+                let sup = Arc::clone(&__sup);
                 let policy = Arc::clone(&policy_for_mem);
                 async move {
                     crate::resource::handle_memory(&notif, &sup, &policy).await
@@ -322,9 +325,10 @@ pub fn build_dispatch_table(
     // ------------------------------------------------------------------
     if policy.has_net_allowlist || policy.has_http_acl {
         for &nr in &[libc::SYS_connect, libc::SYS_sendto, libc::SYS_sendmsg] {
-            table.register(nr, |cx: &HandlerCtx<'_>| {
+            let __sup = Arc::clone(ctx);
+            table.register(nr, move |cx: &HandlerCtx| {
                 let notif = cx.notif;
-                let sup = std::sync::Arc::clone(cx.sup);
+                let sup = Arc::clone(&__sup);
                 let notif_fd = cx.notif_fd;
                 async move {
                     crate::network::handle_net(&notif, &sup, notif_fd).await
@@ -337,9 +341,10 @@ pub fn build_dispatch_table(
     // Deterministic random — getrandom()
     // ------------------------------------------------------------------
     if policy.has_random_seed {
-        table.register(libc::SYS_getrandom, |cx: &HandlerCtx<'_>| {
+        let __sup = Arc::clone(ctx);
+        table.register(libc::SYS_getrandom, move |cx: &HandlerCtx| {
             let notif = cx.notif;
-            let sup = std::sync::Arc::clone(cx.sup);
+            let sup = Arc::clone(&__sup);
             let notif_fd = cx.notif_fd;
             async move {
                 let mut tr = sup.time_random.lock().await;
@@ -356,9 +361,10 @@ pub fn build_dispatch_table(
     // Deterministic random — /dev/urandom opens (openat)
     // ------------------------------------------------------------------
     if policy.has_random_seed {
-        table.register(libc::SYS_openat, |cx: &HandlerCtx<'_>| {
+        let __sup = Arc::clone(ctx);
+        table.register(libc::SYS_openat, move |cx: &HandlerCtx| {
             let notif = cx.notif;
-            let sup = std::sync::Arc::clone(cx.sup);
+            let sup = Arc::clone(&__sup);
             let notif_fd = cx.notif_fd;
             async move {
                 let mut tr = sup.time_random.lock().await;
@@ -382,7 +388,7 @@ pub fn build_dispatch_table(
             libc::SYS_timerfd_settime as i64,
             libc::SYS_timer_settime as i64,
         ] {
-            table.register(nr, move |cx: &HandlerCtx<'_>| {
+            table.register(nr, move |cx: &HandlerCtx| {
                 let notif = cx.notif;
                 let notif_fd = cx.notif_fd;
                 async move {
@@ -396,14 +402,14 @@ pub fn build_dispatch_table(
     // Chroot path interception (before COW)
     // ------------------------------------------------------------------
     if policy.chroot_root.is_some() {
-        register_chroot_handlers(&mut table, policy);
+        register_chroot_handlers(&mut table, policy, ctx);
     }
 
     // ------------------------------------------------------------------
     // COW filesystem interception
     // ------------------------------------------------------------------
     if policy.cow_enabled {
-        register_cow_handlers(&mut table);
+        register_cow_handlers(&mut table, ctx);
     }
 
     // ------------------------------------------------------------------
@@ -412,9 +418,10 @@ pub fn build_dispatch_table(
     {
         let policy_for_proc_open = Arc::clone(policy);
         let resource_for_proc_open = Arc::clone(resource);
-        table.register(libc::SYS_openat, move |cx: &HandlerCtx<'_>| {
+        let __sup = Arc::clone(ctx);
+        table.register(libc::SYS_openat, move |cx: &HandlerCtx| {
             let notif = cx.notif;
-            let sup = std::sync::Arc::clone(cx.sup);
+            let sup = Arc::clone(&__sup);
             let notif_fd = cx.notif_fd;
             let policy = Arc::clone(&policy_for_proc_open);
             let resource = Arc::clone(&resource_for_proc_open);
@@ -431,9 +438,10 @@ pub fn build_dispatch_table(
     }
     for nr in getdents_nrs {
         let policy_for_getdents = Arc::clone(policy);
-        table.register(nr, move |cx: &HandlerCtx<'_>| {
+        let __sup = Arc::clone(ctx);
+        table.register(nr, move |cx: &HandlerCtx| {
             let notif = cx.notif;
-            let sup = std::sync::Arc::clone(cx.sup);
+            let sup = Arc::clone(&__sup);
             let notif_fd = cx.notif_fd;
             let policy = Arc::clone(&policy_for_getdents);
             async move {
@@ -447,7 +455,7 @@ pub fn build_dispatch_table(
     // Virtual CPU count
     // ------------------------------------------------------------------
     if let Some(n) = policy.num_cpus {
-        table.register(libc::SYS_sched_getaffinity, move |cx: &HandlerCtx<'_>| {
+        table.register(libc::SYS_sched_getaffinity, move |cx: &HandlerCtx| {
             let notif = cx.notif;
             let notif_fd = cx.notif_fd;
             async move {
@@ -462,7 +470,7 @@ pub fn build_dispatch_table(
     if let Some(ref hostname) = policy.virtual_hostname {
         let hostname_for_uname = hostname.clone();
         let hostname_for_open = hostname.clone();
-        table.register(libc::SYS_uname, move |cx: &HandlerCtx<'_>| {
+        table.register(libc::SYS_uname, move |cx: &HandlerCtx| {
             let notif = cx.notif;
             let notif_fd = cx.notif_fd;
             let hostname = hostname_for_uname.clone();
@@ -470,7 +478,7 @@ pub fn build_dispatch_table(
                 crate::procfs::handle_uname(&notif, &hostname, notif_fd)
             }
         });
-        table.register(libc::SYS_openat, move |cx: &HandlerCtx<'_>| {
+        table.register(libc::SYS_openat, move |cx: &HandlerCtx| {
             let notif = cx.notif;
             let notif_fd = cx.notif_fd;
             let hostname = hostname_for_open.clone();
@@ -489,7 +497,8 @@ pub fn build_dispatch_table(
     // ------------------------------------------------------------------
     if let Some(ref etc_hosts) = policy.virtual_etc_hosts {
         let etc_hosts_for_open = etc_hosts.clone();
-        table.register(libc::SYS_openat, move |cx: &HandlerCtx<'_>| {
+        let __sup = Arc::clone(ctx);
+        table.register(libc::SYS_openat, move |cx: &HandlerCtx| {
             let notif = cx.notif;
             let notif_fd = cx.notif_fd;
             let etc_hosts = etc_hosts_for_open.clone();
@@ -512,9 +521,10 @@ pub fn build_dispatch_table(
             getdents_nrs.push(getdents);
         }
         for nr in getdents_nrs {
-            table.register(nr, |cx: &HandlerCtx<'_>| {
+            let __sup = Arc::clone(ctx);
+            table.register(nr, move |cx: &HandlerCtx| {
                 let notif = cx.notif;
-                let sup = std::sync::Arc::clone(cx.sup);
+                let sup = Arc::clone(&__sup);
                 let notif_fd = cx.notif_fd;
                 async move {
                     let processes = Arc::clone(&sup.processes);
@@ -537,25 +547,28 @@ pub fn build_dispatch_table(
     // runs first and returns `Continue` for non-cookie fds.
     // ------------------------------------------------------------------
     {
-        table.register(libc::SYS_socket, |cx: &HandlerCtx<'_>| {
+        let __sup = Arc::clone(ctx);
+        table.register(libc::SYS_socket, move |cx: &HandlerCtx| {
             let notif = cx.notif;
-            let sup = std::sync::Arc::clone(cx.sup);
+            let sup = Arc::clone(&__sup);
             async move {
                 let state = Arc::clone(&sup.netlink);
                 crate::netlink::handlers::handle_socket(&notif, &state).await
             }
         });
-        table.register(libc::SYS_bind, |cx: &HandlerCtx<'_>| {
+        let __sup = Arc::clone(ctx);
+        table.register(libc::SYS_bind, move |cx: &HandlerCtx| {
             let notif = cx.notif;
-            let sup = std::sync::Arc::clone(cx.sup);
+            let sup = Arc::clone(&__sup);
             async move {
                 let state = Arc::clone(&sup.netlink);
                 crate::netlink::handlers::handle_bind(&notif, &state).await
             }
         });
-        table.register(libc::SYS_getsockname, |cx: &HandlerCtx<'_>| {
+        let __sup = Arc::clone(ctx);
+        table.register(libc::SYS_getsockname, move |cx: &HandlerCtx| {
             let notif = cx.notif;
-            let sup = std::sync::Arc::clone(cx.sup);
+            let sup = Arc::clone(&__sup);
             let notif_fd = cx.notif_fd;
             async move {
                 let state = Arc::clone(&sup.netlink);
@@ -566,9 +579,10 @@ pub fn build_dispatch_table(
         // (the kernel only writes sun_family on unix socketpair recvmsg,
         //  leaving the rest of the buffer as stack garbage otherwise).
         for &nr in &[libc::SYS_recvfrom, libc::SYS_recvmsg] {
-            table.register(nr, |cx: &HandlerCtx<'_>| {
+            let __sup = Arc::clone(ctx);
+            table.register(nr, move |cx: &HandlerCtx| {
                 let notif = cx.notif;
-                let sup = std::sync::Arc::clone(cx.sup);
+                let sup = Arc::clone(&__sup);
                 let notif_fd = cx.notif_fd;
                 async move {
                     let state = Arc::clone(&sup.netlink);
@@ -578,9 +592,10 @@ pub fn build_dispatch_table(
         }
         // Unregister on close so the (pid, fd) slot isn't left in the
         // cookie set once the child reuses the fd for something else.
-        table.register(libc::SYS_close, |cx: &HandlerCtx<'_>| {
+        let __sup = Arc::clone(ctx);
+        table.register(libc::SYS_close, move |cx: &HandlerCtx| {
             let notif = cx.notif;
-            let sup = std::sync::Arc::clone(cx.sup);
+            let sup = Arc::clone(&__sup);
             async move {
                 let state = Arc::clone(&sup.netlink);
                 crate::netlink::handlers::handle_close(&notif, &state).await
@@ -592,9 +607,10 @@ pub fn build_dispatch_table(
     // Bind — on-behalf
     // ------------------------------------------------------------------
     if policy.port_remap || policy.has_net_allowlist {
-        table.register(libc::SYS_bind, |cx: &HandlerCtx<'_>| {
+        let __sup = Arc::clone(ctx);
+        table.register(libc::SYS_bind, move |cx: &HandlerCtx| {
             let notif = cx.notif;
-            let sup = std::sync::Arc::clone(cx.sup);
+            let sup = Arc::clone(&__sup);
             let notif_fd = cx.notif_fd;
             async move {
                 crate::port_remap::handle_bind(&notif, &sup.network, notif_fd).await
@@ -606,9 +622,10 @@ pub fn build_dispatch_table(
     // getsockname — port remap
     // ------------------------------------------------------------------
     if policy.port_remap {
-        table.register(libc::SYS_getsockname, |cx: &HandlerCtx<'_>| {
+        let __sup = Arc::clone(ctx);
+        table.register(libc::SYS_getsockname, move |cx: &HandlerCtx| {
             let notif = cx.notif;
-            let sup = std::sync::Arc::clone(cx.sup);
+            let sup = Arc::clone(&__sup);
             let notif_fd = cx.notif_fd;
             async move {
                 crate::port_remap::handle_getsockname(&notif, &sup.network, notif_fd).await
@@ -632,7 +649,11 @@ pub fn build_dispatch_table(
 // Chroot handler registration
 // ============================================================
 
-fn register_chroot_handlers(table: &mut DispatchTable, policy: &Arc<NotifPolicy>) {
+fn register_chroot_handlers(
+    table: &mut DispatchTable,
+    policy: &Arc<NotifPolicy>,
+    ctx: &Arc<SupervisorCtx>,
+) {
     use crate::chroot::dispatch::ChrootCtx;
 
     // Helper macro — produces a closure satisfying Handler via blanket impl.
@@ -641,9 +662,12 @@ fn register_chroot_handlers(table: &mut DispatchTable, policy: &Arc<NotifPolicy>
     macro_rules! chroot_handler {
         ($policy:expr, $handler:expr) => {{
             let policy = Arc::clone($policy);
-            move |cx: &HandlerCtx<'_>| {
+            let chroot_state = Arc::clone(&ctx.chroot);
+            let cow_state = Arc::clone(&ctx.cow);
+            move |cx: &HandlerCtx| {
                 let notif = cx.notif;
-                let sup = std::sync::Arc::clone(cx.sup);
+                let chroot_state = Arc::clone(&chroot_state);
+                let cow_state = Arc::clone(&cow_state);
                 let notif_fd = cx.notif_fd;
                 let policy = Arc::clone(&policy);
                 async move {
@@ -654,7 +678,7 @@ fn register_chroot_handlers(table: &mut DispatchTable, policy: &Arc<NotifPolicy>
                         denied: &policy.chroot_denied,
                         mounts: &policy.chroot_mounts,
                     };
-                    $handler(&notif, &sup.chroot, &sup.cow, notif_fd, &chroot_ctx).await
+                    $handler(&notif, &chroot_state, &cow_state, notif_fd, &chroot_ctx).await
                 }
             }
         }};
@@ -665,9 +689,12 @@ fn register_chroot_handlers(table: &mut DispatchTable, policy: &Arc<NotifPolicy>
     macro_rules! chroot_handler_fallthrough {
         ($policy:expr, $handler:expr) => {{
             let policy = Arc::clone($policy);
-            move |cx: &HandlerCtx<'_>| {
+            let chroot_state = Arc::clone(&ctx.chroot);
+            let cow_state = Arc::clone(&ctx.cow);
+            move |cx: &HandlerCtx| {
                 let notif = cx.notif;
-                let sup = std::sync::Arc::clone(cx.sup);
+                let chroot_state = Arc::clone(&chroot_state);
+                let cow_state = Arc::clone(&cow_state);
                 let notif_fd = cx.notif_fd;
                 let policy = Arc::clone(&policy);
                 async move {
@@ -678,7 +705,7 @@ fn register_chroot_handlers(table: &mut DispatchTable, policy: &Arc<NotifPolicy>
                         denied: &policy.chroot_denied,
                         mounts: &policy.chroot_mounts,
                     };
-                    $handler(&notif, &sup.chroot, &sup.cow, notif_fd, &chroot_ctx).await
+                    $handler(&notif, &chroot_state, &cow_state, notif_fd, &chroot_ctx).await
                 }
             }
         }};
@@ -716,26 +743,32 @@ fn register_chroot_handlers(table: &mut DispatchTable, policy: &Arc<NotifPolicy>
             crate::chroot::dispatch::handle_chroot_legacy_unlink));
     }
     if let Some(nr) = arch::SYS_RMDIR {
+        let __sup = Arc::clone(ctx);
         table.register(nr, chroot_handler!(policy,
             crate::chroot::dispatch::handle_chroot_legacy_rmdir));
     }
     if let Some(nr) = arch::SYS_MKDIR {
+        let __sup = Arc::clone(ctx);
         table.register(nr, chroot_handler!(policy,
             crate::chroot::dispatch::handle_chroot_legacy_mkdir));
     }
     if let Some(nr) = arch::SYS_RENAME {
+        let __sup = Arc::clone(ctx);
         table.register(nr, chroot_handler!(policy,
             crate::chroot::dispatch::handle_chroot_legacy_rename));
     }
     if let Some(nr) = arch::SYS_SYMLINK {
+        let __sup = Arc::clone(ctx);
         table.register(nr, chroot_handler!(policy,
             crate::chroot::dispatch::handle_chroot_legacy_symlink));
     }
     if let Some(nr) = arch::SYS_LINK {
+        let __sup = Arc::clone(ctx);
         table.register(nr, chroot_handler!(policy,
             crate::chroot::dispatch::handle_chroot_legacy_link));
     }
     if let Some(nr) = arch::SYS_CHMOD {
+        let __sup = Arc::clone(ctx);
         table.register(nr, chroot_handler!(policy,
             crate::chroot::dispatch::handle_chroot_legacy_chmod));
     }
@@ -743,9 +776,10 @@ fn register_chroot_handlers(table: &mut DispatchTable, policy: &Arc<NotifPolicy>
     // chown — non-follow
     if let Some(chown) = arch::SYS_CHOWN {
         let policy_for_chown = Arc::clone(policy);
-        table.register(chown, move |cx: &HandlerCtx<'_>| {
+        let __sup = Arc::clone(ctx);
+        table.register(chown, move |cx: &HandlerCtx| {
             let notif = cx.notif;
-            let sup = std::sync::Arc::clone(cx.sup);
+            let sup = Arc::clone(&__sup);
             let notif_fd = cx.notif_fd;
             let policy = Arc::clone(&policy_for_chown);
             async move {
@@ -764,9 +798,10 @@ fn register_chroot_handlers(table: &mut DispatchTable, policy: &Arc<NotifPolicy>
     // lchown — follow
     if let Some(lchown) = arch::SYS_LCHOWN {
         let policy_for_lchown = Arc::clone(policy);
-        table.register(lchown, move |cx: &HandlerCtx<'_>| {
+        let __sup = Arc::clone(ctx);
+        table.register(lchown, move |cx: &HandlerCtx| {
             let notif = cx.notif;
-            let sup = std::sync::Arc::clone(cx.sup);
+            let sup = Arc::clone(&__sup);
             let notif_fd = cx.notif_fd;
             let policy = Arc::clone(&policy_for_lchown);
             async move {
@@ -824,17 +859,22 @@ fn register_chroot_handlers(table: &mut DispatchTable, policy: &Arc<NotifPolicy>
         getdents_nrs.push(getdents);
     }
     for nr in getdents_nrs {
+        let __sup = Arc::clone(ctx);
         table.register(nr, chroot_handler!(policy,
             crate::chroot::dispatch::handle_chroot_getdents));
     }
 
     // chdir, getcwd, statfs, utimensat
+    let __sup = Arc::clone(ctx);
     table.register(libc::SYS_chdir as i64, chroot_handler!(policy,
         crate::chroot::dispatch::handle_chroot_chdir));
+    let __sup = Arc::clone(ctx);
     table.register(libc::SYS_getcwd as i64, chroot_handler!(policy,
         crate::chroot::dispatch::handle_chroot_getcwd));
+    let __sup = Arc::clone(ctx);
     table.register(libc::SYS_statfs as i64, chroot_handler!(policy,
         crate::chroot::dispatch::handle_chroot_statfs));
+    let __sup = Arc::clone(ctx);
     table.register(libc::SYS_utimensat as i64, chroot_handler!(policy,
         crate::chroot::dispatch::handle_chroot_utimensat));
 }
@@ -843,21 +883,22 @@ fn register_chroot_handlers(table: &mut DispatchTable, policy: &Arc<NotifPolicy>
 // COW handler registration
 // ============================================================
 
-fn register_cow_handlers(table: &mut DispatchTable) {
+fn register_cow_handlers(table: &mut DispatchTable, ctx: &Arc<SupervisorCtx>) {
     // Helper to grab cow + processes from cx.sup in one place.
     macro_rules! cow_call {
-        ($handler:expr) => {
-            |cx: &HandlerCtx<'_>| {
+        ($handler:expr) => {{
+            let cow_state = Arc::clone(&ctx.cow);
+            let processes_state = Arc::clone(&ctx.processes);
+            move |cx: &HandlerCtx| {
                 let notif = cx.notif;
-                let sup = std::sync::Arc::clone(cx.sup);
+                let cow_state = Arc::clone(&cow_state);
+                let processes_state = Arc::clone(&processes_state);
                 let notif_fd = cx.notif_fd;
                 async move {
-                    let cow = Arc::clone(&sup.cow);
-                    let processes = Arc::clone(&sup.processes);
-                    $handler(&notif, &cow, &processes, notif_fd).await
+                    $handler(&notif, &cow_state, &processes_state, notif_fd).await
                 }
             }
-        };
+        }};
     }
 
     // Write syscalls (*at variants + legacy)
@@ -1010,7 +1051,7 @@ mod extra_handler_tests {
             let order_clone = Arc::clone(&order);
             table.register(
                 libc::SYS_openat,
-                move |_cx: &HandlerCtx<'_>| {
+                move |_cx: &HandlerCtx| {
                     let order = Arc::clone(&order_clone);
                     async move {
                         order.lock().unwrap().push(tag);
@@ -1020,9 +1061,9 @@ mod extra_handler_tests {
             );
         }
 
-        let ctx = fake_supervisor_ctx();
+        let _ctx = fake_supervisor_ctx();
         let action = table
-            .dispatch(fake_notif(libc::SYS_openat as i32), &ctx, -1)
+            .dispatch(fake_notif(libc::SYS_openat as i32), -1)
             .await;
 
         assert!(matches!(action, NotifAction::Continue));
@@ -1050,7 +1091,7 @@ mod extra_handler_tests {
         let order_builtin = Arc::clone(&order);
         table.register(
             libc::SYS_openat,
-            move |_cx: &HandlerCtx<'_>| {
+            move |_cx: &HandlerCtx| {
                 let order = Arc::clone(&order_builtin);
                 async move {
                     order.lock().unwrap().push(b'B');
@@ -1064,7 +1105,7 @@ mod extra_handler_tests {
         let order_extra = Arc::clone(&order);
         table.register(
             libc::SYS_openat,
-            move |_cx: &HandlerCtx<'_>| {
+            move |_cx: &HandlerCtx| {
                 let order = Arc::clone(&order_extra);
                 async move {
                     order.lock().unwrap().push(b'E');
@@ -1073,9 +1114,9 @@ mod extra_handler_tests {
             },
         );
 
-        let ctx = fake_supervisor_ctx();
+        let _ctx = fake_supervisor_ctx();
         let action = table
-            .dispatch(fake_notif(libc::SYS_openat as i32), &ctx, -1)
+            .dispatch(fake_notif(libc::SYS_openat as i32), -1)
             .await;
 
         assert!(matches!(action, NotifAction::Continue));
@@ -1102,7 +1143,7 @@ mod extra_handler_tests {
         let calls_first = Arc::clone(&calls);
         table.register(
             libc::SYS_openat,
-            move |_cx: &HandlerCtx<'_>| {
+            move |_cx: &HandlerCtx| {
                 let calls = Arc::clone(&calls_first);
                 async move {
                     calls.fetch_add(1, Ordering::SeqCst);
@@ -1115,7 +1156,7 @@ mod extra_handler_tests {
         let calls_second = Arc::clone(&calls);
         table.register(
             libc::SYS_openat,
-            move |_cx: &HandlerCtx<'_>| {
+            move |_cx: &HandlerCtx| {
                 let calls = Arc::clone(&calls_second);
                 async move {
                     calls.fetch_add(1, Ordering::SeqCst);
@@ -1124,9 +1165,9 @@ mod extra_handler_tests {
             },
         );
 
-        let ctx = fake_supervisor_ctx();
+        let _ctx = fake_supervisor_ctx();
         let action = table
-            .dispatch(fake_notif(libc::SYS_openat as i32), &ctx, -1)
+            .dispatch(fake_notif(libc::SYS_openat as i32), -1)
             .await;
 
         match action {
@@ -1179,7 +1220,7 @@ mod extra_handler_tests {
         let counter = Arc::new(AtomicU64::new(0));
         let counter_clone = Arc::clone(&counter);
 
-        let h = move |cx: &HandlerCtx<'_>| {
+        let h = move |cx: &HandlerCtx| {
             let counter = Arc::clone(&counter_clone);
             async move {
                 counter.fetch_add(1, Ordering::SeqCst);
@@ -1188,9 +1229,9 @@ mod extra_handler_tests {
             }
         };
 
-        let sup = fake_supervisor_ctx();
+        let _sup = fake_supervisor_ctx();
         let notif = fake_notif(libc::SYS_openat as i32);
-        let cx = HandlerCtx { notif, sup: &sup, notif_fd: -1 };
+        let cx = HandlerCtx { notif, notif_fd: -1 };
 
         let action = h.handle(&cx).await;
         assert!(matches!(action, NotifAction::Continue));
@@ -1216,7 +1257,7 @@ mod extra_handler_tests {
         impl Handler for StructHandler {
             fn handle<'a>(
                 &'a self,
-                _cx: &'a HandlerCtx<'_>,
+                _cx: &'a HandlerCtx,
             ) -> std::pin::Pin<Box<dyn std::future::Future<Output = NotifAction> + Send + 'a>> {
                 Box::pin(async move {
                     self.calls.fetch_add(1, Ordering::SeqCst);
@@ -1231,14 +1272,14 @@ mod extra_handler_tests {
         });
         table.register_arc(libc::SYS_openat, handler.clone() as std::sync::Arc<dyn Handler>);
 
-        let sup = fake_supervisor_ctx();
+        let _sup = fake_supervisor_ctx();
         let notif = fake_notif(libc::SYS_openat as i32);
 
         // Three independent dispatches against the same registered handler.
         // Walker MUST hit the struct's handle() each time, accumulating
         // state on &self.calls.
         for _ in 0..3 {
-            let action = table.dispatch(notif, &sup, -1).await;
+            let action = table.dispatch(notif, -1).await;
             assert!(matches!(action, NotifAction::Continue));
         }
 

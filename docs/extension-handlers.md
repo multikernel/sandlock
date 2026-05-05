@@ -20,7 +20,7 @@ loop.
 
 ### `Handler` trait
 
-The `Handler` trait has a single async method `handle(&self, cx: &HandlerCtx<'_>) -> NotifAction`.
+The `Handler` trait has a single async method `handle(&self, cx: &HandlerCtx) -> NotifAction`.
 State lives on the struct's fields — no `Arc::clone` ladders, no `Box::pin` ceremony at call site.
 
 ```rust
@@ -33,7 +33,7 @@ struct OpenAudit { count: AtomicU64 }
 
 #[async_trait]
 impl Handler for OpenAudit {
-    async fn handle(&self, cx: &HandlerCtx<'_>) -> NotifAction {
+    async fn handle(&self, cx: &HandlerCtx) -> NotifAction {
         let n = self.count.fetch_add(1, Ordering::SeqCst) + 1;
         eprintln!("[audit #{n}] pid={} openat", cx.notif.pid);
         NotifAction::Continue
@@ -49,15 +49,16 @@ Sandbox::run_with_extra_handlers(
 .await?;
 ```
 
-`HandlerCtx<'_>` is borrowed for the dispatch call (cannot outlive it — its `&Arc<SupervisorCtx>`
-ref carries supervisor state for the next notification).
+`HandlerCtx` is passed by reference for the dispatch call.  It exposes only the kernel
+notification (`notif`) and the supervisor's seccomp listener fd (`notif_fd`); supervisor-internal
+state is intentionally not part of this contract — handler state lives on the implementor.
 
 ### Closures via blanket impl
 
 For trivial single-shot handlers, closures work via the blanket `impl<F, Fut> Handler for F`:
 
 ```rust
-let audit = |cx: &HandlerCtx<'_>| async move {
+let audit = |cx: &HandlerCtx| async move {
     eprintln!("openat from pid {}", cx.notif.pid);
     NotifAction::Continue
 };
@@ -198,7 +199,7 @@ struct ExtensionDenyHandler { denied_suffixes: Vec<String> }
 
 #[async_trait]
 impl Handler for ExtensionDenyHandler {
-    async fn handle(&self, cx: &HandlerCtx<'_>) -> NotifAction {
+    async fn handle(&self, cx: &HandlerCtx) -> NotifAction {
         // openat(2): args[1] is `const char *pathname`.  4096 = PATH_MAX.
         let path = match read_child_cstr(cx.notif_fd, cx.notif.id, cx.notif.pid,
                                           cx.notif.data.args[1], 4096) {
@@ -221,7 +222,7 @@ Synthesising data INTO the guest follows the same pattern with `write_child_mem`
 `getdents64` handler that returns an empty directory listing:
 
 ```rust
-async fn handle(&self, cx: &HandlerCtx<'_>) -> NotifAction {
+async fn handle(&self, cx: &HandlerCtx) -> NotifAction {
     // args[1] is `struct linux_dirent64 *dirp` — write zero bytes (empty
     // listing) and return 0 (no entries) to the guest.
     let buf_addr = cx.notif.data.args[1];
@@ -261,7 +262,7 @@ struct CallStats {
 
 #[async_trait]
 impl Handler for CallStats {
-    async fn handle(&self, cx: &HandlerCtx<'_>) -> NotifAction {
+    async fn handle(&self, cx: &HandlerCtx) -> NotifAction {
         match cx.notif.data.nr as i64 {
             n if n == libc::SYS_openat => self.openat.fetch_add(1, Ordering::Relaxed),
             n if n == libc::SYS_close  => self.close.fetch_add(1, Ordering::Relaxed),
@@ -279,7 +280,7 @@ struct DispatchCallStats(std::sync::Arc<CallStats>);
 
 #[async_trait]
 impl Handler for DispatchCallStats {
-    async fn handle(&self, cx: &HandlerCtx<'_>) -> NotifAction {
+    async fn handle(&self, cx: &HandlerCtx) -> NotifAction {
         self.0.handle(cx).await
     }
 }
@@ -348,16 +349,17 @@ The contract is exercised at two layers:
 ### Continue-site safety
 
 The supervisor processes notifications sequentially in a single tokio task, so the response sent
-for one notification gates the kernel resumption of the trapped syscall. A handler must not hold
-any [`SupervisorCtx`](../crates/sandlock-core/src/seccomp/ctx.rs) internal lock
-(`tokio::sync::Mutex`/`RwLock`) across an `.await` point: if the guard is alive when control
-returns to the supervisor loop, the next notification that needs the same lock parks, the response
-for the current notification is not sent, and the child stays trapped in the syscall. Acquire,
-mutate, drop — `await` only after the guard is out of scope.
+for one notification gates the kernel resumption of the trapped syscall.  Sandlock-internal
+locks (`tokio::sync::Mutex`/`RwLock`) live on the supervisor; user handlers do not have access
+to them through `HandlerCtx`, so the contract here is local to handler-owned state on `&self`:
+a `tokio::sync::Mutex<T>` or `RwLock<T>` field on your handler must not be held across an
+`.await` point.  If the guard is alive when control returns to the supervisor loop, the next
+notification that needs the same lock parks, the response for the current notification is not
+sent, and the child stays trapped in the syscall.  Acquire, mutate, drop — `await` only after
+the guard is out of scope.
 
-The trait shape does not change this contract — `&self` in `Handler::handle` gives access to your
-own struct fields, but `cx.sup` is a borrowed `&Arc<SupervisorCtx>` and its locks have the same
-constraint as before. See [issue #27][i27] for the underlying contract.
+See [issue #27][i27] for the underlying supervisor-loop contract that this convention extends to
+user handlers.
 
 [i27]: https://github.com/multikernel/sandlock/issues/27
 
@@ -436,7 +438,7 @@ struct PanicSafe<H: Handler>(H);
 
 #[async_trait]
 impl<H: Handler> Handler for PanicSafe<H> {
-    async fn handle(&self, cx: &HandlerCtx<'_>) -> NotifAction {
+    async fn handle(&self, cx: &HandlerCtx) -> NotifAction {
         AssertUnwindSafe(self.0.handle(cx))
             .catch_unwind()
             .await
@@ -530,7 +532,7 @@ pub struct OpenatHandler {
 
 #[async_trait]
 impl Handler for OpenatHandler {
-    async fn handle(&self, cx: &HandlerCtx<'_>) -> NotifAction {
+    async fn handle(&self, cx: &HandlerCtx) -> NotifAction {
         /* read path arg via sandlock_core::seccomp::notif::read_child_cstr,
            consult self.virtual_tree, return NotifAction::InjectFdSendTracked
            / Errno / ... */

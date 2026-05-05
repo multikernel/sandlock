@@ -967,10 +967,10 @@ async fn handle_notification(
                 NotifAction::Errno(libc::EACCES)
             } else {
                 drop(pfs);
-                dispatch_table.dispatch(notif, ctx, fd).await
+                dispatch_table.dispatch(notif, fd).await
             }
         } else {
-            dispatch_table.dispatch(notif, ctx, fd).await
+            dispatch_table.dispatch(notif, fd).await
         }
     };
 
@@ -1113,6 +1113,7 @@ pub async fn supervisor(
     let dispatch_table = Arc::new(super::dispatch::build_dispatch_table(
         &ctx.policy,
         &ctx.resource,
+        &ctx,
         pending_handlers,
     ));
 

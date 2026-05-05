@@ -98,7 +98,7 @@ async fn extra_handler_intercepts_syscall_outside_builtin_set() {
 
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_in_handler = Arc::clone(&calls);
-    let handler = move |_cx: &HandlerCtx<'_>| {
+    let handler = move |_cx: &HandlerCtx| {
         let calls = Arc::clone(&calls_in_handler);
         async move {
             calls.fetch_add(1, Ordering::SeqCst);
@@ -141,7 +141,7 @@ async fn extra_handler_continue_lets_syscall_proceed() {
 
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_in_handler = Arc::clone(&calls);
-    let handler = move |_cx: &HandlerCtx<'_>| {
+    let handler = move |_cx: &HandlerCtx| {
         let calls = Arc::clone(&calls_in_handler);
         async move {
             calls.fetch_add(1, Ordering::SeqCst);
@@ -181,7 +181,7 @@ async fn empty_extras_preserves_default_behaviour() {
     let policy = base_policy().build().unwrap();
 
     let baseline = Sandbox::run(&policy, None, &["/bin/pwd"]).await.unwrap();
-    let no_handlers: [(i64, fn(&HandlerCtx<'_>) -> std::future::Ready<NotifAction>); 0] = [];
+    let no_handlers: [(i64, fn(&HandlerCtx) -> std::future::Ready<NotifAction>); 0] = [];
     let with_extras = Sandbox::run_with_extra_handlers(&policy, None, &["/bin/pwd"], no_handlers)
         .await
         .unwrap();
@@ -207,7 +207,7 @@ async fn extra_handler_runs_after_builtin_returns_continue() {
 
     let openat_calls = Arc::new(AtomicUsize::new(0));
     let openat_in_handler = Arc::clone(&openat_calls);
-    let handler = move |_cx: &HandlerCtx<'_>| {
+    let handler = move |_cx: &HandlerCtx| {
         let openat_calls = Arc::clone(&openat_in_handler);
         async move {
             openat_calls.fetch_add(1, Ordering::SeqCst);
@@ -264,7 +264,7 @@ async fn builtin_non_continue_blocks_extra() {
 
     let observed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let observed_in_handler = Arc::clone(&observed);
-    let handler = move |cx: &HandlerCtx<'_>| {
+    let handler = move |cx: &HandlerCtx| {
         let observed = Arc::clone(&observed_in_handler);
         let notif = cx.notif;
         async move {
@@ -327,7 +327,7 @@ async fn chain_of_extras_runs_in_insertion_order() {
     impl Handler for Counter {
         fn handle<'a>(
             &'a self,
-            _cx: &'a HandlerCtx<'_>,
+            _cx: &'a HandlerCtx,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = NotifAction> + Send + 'a>> {
             Box::pin(async move {
                 self.c.fetch_add(1, Ordering::SeqCst);
@@ -395,7 +395,7 @@ async fn chain_of_extras_runs_in_insertion_order() {
 #[tokio::test]
 async fn extra_handler_on_default_deny_syscall_is_rejected() {
     let policy = base_policy().build().unwrap();
-    let handler = |_cx: &HandlerCtx<'_>| async { NotifAction::Continue };
+    let handler = |_cx: &HandlerCtx| async { NotifAction::Continue };
 
     let result = Sandbox::run_with_extra_handlers(
         &policy,
@@ -435,7 +435,7 @@ async fn extra_handler_on_user_specified_deny_is_rejected() {
         .deny_syscalls(vec!["mremap".into()])
         .build()
         .unwrap();
-    let handler = |_cx: &HandlerCtx<'_>| async { NotifAction::Continue };
+    let handler = |_cx: &HandlerCtx| async { NotifAction::Continue };
 
     let result = Sandbox::run_with_extra_handlers(
         &policy,
@@ -479,7 +479,7 @@ async fn handler_via_blanket_impl_dispatches_in_sandbox() {
 
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_in_handler = Arc::clone(&calls);
-    let handler = move |_cx: &HandlerCtx<'_>| {
+    let handler = move |_cx: &HandlerCtx| {
         let calls = Arc::clone(&calls_in_handler);
         async move {
             calls.fetch_add(1, Ordering::SeqCst);
@@ -535,7 +535,7 @@ async fn struct_handler_state_persists_across_sandbox_calls() {
     impl Handler for UnameCounter {
         fn handle<'a>(
             &'a self,
-            _cx: &'a HandlerCtx<'_>,
+            _cx: &'a HandlerCtx,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = NotifAction> + Send + 'a>> {
             Box::pin(async move {
                 self.calls.fetch_add(1, Ordering::SeqCst);
@@ -577,7 +577,7 @@ async fn struct_handler_state_persists_across_sandbox_calls() {
 #[tokio::test]
 async fn run_with_extra_handlers_rejects_negative_syscall() {
     let policy = base_policy().build().unwrap();
-    let handler = |_cx: &HandlerCtx<'_>| async { NotifAction::Continue };
+    let handler = |_cx: &HandlerCtx| async { NotifAction::Continue };
 
     let result =
         Sandbox::run_with_extra_handlers(&policy, None, &["true"], [(-5i64, handler)]).await;
@@ -595,7 +595,7 @@ async fn run_with_extra_handlers_rejects_negative_syscall() {
 #[tokio::test]
 async fn run_with_extra_handlers_rejects_arch_unknown_syscall() {
     let policy = base_policy().build().unwrap();
-    let handler = |_cx: &HandlerCtx<'_>| async { NotifAction::Continue };
+    let handler = |_cx: &HandlerCtx| async { NotifAction::Continue };
 
     let result =
         Sandbox::run_with_extra_handlers(&policy, None, &["true"], [(99_999i64, handler)]).await;
@@ -629,7 +629,7 @@ async fn run_with_extra_handlers_preserves_insertion_order_in_sandbox_chain() {
     impl Handler for OrderTracker {
         fn handle<'a>(
             &'a self,
-            _cx: &'a HandlerCtx<'_>,
+            _cx: &'a HandlerCtx,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = NotifAction> + Send + 'a>> {
             Box::pin(async move {
                 self.order.lock().unwrap().push(self.id);
@@ -681,7 +681,7 @@ async fn run_with_extra_handlers_preserves_insertion_order_in_sandbox_chain() {
 #[tokio::test]
 async fn run_with_extra_handlers_rejects_handler_on_default_deny_syscall() {
     let policy = base_policy().build().unwrap();
-    let handler = |_cx: &HandlerCtx<'_>| async { NotifAction::Continue };
+    let handler = |_cx: &HandlerCtx| async { NotifAction::Continue };
 
     // SYS_mount is in DEFAULT_DENY_SYSCALLS.
     let result =
