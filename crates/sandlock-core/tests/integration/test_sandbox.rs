@@ -57,7 +57,7 @@ async fn test_denied_syscall() {
         .fs_read("/dev")
         .build()
         .unwrap();
-    // mount is in DEFAULT_DENY_SYSCALLS; redirect stderr to /dev/null
+    // mount is in DEFAULT_BLOCKLIST_SYSCALLS; redirect stderr to /dev/null
     // (need /dev readable for this)
     let result = Sandbox::run(
         &policy, Some("test"),

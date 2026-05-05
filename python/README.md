@@ -72,12 +72,12 @@ Unset fields mean "no restriction" unless noted otherwise.
 
 Enforce method + host + path rules on HTTP traffic via a transparent
 MITM proxy. When `http_allow` is set, all non-matching HTTP requests are
-denied by default. Deny rules are checked first and take precedence.
+denied by default. Block rules are checked first and take precedence.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `http_allow` | `list[str]` | `[]` | Allow rules in `"METHOD host/path"` format |
-| `http_deny` | `list[str]` | `[]` | Deny rules in `"METHOD host/path"` format |
+| `http_deny` | `list[str]` | `[]` | Block rules in `"METHOD host/path"` format |
 | `http_ports` | `list[int]` | `[80]` | TCP ports to intercept (443 added when `https_ca` is set) |
 | `https_ca` | `str \| None` | `None` | CA certificate for HTTPS MITM |
 | `https_key` | `str \| None` | `None` | CA private key for HTTPS MITM |
@@ -144,10 +144,10 @@ policy = Policy(
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `syscall_policy` | `SyscallPolicy` | `DEFAULT_DENY` | Syscall filtering mode |
-| `deny_syscalls` | `list[str]` | `[]` | Syscall names used when `syscall_policy=DENY` |
+| `syscall_policy` | `SyscallPolicy` | `DEFAULT_BLOCKLIST` | Syscall filtering mode |
+| `block_syscalls` | `list[str]` | `[]` | Syscall names used when `syscall_policy=BLOCKLIST` |
 
-Use `SyscallPolicy.DEFAULT_DENY`, `DENY`, or `NONE`.
+Use `SyscallPolicy.DEFAULT_BLOCKLIST`, `BLOCKLIST`, or `NONE`.
 
 #### Deterministic execution
 

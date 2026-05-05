@@ -96,8 +96,8 @@ class BranchAction(Enum):
 class SyscallPolicy(Enum):
     """Seccomp syscall filtering mode."""
 
-    DEFAULT_DENY = "default_deny"
-    DENY = "deny"
+    DEFAULT_BLOCKLIST = "default_blocklist"
+    BLOCKLIST = "blocklist"
     NONE = "none"
 
 
@@ -129,7 +129,7 @@ class Policy:
     """Immutable sandbox policy.
 
     All fields are optional — unset fields mean "no restriction"
-    except ``syscall_policy``, which defaults to ``DEFAULT_DENY``.
+    except ``syscall_policy``, which defaults to ``DEFAULT_BLOCKLIST``.
     """
 
     # Filesystem (Landlock)
@@ -143,11 +143,11 @@ class Policy:
     """Paths explicitly denied (neither read nor write)."""
 
     # Syscall filtering (seccomp)
-    syscall_policy: SyscallPolicy = SyscallPolicy.DEFAULT_DENY
-    """Syscall filtering mode: DEFAULT_DENY, DENY, or NONE."""
+    syscall_policy: SyscallPolicy = SyscallPolicy.DEFAULT_BLOCKLIST
+    """Syscall filtering mode: DEFAULT_BLOCKLIST, BLOCKLIST, or NONE."""
 
-    deny_syscalls: Sequence[str] = field(default_factory=list)
-    """Syscall names used when syscall_policy is DENY."""
+    block_syscalls: Sequence[str] = field(default_factory=list)
+    """Syscall names used when syscall_policy is BLOCKLIST."""
 
     # Network — endpoint allowlist (IP × port via seccomp on-behalf path)
     net_allow: Sequence[str] = field(default_factory=list)
@@ -200,7 +200,7 @@ class Policy:
     A transparent MITM proxy is spawned in the supervisor."""
 
     http_deny: Sequence[str] = field(default_factory=list)
-    """HTTP deny rules. Checked before allow rules. Format: "METHOD host/path"."""
+    """HTTP block rules. Checked before allow rules. Format: "METHOD host/path"."""
 
     http_ports: Sequence[int] = field(default_factory=list)
     """TCP ports to intercept for HTTP ACL. Defaults to [80] (plus 443 with

@@ -29,7 +29,7 @@ _SIMPLE_FIELDS: dict[str, type] = {
     "fs_denied": list,
     # Syscall filtering
     "syscall_policy": str,
-    "deny_syscalls": list,
+    "block_syscalls": list,
     # Network
     "net_allow": list,
     "net_bind": list,
@@ -128,8 +128,8 @@ def policy_from_dict(data: dict, source: str = "<dict>") -> Policy:
             f"unknown fields in {source}: {', '.join(sorted(unknown))}"
         )
     syscall_policy = data.get("syscall_policy")
-    if "deny_syscalls" in data and syscall_policy not in (None, "deny"):
-        raise PolicyError(f"{source}: deny_syscalls requires syscall_policy='deny'")
+    if "block_syscalls" in data and syscall_policy not in (None, "blocklist"):
+        raise PolicyError(f"{source}: block_syscalls requires syscall_policy='blocklist'")
 
     kwargs: dict = {}
     for key, value in data.items():
@@ -159,7 +159,7 @@ def policy_from_dict(data: dict, source: str = "<dict>") -> Policy:
                 kwargs[key] = SyscallPolicy(value)
             except ValueError:
                 raise PolicyError(
-                    f"{source}: syscall_policy must be 'default_deny', 'deny', or 'none', "
+                    f"{source}: syscall_policy must be 'default_blocklist', 'blocklist', or 'none', "
                     f"got {value!r}"
                 )
             continue

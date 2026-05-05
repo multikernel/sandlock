@@ -389,14 +389,14 @@ async fn chain_of_extras_runs_in_insertion_order() {
 }
 
 /// Default-deny bypass guard: registering an extra on a syscall in
-/// `DEFAULT_DENY_SYSCALLS` (e.g. `mount`) MUST be rejected at registration
+/// `DEFAULT_BLOCKLIST_SYSCALLS` (e.g. `mount`) MUST be rejected at registration
 /// time.  Without this check the extra-syscall ends up in the BPF notif
 /// block, which is matched *before* the deny block, so a user handler
 /// returning `Continue` would translate into
 /// `SECCOMP_USER_NOTIF_FLAG_CONTINUE` and the kernel would actually run
-/// `mount` — silently bypassing default deny.
+/// `mount` — silently bypassing default blocklist.
 #[tokio::test]
-async fn extra_handler_on_default_deny_syscall_is_rejected() {
+async fn extra_handler_on_default_blocklist_syscall_is_rejected() {
     let policy = base_policy().build().unwrap();
     let handler = |_cx: &HandlerCtx| async { NotifAction::Continue };
 
@@ -410,32 +410,32 @@ async fn extra_handler_on_default_deny_syscall_is_rejected() {
 
     assert!(
         result.is_err(),
-        "extras on a default-deny syscall must be rejected up-front"
+        "extras on a default-blocklist syscall must be rejected up-front"
     );
     let msg = format!("{}", result.unwrap_err());
     assert!(
-        msg.contains("deny") || msg.contains("bypass"),
+        msg.contains("blocklist") || msg.contains("bypass"),
         "error must explain why the registration is rejected, got: {}",
         msg
     );
 }
 
-/// User-supplied `SyscallPolicy::Deny` entries must be honoured by the same guard
-/// that protects DEFAULT_DENY: an extra registered on a syscall the caller
+/// User-supplied `SyscallPolicy::Blocklist` entries must be honoured by the same guard
+/// that protects DEFAULT_BLOCKLIST: an extra registered on a syscall the caller
 /// explicitly asked to deny would otherwise let a `Continue` from the
 /// handler reach the deny-JEQ via the notif path and bypass the kernel
 /// rejection at user-space discretion.
 ///
-/// Counterpart to `extra_handler_on_default_deny_syscall_is_rejected`,
-/// driving the user-list branch of `deny_syscall_numbers` (see
+/// Counterpart to `extra_handler_on_default_blocklist_syscall_is_rejected`,
+/// driving the user-list branch of `blocklist_syscall_numbers` (see
 /// `crates/sandlock-core/src/context.rs`).  Uses `SYS_mremap` because it is
-/// in `syscall_name_to_nr` but **not** in DEFAULT_DENY — putting it into
-/// `SyscallPolicy::Deny` is the only way it lands on the deny list, isolating the
-/// user-supplied branch under test from the default-deny branch.
+/// in `syscall_name_to_nr` but **not** in DEFAULT_BLOCKLIST — putting it into
+/// `SyscallPolicy::Blocklist` is the only way it lands on the blocklist, isolating the
+/// user-supplied branch under test from the default-blocklist branch.
 #[tokio::test]
 async fn extra_handler_on_user_specified_deny_is_rejected() {
     let policy = base_policy()
-        .deny_syscalls(vec!["mremap".into()])
+        .block_syscalls(vec!["mremap".into()])
         .build()
         .unwrap();
     let handler = |_cx: &HandlerCtx| async { NotifAction::Continue };
@@ -450,7 +450,7 @@ async fn extra_handler_on_user_specified_deny_is_rejected() {
 
     assert!(
         result.is_err(),
-        "extras on a user-specified deny syscall must be rejected up-front"
+        "extras on a user-specified blocklist syscall must be rejected up-front"
     );
     let msg = format!("{}", result.unwrap_err());
     assert!(

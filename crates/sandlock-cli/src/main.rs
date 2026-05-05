@@ -696,7 +696,7 @@ fn no_supervisor_exec(policy: &Policy, cmd: &[&str]) -> Result<()> {
         .map_err(|e| anyhow!("Landlock confinement failed: {}", e))?;
 
     // 2. Install deny-only seccomp filter (blocks dangerous syscalls without supervisor)
-    let deny_nrs = sandlock_core::context::no_supervisor_deny_syscall_numbers(policy);
+    let deny_nrs = sandlock_core::context::no_supervisor_blocklist_syscall_numbers(policy);
     let filter = sandlock_core::seccomp::bpf::assemble_filter(&[], &deny_nrs, &[])
         .map_err(|e| anyhow!("seccomp assemble failed: {}", e))?;
     sandlock_core::seccomp::bpf::install_deny_filter(&filter)

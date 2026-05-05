@@ -51,8 +51,8 @@ class TestPolicy:
         assert p.fs_writable == []
         assert p.fs_readable == []
         assert p.fs_denied == []
-        assert p.syscall_policy is SyscallPolicy.DEFAULT_DENY
-        assert p.deny_syscalls == []
+        assert p.syscall_policy is SyscallPolicy.DEFAULT_BLOCKLIST
+        assert p.block_syscalls == []
         assert p.net_bind == []
         assert p.net_allow == []
         assert p.max_memory is None

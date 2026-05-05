@@ -410,7 +410,7 @@ impl Sandbox {
 
             let _ = crate::landlock::confine(&policy);
 
-            let deny = crate::context::deny_syscall_numbers(&policy);
+            let deny = crate::context::blocklist_syscall_numbers(&policy);
             let args = crate::context::arg_filters(&policy);
             let filter = match crate::seccomp::bpf::assemble_filter(&[], &deny, &args) {
                 Ok(f) => f,

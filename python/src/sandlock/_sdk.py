@@ -103,7 +103,7 @@ _b_random_seed = _builder_fn("sandlock_policy_builder_random_seed", ctypes.c_uin
 _b_clean_env = _builder_fn("sandlock_policy_builder_clean_env", ctypes.c_bool)
 _b_env_var = _builder_fn("sandlock_policy_builder_env_var", ctypes.c_char_p, ctypes.c_char_p)
 _b_time_start = _builder_fn("sandlock_policy_builder_time_start", ctypes.c_uint64)
-_b_deny_syscalls = _builder_fn("sandlock_policy_builder_deny_syscalls", ctypes.c_char_p)
+_b_block_syscalls = _builder_fn("sandlock_policy_builder_block_syscalls", ctypes.c_char_p)
 _b_no_syscall_policy = _builder_fn("sandlock_policy_builder_no_syscall_policy")
 _b_max_open_files = _builder_fn("sandlock_policy_builder_max_open_files", ctypes.c_uint32)
 _b_no_randomize_memory = _builder_fn("sandlock_policy_builder_no_randomize_memory", ctypes.c_bool)
@@ -751,7 +751,7 @@ class _NativePolicy:
         "http_allow", "http_deny", "http_ports", "https_ca", "https_key",
         "uid",
         "random_seed", "time_start", "clean_env", "env",
-        "syscall_policy", "deny_syscalls", "max_open_files",
+        "syscall_policy", "block_syscalls", "max_open_files",
         "no_randomize_memory", "no_huge_pages", "no_coredump", "deterministic_dirs",
         # Managed outside _build_from_policy:
         "notif_policy",
@@ -870,13 +870,13 @@ class _NativePolicy:
             b = _b_env_var(b, _encode(k), _encode(v))
 
         syscall_policy = policy.syscall_policy.value if hasattr(policy.syscall_policy, "value") else str(policy.syscall_policy)
-        if policy.deny_syscalls and syscall_policy != "deny":
-            raise ValueError("deny_syscalls requires syscall_policy=SyscallPolicy.DENY")
-        if syscall_policy == "deny":
-            b = _b_deny_syscalls(b, _encode(",".join(policy.deny_syscalls or [])))
+        if policy.block_syscalls and syscall_policy != "blocklist":
+            raise ValueError("block_syscalls requires syscall_policy=SyscallPolicy.BLOCKLIST")
+        if syscall_policy == "blocklist":
+            b = _b_block_syscalls(b, _encode(",".join(policy.block_syscalls or [])))
         elif syscall_policy == "none":
             b = _b_no_syscall_policy(b)
-        elif syscall_policy != "default_deny":
+        elif syscall_policy != "default_blocklist":
             raise ValueError(f"unknown syscall_policy: {syscall_policy!r}")
         if policy.max_open_files is not None:
             b = _b_max_open_files(b, policy.max_open_files)

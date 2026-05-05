@@ -403,9 +403,9 @@ class TestNewPolicyFields:
         assert result.success
         assert result.stdout.strip() == b"2000"
 
-    def test_deny_syscalls(self):
+    def test_block_syscalls(self):
         from sandlock.policy import SyscallPolicy
-        p = _policy(syscall_policy=SyscallPolicy.DENY, deny_syscalls=["mount"])
+        p = _policy(syscall_policy=SyscallPolicy.BLOCKLIST, block_syscalls=["mount"])
         result = Sandbox(p).run(["echo", "ok"])
         assert result.success
         assert result.stdout.strip() == b"ok"

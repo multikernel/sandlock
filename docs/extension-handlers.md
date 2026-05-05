@@ -427,28 +427,28 @@ builtin and a user handler produces a single JEQ in the assembled program.
 Validation runs at registration time (before fork). If `Syscall::checked` fails, `run_with_extra_handlers`
 returns the error without enqueueing the handler.
 
-### Deny-list bypass guard
+### Blocklist Bypass Guard
 
-The cBPF program emits notif JEQs *before* deny JEQs, so a syscall present in both lists hits
-`SECCOMP_RET_USER_NOTIF` first. A handler registered on a syscall in
-[`DEFAULT_DENY_SYSCALLS`](../crates/sandlock-core/src/sys/structs.rs) — or in
-the policy's explicit `SyscallPolicy::Deny` mode — would convert a kernel-deny into a
-user-supervised path; a handler returning `NotifAction::Continue` would become
+The cBPF program emits notif JEQs *before* deny JEQs, so a syscall present in both lists
+hits `SECCOMP_RET_USER_NOTIF` first. A handler registered on a syscall in
+[`DEFAULT_BLOCKLIST_SYSCALLS`](../crates/sandlock-core/src/sys/structs.rs) — or in the policy's
+explicit `SyscallPolicy::Blocklist` mode — would convert a kernel-deny into a user-supervised
+path; a handler returning `NotifAction::Continue` would become
 `SECCOMP_USER_NOTIF_FLAG_CONTINUE` and the kernel would actually run the syscall, silently
 bypassing deny.
 
 `run_with_extra_handlers` rejects this configuration at registration time and returns
 `HandlerError::OnDenySyscall { syscall_nr }`. The check is implemented in
 [`validate_handler_syscalls_against_policy`](../crates/sandlock-core/src/seccomp/dispatch.rs)
-and covers both the default-deny branch (`DEFAULT_DENY_SYSCALLS`) and the user-specified branch
-(`SyscallPolicy::Deny`); both branches are tested
+and covers both the default-blocklist branch (`DEFAULT_BLOCKLIST_SYSCALLS`) and the
+user-specified branch (`SyscallPolicy::Blocklist`); both branches are tested
 (`validate_extras_rejects_user_specified_deny`,
-`extra_handler_on_default_deny_syscall_is_rejected`,
+`extra_handler_on_default_blocklist_syscall_is_rejected`,
 `run_with_extra_handlers_rejects_handler_on_default_deny_syscall`,
 `run_with_extra_handlers_rejects_negative_syscall`,
 `run_with_extra_handlers_rejects_arch_unknown_syscall`).
 
-When syscall filtering is disabled (`SyscallPolicy::None`) the resolved deny list is empty and
+When syscall filtering is disabled (`SyscallPolicy::None`) the resolved blocklist is empty and
 the guard is a no-op — but so is the BPF deny block, so there is no notif/deny overlap to bypass.
 
 ## Panics

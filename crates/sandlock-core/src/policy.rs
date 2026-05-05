@@ -58,21 +58,21 @@ impl ByteSize {
 
 /// Seccomp syscall filtering mode for a full sandbox.
 ///
-/// This is intentionally explicit: the default deny profile is a named
+/// This is intentionally explicit: the default blocklist profile is a named
 /// policy, not an implicit side effect of an unset field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SyscallPolicy {
     /// Sandlock's maintained profile for dangerous host-affecting syscalls.
-    DefaultDeny,
-    /// Deny exactly these syscall names, plus SysV IPC when not allowed.
-    Deny(Vec<String>),
-    /// Do not install a syscall deny/allow policy beyond built-in arg filters.
+    DefaultBlocklist,
+    /// Block exactly these syscall names, plus SysV IPC when not allowed.
+    Blocklist(Vec<String>),
+    /// Do not install a syscall blocklist beyond built-in arg filters.
     None,
 }
 
 impl Default for SyscallPolicy {
     fn default() -> Self {
-        Self::DefaultDeny
+        Self::DefaultBlocklist
     }
 }
 
@@ -120,7 +120,7 @@ impl TryFrom<&Policy> for ConfinePolicy {
     fn try_from(policy: &Policy) -> Result<Self, Self::Error> {
         let mut unsupported = Vec::new();
         if !policy.fs_denied.is_empty() { unsupported.push("fs_denied"); }
-        if !matches!(policy.syscall_policy, SyscallPolicy::DefaultDeny) {
+        if !matches!(policy.syscall_policy, SyscallPolicy::DefaultBlocklist) {
             unsupported.push("syscall_policy");
         }
         if !policy.net_allow.is_empty() { unsupported.push("net_allow"); }
@@ -403,7 +403,7 @@ pub fn prefix_or_exact_match(pattern: &str, value: &str) -> bool {
 
 /// Evaluate HTTP ACL rules against a request.
 ///
-/// - Deny rules are checked first; if any match, return false.
+/// - Block rules are checked first; if any match, return false.
 /// - Allow rules are checked next; if any match, return true.
 /// - If allow rules exist but none matched, return false (deny-by-default).
 /// - If no rules at all, return true (unrestricted).
@@ -414,7 +414,7 @@ pub fn http_acl_check(
     host: &str,
     path: &str,
 ) -> bool {
-    // Deny rules checked first
+    // Block rules checked first
     for rule in deny {
         if rule.matches(method, host, path) {
             return false;
@@ -425,7 +425,7 @@ pub fn http_acl_check(
         return true; // unrestricted
     }
     if allow.is_empty() {
-        // Only deny rules exist; anything not denied is allowed
+        // Only block rules exist; anything not denied is allowed
         return true;
     }
     for rule in allow {
@@ -578,8 +578,8 @@ fn validate_syscall_names(names: &[String]) -> Result<(), PolicyError> {
 
 fn validate_syscall_policy(policy: &SyscallPolicy) -> Result<(), PolicyError> {
     match policy {
-        SyscallPolicy::DefaultDeny | SyscallPolicy::None => Ok(()),
-        SyscallPolicy::Deny(names) => validate_syscall_names(names),
+        SyscallPolicy::DefaultBlocklist | SyscallPolicy::None => Ok(()),
+        SyscallPolicy::Blocklist(names) => validate_syscall_names(names),
     }
 }
 
@@ -670,8 +670,8 @@ impl PolicyBuilder {
         self
     }
 
-    pub fn deny_syscalls(mut self, calls: Vec<String>) -> Self {
-        self.syscall_policy = Some(SyscallPolicy::Deny(calls));
+    pub fn block_syscalls(mut self, calls: Vec<String>) -> Self {
+        self.syscall_policy = Some(SyscallPolicy::Blocklist(calls));
         self
     }
 
