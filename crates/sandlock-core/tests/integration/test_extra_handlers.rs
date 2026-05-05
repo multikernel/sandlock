@@ -17,7 +17,10 @@
 //! Each test uses `SYS_getcwd` because under the default policy it is
 //! **not** intercepted by any builtin (`getcwd` is added only for
 //! chroot or COW path virtualization). This isolates the behaviour under test
-//! to the extras path.
+//! to the extras path. The guest must run `/bin/pwd` (the binary), not
+//! `pwd` (the shell builtin which reads `$PWD` and never issues the
+//! syscall) — otherwise any errno injected by an extra handler can't
+//! reach the user-visible exit code.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -92,7 +95,7 @@ fn temp_out(name: &str) -> PathBuf {
 async fn extra_handler_intercepts_syscall_outside_builtin_set() {
     let policy = base_policy().build().unwrap();
     let out = temp_out("getcwd-eacces");
-    let cmd = format!("pwd; echo $? > {}", out.display());
+    let cmd = format!("/bin/pwd; echo $? > {}", out.display());
 
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_in_handler = Arc::clone(&calls);
@@ -132,7 +135,7 @@ async fn extra_handler_intercepts_syscall_outside_builtin_set() {
 async fn extra_handler_continue_lets_syscall_proceed() {
     let policy = base_policy().build().unwrap();
     let out = temp_out("getcwd-continue");
-    let cmd = format!("pwd; echo $? > {}", out.display());
+    let cmd = format!("/bin/pwd; echo $? > {}", out.display());
 
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_in_handler = Arc::clone(&calls);
@@ -301,7 +304,7 @@ async fn builtin_non_continue_blocks_extra() {
 async fn chain_of_extras_runs_in_insertion_order() {
     let policy = base_policy().build().unwrap();
     let out = temp_out("chain-order");
-    let cmd = format!("pwd; echo $? > {}", out.display());
+    let cmd = format!("/bin/pwd; echo $? > {}", out.display());
 
     let c1 = Arc::new(AtomicUsize::new(0));
     let c2 = Arc::new(AtomicUsize::new(0));
