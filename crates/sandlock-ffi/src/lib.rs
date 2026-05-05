@@ -656,7 +656,7 @@ pub unsafe extern "C" fn sandlock_confine(
 ) -> c_int {
     if policy.is_null() { return -1; }
     let policy = &(*policy)._private;
-    match sandlock_core::confine_current_process(policy) {
+    match sandlock_core::confine(policy) {
         Ok(()) => 0,
         Err(_) => -1,
     }

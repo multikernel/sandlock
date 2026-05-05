@@ -202,7 +202,7 @@ def confine(policy: "PolicyDataclass") -> None:
     ret = _lib.sandlock_confine(native.ptr)
     if ret != 0:
         from .exceptions import ConfinementError
-        raise ConfinementError("confine_current_process failed")
+        raise ConfinementError("confine failed")
 
 
 _lib.sandlock_policy_build.restype = _c_policy_p

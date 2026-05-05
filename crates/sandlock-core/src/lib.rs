@@ -59,7 +59,7 @@ pub const MIN_LANDLOCK_ABI: u32 = landlock::MIN_ABI;
 /// Network, seccomp, resource limits, and other policy fields are ignored.
 ///
 /// This does NOT fork or exec — it confines the current process in-place.
-pub fn confine_current_process(policy: &Policy) -> Result<(), SandlockError> {
+pub fn confine(policy: &Policy) -> Result<(), SandlockError> {
     // Set NO_NEW_PRIVS (required for Landlock)
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         return Err(SandlockError::Sandbox(
@@ -73,7 +73,7 @@ pub fn confine_current_process(policy: &Policy) -> Result<(), SandlockError> {
     }
 
     // Build a stripped policy with only Landlock-native fields that
-    // confine_current_process supports: filesystem + IPC + signals.
+    // confine supports: filesystem + IPC + signals.
     // Network rules are excluded — they require the full sandbox.
     let mut stripped = policy.clone();
     stripped.net_bind.clear();

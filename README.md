@@ -332,7 +332,7 @@ positive int = deny with errno, `"audit"`/`-2` = allow + flag.
 ### Rust API
 
 ```rust
-use sandlock_core::{Policy, Sandbox, Pipeline, Stage, confine_current_process};
+use sandlock_core::{Policy, Sandbox, Pipeline, Stage, confine};
 
 // Basic run
 let policy = Policy::builder()
@@ -356,7 +356,7 @@ let policy = Policy::builder()
     .fs_read("/usr").fs_read("/lib")
     .fs_write("/tmp")
     .build()?;
-confine_current_process(&policy)?;
+confine(&policy)?;
 
 // Pipeline
 let result = (
