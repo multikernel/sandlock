@@ -151,12 +151,10 @@ pub enum HandlerError {
 /// the kernel actually runs the syscall — silently bypassing deny.
 ///
 /// The deny list is whatever [`crate::context::deny_syscall_numbers`]
-/// resolves: `policy.deny_syscalls` if set, otherwise
-/// `DEFAULT_DENY_SYSCALLS` when neither `deny_syscalls` nor
-/// `allow_syscalls` is set; both branches are guarded by this function.
+/// resolves from the policy's explicit [`crate::policy::SyscallPolicy`].
 ///
-/// **Allowlist mode** (`policy.allow_syscalls = Some(_)`): the resolved
-/// deny list is empty, so this function returns `Ok(())` for any syscall.
+/// **Allowlist mode** (`SyscallPolicy::Allow(_)`): the resolved deny list
+/// is empty, so this function returns `Ok(())` for any syscall.
 /// That is sound because the BPF deny block is empty in this mode too —
 /// confinement comes from the allowlist enforced at the kernel level,
 /// and there is no notif/deny overlap to bypass.
@@ -1169,14 +1167,14 @@ mod extra_handler_tests {
     }
 
     /// `validate_handler_syscalls_against_policy` must reject handlers whose
-    /// syscall is in the policy's user-specified `deny_syscalls` list, with
-    /// the same rationale as DEFAULT_DENY: the BPF program emits notif JEQs
-    /// before deny JEQs, so a user handler returning `Continue` would
-    /// translate into `SECCOMP_USER_NOTIF_FLAG_CONTINUE` and silently bypass
-    /// the kernel-level deny.
+    /// syscall is in the policy's user-specified deny list, with the same
+    /// rationale as DEFAULT_DENY: the BPF program emits notif JEQs before
+    /// deny JEQs, so a user handler returning `Continue` would translate into
+    /// `SECCOMP_USER_NOTIF_FLAG_CONTINUE` and silently bypass the kernel-level
+    /// deny.
     ///
     /// Uses `mremap` because it is in `syscall_name_to_nr` but not in
-    /// `DEFAULT_DENY_SYSCALLS` — putting it into `deny_syscalls` is the only
+    /// `DEFAULT_DENY_SYSCALLS` — putting it into `SyscallPolicy::Deny` is the only
     /// way it ends up on the deny list, so the test isolates the user-supplied
     /// path of `deny_syscall_numbers` from the default branch covered by
     /// `extra_handler_on_default_deny_syscall_is_rejected`.

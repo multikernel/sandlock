@@ -5,6 +5,7 @@ import pytest
 
 from sandlock.policy import (
     Policy,
+    SyscallPolicy,
     parse_memory_size,
     parse_ports,
 )
@@ -50,7 +51,8 @@ class TestPolicy:
         assert p.fs_writable == []
         assert p.fs_readable == []
         assert p.fs_denied == []
-        assert p.deny_syscalls is None
+        assert p.syscall_policy is SyscallPolicy.DEFAULT_DENY
+        assert p.deny_syscalls == []
         assert p.net_bind == []
         assert p.net_allow == []
         assert p.max_memory is None
@@ -210,6 +212,5 @@ class TestNetAllow:
             "github.com:22,443",
             ":8080",
         ]
-
 
 

@@ -175,6 +175,15 @@ pub const MIN_ABI: u32 = 6;
 /// Requires Landlock ABI v6 or later. Returns an error if the kernel does
 /// not meet this requirement.
 pub fn confine(policy: &Policy) -> Result<(), SandlockError> {
+    confine_inner(policy, true)
+}
+
+/// Apply Landlock filesystem confinement without TCP bind/connect rules.
+pub fn confine_filesystem(policy: &Policy) -> Result<(), SandlockError> {
+    confine_inner(policy, false)
+}
+
+fn confine_inner(policy: &Policy, handle_net: bool) -> Result<(), SandlockError> {
     // Step 1 -- detect and validate ABI version.
     let abi = abi_version().map_err(|e| {
         SandlockError::Sandbox(crate::error::SandboxError::Confinement(e))
@@ -205,7 +214,9 @@ pub fn confine(policy: &Policy) -> Result<(), SandlockError> {
     // the on-behalf path becomes `NetworkPolicy::Unrestricted` (no
     // additional check). Bind enforcement is unaffected.
     let net_wildcard = policy.net_allow.iter().any(|r| r.all_ports);
-    let handled_access_net = if net_wildcard {
+    let handled_access_net = if !handle_net {
+        0
+    } else if net_wildcard {
         LANDLOCK_ACCESS_NET_BIND_TCP
     } else {
         LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP
@@ -287,10 +298,12 @@ pub fn confine(policy: &Policy) -> Result<(), SandlockError> {
     }
 
     // Step 5 -- add network port rules.
-    for &port in &policy.net_bind {
-        add_net_rule(&ruleset_fd, port, LANDLOCK_ACCESS_NET_BIND_TCP).map_err(|e| {
-            SandlockError::Sandbox(crate::error::SandboxError::Confinement(e))
-        })?;
+    if handle_net {
+        for &port in &policy.net_bind {
+            add_net_rule(&ruleset_fd, port, LANDLOCK_ACCESS_NET_BIND_TCP).map_err(|e| {
+                SandlockError::Sandbox(crate::error::SandboxError::Confinement(e))
+            })?;
+        }
     }
     // For TCP connect, Landlock is the only enforcer on the direct path.
     // The on-behalf path (when enabled) re-checks (ip, port) against the
@@ -302,7 +315,7 @@ pub fn confine(policy: &Policy) -> Result<(), SandlockError> {
     // When `net_wildcard` is set we already excluded CONNECT_TCP from
     // `handled_access_net`, so adding rules here would fail with EINVAL.
     // Skip — the on-behalf path is the sole enforcer.
-    if !net_wildcard {
+    if handle_net && !net_wildcard {
         let mut connect_ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
         for rule in &policy.net_allow {
             for &p in &rule.ports {

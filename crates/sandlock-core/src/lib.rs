@@ -29,7 +29,7 @@ pub(crate) mod http_acl;
 
 pub use error::SandlockError;
 pub use checkpoint::Checkpoint;
-pub use policy::{Policy, PolicyBuilder};
+pub use policy::{ConfinePolicy, ConfinePolicyBuilder, Policy, PolicyBuilder, SyscallPolicy};
 pub use result::{RunResult, ExitStatus};
 pub use sandbox::Sandbox;
 pub use pipeline::{Stage, Pipeline, Gather};
@@ -49,17 +49,12 @@ pub const MIN_LANDLOCK_ABI: u32 = landlock::MIN_ABI;
 
 /// Confine the calling process with Landlock restrictions.
 ///
-/// This applies `PR_SET_NO_NEW_PRIVS` and Landlock rules from the policy's
-/// filesystem (`fs_readable`, `fs_writable`) fields. IPC and signal
-/// isolation are always enabled. The confinement is **irreversible**.
-///
-/// `fs_denied` is not enforced here because it requires supervisor-mediated
-/// path interception rather than Landlock's allowlist model.
-///
-/// Network, seccomp, resource limits, and other policy fields are ignored.
+/// This applies `PR_SET_NO_NEW_PRIVS` and Landlock rules from the policy.
+/// IPC and signal isolation are always enabled. The confinement is
+/// **irreversible**.
 ///
 /// This does NOT fork or exec — it confines the current process in-place.
-pub fn confine(policy: &Policy) -> Result<(), SandlockError> {
+pub fn confine(policy: &ConfinePolicy) -> Result<(), SandlockError> {
     // Set NO_NEW_PRIVS (required for Landlock)
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         return Err(SandlockError::Sandbox(
@@ -72,13 +67,15 @@ pub fn confine(policy: &Policy) -> Result<(), SandlockError> {
         ));
     }
 
-    // Build a stripped policy with only Landlock-native fields that
-    // confine supports: filesystem + IPC + signals.
-    // Network rules are excluded — they require the full sandbox.
-    let mut stripped = policy.clone();
-    stripped.net_bind.clear();
-    stripped.net_allow.clear();
+    let mut builder = Policy::builder();
+    for path in &policy.fs_readable {
+        builder = builder.fs_read(path.clone());
+    }
+    for path in &policy.fs_writable {
+        builder = builder.fs_write(path.clone());
+    }
+    let stripped = builder.build()?;
 
-    // Apply Landlock rules
-    landlock::confine(&stripped)
+    // Apply Landlock filesystem rules.
+    landlock::confine_filesystem(&stripped)
 }

@@ -93,6 +93,15 @@ class BranchAction(Enum):
     KEEP = "keep"        # Leave branch as-is (caller decides)
 
 
+class SyscallPolicy(Enum):
+    """Seccomp syscall filtering mode."""
+
+    DEFAULT_DENY = "default_deny"
+    DENY = "deny"
+    ALLOW = "allow"
+    NONE = "none"
+
+
 @dataclass(frozen=True)
 class Change:
     """A single filesystem change detected by dry-run."""
@@ -121,7 +130,7 @@ class Policy:
     """Immutable sandbox policy.
 
     All fields are optional — unset fields mean "no restriction"
-    (except ``deny_syscalls`` which defaults to a safe blocklist).
+    except ``syscall_policy``, which defaults to ``DEFAULT_DENY``.
     """
 
     # Filesystem (Landlock)
@@ -134,13 +143,16 @@ class Policy:
     fs_denied: Sequence[str] = field(default_factory=list)
     """Paths explicitly denied (neither read nor write)."""
 
-    # Syscall filtering (seccomp) — set one or neither, not both
-    deny_syscalls: Sequence[str] | None = None
-    """Syscall names to block (blocklist mode). None = default blocklist."""
+    # Syscall filtering (seccomp)
+    syscall_policy: SyscallPolicy = SyscallPolicy.DEFAULT_DENY
+    """Syscall filtering mode: DEFAULT_DENY, DENY, ALLOW, or NONE."""
 
-    allow_syscalls: Sequence[str] | None = None
+    deny_syscalls: Sequence[str] = field(default_factory=list)
+    """Syscall names used when syscall_policy is DENY."""
+
+    allow_syscalls: Sequence[str] = field(default_factory=list)
     """Syscall names to allow (allowlist mode). Everything else is blocked.
-    Stricter than deny_syscalls — unknown/new syscalls are denied by default."""
+    Used when syscall_policy is ALLOW."""
 
     # Network — endpoint allowlist (IP × port via seccomp on-behalf path)
     net_allow: Sequence[str] = field(default_factory=list)

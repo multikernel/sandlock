@@ -531,6 +531,17 @@ pub unsafe extern "C" fn sandlock_policy_builder_allow_syscalls(
 /// # Safety
 /// `b` must be a valid builder pointer.
 #[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_no_syscall_policy(
+    b: *mut PolicyBuilder,
+) -> *mut PolicyBuilder {
+    if b.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.no_syscall_policy()))
+}
+
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
 pub unsafe extern "C" fn sandlock_policy_builder_max_open_files(
     b: *mut PolicyBuilder, n: c_uint,
 ) -> *mut PolicyBuilder {
@@ -656,7 +667,11 @@ pub unsafe extern "C" fn sandlock_confine(
 ) -> c_int {
     if policy.is_null() { return -1; }
     let policy = &(*policy)._private;
-    match sandlock_core::confine(policy) {
+    let policy = match sandlock_core::ConfinePolicy::try_from(policy) {
+        Ok(policy) => policy,
+        Err(_) => return -1,
+    };
+    match sandlock_core::confine(&policy) {
         Ok(()) => 0,
         Err(_) => -1,
     }

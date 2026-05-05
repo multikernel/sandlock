@@ -56,6 +56,124 @@ impl ByteSize {
     }
 }
 
+/// Seccomp syscall filtering mode for a full sandbox.
+///
+/// This is intentionally explicit: the default deny profile is a named
+/// policy, not an implicit side effect of an unset field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SyscallPolicy {
+    /// Sandlock's maintained profile for dangerous host-affecting syscalls.
+    DefaultDeny,
+    /// Deny exactly these syscall names, plus SysV IPC when not allowed.
+    Deny(Vec<String>),
+    /// Allow exactly these syscall names. Everything else is denied.
+    Allow(Vec<String>),
+    /// Do not install a syscall deny/allow policy beyond built-in arg filters.
+    None,
+}
+
+impl Default for SyscallPolicy {
+    fn default() -> Self {
+        Self::DefaultDeny
+    }
+}
+
+/// Policy for confining the current process in place.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfinePolicy {
+    pub fs_writable: Vec<PathBuf>,
+    pub fs_readable: Vec<PathBuf>,
+}
+
+impl ConfinePolicy {
+    pub fn builder() -> ConfinePolicyBuilder {
+        ConfinePolicyBuilder::default()
+    }
+}
+
+#[derive(Default)]
+pub struct ConfinePolicyBuilder {
+    fs_writable: Vec<PathBuf>,
+    fs_readable: Vec<PathBuf>,
+}
+
+impl ConfinePolicyBuilder {
+    pub fn fs_write(mut self, path: impl Into<PathBuf>) -> Self {
+        self.fs_writable.push(path.into());
+        self
+    }
+
+    pub fn fs_read(mut self, path: impl Into<PathBuf>) -> Self {
+        self.fs_readable.push(path.into());
+        self
+    }
+
+    pub fn build(self) -> ConfinePolicy {
+        ConfinePolicy {
+            fs_writable: self.fs_writable,
+            fs_readable: self.fs_readable,
+        }
+    }
+}
+
+impl TryFrom<&Policy> for ConfinePolicy {
+    type Error = PolicyError;
+
+    fn try_from(policy: &Policy) -> Result<Self, Self::Error> {
+        let mut unsupported = Vec::new();
+        if !policy.fs_denied.is_empty() { unsupported.push("fs_denied"); }
+        if !matches!(policy.syscall_policy, SyscallPolicy::DefaultDeny) {
+            unsupported.push("syscall_policy");
+        }
+        if !policy.net_allow.is_empty() { unsupported.push("net_allow"); }
+        if !policy.net_bind.is_empty() { unsupported.push("net_bind"); }
+        if policy.allow_udp { unsupported.push("allow_udp"); }
+        if policy.allow_icmp { unsupported.push("allow_icmp"); }
+        if policy.allow_sysv_ipc { unsupported.push("allow_sysv_ipc"); }
+        if !policy.http_allow.is_empty() { unsupported.push("http_allow"); }
+        if !policy.http_deny.is_empty() { unsupported.push("http_deny"); }
+        if !policy.http_ports.is_empty() { unsupported.push("http_ports"); }
+        if policy.https_ca.is_some() { unsupported.push("https_ca"); }
+        if policy.https_key.is_some() { unsupported.push("https_key"); }
+        if policy.max_memory.is_some() { unsupported.push("max_memory"); }
+        if policy.max_processes != 64 { unsupported.push("max_processes"); }
+        if policy.max_open_files.is_some() { unsupported.push("max_open_files"); }
+        if policy.max_cpu.is_some() { unsupported.push("max_cpu"); }
+        if policy.random_seed.is_some() { unsupported.push("random_seed"); }
+        if policy.time_start.is_some() { unsupported.push("time_start"); }
+        if policy.no_randomize_memory { unsupported.push("no_randomize_memory"); }
+        if policy.no_huge_pages { unsupported.push("no_huge_pages"); }
+        if policy.no_coredump { unsupported.push("no_coredump"); }
+        if policy.deterministic_dirs { unsupported.push("deterministic_dirs"); }
+        if policy.fs_isolation != FsIsolation::None { unsupported.push("fs_isolation"); }
+        if policy.workdir.is_some() { unsupported.push("workdir"); }
+        if policy.cwd.is_some() { unsupported.push("cwd"); }
+        if policy.fs_storage.is_some() { unsupported.push("fs_storage"); }
+        if policy.max_disk.is_some() { unsupported.push("max_disk"); }
+        if policy.on_exit != BranchAction::Commit { unsupported.push("on_exit"); }
+        if policy.on_error != BranchAction::Abort { unsupported.push("on_error"); }
+        if !policy.fs_mount.is_empty() { unsupported.push("fs_mount"); }
+        if policy.chroot.is_some() { unsupported.push("chroot"); }
+        if policy.clean_env { unsupported.push("clean_env"); }
+        if !policy.env.is_empty() { unsupported.push("env"); }
+        if policy.gpu_devices.is_some() { unsupported.push("gpu_devices"); }
+        if policy.cpu_cores.is_some() { unsupported.push("cpu_cores"); }
+        if policy.num_cpus.is_some() { unsupported.push("num_cpus"); }
+        if policy.port_remap { unsupported.push("port_remap"); }
+        if policy.uid.is_some() { unsupported.push("uid"); }
+        if policy.policy_fn.is_some() { unsupported.push("policy_fn"); }
+
+        if !unsupported.is_empty() {
+            return Err(PolicyError::UnsupportedForConfine(unsupported.join(", ")));
+        }
+
+        Ok(Self {
+            fs_writable: policy.fs_writable.clone(),
+            fs_readable: policy.fs_readable.clone(),
+        })
+    }
+}
+
 /// Filesystem isolation mode.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum FsIsolation {
@@ -329,8 +447,7 @@ pub struct Policy {
     pub fs_denied: Vec<PathBuf>,
 
     // Syscall filtering
-    pub deny_syscalls: Option<Vec<String>>,
-    pub allow_syscalls: Option<Vec<String>>,
+    pub syscall_policy: SyscallPolicy,
 
     // Network
     /// Outbound endpoint allowlist as a list of `(host?, ports)` rules.
@@ -445,6 +562,29 @@ impl Policy {
     }
 }
 
+fn validate_syscall_names(names: &[String]) -> Result<(), PolicyError> {
+    let unknown: Vec<&str> = names
+        .iter()
+        .map(String::as_str)
+        .filter(|name| crate::context::syscall_name_to_nr(name).is_none())
+        .collect();
+    if unknown.is_empty() {
+        Ok(())
+    } else {
+        Err(PolicyError::Invalid(format!(
+            "unknown syscall name(s): {}",
+            unknown.join(", ")
+        )))
+    }
+}
+
+fn validate_syscall_policy(policy: &SyscallPolicy) -> Result<(), PolicyError> {
+    match policy {
+        SyscallPolicy::DefaultDeny | SyscallPolicy::None => Ok(()),
+        SyscallPolicy::Deny(names) | SyscallPolicy::Allow(names) => validate_syscall_names(names),
+    }
+}
+
 /// Fluent builder for `Policy`.
 #[derive(Default)]
 pub struct PolicyBuilder {
@@ -452,8 +592,7 @@ pub struct PolicyBuilder {
     fs_readable: Vec<PathBuf>,
     fs_denied: Vec<PathBuf>,
 
-    deny_syscalls: Option<Vec<String>>,
-    allow_syscalls: Option<Vec<String>>,
+    syscall_policy: Option<SyscallPolicy>,
 
     /// Raw `--net-allow` specs; parsed in `build()` to surface errors.
     net_allow: Vec<String>,
@@ -528,13 +667,23 @@ impl PolicyBuilder {
         self
     }
 
+    pub fn syscalls(mut self, policy: SyscallPolicy) -> Self {
+        self.syscall_policy = Some(policy);
+        self
+    }
+
     pub fn deny_syscalls(mut self, calls: Vec<String>) -> Self {
-        self.deny_syscalls = Some(calls);
+        self.syscall_policy = Some(SyscallPolicy::Deny(calls));
         self
     }
 
     pub fn allow_syscalls(mut self, calls: Vec<String>) -> Self {
-        self.allow_syscalls = Some(calls);
+        self.syscall_policy = Some(SyscallPolicy::Allow(calls));
+        self
+    }
+
+    pub fn no_syscall_policy(mut self) -> Self {
+        self.syscall_policy = Some(SyscallPolicy::None);
         self
     }
 
@@ -743,10 +892,8 @@ impl PolicyBuilder {
     }
 
     pub fn build(self) -> Result<Policy, PolicyError> {
-        // Validate: deny_syscalls and allow_syscalls are mutually exclusive
-        if self.deny_syscalls.is_some() && self.allow_syscalls.is_some() {
-            return Err(PolicyError::MutuallyExclusiveSyscalls);
-        }
+        let syscall_policy = self.syscall_policy.unwrap_or_default();
+        validate_syscall_policy(&syscall_policy)?;
 
         // Validate: max_cpu must be 1-100
         if let Some(cpu) = self.max_cpu {
@@ -835,8 +982,7 @@ impl PolicyBuilder {
             fs_writable: self.fs_writable,
             fs_readable: self.fs_readable,
             fs_denied: self.fs_denied,
-            deny_syscalls: self.deny_syscalls,
-            allow_syscalls: self.allow_syscalls,
+            syscall_policy,
             net_allow,
             net_bind: self.net_bind,
             allow_udp: self.allow_udp,

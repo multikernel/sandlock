@@ -12,7 +12,7 @@ from ._sdk import (
     landlock_abi_version, min_landlock_abi, confine,
 )
 from .inputs import inputs
-from .policy import Policy, FsIsolation, BranchAction, parse_ports, Change, DryRunResult
+from .policy import Policy, FsIsolation, BranchAction, SyscallPolicy, parse_ports, Change, DryRunResult
 from ._profile import load_profile, list_profiles
 from .exceptions import (
     SandlockError,
@@ -46,6 +46,7 @@ __all__ = [
     "Policy",
     "FsIsolation",
     "BranchAction",
+    "SyscallPolicy",
     "parse_ports",
     "Change",
     "DryRunResult",

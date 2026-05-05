@@ -432,24 +432,25 @@ returns the error without enqueueing the handler.
 The cBPF program emits notif JEQs *before* deny JEQs, so a syscall present in both lists hits
 `SECCOMP_RET_USER_NOTIF` first. A handler registered on a syscall in
 [`DEFAULT_DENY_SYSCALLS`](../crates/sandlock-core/src/sys/structs.rs) — or in
-`policy.deny_syscalls` — would convert a kernel-deny into a user-supervised path; a handler
-returning `NotifAction::Continue` would become `SECCOMP_USER_NOTIF_FLAG_CONTINUE` and the kernel
-would actually run the syscall, silently bypassing deny.
+the policy's explicit `SyscallPolicy::Deny` mode — would convert a kernel-deny into a
+user-supervised path; a handler returning `NotifAction::Continue` would become
+`SECCOMP_USER_NOTIF_FLAG_CONTINUE` and the kernel would actually run the syscall, silently
+bypassing deny.
 
 `run_with_extra_handlers` rejects this configuration at registration time and returns
 `HandlerError::OnDenySyscall { syscall_nr }`. The check is implemented in
 [`validate_handler_syscalls_against_policy`](../crates/sandlock-core/src/seccomp/dispatch.rs)
 and covers both the default-deny branch (`DEFAULT_DENY_SYSCALLS`) and the user-specified branch
-(`policy.deny_syscalls`); both branches are tested
+(`SyscallPolicy::Deny`); both branches are tested
 (`validate_extras_rejects_user_specified_deny`,
 `extra_handler_on_default_deny_syscall_is_rejected`,
 `run_with_extra_handlers_rejects_handler_on_default_deny_syscall`,
 `run_with_extra_handlers_rejects_negative_syscall`,
 `run_with_extra_handlers_rejects_arch_unknown_syscall`).
 
-In allowlist mode (`policy.allow_syscalls = Some(_)`) the resolved deny list is empty and the
-guard is a no-op — but so is the BPF deny block, and confinement comes entirely from the
-kernel-enforced allowlist, so there is no overlap to bypass.
+In allowlist mode (`SyscallPolicy::Allow(_)`) the resolved deny list is empty and the guard is
+a no-op — but so is the BPF deny block, and confinement comes entirely from the kernel-enforced
+allowlist, so there is no overlap to bypass.
 
 ## Panics
 

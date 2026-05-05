@@ -420,7 +420,7 @@ async fn extra_handler_on_default_deny_syscall_is_rejected() {
     );
 }
 
-/// User-supplied `policy.deny_syscalls` must be honoured by the same guard
+/// User-supplied `SyscallPolicy::Deny` entries must be honoured by the same guard
 /// that protects DEFAULT_DENY: an extra registered on a syscall the caller
 /// explicitly asked to deny would otherwise let a `Continue` from the
 /// handler reach the deny-JEQ via the notif path and bypass the kernel
@@ -430,7 +430,7 @@ async fn extra_handler_on_default_deny_syscall_is_rejected() {
 /// driving the user-list branch of `deny_syscall_numbers` (see
 /// `crates/sandlock-core/src/context.rs`).  Uses `SYS_mremap` because it is
 /// in `syscall_name_to_nr` but **not** in DEFAULT_DENY — putting it into
-/// `deny_syscalls` is the only way it lands on the deny list, isolating the
+/// `SyscallPolicy::Deny` is the only way it lands on the deny list, isolating the
 /// user-supplied branch under test from the default-deny branch.
 #[tokio::test]
 async fn extra_handler_on_user_specified_deny_is_rejected() {

@@ -6,7 +6,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use crate::arch;
-use crate::policy::{FsIsolation, Policy};
+use crate::policy::{FsIsolation, Policy, SyscallPolicy};
 use crate::seccomp::bpf::{self, stmt, jump};
 use crate::sys::structs::{
     AF_INET, AF_INET6,
@@ -222,6 +222,11 @@ pub fn syscall_name_to_nr(name: &str) -> Option<u32> {
         "readlink" => arch::SYS_READLINK?,
         "futimesat" => arch::SYS_FUTIMESAT?,
         "fork" => arch::SYS_FORK?,
+        "read" => libc::SYS_read,
+        "write" => libc::SYS_write,
+        "close" => libc::SYS_close,
+        "exit" => libc::SYS_exit,
+        "exit_group" => libc::SYS_exit_group,
         // SysV IPC (gated by --allow-sysv-ipc; denied by default)
         "shmget" => libc::SYS_shmget,
         "shmat" => libc::SYS_shmat,
@@ -462,30 +467,26 @@ pub fn no_supervisor_deny_syscall_numbers(policy: &Policy) -> Vec<u32> {
     nrs
 }
 
-/// Resolve `deny_syscalls` names to numbers.
+/// Resolve the policy's deny-mode syscall names to numbers.
 ///
-/// If both `deny_syscalls` and `allow_syscalls` are `None`, returns the
-/// numbers for `DEFAULT_DENY_SYSCALLS`.
+/// `SyscallPolicy::DefaultDeny` returns `DEFAULT_DENY_SYSCALLS`.
+/// `SyscallPolicy::Deny` returns exactly that list.
 ///
 /// SysV IPC syscalls are appended to the resolved deny list when
-/// `policy.allow_sysv_ipc` is false — both for the default branch and
-/// the user-supplied `deny_syscalls` branch. They are not appended in
-/// allowlist mode (`allow_syscalls = Some(_)`); a user enumerating the
-/// exact set of permitted syscalls is already in control.
+/// `policy.allow_sysv_ipc` is false in deny/default-deny modes. They
+/// are not appended in allowlist mode; a user enumerating the exact set
+/// of permitted syscalls is already in control.
 pub fn deny_syscall_numbers(policy: &Policy) -> Vec<u32> {
-    let mut nrs: Vec<u32> = if let Some(ref names) = policy.deny_syscalls {
-        names
+    let mut nrs: Vec<u32> = match &policy.syscall_policy {
+        SyscallPolicy::Deny(names) => names
             .iter()
             .filter_map(|n| syscall_name_to_nr(n))
-            .collect()
-    } else if policy.allow_syscalls.is_none() {
-        DEFAULT_DENY_SYSCALLS
+            .collect(),
+        SyscallPolicy::DefaultDeny => DEFAULT_DENY_SYSCALLS
             .iter()
             .filter_map(|n| syscall_name_to_nr(n))
-            .collect()
-    } else {
-        // allow_syscalls is set — no deny list
-        return Vec::new();
+            .collect(),
+        SyscallPolicy::Allow(_) | SyscallPolicy::None => return Vec::new(),
     };
     if !policy.allow_sysv_ipc {
         for name in SYSV_IPC_DENY_SYSCALLS {

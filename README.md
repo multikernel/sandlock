@@ -332,12 +332,13 @@ positive int = deny with errno, `"audit"`/`-2` = allow + flag.
 ### Rust API
 
 ```rust
-use sandlock_core::{Policy, Sandbox, Pipeline, Stage, confine};
+use sandlock_core::{ConfinePolicy, Policy, Sandbox, Pipeline, Stage, SyscallPolicy, confine};
 
 // Basic run
 let policy = Policy::builder()
     .fs_read("/usr").fs_read("/lib")
     .fs_write("/tmp")
+    .syscalls(SyscallPolicy::DefaultDeny)
     .max_memory(ByteSize::mib(256))
     .build()?;
 let result = Sandbox::run(&policy, Some("hello-box"), &["echo", "hello"]).await?;
@@ -352,10 +353,10 @@ let policy = Policy::builder()
 let result = Sandbox::run(&policy, Some("agent-box"), &["python3", "agent.py"]).await?;
 
 // Confine the current process (Landlock filesystem only, irreversible)
-let policy = Policy::builder()
+let policy = ConfinePolicy::builder()
     .fs_read("/usr").fs_read("/lib")
     .fs_write("/tmp")
-    .build()?;
+    .build();
 confine(&policy)?;
 
 // Pipeline
@@ -393,6 +394,7 @@ fs_readable = ["/usr", "/lib", "/lib64", "/bin", "/etc"]
 clean_env = true
 max_memory = "512M"
 max_processes = 50
+syscall_policy = "default_deny"
 
 [env]
 CC = "gcc"
@@ -648,8 +650,9 @@ Policy(
     fs_denied=["/proc/kcore"],     # Explicitly denied
 
     # Syscall filtering (seccomp)
-    deny_syscalls=None,            # None = default blocklist
-    allow_syscalls=None,           # Allowlist mode (stricter)
+    syscall_policy="default_deny", # default_deny | deny | allow | none
+    deny_syscalls=[],              # used when syscall_policy="deny"
+    allow_syscalls=[],             # used when syscall_policy="allow"
 
     # Network — see "Network Model" above. Each entry is `host:port[,port,...]`,
     # `:port`, `*:port`, `host:*`, or `:*` / `*:*`. Empty list = deny all

@@ -105,6 +105,7 @@ _b_env_var = _builder_fn("sandlock_policy_builder_env_var", ctypes.c_char_p, cty
 _b_time_start = _builder_fn("sandlock_policy_builder_time_start", ctypes.c_uint64)
 _b_deny_syscalls = _builder_fn("sandlock_policy_builder_deny_syscalls", ctypes.c_char_p)
 _b_allow_syscalls = _builder_fn("sandlock_policy_builder_allow_syscalls", ctypes.c_char_p)
+_b_no_syscall_policy = _builder_fn("sandlock_policy_builder_no_syscall_policy")
 _b_max_open_files = _builder_fn("sandlock_policy_builder_max_open_files", ctypes.c_uint32)
 _b_no_randomize_memory = _builder_fn("sandlock_policy_builder_no_randomize_memory", ctypes.c_bool)
 _b_no_huge_pages = _builder_fn("sandlock_policy_builder_no_huge_pages", ctypes.c_bool)
@@ -184,11 +185,12 @@ def confine(policy: "PolicyDataclass") -> None:
     """Confine the calling process with Landlock restrictions.
 
     Applies PR_SET_NO_NEW_PRIVS and Landlock rules from the policy's
-    filesystem, IPC, and signal isolation fields. The confinement is
-    **irreversible**.
+    filesystem fields. IPC and signal isolation are always enabled. The
+    confinement is **irreversible**.
 
-    Only filesystem paths are used (IPC and signal isolation are always enabled).
-    Network, resource limits, and other policy fields are ignored.
+    Only filesystem paths are accepted. Policies containing supervisor,
+    seccomp, network, resource, environment, or COW settings are rejected
+    rather than silently ignored.
 
     This does NOT fork or exec — it confines the current process in-place.
 
@@ -750,7 +752,7 @@ class _NativePolicy:
         "http_allow", "http_deny", "http_ports", "https_ca", "https_key",
         "uid",
         "random_seed", "time_start", "clean_env", "env",
-        "deny_syscalls", "allow_syscalls", "max_open_files",
+        "syscall_policy", "deny_syscalls", "allow_syscalls", "max_open_files",
         "no_randomize_memory", "no_huge_pages", "no_coredump", "deterministic_dirs",
         # Managed outside _build_from_policy:
         "notif_policy",
@@ -868,10 +870,19 @@ class _NativePolicy:
         for k, v in (policy.env or {}).items():
             b = _b_env_var(b, _encode(k), _encode(v))
 
-        if policy.deny_syscalls:
-            b = _b_deny_syscalls(b, _encode(",".join(policy.deny_syscalls)))
-        if policy.allow_syscalls:
-            b = _b_allow_syscalls(b, _encode(",".join(policy.allow_syscalls)))
+        syscall_policy = policy.syscall_policy.value if hasattr(policy.syscall_policy, "value") else str(policy.syscall_policy)
+        if policy.deny_syscalls and syscall_policy != "deny":
+            raise ValueError("deny_syscalls requires syscall_policy=SyscallPolicy.DENY")
+        if policy.allow_syscalls and syscall_policy != "allow":
+            raise ValueError("allow_syscalls requires syscall_policy=SyscallPolicy.ALLOW")
+        if syscall_policy == "deny":
+            b = _b_deny_syscalls(b, _encode(",".join(policy.deny_syscalls or [])))
+        elif syscall_policy == "allow":
+            b = _b_allow_syscalls(b, _encode(",".join(policy.allow_syscalls or [])))
+        elif syscall_policy == "none":
+            b = _b_no_syscall_policy(b)
+        elif syscall_policy != "default_deny":
+            raise ValueError(f"unknown syscall_policy: {syscall_policy!r}")
         if policy.max_open_files is not None:
             b = _b_max_open_files(b, policy.max_open_files)
 

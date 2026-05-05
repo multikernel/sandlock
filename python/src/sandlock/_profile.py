@@ -16,7 +16,7 @@ else:
 from pathlib import Path
 
 from .exceptions import PolicyError
-from .policy import Policy, FsIsolation, BranchAction
+from .policy import Policy, FsIsolation, BranchAction, SyscallPolicy
 
 
 _PROFILES_DIR = Path("~/.config/sandlock/profiles").expanduser()
@@ -28,6 +28,7 @@ _SIMPLE_FIELDS: dict[str, type] = {
     "fs_readable": list,
     "fs_denied": list,
     # Syscall filtering
+    "syscall_policy": str,
     "deny_syscalls": list,
     "allow_syscalls": list,
     # Network
@@ -127,6 +128,13 @@ def policy_from_dict(data: dict, source: str = "<dict>") -> Policy:
         raise PolicyError(
             f"unknown fields in {source}: {', '.join(sorted(unknown))}"
         )
+    syscall_policy = data.get("syscall_policy")
+    if "deny_syscalls" in data and "allow_syscalls" in data:
+        raise PolicyError(f"{source}: deny_syscalls and allow_syscalls cannot both be set")
+    if "deny_syscalls" in data and syscall_policy not in (None, "deny"):
+        raise PolicyError(f"{source}: deny_syscalls requires syscall_policy='deny'")
+    if "allow_syscalls" in data and syscall_policy not in (None, "allow"):
+        raise PolicyError(f"{source}: allow_syscalls requires syscall_policy='allow'")
 
     kwargs: dict = {}
     for key, value in data.items():
@@ -148,6 +156,15 @@ def policy_from_dict(data: dict, source: str = "<dict>") -> Policy:
             except ValueError:
                 raise PolicyError(
                     f"{source}: {key} must be 'commit', 'abort', or 'keep', "
+                    f"got {value!r}"
+                )
+            continue
+        if key == "syscall_policy":
+            try:
+                kwargs[key] = SyscallPolicy(value)
+            except ValueError:
+                raise PolicyError(
+                    f"{source}: syscall_policy must be 'default_deny', 'deny', 'allow', or 'none', "
                     f"got {value!r}"
                 )
             continue

@@ -144,10 +144,11 @@ policy = Policy(
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `deny_syscalls` | `list[str] \| None` | `None` | Syscall names to block (blocklist mode) |
-| `allow_syscalls` | `list[str] \| None` | `None` | Syscall names to allow (allowlist mode) |
+| `syscall_policy` | `SyscallPolicy` | `DEFAULT_DENY` | Syscall filtering mode |
+| `deny_syscalls` | `list[str]` | `[]` | Syscall names used when `syscall_policy=DENY` |
+| `allow_syscalls` | `list[str]` | `[]` | Syscall names used when `syscall_policy=ALLOW` |
 
-Set one or neither, not both.
+Use `SyscallPolicy.DEFAULT_DENY`, `DENY`, `ALLOW`, or `NONE`.
 
 #### Deterministic execution
 

@@ -685,7 +685,13 @@ fn no_supervisor_exec(policy: &Policy, cmd: &[&str]) -> Result<()> {
     use std::ffi::CString;
 
     // 1. Apply Landlock confinement (sets NO_NEW_PRIVS + Landlock rules)
-    sandlock_core::confine(policy)
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(anyhow!(
+            "prctl(PR_SET_NO_NEW_PRIVS) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    sandlock_core::landlock::confine(policy)
         .map_err(|e| anyhow!("Landlock confinement failed: {}", e))?;
 
     // 2. Install deny-only seccomp filter (blocks dangerous syscalls without supervisor)

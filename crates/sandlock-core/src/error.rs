@@ -21,14 +21,14 @@ pub enum PolicyError {
     #[error("invalid policy: {0}")]
     Invalid(String),
 
-    #[error("deny_syscalls and allow_syscalls are mutually exclusive")]
-    MutuallyExclusiveSyscalls,
-
     #[error("fs_isolation requires workdir to be set")]
     FsIsolationRequiresWorkdir,
 
     #[error("max_cpu must be 1-100, got {0}")]
     InvalidCpuPercent(u8),
+
+    #[error("confine() only accepts Landlock filesystem policy; unsupported fields: {0}")]
+    UnsupportedForConfine(String),
 }
 
 #[derive(Debug, Error)]
