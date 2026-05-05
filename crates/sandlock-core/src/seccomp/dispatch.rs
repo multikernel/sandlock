@@ -84,6 +84,31 @@ where
     }
 }
 
+// Concrete impls for `Box<dyn Handler>` and `Arc<dyn Handler>` so callers
+// can erase concrete handler types behind a smart pointer when mixing
+// different handler shapes in one `IntoIterator` passed to
+// `run_with_extra_handlers` — e.g. `Vec<(i64, Box<dyn Handler>)>` lets a
+// downstream register handlers of different concrete types without
+// writing a per-crate wrapper enum.
+//
+// These are concrete `Box<dyn Handler>` / `Arc<dyn Handler>` rather than
+// `<H: Handler + ?Sized>` blankets to avoid coherence overlap with the
+// `impl<F, Fut> Handler for F where F: Fn(&HandlerCtx<'_>) -> Fut` blanket
+// above.
+#[async_trait::async_trait]
+impl Handler for Box<dyn Handler> {
+    async fn handle(&self, cx: &HandlerCtx<'_>) -> NotifAction {
+        (**self).handle(cx).await
+    }
+}
+
+#[async_trait::async_trait]
+impl Handler for std::sync::Arc<dyn Handler> {
+    async fn handle(&self, cx: &HandlerCtx<'_>) -> NotifAction {
+        (**self).handle(cx).await
+    }
+}
+
 /// Errors raised when registering user handlers via
 /// [`crate::Sandbox::run_with_extra_handlers`].
 #[derive(Debug, Error, PartialEq, Eq)]
