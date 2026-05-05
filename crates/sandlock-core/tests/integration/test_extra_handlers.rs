@@ -14,9 +14,9 @@
 //! * `Continue` not translated to `SECCOMP_USER_NOTIF_FLAG_CONTINUE` →
 //!   observe-only handlers wedge the guest.
 //!
-//! Each test uses `SYS_uname` because under the default policy it is
-//! **not** intercepted by any builtin (`uname` is added only when the
-//! policy sets a `hostname`).  This isolates the behaviour under test
+//! Each test uses `SYS_getcwd` because under the default policy it is
+//! **not** intercepted by any builtin (`getcwd` is added only for
+//! chroot or COW path virtualization). This isolates the behaviour under test
 //! to the extras path.
 
 use std::path::PathBuf;
@@ -83,16 +83,16 @@ fn temp_out(name: &str) -> PathBuf {
 }
 
 /// An extra handler registered on a syscall that the default policy
-/// does not intercept (`SYS_uname`) MUST receive notifications and its
+/// does not intercept (`SYS_getcwd`) MUST receive notifications and its
 /// `NotifAction::Errno` MUST surface in the guest as the corresponding
 /// errno.  This is the security contract: without BPF plumbing the
-/// kernel would never raise USER_NOTIF for `uname` and the handler
+/// kernel would never raise USER_NOTIF for `getcwd` and the handler
 /// would silently never fire — the maintainer-cited footgun.
 #[tokio::test]
 async fn extra_handler_intercepts_syscall_outside_builtin_set() {
     let policy = base_policy().build().unwrap();
-    let out = temp_out("uname-eacces");
-    let cmd = format!("uname -a; echo $? > {}", out.display());
+    let out = temp_out("getcwd-eacces");
+    let cmd = format!("pwd; echo $? > {}", out.display());
 
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_in_handler = Arc::clone(&calls);
@@ -104,9 +104,9 @@ async fn extra_handler_intercepts_syscall_outside_builtin_set() {
         })
     });
 
-    let extras = vec![ExtraHandler::new(libc::SYS_uname, handler)];
+    let extras = vec![ExtraHandler::new(libc::SYS_getcwd, handler)];
 
-    let result = Sandbox::run_with_extra_handlers(&policy, &["sh", "-c", &cmd], extras)
+    let result = Sandbox::run_with_extra_handlers(&policy, Some("test"), &["sh", "-c", &cmd], extras)
         .await
         .expect("sandbox spawn failed");
 
@@ -117,11 +117,11 @@ async fn extra_handler_intercepts_syscall_outside_builtin_set() {
     assert!(result.success(), "shell wrapper should exit 0");
     assert!(
         calls.load(Ordering::SeqCst) >= 1,
-        "extra handler must have fired at least once for SYS_uname"
+        "extra handler must have fired at least once for SYS_getcwd"
     );
     assert_ne!(
         code, 0,
-        "uname must observe the errno injected by the extra handler"
+        "getcwd must observe the errno injected by the extra handler"
     );
 }
 
@@ -131,8 +131,8 @@ async fn extra_handler_intercepts_syscall_outside_builtin_set() {
 #[tokio::test]
 async fn extra_handler_continue_lets_syscall_proceed() {
     let policy = base_policy().build().unwrap();
-    let out = temp_out("uname-continue");
-    let cmd = format!("uname -a; echo $? > {}", out.display());
+    let out = temp_out("getcwd-continue");
+    let cmd = format!("pwd; echo $? > {}", out.display());
 
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_in_handler = Arc::clone(&calls);
@@ -144,9 +144,9 @@ async fn extra_handler_continue_lets_syscall_proceed() {
         })
     });
 
-    let extras = vec![ExtraHandler::new(libc::SYS_uname, handler)];
+    let extras = vec![ExtraHandler::new(libc::SYS_getcwd, handler)];
 
-    let result = Sandbox::run_with_extra_handlers(&policy, &["sh", "-c", &cmd], extras)
+    let result = Sandbox::run_with_extra_handlers(&policy, Some("test"), &["sh", "-c", &cmd], extras)
         .await
         .expect("sandbox spawn failed");
 
@@ -157,23 +157,22 @@ async fn extra_handler_continue_lets_syscall_proceed() {
     assert!(result.success());
     assert!(
         calls.load(Ordering::SeqCst) >= 1,
-        "observe-only handler must have seen at least one SYS_uname"
+        "observe-only handler must have seen at least one SYS_getcwd"
     );
     assert_eq!(
         code, 0,
-        "Continue must let the kernel execute uname normally"
+        "Continue must let the kernel execute getcwd normally"
     );
 }
 
-/// `Sandbox::run_with_extra_handlers(_, _, vec![])` must be observably
-/// identical to `Sandbox::run(_, _)`.  Guards the documented backwards
-/// compatibility contract.
+/// `Sandbox::run_with_extra_handlers(_, _, _, vec![])` must be observably
+/// identical to `Sandbox::run(_, _, _)`.
 #[tokio::test]
 async fn empty_extras_preserves_default_behaviour() {
     let policy = base_policy().build().unwrap();
 
-    let baseline = Sandbox::run(&policy, &["uname", "-a"]).await.unwrap();
-    let with_extras = Sandbox::run_with_extra_handlers(&policy, &["uname", "-a"], Vec::new())
+    let baseline = Sandbox::run(&policy, Some("test"), &["pwd"]).await.unwrap();
+    let with_extras = Sandbox::run_with_extra_handlers(&policy, Some("test"), &["pwd"], Vec::new())
         .await
         .unwrap();
 
@@ -194,7 +193,7 @@ async fn empty_extras_preserves_default_behaviour() {
 async fn extra_handler_runs_after_builtin_returns_continue() {
     let policy = base_policy().build().unwrap();
     let out = temp_out("openat-cross");
-    let cmd = format!("cat /etc/hostname; echo $? > {}", out.display());
+    let cmd = format!("cat /etc/passwd; echo $? > {}", out.display());
 
     let openat_calls = Arc::new(AtomicUsize::new(0));
     let openat_in_handler = Arc::clone(&openat_calls);
@@ -211,7 +210,7 @@ async fn extra_handler_runs_after_builtin_returns_continue() {
 
     let extras = vec![ExtraHandler::new(libc::SYS_openat, handler)];
 
-    let result = Sandbox::run_with_extra_handlers(&policy, &["sh", "-c", &cmd], extras)
+    let result = Sandbox::run_with_extra_handlers(&policy, Some("test"), &["sh", "-c", &cmd], extras)
         .await
         .expect("sandbox spawn failed");
 
@@ -246,7 +245,7 @@ async fn builtin_non_continue_blocks_extra() {
     let policy = base_policy().build().unwrap();
     let out = temp_out("openat-blocked-by-builtin");
     let cmd = format!(
-        "cat /proc/1/cmdline; cat /etc/hostname; echo $? > {}",
+        "cat /proc/1/cmdline; cat /etc/passwd; echo $? > {}",
         out.display()
     );
 
@@ -266,18 +265,18 @@ async fn builtin_non_continue_blocks_extra() {
 
     let extras = vec![ExtraHandler::new(libc::SYS_openat, handler)];
 
-    let _ = Sandbox::run_with_extra_handlers(&policy, &["sh", "-c", &cmd], extras)
+    let _ = Sandbox::run_with_extra_handlers(&policy, Some("test"), &["sh", "-c", &cmd], extras)
         .await
         .expect("sandbox spawn failed");
 
     let _ = std::fs::remove_file(&out);
     let paths = observed.lock().unwrap();
 
-    let saw_etc_hostname = paths.iter().any(|p| p == "/etc/hostname");
+    let saw_etc_passwd = paths.iter().any(|p| p == "/etc/passwd");
     let saw_proc_pid = paths.iter().any(|p| p.starts_with("/proc/1/"));
 
     assert!(
-        saw_etc_hostname,
+        saw_etc_passwd,
         "extra must observe non-blocked openats, got paths: {:?}",
         *paths,
     );
@@ -292,7 +291,7 @@ async fn builtin_non_continue_blocks_extra() {
 /// chain stops at the first non-`Continue`.  Verified end-to-end:
 /// `extra1` returns `Continue` and increments `c1`; `extra2` returns
 /// `Errno(EACCES)` and increments `c2`.  Each guest invocation of
-/// `SYS_uname` must produce exactly one increment in each counter
+/// `SYS_getcwd` must produce exactly one increment in each counter
 /// (`c1 == c2`), and the guest must observe the `EACCES` from `extra2`.
 ///
 /// If insertion order were not preserved (`extra2` before `extra1`),
@@ -302,7 +301,7 @@ async fn builtin_non_continue_blocks_extra() {
 async fn chain_of_extras_runs_in_insertion_order() {
     let policy = base_policy().build().unwrap();
     let out = temp_out("chain-order");
-    let cmd = format!("uname -a; echo $? > {}", out.display());
+    let cmd = format!("pwd; echo $? > {}", out.display());
 
     let c1 = Arc::new(AtomicUsize::new(0));
     let c2 = Arc::new(AtomicUsize::new(0));
@@ -326,11 +325,11 @@ async fn chain_of_extras_runs_in_insertion_order() {
     });
 
     let extras = vec![
-        ExtraHandler::new(libc::SYS_uname, h1),
-        ExtraHandler::new(libc::SYS_uname, h2),
+        ExtraHandler::new(libc::SYS_getcwd, h1),
+        ExtraHandler::new(libc::SYS_getcwd, h2),
     ];
 
-    let result = Sandbox::run_with_extra_handlers(&policy, &["sh", "-c", &cmd], extras)
+    let result = Sandbox::run_with_extra_handlers(&policy, Some("test"), &["sh", "-c", &cmd], extras)
         .await
         .expect("sandbox spawn failed");
 
@@ -350,7 +349,7 @@ async fn chain_of_extras_runs_in_insertion_order() {
     );
     assert_ne!(
         code, 0,
-        "uname must observe the EACCES injected by the second handler"
+        "getcwd must observe the EACCES injected by the second handler"
     );
 }
 
@@ -369,7 +368,7 @@ async fn extra_handler_on_default_deny_syscall_is_rejected() {
     });
     let extras = vec![ExtraHandler::new(libc::SYS_mount, handler)];
 
-    let result = Sandbox::run_with_extra_handlers(&policy, &["true"], extras).await;
+    let result = Sandbox::run_with_extra_handlers(&policy, Some("test"), &["true"], extras).await;
 
     assert!(
         result.is_err(),
@@ -406,7 +405,7 @@ async fn extra_handler_on_user_specified_deny_is_rejected() {
     });
     let extras = vec![ExtraHandler::new(libc::SYS_mremap, handler)];
 
-    let result = Sandbox::run_with_extra_handlers(&policy, &["true"], extras).await;
+    let result = Sandbox::run_with_extra_handlers(&policy, Some("test"), &["true"], extras).await;
 
     assert!(
         result.is_err(),

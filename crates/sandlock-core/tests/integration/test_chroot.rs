@@ -101,7 +101,7 @@ async fn test_chroot_ls_root() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, &["rootfs-helper", "ls", "/"]).await;
+    let result = Sandbox::run(&policy, Some("test"), &["rootfs-helper", "ls", "/"]).await;
     match result {
         Ok(r) => {
             assert!(
@@ -142,7 +142,7 @@ async fn test_chroot_no_escape() {
 
     // Path traversal: /../../etc/sentinel should resolve to /etc/sentinel inside
     // the chroot (the sentinel file we created), not escape to the host.
-    let result = Sandbox::run(&policy, &["rootfs-helper", "cat", "/../../etc/sentinel"]).await;
+    let result = Sandbox::run(&policy, Some("test"), &["rootfs-helper", "cat", "/../../etc/sentinel"]).await;
     match result {
         Ok(r) => {
             assert!(
@@ -179,7 +179,7 @@ async fn test_chroot_getcwd() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, &["rootfs-helper", "pwd"]).await;
+    let result = Sandbox::run(&policy, Some("test"), &["rootfs-helper", "pwd"]).await;
     match result {
         Ok(r) => {
             assert!(
@@ -213,7 +213,7 @@ async fn test_chroot_write_file() {
         .unwrap();
 
     let result = Sandbox::run(
-        &policy,
+        &policy, Some("test"),
         &["rootfs-helper", "sh", "-c", "echo hello > /tmp/test.txt && cat /tmp/test.txt"],
     )
     .await;
@@ -267,7 +267,7 @@ async fn test_chroot_cow_directory_open_stays_in_rootfs() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, &["rootfs-helper", "ls", "/tmp"]).await;
+    let result = Sandbox::run(&policy, Some("test"), &["rootfs-helper", "ls", "/tmp"]).await;
     match result {
         Ok(r) => {
             assert!(
@@ -314,7 +314,7 @@ async fn test_chroot_with_cow() {
         .unwrap();
 
     let result = Sandbox::run(
-        &policy,
+        &policy, Some("test"),
         &["rootfs-helper", "sh", "-c", "echo cow-test > /tmp/cow.txt"],
     )
     .await;
@@ -354,7 +354,7 @@ async fn test_chroot_proc_self_root() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, &["rootfs-helper", "readlink", "/proc/self/root"]).await;
+    let result = Sandbox::run(&policy, Some("test"), &["rootfs-helper", "readlink", "/proc/self/root"]).await;
     match result {
         Ok(r) => {
             assert!(
@@ -388,7 +388,7 @@ async fn test_chroot_write_denied_without_fs_write() {
         .unwrap();
 
     let result = Sandbox::run(
-        &policy,
+        &policy, Some("test"),
         &["rootfs-helper", "sh", "-c", "echo denied > /tmp/should-fail.txt"],
     )
     .await;
@@ -419,7 +419,7 @@ async fn test_chroot_exec_with_root_readable() {
         .unwrap();
 
     // Use /bin/rootfs-helper which goes through the bin -> usr/bin symlink
-    let result = Sandbox::run(&policy, &["/bin/rootfs-helper", "echo", "chroot-exec-ok"]).await;
+    let result = Sandbox::run(&policy, Some("test"), &["/bin/rootfs-helper", "echo", "chroot-exec-ok"]).await;
     match result {
         Ok(r) => {
             assert!(
@@ -453,7 +453,7 @@ async fn test_chroot_fs_deny_blocks_virtual_path() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, &["rootfs-helper", "cat", "/etc/hostname"]).await;
+    let result = Sandbox::run(&policy, Some("test"), &["rootfs-helper", "cat", "/etc/hostname"]).await;
     match result {
         Ok(r) => {
             assert!(
@@ -482,7 +482,7 @@ async fn test_chroot_read_denied_without_fs_read() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, &["rootfs-helper", "cat", "/etc/hostname"]).await;
+    let result = Sandbox::run(&policy, Some("test"), &["rootfs-helper", "cat", "/etc/hostname"]).await;
     match result {
         Ok(r) => {
             assert!(
@@ -521,7 +521,7 @@ async fn test_fs_mount_read_write() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, &["rootfs-helper", "cat", "/work/input.txt"]).await;
+    let result = Sandbox::run(&policy, Some("test"), &["rootfs-helper", "cat", "/work/input.txt"]).await;
     match result {
         Ok(r) => {
             assert!(

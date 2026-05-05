@@ -583,18 +583,6 @@ pub unsafe extern "C" fn sandlock_policy_builder_deterministic_dirs(
     Box::into_raw(Box::new(builder.deterministic_dirs(v)))
 }
 
-/// # Safety
-/// `b` must be a valid builder pointer. `name` must be a valid NUL-terminated string.
-#[no_mangle]
-pub unsafe extern "C" fn sandlock_policy_builder_hostname(
-    b: *mut PolicyBuilder, name: *const std::os::raw::c_char,
-) -> *mut PolicyBuilder {
-    if b.is_null() || name.is_null() { return b; }
-    let builder = *Box::from_raw(b);
-    let s = std::ffi::CStr::from_ptr(name).to_string_lossy().into_owned();
-    Box::into_raw(Box::new(builder.hostname(s)))
-}
-
 // ----------------------------------------------------------------
 // Policy Builder — build & free
 // ----------------------------------------------------------------
@@ -681,15 +669,22 @@ pub unsafe extern "C" fn sandlock_confine(
 /// Run a command with captured stdout/stderr. Returns a result handle.
 ///
 /// # Safety
-/// `policy` must be a valid policy pointer. `argv` must point to `argc` C strings.
+/// `policy` must be a valid policy pointer. `name` may be NULL to
+/// auto-generate a sandbox name, or a valid NUL-terminated string.
+/// `argv` must point to `argc` C strings.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_run(
     policy: *const sandlock_policy_t,
+    name: *const c_char,
     argv: *const *const c_char,
     argc: c_uint,
 ) -> *mut sandlock_result_t {
     if policy.is_null() || argv.is_null() { return ptr::null_mut(); }
     let policy = &(*policy)._private;
+    let name = match optional_name(name) {
+        Ok(name) => name,
+        Err(_) => return ptr::null_mut(),
+    };
     let args = read_argv(argv, argc);
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
@@ -697,7 +692,7 @@ pub unsafe extern "C" fn sandlock_run(
         Ok(rt) => rt,
         Err(_) => return ptr::null_mut(),
     };
-    match rt.block_on(Sandbox::run(policy, &arg_refs)) {
+    match rt.block_on(Sandbox::run(policy, name.as_deref(), &arg_refs)) {
         Ok(result) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
         Err(_) => ptr::null_mut(),
     }
@@ -720,15 +715,22 @@ pub struct sandlock_handle_t {
 /// to collect the result when done.
 ///
 /// # Safety
-/// `policy` must be a valid policy pointer. `argv` must point to `argc` C strings.
+/// `policy` must be a valid policy pointer. `name` may be NULL to
+/// auto-generate a sandbox name, or a valid NUL-terminated string.
+/// `argv` must point to `argc` C strings.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_spawn(
     policy: *const sandlock_policy_t,
+    name: *const c_char,
     argv: *const *const c_char,
     argc: c_uint,
 ) -> *mut sandlock_handle_t {
     if policy.is_null() || argv.is_null() { return ptr::null_mut(); }
     let policy = &(*policy)._private;
+    let name = match optional_name(name) {
+        Ok(name) => name,
+        Err(_) => return ptr::null_mut(),
+    };
     let args = read_argv(argv, argc);
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
@@ -737,7 +739,7 @@ pub unsafe extern "C" fn sandlock_spawn(
         Err(_) => return ptr::null_mut(),
     };
 
-    let mut sb = match Sandbox::new(policy) {
+    let mut sb = match Sandbox::new(policy, name.as_deref()) {
         Ok(sb) => sb,
         Err(_) => return ptr::null_mut(),
     };
@@ -846,15 +848,22 @@ pub unsafe extern "C" fn sandlock_handle_free(h: *mut sandlock_handle_t) {
 /// Run a command with inherited stdio (interactive). Returns exit code.
 ///
 /// # Safety
-/// `policy` must be a valid policy pointer. `argv` must point to `argc` C strings.
+/// `policy` must be a valid policy pointer. `name` may be NULL to
+/// auto-generate a sandbox name, or a valid NUL-terminated string.
+/// `argv` must point to `argc` C strings.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_run_interactive(
     policy: *const sandlock_policy_t,
+    name: *const c_char,
     argv: *const *const c_char,
     argc: c_uint,
 ) -> c_int {
     if policy.is_null() || argv.is_null() { return -1; }
     let policy = &(*policy)._private;
+    let name = match optional_name(name) {
+        Ok(name) => name,
+        Err(_) => return -1,
+    };
     let args = read_argv(argv, argc);
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
@@ -862,7 +871,7 @@ pub unsafe extern "C" fn sandlock_run_interactive(
         Ok(rt) => rt,
         Err(_) => return -1,
     };
-    match rt.block_on(Sandbox::run_interactive(policy, &arg_refs)) {
+    match rt.block_on(Sandbox::run_interactive(policy, name.as_deref(), &arg_refs)) {
         Ok(result) => result.code().unwrap_or(-1),
         Err(_) => -1,
     }
@@ -987,15 +996,22 @@ pub struct sandlock_dry_run_result_t {
 /// Run a command in dry-run mode with captured stdout/stderr.
 ///
 /// # Safety
-/// `policy` must be a valid policy pointer. `argv` must point to `argc` C strings.
+/// `policy` must be a valid policy pointer. `name` may be NULL to
+/// auto-generate a sandbox name, or a valid NUL-terminated string.
+/// `argv` must point to `argc` C strings.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_dry_run(
     policy: *const sandlock_policy_t,
+    name: *const c_char,
     argv: *const *const c_char,
     argc: c_uint,
 ) -> *mut sandlock_dry_run_result_t {
     if policy.is_null() || argv.is_null() { return ptr::null_mut(); }
     let policy = &(*policy)._private;
+    let name = match optional_name(name) {
+        Ok(name) => name,
+        Err(_) => return ptr::null_mut(),
+    };
     let args = read_argv(argv, argc);
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
@@ -1003,7 +1019,7 @@ pub unsafe extern "C" fn sandlock_dry_run(
         Ok(rt) => rt,
         Err(_) => return ptr::null_mut(),
     };
-    match rt.block_on(Sandbox::dry_run(policy, &arg_refs)) {
+    match rt.block_on(Sandbox::dry_run(policy, name.as_deref(), &arg_refs)) {
         Ok(result) => Box::into_raw(Box::new(sandlock_dry_run_result_t { _private: result })),
         Err(_) => ptr::null_mut(),
     }
@@ -1535,20 +1551,27 @@ pub type sandlock_work_fn_t = unsafe extern "C" fn(clone_id: u32);
 /// Create a sandbox with init/work functions for COW forking.
 ///
 /// # Safety
-/// `policy` must be valid. `init_fn` and `work_fn` must be valid function pointers.
+/// `policy` must be valid. `name` may be NULL to auto-generate a sandbox
+/// name, or a valid NUL-terminated string. `init_fn` and `work_fn` must
+/// be valid function pointers.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_new_with_fns(
     policy: *const sandlock_policy_t,
+    name: *const c_char,
     init_fn: sandlock_init_fn_t,
     work_fn: sandlock_work_fn_t,
 ) -> *mut Sandbox {
     if policy.is_null() { return ptr::null_mut(); }
     let policy = &(*policy)._private;
+    let name = match optional_name(name) {
+        Ok(name) => name,
+        Err(_) => return ptr::null_mut(),
+    };
 
     let init = move || { unsafe { init_fn() } };
     let work = move |id: u32| { unsafe { work_fn(id) } };
 
-    match Sandbox::new_with_fns(policy, init, work) {
+    match Sandbox::new_with_fns(policy, name.as_deref(), init, work) {
         Ok(sb) => Box::into_raw(Box::new(sb)),
         Err(_) => ptr::null_mut(),
     }
@@ -1600,11 +1623,14 @@ pub unsafe extern "C" fn sandlock_fork_result_pid(r: *const sandlock_fork_result
 /// Reduce: read all clone stdout pipes, feed to reducer stdin, return result.
 ///
 /// # Safety
-/// `fork_result` is consumed. `policy` and `argv` must be valid.
+/// `fork_result` is consumed. `policy` and `argv` must be valid. `name`
+/// may be NULL to auto-generate a sandbox name, or a valid
+/// NUL-terminated string.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_reduce(
     fork_result: *mut sandlock_fork_result_t,
     policy: *const sandlock_policy_t,
+    name: *const c_char,
     argv: *const *const c_char,
     argc: c_uint,
 ) -> *mut sandlock_result_t {
@@ -1613,6 +1639,10 @@ pub unsafe extern "C" fn sandlock_reduce(
     }
     let mut fr = *Box::from_raw(fork_result);
     let policy = &(*policy)._private;
+    let name = match optional_name(name) {
+        Ok(name) => name,
+        Err(_) => return ptr::null_mut(),
+    };
     let args = read_argv(argv, argc);
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
@@ -1621,7 +1651,7 @@ pub unsafe extern "C" fn sandlock_reduce(
         Err(_) => return ptr::null_mut(),
     };
 
-    let reducer = match Sandbox::new(policy) {
+    let reducer = match Sandbox::new(policy, name.as_deref()) {
         Ok(r) => r,
         Err(_) => return ptr::null_mut(),
     };
@@ -1825,6 +1855,14 @@ pub extern "C" fn sandlock_min_landlock_abi() -> c_int {
 // ----------------------------------------------------------------
 // Helpers
 // ----------------------------------------------------------------
+
+unsafe fn optional_name(name: *const c_char) -> Result<Option<String>, std::str::Utf8Error> {
+    if name.is_null() {
+        Ok(None)
+    } else {
+        CStr::from_ptr(name).to_str().map(|s| Some(s.to_string()))
+    }
+}
 
 unsafe fn read_argv(argv: *const *const c_char, argc: c_uint) -> Vec<String> {
     let mut args = Vec::new();

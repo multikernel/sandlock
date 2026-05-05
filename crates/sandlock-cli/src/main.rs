@@ -110,7 +110,7 @@ enum Command {
         no_huge_pages: bool,
         #[arg(long)]
         deterministic_dirs: bool,
-        /// Sandbox name (also sets UTS hostname; auto-generated if omitted)
+        /// Sandbox name (also exposed as the virtual hostname; auto-generated if omitted)
         #[arg(long)]
         name: Option<String>,
         #[arg(long)]
@@ -348,7 +348,6 @@ async fn main() -> Result<()> {
             if no_huge_pages { builder = builder.no_huge_pages(true); }
             if deterministic_dirs { builder = builder.deterministic_dirs(true); }
             let sandbox_name = name.clone().unwrap_or_else(|| network_registry::next_name());
-            builder = builder.hostname(&sandbox_name);
             if no_coredump { builder = builder.no_coredump(true); }
             for spec in &env_vars {
                 if let Some((k, v)) = spec.split_once('=') {
@@ -396,13 +395,13 @@ async fn main() -> Result<()> {
                 let dr = if let Some(secs) = timeout {
                     tokio::time::timeout(
                         std::time::Duration::from_secs(secs),
-                        Sandbox::dry_run_interactive(&policy, &cmd_strs)
+                        Sandbox::dry_run_interactive(&policy, Some(sandbox_name.as_str()), &cmd_strs)
                     ).await.unwrap_or_else(|_| {
                         eprintln!("sandlock: timeout after {}s", secs);
                         std::process::exit(124);
                     })?
                 } else {
-                    Sandbox::dry_run_interactive(&policy, &cmd_strs).await?
+                    Sandbox::dry_run_interactive(&policy, Some(sandbox_name.as_str()), &cmd_strs).await?
                 };
 
                 if dr.changes.is_empty() {
@@ -416,7 +415,7 @@ async fn main() -> Result<()> {
                 dr.run_result
             } else if policy.port_remap {
                 // Use spawn+wait so we can register/unregister network state.
-                let mut sb = Sandbox::new(&policy)?;
+                let mut sb = Sandbox::new(&policy, Some(sandbox_name.as_str()))?;
 
                 // Set up callback to update registry on each port bind.
                 let reg_name = sandbox_name.clone();
@@ -460,13 +459,13 @@ async fn main() -> Result<()> {
             } else if let Some(secs) = timeout {
                 tokio::time::timeout(
                     std::time::Duration::from_secs(secs),
-                    Sandbox::run_interactive(&policy, &cmd_strs)
+                    Sandbox::run_interactive(&policy, Some(sandbox_name.as_str()), &cmd_strs)
                 ).await.unwrap_or_else(|_| {
                     eprintln!("sandlock: timeout after {}s", secs);
                     std::process::exit(124);
                 })?
             } else {
-                Sandbox::run_interactive(&policy, &cmd_strs).await?
+                Sandbox::run_interactive(&policy, Some(sandbox_name.as_str()), &cmd_strs).await?
             };
 
             if let Some(fd) = status_fd {

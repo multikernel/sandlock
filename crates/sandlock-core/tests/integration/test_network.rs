@@ -36,7 +36,7 @@ async fn test_net_allow_blocks_disallowed_host() {
         "  open('{out}', 'w').write('BLOCKED')\n",
     ), out = out.display());
 
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script]).await.unwrap();
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     assert_eq!(content, "BLOCKED", "connection to 1.1.1.1 should be blocked");
@@ -78,7 +78,7 @@ async fn test_net_allow_permits_listed_endpoint() {
         "open('{out}', 'w').write('CONNECTED')\n",
     ), out = out.display(), port = test_port);
 
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script]).await.unwrap();
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     assert_eq!(content, "CONNECTED");
@@ -111,7 +111,7 @@ async fn test_net_allow_any_ip_port() {
         "  s.close()\n",
     ), out = out.display());
 
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script]).await.unwrap();
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     assert_eq!(content, "REFUSED", "connect to permitted port should reach kernel; got: {}", content);
@@ -166,7 +166,7 @@ async fn test_net_allow_endpoint_rejects_other_ports() {
         "  s.close()\n",
     ), out = out.display(), port = blocked_port);
 
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script]).await.unwrap();
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script]).await.unwrap();
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
     let _ = acceptor.join();
 
@@ -218,7 +218,7 @@ async fn test_grandchild_network_connect() {
         "sys.exit(child.returncode)\n",
     ), out = out.display(), port = port);
 
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script]).await.unwrap();
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     assert_eq!(content, "hello", "grandchild should connect and read data");
@@ -255,7 +255,7 @@ async fn test_net_allow_wildcard_any_host_any_port() {
         "open('{out}', 'w').write(data.decode())\n",
     ), out = out.display(), port = port);
 
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script]).await.unwrap();
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     assert_eq!(content, "ok", "wildcard :* should permit arbitrary egress");
@@ -305,7 +305,7 @@ async fn test_net_allow_wildcard_host_only() {
         "open('{out}', 'w').write(','.join(results))\n",
     ), out = out.display(), port = port);
 
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script]).await.unwrap();
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     assert!(content.contains("local:ok"), "localhost should connect; got: {}", content);

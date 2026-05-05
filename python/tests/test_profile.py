@@ -65,6 +65,10 @@ class TestPolicyFromDict:
         with pytest.raises(PolicyError, match="unknown fields.*bogus"):
             policy_from_dict({"bogus": True})
 
+    def test_name_field_raises(self):
+        with pytest.raises(PolicyError, match="name.*not policy"):
+            policy_from_dict({"name": "api.local"})
+
     def test_type_mismatch_raises(self):
         with pytest.raises(PolicyError, match="expected bool.*got str"):
             policy_from_dict({"clean_env": "yes"})

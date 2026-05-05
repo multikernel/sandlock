@@ -11,7 +11,7 @@ async fn test_echo() {
         .fs_read("/proc")
         .build()
         .unwrap();
-    let result = Sandbox::run(&policy, &["echo", "hello"]).await.unwrap();
+    let result = Sandbox::run(&policy, Some("test"), &["echo", "hello"]).await.unwrap();
     assert!(result.success());
     assert_eq!(result.code(), Some(0));
 }
@@ -26,7 +26,7 @@ async fn test_exit_code() {
         .fs_read("/proc")
         .build()
         .unwrap();
-    let result = Sandbox::run(&policy, &["sh", "-c", "exit 42"]).await.unwrap();
+    let result = Sandbox::run(&policy, Some("test"), &["sh", "-c", "exit 42"]).await.unwrap();
     assert_eq!(result.code(), Some(42));
 }
 
@@ -41,7 +41,7 @@ async fn test_denied_path() {
         .fs_read("/proc")
         .build()
         .unwrap();
-    let result = Sandbox::run(&policy, &["cat", "/etc/hostname"]).await.unwrap();
+    let result = Sandbox::run(&policy, Some("test"), &["cat", "/etc/passwd"]).await.unwrap();
     assert!(!result.success());
 }
 
@@ -60,7 +60,7 @@ async fn test_denied_syscall() {
     // mount is in DEFAULT_DENY_SYSCALLS; redirect stderr to /dev/null
     // (need /dev readable for this)
     let result = Sandbox::run(
-        &policy,
+        &policy, Some("test"),
         &["sh", "-c", "mount -t tmpfs none /tmp 2>/dev/null; echo $?"],
     )
     .await
@@ -72,21 +72,32 @@ async fn test_denied_syscall() {
 #[tokio::test]
 async fn test_kill_not_running() {
     let policy = Policy::builder().build().unwrap();
-    let mut sb = Sandbox::new(&policy).unwrap();
+    let mut sb = Sandbox::new(&policy, Some("test")).unwrap();
+    assert_eq!(sb.name(), "test");
     assert!(sb.kill().is_err()); // NotRunning
+}
+
+#[tokio::test]
+async fn test_invalid_sandbox_name() {
+    let policy = Policy::builder().build().unwrap();
+    assert!(Sandbox::new(&policy, None).is_ok());
+    assert!(Sandbox::new(&policy, Some("")).is_err());
+    assert!(Sandbox::new(&policy, Some("bad\0name")).is_err());
+    let long_name = "x".repeat(65);
+    assert!(Sandbox::new(&policy, Some(long_name.as_str())).is_err());
 }
 
 #[tokio::test]
 async fn test_pause_not_running() {
     let policy = Policy::builder().build().unwrap();
-    let mut sb = Sandbox::new(&policy).unwrap();
+    let mut sb = Sandbox::new(&policy, Some("test")).unwrap();
     assert!(sb.pause().is_err());
 }
 
 #[tokio::test]
 async fn test_resume_not_running() {
     let policy = Policy::builder().build().unwrap();
-    let mut sb = Sandbox::new(&policy).unwrap();
+    let mut sb = Sandbox::new(&policy, Some("test")).unwrap();
     assert!(sb.resume().is_err());
 }
 
@@ -103,7 +114,7 @@ async fn test_default_policy_runs_ls() {
         .unwrap();
     // Use "ls /bin" instead of "ls /" because Landlock restricts access
     // to specific subtrees, not the root directory itself.
-    let result = Sandbox::run(&policy, &["ls", "/bin"]).await.unwrap();
+    let result = Sandbox::run(&policy, Some("test"), &["ls", "/bin"]).await.unwrap();
     assert!(result.success());
 }
 
@@ -123,7 +134,7 @@ async fn test_nested_sandbox() {
         .build()
         .unwrap();
 
-    // Inner: does NOT allow /etc — run cat /etc/hostname, should fail
+    // Inner: does NOT allow /etc — run cat /etc/passwd, should fail
     let inner = Policy::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
         .fs_read("/proc")
@@ -131,7 +142,7 @@ async fn test_nested_sandbox() {
         .unwrap();
 
     // Spawn outer, then nest inner inside it
-    let mut outer_sb = Sandbox::new(&outer).unwrap();
+    let mut outer_sb = Sandbox::new(&outer, Some("test")).unwrap();
     outer_sb.spawn(&["sleep", "10"]).await.unwrap();
 
     // The inner sandbox runs in the same parent process context —
@@ -148,10 +159,10 @@ async fn test_nested_sandbox() {
     // Sequential sandboxes: first sandbox applies Landlock + seccomp,
     // second sandbox from the same parent gets EBUSY on seccomp
     // but Landlock stacks. Verify both work independently.
-    let r1 = Sandbox::run_interactive(&outer, &["cat", "/etc/hostname"]).await.unwrap();
+    let r1 = Sandbox::run_interactive(&outer, Some("test"), &["cat", "/etc/passwd"]).await.unwrap();
     assert!(r1.success(), "outer should allow /etc");
 
-    let r2 = Sandbox::run_interactive(&inner, &["cat", "/etc/hostname"]).await.unwrap();
+    let r2 = Sandbox::run_interactive(&inner, Some("test"), &["cat", "/etc/passwd"]).await.unwrap();
     assert!(!r2.success(), "inner should deny /etc");
 }
 
@@ -184,11 +195,11 @@ async fn test_nested_sandbox_via_cli() {
         .unwrap();
 
     let inner_cmd = format!(
-        "{} run -r /usr -r /lib{} -r /bin -r /proc -- cat /etc/hostname",
+        "{} run -r /usr -r /lib{} -r /bin -r /proc -- cat /etc/passwd",
         bin, lib64_arg
     );
     let result = Sandbox::run_interactive(
-        &outer, &["sh", "-c", &inner_cmd],
+        &outer, Some("test"), &["sh", "-c", &inner_cmd],
     ).await.unwrap();
     assert!(!result.success(), "inner sandbox should block /etc");
 
@@ -198,7 +209,7 @@ async fn test_nested_sandbox_via_cli() {
         bin, lib64_arg
     );
     let result = Sandbox::run_interactive(
-        &outer, &["sh", "-c", &inner_cmd],
+        &outer, Some("test"), &["sh", "-c", &inner_cmd],
     ).await.unwrap();
     assert!(result.success(), "nested sandbox with shared paths should work");
 }
@@ -229,7 +240,7 @@ async fn test_denied_path_hardlink_blocked() {
         tmp.path().display(),
         tmp.path().display(),
     );
-    let result = Sandbox::run(&policy, &["sh", "-c", &cmd]).await.unwrap();
+    let result = Sandbox::run(&policy, Some("test"), &["sh", "-c", &cmd]).await.unwrap();
     assert!(
         result.stdout_str().map_or(true, |s| !s.contains("TOP_SECRET")),
         "hardlink bypass: sandbox allowed reading denied file via hardlink"
@@ -258,7 +269,7 @@ async fn test_denied_path_rename_blocked() {
         tmp.path().display(),
         tmp.path().display(),
     );
-    let result = Sandbox::run(&policy, &["sh", "-c", &cmd]).await.unwrap();
+    let result = Sandbox::run(&policy, Some("test"), &["sh", "-c", &cmd]).await.unwrap();
     assert!(
         result.stdout_str().map_or(true, |s| !s.contains("TOP_SECRET")),
         "rename bypass: sandbox allowed reading denied file via rename"
@@ -287,7 +298,7 @@ async fn test_denied_path_symlink_blocked() {
         tmp.path().display(),
         tmp.path().display(),
     );
-    let result = Sandbox::run(&policy, &["sh", "-c", &cmd]).await.unwrap();
+    let result = Sandbox::run(&policy, Some("test"), &["sh", "-c", &cmd]).await.unwrap();
     assert!(
         result.stdout_str().map_or(true, |s| !s.contains("TOP_SECRET")),
         "symlink bypass: sandbox allowed reading denied file via symlink"
@@ -314,7 +325,7 @@ async fn test_denied_path_preexisting_symlink_blocked() {
         .unwrap();
 
     let cmd = format!("cat {}", link.display());
-    let result = Sandbox::run(&policy, &["sh", "-c", &cmd]).await.unwrap();
+    let result = Sandbox::run(&policy, Some("test"), &["sh", "-c", &cmd]).await.unwrap();
     assert!(
         result.stdout_str().map_or(true, |s| !s.contains("TOP_SECRET")),
         "pre-existing symlink bypass: read denied file through symlink created before sandbox"
@@ -343,7 +354,7 @@ async fn test_denied_path_chained_symlinks_blocked() {
         .unwrap();
 
     let cmd = format!("cat {}", link2.display());
-    let result = Sandbox::run(&policy, &["sh", "-c", &cmd]).await.unwrap();
+    let result = Sandbox::run(&policy, Some("test"), &["sh", "-c", &cmd]).await.unwrap();
     assert!(
         result.stdout_str().map_or(true, |s| !s.contains("TOP_SECRET")),
         "chained symlink bypass: read denied file through symlink chain"
@@ -371,7 +382,7 @@ async fn test_denied_path_allows_normal_writes() {
         "echo ok > {0}/a.txt && ln {0}/a.txt {0}/b.txt && cat {0}/b.txt",
         tmp.path().display(),
     );
-    let result = Sandbox::run(&policy, &["sh", "-c", &cmd]).await.unwrap();
+    let result = Sandbox::run(&policy, Some("test"), &["sh", "-c", &cmd]).await.unwrap();
     assert!(result.success(), "normal write should succeed");
     assert_eq!(result.stdout_str(), Some("ok"));
 }
@@ -414,7 +425,7 @@ async fn test_chroot() {
 
     // cat the marker file — it should be at /marker.txt inside the chroot
     let result = Sandbox::run_interactive(
-        &policy,
+        &policy, Some("test"),
         &["cat", "/marker.txt"],
     ).await;
 

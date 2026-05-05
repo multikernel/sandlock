@@ -651,7 +651,7 @@ mod tests {
             chroot_denied: Vec::new(),
             chroot_mounts: Vec::new(),
             deterministic_dirs: false,
-            hostname: None,
+            virtual_hostname: None,
             has_http_acl: false,
             virtual_etc_hosts: None,
         }

@@ -245,7 +245,7 @@ pub fn syscall_name_to_nr(name: &str) -> Option<u32> {
 // ============================================================
 
 /// Determine which syscalls need `SECCOMP_RET_USER_NOTIF`.
-pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
+pub fn notif_syscalls(policy: &Policy, sandbox_name: Option<&str>) -> Vec<u32> {
     let mut nrs = vec![
         libc::SYS_clone as u32,
         libc::SYS_clone3 as u32,
@@ -329,7 +329,7 @@ pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
     if policy.num_cpus.is_some() {
         nrs.push(libc::SYS_sched_getaffinity as u32);
     }
-    if policy.hostname.is_some() {
+    if sandbox_name.is_some() {
         nrs.push(libc::SYS_uname as u32);
         nrs.push(libc::SYS_openat as u32);
     }
@@ -760,6 +760,9 @@ pub(crate) struct ChildSpawnArgs<'a> {
     pub cow_config: Option<&'a ChildMountConfig>,
     pub nested: bool,
     pub keep_fds: &'a [RawFd],
+    /// Sandbox instance name. When set, it is also exposed as the
+    /// sandbox's virtual hostname.
+    pub sandbox_name: Option<&'a str>,
     /// Syscall numbers for which the parent registered `ExtraHandler`s.
     /// Merged into the child's BPF notif list so the kernel actually
     /// raises USER_NOTIF for them.
@@ -778,6 +781,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         cow_config,
         nested,
         keep_fds,
+        sandbox_name,
         extra_syscalls,
     } = args;
     // Helper: abort child on error. Includes the OS error automatically.
@@ -1002,7 +1006,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         // them and the handler silently never fires.  We merge `extra_syscalls`
         // into the notif list and dedup so each syscall produces exactly one
         // JEQ in the assembled program.
-        let mut notif = notif_syscalls(policy);
+        let mut notif = notif_syscalls(policy, sandbox_name);
         if !extra_syscalls.is_empty() {
             notif.extend_from_slice(extra_syscalls);
         }
@@ -1155,7 +1159,7 @@ mod tests {
     #[test]
     fn test_notif_syscalls_always_has_clone() {
         let policy = Policy::builder().build().unwrap();
-        let nrs = notif_syscalls(&policy);
+        let nrs = notif_syscalls(&policy, None);
         assert!(nrs.contains(&(libc::SYS_clone as u32)));
         assert!(nrs.contains(&(libc::SYS_clone3 as u32)));
         if let Some(vfork) = arch::SYS_VFORK {
@@ -1177,7 +1181,7 @@ mod tests {
             .policy_fn(|_event, _ctx| crate::policy_fn::Verdict::Allow)
             .build()
             .unwrap();
-        let nrs = notif_syscalls(&policy);
+        let nrs = notif_syscalls(&policy, None);
         assert!(nrs.contains(&(fork as u32)));
     }
 
@@ -1192,7 +1196,7 @@ mod tests {
             .allow_sysv_ipc(true)
             .build()
             .unwrap();
-        let nrs = notif_syscalls(&policy);
+        let nrs = notif_syscalls(&policy, None);
         assert!(nrs.contains(&(libc::SYS_mmap as u32)));
         assert!(nrs.contains(&(libc::SYS_munmap as u32)));
         assert!(nrs.contains(&(libc::SYS_brk as u32)));
@@ -1210,7 +1214,7 @@ mod tests {
             .max_memory(crate::policy::ByteSize::mib(256))
             .build()
             .unwrap();
-        let nrs = notif_syscalls(&policy);
+        let nrs = notif_syscalls(&policy, None);
         assert!(!nrs.contains(&(libc::SYS_shmget as u32)));
         // Other memory syscalls remain notified — they are not denied.
         assert!(nrs.contains(&(libc::SYS_mmap as u32)));
@@ -1223,10 +1227,18 @@ mod tests {
             .net_allow("example.com:443")
             .build()
             .unwrap();
-        let nrs = notif_syscalls(&policy);
+        let nrs = notif_syscalls(&policy, None);
         assert!(nrs.contains(&(libc::SYS_connect as u32)));
         assert!(nrs.contains(&(libc::SYS_sendto as u32)));
         assert!(nrs.contains(&(libc::SYS_sendmsg as u32)));
+    }
+
+    #[test]
+    fn test_notif_syscalls_sandbox_name_enables_hostname_virtualization() {
+        let policy = Policy::builder().build().unwrap();
+        let nrs = notif_syscalls(&policy, Some("api.local"));
+        assert!(nrs.contains(&(libc::SYS_uname as u32)));
+        assert!(nrs.contains(&(libc::SYS_openat as u32)));
     }
 
     /// SYS_faccessat2 (439) must be in the notification filter for both
@@ -1240,7 +1252,7 @@ mod tests {
             .chroot("/tmp")
             .build()
             .unwrap();
-        let nrs = notif_syscalls(&policy);
+        let nrs = notif_syscalls(&policy, None);
         assert!(nrs.contains(&(libc::SYS_faccessat as u32)));
         assert!(nrs.contains(&SYS_FACCESSAT2),
                 "chroot notif filter must include SYS_faccessat2 (439)");
@@ -1250,7 +1262,7 @@ mod tests {
             .workdir("/tmp")
             .build()
             .unwrap();
-        let nrs = notif_syscalls(&policy);
+        let nrs = notif_syscalls(&policy, None);
         assert!(nrs.contains(&(libc::SYS_faccessat as u32)));
         assert!(nrs.contains(&SYS_FACCESSAT2),
                 "COW notif filter must include SYS_faccessat2 (439)");

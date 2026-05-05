@@ -340,7 +340,7 @@ let policy = Policy::builder()
     .fs_write("/tmp")
     .max_memory(ByteSize::mib(256))
     .build()?;
-let result = Sandbox::run(&policy, &["echo", "hello"]).await?;
+let result = Sandbox::run(&policy, Some("hello-box"), &["echo", "hello"]).await?;
 assert!(result.success());
 
 // HTTP ACL: restrict API access at the HTTP level
@@ -349,7 +349,7 @@ let policy = Policy::builder()
     .http_allow("POST api.openai.com/v1/chat/completions")
     .http_deny("* */admin/*")
     .build()?;
-let result = Sandbox::run(&policy, &["python3", "agent.py"]).await?;
+let result = Sandbox::run(&policy, Some("agent-box"), &["python3", "agent.py"]).await?;
 
 // Confine the current process (Landlock filesystem only, irreversible)
 let policy = Policy::builder()
@@ -384,6 +384,7 @@ let policy = Policy::builder()
 ## Profiles
 
 Save reusable policies as TOML files in `~/.config/sandlock/profiles/`:
+Profiles contain policy only; pass a sandbox instance name with `--name`.
 
 ```toml
 # ~/.config/sandlock/profiles/build.toml
@@ -495,13 +496,13 @@ print(result.stdout)  # b"total\n"
 ```
 
 ```rust
-let mut mapper = Sandbox::new_with_fns(&map_policy,
+let mut mapper = Sandbox::new_with_fns(&map_policy, Some("mapper"),
     || { load_data(); },
     |id| { println!("{}", compute(id)); },
 )?;
 let mut clones = mapper.fork(4).await?;
 
-let reducer = Sandbox::new(&reduce_policy)?;
+let reducer = Sandbox::new(&reduce_policy, Some("reducer"))?;
 let result = reducer.reduce(
     &["python3", "-c", "import sys; print(sum(int(l) for l in sys.stdin))"],
     &mut clones,

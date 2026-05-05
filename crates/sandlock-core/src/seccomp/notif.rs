@@ -231,7 +231,7 @@ pub struct NotifPolicy {
     /// Mount mappings: (virtual_path, host_path) pairs.
     pub chroot_mounts: Vec<(std::path::PathBuf, std::path::PathBuf)>,
     pub deterministic_dirs: bool,
-    pub hostname: Option<String>,
+    pub virtual_hostname: Option<String>,
     pub has_http_acl: bool,
     /// Synthetic `/etc/hosts` content for `net_allow_hosts` virtualization.
     /// When set, `openat("/etc/hosts")` returns a memfd with this content

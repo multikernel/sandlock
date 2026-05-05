@@ -365,7 +365,7 @@ pub fn build_dispatch_table(
     // ------------------------------------------------------------------
     // Hostname virtualization
     // ------------------------------------------------------------------
-    if let Some(ref hostname) = policy.hostname {
+    if let Some(ref hostname) = policy.virtual_hostname {
         let hostname = hostname.clone();
         let hostname2 = hostname.clone();
         table.register(libc::SYS_uname, Box::new(move |notif, _ctx, notif_fd| {
@@ -851,7 +851,7 @@ mod extra_handler_tests {
                 chroot_denied: Vec::new(),
                 chroot_mounts: Vec::new(),
                 deterministic_dirs: false,
-                hostname: None,
+                virtual_hostname: None,
                 has_http_acl: false,
                 virtual_etc_hosts: None,
             }),

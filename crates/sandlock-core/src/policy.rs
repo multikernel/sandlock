@@ -394,7 +394,6 @@ pub struct Policy {
     pub no_huge_pages: bool,
     pub no_coredump: bool,
     pub deterministic_dirs: bool,
-    pub hostname: Option<String>,
 
     // Filesystem branch
     pub fs_isolation: FsIsolation,
@@ -480,7 +479,6 @@ pub struct PolicyBuilder {
     no_huge_pages: bool,
     no_coredump: bool,
     deterministic_dirs: bool,
-    hostname: Option<String>,
 
     fs_isolation: Option<FsIsolation>,
     workdir: Option<PathBuf>,
@@ -652,11 +650,6 @@ impl PolicyBuilder {
 
     pub fn deterministic_dirs(mut self, v: bool) -> Self {
         self.deterministic_dirs = v;
-        self
-    }
-
-    pub fn hostname(mut self, name: impl Into<String>) -> Self {
-        self.hostname = Some(name.into());
         self
     }
 
@@ -864,7 +857,6 @@ impl PolicyBuilder {
             no_huge_pages: self.no_huge_pages,
             no_coredump: self.no_coredump,
             deterministic_dirs: self.deterministic_dirs,
-            hostname: self.hostname,
             fs_isolation,
             workdir: self.workdir,
             cwd: self.cwd,

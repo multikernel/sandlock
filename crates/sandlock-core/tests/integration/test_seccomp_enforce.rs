@@ -35,7 +35,7 @@ async fn test_mount_blocked() {
         out.display()
     );
     let policy = base_policy().build().unwrap();
-    let result = Sandbox::run_interactive(&policy, &["sh", "-c", &cmd_str])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["sh", "-c", &cmd_str])
         .await
         .unwrap();
 
@@ -60,7 +60,7 @@ async fn test_ptrace_blocked() {
         out.display()
     );
     let policy = base_policy().build().unwrap();
-    let result = Sandbox::run_interactive(&policy, &["sh", "-c", &cmd_str])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["sh", "-c", &cmd_str])
         .await
         .unwrap();
 
@@ -92,7 +92,7 @@ async fn test_personality_blocked() {
     ), out = out.display());
 
     let policy = base_policy().build().unwrap();
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -127,7 +127,7 @@ async fn test_raw_socket_blocked() {
     ), out = out.display());
 
     let policy = base_policy().build().unwrap();
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -166,7 +166,7 @@ async fn test_allow_icmp_permits_icmp_raw() {
         .allow_icmp(true)
         .build()
         .unwrap();
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -209,7 +209,7 @@ async fn test_allow_icmp_still_blocks_other_raw() {
         .allow_icmp(true)
         .build()
         .unwrap();
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -249,7 +249,7 @@ async fn test_udp_allowed_when_opted_in() {
         .allow_udp(true)
         .build()
         .unwrap();
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -284,7 +284,7 @@ async fn test_udp_denied_by_default() {
     ), out = out.display());
 
     let policy = base_policy().build().unwrap();
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -322,7 +322,7 @@ async fn test_sysv_shmget_denied_by_default() {
     ), out = out.display());
 
     let policy = base_policy().build().unwrap();
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -361,7 +361,7 @@ async fn test_sysv_shmget_allowed_when_opted_in() {
         .allow_sysv_ipc(true)
         .build()
         .unwrap();
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -398,7 +398,7 @@ async fn test_tcp_always_allowed() {
     let policy = base_policy()
         .build()
         .unwrap();
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await
         .unwrap();
 

@@ -53,7 +53,6 @@ _SIMPLE_FIELDS: dict[str, type] = {
     "no_randomize_memory": bool,
     "no_huge_pages": bool,
     "deterministic_dirs": bool,
-    "name": str,
     "no_coredump": bool,
     # Misc
     "port_remap": bool,
@@ -119,6 +118,10 @@ def policy_from_dict(data: dict, source: str = "<dict>") -> Policy:
     Raises:
         PolicyError: If unknown keys or type mismatches are found.
     """
+    if "name" in data:
+        raise PolicyError(
+            f"{source}: field 'name' is not policy; pass the sandbox name to Sandbox(..., name=...)"
+        )
     unknown = set(data.keys()) - set(_SIMPLE_FIELDS.keys())
     if unknown:
         raise PolicyError(

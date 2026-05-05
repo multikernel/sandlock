@@ -63,6 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let result = Sandbox::run_with_extra_handlers(
         &policy,
+        Some("openat-audit"),
         &cmd_ref,
         vec![ExtraHandler::new(libc::SYS_openat, audit)],
     )

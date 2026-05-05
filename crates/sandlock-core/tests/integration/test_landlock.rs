@@ -32,7 +32,7 @@ async fn test_can_read_allowed_path() {
         .unwrap();
 
     let cmd_str = format!("cat {} > {}", input.display(), out.display());
-    let result = Sandbox::run_interactive(&policy, &["sh", "-c", &cmd_str])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["sh", "-c", &cmd_str])
         .await
         .unwrap();
     assert!(result.success(), "cat should succeed for allowed path");
@@ -57,8 +57,8 @@ async fn test_cannot_read_outside_allowed() {
         .build()
         .unwrap();
 
-    // /etc is NOT in fs_read, so cat /etc/hostname should fail
-    let result = Sandbox::run_interactive(&policy, &["cat", "/etc/hostname"])
+    // /etc is NOT in fs_read, so cat /etc/passwd should fail
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["cat", "/etc/passwd"])
         .await
         .unwrap();
     assert!(!result.success(), "cat should fail without /etc in fs_read");
@@ -81,7 +81,7 @@ async fn test_can_write_to_writable_path() {
         .unwrap();
 
     let cmd_str = format!("echo hello > {}", out.display());
-    let result = Sandbox::run_interactive(&policy, &["sh", "-c", &cmd_str])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["sh", "-c", &cmd_str])
         .await
         .unwrap();
     assert!(result.success(), "writing to /tmp should succeed");
@@ -114,7 +114,7 @@ async fn test_cannot_write_to_readonly_path() {
 
     // dir is read-only, writing should fail
     let cmd_str = format!("echo nope > {} 2>/dev/null", target.display());
-    let result = Sandbox::run_interactive(&policy, &["sh", "-c", &cmd_str])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["sh", "-c", &cmd_str])
         .await
         .unwrap();
     assert!(!result.success(), "writing to read-only dir should fail");
@@ -143,7 +143,7 @@ async fn test_denied_path_blocks_read() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, &["cat", input.to_str().unwrap()])
+    let result = Sandbox::run(&policy, Some("test"), &["cat", input.to_str().unwrap()])
         .await
         .unwrap();
     assert!(!result.success(), "cat should fail on denied path");
@@ -166,7 +166,7 @@ async fn test_denied_path_blocks_exec() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, &["/bin/cat", "/etc/hostname"]).await.unwrap();
+    let result = Sandbox::run(&policy, Some("test"), &["/bin/cat", "/etc/hostname"]).await.unwrap();
     assert!(!result.success(), "exec should fail on denied binary path");
 }
 
@@ -243,7 +243,7 @@ async fn test_isolate_ipc() {
         .build()
         .unwrap();
 
-    let _result = Sandbox::run_interactive(&policy, &["python3", "-c", &child_script])
+    let _result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &child_script])
         .await
         .unwrap();
 
@@ -297,7 +297,7 @@ async fn test_isolate_signals_blocks_parent() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success(), "python script should exit 0");
@@ -348,7 +348,7 @@ async fn test_isolate_signals_allows_self() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success(), "python script should exit 0");

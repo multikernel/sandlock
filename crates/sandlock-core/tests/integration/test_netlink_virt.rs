@@ -24,7 +24,7 @@ async fn if_nameindex_returns_only_lo() {
     ), out = out.display());
 
     let policy = base_policy().build().unwrap();
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await.unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
@@ -54,7 +54,7 @@ async fn loopback_bind_succeeds() {
 
     // port 0 in Landlock net rules means "allow any port"
     let policy = base_policy().net_bind_port(0).build().unwrap();
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await.unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
@@ -79,7 +79,7 @@ async fn getaddrinfo_ai_addrconfig_returns_v4_and_v6() {
     ), out = out.display());
 
     let policy = base_policy().build().unwrap();
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await.unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
@@ -104,7 +104,7 @@ async fn proc_net_dev_shows_only_lo() {
     ), out = out.display());
 
     let policy = base_policy().build().unwrap();
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await.unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
@@ -124,7 +124,7 @@ async fn proc_net_if_inet6_shows_only_lo() {
     ), out = out.display());
 
     let policy = base_policy().build().unwrap();
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await.unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
@@ -154,7 +154,7 @@ async fn ioctl_siocgifconf_blocked() {
     ), out = out.display());
 
     let policy = base_policy().build().unwrap();
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await.unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
@@ -187,7 +187,7 @@ async fn ioctl_siocethtool_blocked() {
     ), out = out.display());
 
     let policy = base_policy().build().unwrap();
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await.unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
@@ -215,7 +215,7 @@ async fn sys_class_net_blocked() {
     ), out = out.display());
 
     let policy = base_policy().build().unwrap();
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await.unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
@@ -243,7 +243,7 @@ async fn non_route_netlink_still_blocked() {
     ), out = out.display());
 
     let policy = base_policy().build().unwrap();
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await.unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();

@@ -7,7 +7,7 @@ import sys
 import pytest
 
 from sandlock import Sandbox, Policy, Checkpoint
-from sandlock._sdk import _lib, _make_argv
+from sandlock._sdk import _encode, _lib, _make_argv
 
 
 _PYTHON_READABLE = list(dict.fromkeys([
@@ -27,7 +27,12 @@ def running_sandbox():
     """A sandbox with a long-running process for checkpoint tests."""
     sb = Sandbox(_policy())
     argv, argc = _make_argv(["sleep", "60"])
-    sb._handle = _lib.sandlock_spawn(sb._native.ptr, argv, argc)
+    sb._handle = _lib.sandlock_spawn(
+        sb._native.ptr,
+        _encode(sb._resolve_name()),
+        argv,
+        argc,
+    )
     assert sb._handle, "spawn failed"
     yield sb
     if sb._handle:

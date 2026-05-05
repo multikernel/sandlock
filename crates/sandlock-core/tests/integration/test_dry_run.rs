@@ -24,7 +24,7 @@ async fn test_dry_run_reports_added_file() {
 
     let new_file = workdir.join("new.txt");
     let cmd = format!("echo created > {}", new_file.display());
-    let result = Sandbox::dry_run(&policy, &["sh", "-c", &cmd]).await;
+    let result = Sandbox::dry_run(&policy, Some("test"), &["sh", "-c", &cmd]).await;
     match result {
         Ok(dr) => {
             assert!(dr.run_result.success());
@@ -54,7 +54,7 @@ async fn test_dry_run_reports_modified_file() {
         .unwrap();
 
     let cmd = format!("echo modified > {}/data.txt", workdir.display());
-    let result = Sandbox::dry_run(&policy, &["sh", "-c", &cmd]).await;
+    let result = Sandbox::dry_run(&policy, Some("test"), &["sh", "-c", &cmd]).await;
     match result {
         Ok(dr) => {
             assert!(dr.run_result.success());
@@ -85,7 +85,7 @@ async fn test_dry_run_reports_deleted_file() {
         .unwrap();
 
     let cmd = format!("rm {}/victim.txt", workdir.display());
-    let result = Sandbox::dry_run(&policy, &["sh", "-c", &cmd]).await;
+    let result = Sandbox::dry_run(&policy, Some("test"), &["sh", "-c", &cmd]).await;
     match result {
         Ok(dr) => {
             assert!(dr.run_result.success());

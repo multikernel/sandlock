@@ -9,7 +9,7 @@ async fn test_checkpoint_save_load() {
         .build().unwrap();
 
     // Start a long-running process
-    let mut sb = Sandbox::new(&policy).unwrap();
+    let mut sb = Sandbox::new(&policy, Some("test")).unwrap();
     // We need to spawn something that stays alive long enough to checkpoint
     // Use "sleep 60" — we'll kill it after checkpoint
     sb.spawn(&["sleep", "60"]).await.unwrap();
@@ -57,7 +57,7 @@ async fn test_checkpoint_memory_maps() {
         .fs_read("/proc")
         .build().unwrap();
 
-    let mut sb = Sandbox::new(&policy).unwrap();
+    let mut sb = Sandbox::new(&policy, Some("test")).unwrap();
     sb.spawn(&["sleep", "60"]).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -84,7 +84,7 @@ async fn test_checkpoint_app_state_roundtrip() {
         .fs_read("/proc")
         .build().unwrap();
 
-    let mut sb = Sandbox::new(&policy).unwrap();
+    let mut sb = Sandbox::new(&policy, Some("test")).unwrap();
     sb.spawn(&["sleep", "60"]).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -117,7 +117,7 @@ async fn test_checkpoint_no_app_state_file() {
         .fs_read("/proc")
         .build().unwrap();
 
-    let mut sb = Sandbox::new(&policy).unwrap();
+    let mut sb = Sandbox::new(&policy, Some("test")).unwrap();
     sb.spawn(&["sleep", "60"]).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -144,7 +144,7 @@ async fn test_checkpoint_process_info() {
         .fs_read("/proc")
         .build().unwrap();
 
-    let mut sb = Sandbox::new(&policy).unwrap();
+    let mut sb = Sandbox::new(&policy, Some("test")).unwrap();
     sb.spawn(&["sleep", "60"]).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -170,7 +170,7 @@ async fn test_checkpoint_load_nonexistent() {
 #[tokio::test]
 async fn test_checkpoint_not_running() {
     let policy = Policy::builder().build().unwrap();
-    let sb = Sandbox::new(&policy).unwrap();
+    let sb = Sandbox::new(&policy, Some("test")).unwrap();
     let result = sb.checkpoint().await;
     assert!(result.is_err(), "Checkpoint on non-running sandbox should error");
 }

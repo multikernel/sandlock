@@ -110,7 +110,6 @@ _b_no_randomize_memory = _builder_fn("sandlock_policy_builder_no_randomize_memor
 _b_no_huge_pages = _builder_fn("sandlock_policy_builder_no_huge_pages", ctypes.c_bool)
 _b_no_coredump = _builder_fn("sandlock_policy_builder_no_coredump", ctypes.c_bool)
 _b_deterministic_dirs = _builder_fn("sandlock_policy_builder_deterministic_dirs", ctypes.c_bool)
-_b_hostname = _builder_fn("sandlock_policy_builder_hostname", ctypes.c_char_p)
 _b_cpu_cores = _builder_fn("sandlock_policy_builder_cpu_cores", ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32)
 
 # Policy callback (policy_fn).
@@ -224,16 +223,16 @@ _lib.sandlock_string_free.argtypes = [ctypes.c_char_p]
 
 # Run
 _lib.sandlock_run.restype = _c_result_p
-_lib.sandlock_run.argtypes = [_c_policy_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
+_lib.sandlock_run.argtypes = [_c_policy_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
 
 _lib.sandlock_run_interactive.restype = ctypes.c_int
-_lib.sandlock_run_interactive.argtypes = [_c_policy_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
+_lib.sandlock_run_interactive.argtypes = [_c_policy_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
 
 # Spawn handle
 _c_handle_p = ctypes.c_void_p
 
 _lib.sandlock_spawn.restype = _c_handle_p
-_lib.sandlock_spawn.argtypes = [_c_policy_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
+_lib.sandlock_spawn.argtypes = [_c_policy_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
 
 _lib.sandlock_handle_pid.restype = ctypes.c_int
 _lib.sandlock_handle_pid.argtypes = [_c_handle_p]
@@ -270,7 +269,7 @@ _lib.sandlock_result_free.argtypes = [_c_result_p]
 _c_dry_run_p = ctypes.c_void_p
 
 _lib.sandlock_dry_run.restype = _c_dry_run_p
-_lib.sandlock_dry_run.argtypes = [_c_policy_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
+_lib.sandlock_dry_run.argtypes = [_c_policy_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
 
 _lib.sandlock_dry_run_result_exit_code.restype = ctypes.c_int
 _lib.sandlock_dry_run_result_exit_code.argtypes = [_c_dry_run_p]
@@ -345,7 +344,7 @@ _WORK_FN_TYPE = ctypes.CFUNCTYPE(None, ctypes.c_uint32)
 _c_sandbox_p = ctypes.c_void_p
 
 _lib.sandlock_new_with_fns.restype = _c_sandbox_p
-_lib.sandlock_new_with_fns.argtypes = [_c_policy_p, _INIT_FN_TYPE, _WORK_FN_TYPE]
+_lib.sandlock_new_with_fns.argtypes = [_c_policy_p, ctypes.c_char_p, _INIT_FN_TYPE, _WORK_FN_TYPE]
 
 _c_fork_result_p = ctypes.c_void_p
 
@@ -359,7 +358,7 @@ _lib.sandlock_fork_result_pid.restype = ctypes.c_int32
 _lib.sandlock_fork_result_pid.argtypes = [_c_fork_result_p, ctypes.c_uint32]
 
 _lib.sandlock_reduce.restype = _c_result_p
-_lib.sandlock_reduce.argtypes = [_c_fork_result_p, _c_policy_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
+_lib.sandlock_reduce.argtypes = [_c_fork_result_p, _c_policy_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
 
 _lib.sandlock_fork_result_free.restype = None
 _lib.sandlock_fork_result_free.argtypes = [_c_fork_result_p]
@@ -758,7 +757,7 @@ class _NativePolicy:
     }
 
     @staticmethod
-    def _build_from_policy(policy: PolicyDataclass, override_hostname=None):
+    def _build_from_policy(policy: PolicyDataclass):
         """Build a native builder from a Python Policy dataclass. Returns builder pointer."""
         from .policy import parse_memory_size, parse_ports
 
@@ -884,9 +883,6 @@ class _NativePolicy:
             b = _b_no_coredump(b, True)
         if policy.deterministic_dirs:
             b = _b_deterministic_dirs(b, True)
-        if override_hostname is not None:
-            b = _b_hostname(b, override_hostname.encode())
-
         # Guard: warn if any dataclass field was set to a non-default value
         # but is not in _HANDLED_FIELDS (i.e. silently dropped).
         import dataclasses as _dc
@@ -908,9 +904,9 @@ class _NativePolicy:
         return b
 
     @classmethod
-    def from_dataclass(cls, policy: PolicyDataclass, policy_fn=None, override_hostname=None) -> _NativePolicy:
+    def from_dataclass(cls, policy: PolicyDataclass, policy_fn=None) -> _NativePolicy:
         """Build a native policy from a Python Policy dataclass."""
-        b = _NativePolicy._build_from_policy(policy, override_hostname=override_hostname)
+        b = _NativePolicy._build_from_policy(policy)
 
         # Store callback reference to prevent GC
         c_callback = None
@@ -991,6 +987,13 @@ class Sandbox:
 
     def __init__(self, policy: PolicyDataclass, policy_fn=None,
                  init_fn=None, work_fn=None, name: str | None = None):
+        if name is not None:
+            if not name:
+                raise ValueError("sandbox name must not be empty")
+            if "\0" in name:
+                raise ValueError("sandbox name must not contain NUL bytes")
+            if len(name.encode()) > 64:
+                raise ValueError("sandbox name must be at most 64 bytes")
         self._policy_dc = policy
         self._policy_fn = policy_fn
         self._init_fn = init_fn
@@ -1101,15 +1104,12 @@ class Sandbox:
         """
         argv, argc = _make_argv(cmd)
 
-        # Resolve sandbox name and rebuild native policy with it
+        # Resolve sandbox name. Sandlock exposes this as the sandbox's
+        # virtual hostname inside the child.
         resolved_name = self._resolve_name()
-        self._native = _NativePolicy.from_dataclass(
-            self._policy_dc, policy_fn=self._policy_fn,
-            override_hostname=resolved_name,
-        )
 
         # Spawn (non-blocking) so PID is available for pause/resume
-        self._handle = _lib.sandlock_spawn(self._native.ptr, argv, argc)
+        self._handle = _lib.sandlock_spawn(self._native.ptr, _encode(resolved_name), argv, argc)
         if not self._handle:
             return Result(success=False, exit_code=-1, error="sandlock_spawn failed")
 
@@ -1149,7 +1149,9 @@ class Sandbox:
         from .policy import Change, DryRunResult
 
         argv, argc = _make_argv(cmd)
-        result_p = _lib.sandlock_dry_run(self._native.ptr, argv, argc)
+        result_p = _lib.sandlock_dry_run(
+            self._native.ptr, _encode(self._resolve_name()), argv, argc,
+        )
 
         if not result_p:
             return DryRunResult(success=False, exit_code=-1, error="sandlock_dry_run failed")
@@ -1186,7 +1188,9 @@ class Sandbox:
     def run_interactive(self, cmd: list[str]) -> int:
         """Run with inherited stdio. Returns exit code."""
         argv, argc = _make_argv(cmd)
-        return _lib.sandlock_run_interactive(self._native.ptr, argv, argc)
+        return _lib.sandlock_run_interactive(
+            self._native.ptr, _encode(self._resolve_name()), argv, argc,
+        )
 
     def cmd(self, args: list[str]) -> Stage:
         """Bind a command to this sandbox, returning a lazy Stage."""
@@ -1223,7 +1227,9 @@ class Sandbox:
         self._c_init = c_init  # prevent GC
         self._c_work = c_work
 
-        sb_ptr = _lib.sandlock_new_with_fns(self._native.ptr, c_init, c_work)
+        sb_ptr = _lib.sandlock_new_with_fns(
+            self._native.ptr, _encode(self._resolve_name()), c_init, c_work,
+        )
         if not sb_ptr:
             raise RuntimeError("sandlock_new_with_fns failed")
 
@@ -1262,7 +1268,7 @@ class Sandbox:
 
         argv, argc = _make_argv(cmd)
         result_p = _lib.sandlock_reduce(
-            fork_result._ptr, self._native.ptr, argv, argc,
+            fork_result._ptr, self._native.ptr, _encode(self._resolve_name()), argv, argc,
         )
         fork_result._ptr = None  # consumed by reduce
 
@@ -1511,4 +1517,3 @@ class Pipeline:
             stderr=stderr,
             error=error,
         )
-

@@ -137,7 +137,7 @@ async fn test_http_allow_get() {
         .unwrap();
 
     let script = http_script(&format!("http://127.0.0.1:{}/get", port), &out);
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
@@ -162,7 +162,7 @@ async fn test_http_deny_non_matching() {
         .unwrap();
 
     let script = http_script(&format!("http://127.0.0.1:{}/denied", port), &out);
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
@@ -188,7 +188,7 @@ async fn test_http_deny_precedence() {
 
     // GET /public — should succeed
     let script = http_script(&format!("http://127.0.0.1:{}/public", port), &out_allowed);
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
@@ -197,7 +197,7 @@ async fn test_http_deny_precedence() {
 
     // GET /secret — should be denied
     let script = http_script(&format!("http://127.0.0.1:{}/secret", port), &out_denied);
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
@@ -222,7 +222,7 @@ async fn test_http_no_acl_unrestricted() {
         .unwrap();
 
     let script = http_script(&format!("http://127.0.0.1:{}/get", port), &out);
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
@@ -248,7 +248,7 @@ async fn test_http_method_filtering() {
 
     // GET should succeed
     let script = http_script(&format!("http://127.0.0.1:{}/anything", port), &out_get);
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
@@ -257,7 +257,7 @@ async fn test_http_method_filtering() {
 
     // POST should be denied
     let script = post_script(&format!("http://127.0.0.1:{}/anything", port), &out_post);
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
@@ -285,7 +285,7 @@ async fn test_http_multiple_allow_rules() {
 
     // GET /get — should succeed (matches first rule)
     let script = http_script(&format!("http://127.0.0.1:{}/get", port), &out_get);
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
@@ -294,7 +294,7 @@ async fn test_http_multiple_allow_rules() {
 
     // GET /anything — should be denied (not in allow list)
     let script = http_script(&format!("http://127.0.0.1:{}/anything", port), &out_other);
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
@@ -322,7 +322,7 @@ async fn test_http_wildcard_host() {
 
     // GET /get — should succeed
     let script = http_script(&format!("http://127.0.0.1:{}/get", port), &out_get);
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
@@ -331,7 +331,7 @@ async fn test_http_wildcard_host() {
 
     // GET /admin/settings — should be denied
     let script = http_script(&format!("http://127.0.0.1:{}/admin/settings", port), &out_denied);
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
@@ -384,7 +384,7 @@ async fn test_http_non_intercepted_port() {
         port = port,
     );
 
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await
         .unwrap();
     srv.join().unwrap();
@@ -412,7 +412,7 @@ async fn test_http_acl_ipv6_allow() {
         .unwrap();
 
     let script = http_script(&format!("http://[::1]:{}/get", port), &out);
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
@@ -436,7 +436,7 @@ async fn test_http_acl_ipv6_deny() {
         .unwrap();
 
     let script = http_script(&format!("http://[::1]:{}/denied", port), &out);
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
@@ -483,7 +483,7 @@ async fn test_http_ipv6_non_intercepted_port() {
         port = port,
     );
 
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await
         .unwrap();
     srv.join().unwrap();
@@ -509,7 +509,7 @@ async fn test_http_acl_ipv6_method_filtering() {
 
     // GET should succeed
     let script = http_script(&format!("http://[::1]:{}/anything", port), &out_get);
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
@@ -518,7 +518,7 @@ async fn test_http_acl_ipv6_method_filtering() {
 
     // POST should be denied
     let script = post_script(&format!("http://[::1]:{}/anything", port), &out_post);
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());

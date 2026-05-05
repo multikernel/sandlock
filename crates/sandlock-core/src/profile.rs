@@ -39,6 +39,12 @@ pub fn parse_profile(content: &str) -> Result<Policy, SandlockError> {
         .and_then(|v| v.as_table())
         .unwrap_or(&table);
 
+    if sandbox.contains_key("name") {
+        return Err(SandlockError::Policy(crate::error::PolicyError::Invalid(
+            "profile field 'name' is not policy; pass the sandbox name at run time".into(),
+        )));
+    }
+
     let mut builder = Policy::builder();
 
     // Parse string arrays
@@ -98,9 +104,6 @@ if let Some(v) = sandbox.get("clean_env").and_then(|v| v.as_bool()) {
     }
     if let Some(v) = sandbox.get("deterministic_dirs").and_then(|v| v.as_bool()) {
         builder = builder.deterministic_dirs(v);
-    }
-    if let Some(v) = sandbox.get("name").and_then(|v| v.as_str()) {
-        builder = builder.hostname(v);
     }
     if let Some(v) = sandbox.get("workdir").and_then(|v| v.as_str()) {
         builder = builder.workdir(v);
@@ -190,6 +193,13 @@ max_processes = 10
     fn parse_invalid_toml() {
         let err = parse_profile("not valid toml {{{").unwrap_err();
         assert!(err.to_string().contains("TOML parse error"));
+    }
+
+    #[test]
+    fn reject_name_in_profile() {
+        let err = parse_profile(r#"name = "api.local""#).unwrap_err();
+        assert!(err.to_string().contains("name"));
+        assert!(err.to_string().contains("not policy"));
     }
 
     #[test]

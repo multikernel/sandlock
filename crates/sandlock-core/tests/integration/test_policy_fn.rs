@@ -29,7 +29,7 @@ async fn test_policy_fn_receives_events_with_metadata() {
         .unwrap();
 
     let result = Sandbox::run_interactive(
-        &policy, &["python3", "-c", "print('hello')"],
+        &policy, Some("test"), &["python3", "-c", "print('hello')"],
     ).await.unwrap();
     assert!(result.success());
 
@@ -72,7 +72,7 @@ async fn test_policy_fn_deny_connect() {
         "  open('{out}', 'w').write(f'BLOCKED:{{e.errno}}')\n",
     ), out = out.display());
 
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script]).await.unwrap();
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script]).await.unwrap();
     assert!(result.success());
 
     let content = std::fs::read_to_string(&out).unwrap_or_default();
@@ -111,7 +111,7 @@ async fn test_policy_fn_restrict_network_takes_effect() {
         "  open('{out}', 'w').write(f'BLOCKED:{{e.errno}}')\n",
     ), out = out.display());
 
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script]).await.unwrap();
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script]).await.unwrap();
     assert!(result.success());
 
     let content = std::fs::read_to_string(&out).unwrap_or_default();
@@ -148,7 +148,7 @@ async fn test_policy_fn_deny_path() {
         "  open('{out}', 'w').write(f'BLOCKED:{{e.errno}}')\n",
     ), out = out.display());
 
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script]).await.unwrap();
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script]).await.unwrap();
     assert!(result.success());
 
     let content = std::fs::read_to_string(&out).unwrap_or_default();
@@ -172,7 +172,7 @@ async fn test_policy_fn_passthrough() {
         .unwrap();
 
     let result = Sandbox::run_interactive(
-        &policy, &["python3", "-c", "print('hello')"],
+        &policy, Some("test"), &["python3", "-c", "print('hello')"],
     ).await.unwrap();
     assert!(result.success());
 
@@ -199,7 +199,7 @@ async fn test_policy_fn_execve_argv() {
         .unwrap();
 
     let result = Sandbox::run_interactive(
-        &policy, &["python3", "-c", "print('argv test')"],
+        &policy, Some("test"), &["python3", "-c", "print('argv test')"],
     ).await.unwrap();
     assert!(result.success());
 
@@ -225,7 +225,7 @@ async fn test_policy_fn_deny_by_argv() {
         .unwrap();
 
     let result = Sandbox::run_interactive(
-        &policy, &["echo", "malicious"],
+        &policy, Some("test"), &["echo", "malicious"],
     ).await.unwrap();
     assert!(!result.success(), "execve with 'malicious' in argv should be denied");
 }
@@ -248,7 +248,7 @@ async fn test_policy_fn_connect_metadata() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run_interactive(&policy, &[
+    let result = Sandbox::run_interactive(&policy, Some("test"), &[
         "python3", "-c",
         "import socket; s=socket.socket(); s.settimeout(0.1); \
          s.connect_ex(('127.0.0.1', 9999)); s.close()",
@@ -283,7 +283,7 @@ async fn test_policy_fn_event_categories() {
         .unwrap();
 
     let result = Sandbox::run_interactive(
-        &policy, &["python3", "-c", "print('categories')"],
+        &policy, Some("test"), &["python3", "-c", "print('categories')"],
     ).await.unwrap();
     assert!(result.success());
 
@@ -317,7 +317,7 @@ async fn test_policy_fn_parent_pid() {
         .unwrap();
 
     let result = Sandbox::run_interactive(
-        &policy, &["python3", "-c", "print('ppid')"],
+        &policy, Some("test"), &["python3", "-c", "print('ppid')"],
     ).await.unwrap();
     assert!(result.success());
 
@@ -361,7 +361,7 @@ async fn test_policy_fn_deny_with_eacces() {
         "  s.close()\n",
     ), out = out.display());
 
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script]).await.unwrap();
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script]).await.unwrap();
     assert!(result.success());
 
     let content = std::fs::read_to_string(&out).unwrap_or_default();
@@ -393,7 +393,7 @@ async fn test_policy_fn_audit() {
         .unwrap();
 
     let result = Sandbox::run_interactive(
-        &policy, &["cat", "/etc/hostname"],
+        &policy, Some("test"), &["cat", "/etc/hostname"],
     ).await.unwrap();
     // Audit should allow the syscall — cat should succeed
     assert!(result.success(), "Audit should allow, not deny");
@@ -441,7 +441,7 @@ sys.exit(1)
 "#).unwrap();
     std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
 
-    let result = Sandbox::run(&policy, &[script.to_str().unwrap()])
+    let result = Sandbox::run(&policy, Some("test"), &[script.to_str().unwrap()])
         .await
         .unwrap();
 

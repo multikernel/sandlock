@@ -198,7 +198,7 @@ sandlock.Sandbox(policy, policy_fn=None, init_fn=None, work_fn=None, name=None)
 Create a sandbox from a `Policy`.
 
 - `policy` -- a `Policy` instance.
-- `name` -- sandbox name (also sets UTS hostname inside the sandbox).
+- `name` -- sandbox name (also exposed as the virtual hostname inside the sandbox).
   Auto-generated as `sandbox-{pid}` when omitted.
 - `policy_fn` -- optional callback for dynamic per-event decisions (see
   [Dynamic policy](#dynamic-policy)).
@@ -418,6 +418,7 @@ Default store: `~/.sandlock/checkpoints/`.
 ### Profiles
 
 Load policies from TOML files:
+Profiles contain policy only; pass the sandbox instance name to `Sandbox(..., name=...)`.
 
 ```python
 from sandlock import load_profile, list_profiles

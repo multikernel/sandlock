@@ -45,6 +45,14 @@ class TestSandboxRun:
         result = Sandbox(_policy()).run(["nonexistent_command_xyz"])
         assert not result.success
 
+    def test_invalid_sandbox_name(self):
+        with pytest.raises(ValueError, match="must not be empty"):
+            Sandbox(_policy(), name="")
+        with pytest.raises(ValueError, match="NUL"):
+            Sandbox(_policy(), name="bad\0name")
+        with pytest.raises(ValueError, match="64 bytes"):
+            Sandbox(_policy(), name="x" * 65)
+
     def test_stderr_captured(self):
         result = Sandbox(_policy()).run(
             ["python3", "-c", "import sys; sys.stderr.write('err\\n')"]

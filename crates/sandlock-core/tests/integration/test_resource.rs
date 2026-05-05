@@ -34,7 +34,7 @@ async fn test_cpu_throttle_slows_execution() {
     // Run CPU-bound workload without throttle
     let policy_fast = base_policy().build().unwrap();
     let start_fast = Instant::now();
-    Sandbox::run_interactive(&policy_fast, &[
+    Sandbox::run_interactive(&policy_fast, Some("test"), &[
         "python3",
         "-c",
         "s = 0\nfor i in range(2_000_000): s += i\n",
@@ -54,7 +54,7 @@ async fn test_cpu_throttle_slows_execution() {
     );
     let policy_slow = base_policy().max_cpu(25).build().unwrap();
     let start_slow = Instant::now();
-    Sandbox::run_interactive(&policy_slow, &["python3", "-c", &script])
+    Sandbox::run_interactive(&policy_slow, Some("test"), &["python3", "-c", &script])
         .await
         .unwrap();
     let slow_elapsed = start_slow.elapsed();
@@ -79,7 +79,7 @@ async fn test_cpu_throttle_100_no_slowdown() {
     // Run without throttle
     let policy_base = base_policy().build().unwrap();
     let start_base = Instant::now();
-    Sandbox::run_interactive(&policy_base, &[
+    Sandbox::run_interactive(&policy_base, Some("test"), &[
         "python3",
         "-c",
         "s = 0\nfor i in range(2_000_000): s += i\n",
@@ -91,7 +91,7 @@ async fn test_cpu_throttle_100_no_slowdown() {
     // Run with max_cpu(100) — should not slow down
     let policy_full = base_policy().max_cpu(100).build().unwrap();
     let start_full = Instant::now();
-    Sandbox::run_interactive(&policy_full, &[
+    Sandbox::run_interactive(&policy_full, Some("test"), &[
         "python3",
         "-c",
         "s = 0\nfor i in range(2_000_000): s += i\n",
@@ -116,7 +116,7 @@ async fn test_timeout_kills_process() {
 
     let result = tokio::time::timeout(
         Duration::from_secs(2),
-        Sandbox::run_interactive(&policy, &["sleep", "300"]),
+        Sandbox::run_interactive(&policy, Some("test"), &["sleep", "300"]),
     )
     .await;
 
@@ -153,7 +153,7 @@ async fn test_process_limit_enforced() {
     ), out = out.display());
 
     let policy = base_policy().max_processes(3).build().unwrap();
-    Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -192,7 +192,7 @@ async fn test_process_limit_allows_sequential_reuse() {
     ), out = out.display());
 
     let policy = base_policy().max_processes(3).build().unwrap();
-    Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -232,7 +232,7 @@ async fn test_threads_do_not_count_toward_process_limit_clone3() {
     // pre-fix bug that counted threads as processes would block thread
     // creation immediately.
     let policy = base_policy().max_processes(2).build().unwrap();
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script]).await.unwrap();
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script]).await.unwrap();
     assert!(
         matches!(result.exit_status, ExitStatus::Code(0)),
         "python should exit 0; got {:?}",
@@ -264,7 +264,7 @@ async fn test_memory_limit_enforced() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script]).await;
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script]).await;
 
     // Process must be killed with SIGKILL when exceeding memory limit
     let run_result = result.expect("sandbox should return a result");
@@ -284,7 +284,7 @@ async fn test_memory_limit_enforced() {
 #[tokio::test]
 async fn test_spawn_and_kill() {
     let policy = base_policy().build().unwrap();
-    let mut sb = Sandbox::new(&policy).unwrap();
+    let mut sb = Sandbox::new(&policy, Some("test")).unwrap();
 
     sb.spawn(&["sleep", "300"]).await.unwrap();
     sb.kill().unwrap();
@@ -312,7 +312,7 @@ async fn test_cpu_cores_affinity() {
         .cpu_cores(vec![0])
         .build()
         .unwrap();
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script]).await.unwrap();
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script]).await.unwrap();
     assert_eq!(result.code(), Some(0));
 
     let content = std::fs::read_to_string(&out).expect("temp file should exist");
@@ -324,7 +324,7 @@ async fn test_cpu_cores_affinity() {
 #[tokio::test]
 async fn test_pause_resume() {
     let policy = base_policy().build().unwrap();
-    let mut sb = Sandbox::new(&policy).unwrap();
+    let mut sb = Sandbox::new(&policy, Some("test")).unwrap();
 
     sb.spawn(&["sleep", "300"]).await.unwrap();
 

@@ -47,7 +47,7 @@ async fn test_uid_zero() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, &["id", "-u"]).await.unwrap();
+    let result = Sandbox::run(&policy, Some("test"), &["id", "-u"]).await.unwrap();
     assert!(result.success(), "id -u failed: {:?}", result.exit_status);
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     assert_eq!(stdout.trim(), "0", "Expected uid 0, got: {:?}", stdout.trim());
@@ -72,7 +72,7 @@ async fn test_uid_zero_gid_zero() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, &["id", "-g"]).await.unwrap();
+    let result = Sandbox::run(&policy, Some("test"), &["id", "-g"]).await.unwrap();
     assert!(result.success(), "id -g failed: {:?}", result.exit_status);
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     assert_eq!(stdout.trim(), "0", "Expected gid 0, got: {:?}", stdout.trim());
@@ -91,7 +91,7 @@ async fn test_no_uid_keeps_real_uid() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, &["id", "-u"]).await.unwrap();
+    let result = Sandbox::run(&policy, Some("test"), &["id", "-u"]).await.unwrap();
     assert!(result.success());
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     // If running as root already, skip this check
@@ -113,7 +113,7 @@ async fn test_uid_zero_echo() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, &["echo", "hello"]).await.unwrap();
+    let result = Sandbox::run(&policy, Some("test"), &["echo", "hello"]).await.unwrap();
     assert!(result.success());
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     assert_eq!(stdout.trim(), "hello");
@@ -138,7 +138,7 @@ async fn test_uid_custom() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, &["id", "-u"]).await.unwrap();
+    let result = Sandbox::run(&policy, Some("test"), &["id", "-u"]).await.unwrap();
     assert!(result.success(), "id -u failed: {:?}", result.exit_status);
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     assert_eq!(stdout.trim(), "1000", "Expected uid 1000, got: {:?}", stdout.trim());

@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::context::{self, PipePair, read_u32_fd, write_u32_fd};
 use crate::cow::{CowBranch, overlayfs::OverlayBranch, branchfs::BranchFsBranch};
@@ -70,6 +70,7 @@ enum SandboxState {
 /// Orchestrates fork, confinement (Landlock + seccomp), and async
 /// notification-based supervision of the sandboxed child process.
 pub struct Sandbox {
+    name: String,
     policy: Policy,
     state: SandboxState,
     child_pid: Option<i32>,
@@ -115,8 +116,9 @@ pub struct Sandbox {
 
 impl Sandbox {
     /// Create a new sandbox in the `Created` state.
-    pub fn new(policy: &Policy) -> Result<Self, SandlockError> {
-        Ok(Self::create(policy))
+    pub fn new(policy: &Policy, name: Option<&str>) -> Result<Self, SandlockError> {
+        let name = resolve_name(name)?;
+        Ok(Self::create(policy, name))
     }
 
     /// Create a sandbox with init and work functions for COW forking.
@@ -125,7 +127,7 @@ impl Sandbox {
     /// `work_fn` runs in each COW clone created by `fork(N)`.
     ///
     /// ```ignore
-    /// let mut sb = Sandbox::new_with_fns(&policy,
+    /// let mut sb = Sandbox::new_with_fns(&policy, Some("rollout"),
     ///     || { load_model(); },
     ///     |clone_id| { rollout(clone_id); },
     /// )?;
@@ -133,17 +135,20 @@ impl Sandbox {
     /// ```
     pub fn new_with_fns(
         policy: &Policy,
+        name: Option<&str>,
         init_fn: impl FnOnce() + Send + 'static,
         work_fn: impl Fn(u32) + Send + Sync + 'static,
     ) -> Result<Self, SandlockError> {
-        let mut sb = Self::create(policy);
+        let name = resolve_name(name)?;
+        let mut sb = Self::create(policy, name);
         sb.init_fn = Some(Box::new(init_fn));
         sb.work_fn = Some(Arc::new(work_fn));
         Ok(sb)
     }
 
-    fn create(policy: &Policy) -> Self {
+    fn create(policy: &Policy, name: String) -> Self {
         Self {
+            name,
             policy: policy.clone(),
             state: SandboxState::Created,
             child_pid: None,
@@ -172,13 +177,21 @@ impl Sandbox {
 
     /// One-shot: spawn a sandboxed process, wait for it to exit, and return
     /// the result. Stdout and stderr are captured.
-    pub async fn run(policy: &Policy, cmd: &[&str]) -> Result<RunResult, SandlockError> {
-        Self::run_with_extra_handlers(policy, cmd, Vec::new()).await
+    pub async fn run(
+        policy: &Policy,
+        name: Option<&str>,
+        cmd: &[&str],
+    ) -> Result<RunResult, SandlockError> {
+        Self::run_with_extra_handlers(policy, name, cmd, Vec::new()).await
     }
 
     /// Run a sandboxed process with inherited stdio (interactive mode).
-    pub async fn run_interactive(policy: &Policy, cmd: &[&str]) -> Result<RunResult, SandlockError> {
-        let mut sb = Self::new(policy)?;
+    pub async fn run_interactive(
+        policy: &Policy,
+        name: Option<&str>,
+        cmd: &[&str],
+    ) -> Result<RunResult, SandlockError> {
+        let mut sb = Self::new(policy, name)?;
         sb.do_spawn(cmd, false).await?;
         sb.wait().await
     }
@@ -213,6 +226,7 @@ impl Sandbox {
     ///
     /// let result = Sandbox::run_with_extra_handlers(
     ///     &policy,
+    ///     Some("audit"),
     ///     &["/usr/bin/true"],
     ///     vec![ExtraHandler::new(libc::SYS_openat, audit)],
     /// ).await.unwrap();
@@ -220,6 +234,7 @@ impl Sandbox {
     /// ```
     pub async fn run_with_extra_handlers(
         policy: &Policy,
+        name: Option<&str>,
         cmd: &[&str],
         extra_handlers: Vec<crate::seccomp::dispatch::ExtraHandler>,
     ) -> Result<RunResult, SandlockError> {
@@ -240,7 +255,7 @@ impl Sandbox {
             .into());
         }
 
-        let mut sb = Self::new(policy)?;
+        let mut sb = Self::new(policy, name)?;
         sb.extra_handlers = extra_handlers;
         sb.do_spawn(cmd, true).await?;
         sb.wait().await
@@ -249,12 +264,16 @@ impl Sandbox {
     /// Dry-run: spawn, wait, collect filesystem changes, then abort.
     /// Returns the run result plus a list of changes that would have been
     /// committed. The workdir is left unchanged.
-    pub async fn dry_run(policy: &Policy, cmd: &[&str]) -> Result<crate::dry_run::DryRunResult, SandlockError> {
+    pub async fn dry_run(
+        policy: &Policy,
+        name: Option<&str>,
+        cmd: &[&str],
+    ) -> Result<crate::dry_run::DryRunResult, SandlockError> {
         let mut policy = policy.clone();
         policy.on_exit = BranchAction::Keep;
         policy.on_error = BranchAction::Keep;
 
-        let mut sb = Self::new(&policy)?;
+        let mut sb = Self::new(&policy, name)?;
         sb.do_spawn(cmd, true).await?;
         let run_result = sb.wait().await?;
         let changes = sb.collect_changes().await;
@@ -263,12 +282,16 @@ impl Sandbox {
     }
 
     /// Dry-run with inherited stdio (interactive mode).
-    pub async fn dry_run_interactive(policy: &Policy, cmd: &[&str]) -> Result<crate::dry_run::DryRunResult, SandlockError> {
+    pub async fn dry_run_interactive(
+        policy: &Policy,
+        name: Option<&str>,
+        cmd: &[&str],
+    ) -> Result<crate::dry_run::DryRunResult, SandlockError> {
         let mut policy = policy.clone();
         policy.on_exit = BranchAction::Keep;
         policy.on_error = BranchAction::Keep;
 
-        let mut sb = Self::new(&policy)?;
+        let mut sb = Self::new(&policy, name)?;
         sb.do_spawn(cmd, false).await?;
         let run_result = sb.wait().await?;
         let changes = sb.collect_changes().await;
@@ -426,7 +449,7 @@ impl Sandbox {
             );
             code_idx += 1;
 
-            let mut sb = Sandbox::create(&policy);
+            let mut sb = Sandbox::create(&policy, format!("{}-fork-{}", self.name, clone_pid));
             sb.child_pid = Some(clone_pid);
             sb.state = SandboxState::Stopped(if code == 0 {
                 ExitStatus::Code(0)
@@ -480,7 +503,8 @@ impl Sandbox {
         });
 
         // Spawn reducer with stdin from pipe, capture stdout
-        let mut reducer = Sandbox::new(&self.policy)?;
+        let reducer_name = format!("{}-reduce", self.name);
+        let mut reducer = Sandbox::new(&self.policy, Some(reducer_name.as_str()))?;
         reducer.io_overrides = Some((Some(stdin_fds[0]), None, None));
         reducer.do_spawn(cmd, true).await?;
         unsafe { libc::close(stdin_fds[0]) };
@@ -622,6 +646,13 @@ impl Sandbox {
     /// Return a reference to the policy.
     pub fn policy(&self) -> &Policy {
         &self.policy
+    }
+
+    /// Return the sandbox instance name.
+    ///
+    /// The same value is exposed to the child as its virtual hostname.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// Commit COW writes to the original directory.
@@ -919,6 +950,7 @@ impl Sandbox {
                 cow_config: cow_config.as_ref(),
                 nested,
                 keep_fds: &gather_keep_fds,
+                sandbox_name: Some(self.name.as_str()),
                 extra_syscalls: &extra_syscalls,
             });
         }
@@ -1019,7 +1051,7 @@ impl Sandbox {
                     (vp.clone(), std::fs::canonicalize(hp).unwrap_or_else(|_| hp.clone()))
                 }).collect(),
                 deterministic_dirs: self.policy.deterministic_dirs,
-                hostname: self.policy.hostname.clone(),
+                virtual_hostname: Some(self.name.clone()),
                 has_http_acl: !self.policy.http_allow.is_empty() || !self.policy.http_deny.is_empty(),
                 virtual_etc_hosts,
             };
@@ -1297,6 +1329,32 @@ async fn throttle_cpu(pid: i32, cpu_pct: u8) {
 // ============================================================
 // Helpers
 // ============================================================
+
+static NEXT_SANDBOX_NAME: AtomicU64 = AtomicU64::new(1);
+
+fn resolve_name(name: Option<&str>) -> Result<String, SandlockError> {
+    match name {
+        Some(name) => validate_name(name.to_string()),
+        None => Ok(format!(
+            "sandbox-{}-{}",
+            std::process::id(),
+            NEXT_SANDBOX_NAME.fetch_add(1, Ordering::Relaxed),
+        )),
+    }
+}
+
+fn validate_name(name: String) -> Result<String, SandlockError> {
+    if name.is_empty() {
+        return Err(SandboxError::Child("sandbox name must not be empty".into()).into());
+    }
+    if name.len() > 64 {
+        return Err(SandboxError::Child("sandbox name must be at most 64 bytes".into()).into());
+    }
+    if name.as_bytes().contains(&0) {
+        return Err(SandboxError::Child("sandbox name must not contain NUL bytes".into()).into());
+    }
+    Ok(name)
+}
 
 /// Convert a raw waitpid status to our ExitStatus enum.
 /// Read all bytes from a file descriptor until EOF.
