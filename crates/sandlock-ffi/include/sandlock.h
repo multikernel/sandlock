@@ -65,8 +65,15 @@ sandlock_builder_t *sandlock_policy_builder_no_randomize_memory(sandlock_builder
 sandlock_builder_t *sandlock_policy_builder_no_huge_pages(sandlock_builder_t *b, bool v);
 
 /* Build & free */
-sandlock_policy_t *sandlock_policy_build(sandlock_builder_t *b, int *err);
+/* On failure, *err is set to -1 and *err_msg (if non-null) is set to a
+ * heap-allocated C string with the error description. Caller frees it
+ * via sandlock_string_free. Pass NULL for err_msg to discard. */
+sandlock_policy_t *sandlock_policy_build(sandlock_builder_t *b,
+                                         int *err,
+                                         char **err_msg);
 void sandlock_policy_free(sandlock_policy_t *p);
+/* sandlock_string_free is declared further down — used for any
+ * heap-allocated C string the FFI returns to the caller. */
 
 /* ----------------------------------------------------------------
  * Run

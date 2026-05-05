@@ -601,15 +601,26 @@ pub unsafe extern "C" fn sandlock_policy_builder_hostname(
 
 /// Consume the builder and produce a policy.
 /// On success, `*err` is 0 and a non-null policy pointer is returned.
-/// On failure, `*err` is -1 and null is returned.
+/// On failure, `*err` is -1, null is returned, and `*err_msg` (if
+/// non-null) is set to a heap-allocated C string describing the
+/// error. The caller must release that string with
+/// [`sandlock_string_free`]. Pass `null` for `err_msg` to discard.
 ///
 /// # Safety
-/// `b` must be a valid builder pointer. `err` may be null.
+/// `b` must be a valid builder pointer. `err` and `err_msg` may both
+/// be null. When `err_msg` is non-null, it must point to writable
+/// storage for one `*mut c_char`.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_policy_build(
-    b: *mut PolicyBuilder, err: *mut c_int,
+    b: *mut PolicyBuilder, err: *mut c_int, err_msg: *mut *mut c_char,
 ) -> *mut sandlock_policy_t {
+    if !err_msg.is_null() { *err_msg = ptr::null_mut(); }
     if b.is_null() {
+        // Null-builder is a programmer error in the binding layer,
+        // not a policy-validation failure. We surface the err code
+        // but deliberately leave err_msg null — there is no
+        // user-actionable message and inventing one here would
+        // require a hard-coded literal living in the wrong layer.
         if !err.is_null() { *err = -1; }
         return ptr::null_mut();
     }
@@ -619,8 +630,17 @@ pub unsafe extern "C" fn sandlock_policy_build(
             if !err.is_null() { *err = 0; }
             Box::into_raw(Box::new(sandlock_policy_t { _private: policy }))
         }
-        Err(_) => {
+        Err(e) => {
             if !err.is_null() { *err = -1; }
+            if !err_msg.is_null() {
+                // CString::new fails only on embedded NULs; thiserror
+                // Display impls don't produce NULs in this codebase,
+                // so on the impossible failure we leave err_msg null
+                // rather than substituting an invented string.
+                if let Ok(c) = CString::new(format!("{}", e)) {
+                    *err_msg = c.into_raw();
+                }
+            }
             ptr::null_mut()
         }
     }
