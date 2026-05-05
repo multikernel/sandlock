@@ -763,7 +763,7 @@ pub(crate) struct ChildSpawnArgs<'a> {
     /// Sandbox instance name. When set, it is also exposed as the
     /// sandbox's virtual hostname.
     pub sandbox_name: Option<&'a str>,
-    /// Syscall numbers for which the parent registered `ExtraHandler`s.
+    /// Syscall numbers for which the parent registered user `Handler`s.
     /// Merged into the child's BPF notif list so the kernel actually
     /// raises USER_NOTIF for them.
     pub extra_syscalls: &'a [u32],

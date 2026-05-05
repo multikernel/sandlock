@@ -128,21 +128,11 @@ Sandbox::run_with_extra_handlers(
 .await?;
 ```
 
-If the closures (or struct handlers) you want to register are of different opaque types and the
-array can no longer infer a single `H`, erase them via `Arc<dyn Handler>` (which itself implements
-`Handler`):
-
-```rust
-let h1: Arc<dyn Handler> = Arc::new(openat_handler);
-let h2: Arc<dyn Handler> = Arc::new(close_handler);
-
-Sandbox::run_with_extra_handlers(
-    &policy,
-    &cmd,
-    [(libc::SYS_openat, h1), (libc::SYS_close, h2)],
-)
-.await?;
-```
+When the iterator mixes handlers of different opaque types (e.g. several different closures, or
+a closure plus a struct), `H` can no longer be inferred to a single concrete type.  Wrap the
+handlers in a small adapter struct in your own crate, or use `Box<dyn Handler>` after defining a
+local `impl Handler for Box<dyn Handler>` shim — sandlock-core does not ship a built-in erasure
+to keep the public surface minimal.
 
 Errors at registration time, before fork:
 
@@ -463,14 +453,34 @@ translate filesystem operations into multipart-upload calls. Those interceptors 
 the same supervisor task as sandlock's builtins — `SECCOMP_FILTER_FLAG_NEW_LISTENER` allows only
 one listener per process.
 
+A small adapter enum lets the iterator's `H` parameter stay homogeneous when the underlying
+struct types differ:
+
 ```rust
+enum S3Handler {
+    Open(S3OpenHandler),
+    Close(S3CloseHandler),
+    MmapDeny(MmapDenyManaged),
+}
+
+#[async_trait]
+impl Handler for S3Handler {
+    async fn handle(&self, cx: &HandlerCtx<'_>) -> NotifAction {
+        match self {
+            S3Handler::Open(h)     => h.handle(cx).await,
+            S3Handler::Close(h)    => h.handle(cx).await,
+            S3Handler::MmapDeny(h) => h.handle(cx).await,
+        }
+    }
+}
+
 Sandbox::run_with_extra_handlers(
     &policy,
     &cmd,
     [
-        (libc::SYS_openat, Arc::new(S3OpenHandler::new(&cfg)?) as Arc<dyn Handler>),
-        (libc::SYS_close,  Arc::new(S3CloseHandler::new(&cfg)?) as Arc<dyn Handler>),
-        (libc::SYS_mmap,   Arc::new(MmapDenyManaged::new(&open_files)) as Arc<dyn Handler>),
+        (libc::SYS_openat, S3Handler::Open(S3OpenHandler::new(&cfg)?)),
+        (libc::SYS_close,  S3Handler::Close(S3CloseHandler::new(&cfg)?)),
+        (libc::SYS_mmap,   S3Handler::MmapDeny(MmapDenyManaged::new(&open_files))),
     ],
 )
 .await?;
@@ -534,24 +544,23 @@ impl Handler for OpenatHandler {
 ```
 
 The host binary instantiates the handlers and passes them as one
-`IntoIterator<Item = (Syscall, Handler)>`:
+`IntoIterator<Item = (Syscall, Handler)>`.  When the handler types differ
+(common in a real downstream), wrap them in a small adapter enum on the
+crate side so the iterator's `H` parameter stays homogeneous (see the
+"VFS engine" use-case above for an example), then call:
 
 ```rust
 Sandbox::run_with_extra_handlers(
     &policy,
     &cmd,
     [
-        (libc::SYS_openat,    Arc::new(OpenatHandler  { virtual_tree, workspace })   as Arc<dyn Handler>),
-        (libc::SYS_close,     Arc::new(CloseHandler   { virtual_tree, oft, store }) as Arc<dyn Handler>),
-        (libc::SYS_getdents64, Arc::new(DirReadHandler { virtual_tree, oft })       as Arc<dyn Handler>),
+        (libc::SYS_openat,     DownstreamHandler::Openat(OpenatHandler   { virtual_tree, workspace })),
+        (libc::SYS_close,      DownstreamHandler::Close (CloseHandler    { virtual_tree, oft, store })),
+        (libc::SYS_getdents64, DownstreamHandler::DirRead(DirReadHandler { virtual_tree, oft })),
     ],
 )
 .await?;
 ```
-
-The `Arc<dyn Handler>` erasure is only needed when the iterator mixes
-several distinct concrete handler types — for a single homogeneous
-handler the bare struct works.
 
 The crate links against `sandlock-core` as an ordinary dependency — no fork, no
 `[patch.crates-io]`, no duplication of `notif::supervisor`.

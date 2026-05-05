@@ -203,7 +203,7 @@ async fn empty_extras_preserves_default_behaviour() {
 async fn extra_handler_runs_after_builtin_returns_continue() {
     let policy = base_policy().build().unwrap();
     let out = temp_out("openat-cross");
-    let cmd = format!("cat /etc/hostname; echo $? > {}", out.display());
+    let cmd = format!("cat /etc/passwd; echo $? > {}", out.display());
 
     let openat_calls = Arc::new(AtomicUsize::new(0));
     let openat_in_handler = Arc::clone(&openat_calls);
@@ -258,7 +258,7 @@ async fn builtin_non_continue_blocks_extra() {
     let policy = base_policy().build().unwrap();
     let out = temp_out("openat-blocked-by-builtin");
     let cmd = format!(
-        "cat /proc/1/cmdline; cat /etc/hostname; echo $? > {}",
+        "cat /proc/1/cmdline; cat /etc/passwd; echo $? > {}",
         out.display()
     );
 
@@ -289,11 +289,11 @@ async fn builtin_non_continue_blocks_extra() {
     let _ = std::fs::remove_file(&out);
     let paths = observed.lock().unwrap();
 
-    let saw_etc_hostname = paths.iter().any(|p| p == "/etc/hostname");
+    let saw_etc_passwd = paths.iter().any(|p| p == "/etc/passwd");
     let saw_proc_pid = paths.iter().any(|p| p.starts_with("/proc/1/"));
 
     assert!(
-        saw_etc_hostname,
+        saw_etc_passwd,
         "extra must observe non-blocked openats, got paths: {:?}",
         *paths,
     );

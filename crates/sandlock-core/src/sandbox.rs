@@ -1231,7 +1231,8 @@ impl Sandbox {
             });
 
             // Spawn notif supervisor.  `extra_handlers` is consumed here
-            // (moved into the supervisor task) because HandlerFn is not Clone.
+            // (moved into the supervisor task) because each `Arc<dyn Handler>`
+            // is shared with the dispatch table and must outlive it.
             let extra_handlers = std::mem::take(&mut self.extra_handlers);
             self.notif_handle = Some(tokio::spawn(
                 notif::supervisor(notif_fd, ctx, extra_handlers),

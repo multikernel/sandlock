@@ -84,17 +84,6 @@ where
     }
 }
 
-// Allow callers to pre-erase concrete handler types via `Arc<dyn Handler>`
-// when they need a uniform type in a collection — e.g. mixing several
-// closures of different opaque types in one IntoIterator passed to
-// run_with_extra_handlers.
-#[async_trait::async_trait]
-impl Handler for std::sync::Arc<dyn Handler> {
-    async fn handle(&self, cx: &HandlerCtx<'_>) -> NotifAction {
-        (**self).handle(cx).await
-    }
-}
-
 /// Errors raised when registering user handlers via
 /// [`crate::Sandbox::run_with_extra_handlers`].
 #[derive(Debug, Error, PartialEq, Eq)]
