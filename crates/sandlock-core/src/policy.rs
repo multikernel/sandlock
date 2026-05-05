@@ -84,12 +84,22 @@ pub enum BranchAction {
 pub struct NetAllow {
     /// Hostname; `None` means "any IP" (the `:port` form).
     pub host: Option<String>,
-    /// Permitted ports. Must be non-empty.
+    /// Permitted ports. Must be non-empty unless `all_ports` is true,
+    /// in which case it must be empty.
     pub ports: Vec<u16>,
+    /// "Any port" wildcard from the `*` token in port position. When
+    /// true, `ports` is empty; the rule permits every TCP/UDP port to
+    /// the host (or to any IP, when `host` is `None`).
+    #[serde(default)]
+    pub all_ports: bool,
 }
 
 impl NetAllow {
-    /// Parse a `host:port[,port,...]` / `:port` / `*:port` spec.
+    /// Parse a `host:port[,port,...]` / `:port` / `*:port` /
+    /// `host:*` / `:*` / `*:*` spec.
+    ///
+    /// `*` in port position means "any port" (the all-ports wildcard).
+    /// Mixing `*` with concrete ports (e.g. `host:80,*`) is rejected.
     pub fn parse(s: &str) -> Result<Self, PolicyError> {
         let (host_part, port_part) = s.rsplit_once(':').ok_or_else(|| {
             PolicyError::Invalid(format!(
@@ -101,9 +111,18 @@ impl NetAllow {
             "" | "*" => None,
             h => Some(h.to_string()),
         };
+
+        // Detect the wildcard token. We split on ',' first so a
+        // single `*` is a clean match — `*,80` is rejected explicitly
+        // below rather than letting `*` parse as port 0.
         let mut ports = Vec::new();
+        let mut saw_wildcard = false;
         for p in port_part.split(',') {
             let p = p.trim();
+            if p == "*" {
+                saw_wildcard = true;
+                continue;
+            }
             let n: u16 = p.parse().map_err(|_| {
                 PolicyError::Invalid(format!("--net-allow: invalid port `{}` in `{}`", p, s))
             })?;
@@ -115,13 +134,19 @@ impl NetAllow {
             }
             ports.push(n);
         }
-        if ports.is_empty() {
+        if saw_wildcard && !ports.is_empty() {
+            return Err(PolicyError::Invalid(format!(
+                "--net-allow: cannot mix `*` with concrete ports in `{}`",
+                s
+            )));
+        }
+        if !saw_wildcard && ports.is_empty() {
             return Err(PolicyError::Invalid(format!(
                 "--net-allow: at least one port required in `{}`",
                 s
             )));
         }
-        Ok(NetAllow { host, ports })
+        Ok(NetAllow { host, ports, all_ports: saw_wildcard })
     }
 }
 
@@ -795,12 +820,14 @@ impl PolicyBuilder {
                 net_allow.push(NetAllow {
                     host: None,
                     ports: http_ports.clone(),
+                    all_ports: false,
                 });
             }
             for h in concrete_hosts {
                 net_allow.push(NetAllow {
                     host: Some(h),
                     ports: http_ports.clone(),
+                    all_ports: false,
                 });
             }
         }
@@ -1155,5 +1182,98 @@ mod http_rule_tests {
 
         let rule = HttpRule::parse("GET example.com/v1//models").unwrap();
         assert_eq!(rule.path, "/v1/models");
+    }
+
+    // --- NetAllow::parse tests ---
+
+    #[test]
+    fn netallow_parse_concrete_host_port() {
+        let r = NetAllow::parse("example.com:443").unwrap();
+        assert_eq!(r.host.as_deref(), Some("example.com"));
+        assert_eq!(r.ports, vec![443]);
+        assert!(!r.all_ports);
+    }
+
+    #[test]
+    fn netallow_parse_any_host_port() {
+        let r = NetAllow::parse(":8080").unwrap();
+        assert_eq!(r.host, None);
+        assert_eq!(r.ports, vec![8080]);
+        assert!(!r.all_ports);
+
+        let r = NetAllow::parse("*:8080").unwrap();
+        assert_eq!(r.host, None);
+        assert_eq!(r.ports, vec![8080]);
+        assert!(!r.all_ports);
+    }
+
+    #[test]
+    fn netallow_parse_multiple_ports() {
+        let r = NetAllow::parse("github.com:22,80,443").unwrap();
+        assert_eq!(r.host.as_deref(), Some("github.com"));
+        assert_eq!(r.ports, vec![22, 80, 443]);
+        assert!(!r.all_ports);
+    }
+
+    #[test]
+    fn netallow_parse_wildcard_any_host_any_port_colon() {
+        let r = NetAllow::parse(":*").unwrap();
+        assert_eq!(r.host, None);
+        assert!(r.ports.is_empty());
+        assert!(r.all_ports);
+    }
+
+    #[test]
+    fn netallow_parse_wildcard_any_host_any_port_star() {
+        let r = NetAllow::parse("*:*").unwrap();
+        assert_eq!(r.host, None);
+        assert!(r.ports.is_empty());
+        assert!(r.all_ports);
+    }
+
+    #[test]
+    fn netallow_parse_wildcard_concrete_host_any_port() {
+        let r = NetAllow::parse("example.com:*").unwrap();
+        assert_eq!(r.host.as_deref(), Some("example.com"));
+        assert!(r.ports.is_empty());
+        assert!(r.all_ports);
+    }
+
+    #[test]
+    fn netallow_parse_rejects_mixed_wildcard_and_concrete() {
+        // `host:80,*` and `host:*,80` are both ambiguous: the user
+        // either meant "any port" (wildcard wins) or "ports 80 plus
+        // some weird placeholder". Refuse and force a clean spec.
+        let err = NetAllow::parse("example.com:80,*").unwrap_err();
+        assert!(format!("{}", err).contains("cannot mix"));
+        let err = NetAllow::parse("example.com:*,80").unwrap_err();
+        assert!(format!("{}", err).contains("cannot mix"));
+    }
+
+    #[test]
+    fn netallow_parse_rejects_port_zero() {
+        let err = NetAllow::parse("example.com:0").unwrap_err();
+        assert!(format!("{}", err).contains("port 0"));
+    }
+
+    #[test]
+    fn netallow_parse_rejects_empty_port() {
+        let err = NetAllow::parse("example.com:").unwrap_err();
+        assert!(format!("{}", err).contains("invalid port"));
+    }
+
+    #[test]
+    fn netallow_parse_rejects_no_colon() {
+        let err = NetAllow::parse("example.com").unwrap_err();
+        assert!(format!("{}", err).contains("expected"));
+    }
+
+    #[test]
+    fn netallow_parse_repeated_wildcard_is_idempotent() {
+        // `*,*` collapses to a single wildcard — neither token contributes
+        // a concrete port, so the rule remains "any port".
+        let r = NetAllow::parse(":*,*").unwrap();
+        assert!(r.all_ports);
+        assert!(r.ports.is_empty());
     }
 }

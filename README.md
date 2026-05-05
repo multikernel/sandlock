@@ -107,6 +107,13 @@ sandlock run --net-allow api.openai.com:443 -r /usr -r /lib -r /etc -- python3 a
 sandlock run --net-allow github.com:22,443 --net-allow :8080 \
   -r /usr -r /lib -r /etc -- python3 agent.py
 
+# Wildcard port — `host:*` permits every port to the host
+sandlock run --net-allow github.com:* -r /usr -r /lib -r /etc -- ssh user@github.com
+
+# Unrestricted outbound — `:*` opens any host and any port. UDP socket
+# creation is still gated by --allow-udp; pair the two for full egress.
+sandlock run --net-allow :* --allow-udp -r /usr -r /lib -r /etc -- ./client
+
 # UDP — opt in to UDP and allowlist the destination (e.g. DNS)
 sandlock run --allow-udp --net-allow 1.1.1.1:53 --net-allow :443 \
   -r /usr -r /lib -r /etc -- ./client
@@ -517,23 +524,32 @@ one rule. The same allowlist applies to TCP `connect()` and to UDP
 ```
 --net-allow <spec>          repeatable; no rules = deny all outbound
                             <spec> = host:port[,port,...]   (IP-restricted)
-                                   | :port  | *:port        (any IP)
+                                   | :port  | *:port        (any IP, listed port)
+                                   | host:*                 (host, any port)
+                                   | :*  | *:*              (any IP, any port)
 ```
 
 **Defaults.** With no `--net-allow` and no HTTP ACL flags, Landlock
 denies every TCP `connect()`, UDP and raw socket creation are denied
-at the seccomp layer, and there is no on-behalf path active. There is
-no "allow-all networking" mode — opt in with explicit endpoints.
+at the seccomp layer, and there is no on-behalf path active. For
+unrestricted egress, opt in explicitly with `--net-allow :*` (still
+UDP-gated by `--allow-udp`).
 
 **Resolution.** Concrete hostnames are resolved once at sandbox start
 and pinned in a synthetic `/etc/hosts`. The synthetic file replaces
 the real one only when `--net-allow` includes at least one concrete
 host; pure `:port` rules leave the real `/etc/hosts` and DNS visible.
 
-**Wildcards.** Hostnames are matched literally. `--net-allow
-*.example.com:443` is **not** supported — list each domain you need.
-The `*` form is only valid as the host part of a `*:port` rule (alias
-for `:port`).
+**Wildcards.** Hostnames are matched literally — `--net-allow
+*.example.com:443` is **not** supported, list each domain you need.
+The `*` token is allowed in two positions: as the host (alias for
+empty: `*:port` ≡ `:port`) and as the port to mean "any port"
+(`host:*`, `:*`, `*:*`). Mixing `*` with concrete ports
+(`host:80,*`) is rejected — use either the wildcard or an explicit
+list. When any rule uses the all-ports wildcard, Landlock no longer
+filters TCP connect at the kernel level (it cannot express "every
+port" without enumerating 65535 rules); the on-behalf path becomes
+the sole enforcer, and for `:*` it short-circuits to allow-all.
 
 **Implementation.** Two enforcement paths:
 
@@ -635,8 +651,9 @@ Policy(
     allow_syscalls=None,           # Allowlist mode (stricter)
 
     # Network — see "Network Model" above. Each entry is `host:port[,port,...]`,
-    # `:port`, or `*:port`. Empty list = deny all outbound. Same allowlist
-    # gates UDP destinations when allow_udp=True (e.g. `:53` for DNS).
+    # `:port`, `*:port`, `host:*`, or `:*` / `*:*`. Empty list = deny all
+    # outbound; `:*` = unrestricted. Same allowlist gates UDP destinations
+    # when allow_udp=True (e.g. `:53` for DNS).
     net_allow=["api.example.com:443", "github.com:22,443", ":8080"],
     net_bind=[8080],               # TCP bind ports (Landlock; ABI v4+)
 
