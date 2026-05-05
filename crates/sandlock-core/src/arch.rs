@@ -29,6 +29,17 @@ mod imp {
     pub const SYS_IOPERM: Option<i64> = Some(libc::SYS_ioperm);
     pub const SYS_IOPL: Option<i64> = Some(libc::SYS_iopl);
     pub const SYS_TIME: Option<i64> = Some(libc::SYS_time);
+
+    /// Every syscall the kernel will dispatch through `handle_fork`.
+    /// Single source of truth for callers that enumerate fork-class
+    /// syscalls (BPF notif registration in `seccomp::dispatch`,
+    /// classification in `resource::is_process_creation_notif`).
+    pub const FORK_LIKE_SYSCALLS: &[i64] = &[
+        libc::SYS_clone,
+        libc::SYS_clone3,
+        libc::SYS_vfork,
+        libc::SYS_fork,
+    ];
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -60,6 +71,13 @@ mod imp {
     pub const SYS_IOPERM: Option<i64> = None;
     pub const SYS_IOPL: Option<i64> = None;
     pub const SYS_TIME: Option<i64> = None;
+
+    /// Every syscall the kernel will dispatch through `handle_fork`.
+    /// aarch64 has no `fork`/`vfork` (glibc emulates via `clone`).
+    pub const FORK_LIKE_SYSCALLS: &[i64] = &[
+        libc::SYS_clone,
+        libc::SYS_clone3,
+    ];
 }
 
 pub use imp::*;

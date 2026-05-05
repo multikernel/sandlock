@@ -63,9 +63,12 @@ pub enum SyscallCategory {
 /// (`fs_read` / `fs_write` / `fs_deny`); see issue #27.
 ///
 /// `argv` *is* exposed for `execve`/`execveat` and is TOCTOU-safe by
-/// construction: before the supervisor returns `Continue` for an
-/// execve, it `PTRACE_SEIZE`+`PTRACE_INTERRUPT`s every task in the
-/// sandbox — both sibling threads of the calling tid (same TGID, share
+/// construction: with `policy_fn` active, fork-like syscalls are traced
+/// for one ptrace creation event, so children are registered in
+/// `ProcessIndex` before they can run user code. Before the supervisor
+/// exposes `argv` to `policy_fn` or returns `Continue` for an execve, it
+/// then `PTRACE_SEIZE`+`PTRACE_INTERRUPT`s every task that could write
+/// the memory — both sibling threads of the calling tid (same TGID, share
 /// `mm_struct`) and peer threads in other TGIDs that may alias argv
 /// pages via `MAP_SHARED` mappings or share `mm_struct` via
 /// `clone(CLONE_VM)`. The kernel's post-Continue re-read therefore
@@ -94,8 +97,11 @@ pub struct SyscallEvent {
     /// Size argument (for mmap, brk).
     pub size: Option<u64>,
     /// Command arguments for execve/execveat. TOCTOU-safe: every task
-    /// in the sandbox (caller's siblings and peer processes) is frozen
-    /// before the kernel re-reads argv from child memory.
+    /// in `ProcessIndex` (caller's siblings and peer processes) is
+    /// frozen before argv is read for this event and before the kernel
+    /// re-reads argv from child memory; fork-like syscalls register
+    /// children before they can run user code while `policy_fn` is
+    /// active.
     pub argv: Option<Vec<String>>,
     /// Whether the supervisor denied this syscall.
     pub denied: bool,

@@ -26,10 +26,12 @@ pub struct SupervisorCtx {
     pub chroot: Arc<Mutex<ChrootState>>,
     /// NETLINK_ROUTE virtualization state.
     pub netlink: Arc<crate::netlink::NetlinkState>,
-    /// Per-process registry: pid → PidKey. Source of truth for
-    /// "which processes are in the sandbox" and the anchor for
-    /// unified per-process state cleanup. Wraps an internal RwLock,
-    /// so handlers can query it synchronously without `.await`.
+    /// Per-process registry: pid → PidKey. This anchors unified
+    /// per-process state cleanup. With policy_fn active, fork-like
+    /// syscalls populate it at child creation time before user code can
+    /// run; otherwise it is populated lazily from notifications. Wraps
+    /// an internal RwLock, so handlers can query it synchronously
+    /// without `.await`.
     pub processes: Arc<ProcessIndex>,
     /// Immutable policy — no lock needed.
     pub policy: Arc<NotifPolicy>,

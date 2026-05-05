@@ -5,17 +5,17 @@
 //! COW clones that share memory pages with the template. Each clone
 //! receives `CLONE_ID=0..N-1` and execs `work_cmd`.
 //!
-//! Uses raw `fork()` syscall (NR 57 on x86_64) to bypass seccomp
-//! notification — the BPF filter only intercepts `clone`/`clone3`.
+//! Uses raw `fork()` syscall (NR 57 on x86_64). The supervisor
+//! intercepts fork-like syscalls for process accounting and, when
+//! `policy_fn` is active, child registration before user code runs.
 
 use std::os::unix::io::RawFd;
 
 // ============================================================
-// Raw fork (bypasses seccomp clone interception)
+// Raw fork
 // ============================================================
 
 /// Raw fork() syscall — NR 57 on x86_64.
-/// Unlike clone/clone3, this is NOT intercepted by the seccomp notif filter.
 fn raw_fork() -> std::io::Result<i32> {
     #[cfg(target_arch = "x86_64")]
     const NR_FORK: i64 = 57;

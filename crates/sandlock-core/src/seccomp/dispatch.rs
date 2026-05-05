@@ -199,18 +199,14 @@ pub fn build_dispatch_table(
     // ------------------------------------------------------------------
     // Fork/clone family (always on)
     // ------------------------------------------------------------------
-    let mut fork_nrs = vec![libc::SYS_clone, libc::SYS_clone3];
-    if let Some(vfork) = arch::SYS_VFORK {
-        fork_nrs.push(vfork);
-    }
-    for nr in fork_nrs {
+    for &nr in arch::FORK_LIKE_SYSCALLS {
         let policy = Arc::clone(policy);
         let resource = Arc::clone(resource);
-        table.register(nr, Box::new(move |notif, _ctx, _notif_fd| {
+        table.register(nr, Box::new(move |notif, _ctx, notif_fd| {
             let policy = Arc::clone(&policy);
             let resource = Arc::clone(&resource);
             Box::pin(async move {
-                crate::resource::handle_fork(&notif, &resource, &policy).await
+                crate::resource::handle_fork(&notif, notif_fd, &resource, &policy).await
             })
         }));
     }
@@ -844,6 +840,7 @@ mod extra_handler_tests {
                 has_net_allowlist: false,
                 has_random_seed: false,
                 has_time_start: false,
+                argv_safety_required: false,
                 time_offset: 0,
                 num_cpus: None,
                 port_remap: false,

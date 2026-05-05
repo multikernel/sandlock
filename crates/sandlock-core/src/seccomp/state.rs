@@ -47,10 +47,10 @@ impl ResourceState {
 // ProcfsState — /proc virtualization state
 // ============================================================
 
-/// /proc virtualization runtime state. Sandbox membership lives in
-/// `ProcessIndex`; per-process getdents caches live in
-/// `PerProcessState::procfs_dir_cache`. This struct only holds
-/// truly global virtualization state.
+/// /proc virtualization runtime state. Per-notification process state
+/// lives in `ProcessIndex`; per-process getdents caches live in
+/// `PerProcessState::procfs_dir_cache`. This struct only holds truly
+/// global virtualization state.
 pub struct ProcfsState {
     /// Base address of the last vDSO we patched (0 = not yet patched).
     pub vdso_patched_addr: u64,
@@ -117,10 +117,17 @@ pub struct PerProcessState {
 }
 
 // ============================================================
-// ProcessIndex — sandbox membership + per-process state
+// ProcessIndex — tracked processes + per-process state
 // ============================================================
 
-/// Source-of-truth registry for processes inside the sandbox.
+/// Registry for tracked sandbox processes plus their per-process
+/// supervisor state.
+///
+/// In the default supervisor this is populated lazily from seccomp
+/// notifications. When `policy_fn` is active, fork-like syscalls are
+/// additionally traced for one ptrace creation event so children are
+/// inserted here before they can run user code; this makes the index
+/// complete for argv-safety freezes.
 ///
 /// Maps the kernel's numeric `pid` (the value that arrives in seccomp
 /// notifications) to the canonical `PidKey` plus an
@@ -188,8 +195,8 @@ impl ProcessIndex {
             .map(|e| (e.key, Arc::clone(&e.state)))
     }
 
-    /// Cheap membership test — used by /proc virtualization to gate
-    /// access to `/proc/<pid>/...` paths and by getdents filtering.
+    /// Cheap tracked-process test — used by /proc virtualization to
+    /// gate access to `/proc/<pid>/...` paths and by getdents filtering.
     pub fn contains(&self, pid: i32) -> bool {
         self.inner
             .read()

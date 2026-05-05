@@ -295,7 +295,7 @@ positive int = deny with errno, `"audit"`/`-2` = allow + flag.
 **Event fields:** `syscall`, `category` (file/network/process/memory),
 `pid`, `parent_pid`, `host`, `port`, `argv`, `denied`.
 
-> **TOCTOU NOTE ** Per `seccomp_unotify(2)`, the kernel
+> **TOCTOU NOTE** Per `seccomp_unotify(2)`, the kernel
 > re-reads user-memory pointers after `Continue`. Sandlock handles this
 > in two places:
 >
@@ -303,14 +303,15 @@ positive int = deny with errno, `"audit"`/`-2` = allow + flag.
 >   belongs in static Landlock rules (`fs_readable` / `fs_writable` /
 >   `fs_denied`) — kernel-enforced and TOCTOU-immune. Use
 >   `ctx.deny_path()` for runtime additions.
-> - **`event.argv` is exposed and TOCTOU-safe.** Before returning
->   `Continue` for an `execve`, the supervisor `PTRACE_SEIZE` +
->   `PTRACE_INTERRUPT`s every sibling thread of the calling tid so the
->   kernel's re-read happens with no other writer running. The pause
->   has no observable cost: `execve`'s `de_thread` step kills sibling
->   threads anyway. If the freeze cannot be established (e.g., YAMA
->   blocks ptrace), the execve is denied with `EPERM` — the safety
->   invariant is never silently relaxed.
+> - **`event.argv` is exposed and TOCTOU-safe.** Before exposing
+>   `argv` to `policy_fn` or returning `Continue` for an
+>   `execve`, the supervisor freezes every task in `ProcessIndex`,
+>   including peer processes that may alias argv through shared memory.
+>   With `policy_fn` active, fork-like syscalls are traced for one
+>   ptrace creation event, so children are registered in `ProcessIndex`
+>   before they can run user code. If the freeze or creation tracking
+>   cannot be established (e.g., YAMA blocks ptrace), the syscall is
+>   denied with `EPERM`; the safety invariant is never silently relaxed.
 
 **Context methods:**
 - `ctx.restrict_network(ips)` / `ctx.grant_network(ips)` — network control
@@ -455,8 +456,8 @@ what a command would do before committing.
 ### COW Fork & Map-Reduce
 
 Initialize expensive state once, then fork COW clones that share memory.
-Each fork uses raw `fork(2)` (bypasses seccomp notification) for minimal
-overhead. 1000 clones in ~530ms, ~1,900 forks/sec.
+Each clone uses raw `fork(2)` with shared copy-on-write pages. 1000
+clones in ~530ms, ~1,900 forks/sec.
 
 Each clone's stdout is captured via its own pipe. `reduce()` reads all
 pipes and feeds combined output to a reducer's stdin — fully pipe-based
