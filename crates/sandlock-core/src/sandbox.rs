@@ -1090,38 +1090,43 @@ impl Sandbox {
             // TimeRandomState
             let time_random_state = TimeRandomState::new(time_offset, random_state);
 
-            // NetworkState
+            // NetworkState — three protocol-keyed policies. Each is
+            // built from the protocol's slice of net_allow rules; the
+            // on-behalf handler picks the right one at check time
+            // based on the dup'd fd's SO_PROTOCOL. A protocol with no
+            // rules gets `Unrestricted` *only* when there are no rules
+            // for any protocol — otherwise it's an empty AllowList,
+            // i.e. deny-all for that protocol. (Empty across the board
+            // means "no on-behalf path active," matching pre-Phase-1
+            // behavior where Landlock is the sole enforcer.)
             let mut net_state = NetworkState::new();
-            net_state.network_policy = if self.policy.net_allow.is_empty()
-                || resolved_net_allow.any_ip_all_ports
-            {
-                // Empty net_allow leaves only Landlock to enforce
-                // (kernel-level deny-all-connect by default). The
-                // `:*` wildcard explicitly opens egress, so the
-                // on-behalf path becomes a no-op.
-                crate::seccomp::notif::NetworkPolicy::Unrestricted
-            } else {
-                use crate::seccomp::notif::PortAllow;
-                let per_ip = resolved_net_allow
-                    .per_ip
-                    .iter()
-                    .map(|(ip, ports)| {
-                        // `host:*` resolves into per_ip_all_ports; for those
-                        // IPs we use PortAllow::Any regardless of the (empty)
-                        // port set in per_ip.
-                        let allow = if resolved_net_allow.per_ip_all_ports.contains(ip) {
-                            PortAllow::Any
-                        } else {
-                            PortAllow::Specific(ports.clone())
-                        };
-                        (*ip, allow)
-                    })
-                    .collect();
-                crate::seccomp::notif::NetworkPolicy::AllowList {
-                    per_ip,
-                    any_ip_ports: resolved_net_allow.any_ip_ports.clone(),
+            let no_rules = self.policy.net_allow.is_empty();
+            let policy_from = |resolved: &network::ResolvedNetAllow| {
+                if no_rules || resolved.any_ip_all_ports {
+                    crate::seccomp::notif::NetworkPolicy::Unrestricted
+                } else {
+                    use crate::seccomp::notif::PortAllow;
+                    let per_ip = resolved
+                        .per_ip
+                        .iter()
+                        .map(|(ip, ports)| {
+                            let allow = if resolved.per_ip_all_ports.contains(ip) {
+                                PortAllow::Any
+                            } else {
+                                PortAllow::Specific(ports.clone())
+                            };
+                            (*ip, allow)
+                        })
+                        .collect();
+                    crate::seccomp::notif::NetworkPolicy::AllowList {
+                        per_ip,
+                        any_ip_ports: resolved.any_ip_ports.clone(),
+                    }
                 }
             };
+            net_state.tcp_policy = policy_from(&resolved_net_allow.tcp);
+            net_state.udp_policy = policy_from(&resolved_net_allow.udp);
+            net_state.icmp_policy = policy_from(&resolved_net_allow.icmp);
             net_state.http_acl_addr = self.http_acl_handle.as_ref().map(|h| h.addr);
             net_state.http_acl_ports = self.policy.http_ports.iter().copied().collect();
             net_state.http_acl_orig_dest = self.http_acl_handle.as_ref().map(|h| h.orig_dest.clone());
@@ -1165,14 +1170,17 @@ impl Sandbox {
                 // from per_ip keys (each represents an IP that some
                 // endpoint rule mentions). The any_ip case has no IPs to
                 // expose to the callback.
-                let allowed_ips = match &net_state.network_policy {
-                    crate::seccomp::notif::NetworkPolicy::AllowList { per_ip, .. } => {
-                        per_ip.keys().copied().collect()
+                // The dynamic-policy live view exposes the IPs the
+                // sandbox can talk to; that's the union of TCP+UDP+ICMP
+                // destination IPs (plus any from policy_fn overrides
+                // applied later). We collect from all three policies.
+                let mut allowed_ips: std::collections::HashSet<std::net::IpAddr> =
+                    std::collections::HashSet::new();
+                for p in [&net_state.tcp_policy, &net_state.udp_policy, &net_state.icmp_policy] {
+                    if let crate::seccomp::notif::NetworkPolicy::AllowList { per_ip, .. } = p {
+                        allowed_ips.extend(per_ip.keys().copied());
                     }
-                    crate::seccomp::notif::NetworkPolicy::Unrestricted => {
-                        std::collections::HashSet::new()
-                    }
-                };
+                }
                 let live = crate::policy_fn::LivePolicy {
                     allowed_ips,
                     max_memory_bytes: notif_policy.max_memory_bytes,

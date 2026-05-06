@@ -296,10 +296,18 @@ impl CowState {
 // NetworkState — network policy and port remapping state
 // ============================================================
 
-/// Network policy and port-remapping state.
+/// Network policy and port-remapping state. Holds one
+/// `NetworkPolicy` per L4 protocol — the on-behalf handler picks the
+/// matching one based on the dup'd fd's `SO_PROTOCOL`.
 pub struct NetworkState {
-    /// Global network policy: endpoint-level allowlist or unrestricted.
-    pub network_policy: crate::seccomp::notif::NetworkPolicy,
+    /// Allowlist for TCP destinations (`tcp://...` and bare-form rules).
+    pub tcp_policy: crate::seccomp::notif::NetworkPolicy,
+    /// Allowlist for UDP destinations (`udp://...` rules).
+    pub udp_policy: crate::seccomp::notif::NetworkPolicy,
+    /// Allowlist for ICMP destinations (`icmp://...` rules). ICMP rules
+    /// carry no ports, so every entry uses `PortAllow::Any` and the
+    /// effective check is IP-only.
+    pub icmp_policy: crate::seccomp::notif::NetworkPolicy,
     /// Port binding and remapping tracker.
     pub port_map: crate::port_remap::PortMap,
     /// Per-PID network overrides from policy_fn (IP-only via the legacy
@@ -316,7 +324,9 @@ pub struct NetworkState {
 impl NetworkState {
     pub fn new() -> Self {
         Self {
-            network_policy: crate::seccomp::notif::NetworkPolicy::Unrestricted,
+            tcp_policy: crate::seccomp::notif::NetworkPolicy::Unrestricted,
+            udp_policy: crate::seccomp::notif::NetworkPolicy::Unrestricted,
+            icmp_policy: crate::seccomp::notif::NetworkPolicy::Unrestricted,
             port_map: crate::port_remap::PortMap::new(),
             pid_ip_overrides: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
             http_acl_addr: None,
@@ -325,16 +335,20 @@ impl NetworkState {
         }
     }
 
-    /// Get the effective network policy for a PID.
+    /// Get the effective network policy for a PID and protocol.
     ///
-    /// Priority: per-PID override > live policy (from PolicyFnState) > global network_policy.
+    /// Priority: per-PID override > live policy (from PolicyFnState) >
+    /// the per-protocol allowlist for `protocol`.
     /// PID/live overrides are IP-only — any port is permitted to listed
-    /// IPs (legacy `policy_fn` semantics).
+    /// IPs (legacy `policy_fn` semantics) — and they apply across all
+    /// protocols, since the legacy API didn't distinguish them.
     pub fn effective_network_policy(
         &self,
         pid: u32,
+        protocol: crate::policy::Protocol,
         live_policy: Option<&std::sync::Arc<std::sync::RwLock<crate::policy_fn::LivePolicy>>>,
     ) -> crate::seccomp::notif::NetworkPolicy {
+        use crate::policy::Protocol;
         use crate::seccomp::notif::{NetworkPolicy, PortAllow};
         let ip_only_allow = |ips: &HashSet<std::net::IpAddr>| {
             let per_ip = ips.iter().map(|&ip| (ip, PortAllow::Any)).collect();
@@ -355,7 +369,11 @@ impl NetworkState {
                 }
             }
         }
-        self.network_policy.clone()
+        match protocol {
+            Protocol::Tcp => self.tcp_policy.clone(),
+            Protocol::Udp => self.udp_policy.clone(),
+            Protocol::Icmp => self.icmp_policy.clone(),
+        }
     }
 }
 

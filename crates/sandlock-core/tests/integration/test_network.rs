@@ -13,6 +13,129 @@ fn base_policy() -> sandlock_core::PolicyBuilder {
         .fs_write("/tmp")
 }
 
+// ============================================================
+// Phase 2: per-protocol destination scoping
+// ============================================================
+
+/// `udp://127.0.0.1:53` rule scopes UDP sends to 127.0.0.1:53. A
+/// `sendto(1.1.1.1, 53)` on the same UDP socket must be denied because
+/// the rule's host filters destinations, not just protocol creation.
+#[tokio::test]
+async fn test_udp_rule_scopes_destination_by_host() {
+    let out_allowed = temp_file("udp-allowed");
+    let out_blocked = temp_file("udp-blocked");
+
+    let policy = base_policy()
+        .net_allow("udp://127.0.0.1:53")
+        .build()
+        .unwrap();
+
+    // Two sendto calls on the same socket: one to the allowed host, one
+    // to a different host on the same port. The on-behalf handler must
+    // accept the first and deny the second with ECONNREFUSED (errno 111).
+    let script = format!(concat!(
+        "import socket\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
+        "try:\n",
+        "  s.sendto(b'x', ('127.0.0.1', 53))\n",
+        "  open('{ok}', 'w').write('ALLOWED')\n",
+        "except OSError as e:\n",
+        "  open('{ok}', 'w').write(f'ERR:{{e.errno}}')\n",
+        "try:\n",
+        "  s.sendto(b'x', ('1.1.1.1', 53))\n",
+        "  open('{deny}', 'w').write('ALLOWED')\n",
+        "except OSError as e:\n",
+        "  open('{deny}', 'w').write(f'ERR:{{e.errno}}')\n",
+        "s.close()\n",
+    ), ok = out_allowed.display(), deny = out_blocked.display());
+
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
+        .await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+
+    let allowed = std::fs::read_to_string(&out_allowed).unwrap_or_default();
+    let blocked = std::fs::read_to_string(&out_blocked).unwrap_or_default();
+    let _ = std::fs::remove_file(&out_allowed);
+    let _ = std::fs::remove_file(&out_blocked);
+
+    assert_eq!(allowed, "ALLOWED", "sendto to allowed host should succeed");
+    assert_eq!(blocked, "ERR:111", "sendto to disallowed host should ECONNREFUSED");
+}
+
+/// `udp://*:*` is the "any UDP destination" gate — it should not regress
+/// after Phase 2's per-protocol routing. Both sendtos succeed.
+#[tokio::test]
+async fn test_udp_wildcard_allows_any_destination() {
+    let out_a = temp_file("udp-wild-a");
+    let out_b = temp_file("udp-wild-b");
+
+    let policy = base_policy().net_allow("udp://*:*").build().unwrap();
+
+    let script = format!(concat!(
+        "import socket\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
+        "try:\n",
+        "  s.sendto(b'x', ('127.0.0.1', 53))\n",
+        "  open('{a}', 'w').write('ALLOWED')\n",
+        "except OSError as e:\n",
+        "  open('{a}', 'w').write(f'ERR:{{e.errno}}')\n",
+        "try:\n",
+        "  s.sendto(b'x', ('1.1.1.1', 53))\n",
+        "  open('{b}', 'w').write('ALLOWED')\n",
+        "except OSError as e:\n",
+        "  open('{b}', 'w').write(f'ERR:{{e.errno}}')\n",
+        "s.close()\n",
+    ), a = out_a.display(), b = out_b.display());
+
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
+        .await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+
+    let a = std::fs::read_to_string(&out_a).unwrap_or_default();
+    let b = std::fs::read_to_string(&out_b).unwrap_or_default();
+    let _ = std::fs::remove_file(&out_a);
+    let _ = std::fs::remove_file(&out_b);
+
+    assert_eq!(a, "ALLOWED");
+    assert_eq!(b, "ALLOWED");
+}
+
+/// A UDP rule must not authorize TCP destinations. Phase 1 closed off
+/// UDP socket creation under a TCP-only policy; Phase 2 must also stop
+/// UDP rules from leaking into the TCP destination check. Here we have
+/// a UDP-only rule for 1.1.1.1:53 and try a TCP connect to that
+/// (host, port) — which should still be denied because the TCP policy
+/// has no rules.
+#[tokio::test]
+async fn test_udp_rule_does_not_authorize_tcp() {
+    let out = temp_file("udp-no-leak-tcp");
+
+    let policy = base_policy().net_allow("udp://1.1.1.1:53").build().unwrap();
+
+    let script = format!(concat!(
+        "import socket\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+        "s.settimeout(2)\n",
+        "try:\n",
+        "  s.connect(('1.1.1.1', 53))\n",
+        "  open('{out}', 'w').write('ALLOWED')\n",
+        "except (OSError, socket.timeout) as e:\n",
+        "  errno = getattr(e, 'errno', 0)\n",
+        "  open('{out}', 'w').write(f'BLOCKED:{{errno}}')\n",
+        "s.close()\n",
+    ), out = out.display());
+
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
+        .await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert!(
+        content.starts_with("BLOCKED:"),
+        "TCP connect must not piggyback on a UDP rule, got: {}", content
+    );
+}
+
 /// Test that --net-allow blocks connections to non-allowed hosts.
 #[tokio::test]
 async fn test_net_allow_blocks_disallowed_host() {

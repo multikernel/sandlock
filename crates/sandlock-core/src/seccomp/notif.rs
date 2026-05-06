@@ -1251,7 +1251,9 @@ mod tests {
     #[test]
     fn test_network_state_new() {
         let ns = super::super::state::NetworkState::new();
-        assert!(matches!(ns.network_policy, NetworkPolicy::Unrestricted));
+        assert!(matches!(ns.tcp_policy, NetworkPolicy::Unrestricted));
+        assert!(matches!(ns.udp_policy, NetworkPolicy::Unrestricted));
+        assert!(matches!(ns.icmp_policy, NetworkPolicy::Unrestricted));
         assert!(ns.port_map.bound_ports.is_empty());
     }
 
