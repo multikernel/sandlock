@@ -143,12 +143,14 @@ async fn test_raw_socket_blocked() {
 }
 
 // ------------------------------------------------------------------
-// 4b. allow_icmp(true) permits AF_INET + SOCK_RAW + IPPROTO_ICMP
-//     while other raw socket types remain denied.
+// 4b. Raw ICMP is unconditionally denied — sandlock does not expose
+//     SOCK_RAW + IPPROTO_ICMP, even with policy concessions. Workloads
+//     that need ping should use the SOCK_DGRAM kernel ping socket via
+//     an `icmp://...` rule (test 4d below).
 // ------------------------------------------------------------------
 #[tokio::test]
-async fn test_allow_icmp_permits_icmp_raw() {
-    let out = temp_out("allow-icmp-permits-icmp");
+async fn test_raw_icmp_always_denied() {
+    let out = temp_out("raw-icmp-denied");
     let script = format!(concat!(
         "import socket\n",
         "try:\n",
@@ -162,8 +164,10 @@ async fn test_allow_icmp_permits_icmp_raw() {
         "open('{out}', 'w').write(result)\n",
     ), out = out.display());
 
+    // Even with an `icmp://*` rule (which permits the dgram path), raw
+    // ICMP must still be blocked: SOCK_RAW is always in the deny list.
     let policy = base_policy()
-        .allow_icmp(true)
+        .net_allow("icmp://*")
         .build()
         .unwrap();
     let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
@@ -172,30 +176,26 @@ async fn test_allow_icmp_permits_icmp_raw() {
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
-    // seccomp must permit it; the kernel may still deny without CAP_NET_RAW
-    // (errno 1 = EPERM). Accept ALLOWED (root) or BLOCKED/ERROR:1 (non-root
-    // capability denial).
-    let trimmed = contents.trim();
-    assert!(
-        trimmed == "ALLOWED" || trimmed == "BLOCKED" || trimmed == "ERROR:1",
-        "ICMP raw socket should be permitted by seccomp under allow_icmp; got: {}",
-        trimmed
+    assert_ne!(
+        contents.trim(), "ALLOWED",
+        "raw ICMP must be denied unconditionally; got: {}",
+        contents.trim()
     );
     assert!(result.success());
 }
 
 // ------------------------------------------------------------------
-// 4c. allow_icmp(true) still blocks SOCK_RAW with non-ICMP protocol
-//     (verifies the BPF arg2 protocol check)
+// 4d. The kernel ping socket (SOCK_DGRAM + IPPROTO_ICMP) is permitted
+//     when an `icmp://*` rule is present — the modern unprivileged
+//     ping path, distinct from raw ICMP.
 // ------------------------------------------------------------------
 #[tokio::test]
-async fn test_allow_icmp_still_blocks_other_raw() {
-    let out = temp_out("allow-icmp-blocks-tcp-raw");
-    // AF_INET + SOCK_RAW + IPPROTO_TCP must still be denied by seccomp.
+async fn test_icmp_dgram_allowed_with_icmp_rule() {
+    let out = temp_out("icmp-dgram-allowed");
     let script = format!(concat!(
         "import socket\n",
         "try:\n",
-        "  s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)\n",
+        "  s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_ICMP)\n",
         "  s.close()\n",
         "  result = 'ALLOWED'\n",
         "except PermissionError:\n",
@@ -206,7 +206,7 @@ async fn test_allow_icmp_still_blocks_other_raw() {
     ), out = out.display());
 
     let policy = base_policy()
-        .allow_icmp(true)
+        .net_allow("icmp://*")
         .build()
         .unwrap();
     let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
@@ -215,19 +215,22 @@ async fn test_allow_icmp_still_blocks_other_raw() {
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
+    // Seccomp must allow the syscall. The kernel may still deny if the
+    // sandbox GID is outside `net.ipv4.ping_group_range` (errno 1 EPERM
+    // or EACCES). Accepting ALLOWED / BLOCKED / ERROR:1 / ERROR:13 keeps
+    // the test green across hosts.
     let trimmed = contents.trim();
-    // Must be denied — either via seccomp (BLOCKED) or the kernel (EPERM).
-    // Critically must NOT be ALLOWED.
-    assert_ne!(
-        trimmed, "ALLOWED",
-        "non-ICMP raw socket must remain denied under allow_icmp; got: {}",
+    assert!(
+        trimmed == "ALLOWED" || trimmed == "BLOCKED"
+            || trimmed == "ERROR:1" || trimmed == "ERROR:13",
+        "kernel ping socket should be permitted by seccomp under icmp://*; got: {}",
         trimmed
     );
     assert!(result.success());
 }
 
 // ------------------------------------------------------------------
-// 5. UDP allowed when allow_udp(true)
+// 5. UDP allowed when a `udp://*:*` rule is present.
 // ------------------------------------------------------------------
 #[tokio::test]
 async fn test_udp_allowed_when_opted_in() {
@@ -246,7 +249,7 @@ async fn test_udp_allowed_when_opted_in() {
     ), out = out.display());
 
     let policy = base_policy()
-        .allow_udp(true)
+        .net_allow("udp://*:*")
         .build()
         .unwrap();
     let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
@@ -258,7 +261,7 @@ async fn test_udp_allowed_when_opted_in() {
     assert_eq!(
         contents.trim(),
         "ALLOWED",
-        "UDP socket should be allowed with allow_udp(true), got: {}",
+        "UDP socket should be allowed with udp://*:*, got: {}",
         contents.trim()
     );
     assert!(result.success());

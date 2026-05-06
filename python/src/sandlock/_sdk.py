@@ -91,8 +91,6 @@ _b_num_cpus = _builder_fn("sandlock_policy_builder_num_cpus", ctypes.c_uint32)
 _b_net_allow = _builder_fn("sandlock_policy_builder_net_allow", ctypes.c_char_p)
 _b_net_bind_port = _builder_fn("sandlock_policy_builder_net_bind_port", ctypes.c_uint16)
 _b_port_remap = _builder_fn("sandlock_policy_builder_port_remap", ctypes.c_bool)
-_b_allow_udp = _builder_fn("sandlock_policy_builder_allow_udp", ctypes.c_bool)
-_b_allow_icmp = _builder_fn("sandlock_policy_builder_allow_icmp", ctypes.c_bool)
 _b_http_allow = _builder_fn("sandlock_policy_builder_http_allow", ctypes.c_char_p)
 _b_http_deny = _builder_fn("sandlock_policy_builder_http_deny", ctypes.c_char_p)
 _b_http_port = _builder_fn("sandlock_policy_builder_http_port", ctypes.c_uint16)
@@ -746,7 +744,7 @@ class _NativePolicy:
         "max_memory", "max_disk", "max_processes", "max_cpu", "num_cpus",
         "cpu_cores", "gpu_devices",
         "net_allow", "net_bind",
-        "port_remap", "allow_udp", "allow_icmp",
+        "port_remap",
         "http_allow", "http_deny", "http_ports", "https_ca", "https_key",
         "uid",
         "random_seed", "time_start", "clean_env", "env",
@@ -828,10 +826,10 @@ class _NativePolicy:
             arr = (ctypes.c_uint32 * len(policy.cpu_cores))(*policy.cpu_cores)
             b = _b_cpu_cores(b, arr, len(policy.cpu_cores))
 
-        # net_allow: list of endpoint specs (`host:port[,port,...]`,
-        # `:port`, `*:port`). Empty = deny all outbound. Applies to TCP
-        # and to UDP (when allow_udp is set). Validation of each spec
-        # happens in the native build().
+        # net_allow: list of endpoint specs. Bare `host:port` means TCP;
+        # `tcp://`/`udp://`/`icmp://` schemes opt other protocols in.
+        # Empty = deny all outbound. Validation of each spec happens in
+        # the native build().
         for spec in (policy.net_allow or []):
             b = _b_net_allow(b, _encode(str(spec)))
         for port in parse_ports(policy.net_bind) if policy.net_bind else []:
@@ -850,10 +848,6 @@ class _NativePolicy:
 
         if policy.port_remap:
             b = _b_port_remap(b, True)
-        if policy.allow_udp:
-            b = _b_allow_udp(b, True)
-        if policy.allow_icmp:
-            b = _b_allow_icmp(b, True)
 
         if policy.uid is not None:
             b = _b_uid(b, policy.uid)

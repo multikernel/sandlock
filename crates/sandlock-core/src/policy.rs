@@ -103,8 +103,6 @@ impl TryFrom<&Policy> for ConfinePolicy {
         if !policy.block_syscalls.is_empty() { unsupported.push("block_syscalls"); }
         if !policy.net_allow.is_empty() { unsupported.push("net_allow"); }
         if !policy.net_bind.is_empty() { unsupported.push("net_bind"); }
-        if policy.allow_udp { unsupported.push("allow_udp"); }
-        if policy.allow_icmp { unsupported.push("allow_icmp"); }
         if policy.allow_sysv_ipc { unsupported.push("allow_sysv_ipc"); }
         if !policy.http_allow.is_empty() { unsupported.push("http_allow"); }
         if !policy.http_deny.is_empty() { unsupported.push("http_deny"); }
@@ -168,18 +166,57 @@ pub enum BranchAction {
     Keep,
 }
 
+/// L4 protocol that a `NetAllow` rule applies to.
+///
+/// `Tcp` is the default if a rule has no scheme (the bare `host:port`
+/// form). `Udp` and `Icmp` require an explicit scheme.
+///
+/// `Icmp` is the kernel's unprivileged ping socket
+/// (`SOCK_DGRAM + IPPROTO_ICMP{,V6}`), gated by `ping_group_range` —
+/// destinations are filterable per host. Sandlock does not expose raw
+/// ICMP (`SOCK_RAW + IPPROTO_ICMP`): destination filtering at `sendto`
+/// would lie because raw sockets let the agent craft the IP header,
+/// and packet-crafting capabilities aren't part of the XOA threat
+/// model. Workloads that genuinely need raw ICMP should run outside
+/// sandlock or rely on the host's `ping_group_range` for the dgram
+/// path instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+    Tcp,
+    Udp,
+    Icmp,
+}
+
+impl Protocol {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "tcp" => Some(Protocol::Tcp),
+            "udp" => Some(Protocol::Udp),
+            "icmp" => Some(Protocol::Icmp),
+            _ => None,
+        }
+    }
+}
+
 /// A network endpoint allow rule.
 ///
-/// Each rule permits TCP `connect()` to one host (or any IP, for the
-/// `:port` form) on a specific set of ports. Multiple rules are OR'd:
-/// a connection is permitted if any rule matches both the destination
-/// IP and the destination port.
+/// Each rule permits one protocol's traffic to one host (or any IP, for
+/// the `:port` form) on a specific set of ports. Multiple rules are
+/// OR'd: traffic is permitted if any rule matches the protocol, the
+/// destination IP, and the destination port.
+///
+/// ICMP rules carry no port (ICMP has none); their `ports` is empty
+/// and `all_ports` is false.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct NetAllow {
-    /// Hostname; `None` means "any IP" (the `:port` form).
+    /// L4 protocol this rule applies to.
+    #[serde(default = "default_protocol_tcp")]
+    pub protocol: Protocol,
+    /// Hostname; `None` means "any IP" (the `:port` form, or `icmp://*`).
     pub host: Option<String>,
     /// Permitted ports. Must be non-empty unless `all_ports` is true,
-    /// in which case it must be empty.
+    /// in which case it must be empty. Always empty for `Protocol::Icmp`.
     pub ports: Vec<u16>,
     /// "Any port" wildcard from the `*` token in port position. When
     /// true, `ports` is empty; the rule permits every TCP/UDP port to
@@ -188,14 +225,41 @@ pub struct NetAllow {
     pub all_ports: bool,
 }
 
+fn default_protocol_tcp() -> Protocol { Protocol::Tcp }
+
 impl NetAllow {
-    /// Parse a `host:port[,port,...]` / `:port` / `*:port` /
-    /// `host:*` / `:*` / `*:*` spec.
+    /// Parse a rule spec. Forms:
+    ///
+    /// - `host:port[,port,...]`, `:port`, `*:port`, `host:*`, `:*`, `*:*`
+    ///   — TCP (the default scheme).
+    /// - `tcp://...` — explicit TCP, same suffix grammar as the bare form.
+    /// - `udp://...` — UDP, same suffix grammar as the bare form.
+    /// - `icmp://host` or `icmp://*` — ICMP echo (kernel ping socket).
+    ///   No port field; `icmp://host:80` is rejected.
     ///
     /// `*` in port position means "any port" (the all-ports wildcard).
     /// Mixing `*` with concrete ports (e.g. `host:80,*`) is rejected.
     pub fn parse(s: &str) -> Result<Self, PolicyError> {
-        let (host_part, port_part) = s.rsplit_once(':').ok_or_else(|| {
+        // Split off the optional scheme prefix `<proto>://`. If absent,
+        // default to TCP and the rest of the parser is unchanged.
+        let (protocol, rest) = match s.split_once("://") {
+            Some((scheme, body)) => {
+                let proto = Protocol::parse(scheme).ok_or_else(|| {
+                    PolicyError::Invalid(format!(
+                        "--net-allow: unknown scheme `{}://` in `{}` (expected tcp, udp, icmp)",
+                        scheme, s
+                    ))
+                })?;
+                (proto, body)
+            }
+            None => (Protocol::Tcp, s),
+        };
+
+        if protocol == Protocol::Icmp {
+            return Self::parse_icmp(rest, s);
+        }
+
+        let (host_part, port_part) = rest.rsplit_once(':').ok_or_else(|| {
             PolicyError::Invalid(format!(
                 "--net-allow: expected `host:port` or `:port`, got `{}`",
                 s
@@ -240,7 +304,34 @@ impl NetAllow {
                 s
             )));
         }
-        Ok(NetAllow { host, ports, all_ports: saw_wildcard })
+        Ok(NetAllow { protocol, host, ports, all_ports: saw_wildcard })
+    }
+
+    /// Parse the body of an `icmp://` rule. Accepts a host or `*` —
+    /// ICMP has no ports, so any `:` separator is rejected.
+    fn parse_icmp(body: &str, full: &str) -> Result<Self, PolicyError> {
+        if body.contains(':') {
+            return Err(PolicyError::Invalid(format!(
+                "--net-allow: icmp rules take no port, got `{}`",
+                full
+            )));
+        }
+        if body.is_empty() {
+            return Err(PolicyError::Invalid(format!(
+                "--net-allow: icmp rule needs a host or `*`, got `{}`",
+                full
+            )));
+        }
+        let host = match body {
+            "*" => None,
+            h => Some(h.to_string()),
+        };
+        Ok(NetAllow {
+            protocol: Protocol::Icmp,
+            host,
+            ports: Vec::new(),
+            all_ports: false,
+        })
     }
 }
 
@@ -426,32 +517,30 @@ pub struct Policy {
     pub block_syscalls: Vec<String>,
 
     // Network
-    /// Outbound endpoint allowlist as a list of `(host?, ports)` rules.
-    /// Applies to TCP `connect()` and to UDP `sendto`/`sendmsg`
-    /// destinations when `allow_udp` is set.
+    /// Outbound endpoint allowlist as a list of `(protocol, host?, ports)`
+    /// rules. Each rule names a protocol (TCP/UDP/ICMP) and either a
+    /// concrete host or "any IP." TCP and UDP rules carry ports; ICMP
+    /// rules have none.
+    ///
+    /// **Protocol gating falls out of rule presence.** Sandlock denies
+    /// UDP and ICMP socket creation by default; opting in is "list at
+    /// least one rule for that protocol" (e.g. `udp://*:*` for any UDP,
+    /// `icmp://*` for any ICMP echo). TCP is always permitted.
     ///
     /// Empty `net_allow` and empty `http_allow`/`http_deny` together
     /// mean "deny all outbound" (Landlock direct path denies, no
     /// on-behalf path is enabled). Otherwise, the on-behalf path
     /// enforces these rules: a destination is permitted iff any rule
-    /// matches both the destination IP (or has `host: None` = any IP)
-    /// and the destination port — same check for TCP and UDP.
+    /// matches the protocol, destination IP (or has `host: None` = any
+    /// IP), and destination port (N/A for ICMP).
     ///
-    /// HTTP rules with concrete hosts auto-add a matching `(host, [80])`
-    /// (and `(host, [443])` when `--https-ca` is set) entry at build
-    /// time so the proxy's intercept ports remain reachable. HTTP rules
-    /// with wildcard hosts auto-add `(None, [80])` instead.
+    /// HTTP rules with concrete hosts auto-add a matching
+    /// `(Tcp, host, [80])` (and `(Tcp, host, [443])` when `--https-ca`
+    /// is set) entry at build time so the proxy's intercept ports
+    /// remain reachable. HTTP rules with wildcard hosts auto-add
+    /// `(Tcp, None, [80])` instead.
     pub net_allow: Vec<NetAllow>,
     pub net_bind: Vec<u16>,
-    /// Permit UDP socket creation (`socket(_, SOCK_DGRAM, _)`). UDP is
-    /// denied by default; outbound destinations remain gated by the
-    /// `net_allow` endpoint allowlist when set.
-    pub allow_udp: bool,
-    /// Narrow ICMP carve-out: permit `socket(AF_INET, SOCK_RAW,
-    /// IPPROTO_ICMP)` and the IPv6 equivalent. All other raw socket
-    /// types remain denied. Useful for `ping` without granting full
-    /// packet-crafting capability.
-    pub allow_icmp: bool,
     /// Permit SysV IPC syscalls: shared memory (`shmget`/`shmat`/
     /// `shmdt`/`shmctl`), message queues (`msgget`/`msgsnd`/`msgrcv`/
     /// `msgctl`), and semaphores (`semget`/`semop`/`semctl`/
@@ -566,8 +655,6 @@ pub struct PolicyBuilder {
     /// Raw `--net-allow` specs; parsed in `build()` to surface errors.
     net_allow: Vec<String>,
     net_bind: Vec<u16>,
-    allow_udp: bool,
-    allow_icmp: bool,
     allow_sysv_ipc: bool,
 
     http_allow: Vec<String>,
@@ -656,20 +743,6 @@ impl PolicyBuilder {
 
     pub fn net_bind_port(mut self, port: u16) -> Self {
         self.net_bind.push(port);
-        self
-    }
-
-    /// Permit UDP socket creation. UDP is denied by default;
-    /// outbound destinations remain gated by `net_allow` if set.
-    pub fn allow_udp(mut self, v: bool) -> Self {
-        self.allow_udp = v;
-        self
-    }
-
-    /// Permit `socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)` and the IPv6
-    /// equivalent only. Other raw socket types stay denied.
-    pub fn allow_icmp(mut self, v: bool) -> Self {
-        self.allow_icmp = v;
         self
     }
 
@@ -911,6 +984,7 @@ impl PolicyBuilder {
             if wildcard_seen || (http_allow.is_empty() && http_deny.is_empty()) {
                 // Fallback: explicit --http-port without rules, or wildcard rules.
                 net_allow.push(NetAllow {
+                    protocol: Protocol::Tcp,
                     host: None,
                     ports: http_ports.clone(),
                     all_ports: false,
@@ -918,6 +992,7 @@ impl PolicyBuilder {
             }
             for h in concrete_hosts {
                 net_allow.push(NetAllow {
+                    protocol: Protocol::Tcp,
                     host: Some(h),
                     ports: http_ports.clone(),
                     all_ports: false,
@@ -938,8 +1013,6 @@ impl PolicyBuilder {
             block_syscalls: self.block_syscalls,
             net_allow,
             net_bind: self.net_bind,
-            allow_udp: self.allow_udp,
-            allow_icmp: self.allow_icmp,
             allow_sysv_ipc: self.allow_sysv_ipc,
             http_allow,
             http_deny,
@@ -1366,5 +1439,81 @@ mod http_rule_tests {
         let r = NetAllow::parse(":*,*").unwrap();
         assert!(r.all_ports);
         assert!(r.ports.is_empty());
+    }
+
+    // --- Protocol scheme prefix tests ---
+
+    #[test]
+    fn netallow_bare_form_defaults_to_tcp() {
+        let r = NetAllow::parse("example.com:443").unwrap();
+        assert_eq!(r.protocol, Protocol::Tcp);
+    }
+
+    #[test]
+    fn netallow_explicit_tcp_scheme() {
+        let r = NetAllow::parse("tcp://example.com:443").unwrap();
+        assert_eq!(r.protocol, Protocol::Tcp);
+        assert_eq!(r.host.as_deref(), Some("example.com"));
+        assert_eq!(r.ports, vec![443]);
+    }
+
+    #[test]
+    fn netallow_udp_scheme_with_host_port() {
+        let r = NetAllow::parse("udp://1.1.1.1:53").unwrap();
+        assert_eq!(r.protocol, Protocol::Udp);
+        assert_eq!(r.host.as_deref(), Some("1.1.1.1"));
+        assert_eq!(r.ports, vec![53]);
+    }
+
+    #[test]
+    fn netallow_udp_wildcard_any_anywhere() {
+        // The "any UDP" gate, equivalent to the old `allow_udp = true`.
+        let r = NetAllow::parse("udp://*:*").unwrap();
+        assert_eq!(r.protocol, Protocol::Udp);
+        assert_eq!(r.host, None);
+        assert!(r.all_ports);
+    }
+
+    #[test]
+    fn netallow_icmp_scheme_with_host() {
+        let r = NetAllow::parse("icmp://github.com").unwrap();
+        assert_eq!(r.protocol, Protocol::Icmp);
+        assert_eq!(r.host.as_deref(), Some("github.com"));
+        assert!(r.ports.is_empty());
+        assert!(!r.all_ports);
+    }
+
+    #[test]
+    fn netallow_icmp_wildcard() {
+        // The "any ICMP echo" gate, equivalent to the old
+        // `allow_icmp = true` for the SOCK_DGRAM path.
+        let r = NetAllow::parse("icmp://*").unwrap();
+        assert_eq!(r.protocol, Protocol::Icmp);
+        assert_eq!(r.host, None);
+    }
+
+    #[test]
+    fn netallow_icmp_rejects_port() {
+        // ICMP has no port — `:port` is meaningless and refused
+        // explicitly so users can't write a rule that doesn't do what
+        // they think.
+        let err = NetAllow::parse("icmp://github.com:80").unwrap_err();
+        assert!(format!("{}", err).contains("icmp rules take no port"));
+    }
+
+    #[test]
+    fn netallow_icmp_rejects_empty_body() {
+        let err = NetAllow::parse("icmp://").unwrap_err();
+        assert!(format!("{}", err).contains("needs a host or `*`"));
+    }
+
+    #[test]
+    fn netallow_unknown_scheme_rejected() {
+        // Including `icmp-raw` — sandlock does not expose raw ICMP, so
+        // the scheme is unknown rather than a special-case error.
+        for spec in ["sctp://host:1234", "icmp-raw://*"] {
+            let err = NetAllow::parse(spec).unwrap_err();
+            assert!(format!("{}", err).contains("unknown scheme"), "spec: {}", spec);
+        }
     }
 }

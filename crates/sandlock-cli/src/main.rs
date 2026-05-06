@@ -69,18 +69,6 @@ enum Command {
         fs_storage: Option<String>,
         #[arg(long = "max-disk")]
         max_disk: Option<String>,
-        /// Allow UDP socket creation. UDP is denied by default; this
-        /// turns it back on. Outbound UDP destinations are still
-        /// gated by `--net-allow` (the same endpoint allowlist used
-        /// for TCP).
-        #[arg(long = "allow-udp")]
-        allow_udp: bool,
-        /// Allow ICMP raw sockets only — `socket(AF_INET, SOCK_RAW,
-        /// IPPROTO_ICMP)` and the IPv6 equivalent. Other `SOCK_RAW`
-        /// types stay denied. Useful for `ping` without granting full
-        /// packet-crafting capability.
-        #[arg(long = "allow-icmp")]
-        allow_icmp: bool,
         /// Allow SysV IPC syscalls (shared memory, message queues,
         /// semaphores). Denied by default: sandlock does not use IPC
         /// namespaces, so without this denial two sandboxes on the
@@ -186,7 +174,7 @@ async fn main() -> Result<()> {
             net_allow, net_bind, time_start, random_seed,
             clean_env, num_cpus, profile: profile_name, status_fd,
             max_cpu, max_open_files, chroot, uid, workdir, cwd,
-            fs_isolation, fs_storage, max_disk, allow_udp, allow_icmp, allow_sysv_ipc,
+            fs_isolation, fs_storage, max_disk, allow_sysv_ipc,
             http_allow, http_deny, http_ports, https_ca, https_key,
             port_remap, no_randomize_memory, no_huge_pages, deterministic_dirs, name, no_coredump,
             env_vars, exec_shell, interactive: _, fs_deny, fs_mount, cpu_cores, gpu_devices, image, dry_run, no_supervisor, cmd } =>
@@ -195,7 +183,7 @@ async fn main() -> Result<()> {
                 validate_no_supervisor(
                     &max_memory, &max_processes, &max_cpu, &max_open_files,
                     &timeout, &net_allow, &net_bind,
-                    allow_udp, allow_icmp, &http_allow, &http_deny, &http_ports,
+                    &http_allow, &http_deny, &http_ports,
                     &num_cpus, &random_seed, &time_start, no_randomize_memory,
                     no_huge_pages, deterministic_dirs, &name, &chroot,
                     &image, &uid, &workdir, &cwd, &fs_isolation, &fs_storage,
@@ -258,9 +246,20 @@ async fn main() -> Result<()> {
                 for p in &base.fs_writable { b = b.fs_write(p); }
                 for p in &base.fs_denied { b = b.fs_deny(p); }
                 for rule in &base.net_allow {
-                    let port_csv: Vec<String> = rule.ports.iter().map(|p| p.to_string()).collect();
-                    let host_part = rule.host.as_deref().unwrap_or("");
-                    let spec = format!("{}:{}", host_part, port_csv.join(","));
+                    let host_part = rule.host.as_deref().unwrap_or("*");
+                    let spec = match rule.protocol {
+                        sandlock_core::policy::Protocol::Tcp => {
+                            let ports = format_ports(&rule.ports, rule.all_ports);
+                            format!("tcp://{}:{}", host_part, ports)
+                        }
+                        sandlock_core::policy::Protocol::Udp => {
+                            let ports = format_ports(&rule.ports, rule.all_ports);
+                            format!("udp://{}:{}", host_part, ports)
+                        }
+                        sandlock_core::policy::Protocol::Icmp => {
+                            format!("icmp://{}", host_part)
+                        }
+                    };
                     b = b.net_allow(spec);
                 }
                 for p in &base.net_bind { b = b.net_bind_port(*p); }
@@ -281,8 +280,6 @@ async fn main() -> Result<()> {
                 if let Some(seed) = base.random_seed { b = b.random_seed(seed); }
                 if let Some(n) = base.num_cpus { b = b.num_cpus(n); }
                 b = b.block_syscalls(base.block_syscalls.clone());
-                b = b.allow_udp(base.allow_udp);
-                b = b.allow_icmp(base.allow_icmp);
                 b = b.allow_sysv_ipc(base.allow_sysv_ipc);
                 b = b.clean_env(base.clean_env);
                 if let Some(ref w) = base.workdir { b = b.workdir(w); }
@@ -330,12 +327,9 @@ async fn main() -> Result<()> {
             }
             if let Some(ref path) = fs_storage { builder = builder.fs_storage(path); }
             if let Some(ref s) = max_disk { builder = builder.max_disk(ByteSize::parse(s)?); }
-            if allow_udp { builder = builder.allow_udp(true); }
-            // --allow-icmp narrowly permits ICMP raw sockets; arbitrary
-            // raw sockets stay denied. The seccomp filter inspects the
-            // protocol arg of `socket()` so non-ICMP `SOCK_RAW` is
-            // still rejected.
-            if allow_icmp { builder = builder.allow_icmp(true); }
+            // UDP, the kernel ping socket (SOCK_DGRAM + IPPROTO_ICMP),
+            // and raw ICMP are all gated by `--net-allow` rule presence
+            // (`udp://...`, `icmp://...`, `icmp-raw://*` respectively).
             if allow_sysv_ipc { builder = builder.allow_sysv_ipc(true); }
             for rule in &http_allow { builder = builder.http_allow(rule); }
             for rule in &http_deny { builder = builder.http_deny(rule); }
@@ -605,8 +599,6 @@ fn validate_no_supervisor(
     timeout: &Option<u64>,
     net_allow: &[String],
     net_bind: &[u16],
-    allow_udp: bool,
-    allow_icmp: bool,
     http_allow: &[String],
     http_deny: &[String],
     http_ports: &[u16],
@@ -642,8 +634,6 @@ fn validate_no_supervisor(
     if timeout.is_some() { bad.push("--timeout"); }
     if !net_allow.is_empty() { bad.push("--net-allow"); }
     if !net_bind.is_empty() { bad.push("--net-bind"); }
-    if allow_udp { bad.push("--allow-udp"); }
-    if allow_icmp { bad.push("--allow-icmp"); }
     if !http_allow.is_empty() { bad.push("--http-allow"); }
     if !http_deny.is_empty() { bad.push("--http-deny"); }
     if !http_ports.is_empty() { bad.push("--http-port"); }
@@ -748,6 +738,16 @@ fn no_supervisor_exec(policy: &Policy, cmd: &[&str]) -> Result<()> {
 }
 
 /// Parse an ISO 8601 timestamp (e.g. "2000-01-01T00:00:00Z") into a SystemTime.
+/// Render a port list back into the `--net-allow` port-suffix form:
+/// concrete ports become `80,443`; the all-ports wildcard becomes `*`.
+fn format_ports(ports: &[u16], all_ports: bool) -> String {
+    if all_ports {
+        "*".to_string()
+    } else {
+        ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",")
+    }
+}
+
 fn parse_time_start(s: &str) -> Result<SystemTime> {
     let ts: jiff::Timestamp = s.parse()
         .map_err(|e| anyhow!("invalid --time-start '{}': {}", s, e))?;

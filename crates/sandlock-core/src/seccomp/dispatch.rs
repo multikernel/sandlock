@@ -313,7 +313,12 @@ pub(crate) fn build_dispatch_table(
     // Network (conditional on has_net_allowlist || has_http_acl)
     // ------------------------------------------------------------------
     if policy.has_net_allowlist || policy.has_http_acl {
-        for &nr in &[libc::SYS_connect, libc::SYS_sendto, libc::SYS_sendmsg] {
+        for &nr in &[
+            libc::SYS_connect,
+            libc::SYS_sendto,
+            libc::SYS_sendmsg,
+            libc::SYS_sendmmsg,
+        ] {
             let __sup = Arc::clone(ctx);
             table.register(nr, move |cx: &HandlerCtx| {
                 let notif = cx.notif;

@@ -10,7 +10,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 
 use crate::seccomp::ctx::SupervisorCtx;
-use crate::seccomp::notif::{read_child_mem, NotifAction};
+use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction};
 use crate::sys::structs::{SeccompNotif, AF_INET, AF_INET6, ECONNREFUSED};
 
 /// Maximum buffer size for sendto/sendmsg on-behalf operations (64 MiB).
@@ -69,6 +69,43 @@ fn parse_port_from_sockaddr(bytes: &[u8]) -> Option<u16> {
 }
 
 // ============================================================
+// query_socket_protocol — derive the rule Protocol from a fd via getsockopt
+// ============================================================
+
+/// Query `SO_PROTOCOL` on a dup'd socket fd to learn whether to route
+/// the on-behalf check through the TCP, UDP, or ICMP policy.
+///
+/// Returns `None` for protocols sandlock does not gate via `net_allow`
+/// (raw, SCTP, etc.) — the handler treats those as "no rule applies"
+/// which collapses to the default-deny path.
+fn query_socket_protocol(fd: RawFd) -> Option<crate::policy::Protocol> {
+    use crate::policy::Protocol;
+    let mut proto: libc::c_int = 0;
+    let mut len: libc::socklen_t = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PROTOCOL,
+            &mut proto as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    match proto {
+        libc::IPPROTO_TCP => Some(Protocol::Tcp),
+        libc::IPPROTO_UDP => Some(Protocol::Udp),
+        // IPPROTO_ICMP and IPPROTO_ICMPV6 both route to the ICMP policy
+        // (the policy doesn't distinguish IP versions; the rule's
+        // resolved IP set already covers both via DNS).
+        libc::IPPROTO_ICMP | libc::IPPROTO_ICMPV6 => Some(Protocol::Icmp),
+        _ => None,
+    }
+}
+
+// ============================================================
 // connect_on_behalf — perform connect() on behalf of the child (TOCTOU-safe)
 // ============================================================
 
@@ -96,23 +133,39 @@ async fn connect_on_behalf(
             Err(_) => return NotifAction::Errno(libc::EIO),
         };
 
-    // 2. Check destination (ip, port) against the endpoint allowlist.
-    // The on-behalf supervisor performs the connect outside Landlock,
-    // so this check is the only port enforcement on this path.
+    // 2. Check destination against the per-protocol endpoint allowlist.
+    // The dup we'd need anyway for the on-behalf connect doubles as
+    // our SO_PROTOCOL probe — one pidfd_getfd, one getsockopt. The
+    // per-protocol policy is keyed on whether the socket is TCP / UDP
+    // / kernel ping (ICMP). Unknown protocol (raw, SCTP, etc.) fails
+    // closed: the BPF should have prevented socket creation, so
+    // reaching here with one is an unexpected case worth refusing.
     if let Some(ip) = parse_ip_from_sockaddr(&addr_bytes) {
         let dest_port = parse_port_from_sockaddr(&addr_bytes);
+        let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
+            Ok(fd) => fd,
+            Err(_) => return NotifAction::Errno(libc::ENOSYS),
+        };
+        let protocol = match query_socket_protocol(dup_fd.as_raw_fd()) {
+            Some(p) => p,
+            None => return NotifAction::Errno(ECONNREFUSED),
+        };
         let ns = ctx.network.lock().await;
         let live_policy = {
             let pfs = ctx.policy_fn.lock().await;
             pfs.live_policy.clone()
         };
-        let effective = ns.effective_network_policy(notif.pid, live_policy.as_ref());
+        let effective = ns.effective_network_policy(notif.pid, protocol, live_policy.as_ref());
         match (effective, dest_port) {
             (crate::seccomp::notif::NetworkPolicy::Unrestricted, _) => {
-                // No allowlist active — Landlock direct path enforces ports.
-                // (Reachable when on-behalf is enabled solely by HTTP ACL.)
+                // No rules for this protocol's wildcard — Landlock (TCP
+                // only) or the protocol's wildcard rule covers it; no
+                // additional check here.
             }
             (policy, Some(p)) => {
+                // For ICMP rules every per-IP entry is `PortAllow::Any`,
+                // so the port arg from the sockaddr (typically 0 or the
+                // ICMP id) is functionally ignored — IP is what matters.
                 if !policy.allows(ip, p) {
                     return NotifAction::Errno(ECONNREFUSED);
                 }
@@ -188,11 +241,9 @@ async fn connect_on_behalf(
             (addr_bytes.clone(), addr_len)
         };
 
-        // 3. Duplicate child's socket into supervisor (use notif.pid for grandchild support)
-        let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
-            Ok(fd) => fd,
-            Err(_) => return NotifAction::Errno(libc::ENOSYS),
-        };
+        // (The supervisor-side dup is the same fd we already created
+        // for the SO_PROTOCOL probe above — reuse it rather than
+        // pidfd_getfd-ing a second time.)
 
         // 4. Record original dest IP *before* connect to prevent TOCTOU race:
         //    the proxy may receive the request before we write the mapping if
@@ -338,15 +389,25 @@ async fn sendto_on_behalf(
             Err(_) => return NotifAction::Errno(libc::EIO),
         };
 
-    // 2. Check (ip, port) against the endpoint allowlist.
+    // 2. Check (ip, port) against the per-protocol endpoint allowlist.
+    // One pidfd_getfd serves both the SO_PROTOCOL probe and the
+    // on-behalf sendto.
     if let Some(ip) = parse_ip_from_sockaddr(&addr_bytes) {
         let dest_port = parse_port_from_sockaddr(&addr_bytes);
+        let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
+            Ok(fd) => fd,
+            Err(_) => return NotifAction::Errno(libc::ENOSYS),
+        };
+        let protocol = match query_socket_protocol(dup_fd.as_raw_fd()) {
+            Some(p) => p,
+            None => return NotifAction::Errno(ECONNREFUSED),
+        };
         let ns = ctx.network.lock().await;
         let live_policy = {
             let pfs = ctx.policy_fn.lock().await;
             pfs.live_policy.clone()
         };
-        let effective = ns.effective_network_policy(notif.pid, live_policy.as_ref());
+        let effective = ns.effective_network_policy(notif.pid, protocol, live_policy.as_ref());
         if !matches!(effective, crate::seccomp::notif::NetworkPolicy::Unrestricted) {
             match dest_port {
                 Some(p) if !effective.allows(ip, p) => {
@@ -364,11 +425,7 @@ async fn sendto_on_behalf(
             Err(_) => return NotifAction::Errno(libc::EIO),
         };
 
-        // 4. Duplicate child's socket into supervisor (use notif.pid for grandchild support)
-        let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
-            Ok(fd) => fd,
-            Err(_) => return NotifAction::Errno(libc::ENOSYS),
-        };
+        // 4. (dup_fd from step 2 is reused for the supervisor sendto.)
 
         // 5. Perform sendto in supervisor with validated sockaddr + copied data
         let ret = unsafe {
@@ -415,21 +472,104 @@ async fn sendmsg_on_behalf(
     let msghdr_ptr = args[1];
     let flags = args[2] as i32;
 
-    // 1. Read full msghdr struct (56 bytes on x86_64):
-    //   msg_name(8) + msg_namelen(4) + pad(4) + msg_iov(8) + msg_iovlen(8)
-    //   + msg_control(8) + msg_controllen(8) + msg_flags(4) + pad(4)
-    //
-    // If we cannot read the msghdr, fail the syscall with EFAULT instead
-    // of falling through to Continue.  Continue would let the kernel
-    // re-read child memory and (for a racing thread that just remapped
-    // it back) potentially execute the sendmsg without the IP allowlist
-    // check this handler exists to enforce.  EFAULT matches what the
-    // kernel itself would return for an unreadable msghdr pointer.
-    let msghdr_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, msghdr_ptr, 56) {
-        Ok(b) if b.len() >= 56 => b,
-        _ => return NotifAction::Errno(libc::EFAULT),
+    // Pre-scan for Continue cases (connected socket / non-IP family).
+    // Same TOCTOU-aware semantics as before: EFAULT on unreadable
+    // msghdr (vs. Continue, which would let the kernel re-read child
+    // memory and bypass our check).
+    match prescan_msghdr(notif, notif_fd, msghdr_ptr) {
+        PrescanResult::ContinueWholeCall => return NotifAction::Continue,
+        PrescanResult::Errno(e) => return NotifAction::Errno(e),
+        PrescanResult::OnBehalf => {}
+    }
+
+    let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
+        Ok(fd) => fd,
+        Err(_) => return NotifAction::Errno(libc::ENOSYS),
+    };
+    let protocol = match query_socket_protocol(dup_fd.as_raw_fd()) {
+        Some(p) => p,
+        None => return NotifAction::Errno(ECONNREFUSED),
     };
 
+    match send_msghdr_on_behalf(notif, ctx, notif_fd, &dup_fd, protocol, msghdr_ptr, flags).await {
+        Ok(n) => NotifAction::ReturnValue(n as i64),
+        Err(errno) => NotifAction::Errno(errno),
+    }
+}
+
+// ============================================================
+// prescan_msghdr / send_msghdr_on_behalf — shared per-message work
+// ============================================================
+
+#[derive(Clone, Copy)]
+enum PrescanResult {
+    /// All fields present, IP-family destination — caller can take the
+    /// on-behalf path with `send_msghdr_on_behalf`.
+    OnBehalf,
+    /// `msg_name == NULL` (connected socket) or non-IP family
+    /// (AF_UNIX etc.). Caller should return `NotifAction::Continue` so
+    /// the kernel handles the syscall in the child's namespace —
+    /// AF_UNIX path resolution is the canonical reason we don't take
+    /// these messages on behalf.
+    ContinueWholeCall,
+    /// Memory read failure. Caller maps to the appropriate errno
+    /// (EFAULT for unreadable msghdr, EIO for the sockaddr).
+    Errno(i32),
+}
+
+/// Probe one `struct msghdr` to decide whether the on-behalf path
+/// applies. Used by both `sendmsg_on_behalf` (one msghdr) and
+/// `sendmmsg_on_behalf` (one per `mmsghdr` entry, before doing any
+/// sends — Continue is a whole-syscall decision).
+fn prescan_msghdr(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+    msghdr_ptr: u64,
+) -> PrescanResult {
+    let msghdr_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, msghdr_ptr, 56) {
+        Ok(b) if b.len() >= 56 => b,
+        _ => return PrescanResult::Errno(libc::EFAULT),
+    };
+    let msg_name_ptr = u64::from_ne_bytes(msghdr_bytes[0..8].try_into().unwrap());
+    if msg_name_ptr == 0 {
+        return PrescanResult::ContinueWholeCall;
+    }
+    let msg_namelen = u32::from_ne_bytes(msghdr_bytes[8..12].try_into().unwrap());
+    let addr_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, msg_name_ptr, msg_namelen as usize) {
+        Ok(b) => b,
+        Err(_) => return PrescanResult::Errno(libc::EIO),
+    };
+    if parse_ip_from_sockaddr(&addr_bytes).is_none() {
+        return PrescanResult::ContinueWholeCall;
+    }
+    PrescanResult::OnBehalf
+}
+
+/// Validate, materialize, and send one `struct msghdr` on behalf of
+/// the child. Caller is responsible for:
+///   - dup'ing the child fd (`dup_fd`),
+///   - resolving the socket protocol (`protocol`) via
+///     `query_socket_protocol` on that dup,
+///   - having confirmed via `prescan_msghdr` that `msghdr_ptr` points
+///     at an IP-family destination (non-NULL `msg_name`).
+///
+/// Returns the byte count returned by `sendmsg`, or an errno suitable
+/// for `NotifAction::Errno`. ECONNREFUSED is used both for "destination
+/// blocked by policy" and for "couldn't parse a port from the
+/// sockaddr"; EIO for sub-buffer read failures (iovec / control).
+async fn send_msghdr_on_behalf(
+    notif: &SeccompNotif,
+    ctx: &Arc<SupervisorCtx>,
+    notif_fd: RawFd,
+    dup_fd: &std::os::unix::io::OwnedFd,
+    protocol: crate::policy::Protocol,
+    msghdr_ptr: u64,
+    flags: i32,
+) -> Result<isize, i32> {
+    let msghdr_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, msghdr_ptr, 56) {
+        Ok(b) if b.len() >= 56 => b,
+        _ => return Err(libc::EFAULT),
+    };
     let msg_name_ptr = u64::from_ne_bytes(msghdr_bytes[0..8].try_into().unwrap());
     let msg_namelen = u32::from_ne_bytes(msghdr_bytes[8..12].try_into().unwrap());
     let msg_iov_ptr = u64::from_ne_bytes(msghdr_bytes[16..24].try_into().unwrap());
@@ -437,22 +577,16 @@ async fn sendmsg_on_behalf(
     let msg_control_ptr = u64::from_ne_bytes(msghdr_bytes[32..40].try_into().unwrap());
     let msg_controllen = u64::from_ne_bytes(msghdr_bytes[40..48].try_into().unwrap());
 
-    if msg_name_ptr == 0 {
-        return NotifAction::Continue; // no address — connected socket
-    }
-
-    // 2. Copy sockaddr from msg_name
-    let addr_bytes = match read_child_mem(
-        notif_fd, notif.id, notif.pid, msg_name_ptr, msg_namelen as usize,
-    ) {
+    let addr_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, msg_name_ptr, msg_namelen as usize) {
         Ok(b) => b,
-        Err(_) => return NotifAction::Errno(libc::EIO),
+        Err(_) => return Err(libc::EIO),
     };
-
-    // 3. Check (ip, port) against the endpoint allowlist.
     let ip = match parse_ip_from_sockaddr(&addr_bytes) {
         Some(ip) => ip,
-        None => return NotifAction::Continue, // Non-IP family — allow through
+        // Caller pre-checks via prescan_msghdr; reaching this branch
+        // means the sockaddr changed under us between the prescan and
+        // here. Fail closed.
+        None => return Err(libc::EAFNOSUPPORT),
     };
     let dest_port = parse_port_from_sockaddr(&addr_bytes);
 
@@ -461,53 +595,42 @@ async fn sendmsg_on_behalf(
         let pfs = ctx.policy_fn.lock().await;
         pfs.live_policy.clone()
     };
-    let effective = ns.effective_network_policy(notif.pid, live_policy.as_ref());
+    let effective = ns.effective_network_policy(notif.pid, protocol, live_policy.as_ref());
     if !matches!(effective, crate::seccomp::notif::NetworkPolicy::Unrestricted) {
         match dest_port {
-            Some(p) if !effective.allows(ip, p) => {
-                return NotifAction::Errno(ECONNREFUSED);
-            }
-            None => return NotifAction::Errno(ECONNREFUSED),
+            Some(p) if !effective.allows(ip, p) => return Err(ECONNREFUSED),
+            None => return Err(ECONNREFUSED),
             Some(_) => {}
         }
     }
     drop(ns);
 
-    // 4. Copy iovec entries and their data buffers from child memory
-    // Safety: cap iovlen to prevent excessive allocation
     let iovlen = (msg_iovlen as usize).min(1024);
-    let iov_size = iovlen * 16; // each iovec is 16 bytes (ptr + len)
+    let iov_size = iovlen * 16;
     let iov_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, msg_iov_ptr, iov_size) {
         Ok(b) => b,
-        Err(_) => return NotifAction::Errno(libc::EIO),
+        Err(_) => return Err(libc::EIO),
     };
-
     let mut data_bufs: Vec<Vec<u8>> = Vec::with_capacity(iovlen);
     let mut local_iovs: Vec<libc::iovec> = Vec::with_capacity(iovlen);
-
     for i in 0..iovlen {
         let off = i * 16;
         if off + 16 > iov_bytes.len() { break; }
         let iov_base = u64::from_ne_bytes(iov_bytes[off..off + 8].try_into().unwrap());
         let iov_len = u64::from_ne_bytes(iov_bytes[off + 8..off + 16].try_into().unwrap()) as usize;
-
         if iov_len > MAX_SEND_BUF {
-            return NotifAction::Errno(libc::EMSGSIZE);
+            return Err(libc::EMSGSIZE);
         }
-
         if iov_base == 0 || iov_len == 0 {
             data_bufs.push(Vec::new());
             continue;
         }
-
         let buf = match read_child_mem(notif_fd, notif.id, notif.pid, iov_base, iov_len) {
             Ok(b) => b,
-            Err(_) => return NotifAction::Errno(libc::EIO),
+            Err(_) => return Err(libc::EIO),
         };
         data_bufs.push(buf);
     }
-
-    // Build local iovec array pointing to our copied data
     for buf in &data_bufs {
         local_iovs.push(libc::iovec {
             iov_base: buf.as_ptr() as *mut libc::c_void,
@@ -515,7 +638,6 @@ async fn sendmsg_on_behalf(
         });
     }
 
-    // 5. Copy control message buffer (ancillary data)
     let control_buf = if msg_control_ptr != 0 && msg_controllen > 0 {
         let len = (msg_controllen as usize).min(4096);
         read_child_mem(notif_fd, notif.id, notif.pid, msg_control_ptr, len).ok()
@@ -523,13 +645,6 @@ async fn sendmsg_on_behalf(
         None
     };
 
-    // 6. Duplicate child's socket into supervisor (use notif.pid for grandchild support)
-    let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
-        Ok(fd) => fd,
-        Err(_) => return NotifAction::Errno(libc::ENOSYS),
-    };
-
-    // 7. Build msghdr and perform sendmsg in supervisor
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_name = addr_bytes.as_ptr() as *mut libc::c_void;
     msg.msg_namelen = addr_bytes.len() as u32;
@@ -541,13 +656,107 @@ async fn sendmsg_on_behalf(
     }
 
     let ret = unsafe { libc::sendmsg(dup_fd.as_raw_fd(), &msg, flags) };
-
-    // 8. Return result
     if ret >= 0 {
-        NotifAction::ReturnValue(ret as i64)
+        Ok(ret)
     } else {
-        let errno = unsafe { *libc::__errno_location() };
-        NotifAction::Errno(errno)
+        Err(unsafe { *libc::__errno_location() })
+    }
+}
+
+// ============================================================
+// sendmmsg_on_behalf — multi-message variant
+// ============================================================
+
+/// `struct mmsghdr` size on Linux x86_64 / aarch64: 56-byte msghdr +
+/// 4-byte msg_len + 4-byte tail padding = 64 bytes. msg_len lives at
+/// offset 56.
+const MMSGHDR_SIZE: usize = 64;
+const MSG_LEN_OFFSET: usize = 56;
+/// Cap on the number of messages we'll process per sendmmsg call.
+/// Linux's UIO_MAXIOV is 1024; lower here to bound supervisor work
+/// per syscall (each entry costs at minimum a few read_child_mem
+/// hops + one sendmsg).
+const MAX_MMSGHDR_ENTRIES: usize = 256;
+
+/// Perform `sendmmsg()` on behalf of the child. Pre-scans every entry
+/// for Continue cases (NULL `msg_name` or non-IP family) — if any
+/// entry would Continue, we Continue the whole syscall to match
+/// `sendmsg_on_behalf`'s coarse-grained behavior. Otherwise dup the
+/// child fd once, query SO_PROTOCOL once, then loop:
+/// validate → send → write `msg_len` back to the child's mmsghdr.
+///
+/// On partial failure (entry K denied or send fails), returns
+/// `ReturnValue(K)` matching the kernel's "messages successfully
+/// transmitted" semantics. Returns the errno only when the very first
+/// entry fails — otherwise the child sees a positive count and reads
+/// per-entry `msg_len` to learn the per-message status.
+async fn sendmmsg_on_behalf(
+    notif: &SeccompNotif,
+    ctx: &Arc<SupervisorCtx>,
+    notif_fd: RawFd,
+) -> NotifAction {
+    let args = &notif.data.args;
+    let sockfd = args[0] as i32;
+    let msgvec_ptr = args[1];
+    let vlen = (args[2] as u32 as usize).min(MAX_MMSGHDR_ENTRIES);
+    let flags = args[3] as i32;
+
+    if vlen == 0 {
+        return NotifAction::ReturnValue(0);
+    }
+
+    // Pre-scan every entry. If any has a Continue-eligible shape
+    // (NULL msg_name or non-IP family), Continue the whole sendmmsg.
+    // Mixed-shape sendmmsg calls (some entries on-behalf, others not)
+    // aren't supported because Continue is binary at the syscall
+    // level.
+    for i in 0..vlen {
+        let entry_ptr = msgvec_ptr + (i * MMSGHDR_SIZE) as u64;
+        match prescan_msghdr(notif, notif_fd, entry_ptr) {
+            PrescanResult::OnBehalf => continue,
+            PrescanResult::ContinueWholeCall => return NotifAction::Continue,
+            PrescanResult::Errno(e) => return NotifAction::Errno(e),
+        }
+    }
+
+    let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
+        Ok(fd) => fd,
+        Err(_) => return NotifAction::Errno(libc::ENOSYS),
+    };
+    let protocol = match query_socket_protocol(dup_fd.as_raw_fd()) {
+        Some(p) => p,
+        None => return NotifAction::Errno(ECONNREFUSED),
+    };
+
+    let mut sent: usize = 0;
+    let mut first_errno: Option<i32> = None;
+
+    for i in 0..vlen {
+        let entry_ptr = msgvec_ptr + (i * MMSGHDR_SIZE) as u64;
+        match send_msghdr_on_behalf(notif, ctx, notif_fd, &dup_fd, protocol, entry_ptr, flags).await {
+            Ok(n) => {
+                let bytes = (n as u32).to_ne_bytes();
+                let _ = write_child_mem(
+                    notif_fd, notif.id, notif.pid,
+                    entry_ptr + MSG_LEN_OFFSET as u64,
+                    &bytes,
+                );
+                sent += 1;
+            }
+            Err(errno) => {
+                first_errno = Some(errno);
+                break;
+            }
+        }
+    }
+
+    if sent > 0 {
+        NotifAction::ReturnValue(sent as i64)
+    } else {
+        // Defensive: vlen > 0 + no successes means at least one attempt
+        // failed, so first_errno is set. Fall back to ECONNREFUSED
+        // rather than panicking on the unwrap if invariants ever drift.
+        NotifAction::Errno(first_errno.unwrap_or(ECONNREFUSED))
     }
 }
 
@@ -591,6 +800,8 @@ pub(crate) async fn handle_net(
         sendto_on_behalf(notif, ctx, notif_fd).await
     } else if nr == libc::SYS_sendmsg {
         sendmsg_on_behalf(notif, ctx, notif_fd).await
+    } else if nr == libc::SYS_sendmmsg {
+        sendmmsg_on_behalf(notif, ctx, notif_fd).await
     } else {
         NotifAction::Continue
     }
@@ -613,72 +824,116 @@ pub struct ResolvedNetAllow {
     pub per_ip_all_ports: HashSet<IpAddr>,
     /// Ports permitted to any IP (the `:port` form).
     pub any_ip_ports: HashSet<u16>,
-    /// Any-host any-port wildcard (`:*` / `*:*`). When true, the
-    /// sandbox is fully unrestricted on outbound TCP/UDP and the
-    /// on-behalf path is bypassed (`NetworkPolicy::Unrestricted`).
+    /// Any-host any-port wildcard (`:*` / `*:*`, or `icmp://*`). When
+    /// true, the per-protocol policy becomes `Unrestricted` and the
+    /// on-behalf check is bypassed for that protocol.
     pub any_ip_all_ports: bool,
-    /// Synthetic `/etc/hosts` content for any concrete hostnames.
-    /// `None` when no concrete hostnames are present (real `/etc/hosts`
-    /// stays visible).
+}
+
+/// Per-protocol resolved allowlists. Each protocol gets its own
+/// `ResolvedNetAllow`; the on-behalf path picks the right one based on
+/// the dup'd fd's `SO_PROTOCOL`. `etc_hosts` is shared across all
+/// protocols (the synthetic file maps every concrete host that appears
+/// in any rule).
+pub struct ResolvedNetAllowSet {
+    pub tcp: ResolvedNetAllow,
+    pub udp: ResolvedNetAllow,
+    pub icmp: ResolvedNetAllow,
+    /// Synthetic `/etc/hosts` content combining every concrete host
+    /// across all protocols. `None` when no concrete hostnames appear.
     pub etc_hosts: Option<String>,
 }
 
-/// Resolve `--net-allow` rules into the runtime allowlist.
+/// Resolve `--net-allow` rules into per-protocol runtime allowlists.
+///
+/// Rules are grouped by `Protocol` and each group is resolved
+/// independently. ICMP rules carry no ports, so the resulting ICMP
+/// `ResolvedNetAllow` always has empty `any_ip_ports` / per-IP port
+/// sets — the on-behalf check routes ICMP through the IP-only path
+/// (PortAllow::Any). A `*` host on ICMP becomes `any_ip_all_ports`,
+/// which the handler reads as "no destination check."
 pub async fn resolve_net_allow(
     rules: &[crate::policy::NetAllow],
-) -> io::Result<ResolvedNetAllow> {
-    let mut per_ip: HashMap<IpAddr, HashSet<u16>> = HashMap::new();
-    let mut per_ip_all_ports: HashSet<IpAddr> = HashSet::new();
-    let mut any_ip_ports: HashSet<u16> = HashSet::new();
-    let mut any_ip_all_ports = false;
+) -> io::Result<ResolvedNetAllowSet> {
+    use crate::policy::Protocol;
+
+    // Single shared etc_hosts for all protocols. Every concrete host
+    // (regardless of protocol) ends up resolvable in the sandbox.
     let mut etc_hosts = String::from("127.0.0.1 localhost\n::1 localhost\n");
     let mut has_concrete_host = false;
 
-    for rule in rules {
-        match &rule.host {
-            None => {
-                if rule.all_ports {
-                    any_ip_all_ports = true;
-                } else {
-                    for &p in &rule.ports {
-                        any_ip_ports.insert(p);
-                    }
-                }
-            }
-            Some(host) => {
-                has_concrete_host = true;
-                let addr = format!("{}:0", host);
-                let resolved = tokio::net::lookup_host(addr.as_str()).await.map_err(|e| {
-                    io::Error::new(
-                        e.kind(),
-                        format!("failed to resolve host '{}': {}", host, e),
-                    )
-                })?;
-                for socket_addr in resolved {
-                    let ip = socket_addr.ip();
-                    if rule.all_ports {
-                        per_ip_all_ports.insert(ip);
-                        // Keep an entry in per_ip so callers iterating
-                        // resolved hosts still see this IP. The runtime
-                        // policy honors per_ip_all_ports first.
-                        per_ip.entry(ip).or_default();
+    let per_proto = |target: Protocol| async move {
+        let mut per_ip: HashMap<IpAddr, HashSet<u16>> = HashMap::new();
+        let mut per_ip_all_ports: HashSet<IpAddr> = HashSet::new();
+        let mut any_ip_ports: HashSet<u16> = HashSet::new();
+        let mut any_ip_all_ports = false;
+        let mut local_etc_hosts = String::new();
+        let mut local_has_concrete = false;
+
+        for rule in rules.iter().filter(|r| r.protocol == target) {
+            match &rule.host {
+                None => {
+                    if rule.all_ports || target == Protocol::Icmp {
+                        // ICMP rules never carry ports, so a wildcard-host
+                        // ICMP rule (`icmp://*`) means "any destination."
+                        any_ip_all_ports = true;
                     } else {
-                        let entry = per_ip.entry(ip).or_default();
                         for &p in &rule.ports {
-                            entry.insert(p);
+                            any_ip_ports.insert(p);
                         }
                     }
-                    etc_hosts.push_str(&format!("{} {}\n", ip, host));
+                }
+                Some(host) => {
+                    local_has_concrete = true;
+                    let addr = format!("{}:0", host);
+                    let resolved = tokio::net::lookup_host(addr.as_str()).await.map_err(|e| {
+                        io::Error::new(
+                            e.kind(),
+                            format!("failed to resolve host '{}': {}", host, e),
+                        )
+                    })?;
+                    for socket_addr in resolved {
+                        let ip = socket_addr.ip();
+                        if rule.all_ports || target == Protocol::Icmp {
+                            per_ip_all_ports.insert(ip);
+                            per_ip.entry(ip).or_default();
+                        } else {
+                            let entry = per_ip.entry(ip).or_default();
+                            for &p in &rule.ports {
+                                entry.insert(p);
+                            }
+                        }
+                        local_etc_hosts.push_str(&format!("{} {}\n", ip, host));
+                    }
                 }
             }
         }
-    }
 
-    Ok(ResolvedNetAllow {
-        per_ip,
-        per_ip_all_ports,
-        any_ip_ports,
-        any_ip_all_ports,
+        Ok::<_, io::Error>((
+            ResolvedNetAllow {
+                per_ip,
+                per_ip_all_ports,
+                any_ip_ports,
+                any_ip_all_ports,
+            },
+            local_etc_hosts,
+            local_has_concrete,
+        ))
+    };
+
+    let (tcp, tcp_eh, tcp_concrete) = per_proto(Protocol::Tcp).await?;
+    let (udp, udp_eh, udp_concrete) = per_proto(Protocol::Udp).await?;
+    let (icmp, icmp_eh, icmp_concrete) = per_proto(Protocol::Icmp).await?;
+
+    for chunk in [tcp_eh, udp_eh, icmp_eh] {
+        etc_hosts.push_str(&chunk);
+    }
+    has_concrete_host |= tcp_concrete || udp_concrete || icmp_concrete;
+
+    Ok(ResolvedNetAllowSet {
+        tcp,
+        udp,
+        icmp,
         etc_hosts: if has_concrete_host { Some(etc_hosts) } else { None },
     })
 }
@@ -695,88 +950,161 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_net_allow_empty() {
         let resolved = resolve_net_allow(&[]).await.unwrap();
-        assert!(resolved.per_ip.is_empty());
-        assert!(resolved.any_ip_ports.is_empty());
+        assert!(resolved.tcp.per_ip.is_empty());
+        assert!(resolved.tcp.any_ip_ports.is_empty());
+        assert!(resolved.udp.per_ip.is_empty());
+        assert!(resolved.icmp.per_ip.is_empty());
         assert!(resolved.etc_hosts.is_none());
     }
 
     #[tokio::test]
     async fn test_resolve_net_allow_concrete_host() {
         let rules = vec![NetAllow {
+            protocol: crate::policy::Protocol::Tcp,
             host: Some("localhost".to_string()),
             ports: vec![80, 443],
             all_ports: false,
         }];
         let resolved = resolve_net_allow(&rules).await.unwrap();
-        // localhost should resolve to at least one loopback addr.
-        assert!(!resolved.per_ip.is_empty());
-        for ports in resolved.per_ip.values() {
+        // localhost should resolve to at least one loopback addr; only
+        // the TCP set has entries.
+        assert!(!resolved.tcp.per_ip.is_empty());
+        for ports in resolved.tcp.per_ip.values() {
             assert!(ports.contains(&80));
             assert!(ports.contains(&443));
         }
+        assert!(resolved.udp.per_ip.is_empty());
+        assert!(resolved.icmp.per_ip.is_empty());
         assert!(resolved.etc_hosts.as_deref().unwrap_or("").contains("localhost"));
     }
 
     #[tokio::test]
     async fn test_resolve_net_allow_any_ip() {
-        let rules = vec![NetAllow { host: None, ports: vec![8080], all_ports: false }];
+        let rules = vec![NetAllow { protocol: crate::policy::Protocol::Tcp, host: None, ports: vec![8080], all_ports: false }];
         let resolved = resolve_net_allow(&rules).await.unwrap();
-        assert!(resolved.per_ip.is_empty());
-        assert!(resolved.any_ip_ports.contains(&8080));
-        assert!(!resolved.any_ip_all_ports);
+        assert!(resolved.tcp.per_ip.is_empty());
+        assert!(resolved.tcp.any_ip_ports.contains(&8080));
+        assert!(!resolved.tcp.any_ip_all_ports);
         assert!(resolved.etc_hosts.is_none());
     }
 
     #[tokio::test]
     async fn test_resolve_net_allow_any_ip_all_ports() {
-        // `:*` — fully unrestricted egress.
-        let rules = vec![NetAllow { host: None, ports: vec![], all_ports: true }];
+        // `:*` — fully unrestricted egress, TCP-only.
+        let rules = vec![NetAllow { protocol: crate::policy::Protocol::Tcp, host: None, ports: vec![], all_ports: true }];
         let resolved = resolve_net_allow(&rules).await.unwrap();
-        assert!(resolved.any_ip_all_ports);
-        assert!(resolved.per_ip.is_empty());
-        assert!(resolved.per_ip_all_ports.is_empty());
-        assert!(resolved.any_ip_ports.is_empty());
+        assert!(resolved.tcp.any_ip_all_ports);
+        assert!(resolved.tcp.per_ip.is_empty());
+        assert!(resolved.tcp.per_ip_all_ports.is_empty());
+        assert!(resolved.tcp.any_ip_ports.is_empty());
+        // UDP/ICMP unaffected by a TCP rule.
+        assert!(!resolved.udp.any_ip_all_ports);
+        assert!(!resolved.icmp.any_ip_all_ports);
     }
 
     #[tokio::test]
     async fn test_resolve_net_allow_concrete_host_all_ports() {
-        // `localhost:*` — every port to localhost only.
+        // `localhost:*` — every port to localhost only, TCP.
         let rules = vec![NetAllow {
+            protocol: crate::policy::Protocol::Tcp,
             host: Some("localhost".to_string()),
             ports: vec![],
             all_ports: true,
         }];
         let resolved = resolve_net_allow(&rules).await.unwrap();
-        assert!(!resolved.any_ip_all_ports);
-        assert!(!resolved.per_ip_all_ports.is_empty(),
+        assert!(!resolved.tcp.any_ip_all_ports);
+        assert!(!resolved.tcp.per_ip_all_ports.is_empty(),
             "localhost should resolve to at least one IP marked as any-port");
-        // per_ip has placeholder entries for the same IPs (so callers
-        // iterating per_ip still see them).
-        for ip in resolved.per_ip_all_ports.iter() {
-            assert!(resolved.per_ip.contains_key(ip));
+        for ip in resolved.tcp.per_ip_all_ports.iter() {
+            assert!(resolved.tcp.per_ip.contains_key(ip));
         }
-        // /etc/hosts is synthesized for concrete hosts.
         assert!(resolved.etc_hosts.is_some());
     }
 
     #[tokio::test]
     async fn test_resolve_net_allow_mixed_wildcard_and_concrete() {
         // Wildcard rule alongside concrete: wildcard sets the global
-        // any-host any-port flag; concrete rule still resolves into
-        // per_ip (the runtime layer chooses Unrestricted, ignoring the
-        // concrete entries — that's a runtime-policy concern, not a
-        // resolver concern).
+        // any-host any-port flag for TCP; concrete rule still resolves
+        // into per_ip (the runtime layer chooses Unrestricted, ignoring
+        // the concrete entries).
         let rules = vec![
-            NetAllow { host: None, ports: vec![], all_ports: true },
+            NetAllow { protocol: crate::policy::Protocol::Tcp, host: None, ports: vec![], all_ports: true },
             NetAllow {
+                protocol: crate::policy::Protocol::Tcp,
                 host: Some("localhost".to_string()),
                 ports: vec![22],
                 all_ports: false,
             },
         ];
         let resolved = resolve_net_allow(&rules).await.unwrap();
-        assert!(resolved.any_ip_all_ports);
-        // Concrete entries still present in per_ip.
-        assert!(!resolved.per_ip.is_empty());
+        assert!(resolved.tcp.any_ip_all_ports);
+        assert!(!resolved.tcp.per_ip.is_empty());
+    }
+
+    // ============================================================
+    // Per-protocol resolution — UDP / ICMP slices stay isolated
+    // ============================================================
+
+    #[tokio::test]
+    async fn test_resolve_per_protocol_isolation() {
+        // A UDP rule should not appear in the TCP set, and vice versa.
+        // This is the property Phase 2 relies on for protocol routing.
+        let rules = vec![
+            NetAllow {
+                protocol: crate::policy::Protocol::Tcp,
+                host: Some("localhost".to_string()),
+                ports: vec![443],
+                all_ports: false,
+            },
+            NetAllow {
+                protocol: crate::policy::Protocol::Udp,
+                host: None,
+                ports: vec![53],
+                all_ports: false,
+            },
+        ];
+        let resolved = resolve_net_allow(&rules).await.unwrap();
+        assert!(!resolved.tcp.per_ip.is_empty(), "TCP rule should populate tcp set");
+        assert!(resolved.udp.any_ip_ports.contains(&53), "UDP rule should populate udp set");
+        // Cross-contamination check: TCP per_ip ports must not contain 53;
+        // UDP must not contain 443.
+        for ports in resolved.tcp.per_ip.values() {
+            assert!(!ports.contains(&53), "UDP port leaked into TCP set");
+        }
+        assert!(!resolved.udp.any_ip_ports.contains(&443), "TCP port leaked into UDP set");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_icmp_no_ports() {
+        // ICMP rules carry no ports; concrete hosts go into per_ip with
+        // PortAllow::Any-style empty port set, plus per_ip_all_ports.
+        let rules = vec![NetAllow {
+            protocol: crate::policy::Protocol::Icmp,
+            host: Some("localhost".to_string()),
+            ports: vec![],
+            all_ports: false,
+        }];
+        let resolved = resolve_net_allow(&rules).await.unwrap();
+        assert!(!resolved.icmp.per_ip.is_empty(), "icmp host should populate per_ip");
+        assert!(!resolved.icmp.per_ip_all_ports.is_empty(),
+            "icmp host should mark per_ip_all_ports (no port check)");
+        assert!(resolved.icmp.any_ip_ports.is_empty());
+        // TCP/UDP unaffected.
+        assert!(resolved.tcp.per_ip.is_empty());
+        assert!(resolved.udp.per_ip.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_icmp_wildcard() {
+        // `icmp://*` — any ICMP destination.
+        let rules = vec![NetAllow {
+            protocol: crate::policy::Protocol::Icmp,
+            host: None,
+            ports: vec![],
+            all_ports: false,
+        }];
+        let resolved = resolve_net_allow(&rules).await.unwrap();
+        assert!(resolved.icmp.any_ip_all_ports);
+        assert!(!resolved.tcp.any_ip_all_ports);
     }
 }

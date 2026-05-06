@@ -575,6 +575,7 @@ fn syscall_name(nr: i64) -> &'static str {
         n if n == libc::SYS_connect => "connect",
         n if n == libc::SYS_sendto => "sendto",
         n if n == libc::SYS_sendmsg => "sendmsg",
+        n if n == libc::SYS_sendmmsg => "sendmmsg",
         n if n == libc::SYS_bind => "bind",
         n if n == libc::SYS_clone => "clone",
         n if n == libc::SYS_clone3 => "clone3",
@@ -605,7 +606,8 @@ fn syscall_category(nr: i64) -> crate::policy_fn::SyscallCategory {
             || n == libc::SYS_faccessat || n == libc::SYS_getdents64
             || Some(n) == arch::SYS_GETDENTS => SyscallCategory::File,
         n if n == libc::SYS_connect || n == libc::SYS_sendto
-            || n == libc::SYS_sendmsg || n == libc::SYS_bind
+            || n == libc::SYS_sendmsg || n == libc::SYS_sendmmsg
+            || n == libc::SYS_bind
             || n == libc::SYS_getsockname => SyscallCategory::Network,
         n if n == libc::SYS_clone || n == libc::SYS_clone3
             || Some(n) == arch::SYS_VFORK || Some(n) == arch::SYS_FORK
@@ -1251,7 +1253,9 @@ mod tests {
     #[test]
     fn test_network_state_new() {
         let ns = super::super::state::NetworkState::new();
-        assert!(matches!(ns.network_policy, NetworkPolicy::Unrestricted));
+        assert!(matches!(ns.tcp_policy, NetworkPolicy::Unrestricted));
+        assert!(matches!(ns.udp_policy, NetworkPolicy::Unrestricted));
+        assert!(matches!(ns.icmp_policy, NetworkPolicy::Unrestricted));
         assert!(ns.port_map.bound_ports.is_empty());
     }
 

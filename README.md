@@ -110,13 +110,18 @@ sandlock run --net-allow github.com:22,443 --net-allow :8080 \
 # Wildcard port — `host:*` permits every port to the host
 sandlock run --net-allow github.com:* -r /usr -r /lib -r /etc -- ssh user@github.com
 
-# Unrestricted outbound — `:*` opens any host and any port. UDP socket
-# creation is still gated by --allow-udp; pair the two for full egress.
-sandlock run --net-allow :* --allow-udp -r /usr -r /lib -r /etc -- ./client
-
-# UDP — opt in to UDP and allowlist the destination (e.g. DNS)
-sandlock run --allow-udp --net-allow 1.1.1.1:53 --net-allow :443 \
+# Unrestricted outbound — `:*` opens any host and any TCP port. For full
+# egress add a UDP wildcard via the `udp://*:*` scheme.
+sandlock run --net-allow :* --net-allow udp://*:* \
   -r /usr -r /lib -r /etc -- ./client
+
+# UDP — scheme prefix gates the protocol and scopes the destination
+# (e.g. DNS to 1.1.1.1, plus TCP HTTPS to anywhere)
+sandlock run --net-allow udp://1.1.1.1:53 --net-allow :443 \
+  -r /usr -r /lib -r /etc -- ./client
+
+# Ping — kernel ping socket (SOCK_DGRAM) gated by net.ipv4.ping_group_range
+sandlock run --net-allow icmp://github.com -r /usr -r /lib -r /etc -- ping github.com
 
 # HTTP-level ACL (method + host + path rules via transparent proxy)
 # HTTP rules with concrete hosts auto-extend --net-allow with host:80,443
@@ -516,81 +521,88 @@ Landlock + seccomp confinement. `CLONE_ID=0..N-1` is set automatically.
 
 ### Network Model
 
-Outbound traffic is gated by a single endpoint allowlist. Each
-`--net-allow` rule names a `(host, ports)` pair, multiple rules are
-OR'd, and a destination is permitted iff `(IP, port)` matches at least
-one rule. The same allowlist applies to TCP `connect()` and to UDP
-`sendto` / `sendmsg` destinations — the latter only relevant when
-`--allow-udp` is set, since UDP socket creation is denied by default.
+Outbound traffic is gated by a single endpoint allowlist that names
+**protocol × destination**. Each `--net-allow` rule is one of:
 
 ```
 --net-allow <spec>          repeatable; no rules = deny all outbound
-                            <spec> = host:port[,port,...]   (IP-restricted)
-                                   | :port  | *:port        (any IP, listed port)
-                                   | host:*                 (host, any port)
-                                   | :*  | *:*              (any IP, any port)
+  bare form  host:port[,port,...] / :port / *:port / host:* / :* / *:*   (TCP)
+  tcp://     same suffix grammar — explicit TCP
+  udp://     same suffix grammar — UDP (`udp://*:*` opens any UDP)
+  icmp://    host or `*`, no port — kernel ping socket (SOCK_DGRAM)
 ```
 
+Multiple rules are OR'd. A destination is permitted iff some rule
+matches the **same protocol** as the socket plus the destination IP
+and port (port is N/A for ICMP).
+
+**Protocol gating** falls out of rule presence per scheme:
+
+  * No UDP rule → UDP socket creation is denied at the seccomp layer.
+  * No ICMP rule → kernel ping socket creation (SOCK_DGRAM + IPPROTO_ICMP)
+    is denied at the seccomp layer.
+  * Raw ICMP (SOCK_RAW + IPPROTO_ICMP) is **never exposed** — packet
+    crafting is out of scope. Workloads that need ping should rely on
+    the host's `net.ipv4.ping_group_range` and use the dgram path
+    above (`--net-allow icmp://...`).
+  * TCP is always permitted at the syscall level; destinations are
+    governed by Landlock and/or the on-behalf path.
+
 **Defaults.** With no `--net-allow` and no HTTP ACL flags, Landlock
-denies every TCP `connect()`, UDP and raw socket creation are denied
-at the seccomp layer, and there is no on-behalf path active. For
-unrestricted egress, opt in explicitly with `--net-allow :*` (still
-UDP-gated by `--allow-udp`).
+denies every TCP `connect()`, UDP / ICMP / raw socket creation are
+denied at the seccomp layer, and there is no on-behalf path active.
+For unrestricted TCP egress, opt in explicitly with
+`--net-allow :*`; for any UDP, add `--net-allow udp://*:*`.
 
 **Resolution.** Concrete hostnames are resolved once at sandbox start
-and pinned in a synthetic `/etc/hosts`. The synthetic file replaces
-the real one only when `--net-allow` includes at least one concrete
-host; pure `:port` rules leave the real `/etc/hosts` and DNS visible.
+and pinned in a synthetic `/etc/hosts` (across all protocols). The
+synthetic file replaces the real one only when at least one rule has
+a concrete host; pure `:port` / `udp://*:*` / `icmp://*` rules leave
+the real `/etc/hosts` and DNS visible.
 
 **Wildcards.** Hostnames are matched literally — `--net-allow
 *.example.com:443` is **not** supported, list each domain you need.
-The `*` token is allowed in two positions: as the host (alias for
-empty: `*:port` ≡ `:port`) and as the port to mean "any port"
-(`host:*`, `:*`, `*:*`). Mixing `*` with concrete ports
-(`host:80,*`) is rejected — use either the wildcard or an explicit
-list. When any rule uses the all-ports wildcard, Landlock no longer
-filters TCP connect at the kernel level (it cannot express "every
-port" without enumerating 65535 rules); the on-behalf path becomes
-the sole enforcer, and for `:*` it short-circuits to allow-all.
+The `*` token is allowed as the host (alias for empty: `*:port` ≡
+`:port`) and as the port for TCP/UDP rules (`host:*`, `:*`, `*:*`,
+`udp://*:*`). Mixing `*` with concrete ports (`host:80,*`) is
+rejected. When any TCP rule uses the all-ports wildcard, Landlock no
+longer filters TCP connect at the kernel level (it cannot express
+"every port" without enumerating 65535 rules); the on-behalf path
+becomes the sole enforcer, and for `:*` it short-circuits to
+allow-all.
 
 **Implementation.** Two enforcement paths:
 
-  * **Direct path** — pure `:port` policies (no concrete host) and no
-    HTTP ACL. Landlock enforces the TCP port allowlist at the kernel
-    level; no per-syscall overhead. UDP is not covered by Landlock and
-    therefore always uses the on-behalf path when allowed.
-  * **On-behalf path** — any concrete host, any HTTP ACL rule, or
-    `--allow-udp`. Seccomp traps `connect()`, `sendto()`, and
-    `sendmsg()`; the supervisor checks the `(ip, port)` against the
-    resolved allowlist and performs the syscall. The HTTP/HTTPS proxy
-    redirect (when configured) happens here too.
+  * **Direct path** — pure `:port` TCP policies (no concrete host)
+    and no HTTP ACL. Landlock enforces the TCP port allowlist at the
+    kernel level; no per-syscall overhead. UDP and ICMP are not
+    covered by Landlock and always use the on-behalf path when allowed.
+  * **On-behalf path** — any concrete host, any HTTP ACL rule, or any
+    UDP / ICMP rule. Seccomp traps `connect()`, `sendto()`, `sendmsg()`,
+    and `sendmmsg()`; the supervisor dups the child fd, queries
+    `getsockopt(SOL_SOCKET, SO_PROTOCOL)` to learn whether the socket
+    is TCP / UDP / ICMP, then checks the destination against that
+    protocol's resolved allowlist before performing the syscall.
+    The HTTP/HTTPS proxy redirect (when configured) happens here too.
 
 **HTTP / HTTPS interception.** `--http-allow` / `--http-deny` route
 matching ports through a transparent proxy. Each rule with a concrete
 host auto-extends `--net-allow` with `host:80` (and `host:443` when
 `--https-ca` is set) so the proxy's intercept ports are reachable;
-wildcard hosts auto-add `:80` / `:443` (any IP). HTTPS MITM is opt-in:
-pass `--https-ca <cert>` and `--https-key <key>` for a CA *you generate*
-and trust inside the sandbox (typically install the cert into the
-workload's `/etc/ssl/certs/`). Without `--https-ca`, port 443 is not
-intercepted — `--net-allow host:443` permits raw TLS to the host with
-no content inspection.
+wildcard hosts auto-add `:80` / `:443` (any IP). All auto-added
+entries are TCP. HTTPS MITM is opt-in: pass `--https-ca <cert>` and
+`--https-key <key>` for a CA *you generate* and trust inside the
+sandbox (typically install the cert into the workload's
+`/etc/ssl/certs/`). Without `--https-ca`, port 443 is not intercepted
+— `--net-allow host:443` permits raw TLS to the host with no content
+inspection.
 
 **Bind.** `--net-bind <port>` is independent from `--net-allow` and
-governs server-side `bind()`. Landlock enforces it; `--port-remap` adds
-on-behalf virtualization for binding.
+governs server-side `bind()`. Landlock enforces it (TCP only);
+`--port-remap` adds on-behalf virtualization for binding.
 
-**UDP, ICMP, unix.** Default-deny, opt in via dedicated flags:
-
-  * `--allow-udp` enables UDP socket creation. Outbound UDP
-    destinations are then gated by the same `--net-allow` allowlist
-    used for TCP — the seccomp on-behalf path also covers `sendto` /
-    `sendmsg`. Example: `--allow-udp --net-allow 1.1.1.1:53` for DNS.
-  * `--allow-icmp` narrowly permits `socket(AF_INET, SOCK_RAW,
-    IPPROTO_ICMP)` and the IPv6 equivalent only — enough for `ping`.
-    Other raw socket types stay denied.
-  * AF_UNIX sockets are governed by Landlock's
-    `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`.
+**AF_UNIX sockets** are governed by Landlock's
+`LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`, independent from `--net-allow`.
 
 ### Port Virtualization
 
@@ -651,11 +663,20 @@ Policy(
     # Syscall filtering (seccomp)
     block_syscalls=[],              # Extra syscalls to block in addition to Sandlock defaults
 
-    # Network — see "Network Model" above. Each entry is `host:port[,port,...]`,
-    # `:port`, `*:port`, `host:*`, or `:*` / `*:*`. Empty list = deny all
-    # outbound; `:*` = unrestricted. Same allowlist gates UDP destinations
-    # when allow_udp=True (e.g. `:53` for DNS).
-    net_allow=["api.example.com:443", "github.com:22,443", ":8080"],
+    # Network — see "Network Model" above. Each entry is one of:
+    #   bare host:port[,port,...]  — TCP (default scheme)
+    #   tcp://host:port            — explicit TCP
+    #   udp://host:port            — UDP (`udp://*:*` for any UDP)
+    #   icmp://host                — kernel ping socket (`icmp://*` = any)
+    # Empty list = deny all outbound. Protocol gating falls out of rule
+    # presence: with no UDP/ICMP rule, the corresponding socket creation
+    # is denied at the seccomp layer. Raw ICMP is not exposed.
+    net_allow=[
+        "api.example.com:443",
+        "github.com:22,443",
+        "udp://1.1.1.1:53",        # DNS over UDP
+        "icmp://github.com",       # ping (gated by ping_group_range)
+    ],
     net_bind=[8080],               # TCP bind ports (Landlock; ABI v4+)
 
     # HTTP ACL (transparent proxy)
@@ -664,10 +685,6 @@ Policy(
     http_ports=[80],               # Ports to intercept (default: [80])
     https_ca="ca.pem",             # CA cert for HTTPS MITM (adds port 443)
     https_key="ca-key.pem",        # CA key for HTTPS MITM
-
-    # Socket restrictions (raw sockets and UDP denied by default)
-    allow_udp=False,               # CLI: --allow-udp; outbound UDP still gated by net_allow
-    allow_icmp=False,              # CLI: --allow-icmp; permits ICMP raw only (AF_INET/AF_INET6 + SOCK_RAW + IPPROTO_ICMP[V6])
 
     # Resources
     max_memory="512M",             # Memory limit
