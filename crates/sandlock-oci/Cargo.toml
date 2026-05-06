@@ -1,0 +1,28 @@
+[package]
+name = "sandlock-oci"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "OCI runtime shim for sandlock — namespace-less, Landlock-based sandbox"
+readme = "../../README.md"
+
+[[bin]]
+name = "sandlock-oci"
+path = "src/main.rs"
+
+[dependencies]
+sandlock-core = { version = "0.7.0", path = "../sandlock-core" }
+anyhow      = "1"
+clap        = { version = "4", features = ["derive"] }
+tokio       = { version = "1", features = ["rt-multi-thread", "macros"] }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+libc        = "0.2"
+oci-spec    = { version = "0.7", features = ["runtime"] }
+nix         = { version = "0.29", features = ["signal", "process"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio    = { version = "1", features = ["rt-multi-thread", "macros"] }
