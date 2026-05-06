@@ -192,12 +192,12 @@ mod tests {
 
     #[test]
     fn test_confine_absolute() {
-        assert_eq!(confine("/etc/os-release"), PathBuf::from("/etc/os-release"));
+        assert_eq!(confine("/etc/group"), PathBuf::from("/etc/group"));
     }
 
     #[test]
     fn test_confine_dotdot_at_root() {
-        assert_eq!(confine("/../../etc/os-release"), PathBuf::from("/etc/os-release"));
+        assert_eq!(confine("/../../etc/group"), PathBuf::from("/etc/group"));
     }
 
     #[test]
@@ -218,8 +218,8 @@ mod tests {
     #[test]
     fn test_to_virtual_path() {
         assert_eq!(
-            to_virtual_path(Path::new("/rootfs"), Path::new("/rootfs/etc/os-release")),
-            Some(PathBuf::from("/etc/os-release"))
+            to_virtual_path(Path::new("/rootfs"), Path::new("/rootfs/etc/group")),
+            Some(PathBuf::from("/etc/group"))
         );
     }
 
@@ -249,9 +249,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(root.join("etc")).unwrap();
-        std::fs::write(root.join("etc/os-release"), "ID=test\n").unwrap();
+        std::fs::write(root.join("etc/group"), "root:x:0:\n").unwrap();
 
-        let fd = openat2_in_root(root, "/etc/os-release", libc::O_RDONLY, 0);
+        let fd = openat2_in_root(root, "/etc/group", libc::O_RDONLY, 0);
         match fd {
             Ok(fd) => unsafe { libc::close(fd) },
             Err(libc::ENOSYS) => return, // kernel too old
@@ -265,10 +265,10 @@ mod tests {
         let root = tmp.path();
         std::fs::create_dir_all(root.join("a")).unwrap();
 
-        let fd = openat2_in_root(root, "/../../../etc/os-release", libc::O_PATH, 0);
+        let fd = openat2_in_root(root, "/../../../etc/group", libc::O_PATH, 0);
         match fd {
             // RESOLVE_IN_ROOT clamps ".." at the root, so this resolves
-            // to <root>/etc/os-release which doesn't exist → ENOENT.
+            // to <root>/etc/group which doesn't exist → ENOENT.
             Err(libc::ENOENT) => {}
             Err(libc::ENOSYS) => return,
             Ok(fd) => {
@@ -373,7 +373,7 @@ mod tests {
         let root = tmp.path();
         std::fs::create_dir_all(root.join("a")).unwrap();
 
-        let result = resolve_in_root(root, "/a/../../etc/os-release");
+        let result = resolve_in_root(root, "/a/../../etc/group");
         // Either resolves within root or returns None — never escapes.
         if let Some((host, _)) = result {
             assert!(host.starts_with(root));
