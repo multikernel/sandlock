@@ -137,21 +137,29 @@ class Policy:
     block_syscalls: Sequence[str] = field(default_factory=list)
     """Additional syscall names to block on top of Sandlock's default blocklist."""
 
-    # Network — endpoint allowlist (IP × port via seccomp on-behalf path)
+    # Network — endpoint allowlist (protocol × IP × port via seccomp on-behalf path)
     net_allow: Sequence[str] = field(default_factory=list)
-    """Outbound endpoint rules. Applies to TCP and to UDP (when
-    :attr:`allow_udp` is set). Each entry is a string of the form:
+    """Outbound endpoint rules. Each entry is a string. The bare form is
+    TCP; other protocols use a scheme prefix:
 
-    * ``"host:port"`` — restrict to one host on one port (e.g. ``"api.openai.com:443"``)
-    * ``"host:port,port,..."`` — multiple ports for one host (e.g. ``"github.com:22,443"``)
-    * ``":port"`` or ``"*:port"`` — any IP on this port (e.g. ``":53"`` for DNS)
+    * ``"host:port"`` — TCP to one host on one port (e.g. ``"api.openai.com:443"``)
+    * ``"host:port,port,..."`` — TCP, multiple ports (e.g. ``"github.com:22,443"``)
+    * ``":port"`` / ``"*:port"`` — TCP on any IP (e.g. ``":53"``)
+    * ``"tcp://host:port"`` — explicit TCP (same suffix grammar as bare form)
+    * ``"udp://host:port"`` — UDP to a host
+    * ``"udp://*:*"`` — any UDP (matches the previous ``allow_udp=True`` behavior)
+    * ``"icmp://host"`` — kernel ping socket (SOCK_DGRAM + IPPROTO_ICMP) to a host
+    * ``"icmp://*"`` — any ICMP echo destination
 
+    Sandlock does not expose raw ICMP (SOCK_RAW). Workloads that need
+    ping should rely on the host's ``net.ipv4.ping_group_range`` and
+    use the dgram path above.
+
+    Protocol gating falls out of rule presence: with no UDP/ICMP rules,
+    UDP and ICMP socket creation are denied at the seccomp layer.
     Hostnames are resolved at sandbox-creation time and pinned via a
-    synthetic ``/etc/hosts``. Empty = deny all outbound (Landlock
-    rejects TCP on the direct path; no on-behalf path is enabled, so
-    UDP `sendto`/`sendmsg` are also untrapped — but UDP socket creation
-    itself is denied unless :attr:`allow_udp` is set). HTTP rules with
-    concrete hosts auto-add a matching entry on :attr:`http_ports`.
+    synthetic ``/etc/hosts``. Empty = deny all outbound. HTTP rules with
+    concrete hosts auto-add a matching TCP entry on :attr:`http_ports`.
     See README "Network Model" for details."""
 
     no_coredump: bool = False
@@ -162,24 +170,8 @@ class Policy:
     # Network — bind allowlist (Landlock ABI v4+, TCP only)
     net_bind: Sequence[int | str] = field(default_factory=list)
     """TCP ports the sandbox may bind. Empty = deny all. Each entry is
-    a port number or a ``"lo-hi"`` range string. UDP bind is gated by
-    :attr:`allow_udp` rather than this list — Landlock's port hooks
-    are TCP-only."""
-
-    # Socket type restrictions (seccomp-enforced).
-    # Raw sockets and UDP are denied by default; opt in via the flags below.
-    allow_udp: bool = False
-    """Permit UDP sockets (SOCK_DGRAM on AF_INET/AF_INET6). UDP is denied
-    by default. When ``True``, outbound UDP destinations are still gated
-    by :attr:`net_allow` — same endpoint allowlist used for TCP. AF_UNIX
-    datagrams are unaffected. CLI: ``--allow-udp``. Enforced via seccomp BPF."""
-
-    allow_icmp: bool = False
-    """Narrow ICMP raw socket carve-out: permit
-    ``socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)`` and the IPv6 equivalent
-    only. All other raw socket types remain denied. Useful for ``ping``
-    without granting full packet-crafting capability.
-    CLI: ``--allow-icmp``. Enforced via seccomp BPF."""
+    a port number or a ``"lo-hi"`` range string. Landlock's port hooks
+    are TCP-only — UDP bind is not separately gated."""
 
     # HTTP ACL
     http_allow: Sequence[str] = field(default_factory=list)

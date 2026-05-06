@@ -5,8 +5,10 @@ fn test_default_policy() {
     let policy = Policy::builder().build().unwrap();
     assert_eq!(policy.max_processes, 64);
     assert!(policy.block_syscalls.is_empty());
-    assert!(!policy.allow_udp, "UDP is denied by default");
-    assert!(!policy.allow_icmp, "ICMP raw is denied by default");
+    // UDP, ICMP, and raw ICMP are denied by default — there are no rules
+    // for those protocols in `net_allow`, which is what the BPF filter
+    // gates on now (no separate booleans).
+    assert!(policy.net_allow.is_empty());
     assert!(policy.uid.is_none());
     assert!(policy.fs_writable.is_empty());
     assert!(policy.fs_readable.is_empty());
@@ -128,15 +130,20 @@ fn test_env_var() {
 }
 
 #[test]
-fn test_allow_udp_default_false() {
+fn test_udp_default_denied() {
+    // Opt in via `.net_allow("udp://*:*")` (or a scoped UDP rule).
     let p = Policy::builder().build().unwrap();
-    assert!(!p.allow_udp, "UDP is denied by default; opt in via .allow_udp(true)");
+    use sandlock_core::policy::Protocol;
+    assert!(!p.net_allow.iter().any(|r| r.protocol == Protocol::Udp));
 }
 
 #[test]
-fn test_allow_icmp_default_false() {
+fn test_icmp_default_denied() {
+    // Opt in via `.net_allow("icmp://*")` (kernel ping socket).
+    // Raw ICMP is unconditionally denied — sandlock does not expose it.
     let p = Policy::builder().build().unwrap();
-    assert!(!p.allow_icmp, "ICMP raw is denied by default; opt in via .allow_icmp(true)");
+    use sandlock_core::policy::Protocol;
+    assert!(!p.net_allow.iter().any(|r| r.protocol == Protocol::Icmp));
 }
 
 #[test]

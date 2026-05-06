@@ -32,8 +32,6 @@ _SIMPLE_FIELDS: dict[str, type] = {
     # Network
     "net_allow": list,
     "net_bind": list,
-    "allow_udp": bool,
-    "allow_icmp": bool,
     # Resources
     "max_memory": str,
     "max_processes": int,

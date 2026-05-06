@@ -213,7 +213,16 @@ fn confine_inner(policy: &Policy, handle_net: bool) -> Result<(), SandlockError>
     // the per-rule IP allowlist when the rule is `host:*`. For `:*`
     // the on-behalf path becomes `NetworkPolicy::Unrestricted` (no
     // additional check). Bind enforcement is unaffected.
-    let net_wildcard = policy.net_allow.iter().any(|r| r.all_ports);
+    // Landlock's net hooks only cover TCP (CONNECT_TCP / BIND_TCP).
+    // UDP and ICMP rules are enforced elsewhere (BPF gates plus the
+    // on-behalf path), so they're filtered out here — feeding them to
+    // Landlock would either be a no-op (for unhandled protocols) or
+    // wrongly install TCP rules from a UDP wildcard.
+    use crate::policy::Protocol;
+    let net_wildcard = policy
+        .net_allow
+        .iter()
+        .any(|r| r.protocol == Protocol::Tcp && r.all_ports);
     let handled_access_net = if !handle_net {
         0
     } else if net_wildcard {
@@ -318,6 +327,10 @@ fn confine_inner(policy: &Policy, handle_net: bool) -> Result<(), SandlockError>
     if handle_net && !net_wildcard {
         let mut connect_ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
         for rule in &policy.net_allow {
+            // TCP-only — see net_wildcard comment above.
+            if rule.protocol != Protocol::Tcp {
+                continue;
+            }
             for &p in &rule.ports {
                 connect_ports.insert(p);
             }

@@ -703,6 +703,7 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_net_allow_concrete_host() {
         let rules = vec![NetAllow {
+            protocol: crate::policy::Protocol::Tcp,
             host: Some("localhost".to_string()),
             ports: vec![80, 443],
             all_ports: false,
@@ -719,7 +720,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_net_allow_any_ip() {
-        let rules = vec![NetAllow { host: None, ports: vec![8080], all_ports: false }];
+        let rules = vec![NetAllow { protocol: crate::policy::Protocol::Tcp, host: None, ports: vec![8080], all_ports: false }];
         let resolved = resolve_net_allow(&rules).await.unwrap();
         assert!(resolved.per_ip.is_empty());
         assert!(resolved.any_ip_ports.contains(&8080));
@@ -730,7 +731,7 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_net_allow_any_ip_all_ports() {
         // `:*` — fully unrestricted egress.
-        let rules = vec![NetAllow { host: None, ports: vec![], all_ports: true }];
+        let rules = vec![NetAllow { protocol: crate::policy::Protocol::Tcp, host: None, ports: vec![], all_ports: true }];
         let resolved = resolve_net_allow(&rules).await.unwrap();
         assert!(resolved.any_ip_all_ports);
         assert!(resolved.per_ip.is_empty());
@@ -742,6 +743,7 @@ mod tests {
     async fn test_resolve_net_allow_concrete_host_all_ports() {
         // `localhost:*` — every port to localhost only.
         let rules = vec![NetAllow {
+            protocol: crate::policy::Protocol::Tcp,
             host: Some("localhost".to_string()),
             ports: vec![],
             all_ports: true,
@@ -767,8 +769,9 @@ mod tests {
         // concrete entries — that's a runtime-policy concern, not a
         // resolver concern).
         let rules = vec![
-            NetAllow { host: None, ports: vec![], all_ports: true },
+            NetAllow { protocol: crate::policy::Protocol::Tcp, host: None, ports: vec![], all_ports: true },
             NetAllow {
+                protocol: crate::policy::Protocol::Tcp,
                 host: Some("localhost".to_string()),
                 ports: vec![22],
                 all_ports: false,
