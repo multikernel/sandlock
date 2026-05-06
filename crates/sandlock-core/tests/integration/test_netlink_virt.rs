@@ -227,6 +227,81 @@ async fn sys_class_net_blocked() {
     assert!(result.success());
 }
 
+/// Regression for Copy Fail (CVE-2026-31431). The exploit's first step is
+/// `socket(AF_ALG, SOCK_SEQPACKET, 0)`, then `bind()` to a sockaddr_alg
+/// naming "authencesn(hmac(sha256),cbc(aes))". If `socket()` is denied
+/// with EAFNOSUPPORT the page-cache corruption primitive is unreachable.
+#[tokio::test]
+async fn af_alg_socket_blocked() {
+    let out = temp_out("af-alg-blocked");
+    let script = format!(concat!(
+        "import socket, errno\n",
+        "AF_ALG = 38\n",
+        "try:\n",
+        "  s = socket.socket(AF_ALG, socket.SOCK_SEQPACKET, 0)\n",
+        "  s.close()\n",
+        "  result = 'ALLOWED'\n",
+        "except OSError as e:\n",
+        "  result = f'BLOCKED:{{e.errno}}'\n",
+        "open('{out}', 'w').write(result)\n",
+    ), out = out.display());
+
+    let policy = base_policy().build().unwrap();
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
+        .await.unwrap();
+
+    let contents = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    // EAFNOSUPPORT == 97 on Linux. We assert the exact errno so a future
+    // accidental switch to EPERM/EACCES (which would surface differently
+    // to callers) is caught.
+    assert_eq!(
+        contents, "BLOCKED:97",
+        "AF_ALG socket() must return EAFNOSUPPORT, got: {contents}"
+    );
+    assert!(result.success());
+}
+
+/// Other niche socket families — same threat model as AF_ALG (kernel LPE
+/// surface that XOA agents have no business reaching). AF_ALG has its own
+/// dedicated test above; this one guards the broader class.
+#[tokio::test]
+async fn niche_socket_families_blocked() {
+    // (name, AF_* numeric value)
+    let families: &[(&str, i32)] = &[
+        ("AF_PACKET", 17),    // PACKET_MMAP has had UAFs
+        ("AF_VSOCK", 40),     // recurring use-after-frees
+        ("AF_XDP", 44),
+        ("AF_TIPC", 30),
+    ];
+
+    for (name, af) in families {
+        let out = temp_out(&format!("family-blocked-{}", name));
+        let script = format!(concat!(
+            "import socket\n",
+            "try:\n",
+            "  s = socket.socket({af}, socket.SOCK_RAW, 0)\n",
+            "  s.close()\n",
+            "  result = 'ALLOWED'\n",
+            "except OSError as e:\n",
+            "  result = f'BLOCKED:{{e.errno}}'\n",
+            "open('{out}', 'w').write(result)\n",
+        ), af = af, out = out.display());
+
+        let policy = base_policy().build().unwrap();
+        let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
+            .await.unwrap();
+
+        let contents = std::fs::read_to_string(&out).unwrap_or_default();
+        let _ = std::fs::remove_file(&out);
+        assert!(
+            contents.starts_with("BLOCKED:"),
+            "{name} should be blocked, got: {contents}"
+        );
+        assert!(result.success());
+    }
+}
+
 #[tokio::test]
 async fn non_route_netlink_still_blocked() {
     let out = temp_out("netlink-audit-blocked");
