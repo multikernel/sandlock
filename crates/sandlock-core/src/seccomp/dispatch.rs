@@ -170,13 +170,12 @@ pub enum HandlerError {
 pub(crate) fn validate_handler_syscalls_against_policy(
     syscall_nrs: &[i64],
     policy: &crate::policy::Policy,
-) -> Result<(), u32> {
+) -> Result<(), i64> {
     let deny: std::collections::HashSet<u32> =
         crate::context::deny_syscall_numbers(policy).into_iter().collect();
     for &nr in syscall_nrs {
-        let nr_u = nr as u32;
-        if deny.contains(&nr_u) {
-            return Err(nr_u);
+        if deny.contains(&(nr as u32)) {
+            return Err(nr);
         }
     }
     Ok(())
@@ -289,7 +288,6 @@ pub(crate) fn build_dispatch_table(
     // ------------------------------------------------------------------
     for &nr in &[libc::SYS_wait4, libc::SYS_waitid] {
         let resource_for_wait = Arc::clone(resource);
-        let __sup = Arc::clone(ctx);
         table.register(nr, move |cx: &HandlerCtx| {
             let notif = cx.notif;
             let resource = Arc::clone(&resource_for_wait);
@@ -497,7 +495,6 @@ pub(crate) fn build_dispatch_table(
     // ------------------------------------------------------------------
     if let Some(ref etc_hosts) = policy.virtual_etc_hosts {
         let etc_hosts_for_open = etc_hosts.clone();
-        let __sup = Arc::clone(ctx);
         table.register(libc::SYS_openat, move |cx: &HandlerCtx| {
             let notif = cx.notif;
             let notif_fd = cx.notif_fd;
@@ -743,32 +740,26 @@ fn register_chroot_handlers(
             crate::chroot::dispatch::handle_chroot_legacy_unlink));
     }
     if let Some(nr) = arch::SYS_RMDIR {
-        let __sup = Arc::clone(ctx);
         table.register(nr, chroot_handler!(policy,
             crate::chroot::dispatch::handle_chroot_legacy_rmdir));
     }
     if let Some(nr) = arch::SYS_MKDIR {
-        let __sup = Arc::clone(ctx);
         table.register(nr, chroot_handler!(policy,
             crate::chroot::dispatch::handle_chroot_legacy_mkdir));
     }
     if let Some(nr) = arch::SYS_RENAME {
-        let __sup = Arc::clone(ctx);
         table.register(nr, chroot_handler!(policy,
             crate::chroot::dispatch::handle_chroot_legacy_rename));
     }
     if let Some(nr) = arch::SYS_SYMLINK {
-        let __sup = Arc::clone(ctx);
         table.register(nr, chroot_handler!(policy,
             crate::chroot::dispatch::handle_chroot_legacy_symlink));
     }
     if let Some(nr) = arch::SYS_LINK {
-        let __sup = Arc::clone(ctx);
         table.register(nr, chroot_handler!(policy,
             crate::chroot::dispatch::handle_chroot_legacy_link));
     }
     if let Some(nr) = arch::SYS_CHMOD {
-        let __sup = Arc::clone(ctx);
         table.register(nr, chroot_handler!(policy,
             crate::chroot::dispatch::handle_chroot_legacy_chmod));
     }
@@ -859,22 +850,17 @@ fn register_chroot_handlers(
         getdents_nrs.push(getdents);
     }
     for nr in getdents_nrs {
-        let __sup = Arc::clone(ctx);
         table.register(nr, chroot_handler!(policy,
             crate::chroot::dispatch::handle_chroot_getdents));
     }
 
     // chdir, getcwd, statfs, utimensat
-    let __sup = Arc::clone(ctx);
     table.register(libc::SYS_chdir as i64, chroot_handler!(policy,
         crate::chroot::dispatch::handle_chroot_chdir));
-    let __sup = Arc::clone(ctx);
     table.register(libc::SYS_getcwd as i64, chroot_handler!(policy,
         crate::chroot::dispatch::handle_chroot_getcwd));
-    let __sup = Arc::clone(ctx);
     table.register(libc::SYS_statfs as i64, chroot_handler!(policy,
         crate::chroot::dispatch::handle_chroot_statfs));
-    let __sup = Arc::clone(ctx);
     table.register(libc::SYS_utimensat as i64, chroot_handler!(policy,
         crate::chroot::dispatch::handle_chroot_utimensat));
 }
@@ -884,7 +870,8 @@ fn register_chroot_handlers(
 // ============================================================
 
 fn register_cow_handlers(table: &mut DispatchTable, ctx: &Arc<SupervisorCtx>) {
-    // Helper to grab cow + processes from cx.sup in one place.
+    // Helper that captures `ctx.cow` and `ctx.processes` once at table-build
+    // time, then re-clones the per-handler `Arc`s on each invocation.
     macro_rules! cow_call {
         ($handler:expr) => {{
             let cow_state = Arc::clone(&ctx.cow);
@@ -1207,7 +1194,7 @@ mod extra_handler_tests {
         let result = validate_handler_syscalls_against_policy(&[libc::SYS_mremap], &policy);
         assert_eq!(
             result,
-            Err(libc::SYS_mremap as u32),
+            Err(libc::SYS_mremap),
             "handler on user-specified deny must be rejected, naming the offending syscall"
         );
     }

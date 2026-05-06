@@ -15,10 +15,13 @@
 //! * `Continue` not translated to `SECCOMP_USER_NOTIF_FLAG_CONTINUE` →
 //!   observe-only handlers wedge the guest.
 //!
-//! Each test uses `SYS_getcwd` because under the default policy it is
-//! **not** intercepted by any builtin (`uname` is added only when the
-//! policy sets a `hostname`).  This isolates the behaviour under test
-//! to the user-handler path.
+//! Each test uses `SYS_getcwd` because under the default policy no builtin
+//! registers against it (`getcwd` is intercepted only when chroot or COW
+//! path virtualization is enabled).  This isolates the behaviour under
+//! test to the user-handler path.  The guest must run `/bin/pwd` (the
+//! binary), not `pwd` (the shell builtin which reads `$PWD` and never
+//! issues the syscall) — otherwise any errno injected by a user handler
+//! can't reach the user-visible exit code.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -88,7 +91,7 @@ fn temp_out(name: &str) -> PathBuf {
 /// does not intercept (`SYS_getcwd`) MUST receive notifications and its
 /// `NotifAction::Errno` MUST surface in the guest as the corresponding
 /// errno.  This is the security contract: without BPF plumbing the
-/// kernel would never raise USER_NOTIF for `uname` and the handler
+/// kernel would never raise USER_NOTIF for `getcwd` and the handler
 /// would silently never fire — the maintainer-cited footgun.
 #[tokio::test]
 async fn extra_handler_intercepts_syscall_outside_builtin_set() {
@@ -126,7 +129,7 @@ async fn extra_handler_intercepts_syscall_outside_builtin_set() {
     );
     assert_ne!(
         code, 0,
-        "uname must observe the errno injected by the extra handler"
+        "getcwd must observe the errno injected by the extra handler"
     );
 }
 
@@ -169,7 +172,7 @@ async fn extra_handler_continue_lets_syscall_proceed() {
     );
     assert_eq!(
         code, 0,
-        "Continue must let the kernel execute uname normally"
+        "Continue must let the kernel execute getcwd normally"
     );
 }
 
@@ -381,7 +384,7 @@ async fn chain_of_extras_runs_in_insertion_order() {
     );
     assert_ne!(
         code, 0,
-        "uname must observe the EACCES injected by the second handler"
+        "getcwd must observe the EACCES injected by the second handler"
     );
 }
 
@@ -518,7 +521,7 @@ async fn handler_via_blanket_impl_dispatches_in_sandbox() {
 /// This exercises the full struct-impl-Handler shape end-to-end: the
 /// handler owns its own `Arc<AtomicUsize>` field, gets registered
 /// against `SYS_getcwd`, and the dispatch walker invokes
-/// `UnameCounter::handle` on every notification.  Returning `Errno(EPERM)`
+/// `GetcwdCounter::handle` on every notification.  Returning `Errno(EPERM)`
 /// serialises the notification cycle (kernel waits for the response before
 /// letting the child proceed), so the counter is guaranteed observable
 /// after `run_with_extra_handlers` returns.
@@ -528,11 +531,11 @@ async fn handler_via_blanket_impl_dispatches_in_sandbox() {
 /// working would not be caught at the integration layer.
 #[tokio::test]
 async fn struct_handler_state_persists_across_sandbox_calls() {
-    struct UnameCounter {
+    struct GetcwdCounter {
         calls: Arc<AtomicUsize>,
     }
 
-    impl Handler for UnameCounter {
+    impl Handler for GetcwdCounter {
         fn handle<'a>(
             &'a self,
             _cx: &'a HandlerCtx,
@@ -546,7 +549,7 @@ async fn struct_handler_state_persists_across_sandbox_calls() {
 
     let policy = base_policy().build().unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
-    let handler = UnameCounter {
+    let handler = GetcwdCounter {
         calls: Arc::clone(&calls),
     };
 
@@ -565,7 +568,7 @@ async fn struct_handler_state_persists_across_sandbox_calls() {
 
     assert!(
         calls.load(Ordering::SeqCst) >= 2,
-        "struct-based handler MUST have observed at least 2 uname calls \
+        "struct-based handler MUST have observed at least 2 getcwd calls \
          (state persists across notifications via &self), got {}",
         calls.load(Ordering::SeqCst)
     );

@@ -20,29 +20,36 @@ loop.
 
 ### `Handler` trait
 
-The `Handler` trait has a single async method `handle(&self, cx: &HandlerCtx) -> NotifAction`.
-State lives on the struct's fields — no `Arc::clone` ladders, no `Box::pin` ceremony at call site.
+The `Handler` trait has a single method that returns a boxed future, kept dyn-compatible so the
+supervisor can store user handlers as `Vec<Arc<dyn Handler>>`. State lives on the struct's
+fields — no `Arc::clone` ladders, no closure ceremony at the call site.
 
 ```rust
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use sandlock_core::{Handler, HandlerCtx, Policy, Sandbox};
 use sandlock_core::seccomp::notif::NotifAction;
-use async_trait::async_trait;
 
 struct OpenAudit { count: AtomicU64 }
 
-#[async_trait]
 impl Handler for OpenAudit {
-    async fn handle(&self, cx: &HandlerCtx) -> NotifAction {
-        let n = self.count.fetch_add(1, Ordering::SeqCst) + 1;
-        eprintln!("[audit #{n}] pid={} openat", cx.notif.pid);
-        NotifAction::Continue
+    fn handle<'a>(
+        &'a self,
+        cx: &'a HandlerCtx,
+    ) -> Pin<Box<dyn Future<Output = NotifAction> + Send + 'a>> {
+        Box::pin(async move {
+            let n = self.count.fetch_add(1, Ordering::SeqCst) + 1;
+            eprintln!("[audit #{n}] pid={} openat", cx.notif.pid);
+            NotifAction::Continue
+        })
     }
 }
 
 let policy = Policy::builder().fs_read("/usr").fs_write("/tmp").build()?;
 Sandbox::run_with_extra_handlers(
     &policy,
+    None,
     &["python3", "-c", "print(42)"],
     [(libc::SYS_openat, OpenAudit { count: AtomicU64::new(0) })],
 )
@@ -63,7 +70,7 @@ let audit = |cx: &HandlerCtx| async move {
     NotifAction::Continue
 };
 
-Sandbox::run_with_extra_handlers(&policy, &cmd, [(libc::SYS_openat, audit)]).await?;
+Sandbox::run_with_extra_handlers(&policy, None, &cmd, [(libc::SYS_openat, audit)]).await?;
 ```
 
 Use closures for prototyping or trivial state; switch to a struct as soon as the handler grows
@@ -85,7 +92,7 @@ assert!(matches!(Syscall::checked(99_999), Err(SyscallError::UnknownForArch(99_9
 so callers can pass raw `i64`/`u32` syscall numbers and they are validated up-front:
 
 ```rust
-Sandbox::run_with_extra_handlers(&policy, &cmd, [(libc::SYS_openat, openat_h)]).await?;
+Sandbox::run_with_extra_handlers(&policy, None, &cmd, [(libc::SYS_openat, openat_h)]).await?;
 ```
 
 Without `Syscall::checked`, passing `-5` as a syscall number would compile but never fire — the
@@ -97,14 +104,18 @@ There are two entry points; both spawn the sandbox, wait for it to exit, and ret
 
 | name | stdio |
 | --- | --- |
-| `Sandbox::run_with_extra_handlers(policy, cmd, handlers)` | captured (returned in `RunResult`) |
-| `Sandbox::run_interactive_with_extra_handlers(policy, cmd, handlers)` | inherited from the parent |
+| `Sandbox::run_with_extra_handlers(policy, name, cmd, handlers)` | captured (returned in `RunResult`) |
+| `Sandbox::run_interactive_with_extra_handlers(policy, name, cmd, handlers)` | inherited from the parent |
+
+`name: Option<&str>` is the sandbox instance name (also exposed as the virtual hostname when set);
+pass `None` when no name is needed.
 
 Both have the same generic shape:
 
 ```rust
 pub async fn run_with_extra_handlers<I, S, H>(
     policy: &Policy,
+    name: Option<&str>,
     cmd: &[&str],
     extra_handlers: I,
 ) -> Result<RunResult, SandlockError>
@@ -119,6 +130,7 @@ Multiple handlers — passed in one array literal:
 ```rust
 Sandbox::run_with_extra_handlers(
     &policy,
+    None,
     &cmd,
     [
         (libc::SYS_openat, openat_handler),
@@ -162,6 +174,7 @@ is identical:
 ```rust
 Sandbox::run_interactive_with_extra_handlers(
     &policy,
+    None,
     &["bash"],
     [(libc::SYS_openat, audit_handler)],
 )
@@ -191,29 +204,34 @@ Example: an `openat` handler that reads the path argument and rejects access to 
 of suffixes:
 
 ```rust
-use sandlock_core::seccomp::dispatch::{Handler, HandlerCtx};
+use std::future::Future;
+use std::pin::Pin;
+use sandlock_core::{Handler, HandlerCtx};
 use sandlock_core::seccomp::notif::{read_child_cstr, NotifAction};
-use async_trait::async_trait;
 
 struct ExtensionDenyHandler { denied_suffixes: Vec<String> }
 
-#[async_trait]
 impl Handler for ExtensionDenyHandler {
-    async fn handle(&self, cx: &HandlerCtx) -> NotifAction {
-        // openat(2): args[1] is `const char *pathname`.  4096 = PATH_MAX.
-        let path = match read_child_cstr(cx.notif_fd, cx.notif.id, cx.notif.pid,
-                                          cx.notif.data.args[1], 4096) {
-            Some(p) => p,
-            // Couldn't read path (rare: NULL pointer, kernel released the
-            // notification mid-read, etc.).  Pass through and let the kernel
-            // handle the syscall — usually it will fail with EFAULT itself.
-            None => return NotifAction::Continue,
-        };
+    fn handle<'a>(
+        &'a self,
+        cx: &'a HandlerCtx,
+    ) -> Pin<Box<dyn Future<Output = NotifAction> + Send + 'a>> {
+        Box::pin(async move {
+            // openat(2): args[1] is `const char *pathname`.  4096 = PATH_MAX.
+            let path = match read_child_cstr(cx.notif_fd, cx.notif.id, cx.notif.pid,
+                                              cx.notif.data.args[1], 4096) {
+                Some(p) => p,
+                // Couldn't read path (rare: NULL pointer, kernel released the
+                // notification mid-read, etc.).  Pass through and let the kernel
+                // handle the syscall — usually it will fail with EFAULT itself.
+                None => return NotifAction::Continue,
+            };
 
-        if self.denied_suffixes.iter().any(|s| path.ends_with(s)) {
-            return NotifAction::Errno(libc::EACCES);
-        }
-        NotifAction::Continue
+            if self.denied_suffixes.iter().any(|s| path.ends_with(s)) {
+                return NotifAction::Errno(libc::EACCES);
+            }
+            NotifAction::Continue
+        })
     }
 }
 ```
@@ -222,14 +240,19 @@ Synthesising data INTO the guest follows the same pattern with `write_child_mem`
 `getdents64` handler that returns an empty directory listing:
 
 ```rust
-async fn handle(&self, cx: &HandlerCtx) -> NotifAction {
-    // args[1] is `struct linux_dirent64 *dirp` — write zero bytes (empty
-    // listing) and return 0 (no entries) to the guest.
-    let buf_addr = cx.notif.data.args[1];
-    if let Err(_e) = write_child_mem(cx.notif_fd, cx.notif.id, cx.notif.pid, buf_addr, &[]) {
-        return NotifAction::Errno(libc::EFAULT);
-    }
-    NotifAction::ReturnValue(0)
+fn handle<'a>(
+    &'a self,
+    cx: &'a HandlerCtx,
+) -> Pin<Box<dyn Future<Output = NotifAction> + Send + 'a>> {
+    Box::pin(async move {
+        // args[1] is `struct linux_dirent64 *dirp` — write zero bytes (empty
+        // listing) and return 0 (no entries) to the guest.
+        let buf_addr = cx.notif.data.args[1];
+        if let Err(_e) = write_child_mem(cx.notif_fd, cx.notif.id, cx.notif.pid, buf_addr, &[]) {
+            return NotifAction::Errno(libc::EFAULT);
+        }
+        NotifAction::ReturnValue(0)
+    })
 }
 ```
 
@@ -253,6 +276,8 @@ Use sync `parking_lot::Mutex` for short critical sections instead — it cannot 
 supervisor loop because it cannot be held across `.await`.
 
 ```rust
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 struct CallStats {
@@ -260,15 +285,19 @@ struct CallStats {
     close:  AtomicU64,
 }
 
-#[async_trait]
 impl Handler for CallStats {
-    async fn handle(&self, cx: &HandlerCtx) -> NotifAction {
-        match cx.notif.data.nr as i64 {
-            n if n == libc::SYS_openat => self.openat.fetch_add(1, Ordering::Relaxed),
-            n if n == libc::SYS_close  => self.close.fetch_add(1, Ordering::Relaxed),
-            _ => 0,
-        };
-        NotifAction::Continue
+    fn handle<'a>(
+        &'a self,
+        cx: &'a HandlerCtx,
+    ) -> Pin<Box<dyn Future<Output = NotifAction> + Send + 'a>> {
+        Box::pin(async move {
+            match cx.notif.data.nr as i64 {
+                n if n == libc::SYS_openat => self.openat.fetch_add(1, Ordering::Relaxed),
+                n if n == libc::SYS_close  => self.close.fetch_add(1, Ordering::Relaxed),
+                _ => 0,
+            };
+            NotifAction::Continue
+        })
     }
 }
 ```
@@ -278,10 +307,12 @@ For one handler instance shared across multiple syscall registrations, write a t
 ```rust
 struct DispatchCallStats(std::sync::Arc<CallStats>);
 
-#[async_trait]
 impl Handler for DispatchCallStats {
-    async fn handle(&self, cx: &HandlerCtx) -> NotifAction {
-        self.0.handle(cx).await
+    fn handle<'a>(
+        &'a self,
+        cx: &'a HandlerCtx,
+    ) -> Pin<Box<dyn Future<Output = NotifAction> + Send + 'a>> {
+        self.0.handle(cx)
     }
 }
 
@@ -292,6 +323,7 @@ let stats = std::sync::Arc::new(CallStats {
 
 Sandbox::run_with_extra_handlers(
     &policy,
+    None,
     &cmd,
     [
         (libc::SYS_openat, DispatchCallStats(std::sync::Arc::clone(&stats))),
@@ -430,24 +462,30 @@ To tolerate bugs in downstream handlers, wrap each one with
 apply to async futures):
 
 ```rust
-use async_trait::async_trait;
-use futures::future::FutureExt as _;
+use std::future::Future;
 use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
+use futures::future::FutureExt as _;
 
 struct PanicSafe<H: Handler>(H);
 
-#[async_trait]
 impl<H: Handler> Handler for PanicSafe<H> {
-    async fn handle(&self, cx: &HandlerCtx) -> NotifAction {
-        AssertUnwindSafe(self.0.handle(cx))
-            .catch_unwind()
-            .await
-            .unwrap_or(NotifAction::Continue) // fail-open on panic
+    fn handle<'a>(
+        &'a self,
+        cx: &'a HandlerCtx,
+    ) -> Pin<Box<dyn Future<Output = NotifAction> + Send + 'a>> {
+        Box::pin(async move {
+            AssertUnwindSafe(self.0.handle(cx))
+                .catch_unwind()
+                .await
+                .unwrap_or(NotifAction::Continue) // fail-open on panic
+        })
     }
 }
 
 Sandbox::run_with_extra_handlers(
     &policy,
+    None,
     &cmd,
     [(libc::SYS_openat, PanicSafe(actual_handler))],
 )
@@ -530,12 +568,16 @@ pub struct OpenatHandler {
     /* ... */
 }
 
-#[async_trait]
 impl Handler for OpenatHandler {
-    async fn handle(&self, cx: &HandlerCtx) -> NotifAction {
-        /* read path arg via sandlock_core::seccomp::notif::read_child_cstr,
-           consult self.virtual_tree, return NotifAction::InjectFdSendTracked
-           / Errno / ... */
+    fn handle<'a>(
+        &'a self,
+        cx: &'a HandlerCtx,
+    ) -> Pin<Box<dyn Future<Output = NotifAction> + Send + 'a>> {
+        Box::pin(async move {
+            /* read path arg via sandlock_core::seccomp::notif::read_child_cstr,
+               consult self.virtual_tree, return NotifAction::InjectFdSendTracked
+               / Errno / ... */
+        })
     }
 }
 ```

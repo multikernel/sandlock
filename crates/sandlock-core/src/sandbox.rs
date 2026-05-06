@@ -1300,7 +1300,7 @@ where
 
     let nrs: Vec<i64> = pending.iter().map(|(nr, _)| *nr).collect();
     crate::seccomp::dispatch::validate_handler_syscalls_against_policy(&nrs, policy)
-        .map_err(|nr_u| HandlerError::OnDenySyscall { syscall_nr: nr_u as i64 })?;
+        .map_err(|syscall_nr| HandlerError::OnDenySyscall { syscall_nr })?;
 
     Ok(pending)
 }
