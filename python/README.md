@@ -62,11 +62,9 @@ Unset fields mean "no restriction" unless noted otherwise.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `net_allow` | `list[str]` | `[]` | Outbound endpoint rules (TCP; UDP too when `allow_udp=True`). Each entry is `"host:port[,port,...]"`, `":port"`, or `"*:port"`. Empty = deny all. |
+| `net_allow` | `list[str]` | `[]` | Outbound endpoint rules. Bare `host:port` is TCP; protocol prefixes opt others in: `tcp://host:port`, `udp://host:port` (or `udp://*:*` for any UDP), `icmp://host` (or `icmp://*` for any ICMP echo via the kernel ping socket — gated by `net.ipv4.ping_group_range` on the host). Empty = deny all. Raw ICMP is not exposed. |
 | `net_bind` | `list[int \| str]` | `[]` | TCP ports the sandbox may bind (empty = deny all) |
 | `port_remap` | `bool` | `False` | Transparent TCP port virtualization |
-| `allow_udp` | `bool` | `False` | Permit UDP sockets (outbound destinations still gated by `net_allow`) |
-| `allow_icmp` | `bool` | `False` | Permit `socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)` and IPv6 equivalent only — useful for `ping`. Other raw socket types stay denied. |
 
 #### HTTP ACL
 
@@ -508,7 +506,7 @@ permissions explicitly:
 | Capability | Example | Description |
 |------------|---------|-------------|
 | `fs_writable` | `["/tmp/agent"]` | Paths the tool can write to |
-| `net_allow` | `["api.example.com:443"]` | Outbound endpoints (`host:port`, `:port`, or `*:port`) — TCP, plus UDP when `allow_udp=True` |
+| `net_allow` | `["api.example.com:443", "udp://1.1.1.1:53"]` | Outbound endpoints. Bare `host:port` is TCP; `udp://...` / `icmp://...` schemes opt UDP / ICMP echo in. |
 | `env` | `{"KEY": "val"}` | Environment variables to pass |
 | `max_memory` | `"256M"` | Memory limit |
 
