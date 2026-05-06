@@ -41,7 +41,7 @@ async fn test_denied_path() {
         .fs_read("/proc")
         .build()
         .unwrap();
-    let result = Sandbox::run(&policy, Some("test"), &["cat", "/etc/passwd"]).await.unwrap();
+    let result = Sandbox::run(&policy, Some("test"), &["cat", "/etc/os-release"]).await.unwrap();
     assert!(!result.success());
 }
 
@@ -134,7 +134,7 @@ async fn test_nested_sandbox() {
         .build()
         .unwrap();
 
-    // Inner: does NOT allow /etc — run cat /etc/passwd, should fail
+    // Inner: does NOT allow /etc — run cat /etc/os-release, should fail
     let inner = Policy::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
         .fs_read("/proc")
@@ -159,10 +159,10 @@ async fn test_nested_sandbox() {
     // Sequential sandboxes: first sandbox applies Landlock + seccomp,
     // second sandbox from the same parent gets EBUSY on seccomp
     // but Landlock stacks. Verify both work independently.
-    let r1 = Sandbox::run_interactive(&outer, Some("test"), &["cat", "/etc/passwd"]).await.unwrap();
+    let r1 = Sandbox::run(&outer, Some("test"), &["cat", "/etc/os-release"]).await.unwrap();
     assert!(r1.success(), "outer should allow /etc");
 
-    let r2 = Sandbox::run_interactive(&inner, Some("test"), &["cat", "/etc/passwd"]).await.unwrap();
+    let r2 = Sandbox::run(&inner, Some("test"), &["cat", "/etc/os-release"]).await.unwrap();
     assert!(!r2.success(), "inner should deny /etc");
 }
 
@@ -195,10 +195,10 @@ async fn test_nested_sandbox_via_cli() {
         .unwrap();
 
     let inner_cmd = format!(
-        "{} run -r /usr -r /lib{} -r /bin -r /proc -- cat /etc/passwd",
+        "{} run -r /usr -r /lib{} -r /bin -r /proc -- cat /etc/os-release",
         bin, lib64_arg
     );
-    let result = Sandbox::run_interactive(
+    let result = Sandbox::run(
         &outer, Some("test"), &["sh", "-c", &inner_cmd],
     ).await.unwrap();
     assert!(!result.success(), "inner sandbox should block /etc");
@@ -208,7 +208,7 @@ async fn test_nested_sandbox_via_cli() {
         "{} run -r /usr -r /lib{} -r /bin -r /etc -r /proc -- echo nested-ok",
         bin, lib64_arg
     );
-    let result = Sandbox::run_interactive(
+    let result = Sandbox::run(
         &outer, Some("test"), &["sh", "-c", &inner_cmd],
     ).await.unwrap();
     assert!(result.success(), "nested sandbox with shared paths should work");

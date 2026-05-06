@@ -40,7 +40,7 @@ fn test_run_exit_code() {
 #[test]
 fn test_run_denied_path() {
     let output = sandlock_bin()
-        .args(["run", "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "--", "cat", "/etc/passwd"])
+        .args(["run", "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "--", "cat", "/etc/os-release"])
         .output()
         .expect("failed to run");
     assert!(!output.status.success(), "Should fail without /etc readable");

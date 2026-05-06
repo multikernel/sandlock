@@ -940,7 +940,7 @@ mod tests {
         assert_eq!(extract_proc_pid("/proc/cpuinfo"), None);
         assert_eq!(extract_proc_pid("/proc/meminfo"), None);
         assert_eq!(extract_proc_pid("/proc/net/tcp"), None);
-        assert_eq!(extract_proc_pid("/etc/passwd"), None);
+        assert_eq!(extract_proc_pid("/etc/os-release"), None);
         assert_eq!(extract_proc_pid("/proc/"), None);
     }
 
