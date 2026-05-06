@@ -133,9 +133,8 @@ pub enum HandlerError {
     InvalidSyscall(#[from] SyscallError),
 
     #[error(
-        "handler on syscall {syscall_nr} conflicts with the deny list \
-         (DEFAULT_DENY_SYSCALLS or policy.deny_syscalls) and would let \
-         user code bypass it via SECCOMP_USER_NOTIF_FLAG_CONTINUE"
+        "handler on syscall {syscall_nr} conflicts with the policy syscall blocklist \
+         and would let user code bypass it via SECCOMP_USER_NOTIF_FLAG_CONTINUE"
     )]
     OnDenySyscall { syscall_nr: i64 },
 }
@@ -145,21 +144,13 @@ pub enum HandlerError {
 ///
 /// The cBPF program emits notif JEQs *before* deny JEQs, so a syscall
 /// present in both lists hits `SECCOMP_RET_USER_NOTIF` first.  A handler
-/// registered on a syscall that is on the deny list would therefore
+/// registered on a syscall that is on the blocklist would therefore
 /// convert a kernel-deny into a user-supervised path: a handler returning
 /// `NotifAction::Continue` becomes `SECCOMP_USER_NOTIF_FLAG_CONTINUE` and
 /// the kernel actually runs the syscall — silently bypassing deny.
 ///
-/// The deny list is whatever [`crate::context::deny_syscall_numbers`]
-/// resolves: `policy.deny_syscalls` if set, otherwise
-/// `DEFAULT_DENY_SYSCALLS` when neither `deny_syscalls` nor
-/// `allow_syscalls` is set; both branches are guarded by this function.
-///
-/// **Allowlist mode** (`policy.allow_syscalls = Some(_)`): the resolved
-/// deny list is empty, so this function returns `Ok(())` for any syscall.
-/// That is sound because the BPF deny block is empty in this mode too —
-/// confinement comes from the allowlist enforced at the kernel level,
-/// and there is no notif/deny overlap to bypass.
+/// The blocklist is whatever [`crate::context::blocklist_syscall_numbers`]
+/// resolves from Sandlock's default syscall blocklist plus policy extras.
 ///
 /// Takes only the syscall numbers because that's all it needs to check.
 /// Called from the `run_with_extra_handlers` entry points before any
@@ -171,10 +162,10 @@ pub(crate) fn validate_handler_syscalls_against_policy(
     syscall_nrs: &[i64],
     policy: &crate::policy::Policy,
 ) -> Result<(), i64> {
-    let deny: std::collections::HashSet<u32> =
-        crate::context::deny_syscall_numbers(policy).into_iter().collect();
+    let blocklist: std::collections::HashSet<u32> =
+        crate::context::blocklist_syscall_numbers(policy).into_iter().collect();
     for &nr in syscall_nrs {
-        if deny.contains(&(nr as u32)) {
+        if blocklist.contains(&(nr as u32)) {
             return Err(nr);
         }
     }
@@ -1169,25 +1160,25 @@ mod extra_handler_tests {
     }
 
     /// `validate_handler_syscalls_against_policy` must reject handlers whose
-    /// syscall is in the policy's user-specified `deny_syscalls` list, with
-    /// the same rationale as DEFAULT_DENY: the BPF program emits notif JEQs
-    /// before deny JEQs, so a user handler returning `Continue` would
-    /// translate into `SECCOMP_USER_NOTIF_FLAG_CONTINUE` and silently bypass
-    /// the kernel-level deny.
+    /// syscall is in the policy's user-specified blocklist, with the same
+    /// rationale as DEFAULT_BLOCKLIST: the BPF program emits notif JEQs before
+    /// deny JEQs, so a user handler returning `Continue` would translate into
+    /// `SECCOMP_USER_NOTIF_FLAG_CONTINUE` and silently bypass the kernel-level
+    /// block.
     ///
     /// Uses `mremap` because it is in `syscall_name_to_nr` but not in
-    /// `DEFAULT_DENY_SYSCALLS` — putting it into `deny_syscalls` is the only
-    /// way it ends up on the deny list, so the test isolates the user-supplied
-    /// path of `deny_syscall_numbers` from the default branch covered by
-    /// `extra_handler_on_default_deny_syscall_is_rejected`.
+    /// `DEFAULT_BLOCKLIST_SYSCALLS` — putting it into `block_syscalls` is the only
+    /// way it ends up on the extra blocklist, so the test isolates the user-supplied
+    /// path of `blocklist_syscall_numbers` from the default branch covered by
+    /// `extra_handler_on_default_blocklist_syscall_is_rejected`.
     ///
     /// Pure-logic counterpart to the integration test of the same name —
     /// runs without a live sandbox so the contract is enforced even on
     /// hosts where seccomp integration tests are skipped.
     #[test]
-    fn validate_extras_rejects_user_specified_deny() {
+    fn validate_extras_rejects_user_specified_blocklist() {
         let policy = crate::policy::Policy::builder()
-            .deny_syscalls(vec!["mremap".into()])
+            .block_syscalls(vec!["mremap".into()])
             .build()
             .expect("policy builds");
 
@@ -1195,7 +1186,7 @@ mod extra_handler_tests {
         assert_eq!(
             result,
             Err(libc::SYS_mremap),
-            "handler on user-specified deny must be rejected, naming the offending syscall"
+            "handler on user-specified blocklist must be rejected, naming the offending syscall"
         );
     }
 

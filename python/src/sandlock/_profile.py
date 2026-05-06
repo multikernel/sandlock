@@ -27,9 +27,8 @@ _SIMPLE_FIELDS: dict[str, type] = {
     "fs_writable": list,
     "fs_readable": list,
     "fs_denied": list,
-    # Syscall filtering
-    "deny_syscalls": list,
-    "allow_syscalls": list,
+    # Extra syscall blocklist entries
+    "block_syscalls": list,
     # Network
     "net_allow": list,
     "net_bind": list,
@@ -127,7 +126,6 @@ def policy_from_dict(data: dict, source: str = "<dict>") -> Policy:
         raise PolicyError(
             f"unknown fields in {source}: {', '.join(sorted(unknown))}"
         )
-
     kwargs: dict = {}
     for key, value in data.items():
         expected = _SIMPLE_FIELDS[key]
@@ -151,7 +149,6 @@ def policy_from_dict(data: dict, source: str = "<dict>") -> Policy:
                     f"got {value!r}"
                 )
             continue
-
         # Type checking
         if not isinstance(value, expected):
             raise PolicyError(

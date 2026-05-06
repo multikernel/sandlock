@@ -280,6 +280,7 @@ async fn main() -> Result<()> {
                 if let Some(cpu) = base.max_cpu { b = b.max_cpu(cpu); }
                 if let Some(seed) = base.random_seed { b = b.random_seed(seed); }
                 if let Some(n) = base.num_cpus { b = b.num_cpus(n); }
+                b = b.block_syscalls(base.block_syscalls.clone());
                 b = b.allow_udp(base.allow_udp);
                 b = b.allow_icmp(base.allow_icmp);
                 b = b.allow_sysv_ipc(base.allow_sysv_ipc);
@@ -685,11 +686,17 @@ fn no_supervisor_exec(policy: &Policy, cmd: &[&str]) -> Result<()> {
     use std::ffi::CString;
 
     // 1. Apply Landlock confinement (sets NO_NEW_PRIVS + Landlock rules)
-    sandlock_core::confine_current_process(policy)
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(anyhow!(
+            "prctl(PR_SET_NO_NEW_PRIVS) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    sandlock_core::landlock::confine(policy)
         .map_err(|e| anyhow!("Landlock confinement failed: {}", e))?;
 
     // 2. Install deny-only seccomp filter (blocks dangerous syscalls without supervisor)
-    let deny_nrs = sandlock_core::context::no_supervisor_deny_syscall_numbers(policy);
+    let deny_nrs = sandlock_core::context::no_supervisor_blocklist_syscall_numbers(policy);
     let filter = sandlock_core::seccomp::bpf::assemble_filter(&[], &deny_nrs, &[])
         .map_err(|e| anyhow!("seccomp assemble failed: {}", e))?;
     sandlock_core::seccomp::bpf::install_deny_filter(&filter)

@@ -25,7 +25,7 @@ fn temp_out(name: &str) -> PathBuf {
 }
 
 // ------------------------------------------------------------------
-// 1. mount() is blocked by default seccomp deny list
+// 1. mount() is blocked by default seccomp blocklist
 // ------------------------------------------------------------------
 #[tokio::test]
 async fn test_mount_blocked() {
@@ -377,7 +377,7 @@ async fn test_sysv_shmget_allowed_when_opted_in() {
 }
 
 // ------------------------------------------------------------------
-// 8. TCP always allowed (default deny posture for raw + UDP)
+// 8. TCP always allowed (default blocklist posture for raw + UDP)
 // ------------------------------------------------------------------
 #[tokio::test]
 async fn test_tcp_always_allowed() {

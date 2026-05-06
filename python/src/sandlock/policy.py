@@ -120,8 +120,8 @@ class DryRunResult:
 class Policy:
     """Immutable sandbox policy.
 
-    All fields are optional — unset fields mean "no restriction"
-    (except ``deny_syscalls`` which defaults to a safe blocklist).
+    Most fields are optional — unset fields mean "no restriction". Sandlock's
+    default syscall blocklist is always applied.
     """
 
     # Filesystem (Landlock)
@@ -134,13 +134,8 @@ class Policy:
     fs_denied: Sequence[str] = field(default_factory=list)
     """Paths explicitly denied (neither read nor write)."""
 
-    # Syscall filtering (seccomp) — set one or neither, not both
-    deny_syscalls: Sequence[str] | None = None
-    """Syscall names to block (blocklist mode). None = default blocklist."""
-
-    allow_syscalls: Sequence[str] | None = None
-    """Syscall names to allow (allowlist mode). Everything else is blocked.
-    Stricter than deny_syscalls — unknown/new syscalls are denied by default."""
+    block_syscalls: Sequence[str] = field(default_factory=list)
+    """Additional syscall names to block on top of Sandlock's default blocklist."""
 
     # Network — endpoint allowlist (IP × port via seccomp on-behalf path)
     net_allow: Sequence[str] = field(default_factory=list)
@@ -193,7 +188,7 @@ class Policy:
     A transparent MITM proxy is spawned in the supervisor."""
 
     http_deny: Sequence[str] = field(default_factory=list)
-    """HTTP deny rules. Checked before allow rules. Format: "METHOD host/path"."""
+    """HTTP block rules. Checked before allow rules. Format: "METHOD host/path"."""
 
     http_ports: Sequence[int] = field(default_factory=list)
     """TCP ports to intercept for HTTP ACL. Defaults to [80] (plus 443 with
