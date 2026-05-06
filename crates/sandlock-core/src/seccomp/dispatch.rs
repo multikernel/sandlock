@@ -150,11 +150,7 @@ pub enum HandlerError {
 /// the kernel actually runs the syscall — silently bypassing deny.
 ///
 /// The blocklist is whatever [`crate::context::blocklist_syscall_numbers`]
-/// resolves from the policy's explicit [`crate::policy::SyscallPolicy`].
-///
-/// **No syscall policy** (`SyscallPolicy::None`): the resolved blocklist is
-/// empty, so this function returns `Ok(())` for any syscall. There is no BPF
-/// deny block in this mode, so there is no notif/deny overlap to bypass.
+/// resolves from Sandlock's default syscall blocklist plus policy extras.
 ///
 /// Takes only the syscall numbers because that's all it needs to check.
 /// Called from the `run_with_extra_handlers` entry points before any
@@ -166,10 +162,10 @@ pub(crate) fn validate_handler_syscalls_against_policy(
     syscall_nrs: &[i64],
     policy: &crate::policy::Policy,
 ) -> Result<(), i64> {
-    let deny: std::collections::HashSet<u32> =
+    let blocklist: std::collections::HashSet<u32> =
         crate::context::blocklist_syscall_numbers(policy).into_iter().collect();
     for &nr in syscall_nrs {
-        if deny.contains(&(nr as u32)) {
+        if blocklist.contains(&(nr as u32)) {
             return Err(nr);
         }
     }
@@ -1168,11 +1164,11 @@ mod extra_handler_tests {
     /// rationale as DEFAULT_BLOCKLIST: the BPF program emits notif JEQs before
     /// deny JEQs, so a user handler returning `Continue` would translate into
     /// `SECCOMP_USER_NOTIF_FLAG_CONTINUE` and silently bypass the kernel-level
-    /// deny.
+    /// block.
     ///
     /// Uses `mremap` because it is in `syscall_name_to_nr` but not in
-    /// `DEFAULT_BLOCKLIST_SYSCALLS` — putting it into `SyscallPolicy::Blocklist` is the only
-    /// way it ends up on the blocklist, so the test isolates the user-supplied
+    /// `DEFAULT_BLOCKLIST_SYSCALLS` — putting it into `block_syscalls` is the only
+    /// way it ends up on the extra blocklist, so the test isolates the user-supplied
     /// path of `blocklist_syscall_numbers` from the default branch covered by
     /// `extra_handler_on_default_blocklist_syscall_is_rejected`.
     ///
@@ -1180,7 +1176,7 @@ mod extra_handler_tests {
     /// runs without a live sandbox so the contract is enforced even on
     /// hosts where seccomp integration tests are skipped.
     #[test]
-    fn validate_extras_rejects_user_specified_deny() {
+    fn validate_extras_rejects_user_specified_blocklist() {
         let policy = crate::policy::Policy::builder()
             .block_syscalls(vec!["mremap".into()])
             .build()

@@ -220,7 +220,7 @@ impl Sandbox {
     /// confinement.
     ///
     /// Validation happens up-front (before fork): each `syscall` is checked
-    /// through `Syscall::checked`, and the deny-list contract is enforced via
+    /// through `Syscall::checked`, and the blocklist contract is enforced via
     /// [`crate::seccomp::dispatch::validate_handler_syscalls_against_policy`].
     ///
     /// # Example
@@ -1277,7 +1277,7 @@ impl Sandbox {
 
 /// Convert a user-supplied iterator of `(syscall, handler)` pairs into
 /// the internal `Vec<(i64, Arc<dyn Handler>)>` shape used by the
-/// supervisor, validating each syscall up-front against the deny list.
+/// supervisor, validating each syscall up-front against the blocklist.
 fn collect_extra_handlers<I, S, H>(
     extra_handlers: I,
     policy: &Policy,

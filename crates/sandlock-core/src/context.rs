@@ -6,7 +6,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use crate::arch;
-use crate::policy::{FsIsolation, Policy, SyscallPolicy};
+use crate::policy::{FsIsolation, Policy};
 use crate::seccomp::bpf::{self, stmt, jump};
 use crate::sys::structs::{
     AF_INET, AF_INET6,
@@ -448,6 +448,8 @@ pub fn no_supervisor_blocklist_syscall_numbers(policy: &Policy) -> Vec<u32> {
     use crate::sys::structs::NO_SUPERVISOR_BLOCKLIST_SYSCALLS;
     let mut nrs: Vec<u32> = NO_SUPERVISOR_BLOCKLIST_SYSCALLS
         .iter()
+        .copied()
+        .chain(policy.block_syscalls.iter().map(String::as_str))
         .filter_map(|n| syscall_name_to_nr(n))
         .collect();
     if !policy.allow_sysv_ipc {
@@ -459,29 +461,22 @@ pub fn no_supervisor_blocklist_syscall_numbers(policy: &Policy) -> Vec<u32> {
             }
         }
     }
+    nrs.sort_unstable();
+    nrs.dedup();
     nrs
 }
 
-/// Resolve the policy's blocklist-mode syscall names to numbers.
-///
-/// `SyscallPolicy::DefaultBlocklist` returns `DEFAULT_BLOCKLIST_SYSCALLS`.
-/// `SyscallPolicy::Blocklist` returns exactly that list.
+/// Resolve the default syscall blocklist plus policy extras to numbers.
 ///
 /// SysV IPC syscalls are appended to the resolved blocklist when
-/// `policy.allow_sysv_ipc` is false in blocklist/default-blocklist modes. They
-/// are not appended when syscall filtering is disabled.
+/// `policy.allow_sysv_ipc` is false.
 pub fn blocklist_syscall_numbers(policy: &Policy) -> Vec<u32> {
-    let mut nrs: Vec<u32> = match &policy.syscall_policy {
-        SyscallPolicy::Blocklist(names) => names
-            .iter()
-            .filter_map(|n| syscall_name_to_nr(n))
-            .collect(),
-        SyscallPolicy::DefaultBlocklist => DEFAULT_BLOCKLIST_SYSCALLS
-            .iter()
-            .filter_map(|n| syscall_name_to_nr(n))
-            .collect(),
-        SyscallPolicy::None => return Vec::new(),
-    };
+    let mut nrs: Vec<u32> = DEFAULT_BLOCKLIST_SYSCALLS
+        .iter()
+        .copied()
+        .chain(policy.block_syscalls.iter().map(String::as_str))
+        .filter_map(|n| syscall_name_to_nr(n))
+        .collect();
     if !policy.allow_sysv_ipc {
         for name in SYSV_IPC_BLOCKLIST_SYSCALLS {
             if let Some(nr) = syscall_name_to_nr(name) {
@@ -491,6 +486,8 @@ pub fn blocklist_syscall_numbers(policy: &Policy) -> Vec<u32> {
             }
         }
     }
+    nrs.sort_unstable();
+    nrs.dedup();
     nrs
 }
 
@@ -1302,10 +1299,10 @@ mod tests {
             .build()
             .unwrap();
         let nrs = blocklist_syscall_numbers(&policy);
-        // Exactly the user-supplied two — no SysV IPC append.
-        assert_eq!(nrs.len(), 2);
+        // Default blocklist plus user extras — no SysV IPC append.
         assert!(nrs.contains(&(libc::SYS_mount as u32)));
         assert!(nrs.contains(&(libc::SYS_ptrace as u32)));
+        assert!(nrs.contains(&(libc::SYS_bpf as u32)));
         assert!(!nrs.contains(&(libc::SYS_shmget as u32)));
     }
 
@@ -1324,7 +1321,7 @@ mod tests {
     }
 
     #[test]
-    fn test_no_supervisor_deny_includes_sysv_ipc_by_default() {
+    fn test_no_supervisor_blocklist_includes_sysv_ipc_by_default() {
         let policy = Policy::builder().build().unwrap();
         let nrs = no_supervisor_blocklist_syscall_numbers(&policy);
         assert!(nrs.contains(&(libc::SYS_shmget as u32)));
@@ -1333,7 +1330,7 @@ mod tests {
     }
 
     #[test]
-    fn test_no_supervisor_deny_excludes_sysv_ipc_when_allowed() {
+    fn test_no_supervisor_blocklist_excludes_sysv_ipc_when_allowed() {
         let policy = Policy::builder()
             .allow_sysv_ipc(true)
             .build()

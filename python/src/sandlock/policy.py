@@ -93,14 +93,6 @@ class BranchAction(Enum):
     KEEP = "keep"        # Leave branch as-is (caller decides)
 
 
-class SyscallPolicy(Enum):
-    """Seccomp syscall filtering mode."""
-
-    DEFAULT_BLOCKLIST = "default_blocklist"
-    BLOCKLIST = "blocklist"
-    NONE = "none"
-
-
 @dataclass(frozen=True)
 class Change:
     """A single filesystem change detected by dry-run."""
@@ -128,8 +120,8 @@ class DryRunResult:
 class Policy:
     """Immutable sandbox policy.
 
-    All fields are optional — unset fields mean "no restriction"
-    except ``syscall_policy``, which defaults to ``DEFAULT_BLOCKLIST``.
+    Most fields are optional — unset fields mean "no restriction". Sandlock's
+    default syscall blocklist is always applied.
     """
 
     # Filesystem (Landlock)
@@ -142,12 +134,8 @@ class Policy:
     fs_denied: Sequence[str] = field(default_factory=list)
     """Paths explicitly denied (neither read nor write)."""
 
-    # Syscall filtering (seccomp)
-    syscall_policy: SyscallPolicy = SyscallPolicy.DEFAULT_BLOCKLIST
-    """Syscall filtering mode: DEFAULT_BLOCKLIST, BLOCKLIST, or NONE."""
-
     block_syscalls: Sequence[str] = field(default_factory=list)
-    """Syscall names used when syscall_policy is BLOCKLIST."""
+    """Additional syscall names to block on top of Sandlock's default blocklist."""
 
     # Network — endpoint allowlist (IP × port via seccomp on-behalf path)
     net_allow: Sequence[str] = field(default_factory=list)

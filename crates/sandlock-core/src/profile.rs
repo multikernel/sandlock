@@ -1,4 +1,4 @@
-use crate::policy::{ByteSize, Policy, SyscallPolicy};
+use crate::policy::{ByteSize, Policy};
 use crate::error::SandlockError;
 use std::path::PathBuf;
 
@@ -42,6 +42,12 @@ pub fn parse_profile(content: &str) -> Result<Policy, SandlockError> {
     if sandbox.contains_key("name") {
         return Err(SandlockError::Policy(crate::error::PolicyError::Invalid(
             "profile field 'name' is not policy; pass the sandbox name at run time".into(),
+        )));
+    }
+    if sandbox.contains_key("syscall_policy") {
+        return Err(SandlockError::Policy(crate::error::PolicyError::Invalid(
+            "profile field 'syscall_policy' was removed; Sandlock always applies its \
+             default syscall blocklist, and 'block_syscalls' only adds entries".into(),
         )));
     }
 
@@ -99,7 +105,7 @@ pub fn parse_profile(content: &str) -> Result<Policy, SandlockError> {
     if let Some(v) = sandbox.get("allow_sysv_ipc").and_then(|v| v.as_bool()) {
         builder = builder.allow_sysv_ipc(v);
     }
-if let Some(v) = sandbox.get("clean_env").and_then(|v| v.as_bool()) {
+    if let Some(v) = sandbox.get("clean_env").and_then(|v| v.as_bool()) {
         builder = builder.clean_env(v);
     }
     if let Some(v) = sandbox.get("deterministic_dirs").and_then(|v| v.as_bool()) {
@@ -116,27 +122,7 @@ if let Some(v) = sandbox.get("clean_env").and_then(|v| v.as_bool()) {
         for p in ports { if let Some(n) = p.as_integer() { builder = builder.net_bind_port(n as u16); } }
     }
 
-    // Parse syscall policy.
-    let syscall_mode = sandbox.get("syscall_policy").and_then(|v| v.as_str());
-    let has_block_syscalls = sandbox.get("block_syscalls").is_some();
-    if has_block_syscalls && !matches!(syscall_mode, None | Some("blocklist")) {
-        return Err(SandlockError::Policy(crate::error::PolicyError::Invalid(
-            "block_syscalls requires syscall_policy = \"blocklist\"".into(),
-        )));
-    }
-
-    if let Some(mode) = syscall_mode {
-        builder = match mode {
-            "default_blocklist" => builder.syscalls(SyscallPolicy::DefaultBlocklist),
-            "blocklist" => builder.block_syscalls(Vec::new()),
-            "none" => builder.syscalls(SyscallPolicy::None),
-            other => {
-                return Err(SandlockError::Policy(crate::error::PolicyError::Invalid(
-                    format!("unknown syscall_policy: {}", other),
-                )));
-            }
-        };
-    }
+    // Parse extra syscall blocklist entries.
     if let Some(syscalls) = sandbox.get("block_syscalls").and_then(|v| v.as_array()) {
         let names: Vec<String> = syscalls.iter().filter_map(|v| v.as_str().map(String::from)).collect();
         builder = builder.block_syscalls(names);
@@ -220,6 +206,13 @@ max_processes = 10
         let err = parse_profile(r#"name = "api.local""#).unwrap_err();
         assert!(err.to_string().contains("name"));
         assert!(err.to_string().contains("not policy"));
+    }
+
+    #[test]
+    fn reject_removed_syscall_policy_in_profile() {
+        let err = parse_profile(r#"syscall_policy = "none""#).unwrap_err();
+        assert!(err.to_string().contains("syscall_policy"));
+        assert!(err.to_string().contains("removed"));
     }
 
     #[test]

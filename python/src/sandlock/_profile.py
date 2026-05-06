@@ -16,7 +16,7 @@ else:
 from pathlib import Path
 
 from .exceptions import PolicyError
-from .policy import Policy, FsIsolation, BranchAction, SyscallPolicy
+from .policy import Policy, FsIsolation, BranchAction
 
 
 _PROFILES_DIR = Path("~/.config/sandlock/profiles").expanduser()
@@ -27,8 +27,7 @@ _SIMPLE_FIELDS: dict[str, type] = {
     "fs_writable": list,
     "fs_readable": list,
     "fs_denied": list,
-    # Syscall filtering
-    "syscall_policy": str,
+    # Extra syscall blocklist entries
     "block_syscalls": list,
     # Network
     "net_allow": list,
@@ -127,10 +126,6 @@ def policy_from_dict(data: dict, source: str = "<dict>") -> Policy:
         raise PolicyError(
             f"unknown fields in {source}: {', '.join(sorted(unknown))}"
         )
-    syscall_policy = data.get("syscall_policy")
-    if "block_syscalls" in data and syscall_policy not in (None, "blocklist"):
-        raise PolicyError(f"{source}: block_syscalls requires syscall_policy='blocklist'")
-
     kwargs: dict = {}
     for key, value in data.items():
         expected = _SIMPLE_FIELDS[key]
@@ -154,16 +149,6 @@ def policy_from_dict(data: dict, source: str = "<dict>") -> Policy:
                     f"got {value!r}"
                 )
             continue
-        if key == "syscall_policy":
-            try:
-                kwargs[key] = SyscallPolicy(value)
-            except ValueError:
-                raise PolicyError(
-                    f"{source}: syscall_policy must be 'default_blocklist', 'blocklist', or 'none', "
-                    f"got {value!r}"
-                )
-            continue
-
         # Type checking
         if not isinstance(value, expected):
             raise PolicyError(

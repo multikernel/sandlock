@@ -1,10 +1,10 @@
-use sandlock_core::policy::{ByteSize, FsIsolation, BranchAction, Policy, SyscallPolicy};
+use sandlock_core::policy::{ByteSize, FsIsolation, BranchAction, Policy};
 
 #[test]
 fn test_default_policy() {
     let policy = Policy::builder().build().unwrap();
     assert_eq!(policy.max_processes, 64);
-    assert_eq!(policy.syscall_policy, SyscallPolicy::DefaultBlocklist);
+    assert!(policy.block_syscalls.is_empty());
     assert!(!policy.allow_udp, "UDP is denied by default");
     assert!(!policy.allow_icmp, "ICMP raw is denied by default");
     assert!(policy.uid.is_none());

@@ -388,7 +388,7 @@ async fn chain_of_extras_runs_in_insertion_order() {
     );
 }
 
-/// Default-deny bypass guard: registering an extra on a syscall in
+/// Default-blocklist bypass guard: registering an extra on a syscall in
 /// `DEFAULT_BLOCKLIST_SYSCALLS` (e.g. `mount`) MUST be rejected at registration
 /// time.  Without this check the extra-syscall ends up in the BPF notif
 /// block, which is matched *before* the deny block, so a user handler
@@ -420,9 +420,9 @@ async fn extra_handler_on_default_blocklist_syscall_is_rejected() {
     );
 }
 
-/// User-supplied `SyscallPolicy::Blocklist` entries must be honoured by the same guard
+/// User-supplied `block_syscalls` entries must be honoured by the same guard
 /// that protects DEFAULT_BLOCKLIST: an extra registered on a syscall the caller
-/// explicitly asked to deny would otherwise let a `Continue` from the
+/// explicitly asked to block would otherwise let a `Continue` from the
 /// handler reach the deny-JEQ via the notif path and bypass the kernel
 /// rejection at user-space discretion.
 ///
@@ -430,10 +430,10 @@ async fn extra_handler_on_default_blocklist_syscall_is_rejected() {
 /// driving the user-list branch of `blocklist_syscall_numbers` (see
 /// `crates/sandlock-core/src/context.rs`).  Uses `SYS_mremap` because it is
 /// in `syscall_name_to_nr` but **not** in DEFAULT_BLOCKLIST — putting it into
-/// `SyscallPolicy::Blocklist` is the only way it lands on the blocklist, isolating the
+/// `block_syscalls` is the only way it lands on the blocklist, isolating the
 /// user-supplied branch under test from the default-blocklist branch.
 #[tokio::test]
-async fn extra_handler_on_user_specified_deny_is_rejected() {
+async fn extra_handler_on_user_specified_blocklist_is_rejected() {
     let policy = base_policy()
         .block_syscalls(vec!["mremap".into()])
         .build()
@@ -678,15 +678,15 @@ async fn run_with_extra_handlers_preserves_insertion_order_in_sandbox_chain() {
     let _ = std::fs::remove_file(&out);
 }
 
-/// `run_with_extra_handlers` on a default-deny syscall MUST return
+/// `run_with_extra_handlers` on a default-blocklist syscall MUST return
 /// `HandlerError::OnDenySyscall` up-front (before fork) — closes the
 /// kernel-deny -> NOTIF_FLAG_CONTINUE bypass attack.
 #[tokio::test]
-async fn run_with_extra_handlers_rejects_handler_on_default_deny_syscall() {
+async fn run_with_extra_handlers_rejects_handler_on_default_blocklist_syscall() {
     let policy = base_policy().build().unwrap();
     let handler = |_cx: &HandlerCtx| async { NotifAction::Continue };
 
-    // SYS_mount is in DEFAULT_DENY_SYSCALLS.
+    // SYS_mount is in DEFAULT_BLOCKLIST_SYSCALLS.
     let result =
         Sandbox::run_with_extra_handlers(&policy, None, &["true"], [(libc::SYS_mount, handler)]).await;
 

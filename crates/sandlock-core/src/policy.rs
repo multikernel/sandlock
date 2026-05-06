@@ -56,26 +56,6 @@ impl ByteSize {
     }
 }
 
-/// Seccomp syscall filtering mode for a full sandbox.
-///
-/// This is intentionally explicit: the default blocklist profile is a named
-/// policy, not an implicit side effect of an unset field.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SyscallPolicy {
-    /// Sandlock's maintained profile for dangerous host-affecting syscalls.
-    DefaultBlocklist,
-    /// Block exactly these syscall names, plus SysV IPC when not allowed.
-    Blocklist(Vec<String>),
-    /// Do not install a syscall blocklist beyond built-in arg filters.
-    None,
-}
-
-impl Default for SyscallPolicy {
-    fn default() -> Self {
-        Self::DefaultBlocklist
-    }
-}
-
 /// Policy for confining the current process in place.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfinePolicy {
@@ -120,9 +100,7 @@ impl TryFrom<&Policy> for ConfinePolicy {
     fn try_from(policy: &Policy) -> Result<Self, Self::Error> {
         let mut unsupported = Vec::new();
         if !policy.fs_denied.is_empty() { unsupported.push("fs_denied"); }
-        if !matches!(policy.syscall_policy, SyscallPolicy::DefaultBlocklist) {
-            unsupported.push("syscall_policy");
-        }
+        if !policy.block_syscalls.is_empty() { unsupported.push("block_syscalls"); }
         if !policy.net_allow.is_empty() { unsupported.push("net_allow"); }
         if !policy.net_bind.is_empty() { unsupported.push("net_bind"); }
         if policy.allow_udp { unsupported.push("allow_udp"); }
@@ -444,8 +422,8 @@ pub struct Policy {
     pub fs_readable: Vec<PathBuf>,
     pub fs_denied: Vec<PathBuf>,
 
-    // Syscall filtering
-    pub syscall_policy: SyscallPolicy,
+    // Extra syscall filtering on top of Sandlock's default blocklist.
+    pub block_syscalls: Vec<String>,
 
     // Network
     /// Outbound endpoint allowlist as a list of `(host?, ports)` rules.
@@ -576,13 +554,6 @@ fn validate_syscall_names(names: &[String]) -> Result<(), PolicyError> {
     }
 }
 
-fn validate_syscall_policy(policy: &SyscallPolicy) -> Result<(), PolicyError> {
-    match policy {
-        SyscallPolicy::DefaultBlocklist | SyscallPolicy::None => Ok(()),
-        SyscallPolicy::Blocklist(names) => validate_syscall_names(names),
-    }
-}
-
 /// Fluent builder for `Policy`.
 #[derive(Default)]
 pub struct PolicyBuilder {
@@ -590,7 +561,7 @@ pub struct PolicyBuilder {
     fs_readable: Vec<PathBuf>,
     fs_denied: Vec<PathBuf>,
 
-    syscall_policy: Option<SyscallPolicy>,
+    block_syscalls: Vec<String>,
 
     /// Raw `--net-allow` specs; parsed in `build()` to surface errors.
     net_allow: Vec<String>,
@@ -665,18 +636,8 @@ impl PolicyBuilder {
         self
     }
 
-    pub fn syscalls(mut self, policy: SyscallPolicy) -> Self {
-        self.syscall_policy = Some(policy);
-        self
-    }
-
     pub fn block_syscalls(mut self, calls: Vec<String>) -> Self {
-        self.syscall_policy = Some(SyscallPolicy::Blocklist(calls));
-        self
-    }
-
-    pub fn no_syscall_policy(mut self) -> Self {
-        self.syscall_policy = Some(SyscallPolicy::None);
+        self.block_syscalls.extend(calls);
         self
     }
 
@@ -885,8 +846,7 @@ impl PolicyBuilder {
     }
 
     pub fn build(self) -> Result<Policy, PolicyError> {
-        let syscall_policy = self.syscall_policy.unwrap_or_default();
-        validate_syscall_policy(&syscall_policy)?;
+        validate_syscall_names(&self.block_syscalls)?;
 
         // Validate: max_cpu must be 1-100
         if let Some(cpu) = self.max_cpu {
@@ -975,7 +935,7 @@ impl PolicyBuilder {
             fs_writable: self.fs_writable,
             fs_readable: self.fs_readable,
             fs_denied: self.fs_denied,
-            syscall_policy,
+            block_syscalls: self.block_syscalls,
             net_allow,
             net_bind: self.net_bind,
             allow_udp: self.allow_udp,

@@ -332,13 +332,12 @@ positive int = deny with errno, `"audit"`/`-2` = allow + flag.
 ### Rust API
 
 ```rust
-use sandlock_core::{ConfinePolicy, Policy, Sandbox, Pipeline, Stage, SyscallPolicy, confine};
+use sandlock_core::{ConfinePolicy, Policy, Sandbox, Pipeline, Stage, confine};
 
 // Basic run
 let policy = Policy::builder()
     .fs_read("/usr").fs_read("/lib")
     .fs_write("/tmp")
-    .syscalls(SyscallPolicy::DefaultBlocklist)
     .max_memory(ByteSize::mib(256))
     .build()?;
 let result = Sandbox::run(&policy, Some("hello-box"), &["echo", "hello"]).await?;
@@ -394,7 +393,7 @@ fs_readable = ["/usr", "/lib", "/lib64", "/bin", "/etc"]
 clean_env = true
 max_memory = "512M"
 max_processes = 50
-syscall_policy = "default_blocklist"
+block_syscalls = []
 
 [env]
 CC = "gcc"
@@ -650,8 +649,7 @@ Policy(
     fs_denied=["/proc/kcore"],     # Explicitly denied
 
     # Syscall filtering (seccomp)
-    syscall_policy="default_blocklist", # default_blocklist | blocklist | none
-    block_syscalls=[],              # used when syscall_policy="blocklist"
+    block_syscalls=[],              # Extra syscalls to block in addition to Sandlock defaults
 
     # Network — see "Network Model" above. Each entry is `host:port[,port,...]`,
     # `:port`, `*:port`, `host:*`, or `:*` / `*:*`. Empty list = deny all

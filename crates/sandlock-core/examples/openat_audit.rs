@@ -24,9 +24,8 @@ use std::env;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use sandlock_core::seccomp::dispatch::{ExtraHandler, HandlerFn};
 use sandlock_core::seccomp::notif::NotifAction;
-use sandlock_core::{Policy, Sandbox};
+use sandlock_core::{HandlerCtx, Policy, Sandbox};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -51,21 +50,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_clone = Arc::clone(&counter);
 
-    let audit: HandlerFn = Box::new(move |notif, _ctx, _fd| {
+    let audit = move |cx: &HandlerCtx| {
         let counter = Arc::clone(&counter_clone);
-        Box::pin(async move {
+        let pid = cx.notif.pid;
+        async move {
             let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
-            eprintln!("[audit #{n}] pid={} openat", notif.pid);
+            eprintln!("[audit #{n}] pid={pid} openat");
             // Continue = let the default table and the kernel handle it.
             NotifAction::Continue
-        })
-    });
+        }
+    };
 
     let result = Sandbox::run_with_extra_handlers(
         &policy,
         Some("openat-audit"),
         &cmd_ref,
-        vec![ExtraHandler::new(libc::SYS_openat, audit)],
+        [(libc::SYS_openat, audit)],
     )
     .await?;
 

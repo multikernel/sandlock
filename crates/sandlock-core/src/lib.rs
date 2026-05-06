@@ -29,7 +29,7 @@ pub(crate) mod http_acl;
 
 pub use error::SandlockError;
 pub use checkpoint::Checkpoint;
-pub use policy::{ConfinePolicy, ConfinePolicyBuilder, Policy, PolicyBuilder, SyscallPolicy};
+pub use policy::{ConfinePolicy, ConfinePolicyBuilder, Policy, PolicyBuilder};
 pub use result::{RunResult, ExitStatus};
 pub use sandbox::Sandbox;
 pub use pipeline::{Stage, Pipeline, Gather};

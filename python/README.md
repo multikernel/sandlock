@@ -144,10 +144,9 @@ policy = Policy(
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `syscall_policy` | `SyscallPolicy` | `DEFAULT_BLOCKLIST` | Syscall filtering mode |
-| `block_syscalls` | `list[str]` | `[]` | Syscall names used when `syscall_policy=BLOCKLIST` |
+| `block_syscalls` | `list[str]` | `[]` | Extra syscalls to block in addition to Sandlock defaults |
 
-Use `SyscallPolicy.DEFAULT_BLOCKLIST`, `BLOCKLIST`, or `NONE`.
+Sandlock always applies its default syscall blocklist.
 
 #### Deterministic execution
 

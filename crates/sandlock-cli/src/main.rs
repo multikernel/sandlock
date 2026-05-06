@@ -280,7 +280,7 @@ async fn main() -> Result<()> {
                 if let Some(cpu) = base.max_cpu { b = b.max_cpu(cpu); }
                 if let Some(seed) = base.random_seed { b = b.random_seed(seed); }
                 if let Some(n) = base.num_cpus { b = b.num_cpus(n); }
-                b = b.syscalls(base.syscall_policy.clone());
+                b = b.block_syscalls(base.block_syscalls.clone());
                 b = b.allow_udp(base.allow_udp);
                 b = b.allow_icmp(base.allow_icmp);
                 b = b.allow_sysv_ipc(base.allow_sysv_ipc);
