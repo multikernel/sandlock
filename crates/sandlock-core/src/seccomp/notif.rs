@@ -423,9 +423,9 @@ fn write_child_mem_vm(pid: u32, addr: u64, data: &[u8]) -> Result<(), NotifError
 /// still live (kernel did not abort or release the trapped syscall while the
 /// supervisor was reading guest memory).
 ///
-/// Public — used by downstream `ExtraHandler`s (sandbox-sber/vfs-engine etc.)
-/// to read syscall arguments that the kernel passes by pointer (paths in
-/// `openat`, buffers in `write`/`writev`).
+/// Public — used by downstream `Handler` implementations to read syscall
+/// arguments that the kernel passes by pointer (paths in `openat`, buffers
+/// in `write`/`writev`, etc.).
 pub fn read_child_mem(
     notif_fd: RawFd,
     id: u64,
@@ -441,7 +441,19 @@ pub fn read_child_mem(
 
 /// Read a NUL-terminated string from child memory without crossing unmapped
 /// page boundaries in a single `process_vm_readv` call.
-pub(crate) fn read_child_cstr(
+///
+/// TOCTOU-safe — internally calls [`read_child_mem`], inheriting the
+/// `id_valid` checks bracketing each `process_vm_readv` call.
+///
+/// Page-aware: reads up to a page boundary at a time and stops at the
+/// first NUL byte, never crossing into unmapped memory.  Returns
+/// `None` for `addr == 0`, `max_len == 0`, a read failure, or a string
+/// that exceeds `max_len` without a NUL.
+///
+/// Public — used by downstream `Handler` implementations that read
+/// path arguments from notifications (`openat`, `unlinkat`, `statx`,
+/// `newfstatat`, etc.).
+pub fn read_child_cstr(
     notif_fd: RawFd,
     id: u64,
     pid: u32,
@@ -473,9 +485,10 @@ pub(crate) fn read_child_cstr(
 
 /// Write bytes to a child process via `process_vm_writev` with TOCTOU validation.
 ///
-/// Same TOCTOU contract as [`read_child_mem`]. Public for downstream
-/// `ExtraHandler`s that synthesise syscall results into guest memory
-/// (e.g. fake `getdents64` listings populated from a virtual tree-index).
+/// Same TOCTOU contract as [`read_child_mem`].  Public for downstream
+/// `Handler` implementations that synthesise syscall results into
+/// guest memory (e.g. fake `getdents64` listings populated from a
+/// virtual directory index, or synthesised `stat` buffers).
 pub fn write_child_mem(
     notif_fd: RawFd,
     id: u64,
@@ -954,10 +967,10 @@ async fn handle_notification(
                 NotifAction::Errno(libc::EACCES)
             } else {
                 drop(pfs);
-                dispatch_table.dispatch(notif, ctx, fd).await
+                dispatch_table.dispatch(notif, fd).await
             }
         } else {
-            dispatch_table.dispatch(notif, ctx, fd).await
+            dispatch_table.dispatch(notif, fd).await
         }
     };
 
@@ -1086,13 +1099,13 @@ async fn handle_notification(
 ///
 /// Runs until the notification fd is closed (child exits or filter is removed).
 ///
-/// `extra_handlers` are user-supplied syscall handlers registered after all
-/// builtin handlers (see [`super::dispatch::ExtraHandler`]).  For the default
-/// behaviour without any custom handlers pass an empty `Vec`.
+/// `pending_handlers` are user-supplied syscall handlers registered after all
+/// builtin handlers.  For the default behaviour without any custom handlers
+/// pass an empty `Vec`.
 pub async fn supervisor(
     notif_fd: OwnedFd,
     ctx: Arc<super::ctx::SupervisorCtx>,
-    extra_handlers: Vec<super::dispatch::ExtraHandler>,
+    pending_handlers: Vec<(i64, std::sync::Arc<dyn super::dispatch::Handler>)>,
 ) {
     let fd = notif_fd.as_raw_fd();
 
@@ -1100,7 +1113,8 @@ pub async fn supervisor(
     let dispatch_table = Arc::new(super::dispatch::build_dispatch_table(
         &ctx.policy,
         &ctx.resource,
-        extra_handlers,
+        &ctx,
+        pending_handlers,
     ));
 
     // Try to enable sync wakeup (Linux 6.7+, ignore error on older kernels).
@@ -1211,6 +1225,14 @@ pub(crate) async fn cleanup_pid(ctx: &super::ctx::SupervisorCtx, key: super::sta
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_child_cstr_returns_none_for_null_addr_or_zero_max_len() {
+        // Smoke: addr == 0 short-circuits without touching the child.
+        assert!(read_child_cstr(-1, 0, 0, 0, 4096).is_none());
+        // max_len == 0 also short-circuits.
+        assert!(read_child_cstr(-1, 0, 0, 0xdeadbeef, 0).is_none());
+    }
 
     #[test]
     fn test_notif_action_debug() {

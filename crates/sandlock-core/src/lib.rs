@@ -35,6 +35,10 @@ pub use sandbox::Sandbox;
 pub use pipeline::{Stage, Pipeline, Gather};
 pub use dry_run::{Change, ChangeKind, DryRunResult};
 
+// Public extension API — see docs/extension-handlers.md.
+pub use seccomp::dispatch::{Handler, HandlerCtx, HandlerError};
+pub use seccomp::syscall::{Syscall, SyscallError};
+
 /// Query the Landlock ABI version supported by the running kernel.
 pub fn landlock_abi_version() -> Result<u32, error::ConfinementError> {
     landlock::abi_version()

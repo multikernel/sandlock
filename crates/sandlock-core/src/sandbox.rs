@@ -109,9 +109,10 @@ pub struct Sandbox {
     /// Optional callback invoked when a port bind is recorded.
     #[allow(clippy::type_complexity)]
     on_bind: Option<Box<dyn Fn(&std::collections::HashMap<u16, u16>) + Send + Sync>>,
-    /// User-supplied extra syscall handlers. Taken on spawn and
-    /// appended to the dispatch table after all builtin handlers.
-    extra_handlers: Vec<crate::seccomp::dispatch::ExtraHandler>,
+    /// User-supplied extra syscall handlers as `(syscall_nr, Arc<dyn Handler>)`
+    /// pairs.  Taken on spawn and appended to the dispatch table after
+    /// all builtin handlers.
+    extra_handlers: Vec<(i64, Arc<dyn crate::seccomp::dispatch::Handler>)>,
 }
 
 impl Sandbox {
@@ -182,7 +183,9 @@ impl Sandbox {
         name: Option<&str>,
         cmd: &[&str],
     ) -> Result<RunResult, SandlockError> {
-        Self::run_with_extra_handlers(policy, name, cmd, Vec::new()).await
+        let mut sb = Self::new(policy, name)?;
+        sb.do_spawn(cmd, true).await?;
+        sb.wait().await
     }
 
     /// Run a sandboxed process with inherited stdio (interactive mode).
@@ -198,66 +201,87 @@ impl Sandbox {
 
     /// One-shot run with user-supplied syscall handlers.
     ///
-    /// `extra_handlers` are registered in the dispatch table **after** all
-    /// builtin handlers for the same syscall.  They observe the post-builtin
-    /// view (e.g. [`chroot`]-normalized paths on `openat`) and cannot be used
-    /// to bypass builtin confinement.  See
-    /// [`crate::seccomp::dispatch::ExtraHandler`] for the ordering contract.
+    /// `extra_handlers` is any `IntoIterator` over `(syscall, handler)` pairs
+    /// where:
     ///
-    /// When called with an empty vector, this function is identical to
-    /// [`Self::run`].
+    /// * `syscall: S` is anything implementing `TryInto<Syscall>` — `i64`/`u32`
+    ///   raw numbers (validated through
+    ///   [`crate::seccomp::syscall::Syscall::checked`]), or a pre-validated
+    ///   [`crate::seccomp::syscall::Syscall`].
+    /// * `handler: H` is anything implementing
+    ///   [`crate::seccomp::dispatch::Handler`] — a struct with explicit
+    ///   `impl Handler` for stateful handlers, or a closure of shape
+    ///   `Fn(&HandlerCtx) -> impl Future<Output = NotifAction>` via the
+    ///   blanket impl.
+    ///
+    /// Handlers are registered in the dispatch table **after** all builtin
+    /// handlers for the same syscall, so they observe the post-builtin view
+    /// (e.g. `chroot`-normalized paths on `openat`) and cannot bypass builtin
+    /// confinement.
+    ///
+    /// Validation happens up-front (before fork): each `syscall` is checked
+    /// through `Syscall::checked`, and the deny-list contract is enforced via
+    /// [`crate::seccomp::dispatch::validate_handler_syscalls_against_policy`].
     ///
     /// # Example
     ///
     /// ```ignore
     /// use sandlock_core::{Policy, Sandbox};
-    /// use sandlock_core::seccomp::dispatch::{ExtraHandler, HandlerFn};
     /// use sandlock_core::seccomp::notif::NotifAction;
     ///
     /// # tokio_test::block_on(async {
     /// let policy = Policy::builder().fs_read("/usr").build().unwrap();
     ///
-    /// let audit: HandlerFn = Box::new(|notif, _ctx, _fd| {
-    ///     Box::pin(async move {
-    ///         eprintln!("openat from pid {}", notif.data.pid);
+    /// let audit = |cx: &sandlock_core::HandlerCtx<'_>| {
+    ///     let pid = cx.notif.data.pid;
+    ///     async move {
+    ///         eprintln!("openat from pid {}", pid);
     ///         NotifAction::Continue
-    ///     })
-    /// });
+    ///     }
+    /// };
     ///
     /// let result = Sandbox::run_with_extra_handlers(
     ///     &policy,
     ///     Some("audit"),
     ///     &["/usr/bin/true"],
-    ///     vec![ExtraHandler::new(libc::SYS_openat, audit)],
+    ///     [(libc::SYS_openat, audit)],
     /// ).await.unwrap();
     /// # });
     /// ```
-    pub async fn run_with_extra_handlers(
+    pub async fn run_with_extra_handlers<I, S, H>(
         policy: &Policy,
         name: Option<&str>,
         cmd: &[&str],
-        extra_handlers: Vec<crate::seccomp::dispatch::ExtraHandler>,
-    ) -> Result<RunResult, SandlockError> {
-        // Reject extras that would weaken confinement (e.g. one registered
-        // on a default-deny syscall).  See
-        // [`crate::seccomp::dispatch::validate_extras_against_policy`] for the
-        // rationale.  Done before fork so the caller gets a clear error
-        // instead of a silently-broken sandbox.
-        if let Err(nr) =
-            crate::seccomp::dispatch::validate_extras_against_policy(&extra_handlers, policy)
-        {
-            return Err(SandboxError::Child(format!(
-                "ExtraHandler on syscall {} conflicts with the deny list \
-                 (DEFAULT_DENY_SYSCALLS or policy.deny_syscalls) and would let \
-                 user code bypass it via SECCOMP_USER_NOTIF_FLAG_CONTINUE",
-                nr
-            ))
-            .into());
-        }
-
+        extra_handlers: I,
+    ) -> Result<RunResult, SandlockError>
+    where
+        I: IntoIterator<Item = (S, H)>,
+        S: TryInto<crate::seccomp::syscall::Syscall, Error = crate::seccomp::syscall::SyscallError>,
+        H: crate::seccomp::dispatch::Handler,
+    {
+        let pending = collect_extra_handlers(extra_handlers, policy)?;
         let mut sb = Self::new(policy, name)?;
-        sb.extra_handlers = extra_handlers;
+        sb.extra_handlers = pending;
         sb.do_spawn(cmd, true).await?;
+        sb.wait().await
+    }
+
+    /// Interactive-stdio counterpart of [`Self::run_with_extra_handlers`].
+    pub async fn run_interactive_with_extra_handlers<I, S, H>(
+        policy: &Policy,
+        name: Option<&str>,
+        cmd: &[&str],
+        extra_handlers: I,
+    ) -> Result<RunResult, SandlockError>
+    where
+        I: IntoIterator<Item = (S, H)>,
+        S: TryInto<crate::seccomp::syscall::Syscall, Error = crate::seccomp::syscall::SyscallError>,
+        H: crate::seccomp::dispatch::Handler,
+    {
+        let pending = collect_extra_handlers(extra_handlers, policy)?;
+        let mut sb = Self::new(policy, name)?;
+        sb.extra_handlers = pending;
+        sb.do_spawn(cmd, false).await?;
         sb.wait().await
     }
 
@@ -939,7 +963,7 @@ impl Sandbox {
             let extra_syscalls: Vec<u32> = self
                 .extra_handlers
                 .iter()
-                .map(|h| h.syscall_nr as u32)
+                .map(|h| h.0 as u32)
                 .collect();
 
             // This never returns.
@@ -1036,8 +1060,8 @@ impl Sandbox {
                 // argv reads TOCTOU-safe.
                 argv_safety_required: self.policy.policy_fn.is_some()
                     || self.extra_handlers.iter().any(|h| {
-                        h.syscall_nr == libc::SYS_execve
-                            || h.syscall_nr == libc::SYS_execveat
+                        h.0 == libc::SYS_execve
+                            || h.0 == libc::SYS_execveat
                     }),
                 time_offset: time_offset_val,
                 num_cpus: self.policy.num_cpus,
@@ -1207,7 +1231,8 @@ impl Sandbox {
             });
 
             // Spawn notif supervisor.  `extra_handlers` is consumed here
-            // (moved into the supervisor task) because HandlerFn is not Clone.
+            // (moved into the supervisor task) because each `Arc<dyn Handler>`
+            // is shared with the dispatch table and must outlive it.
             let extra_handlers = std::mem::take(&mut self.extra_handlers);
             self.notif_handle = Some(tokio::spawn(
                 notif::supervisor(notif_fd, ctx, extra_handlers),
@@ -1244,6 +1269,40 @@ impl Sandbox {
 
         Ok(())
     }
+}
+
+// ============================================================
+// Helpers
+// ============================================================
+
+/// Convert a user-supplied iterator of `(syscall, handler)` pairs into
+/// the internal `Vec<(i64, Arc<dyn Handler>)>` shape used by the
+/// supervisor, validating each syscall up-front against the deny list.
+fn collect_extra_handlers<I, S, H>(
+    extra_handlers: I,
+    policy: &Policy,
+) -> Result<Vec<(i64, Arc<dyn crate::seccomp::dispatch::Handler>)>, SandlockError>
+where
+    I: IntoIterator<Item = (S, H)>,
+    S: TryInto<crate::seccomp::syscall::Syscall, Error = crate::seccomp::syscall::SyscallError>,
+    H: crate::seccomp::dispatch::Handler,
+{
+    use crate::seccomp::dispatch::{Handler, HandlerError};
+
+    let pending: Vec<(i64, Arc<dyn Handler>)> = extra_handlers
+        .into_iter()
+        .map(|(syscall, handler)| {
+            let nr = syscall.try_into().map_err(HandlerError::from)?.raw();
+            let h: Arc<dyn Handler> = Arc::new(handler);
+            Ok::<_, HandlerError>((nr, h))
+        })
+        .collect::<Result<_, _>>()?;
+
+    let nrs: Vec<i64> = pending.iter().map(|(nr, _)| *nr).collect();
+    crate::seccomp::dispatch::validate_handler_syscalls_against_policy(&nrs, policy)
+        .map_err(|nr_u| HandlerError::OnDenySyscall { syscall_nr: nr_u as i64 })?;
+
+    Ok(pending)
 }
 
 // ============================================================

@@ -11,6 +11,9 @@ pub enum SandlockError {
 
     #[error("memory protection error: {0}")]
     MemoryProtect(String),
+
+    #[error("handler error: {0}")]
+    Handler(#[from] crate::seccomp::dispatch::HandlerError),
 }
 
 #[derive(Debug, Error)]
