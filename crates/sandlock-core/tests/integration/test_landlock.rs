@@ -57,8 +57,8 @@ async fn test_cannot_read_outside_allowed() {
         .build()
         .unwrap();
 
-    // /etc is NOT in fs_read, so cat /etc/os-release should fail
-    let result = Sandbox::run(&policy, Some("test"), &["cat", "/etc/os-release"])
+    // /etc is NOT in fs_read, so cat /etc/group should fail
+    let result = Sandbox::run(&policy, Some("test"), &["cat", "/etc/group"])
         .await
         .unwrap();
     assert!(!result.success(), "cat should fail without /etc in fs_read");
