@@ -15,7 +15,7 @@
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::time::Duration;
 
-use crate::error::{SandboxProcessError, SandlockError};
+use crate::error::{SandboxRuntimeError, SandlockError};
 use crate::sandbox::Sandbox;
 use crate::result::{ExitStatus, RunResult};
 
@@ -84,7 +84,7 @@ impl Pipeline {
     /// Create a pipeline from a list of stages (must have >= 2).
     pub fn new(stages: Vec<Stage>) -> Result<Self, SandlockError> {
         if stages.len() < 2 {
-            return Err(SandlockError::Process(SandboxProcessError::Child(
+            return Err(SandlockError::Runtime(SandboxRuntimeError::Child(
                 "Pipeline requires at least 2 stages".into(),
             )));
         }
@@ -143,12 +143,12 @@ async fn run_pipeline(stages: Vec<Stage>) -> Result<RunResult, SandlockError> {
     // Create inter-stage pipes: pipe[i] connects stage[i] stdout → stage[i+1] stdin
     let mut inter_pipes: Vec<(OwnedFd, OwnedFd)> = Vec::with_capacity(n - 1);
     for _ in 0..n - 1 {
-        inter_pipes.push(make_pipe().map_err(SandboxProcessError::Io)?);
+        inter_pipes.push(make_pipe().map_err(SandboxRuntimeError::Io)?);
     }
 
     // Create capture pipes for last stage's stdout and stderr
-    let (cap_stdout_r, cap_stdout_w) = make_pipe().map_err(SandboxProcessError::Io)?;
-    let (cap_stderr_r, cap_stderr_w) = make_pipe().map_err(SandboxProcessError::Io)?;
+    let (cap_stdout_r, cap_stdout_w) = make_pipe().map_err(SandboxRuntimeError::Io)?;
+    let (cap_stderr_r, cap_stderr_w) = make_pipe().map_err(SandboxRuntimeError::Io)?;
 
     // Spawn each stage
     let mut sandboxes: Vec<Sandbox> = Vec::with_capacity(n);
@@ -276,10 +276,10 @@ impl Gather {
 
     pub async fn run(self, timeout: Option<Duration>) -> Result<RunResult, SandlockError> {
         let consumer = self.consumer.ok_or_else(|| {
-            SandlockError::Process(SandboxProcessError::Child("Gather requires a consumer".into()))
+            SandlockError::Runtime(SandboxRuntimeError::Child("Gather requires a consumer".into()))
         })?;
         if self.sources.is_empty() {
-            return Err(SandlockError::Process(SandboxProcessError::Child(
+            return Err(SandlockError::Runtime(SandboxRuntimeError::Child(
                 "Gather requires at least one source".into(),
             )));
         }
@@ -310,7 +310,7 @@ async fn run_gather(
     // Last source → consumer stdin (fd 0), others → fd 3, 4, 5, ...
     let mut source_pipes: Vec<(OwnedFd, OwnedFd)> = Vec::with_capacity(n);
     for _ in 0..n {
-        source_pipes.push(make_pipe().map_err(SandboxProcessError::Io)?);
+        source_pipes.push(make_pipe().map_err(SandboxRuntimeError::Io)?);
     }
 
     // Assign consumer fds: last source → fd 0, others → fd 3, 4, ...
@@ -329,8 +329,8 @@ async fn run_gather(
         .join(",");
 
     // Capture pipes for consumer stdout/stderr
-    let (cap_stdout_r, cap_stdout_w) = make_pipe().map_err(SandboxProcessError::Io)?;
-    let (cap_stderr_r, cap_stderr_w) = make_pipe().map_err(SandboxProcessError::Io)?;
+    let (cap_stdout_r, cap_stdout_w) = make_pipe().map_err(SandboxRuntimeError::Io)?;
+    let (cap_stderr_r, cap_stderr_w) = make_pipe().map_err(SandboxRuntimeError::Io)?;
 
     // Spawn producers: each writes stdout to its pipe
     let mut sandboxes: Vec<Sandbox> = Vec::with_capacity(n + 1);

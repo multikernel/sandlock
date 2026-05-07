@@ -447,7 +447,7 @@ names = list_profiles()
 ```
 SandlockError (base)
   +-- SandboxError         invalid sandbox configuration
-  +-- SandboxProcessError  sandbox lifecycle errors
+  +-- SandboxRuntimeError  sandbox lifecycle errors
         +-- ForkError          fork failed
         +-- ChildError         child exited abnormally
         +-- BranchError        BranchFS operation failed
@@ -463,7 +463,7 @@ All exceptions are importable from `sandlock.exceptions` or directly from
 `sandlock`:
 
 ```python
-from sandlock import SandlockError, SandboxError, SandboxProcessError
+from sandlock import SandlockError, SandboxError, SandboxRuntimeError
 ```
 
 ### Enums

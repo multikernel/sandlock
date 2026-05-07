@@ -186,12 +186,12 @@ pub fn confine_filesystem(policy: &Sandbox) -> Result<(), SandlockError> {
 fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError> {
     // Step 1 -- detect and validate ABI version.
     let abi = abi_version().map_err(|e| {
-        SandlockError::Process(crate::error::SandboxProcessError::Confinement(e))
+        SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
     })?;
 
     if abi < MIN_ABI {
-        return Err(SandlockError::Process(
-            crate::error::SandboxProcessError::Confinement(
+        return Err(SandlockError::Runtime(
+            crate::error::SandboxRuntimeError::Confinement(
                 ConfinementError::InsufficientAbi {
                     required: MIN_ABI,
                     actual: abi,
@@ -243,7 +243,7 @@ fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError
 
     let ruleset_fd = syscall::landlock_create_ruleset(&attr, std::mem::size_of::<LandlockRulesetAttr>(), 0)
         .map_err(|e| {
-            SandlockError::Process(crate::error::SandboxProcessError::Confinement(
+            SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(
                 ConfinementError::Landlock(format!("create ruleset: {}", e)),
             ))
         })?;
@@ -267,7 +267,7 @@ fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError
             path.as_path()
         };
         add_path_rule(&ruleset_fd, rule_path, fs_write_mask).map_err(|e| {
-            SandlockError::Process(crate::error::SandboxProcessError::Confinement(e))
+            SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
         })?;
     }
 
@@ -281,7 +281,7 @@ fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError
             path.as_path()
         };
         add_path_rule(&ruleset_fd, rule_path, READ_ACCESS).map_err(|e| {
-            SandlockError::Process(crate::error::SandboxProcessError::Confinement(e))
+            SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
         })?;
     }
 
@@ -310,7 +310,7 @@ fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError
     if handle_net {
         for &port in &policy.net_bind {
             add_net_rule(&ruleset_fd, port, LANDLOCK_ACCESS_NET_BIND_TCP).map_err(|e| {
-                SandlockError::Process(crate::error::SandboxProcessError::Confinement(e))
+                SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
             })?;
         }
     }
@@ -340,14 +340,14 @@ fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError
         }
         for port in connect_ports {
             add_net_rule(&ruleset_fd, port, LANDLOCK_ACCESS_NET_CONNECT_TCP).map_err(|e| {
-                SandlockError::Process(crate::error::SandboxProcessError::Confinement(e))
+                SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
             })?;
         }
     }
 
     // Step 6 — enforce (irreversible).
     syscall::landlock_restrict_self(&ruleset_fd, 0).map_err(|e| {
-        SandlockError::Process(crate::error::SandboxProcessError::Confinement(
+        SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(
             ConfinementError::Landlock(format!("restrict_self: {}", e)),
         ))
     })?;

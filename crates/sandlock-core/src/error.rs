@@ -7,7 +7,7 @@ pub enum SandlockError {
     Sandbox(#[from] SandboxError),
 
     #[error("process error: {0}")]
-    Process(#[from] SandboxProcessError),
+    Runtime(#[from] SandboxRuntimeError),
 
     #[error("memory protection error: {0}")]
     MemoryProtect(String),
@@ -34,7 +34,7 @@ pub enum SandboxError {
 
 /// Errors from the sandbox process runtime (fork, confinement, child, etc.).
 #[derive(Debug, Error)]
-pub enum SandboxProcessError {
+pub enum SandboxRuntimeError {
     #[error("fork failed: {0}")]
     Fork(#[source] std::io::Error),
 

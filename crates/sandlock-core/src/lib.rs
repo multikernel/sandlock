@@ -59,8 +59,8 @@ pub const MIN_LANDLOCK_ABI: u32 = landlock::MIN_ABI;
 pub fn confine(confinement: &Confinement) -> Result<(), SandlockError> {
     // Set NO_NEW_PRIVS (required for Landlock)
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-        return Err(SandlockError::Process(
-            error::SandboxProcessError::Confinement(
+        return Err(SandlockError::Runtime(
+            error::SandboxRuntimeError::Confinement(
                 error::ConfinementError::Landlock(format!(
                     "prctl(PR_SET_NO_NEW_PRIVS): {}",
                     std::io::Error::last_os_error()

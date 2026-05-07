@@ -837,13 +837,13 @@ impl Sandbox {
 
     /// Send SIGSTOP to the child's process group.
     pub fn pause(&mut self) -> Result<(), crate::error::SandlockError> {
-        use crate::error::SandboxProcessError;
+        use crate::error::SandboxRuntimeError;
         let pid = self.runtime.as_ref()
             .and_then(|rt| rt.child_pid)
-            .ok_or(SandboxProcessError::NotRunning)?;
+            .ok_or(SandboxRuntimeError::NotRunning)?;
         let ret = unsafe { libc::killpg(pid, libc::SIGSTOP) };
         if ret < 0 {
-            return Err(SandboxProcessError::Io(std::io::Error::last_os_error()).into());
+            return Err(SandboxRuntimeError::Io(std::io::Error::last_os_error()).into());
         }
         self.rt_mut().state = RuntimeState::Paused;
         Ok(())
@@ -851,13 +851,13 @@ impl Sandbox {
 
     /// Send SIGCONT to the child's process group.
     pub fn resume(&mut self) -> Result<(), crate::error::SandlockError> {
-        use crate::error::SandboxProcessError;
+        use crate::error::SandboxRuntimeError;
         let pid = self.runtime.as_ref()
             .and_then(|rt| rt.child_pid)
-            .ok_or(SandboxProcessError::NotRunning)?;
+            .ok_or(SandboxRuntimeError::NotRunning)?;
         let ret = unsafe { libc::killpg(pid, libc::SIGCONT) };
         if ret < 0 {
-            return Err(SandboxProcessError::Io(std::io::Error::last_os_error()).into());
+            return Err(SandboxRuntimeError::Io(std::io::Error::last_os_error()).into());
         }
         self.rt_mut().state = RuntimeState::Running;
         Ok(())
@@ -865,15 +865,15 @@ impl Sandbox {
 
     /// Send SIGKILL to the child's process group.
     pub fn kill(&mut self) -> Result<(), crate::error::SandlockError> {
-        use crate::error::SandboxProcessError;
+        use crate::error::SandboxRuntimeError;
         let pid = self.runtime.as_ref()
             .and_then(|rt| rt.child_pid)
-            .ok_or(SandboxProcessError::NotRunning)?;
+            .ok_or(SandboxRuntimeError::NotRunning)?;
         let ret = unsafe { libc::killpg(pid, libc::SIGKILL) };
         if ret < 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() != Some(libc::ESRCH) {
-                return Err(SandboxProcessError::Io(err).into());
+                return Err(SandboxRuntimeError::Io(err).into());
             }
         }
         Ok(())
@@ -900,10 +900,10 @@ impl Sandbox {
 
     /// Wait for the child process to exit.
     pub async fn wait(&mut self) -> Result<crate::result::RunResult, crate::error::SandlockError> {
-        use crate::error::SandboxProcessError;
+        use crate::error::SandboxRuntimeError;
         use crate::result::{ExitStatus, RunResult};
 
-        let pid = self.rt().child_pid.ok_or(SandboxProcessError::NotRunning)?;
+        let pid = self.rt().child_pid.ok_or(SandboxRuntimeError::NotRunning)?;
 
         if let RuntimeState::Stopped(ref es) = self.rt().state {
             return Ok(RunResult {
@@ -995,10 +995,10 @@ impl Sandbox {
     /// Commit COW writes to the original directory.
     #[doc(hidden)]
     pub async fn commit(&mut self) -> Result<(), crate::error::SandlockError> {
-        use crate::error::{SandboxProcessError, SandlockError};
+        use crate::error::{SandboxRuntimeError, SandlockError};
         if let Some(ref mut rt) = self.runtime {
             if let Some(branch) = rt.cow_branch.take() {
-                branch.commit().map_err(|e| SandlockError::Process(SandboxProcessError::Branch(e)))?;
+                branch.commit().map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Branch(e)))?;
             }
         }
         Ok(())
@@ -1007,10 +1007,10 @@ impl Sandbox {
     /// Discard COW writes.
     #[doc(hidden)]
     pub async fn abort_branch(&mut self) -> Result<(), crate::error::SandlockError> {
-        use crate::error::{SandboxProcessError, SandlockError};
+        use crate::error::{SandboxRuntimeError, SandlockError};
         if let Some(ref mut rt) = self.runtime {
             if let Some(branch) = rt.cow_branch.take() {
-                branch.abort().map_err(|e| SandlockError::Process(SandboxProcessError::Branch(e)))?;
+                branch.abort().map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Branch(e)))?;
             }
         }
         Ok(())
@@ -1018,9 +1018,9 @@ impl Sandbox {
 
     /// Freeze the sandbox: hold fork notifications + SIGSTOP the process group.
     pub(crate) async fn freeze(&self) -> Result<(), crate::error::SandlockError> {
-        use crate::error::{SandboxProcessError, SandlockError};
-        let rt = self.runtime.as_ref().ok_or(SandlockError::Process(SandboxProcessError::NotRunning))?;
-        let pid = rt.child_pid.ok_or(SandlockError::Process(SandboxProcessError::NotRunning))?;
+        use crate::error::{SandboxRuntimeError, SandlockError};
+        let rt = self.runtime.as_ref().ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
+        let pid = rt.child_pid.ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
         if let Some(ref resource) = rt.supervisor_resource {
             let mut rs = resource.lock().await;
             rs.hold_forks = true;
@@ -1031,9 +1031,9 @@ impl Sandbox {
 
     /// Thaw the sandbox: release held fork notifications + SIGCONT.
     pub(crate) async fn thaw(&self) -> Result<(), crate::error::SandlockError> {
-        use crate::error::{SandboxProcessError, SandlockError};
-        let rt = self.runtime.as_ref().ok_or(SandlockError::Process(SandboxProcessError::NotRunning))?;
-        let pid = rt.child_pid.ok_or(SandlockError::Process(SandboxProcessError::NotRunning))?;
+        use crate::error::{SandboxRuntimeError, SandlockError};
+        let rt = self.runtime.as_ref().ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
+        let pid = rt.child_pid.ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
         if let Some(ref resource) = rt.supervisor_resource {
             let mut rs = resource.lock().await;
             rs.hold_forks = false;
@@ -1045,10 +1045,10 @@ impl Sandbox {
 
     /// Capture a checkpoint of the running sandbox.
     pub async fn checkpoint(&self) -> Result<crate::checkpoint::Checkpoint, crate::error::SandlockError> {
-        use crate::error::{SandboxProcessError, SandlockError};
+        use crate::error::{SandboxRuntimeError, SandlockError};
         let pid = self.runtime.as_ref()
             .and_then(|rt| rt.child_pid)
-            .ok_or(SandlockError::Process(SandboxProcessError::NotRunning))?;
+            .ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
         self.freeze().await?;
         let cp = crate::checkpoint::capture(pid, self);
         self.thaw().await?;
@@ -1156,15 +1156,15 @@ impl Sandbox {
     /// `SandboxBuilder::init_fn` / `work_fn`, or `Sandbox::with_init_fn` /
     /// `with_work_fn`). Returns an error if either is missing.
     pub async fn fork(&mut self, n: u32) -> Result<Vec<Sandbox>, crate::error::SandlockError> {
-        use crate::error::SandboxProcessError;
+        use crate::error::SandboxRuntimeError;
         use std::os::fd::{FromRawFd, OwnedFd};
 
         // Pull init_fn / work_fn directly from self (they live on Sandbox, not
         // Runtime, so ensure_runtime hasn't consumed them yet).
         let init_fn = self.init_fn.take()
-            .ok_or_else(|| SandboxProcessError::Child("fork() requires init_fn and work_fn — use SandboxBuilder::init_fn() / work_fn() or Sandbox::with_init_fn() / with_work_fn()".into()))?;
+            .ok_or_else(|| SandboxRuntimeError::Child("fork() requires init_fn and work_fn — use SandboxBuilder::init_fn() / work_fn() or Sandbox::with_init_fn() / with_work_fn()".into()))?;
         let work_fn = self.work_fn.take()
-            .ok_or_else(|| SandboxProcessError::Child("fork() requires init_fn and work_fn — use SandboxBuilder::init_fn() / work_fn() or Sandbox::with_init_fn() / with_work_fn()".into()))?;
+            .ok_or_else(|| SandboxRuntimeError::Child("fork() requires init_fn and work_fn — use SandboxBuilder::init_fn() / work_fn() or Sandbox::with_init_fn() / with_work_fn()".into()))?;
 
         // Initialize the runtime block so we can record child PID / state below.
         self.ensure_runtime()?;
@@ -1173,7 +1173,7 @@ impl Sandbox {
 
         let mut ctrl_fds = [0i32; 2];
         if unsafe { libc::pipe2(ctrl_fds.as_mut_ptr(), 0) } < 0 {
-            return Err(SandboxProcessError::Io(std::io::Error::last_os_error()).into());
+            return Err(SandboxRuntimeError::Io(std::io::Error::last_os_error()).into());
         }
         let ctrl_parent = unsafe { OwnedFd::from_raw_fd(ctrl_fds[0]) };
         let ctrl_child_fd = ctrl_fds[1];
@@ -1193,7 +1193,7 @@ impl Sandbox {
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             unsafe { libc::close(ctrl_child_fd) };
-            return Err(SandboxProcessError::Fork(std::io::Error::last_os_error()).into());
+            return Err(SandboxRuntimeError::Fork(std::io::Error::last_os_error()).into());
         }
 
         if pid == 0 {
@@ -1301,7 +1301,7 @@ impl Sandbox {
         cmd: &[&str],
         clones: &mut [Sandbox],
     ) -> Result<crate::result::RunResult, crate::error::SandlockError> {
-        use crate::error::SandboxProcessError;
+        use crate::error::SandboxRuntimeError;
 
         let mut combined = Vec::new();
         for clone in clones.iter_mut() {
@@ -1314,7 +1314,7 @@ impl Sandbox {
 
         let mut stdin_fds = [0i32; 2];
         if unsafe { libc::pipe2(stdin_fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
-            return Err(SandboxProcessError::Io(std::io::Error::last_os_error()).into());
+            return Err(SandboxRuntimeError::Io(std::io::Error::last_os_error()).into());
         }
 
         let write_fd = stdin_fds[1];
@@ -1409,7 +1409,7 @@ impl Sandbox {
     async fn do_spawn(&mut self, cmd: &[&str], capture: bool) -> Result<(), crate::error::SandlockError> {
         use std::ffi::CString;
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-        use crate::error::SandboxProcessError;
+        use crate::error::SandboxRuntimeError;
         use crate::context::{PipePair, read_u32_fd, write_u32_fd};
         use crate::cow::{CowBranch, overlayfs::OverlayBranch, branchfs::BranchFsBranch};
         use crate::network;
@@ -1422,25 +1422,25 @@ impl Sandbox {
         self.ensure_runtime()?;
 
         if !matches!(self.rt().state, RuntimeState::Created) {
-            return Err(SandboxProcessError::Child("sandbox already spawned".into()).into());
+            return Err(SandboxRuntimeError::Child("sandbox already spawned".into()).into());
         }
 
         if cmd.is_empty() {
-            return Err(SandboxProcessError::Child("empty command".into()).into());
+            return Err(SandboxRuntimeError::Child("empty command".into()).into());
         }
 
         let c_cmd: Vec<CString> = cmd
             .iter()
-            .map(|s| CString::new(*s).map_err(|_| SandboxProcessError::Child("invalid command string".into())))
+            .map(|s| CString::new(*s).map_err(|_| SandboxRuntimeError::Child("invalid command string".into())))
             .collect::<Result<Vec<_>, _>>()?;
 
         let nested = crate::process::is_nested();
 
-        let pipes = PipePair::new().map_err(SandboxProcessError::Io)?;
+        let pipes = PipePair::new().map_err(SandboxRuntimeError::Io)?;
 
         let resolved_net_allow = network::resolve_net_allow(&self.net_allow)
             .await
-            .map_err(SandboxProcessError::Io)?;
+            .map_err(SandboxRuntimeError::Io)?;
         let virtual_etc_hosts = resolved_net_allow.etc_hosts.clone();
 
         if !self.http_allow.is_empty() || !self.http_deny.is_empty() {
@@ -1449,28 +1449,28 @@ impl Sandbox {
                 self.http_deny.clone(),
                 self.http_ca.as_deref(),
                 self.http_key.as_deref(),
-            ).await.map_err(SandboxProcessError::Io)?;
+            ).await.map_err(SandboxRuntimeError::Io)?;
             self.rt_mut().http_acl_handle = Some(handle);
         }
 
         let cow_branch: Option<Box<dyn CowBranch>> = match self.fs_isolation {
             FsIsolation::OverlayFs => {
                 let workdir = self.workdir.as_ref()
-                    .ok_or_else(|| crate::error::SandlockError::Process(SandboxProcessError::Child("OverlayFs requires workdir".into())))?;
+                    .ok_or_else(|| crate::error::SandlockError::Runtime(SandboxRuntimeError::Child("OverlayFs requires workdir".into())))?;
                 let storage = self.fs_storage.as_ref()
                     .cloned()
                     .unwrap_or_else(|| std::env::temp_dir().join("sandlock-overlay"));
                 std::fs::create_dir_all(&storage)
-                    .map_err(|e| crate::error::SandlockError::Process(SandboxProcessError::Io(e)))?;
+                    .map_err(|e| crate::error::SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
                 let branch = OverlayBranch::create(workdir, &storage)
-                    .map_err(|e| crate::error::SandlockError::Process(SandboxProcessError::Branch(e)))?;
+                    .map_err(|e| crate::error::SandlockError::Runtime(SandboxRuntimeError::Branch(e)))?;
                 Some(Box::new(branch))
             }
             FsIsolation::BranchFs => {
                 let workdir = self.workdir.as_ref()
-                    .ok_or_else(|| crate::error::SandlockError::Process(SandboxProcessError::Child("BranchFs requires workdir".into())))?;
+                    .ok_or_else(|| crate::error::SandlockError::Runtime(SandboxRuntimeError::Child("BranchFs requires workdir".into())))?;
                 let branch = BranchFsBranch::create(workdir)
-                    .map_err(|e| crate::error::SandlockError::Process(SandboxProcessError::Branch(e)))?;
+                    .map_err(|e| crate::error::SandlockError::Runtime(SandboxRuntimeError::Branch(e)))?;
                 Some(Box::new(branch))
             }
             FsIsolation::None => None,
@@ -1482,14 +1482,14 @@ impl Sandbox {
             let mut stdout_fds = [0i32; 2];
             let mut stderr_fds = [0i32; 2];
             if unsafe { libc::pipe2(stdout_fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
-                return Err(SandboxProcessError::Io(std::io::Error::last_os_error()).into());
+                return Err(SandboxRuntimeError::Io(std::io::Error::last_os_error()).into());
             }
             if unsafe { libc::pipe2(stderr_fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
                 unsafe {
                     libc::close(stdout_fds[0]);
                     libc::close(stdout_fds[1]);
                 }
-                return Err(SandboxProcessError::Io(std::io::Error::last_os_error()).into());
+                return Err(SandboxRuntimeError::Io(std::io::Error::last_os_error()).into());
             }
             (
                 Some((
@@ -1507,7 +1507,7 @@ impl Sandbox {
 
         let pid = unsafe { libc::fork() };
         if pid < 0 {
-            return Err(SandboxProcessError::Fork(std::io::Error::last_os_error()).into());
+            return Err(SandboxRuntimeError::Fork(std::io::Error::last_os_error()).into());
         }
 
         if pid == 0 {
@@ -1571,7 +1571,7 @@ impl Sandbox {
         };
 
         let notif_fd_num = read_u32_fd(pipes.notif_r.as_raw_fd())
-            .map_err(|e| SandboxProcessError::Child(format!("read notif fd from child: {}", e)))?;
+            .map_err(|e| SandboxRuntimeError::Child(format!("read notif fd from child: {}", e)))?;
 
         let is_nested_mode = notif_fd_num == 0;
 
@@ -1579,13 +1579,13 @@ impl Sandbox {
             None
         } else if let Some(ref pfd) = pidfd {
             Some(syscall::pidfd_getfd(pfd, notif_fd_num as i32, 0)
-                .map_err(|e| SandboxProcessError::Child(format!("pidfd_getfd: {}", e)))?)
+                .map_err(|e| SandboxRuntimeError::Child(format!("pidfd_getfd: {}", e)))?)
         } else {
             let path = format!("/proc/{}/fd/{}", pid, notif_fd_num);
             let cpath = CString::new(path).unwrap();
             let raw = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) };
             if raw < 0 {
-                return Err(SandboxProcessError::Child("failed to open notif fd from /proc".into()).into());
+                return Err(SandboxRuntimeError::Child("failed to open notif fd from /proc".into()).into());
             }
             Some(unsafe { OwnedFd::from_raw_fd(raw) })
         };
@@ -1789,7 +1789,7 @@ impl Sandbox {
         }
 
         write_u32_fd(pipes.ready_w.as_raw_fd(), 1)
-            .map_err(|e| SandboxProcessError::Child(format!("write ready signal: {}", e)))?;
+            .map_err(|e| SandboxRuntimeError::Child(format!("write ready signal: {}", e)))?;
 
         self.rt_mut().pidfd = pidfd;
 
@@ -1877,15 +1877,15 @@ fn sandbox_resolve_name(name: Option<&str>) -> Result<String, crate::error::Sand
 }
 
 fn sandbox_validate_name(name: String) -> Result<String, crate::error::SandlockError> {
-    use crate::error::SandboxProcessError;
+    use crate::error::SandboxRuntimeError;
     if name.is_empty() {
-        return Err(SandboxProcessError::Child("sandbox name must not be empty".into()).into());
+        return Err(SandboxRuntimeError::Child("sandbox name must not be empty".into()).into());
     }
     if name.len() > 64 {
-        return Err(SandboxProcessError::Child("sandbox name must be at most 64 bytes".into()).into());
+        return Err(SandboxRuntimeError::Child("sandbox name must be at most 64 bytes".into()).into());
     }
     if name.as_bytes().contains(&0) {
-        return Err(SandboxProcessError::Child("sandbox name must not contain NUL bytes".into()).into());
+        return Err(SandboxRuntimeError::Child("sandbox name must not contain NUL bytes".into()).into());
     }
     Ok(name)
 }
