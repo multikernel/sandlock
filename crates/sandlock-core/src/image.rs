@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::error::{SandboxError, SandlockError};
+use crate::error::{SandboxRuntimeError, SandlockError};
 
 /// Default cache directory for extracted images.
 fn default_cache_dir() -> PathBuf {
@@ -56,11 +56,11 @@ pub fn extract(image: &str, cache_dir: Option<&Path>) -> Result<PathBuf, Sandloc
     let output = Command::new("docker")
         .args(["create", image, "/bin/true"])
         .output()
-        .map_err(|e| SandboxError::Child(format!("docker not found: {}", e)))?;
+        .map_err(|e| SandboxRuntimeError::Child(format!("docker not found: {}", e)))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(SandboxError::Child(
+        return Err(SandboxRuntimeError::Child(
             format!("docker create failed: {}", stderr.trim()),
         ).into());
     }
@@ -84,7 +84,7 @@ pub fn extract(image: &str, cache_dir: Option<&Path>) -> Result<PathBuf, Sandloc
 /// Export a container's filesystem and extract it to rootfs.
 fn extract_container(container_id: &str, rootfs: &Path) -> Result<(), SandlockError> {
     std::fs::create_dir_all(rootfs)
-        .map_err(|e| SandboxError::Io(e))?;
+        .map_err(|e| SandboxRuntimeError::Io(e))?;
 
     // docker export → tar stream → extract
     let mut child = Command::new("docker")
@@ -92,7 +92,7 @@ fn extract_container(container_id: &str, rootfs: &Path) -> Result<(), SandlockEr
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| SandboxError::Child(format!("docker export: {}", e)))?;
+        .map_err(|e| SandboxRuntimeError::Child(format!("docker export: {}", e)))?;
 
     let stdout = child.stdout.take().unwrap();
 
@@ -104,20 +104,20 @@ fn extract_container(container_id: &str, rootfs: &Path) -> Result<(), SandlockEr
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .status()
-        .map_err(|e| SandboxError::Child(format!("tar extract: {}", e)))?;
+        .map_err(|e| SandboxRuntimeError::Child(format!("tar extract: {}", e)))?;
 
     let docker_status = child.wait()
-        .map_err(|e| SandboxError::Child(format!("docker export wait: {}", e)))?;
+        .map_err(|e| SandboxRuntimeError::Child(format!("docker export wait: {}", e)))?;
 
     if !docker_status.success() {
         // Clean up partial extraction
         let _ = std::fs::remove_dir_all(rootfs);
-        return Err(SandboxError::Child("docker export failed".into()).into());
+        return Err(SandboxRuntimeError::Child("docker export failed".into()).into());
     }
 
     if !tar_status.success() {
         let _ = std::fs::remove_dir_all(rootfs);
-        return Err(SandboxError::Child("tar extraction failed".into()).into());
+        return Err(SandboxRuntimeError::Child("tar extraction failed".into()).into());
     }
 
     Ok(())
@@ -134,7 +134,7 @@ pub fn inspect_cmd(image: &str) -> Result<Vec<String>, SandlockError> {
             image,
         ])
         .output()
-        .map_err(|_| SandboxError::Child("docker inspect failed".into()))?;
+        .map_err(|_| SandboxRuntimeError::Child("docker inspect failed".into()))?;
 
     if !output.status.success() {
         return Ok(vec!["/bin/sh".into()]);

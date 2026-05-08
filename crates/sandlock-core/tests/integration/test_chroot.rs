@@ -1,6 +1,6 @@
-use sandlock_core::policy::BranchAction;
+use sandlock_core::sandbox::BranchAction;
 #[allow(unused_imports)]
-use sandlock_core::{Policy, Sandbox};
+use sandlock_core::{Sandbox};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -14,8 +14,8 @@ fn helper_binary() -> PathBuf {
 }
 
 /// Minimal fs_readable set needed to run rootfs-helper under chroot.
-fn minimal_exec_policy(rootfs: &PathBuf) -> sandlock_core::PolicyBuilder {
-    Policy::builder()
+fn minimal_exec_policy(rootfs: &PathBuf) -> sandlock_core::SandboxBuilder {
+    Sandbox::builder()
         .chroot(rootfs)
         .fs_read("/usr")
         .fs_read("/bin")
@@ -90,7 +90,7 @@ fn cleanup_rootfs(rootfs: &PathBuf) {
 async fn test_chroot_ls_root() {
     let rootfs = build_test_rootfs("ls-root");
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .chroot(&rootfs)
         .fs_read("/usr")
         .fs_read("/bin")
@@ -101,7 +101,7 @@ async fn test_chroot_ls_root() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, Some("test"), &["rootfs-helper", "ls", "/"]).await;
+    let result = policy.clone().with_name("test").run(&["rootfs-helper", "ls", "/"]).await;
     match result {
         Ok(r) => {
             assert!(
@@ -130,7 +130,7 @@ async fn test_chroot_no_escape() {
     let sentinel = "sandlock-chroot-sentinel";
     fs::write(rootfs.join("etc/sentinel"), sentinel).unwrap();
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .chroot(&rootfs)
         .fs_read("/usr")
         .fs_read("/bin")
@@ -142,7 +142,7 @@ async fn test_chroot_no_escape() {
 
     // Path traversal: /../../etc/sentinel should resolve to /etc/sentinel inside
     // the chroot (the sentinel file we created), not escape to the host.
-    let result = Sandbox::run(&policy, Some("test"), &["rootfs-helper", "cat", "/../../etc/sentinel"]).await;
+    let result = policy.clone().with_name("test").run(&["rootfs-helper", "cat", "/../../etc/sentinel"]).await;
     match result {
         Ok(r) => {
             assert!(
@@ -169,7 +169,7 @@ async fn test_chroot_no_escape() {
 async fn test_chroot_getcwd() {
     let rootfs = build_test_rootfs("getcwd");
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .chroot(&rootfs)
         .fs_read("/usr")
         .fs_read("/bin")
@@ -179,7 +179,7 @@ async fn test_chroot_getcwd() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, Some("test"), &["rootfs-helper", "pwd"]).await;
+    let result = policy.clone().with_name("test").run(&["rootfs-helper", "pwd"]).await;
     match result {
         Ok(r) => {
             assert!(
@@ -201,7 +201,7 @@ async fn test_chroot_getcwd() {
 async fn test_chroot_write_file() {
     let rootfs = build_test_rootfs("write-file");
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .chroot(&rootfs)
         .fs_read("/usr")
         .fs_read("/bin")
@@ -212,9 +212,7 @@ async fn test_chroot_write_file() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(
-        &policy, Some("test"),
-        &["rootfs-helper", "sh", "-c", "echo hello > /tmp/test.txt && cat /tmp/test.txt"],
+    let result = policy.clone().with_name("test").run(&["rootfs-helper", "sh", "-c", "echo hello > /tmp/test.txt && cat /tmp/test.txt"],
     )
     .await;
     match result {
@@ -254,7 +252,7 @@ async fn test_chroot_cow_directory_open_stays_in_rootfs() {
     ));
     fs::write(&host_marker, "host").unwrap();
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .chroot(&rootfs)
         .fs_read("/usr")
         .fs_read("/bin")
@@ -267,7 +265,7 @@ async fn test_chroot_cow_directory_open_stays_in_rootfs() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, Some("test"), &["rootfs-helper", "ls", "/tmp"]).await;
+    let result = policy.clone().with_name("test").run(&["rootfs-helper", "ls", "/tmp"]).await;
     match result {
         Ok(r) => {
             assert!(
@@ -300,7 +298,7 @@ async fn test_chroot_with_cow() {
     let rootfs = build_test_rootfs("cow");
     let tmp_dir = rootfs.join("tmp");
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .chroot(&rootfs)
         .fs_read("/usr")
         .fs_read("/bin")
@@ -313,9 +311,7 @@ async fn test_chroot_with_cow() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(
-        &policy, Some("test"),
-        &["rootfs-helper", "sh", "-c", "echo cow-test > /tmp/cow.txt"],
+    let result = policy.clone().with_name("test").run(&["rootfs-helper", "sh", "-c", "echo cow-test > /tmp/cow.txt"],
     )
     .await;
     match result {
@@ -344,7 +340,7 @@ async fn test_chroot_with_cow() {
 async fn test_chroot_proc_self_root() {
     let rootfs = build_test_rootfs("proc-self-root");
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .chroot(&rootfs)
         .fs_read("/usr")
         .fs_read("/bin")
@@ -354,7 +350,7 @@ async fn test_chroot_proc_self_root() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, Some("test"), &["rootfs-helper", "readlink", "/proc/self/root"]).await;
+    let result = policy.clone().with_name("test").run(&["rootfs-helper", "readlink", "/proc/self/root"]).await;
     match result {
         Ok(r) => {
             assert!(
@@ -387,9 +383,7 @@ async fn test_chroot_write_denied_without_fs_write() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(
-        &policy, Some("test"),
-        &["rootfs-helper", "sh", "-c", "echo denied > /tmp/should-fail.txt"],
+    let result = policy.clone().with_name("test").run(&["rootfs-helper", "sh", "-c", "echo denied > /tmp/should-fail.txt"],
     )
     .await;
     match result {
@@ -419,7 +413,7 @@ async fn test_chroot_exec_with_root_readable() {
         .unwrap();
 
     // Use /bin/rootfs-helper which goes through the bin -> usr/bin symlink
-    let result = Sandbox::run(&policy, Some("test"), &["/bin/rootfs-helper", "echo", "chroot-exec-ok"]).await;
+    let result = policy.clone().with_name("test").run(&["/bin/rootfs-helper", "echo", "chroot-exec-ok"]).await;
     match result {
         Ok(r) => {
             assert!(
@@ -453,7 +447,7 @@ async fn test_chroot_fs_deny_blocks_virtual_path() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, Some("test"), &["rootfs-helper", "cat", "/etc/hostname"]).await;
+    let result = policy.clone().with_name("test").run(&["rootfs-helper", "cat", "/etc/hostname"]).await;
     match result {
         Ok(r) => {
             assert!(
@@ -482,7 +476,7 @@ async fn test_chroot_read_denied_without_fs_read() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, Some("test"), &["rootfs-helper", "cat", "/etc/hostname"]).await;
+    let result = policy.clone().with_name("test").run(&["rootfs-helper", "cat", "/etc/hostname"]).await;
     match result {
         Ok(r) => {
             assert!(
@@ -521,7 +515,7 @@ async fn test_fs_mount_read_write() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, Some("test"), &["rootfs-helper", "cat", "/work/input.txt"]).await;
+    let result = policy.clone().with_name("test").run(&["rootfs-helper", "cat", "/work/input.txt"]).await;
     match result {
         Ok(r) => {
             assert!(

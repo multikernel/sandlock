@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from sandlock import Policy, Sandbox
+from sandlock import Sandbox
 
 
 # ── helpers ──────────────────────────────────────────────────────
@@ -33,7 +33,7 @@ def _chroot_policy(rootfs, **overrides):
         env={"PATH": "/usr/bin:/bin"},
     )
     defaults.update(overrides)
-    return Policy(**defaults)
+    return Sandbox(**defaults)
 
 
 @pytest.fixture
@@ -79,7 +79,7 @@ def _run_helper(rootfs, args, *, fs_writable=None):
         fs_readable=_FS_READABLE + ["/", "/work"],
         fs_writable=fs_writable or [],
     )
-    return Sandbox(policy).run(["rootfs-helper"] + args)
+    return policy.run(["rootfs-helper"] + args)
 
 
 # ── SYS_stat (nr 4) ─────────────────────────────────────────────

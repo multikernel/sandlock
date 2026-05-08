@@ -345,10 +345,10 @@ impl NetworkState {
     pub fn effective_network_policy(
         &self,
         pid: u32,
-        protocol: crate::policy::Protocol,
+        protocol: crate::sandbox::Protocol,
         live_policy: Option<&std::sync::Arc<std::sync::RwLock<crate::policy_fn::LivePolicy>>>,
     ) -> crate::seccomp::notif::NetworkPolicy {
-        use crate::policy::Protocol;
+        use crate::sandbox::Protocol;
         use crate::seccomp::notif::{NetworkPolicy, PortAllow};
         let ip_only_allow = |ips: &HashSet<std::net::IpAddr>| {
             let per_ip = ips.iter().map(|&ip| (ip, PortAllow::Any)).collect();

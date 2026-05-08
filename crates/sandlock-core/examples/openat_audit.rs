@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use sandlock_core::seccomp::notif::NotifAction;
-use sandlock_core::{HandlerCtx, Policy, Sandbox};
+use sandlock_core::{HandlerCtx, Sandbox};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -37,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cmd_ref: Vec<&str> = cmd.iter().map(String::as_str).collect();
 
     // Minimal policy: read /usr, /lib, /etc, /proc; write /tmp.
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read("/lib64")
@@ -61,13 +61,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let result = Sandbox::run_with_extra_handlers(
-        &policy,
-        Some("openat-audit"),
-        &cmd_ref,
-        [(libc::SYS_openat, audit)],
-    )
-    .await?;
+    let result = policy.clone().with_name("openat-audit")
+        .run_with_extra_handlers(
+            &cmd_ref,
+            [(libc::SYS_openat, audit)],
+        )
+        .await?;
 
     println!(
         "exit={:?} opens={} stdout={:?}",

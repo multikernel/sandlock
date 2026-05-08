@@ -136,7 +136,7 @@ sandlock run \
 # (e.g. /etc/ssl/certs/), then pass both files here.
 sandlock run \
   --http-allow "POST api.openai.com/v1/*" \
-  --https-ca ca.pem --https-key ca-key.pem \
+  --http-ca ca.pem --http-key ca-key.pem \
   -r /usr -r /lib -r /etc -- python3 agent.py
 
 # Server listening on a port (Landlock --net-bind, separate from --net-allow)
@@ -185,9 +185,9 @@ sandlock run --no-supervisor -r /proc -r /usr -r /lib -r /lib64 -r /bin -r /etc 
 ### Python API
 
 ```python
-from sandlock import Sandbox, Policy, confine
+from sandlock import Sandbox, confine
 
-policy = Policy(
+sandbox = Sandbox(
     fs_writable=["/tmp/sandbox"],
     fs_readable=["/usr", "/lib", "/etc"],
     max_memory="256M",
@@ -196,37 +196,37 @@ policy = Policy(
 )
 
 # Run a command (with optional timeout in seconds)
-result = Sandbox(policy).run(["python3", "-c", "print('hello')"], timeout=30)
+result = sandbox.run(["python3", "-c", "print('hello')"], timeout=30)
 assert result.success
 assert b"hello" in result.stdout
 
 # HTTP ACL: only allow specific API calls
-agent_policy = Policy(
+agent = Sandbox(
     fs_readable=["/usr", "/lib", "/etc"],
     http_allow=["POST api.openai.com/v1/chat/completions"],
     http_deny=["* */admin/*"],
 )
-result = Sandbox(agent_policy).run(["python3", "agent.py"])
+result = agent.run(["python3", "agent.py"])
 
 # Chroot with per-sandbox mount (Docker-style -v, no root needed)
-chroot_policy = Policy(
+chrooted = Sandbox(
     chroot="/opt/rootfs",
     fs_mount={"/work": "/tmp/sandbox-1/work"},  # maps /work inside chroot
     fs_readable=["/usr", "/bin", "/lib", "/etc"],
     cwd="/work",
 )
-result = Sandbox(chroot_policy).run(["python3", "task.py"])
+result = chrooted.run(["python3", "task.py"])
 
 # Port virtualization: query port mappings while sandbox is running
-sb = Sandbox(Policy(port_remap=True, fs_readable=["/usr", "/lib", "/etc"]), name="api.local")
+sb = Sandbox(port_remap=True, fs_readable=["/usr", "/lib", "/etc"], name="api.local")
 # sb.ports() returns {virtual_port: real_port} while running
 
 # Confine the current process (Landlock filesystem only, irreversible)
-confine(Policy(fs_readable=["/usr", "/lib"], fs_writable=["/tmp"]))
+confine(Sandbox(fs_readable=["/usr", "/lib"], fs_writable=["/tmp"]))
 
 # Dry-run: see what files would change, then discard
-policy = Policy(fs_writable=["."], workdir=".", fs_readable=["/usr", "/lib", "/bin", "/etc"])
-result = Sandbox(policy).dry_run(["make", "build"])
+sandbox = Sandbox(fs_writable=["."], workdir=".", fs_readable=["/usr", "/lib", "/bin", "/etc"])
+result = sandbox.dry_run(["make", "build"])
 for c in result.changes:
     print(f"{c.kind}  {c.path}")  # A=added, M=modified, D=deleted
 ```
@@ -234,18 +234,18 @@ for c in result.changes:
 ### Pipeline
 
 Chain sandboxed stages with the `|` operator — each stage has its own
-independent policy. Data flows through kernel pipes.
+independent sandbox config. Data flows through kernel pipes.
 
 ```python
-from sandlock import Sandbox, Policy
+from sandlock import Sandbox
 
-trusted = Policy(fs_readable=["/usr", "/lib", "/bin", "/etc", "/opt/data"])
-restricted = Policy(fs_readable=["/usr", "/lib", "/bin", "/etc"])
+trusted = Sandbox(fs_readable=["/usr", "/lib", "/bin", "/etc", "/opt/data"])
+restricted = Sandbox(fs_readable=["/usr", "/lib", "/bin", "/etc"])
 
 # Reader can access data, processor cannot
 result = (
-    Sandbox(trusted).cmd(["cat", "/opt/data/secret.csv"])
-    | Sandbox(restricted).cmd(["tr", "a-z", "A-Z"])
+    trusted.cmd(["cat", "/opt/data/secret.csv"])
+    | restricted.cmd(["tr", "a-z", "A-Z"])
 ).run()
 assert b"SECRET" in result.stdout
 ```
@@ -254,12 +254,12 @@ assert b"SECRET" in result.stdout
 executor runs it with data access but no network:
 
 ```python
-planner = Policy(fs_readable=["/usr", "/lib", "/bin", "/etc"])
-executor = Policy(fs_readable=["/usr", "/lib", "/bin", "/etc", "/data"])
+planner = Sandbox(fs_readable=["/usr", "/lib", "/bin", "/etc"])
+executor = Sandbox(fs_readable=["/usr", "/lib", "/bin", "/etc", "/data"])
 
 result = (
-    Sandbox(planner).cmd(["python3", "-c", "print('cat /data/input.txt')"])
-    | Sandbox(executor).cmd(["sh"])
+    planner.cmd(["python3", "-c", "print('cat /data/input.txt')"])
+    | executor.cmd(["sh"])
 ).run()
 ```
 
@@ -271,7 +271,7 @@ Events carry syscall name, category, PID, network destination (for
 returns a verdict to allow, deny, or audit.
 
 ```python
-from sandlock import Sandbox, Policy
+from sandlock import Sandbox
 import errno
 
 def on_event(event, ctx):
@@ -294,11 +294,12 @@ def on_event(event, ctx):
 
     return 0  # allow
 
-policy = Policy(
+sandbox = Sandbox(
     fs_readable=["/usr", "/lib", "/etc"],
     net_allow=["api.example.com:443"],
+    policy_fn=on_event,
 )
-result = Sandbox(policy, policy_fn=on_event).run(["python3", "agent.py"])
+result = sandbox.run(["python3", "agent.py"])
 ```
 
 **Verdicts:** `0`/`False` = allow, `True`/`-1` = deny (EPERM),
@@ -337,41 +338,48 @@ positive int = deny with errno, `"audit"`/`-2` = allow + flag.
 ### Rust API
 
 ```rust
-use sandlock_core::{ConfinePolicy, Policy, Sandbox, Pipeline, Stage, confine};
+use sandlock_core::{confine, Confinement, Sandbox, Stage};
+use sandlock_core::sandbox::ByteSize;
+use sandlock_core::policy_fn::Verdict;
 
 // Basic run
-let policy = Policy::builder()
+let mut sandbox = Sandbox::builder()
     .fs_read("/usr").fs_read("/lib")
     .fs_write("/tmp")
     .max_memory(ByteSize::mib(256))
+    .name("hello-box")
     .build()?;
-let result = Sandbox::run(&policy, Some("hello-box"), &["echo", "hello"]).await?;
+let result = sandbox.run(&["echo", "hello"]).await?;
 assert!(result.success());
 
 // HTTP ACL: restrict API access at the HTTP level
-let policy = Policy::builder()
+let mut agent = Sandbox::builder()
     .fs_read("/usr").fs_read("/lib").fs_read("/etc")
     .http_allow("POST api.openai.com/v1/chat/completions")
     .http_deny("* */admin/*")
+    .name("agent-box")
     .build()?;
-let result = Sandbox::run(&policy, Some("agent-box"), &["python3", "agent.py"]).await?;
+let result = agent.run(&["python3", "agent.py"]).await?;
 
 // Confine the current process (Landlock filesystem only, irreversible)
-let policy = ConfinePolicy::builder()
+let confinement = Confinement::builder()
     .fs_read("/usr").fs_read("/lib")
     .fs_write("/tmp")
     .build();
-confine(&policy)?;
+confine(&confinement)?;
 
 // Pipeline
+let producer = Sandbox::builder()
+    .fs_read("/usr").fs_read("/lib").fs_read("/bin")
+    .build()?;
+let consumer = producer.clone();
 let result = (
-    Stage::new(&policy_a, &["echo", "hello"])
-    | Stage::new(&policy_b, &["tr", "a-z", "A-Z"])
+    Stage::new(&producer, &["echo", "hello"])
+    | Stage::new(&consumer, &["tr", "a-z", "A-Z"])
 ).run(None).await?;
 
 // Dynamic policy
-use sandlock_core::policy_fn::Verdict;
-let policy = Policy::builder()
+let mut dynamic = Sandbox::builder()
     .fs_read("/usr").fs_read("/lib")
     .policy_fn(|event, ctx| {
         if event.argv_contains("curl") {
@@ -384,31 +392,41 @@ let policy = Policy::builder()
         Verdict::Allow
     })
     .build()?;
+let result = dynamic.run(&["python3", "agent.py"]).await?;
 ```
 
 ## Profiles
 
-Save reusable policies as TOML files in `~/.config/sandlock/profiles/`:
-Profiles contain policy only; pass a sandbox instance name with `--name`.
+Save reusable sandbox profiles as TOML files in
+`~/.config/sandlock/profiles/`. Profiles use a sectioned schema; top-level
+flat keys such as `fs_readable = [...]` are rejected. Pass a sandbox instance
+name with `--name` when you need a stable virtual hostname.
 
 ```toml
 # ~/.config/sandlock/profiles/build.toml
-fs_writable = ["/tmp/work"]
-fs_readable = ["/usr", "/lib", "/lib64", "/bin", "/etc"]
+[program]
+exec = "make"
+args = ["-j4"]
 clean_env = true
-max_memory = "512M"
-max_processes = 50
-block_syscalls = []
+env = { CC = "gcc", LANG = "C.UTF-8" }
 
-[env]
-CC = "gcc"
-LANG = "C.UTF-8"
+[filesystem]
+read = ["/usr", "/lib", "/lib64", "/bin", "/etc"]
+write = ["/tmp/work"]
+
+[limits]
+memory = "512M"
+processes = 50
+
+[syscalls]
+extra_deny = []
 ```
 
 ```bash
 sandlock profile list
 sandlock profile show build
-sandlock run -p build -- make -j4
+sandlock run -p build        # uses [program].exec + args
+sandlock run -p build -- make test  # trailing command overrides [program]
 ```
 
 ## How It Works
@@ -478,7 +496,7 @@ pipes and feeds combined output to a reducer's stdin — fully pipe-based
 data flow with no temp files.
 
 ```python
-from sandlock import Sandbox, Policy
+from sandlock import Sandbox
 
 def init():
     global model, data
@@ -489,12 +507,17 @@ def work(clone_id):
     shard = data[clone_id::4]
     print(sum(shard))             # stdout → per-clone pipe
 
-# Map: fork 4 clones with separate policies
-mapper = Sandbox(data_policy, init_fn=init, work_fn=work)
+# Map: fork 4 clones with a separate sandbox config
+mapper = Sandbox(
+    fs_readable=["/usr", "/lib", "/bin", "/etc", "/data"],
+    init_fn=init,
+    work_fn=work,
+)
 clones = mapper.fork(4)
 
 # Reduce: pipe clone outputs to reducer stdin
-result = Sandbox(reduce_policy).reduce(
+reducer = Sandbox(fs_readable=["/usr", "/lib", "/bin", "/etc"])
+result = reducer.reduce(
     ["python3", "-c", "import sys; print(sum(int(l) for l in sys.stdin))"],
     clones,
 )
@@ -502,20 +525,26 @@ print(result.stdout)  # b"total\n"
 ```
 
 ```rust
-let mut mapper = Sandbox::new_with_fns(&map_policy, Some("mapper"),
-    || { load_data(); },
-    |id| { println!("{}", compute(id)); },
-)?;
+let mut mapper = Sandbox::builder()
+    .fs_read("/usr").fs_read("/lib").fs_read("/bin").fs_read("/etc")
+    .fs_read("/data")
+    .name("mapper")
+    .init_fn(|| { load_data(); })
+    .work_fn(|id| { println!("{}", compute(id)); })
+    .build()?;
 let mut clones = mapper.fork(4).await?;
 
-let reducer = Sandbox::new(&reduce_policy, Some("reducer"))?;
+let reducer = Sandbox::builder()
+    .fs_read("/usr").fs_read("/lib").fs_read("/bin").fs_read("/etc")
+    .name("reducer")
+    .build()?;
 let result = reducer.reduce(
     &["python3", "-c", "import sys; print(sum(int(l) for l in sys.stdin))"],
     &mut clones,
 ).await?;
 ```
 
-Map and reduce run in separate sandboxes with independent policies —
+Map and reduce run in separate sandboxes with independent configs —
 the mapper has data access, the reducer doesn't. Each clone inherits
 Landlock + seccomp confinement. `CLONE_ID=0..N-1` is set automatically.
 
@@ -588,12 +617,12 @@ allow-all.
 **HTTP / HTTPS interception.** `--http-allow` / `--http-deny` route
 matching ports through a transparent proxy. Each rule with a concrete
 host auto-extends `--net-allow` with `host:80` (and `host:443` when
-`--https-ca` is set) so the proxy's intercept ports are reachable;
+`--http-ca` is set) so the proxy's intercept ports are reachable;
 wildcard hosts auto-add `:80` / `:443` (any IP). All auto-added
-entries are TCP. HTTPS MITM is opt-in: pass `--https-ca <cert>` and
-`--https-key <key>` for a CA *you generate* and trust inside the
+entries are TCP. HTTPS MITM is opt-in: pass `--http-ca <cert>` and
+`--http-key <key>` for a CA *you generate* and trust inside the
 sandbox (typically install the cert into the workload's
-`/etc/ssl/certs/`). Without `--https-ca`, port 443 is not intercepted
+`/etc/ssl/certs/`). Without `--http-ca`, port 443 is not intercepted
 — `--net-allow host:443` permits raw TLS to the host with no content
 inspection.
 
@@ -651,17 +680,17 @@ cargo test --release
 cd python && pip install -e . && pytest tests/
 ```
 
-## Policy Reference
+## Sandbox Reference
 
 ```python
-Policy(
+Sandbox(
     # Filesystem (Landlock)
     fs_writable=["/tmp"],          # Read/write access
     fs_readable=["/usr", "/lib"],  # Read-only access
     fs_denied=["/proc/kcore"],     # Explicitly denied
 
     # Syscall filtering (seccomp)
-    block_syscalls=[],              # Extra syscalls to block in addition to Sandlock defaults
+    extra_deny_syscalls=[],         # Extra syscalls to block in addition to Sandlock defaults
 
     # Network — see "Network Model" above. Each entry is one of:
     #   bare host:port[,port,...]  — TCP (default scheme)
@@ -683,8 +712,8 @@ Policy(
     http_allow=["POST api.openai.com/v1/*"],  # Allow rules (METHOD host/path)
     http_deny=["* */admin/*"],     # Block rules (checked first)
     http_ports=[80],               # Ports to intercept (default: [80])
-    https_ca="ca.pem",             # CA cert for HTTPS MITM (adds port 443)
-    https_key="ca-key.pem",        # CA key for HTTPS MITM
+    http_ca="ca.pem",              # CA cert for HTTPS MITM (adds port 443)
+    http_key="ca-key.pem",         # CA key for HTTPS MITM
 
     # Resources
     max_memory="512M",             # Memory limit

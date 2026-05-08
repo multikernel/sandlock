@@ -2,30 +2,28 @@
 # SPDX-License-Identifier: Apache-2.0
 """Nested sandbox example."""
 
-from sandlock import Sandbox, Policy
+from sandlock import Sandbox
 
 
 def example_nested():
     """Create nested sandboxes with progressively restrictive policies."""
     print("=== Nested sandboxes ===")
 
-    outer_policy = Policy(
+    outer = Sandbox(
         fs_readable=["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev"],
         fs_writable=["/tmp"],
     )
 
-    inner_policy = Policy(
+    inner = Sandbox(
         fs_readable=["/usr", "/lib", "/lib64", "/bin"],
         fs_writable=[],
     )
 
     # Outer sandbox can write to /tmp
-    sb = Sandbox(outer_policy)
-    result = sb.run(["python3", "-c", "print('outer ok')"])
+    result = outer.run(["python3", "-c", "print('outer ok')"])
     print(f"  outer: {result.success} — {result.stdout.decode().strip()}")
 
     # Inner sandbox: more restrictive (independent sandbox with tighter policy)
-    inner = Sandbox(inner_policy)
     result = inner.run(["echo", "inner ok"])
     print(f"  inner: {result.success} — {result.stdout.decode().strip()}")
     print()

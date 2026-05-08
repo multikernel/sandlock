@@ -1,8 +1,8 @@
 pub mod error;
-pub mod policy;
+pub mod sandbox;     // formerly `policy`; contains Sandbox + SandboxBuilder + Confinement
 pub mod profile;
 pub mod result;
-pub mod sandbox;
+pub mod process;     // runtime helpers (is_nested, CONFINED); SandboxProcess removed
 pub(crate) mod arch;
 pub(crate) mod sys;
 pub mod landlock;
@@ -29,11 +29,13 @@ pub(crate) mod http_acl;
 
 pub use error::SandlockError;
 pub use checkpoint::Checkpoint;
-pub use policy::{ConfinePolicy, ConfinePolicyBuilder, Policy, PolicyBuilder};
+pub use sandbox::{Confinement, ConfinementBuilder, Sandbox, SandboxBuilder};
 pub use result::{RunResult, ExitStatus};
-pub use sandbox::Sandbox;
 pub use pipeline::{Stage, Pipeline, Gather};
 pub use dry_run::{Change, ChangeKind, DryRunResult};
+// Sectioned-profile parsing types: ProfileInput is the top-level deserialization
+// target; ProgramSpec carries [program].exec/args (not a Sandbox field).
+pub use crate::profile::{ProfileInput, ProgramSpec};
 
 // Public extension API — see docs/extension-handlers.md.
 pub use seccomp::dispatch::{Handler, HandlerCtx, HandlerError};
@@ -49,16 +51,16 @@ pub const MIN_LANDLOCK_ABI: u32 = landlock::MIN_ABI;
 
 /// Confine the calling process with Landlock restrictions.
 ///
-/// This applies `PR_SET_NO_NEW_PRIVS` and Landlock rules from the policy.
-/// IPC and signal isolation are always enabled. The confinement is
-/// **irreversible**.
+/// This applies `PR_SET_NO_NEW_PRIVS` and Landlock rules from the sandbox's
+/// filesystem fields. IPC and signal isolation are always enabled. The
+/// confinement is **irreversible**.
 ///
 /// This does NOT fork or exec — it confines the current process in-place.
-pub fn confine(policy: &ConfinePolicy) -> Result<(), SandlockError> {
+pub fn confine(confinement: &Confinement) -> Result<(), SandlockError> {
     // Set NO_NEW_PRIVS (required for Landlock)
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-        return Err(SandlockError::Sandbox(
-            error::SandboxError::Confinement(
+        return Err(SandlockError::Runtime(
+            error::SandboxRuntimeError::Confinement(
                 error::ConfinementError::Landlock(format!(
                     "prctl(PR_SET_NO_NEW_PRIVS): {}",
                     std::io::Error::last_os_error()
@@ -67,11 +69,11 @@ pub fn confine(policy: &ConfinePolicy) -> Result<(), SandlockError> {
         ));
     }
 
-    let mut builder = Policy::builder();
-    for path in &policy.fs_readable {
+    let mut builder = Sandbox::builder();
+    for path in &confinement.fs_readable {
         builder = builder.fs_read(path.clone());
     }
-    for path in &policy.fs_writable {
+    for path in &confinement.fs_writable {
         builder = builder.fs_write(path.clone());
     }
     let stripped = builder.build()?;

@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from sandlock import Sandbox, Policy, Change, DryRunResult
+from sandlock import Sandbox, Change, DryRunResult
 
 
 _PYTHON_READABLE = list(dict.fromkeys([
@@ -22,45 +22,45 @@ def _policy(**overrides):
     """Minimal policy with standard readable paths."""
     defaults = {"fs_readable": _PYTHON_READABLE}
     defaults.update(overrides)
-    return Policy(**defaults)
+    return Sandbox(**defaults)
 
 
 class TestSandboxRun:
     def test_simple_command(self):
-        result = Sandbox(_policy()).run(["echo", "hello"])
+        result = _policy().run(["echo", "hello"])
         assert result.success
         assert b"hello" in result.stdout
 
     def test_python_expression(self):
-        result = Sandbox(_policy()).run(["python3", "-c", "print(42)"])
+        result = _policy().run(["python3", "-c", "print(42)"])
         assert result.success
         assert result.stdout.strip() == b"42"
 
     def test_command_failure(self):
-        result = Sandbox(_policy()).run(["false"])
+        result = _policy().run(["false"])
         assert not result.success
         assert result.exit_code != 0
 
     def test_command_not_found(self):
-        result = Sandbox(_policy()).run(["nonexistent_command_xyz"])
+        result = _policy().run(["nonexistent_command_xyz"])
         assert not result.success
 
     def test_invalid_sandbox_name(self):
         with pytest.raises(ValueError, match="must not be empty"):
-            Sandbox(_policy(), name="")
+            _policy(name="")
         with pytest.raises(ValueError, match="NUL"):
-            Sandbox(_policy(), name="bad\0name")
+            _policy(name="bad\0name")
         with pytest.raises(ValueError, match="64 bytes"):
-            Sandbox(_policy(), name="x" * 65)
+            _policy(name="x" * 65)
 
     def test_stderr_captured(self):
-        result = Sandbox(_policy()).run(
+        result = _policy().run(
             ["python3", "-c", "import sys; sys.stderr.write('err\\n')"]
         )
         assert b"err" in result.stderr
 
     def test_exit_code_preserved(self):
-        result = Sandbox(_policy()).run(["sh", "-c", "exit 42"])
+        result = _policy().run(["sh", "-c", "exit 42"])
         assert result.exit_code == 42
 
     def test_fs_denied_blocks_read(self, tmp_dir):
@@ -71,7 +71,7 @@ class TestSandboxRun:
             fs_readable=[*_PYTHON_READABLE, str(tmp_dir)],
             fs_denied=[str(secret)],
         )
-        result = Sandbox(policy).run(["cat", str(secret)])
+        result = policy.run(["cat", str(secret)])
 
         assert not result.success
 
@@ -90,8 +90,8 @@ class TestPortRemap:
         )
         policy = _policy(port_remap=True)
 
-        r1 = Sandbox(policy).run(["python3", "-c", code])
-        r2 = Sandbox(policy).run(["python3", "-c", code])
+        r1 = policy.run(["python3", "-c", code])
+        r2 = policy.run(["python3", "-c", code])
 
         assert r1.success
         assert r2.success
@@ -109,7 +109,7 @@ class TestPortRemap:
             "s.close()"
         )
         policy = _policy(port_remap=True)
-        result = Sandbox(policy).run(["python3", "-c", code])
+        result = policy.run(["python3", "-c", code])
 
         assert result.success
         parts = result.stdout.strip().split()
@@ -126,7 +126,7 @@ class TestPortRemap:
             "s.close()"
         )
         policy = _policy(port_remap=True)
-        result = Sandbox(policy).run(["python3", "-c", code])
+        result = policy.run(["python3", "-c", code])
 
         assert result.success
         assert int(result.stdout.strip()) > 0
@@ -141,7 +141,7 @@ class TestPortRemap:
             "s.close()"
         )
         policy = _policy(port_remap=True)
-        result = Sandbox(policy).run(["python3", "-c", code])
+        result = policy.run(["python3", "-c", code])
 
         assert result.success
         assert result.stdout.strip() == b"5000"
@@ -161,7 +161,7 @@ class TestPortRemap:
         holder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         holder.bind(("127.0.0.1", 8080))
         try:
-            result = Sandbox(policy).run(["python3", "-c", code])
+            result = policy.run(["python3", "-c", code])
         finally:
             holder.close()
 
@@ -226,7 +226,7 @@ class TestPortRemap:
             "'received': len(received), 'data_ok': bytes(received) == payload}))"
         )
         policy = _policy(port_remap=True, net_bind=[7070], net_allow=["127.0.0.1:7070"])
-        result = Sandbox(policy).run(["python3", "-c", code])
+        result = policy.run(["python3", "-c", code])
 
         assert result.success, f"Sandbox failed: {result}"
         data = json.loads(result.stdout.strip())
@@ -245,11 +245,11 @@ class TestCpuThrottle:
 
     def test_throttle_slows_execution(self):
         t0 = time.monotonic()
-        Sandbox(_policy()).run(["python3", "-c", self._BURN_CODE])
+        _policy().run(["python3", "-c", self._BURN_CODE])
         base = time.monotonic() - t0
 
         t0 = time.monotonic()
-        result = Sandbox(_policy(max_cpu=50)).run(["python3", "-c", self._BURN_CODE])
+        result = _policy(max_cpu=50).run(["python3", "-c", self._BURN_CODE])
         throttled = time.monotonic() - t0
 
         assert result.success
@@ -257,18 +257,18 @@ class TestCpuThrottle:
         assert 1.5 <= ratio <= 3.0, f"ratio={ratio:.1f}, expected ~2.0"
 
     def test_throttle_100_is_noop(self):
-        result = Sandbox(_policy(max_cpu=100)).run(["python3", "-c", self._BURN_CODE])
+        result = _policy(max_cpu=100).run(["python3", "-c", self._BURN_CODE])
         assert result.success
 
     def test_throttle_result_correct(self):
-        result = Sandbox(_policy(max_cpu=50)).run(["python3", "-c", self._BURN_CODE])
+        result = _policy(max_cpu=50).run(["python3", "-c", self._BURN_CODE])
         assert result.success
         assert result.stdout.strip() == b"20000000"
 
 
 class TestPauseResume:
     def test_pause_resume_from_thread(self):
-        sb = Sandbox(_policy())
+        sb = _policy()
 
         def run_in_thread():
             return sb.run(["python3", "-c",
@@ -290,7 +290,7 @@ class TestPauseResume:
         # Process should have completed after resume
 
     def test_pid_available_during_run(self):
-        sb = Sandbox(_policy())
+        sb = _policy()
         pid_seen = []
 
         def run_in_thread():
@@ -310,12 +310,12 @@ class TestPauseResume:
         assert sb.pid is None
 
     def test_pause_not_running_raises(self):
-        sb = Sandbox(_policy())
+        sb = _policy()
         with pytest.raises(RuntimeError):
             sb.pause()
 
     def test_resume_not_running_raises(self):
-        sb = Sandbox(_policy())
+        sb = _policy()
         with pytest.raises(RuntimeError):
             sb.resume()
 
@@ -329,7 +329,7 @@ class TestDryRun:
         (workdir / "existing.txt").write_text("hello")
 
         p = _policy(fs_writable=[str(workdir)], workdir=str(workdir))
-        result = Sandbox(p).dry_run(
+        result = p.dry_run(
             ["sh", "-c", f"touch {workdir}/new.txt"]
         )
         assert result.success
@@ -343,7 +343,7 @@ class TestDryRun:
         (workdir / "data.txt").write_text("original")
 
         p = _policy(fs_writable=[str(workdir)], workdir=str(workdir))
-        result = Sandbox(p).dry_run(
+        result = p.dry_run(
             ["sh", "-c", f"echo changed > {workdir}/data.txt"]
         )
         assert result.success
@@ -357,7 +357,7 @@ class TestDryRun:
         (workdir / "victim.txt").write_text("delete me")
 
         p = _policy(fs_writable=[str(workdir)], workdir=str(workdir))
-        result = Sandbox(p).dry_run(
+        result = p.dry_run(
             ["sh", "-c", f"rm {workdir}/victim.txt"]
         )
         assert result.success
@@ -370,7 +370,7 @@ class TestDryRun:
         workdir.mkdir()
 
         p = _policy(fs_writable=[str(workdir)], workdir=str(workdir))
-        result = Sandbox(p).dry_run(["echo", "hello"])
+        result = p.dry_run(["echo", "hello"])
         assert result.success
         assert result.changes == []
 
@@ -380,7 +380,7 @@ class TestDryRun:
         (workdir / "f.txt").write_text("x")
 
         p = _policy(fs_writable=[str(workdir)], workdir=str(workdir))
-        result = Sandbox(p).dry_run(
+        result = p.dry_run(
             ["sh", "-c", f"echo y > {workdir}/f.txt; touch {workdir}/new.txt"]
         )
         assert isinstance(result, DryRunResult)
@@ -399,13 +399,13 @@ class TestNewPolicyFields:
         # Freeze time to 2000-06-15
         t = datetime(2000, 6, 15, tzinfo=timezone.utc)
         p = _policy(time_start=t)
-        result = Sandbox(p).run(["date", "+%Y"])
+        result = p.run(["date", "+%Y"])
         assert result.success
         assert result.stdout.strip() == b"2000"
 
-    def test_block_syscalls(self):
-        p = _policy(block_syscalls=["mount"])
-        result = Sandbox(p).run(["echo", "ok"])
+    def test_extra_deny_syscalls(self):
+        p = _policy(extra_deny_syscalls=["mount"])
+        result = p.run(["echo", "ok"])
         assert result.success
         assert result.stdout.strip() == b"ok"
 
@@ -413,7 +413,7 @@ class TestNewPolicyFields:
         # max_open_files is accepted by the policy but not yet enforced
         # in the sandbox — just verify it doesn't crash.
         p = _policy(max_open_files=64)
-        result = Sandbox(p).run(["echo", "ok"])
+        result = p.run(["echo", "ok"])
         assert result.success
 
 
@@ -423,15 +423,15 @@ class TestFsIsolation:
 
     def test_fs_isolation_none_runs(self):
         """Default FsIsolation.NONE should work normally."""
-        from sandlock.policy import FsIsolation
+        from sandlock.sandbox import FsIsolation
         p = _policy()
         assert p.fs_isolation == FsIsolation.NONE
-        result = Sandbox(p).run(["echo", "ok"])
+        result = p.run(["echo", "ok"])
         assert result.success
 
     def test_fs_isolation_value_roundtrips(self):
         """Non-default values are accepted by the FFI builder without error."""
-        from sandlock.policy import FsIsolation
+        from sandlock.sandbox import FsIsolation
         import warnings
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
@@ -450,12 +450,12 @@ class TestGpuDevices:
 
     def test_gpu_devices_accepted(self):
         p = _policy(gpu_devices=[0])
-        result = Sandbox(p).run(["echo", "ok"])
+        result = p.run(["echo", "ok"])
         assert result.success
 
     def test_gpu_devices_empty_list(self):
         p = _policy(gpu_devices=[])
-        result = Sandbox(p).run(["echo", "ok"])
+        result = p.run(["echo", "ok"])
         assert result.success
 
 
@@ -470,7 +470,7 @@ class TestNoCoredump:
             "print(f'{soft} {hard}')"
         )
         p = _policy(no_coredump=True)
-        result = Sandbox(p).run(["python3", "-c", code])
+        result = p.run(["python3", "-c", code])
         assert result.success
         assert result.stdout.strip() == b"0 0"
 
@@ -482,7 +482,7 @@ class TestNoCoredump:
             "print(f'{soft} {hard}')"
         )
         p = _policy(no_coredump=False)
-        result = Sandbox(p).run(["python3", "-c", code])
+        result = p.run(["python3", "-c", code])
         assert result.success
         # Default RLIMIT_CORE is typically unlimited (very large number), not "0 0"
         assert result.stdout.strip() != b"0 0"
@@ -502,7 +502,7 @@ class TestUnwiredFieldWarning:
             with warnings.catch_warnings(record=True) as w:
                 warnings.simplefilter("always")
                 p = _policy(no_coredump=True)
-                Sandbox(p).run(["echo", "ok"])
+                p.run(["echo", "ok"])
 
             matched = [x for x in w if "no_coredump" in str(x.message)]
             assert len(matched) >= 1
@@ -511,14 +511,14 @@ class TestUnwiredFieldWarning:
             _NativePolicy._HANDLED_FIELDS.add("no_coredump")
 
     def test_sandbox_name_parameter(self):
-        sb = Sandbox(_policy(), name="test-host")
+        sb = _policy(name="test-host")
         assert sb.name == "test-host"
 
     def test_no_warning_on_default_values(self):
         import warnings
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            Sandbox(_policy()).run(["echo", "ok"])
+            _policy().run(["echo", "ok"])
 
         unwired = [x for x in w if "not wired through FFI" in str(x.message)]
         assert unwired == []
@@ -545,7 +545,7 @@ class TestDiskQuota:
             max_disk="1M",
         )
         # Opening for write triggers COW copy of the 5-byte file.
-        result = Sandbox(p).run(
+        result = p.run(
             ["sh", "-c", f"echo world >> {workdir}/small.txt"]
         )
         assert result.success
@@ -562,7 +562,7 @@ class TestDiskQuota:
             max_disk="1K",  # 1024 bytes — smaller than the 8 KiB file
         )
         # Trying to open big.bin for write triggers COW copy → ENOSPC.
-        result = Sandbox(p).run(
+        result = p.run(
             ["sh", "-c", f"echo x >> {workdir}/big.bin"]
         )
         assert not result.success
@@ -580,7 +580,7 @@ class TestDiskQuota:
             max_disk="1000",
         )
         # First open succeeds (600 <= 1000), second fails (600+600 > 1000).
-        result = Sandbox(p).run(
+        result = p.run(
             ["sh", "-c",
              f"echo x >> {workdir}/a.bin && echo x >> {workdir}/b.bin"]
         )
@@ -596,7 +596,7 @@ class TestDiskQuota:
             workdir=str(workdir),
             max_disk="512",
         )
-        result = Sandbox(p).run(
+        result = p.run(
             ["sh", "-c", f"echo x >> {workdir}/big.bin 2>&1"]
         )
         assert not result.success
@@ -612,7 +612,7 @@ class TestDiskQuota:
             fs_writable=[str(workdir)],
             workdir=str(workdir),
         )
-        result = Sandbox(p).run(
+        result = p.run(
             ["sh", "-c", f"echo x >> {workdir}/data.bin"]
         )
         assert result.success
@@ -627,7 +627,7 @@ class TestDiskQuota:
             workdir=str(workdir),
             max_disk="1K",
         )
-        result = Sandbox(p).dry_run(
+        result = p.dry_run(
             ["sh", "-c", f"echo x >> {workdir}/big.bin"]
         )
         assert not result.success
@@ -642,7 +642,7 @@ class TestDiskQuota:
                 workdir=str(workdir),
                 max_disk=size,
             )
-            result = Sandbox(p).run(["echo", "ok"])
+            result = p.run(["echo", "ok"])
             assert result.success, f"max_disk={size!r} should be accepted"
 
     def test_read_does_not_consume_quota(self, tmp_path):
@@ -655,7 +655,7 @@ class TestDiskQuota:
             workdir=str(workdir),
             max_disk="100",  # tiny quota
         )
-        result = Sandbox(p).run(
+        result = p.run(
             ["cat", f"{workdir}/big.bin"]
         )
         assert result.success
@@ -673,7 +673,7 @@ class TestDiskQuota:
             workdir=str(workdir),
             fs_storage=str(storage),
         )
-        result = Sandbox(p).run(
+        result = p.run(
             ["sh", "-c", f"echo modified > {workdir}/file.txt"]
         )
         assert result.success
@@ -696,7 +696,7 @@ class TestDiskQuota:
             fs_storage=str(storage),
             max_disk="512",
         )
-        result = Sandbox(p).run(
+        result = p.run(
             ["sh", "-c", f"echo x >> {workdir}/big.bin"]
         )
         assert not result.success

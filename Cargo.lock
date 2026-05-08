@@ -1569,6 +1569,7 @@ dependencies = [
  "sandlock-core",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -1577,8 +1578,10 @@ name = "sandlock-core"
 version = "0.7.0"
 dependencies = [
  "bincode",
+ "clap",
  "goblin",
  "hudsucker",
+ "jiff",
  "libc",
  "nix",
  "pathdiff",

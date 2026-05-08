@@ -24,8 +24,7 @@ import textwrap
 from types import SimpleNamespace
 from typing import Any, Callable, Mapping
 
-from ..policy import Policy
-from .._sdk import Sandbox
+from ..sandbox import Sandbox
 from ._policy import policy_for_tool, capabilities_from_mcp_tool
 
 
@@ -61,10 +60,10 @@ class McpSandbox:
         self._workspace = workspace
         self._timeout = timeout
         self._local_tools: dict[str, _LocalTool] = {}
-        self._local_policies: dict[str, Policy] = {}
+        self._local_policies: dict[str, Sandbox] = {}
         self._mcp_tools: dict[str, Any] = {}
         self._mcp_tool_session: dict[str, Any] = {}
-        self._mcp_policies: dict[str, Policy] = {}
+        self._mcp_policies: dict[str, Sandbox] = {}
 
     # --- Local tools ---
 
@@ -147,8 +146,8 @@ class McpSandbox:
             result.append({"type": "function", "function": fn})
         return result
 
-    def get_policy(self, tool_name: str) -> Policy:
-        """Return the policy for a tool."""
+    def get_policy(self, tool_name: str) -> Sandbox:
+        """Return the sandbox config for a tool."""
         if tool_name in self._local_policies:
             return self._local_policies[tool_name]
         if tool_name in self._mcp_policies:
@@ -203,7 +202,7 @@ if _result is not None:
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             None,
-            lambda: Sandbox(policy).run(
+            lambda: policy.run(
                 [sys.executable, "-c", script], timeout=timeout,
             ),
         )

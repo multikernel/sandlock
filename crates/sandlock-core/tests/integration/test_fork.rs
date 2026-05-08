@@ -1,8 +1,8 @@
-use sandlock_core::{Policy, Sandbox};
+use sandlock_core::{Sandbox};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-fn base_policy() -> Policy {
-    Policy::builder()
+fn base_policy() -> Sandbox {
+    Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
         .fs_read("/etc").fs_read("/proc").fs_read("/dev")
         .fs_write("/tmp")
@@ -17,14 +17,12 @@ async fn test_fork_basic() {
     let _ = std::fs::create_dir_all(&out_dir);
     let out = out_dir.clone();
 
-    let policy = base_policy();
-    let mut sb = Sandbox::new_with_fns(
-        &policy, Some("test"),
-        || {},
-        move |clone_id| {
+    let mut sb = base_policy()
+        .with_name("test")
+        .with_init_fn(|| {})
+        .with_work_fn(move |clone_id| {
             let _ = std::fs::write(out.join(format!("{}", clone_id)), clone_id.to_string());
-        },
-    ).unwrap();
+        });
 
     let mut clones = sb.fork(4).await.unwrap();
     assert_eq!(clones.len(), 4);
@@ -54,15 +52,13 @@ async fn test_fork_cow_sharing() {
     let _ = std::fs::create_dir_all(&out_dir);
     let out = out_dir.clone();
 
-    let policy = base_policy();
-    let mut sb = Sandbox::new_with_fns(
-        &policy, Some("test"),
-        || { SHARED.store(42, Ordering::Relaxed); },
-        move |clone_id| {
+    let mut sb = base_policy()
+        .with_name("test")
+        .with_init_fn(|| { SHARED.store(42, Ordering::Relaxed); })
+        .with_work_fn(move |clone_id| {
             let val = SHARED.load(Ordering::Relaxed);
             let _ = std::fs::write(out.join(format!("{}", clone_id)), val.to_string());
-        },
-    ).unwrap();
+        });
 
     let mut clones = sb.fork(3).await.unwrap();
     for c in clones.iter_mut() { let _ = c.wait().await; }
@@ -82,15 +78,13 @@ async fn test_fork_clone_id_env() {
     let _ = std::fs::create_dir_all(&out_dir);
     let out = out_dir.clone();
 
-    let policy = base_policy();
-    let mut sb = Sandbox::new_with_fns(
-        &policy, Some("test"),
-        || {},
-        move |_| {
+    let mut sb = base_policy()
+        .with_name("test")
+        .with_init_fn(|| {})
+        .with_work_fn(move |_| {
             let id = std::env::var("CLONE_ID").unwrap_or_default();
             let _ = std::fs::write(out.join(&id), &id);
-        },
-    ).unwrap();
+        });
 
     let mut clones = sb.fork(3).await.unwrap();
     for c in clones.iter_mut() { let _ = c.wait().await; }
@@ -106,24 +100,20 @@ async fn test_fork_clone_id_env() {
 /// Test map-reduce: clone stdout flows via pipes to reducer stdin.
 #[tokio::test]
 async fn test_fork_reduce() {
-    let map_policy = base_policy();
-    let reduce_policy = base_policy();
-
     // Map: each clone prints its square to stdout (captured via pipe)
-    let mut mapper = Sandbox::new_with_fns(
-        &map_policy, Some("test"),
-        || {},
-        |clone_id| {
+    let mut mapper = base_policy()
+        .with_name("test")
+        .with_init_fn(|| {})
+        .with_work_fn(|clone_id| {
             // Write to stdout — goes to per-clone pipe
             use std::io::Write;
             let _ = writeln!(std::io::stdout(), "{}", clone_id * clone_id);
-        },
-    ).unwrap();
+        });
 
     let mut clones = mapper.fork(4).await.unwrap();
 
     // Reduce: reads all clone pipes, feeds to reducer stdin
-    let reducer = Sandbox::new(&reduce_policy, Some("test")).unwrap();
+    let reducer = base_policy().with_name("test");
     let result = reducer.reduce(
         &["python3", "-c", "import sys; print(sum(int(l) for l in sys.stdin))"],
         &mut clones,
@@ -141,14 +131,12 @@ async fn test_fork_clone_exit_status() {
     let _ = std::fs::create_dir_all(&out_dir);
     let out = out_dir.clone();
 
-    let policy = base_policy();
-    let mut sb = Sandbox::new_with_fns(
-        &policy, Some("test"),
-        || {},
-        move |clone_id| {
+    let mut sb = base_policy()
+        .with_name("test")
+        .with_init_fn(|| {})
+        .with_work_fn(move |clone_id| {
             let _ = std::fs::write(out.join(format!("{}", clone_id)), "done");
-        },
-    ).unwrap();
+        });
 
     let mut clones = sb.fork(3).await.unwrap();
 

@@ -7,7 +7,7 @@ import threading
 
 import pytest
 
-from sandlock import Sandbox, Policy, SyscallEvent, PolicyContext
+from sandlock import Sandbox, SyscallEvent, PolicyContext
 
 
 _PYTHON_READABLE = list(dict.fromkeys([
@@ -19,7 +19,7 @@ _PYTHON_READABLE = list(dict.fromkeys([
 def _policy(**overrides):
     defaults = {"fs_readable": _PYTHON_READABLE, "fs_writable": ["/tmp"]}
     defaults.update(overrides)
-    return Policy(**defaults)
+    return Sandbox(**defaults)
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +74,7 @@ class TestPolicyFnEvents:
         def on_event(event, ctx):
             events.append(event.syscall)
 
-        result = Sandbox(_policy(), policy_fn=on_event).run(
+        result = _policy(policy_fn=on_event).run(
             ["python3", "-c", "print('hello')"]
         )
         assert result.success
@@ -88,7 +88,7 @@ class TestPolicyFnEvents:
             if event.syscall in ("execve", "execveat"):
                 exec_events.append(event)
 
-        result = Sandbox(_policy(), policy_fn=on_event).run(
+        result = _policy(policy_fn=on_event).run(
             ["python3", "-c", "print('hello')"]
         )
         assert result.success
@@ -101,7 +101,7 @@ class TestPolicyFnEvents:
         def on_event(event, ctx):
             count["n"] += 1
 
-        result = Sandbox(_policy(), policy_fn=on_event).run(
+        result = _policy(policy_fn=on_event).run(
             ["python3", "-c", "print(6 * 7)"]
         )
         assert result.success
@@ -115,7 +115,7 @@ class TestPolicyFnEvents:
         def on_event(event, ctx):
             pass  # just needs to not crash
 
-        sb = Sandbox(_policy(), policy_fn=on_event)
+        sb = _policy(policy_fn=on_event)
         r1 = sb.run(["echo", "a"])
         r2 = sb.run(["echo", "b"])
         assert r1.success
@@ -133,10 +133,7 @@ class TestPolicyFnRestrict:
             if event.syscall in ("execve", "execveat"):
                 ctx.restrict_network([])
 
-        result = Sandbox(
-            _policy(net_allow=["127.0.0.1:443"]),
-            policy_fn=on_event,
-        ).run(["python3", "-c", "print('restricted')"])
+        result = _policy(net_allow=["127.0.0.1:443"], policy_fn=on_event).run(["python3", "-c", "print('restricted')"])
         assert result.success
         assert b"restricted" in result.stdout
 
@@ -146,7 +143,7 @@ class TestPolicyFnRestrict:
             if event.syscall in ("execve", "execveat"):
                 ctx.restrict_max_memory(32 * 1024 * 1024)
 
-        result = Sandbox(_policy(), policy_fn=on_event).run(
+        result = _policy(policy_fn=on_event).run(
             ["echo", "ok"]
         )
         # Should still run (echo uses very little memory)
@@ -157,7 +154,7 @@ class TestPolicyFnRestrict:
             if event.syscall in ("execve", "execveat"):
                 ctx.restrict_max_processes(1)
 
-        result = Sandbox(_policy(), policy_fn=on_event).run(
+        result = _policy(policy_fn=on_event).run(
             ["echo", "ok"]
         )
 
@@ -179,10 +176,7 @@ class TestPolicyFnVerdict:
                 return errno.EACCES  # 13
             return 0
 
-        result = Sandbox(
-            _policy(net_allow=["127.0.0.1:443"]),
-            policy_fn=on_event,
-        ).run(["python3", "-c",
+        result = _policy(net_allow=["127.0.0.1:443"], policy_fn=on_event).run(["python3", "-c",
             f"import socket\n"
             f"s = socket.socket(); s.settimeout(0.5)\n"
             f"try:\n"
@@ -205,7 +199,7 @@ class TestPolicyFnVerdict:
                 return "audit"
             return 0
 
-        result = Sandbox(_policy(), policy_fn=on_event).run(
+        result = _policy(policy_fn=on_event).run(
             ["cat", "/etc/hostname"]
         )
         assert result.success, "audit should allow the syscall"
@@ -217,10 +211,7 @@ class TestPolicyFnVerdict:
                 return True
             return False
 
-        result = Sandbox(
-            _policy(net_allow=["127.0.0.1:443"]),
-            policy_fn=on_event,
-        ).run(["python3", "-c",
+        result = _policy(net_allow=["127.0.0.1:443"], policy_fn=on_event).run(["python3", "-c",
             "import socket; s=socket.socket(); s.settimeout(0.5); "
             "s.connect_ex(('127.0.0.1', 1)); s.close(); print('ok')"
         ])
@@ -238,7 +229,7 @@ class TestPolicyFnVerdict:
                 ctx.deny_path("/etc/hostname")
             return 0
 
-        result = Sandbox(_policy(), policy_fn=on_event).run(
+        result = _policy(policy_fn=on_event).run(
             ["python3", "-c",
              f"try:\n"
              f"  open('/etc/hostname').read()\n"
@@ -261,7 +252,4 @@ class TestPolicyFnPerPid:
             if event.syscall in ("execve", "execveat"):
                 ctx.restrict_pid_network(event.pid, ["127.0.0.1"])
 
-        result = Sandbox(
-            _policy(net_allow=["127.0.0.1:443"]),
-            policy_fn=on_event,
-        ).run(["echo", "ok"])
+        result = _policy(net_allow=["127.0.0.1:443"], policy_fn=on_event).run(["echo", "ok"])

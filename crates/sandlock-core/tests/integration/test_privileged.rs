@@ -1,4 +1,4 @@
-use sandlock_core::{Policy, Sandbox};
+use sandlock_core::{Sandbox};
 
 /// Check if user namespaces with uid mapping actually work in this environment.
 /// Some CI environments (containers, restricted kernels) allow unshare but block
@@ -36,7 +36,7 @@ async fn test_uid_zero() {
         return;
     }
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
@@ -47,7 +47,7 @@ async fn test_uid_zero() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, Some("test"), &["id", "-u"]).await.unwrap();
+    let result = policy.clone().with_name("test").run(&["id", "-u"]).await.unwrap();
     assert!(result.success(), "id -u failed: {:?}", result.exit_status);
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     assert_eq!(stdout.trim(), "0", "Expected uid 0, got: {:?}", stdout.trim());
@@ -61,7 +61,7 @@ async fn test_uid_zero_gid_zero() {
         return;
     }
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
@@ -72,7 +72,7 @@ async fn test_uid_zero_gid_zero() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, Some("test"), &["id", "-g"]).await.unwrap();
+    let result = policy.clone().with_name("test").run(&["id", "-g"]).await.unwrap();
     assert!(result.success(), "id -g failed: {:?}", result.exit_status);
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     assert_eq!(stdout.trim(), "0", "Expected gid 0, got: {:?}", stdout.trim());
@@ -81,7 +81,7 @@ async fn test_uid_zero_gid_zero() {
 /// Test that without --uid, uid is NOT 0 (assuming tests don't run as root).
 #[tokio::test]
 async fn test_no_uid_keeps_real_uid() {
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
@@ -91,7 +91,7 @@ async fn test_no_uid_keeps_real_uid() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, Some("test"), &["id", "-u"]).await.unwrap();
+    let result = policy.clone().with_name("test").run(&["id", "-u"]).await.unwrap();
     assert!(result.success());
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     // If running as root already, skip this check
@@ -103,7 +103,7 @@ async fn test_no_uid_keeps_real_uid() {
 /// Test that --uid 0 doesn't break basic command execution.
 #[tokio::test]
 async fn test_uid_zero_echo() {
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
@@ -113,7 +113,7 @@ async fn test_uid_zero_echo() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, Some("test"), &["echo", "hello"]).await.unwrap();
+    let result = policy.clone().with_name("test").run(&["echo", "hello"]).await.unwrap();
     assert!(result.success());
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     assert_eq!(stdout.trim(), "hello");
@@ -127,7 +127,7 @@ async fn test_uid_custom() {
         return;
     }
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
@@ -138,7 +138,7 @@ async fn test_uid_custom() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, Some("test"), &["id", "-u"]).await.unwrap();
+    let result = policy.clone().with_name("test").run(&["id", "-u"]).await.unwrap();
     assert!(result.success(), "id -u failed: {:?}", result.exit_status);
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     assert_eq!(stdout.trim(), "1000", "Expected uid 1000, got: {:?}", stdout.trim());

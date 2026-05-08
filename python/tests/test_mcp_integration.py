@@ -9,7 +9,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from sandlock import Sandbox, Policy
 from sandlock.mcp import policy_for_tool, McpSandbox
 
 
@@ -18,7 +17,7 @@ from sandlock.mcp import policy_for_tool, McpSandbox
 def _run_in_sandbox(capabilities, script, workspace, timeout=15.0):
     """Run a script in a sandbox with given capabilities."""
     policy = policy_for_tool(workspace=workspace, capabilities=capabilities)
-    return Sandbox(policy).run([sys.executable, "-c", script], timeout=timeout)
+    return policy.run([sys.executable, "-c", script], timeout=timeout)
 
 
 # -- Tool functions for McpSandbox tests --

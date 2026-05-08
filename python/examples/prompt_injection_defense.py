@@ -202,7 +202,7 @@ def demo_xoa_sandboxed(client: OpenAI, csv_path: str, exfil_port: int):
     The executor sees the data but has no network access.
     Even if the LLM were somehow tricked, exfiltration is blocked.
     """
-    from sandlock import Sandbox, Policy
+    from sandlock import Sandbox
 
     print("=" * 60)
     print("DEMO 2: WITH SANDLOCK XOA — planner/executor pipeline")
@@ -230,7 +230,7 @@ def demo_xoa_sandboxed(client: OpenAI, csv_path: str, exfil_port: int):
     #
     # Data flows: planner stdout ──pipe──▶ executor stdin
 
-    planner_policy = Policy(
+    planner = Sandbox(
         fs_readable=list(dict.fromkeys([
             "/usr", "/lib", "/lib64", "/etc", "/bin", "/sbin",
             "/dev", python_prefix,
@@ -241,7 +241,7 @@ def demo_xoa_sandboxed(client: OpenAI, csv_path: str, exfil_port: int):
         # NO workspace in fs_readable — planner cannot see data files
     )
 
-    executor_policy = Policy(
+    executor = Sandbox(
         fs_readable=list(dict.fromkeys([
             workspace, "/usr", "/lib", "/lib64", "/etc",
             "/bin", "/sbin", python_prefix,
@@ -299,12 +299,8 @@ def demo_xoa_sandboxed(client: OpenAI, csv_path: str, exfil_port: int):
     print()
 
     result = (
-        Sandbox(planner_policy).cmd(
-            [sys.executable, "-c", planner_script]
-        )
-        | Sandbox(executor_policy).cmd(
-            [sys.executable, "-"]  # reads script from stdin
-        )
+        planner.cmd([sys.executable, "-c", planner_script])
+        | executor.cmd([sys.executable, "-"])  # reads script from stdin
     ).run(timeout=30)
 
     if result.stderr:

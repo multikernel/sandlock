@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 
 use sandlock_core::seccomp::notif::NotifAction;
 use sandlock_core::{
-    Handler, HandlerCtx, HandlerError, Policy, Sandbox, SandlockError, SyscallError,
+    Handler, HandlerCtx, HandlerError, Sandbox, SandlockError, SyscallError,
 };
 
 /// Read a NUL-terminated path from the sandboxed child's address space.
@@ -60,7 +60,7 @@ fn read_path_from_child(pid: u32, addr: u64) -> Option<String> {
     String::from_utf8(buf[..nul].to_vec()).ok()
 }
 
-fn base_policy() -> sandlock_core::PolicyBuilder {
+fn base_policy() -> sandlock_core::SandboxBuilder {
     // `fs_read_if_exists` for `/lib64` because aarch64 hosts (Ubuntu CI
     // arm64 runner) do not have it — the dynamic linker lives under
     // `/lib/aarch64-linux-gnu/`.  A strict `fs_read` here makes Landlock
@@ -68,7 +68,7 @@ fn base_policy() -> sandlock_core::PolicyBuilder {
     // confinement, surfacing as `pipe closed before 4 bytes read`
     // in the parent.  Mirrors the convention used in upstream
     // `test_dry_run`, `test_fork`, `test_netlink_virt`, `test_landlock`.
-    Policy::builder()
+    Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
@@ -109,10 +109,7 @@ async fn extra_handler_intercepts_syscall_outside_builtin_set() {
         }
     };
 
-    let result = Sandbox::run_with_extra_handlers(
-        &policy,
-        None,
-        &["sh", "-c", &cmd],
+    let result = policy.clone().run_with_extra_handlers(&["sh", "-c", &cmd],
         [(libc::SYS_getcwd, handler)],
     )
     .await
@@ -152,10 +149,7 @@ async fn extra_handler_continue_lets_syscall_proceed() {
         }
     };
 
-    let result = Sandbox::run_with_extra_handlers(
-        &policy,
-        None,
-        &["sh", "-c", &cmd],
+    let result = policy.clone().run_with_extra_handlers(&["sh", "-c", &cmd],
         [(libc::SYS_getcwd, handler)],
     )
     .await
@@ -183,9 +177,9 @@ async fn extra_handler_continue_lets_syscall_proceed() {
 async fn empty_extras_preserves_default_behaviour() {
     let policy = base_policy().build().unwrap();
 
-    let baseline = Sandbox::run(&policy, None, &["/bin/pwd"]).await.unwrap();
+    let baseline = policy.clone().run(&["/bin/pwd"]).await.unwrap();
     let no_handlers: [(i64, fn(&HandlerCtx) -> std::future::Ready<NotifAction>); 0] = [];
-    let with_extras = Sandbox::run_with_extra_handlers(&policy, None, &["/bin/pwd"], no_handlers)
+    let with_extras = policy.clone().run_with_extra_handlers(&["/bin/pwd"], no_handlers)
         .await
         .unwrap();
 
@@ -221,10 +215,7 @@ async fn extra_handler_runs_after_builtin_returns_continue() {
         }
     };
 
-    let result = Sandbox::run_with_extra_handlers(
-        &policy,
-        None,
-        &["sh", "-c", &cmd],
+    let result = policy.clone().run_with_extra_handlers(&["sh", "-c", &cmd],
         [(libc::SYS_openat, handler)],
     )
     .await
@@ -280,10 +271,7 @@ async fn builtin_non_continue_blocks_extra() {
         }
     };
 
-    let _ = Sandbox::run_with_extra_handlers(
-        &policy,
-        None,
-        &["sh", "-c", &cmd],
+    let _ = policy.clone().run_with_extra_handlers(&["sh", "-c", &cmd],
         [(libc::SYS_openat, handler)],
     )
     .await
@@ -359,10 +347,7 @@ async fn chain_of_extras_runs_in_insertion_order() {
         action: NotifAction::Errno(libc::EACCES),
     };
 
-    let result = Sandbox::run_with_extra_handlers(
-        &policy,
-        None,
-        &["sh", "-c", &cmd],
+    let result = policy.clone().run_with_extra_handlers(&["sh", "-c", &cmd],
         [(libc::SYS_getcwd, h1), (libc::SYS_getcwd, h2)],
     )
     .await
@@ -400,10 +385,7 @@ async fn extra_handler_on_default_blocklist_syscall_is_rejected() {
     let policy = base_policy().build().unwrap();
     let handler = |_cx: &HandlerCtx| async { NotifAction::Continue };
 
-    let result = Sandbox::run_with_extra_handlers(
-        &policy,
-        None,
-        &["true"],
+    let result = policy.clone().run_with_extra_handlers(&["true"],
         [(libc::SYS_mount, handler)],
     )
     .await;
@@ -420,7 +402,7 @@ async fn extra_handler_on_default_blocklist_syscall_is_rejected() {
     );
 }
 
-/// User-supplied `block_syscalls` entries must be honoured by the same guard
+/// User-supplied `extra_deny_syscalls` entries must be honoured by the same guard
 /// that protects DEFAULT_BLOCKLIST: an extra registered on a syscall the caller
 /// explicitly asked to block would otherwise let a `Continue` from the
 /// handler reach the deny-JEQ via the notif path and bypass the kernel
@@ -430,20 +412,17 @@ async fn extra_handler_on_default_blocklist_syscall_is_rejected() {
 /// driving the user-list branch of `blocklist_syscall_numbers` (see
 /// `crates/sandlock-core/src/context.rs`).  Uses `SYS_mremap` because it is
 /// in `syscall_name_to_nr` but **not** in DEFAULT_BLOCKLIST — putting it into
-/// `block_syscalls` is the only way it lands on the blocklist, isolating the
+/// `extra_deny_syscalls` is the only way it lands on the blocklist, isolating the
 /// user-supplied branch under test from the default-blocklist branch.
 #[tokio::test]
 async fn extra_handler_on_user_specified_blocklist_is_rejected() {
     let policy = base_policy()
-        .block_syscalls(vec!["mremap".into()])
+        .extra_deny_syscalls(vec!["mremap".into()])
         .build()
         .unwrap();
     let handler = |_cx: &HandlerCtx| async { NotifAction::Continue };
 
-    let result = Sandbox::run_with_extra_handlers(
-        &policy,
-        None,
-        &["true"],
+    let result = policy.clone().run_with_extra_handlers(&["true"],
         [(libc::SYS_mremap, handler)],
     )
     .await;
@@ -490,10 +469,7 @@ async fn handler_via_blanket_impl_dispatches_in_sandbox() {
         }
     };
 
-    let _result = Sandbox::run_with_extra_handlers(
-        &policy,
-        None,
-        &["sh", "-c", &cmd],
+    let _result = policy.clone().run_with_extra_handlers(&["sh", "-c", &cmd],
         [(libc::SYS_getcwd, handler)],
     )
     .await
@@ -556,10 +532,7 @@ async fn struct_handler_state_persists_across_sandbox_calls() {
     let out = temp_out("struct-handler-counter");
     let cmd = format!("/bin/pwd; /bin/pwd; echo done > {}", out.display());
 
-    Sandbox::run_with_extra_handlers(
-        &policy,
-        None,
-        &["sh", "-c", &cmd],
+    policy.clone().run_with_extra_handlers(&["sh", "-c", &cmd],
         [(libc::SYS_getcwd, handler)],
     )
     .await
@@ -583,7 +556,7 @@ async fn run_with_extra_handlers_rejects_negative_syscall() {
     let handler = |_cx: &HandlerCtx| async { NotifAction::Continue };
 
     let result =
-        Sandbox::run_with_extra_handlers(&policy, None, &["true"], [(-5i64, handler)]).await;
+        policy.clone().run_with_extra_handlers(&["true"], [(-5i64, handler)]).await;
 
     match result {
         Err(SandlockError::Handler(HandlerError::InvalidSyscall(SyscallError::Negative(-5)))) => {}
@@ -601,7 +574,7 @@ async fn run_with_extra_handlers_rejects_arch_unknown_syscall() {
     let handler = |_cx: &HandlerCtx| async { NotifAction::Continue };
 
     let result =
-        Sandbox::run_with_extra_handlers(&policy, None, &["true"], [(99_999i64, handler)]).await;
+        policy.clone().run_with_extra_handlers(&["true"], [(99_999i64, handler)]).await;
 
     match result {
         Err(SandlockError::Handler(HandlerError::InvalidSyscall(
@@ -661,10 +634,7 @@ async fn run_with_extra_handlers_preserves_insertion_order_in_sandbox_chain() {
         action: NotifAction::Errno(libc::EACCES),
     };
 
-    Sandbox::run_with_extra_handlers(
-        &policy,
-        None,
-        &["sh", "-c", &cmd],
+    policy.clone().run_with_extra_handlers(&["sh", "-c", &cmd],
         [(libc::SYS_getcwd, h1), (libc::SYS_getcwd, h2)],
     )
     .await
@@ -688,7 +658,7 @@ async fn run_with_extra_handlers_rejects_handler_on_default_blocklist_syscall() 
 
     // SYS_mount is in DEFAULT_BLOCKLIST_SYSCALLS.
     let result =
-        Sandbox::run_with_extra_handlers(&policy, None, &["true"], [(libc::SYS_mount, handler)]).await;
+        policy.clone().run_with_extra_handlers(&["true"], [(libc::SYS_mount, handler)]).await;
 
     match result {
         Err(SandlockError::Handler(HandlerError::OnDenySyscall { syscall_nr })) => {

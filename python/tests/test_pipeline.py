@@ -7,7 +7,7 @@ import tempfile
 
 import pytest
 
-from sandlock import Sandbox, Policy, Stage, Pipeline, NamedStage, Gather, GatherPipeline
+from sandlock import Sandbox, Stage, Pipeline, NamedStage, Gather, GatherPipeline
 
 
 # --- Helpers ---
@@ -24,35 +24,35 @@ def _policy(**overrides):
         "clean_env": True,
     }
     defaults.update(overrides)
-    return Policy(**defaults)
+    return Sandbox(**defaults)
 
 
 # --- Stage ---
 
 class TestStage:
     def test_cmd_returns_stage(self):
-        sb = Sandbox(_policy())
+        sb = _policy()
         stage = sb.cmd(["echo", "hello"])
         assert isinstance(stage, Stage)
         assert stage.sandbox is sb
         assert stage.args == ["echo", "hello"]
 
     def test_stage_run(self):
-        result = Sandbox(_policy()).cmd(["echo", "hello"]).run()
+        result = _policy().cmd(["echo", "hello"]).run()
         assert result.success
         assert b"hello" in result.stdout
 
     def test_stage_or_stage_returns_pipeline(self):
-        a = Sandbox(_policy()).cmd(["echo", "hello"])
-        b = Sandbox(_policy()).cmd(["cat"])
+        a = _policy().cmd(["echo", "hello"])
+        b = _policy().cmd(["cat"])
         p = a | b
         assert isinstance(p, Pipeline)
         assert len(p.stages) == 2
 
     def test_stage_or_pipeline(self):
-        a = Sandbox(_policy()).cmd(["echo", "a"])
-        b = Sandbox(_policy()).cmd(["cat"])
-        c = Sandbox(_policy()).cmd(["cat"])
+        a = _policy().cmd(["echo", "a"])
+        b = _policy().cmd(["cat"])
+        c = _policy().cmd(["cat"])
         p = a | b | c
         assert isinstance(p, Pipeline)
         assert len(p.stages) == 3
@@ -64,8 +64,8 @@ class TestPipeline:
     def test_two_stage_pipe(self):
         """echo | cat: basic data flow through pipe."""
         result = (
-            Sandbox(_policy()).cmd(["echo", "hello pipeline"])
-            | Sandbox(_policy()).cmd(["cat"])
+            _policy().cmd(["echo", "hello pipeline"])
+            | _policy().cmd(["cat"])
         ).run()
         assert result.success
         assert b"hello pipeline" in result.stdout
@@ -73,9 +73,9 @@ class TestPipeline:
     def test_three_stage_pipe(self):
         """echo | tr | cat: data flows through multiple stages."""
         result = (
-            Sandbox(_policy()).cmd(["echo", "hello"])
-            | Sandbox(_policy()).cmd(["tr", "a-z", "A-Z"])
-            | Sandbox(_policy()).cmd(["cat"])
+            _policy().cmd(["echo", "hello"])
+            | _policy().cmd(["tr", "a-z", "A-Z"])
+            | _policy().cmd(["cat"])
         ).run()
         assert result.success
         assert b"HELLO" in result.stdout
@@ -95,8 +95,8 @@ class TestPipeline:
             processor_policy = _policy()
 
             result = (
-                Sandbox(reader_policy).cmd(["cat", secret])
-                | Sandbox(processor_policy).cmd(["tr", "a-z", "A-Z"])
+                reader_policy.cmd(["cat", secret])
+                | processor_policy.cmd(["tr", "a-z", "A-Z"])
             ).run()
             assert result.success
             assert b"SENSITIVE DATA" in result.stdout
@@ -104,8 +104,8 @@ class TestPipeline:
     def test_pipeline_captures_last_stderr(self):
         """Stderr from last stage is captured."""
         result = (
-            Sandbox(_policy()).cmd(["echo", "hello"])
-            | Sandbox(_policy()).cmd(
+            _policy().cmd(["echo", "hello"])
+            | _policy().cmd(
                 [sys.executable, "-c",
                  "import sys; sys.stderr.write('err msg\\n'); "
                  "print(sys.stdin.read().strip())"]
@@ -122,8 +122,8 @@ class TestPipeline:
             out_fd = os.open(out_path, os.O_WRONLY | os.O_CREAT, 0o644)
             try:
                 result = (
-                    Sandbox(_policy()).cmd(["echo", "to fd"])
-                    | Sandbox(_policy()).cmd(["cat"])
+                    _policy().cmd(["echo", "to fd"])
+                    | _policy().cmd(["cat"])
                 ).run(stdout=out_fd)
             finally:
                 os.close(out_fd)
@@ -136,8 +136,8 @@ class TestPipeline:
     def test_first_stage_failure(self):
         """Pipeline reports failure when first stage fails."""
         result = (
-            Sandbox(_policy()).cmd(["/nonexistent"])
-            | Sandbox(_policy()).cmd(["cat"])
+            _policy().cmd(["/nonexistent"])
+            | _policy().cmd(["cat"])
         ).run()
         # Last stage reads EOF from pipe → exits 0, but first stage failed.
         # We report last stage's exit code.
@@ -146,8 +146,8 @@ class TestPipeline:
     def test_last_stage_failure(self):
         """Pipeline reports failure of the last stage."""
         result = (
-            Sandbox(_policy()).cmd(["echo", "hello"])
-            | Sandbox(_policy()).cmd(
+            _policy().cmd(["echo", "hello"])
+            | _policy().cmd(
                 [sys.executable, "-c", "import sys; sys.exit(42)"]
             )
         ).run()
@@ -156,15 +156,15 @@ class TestPipeline:
 
     def test_pipeline_requires_two_stages(self):
         with pytest.raises(ValueError, match="at least 2"):
-            Pipeline([Sandbox(_policy()).cmd(["echo"])])
+            Pipeline([_policy().cmd(["echo"])])
 
     def test_pipeline_timeout(self):
         """Pipeline times out if a stage hangs."""
         result = (
-            Sandbox(_policy()).cmd(
+            _policy().cmd(
                 [sys.executable, "-c", "import time; time.sleep(60)"]
             )
-            | Sandbox(_policy()).cmd(["cat"])
+            | _policy().cmd(["cat"])
         ).run(timeout=1)
         assert not result.success
         assert "timed out" in (result.error or "").lower()
@@ -204,8 +204,8 @@ class TestXOA:
             ]
 
             result = (
-                Sandbox(planner_policy).cmd(planner_cmd)
-                | Sandbox(executor_policy).cmd(
+                planner_policy.cmd(planner_cmd)
+                | executor_policy.cmd(
                     [sys.executable, "-"]  # reads script from stdin
                 )
             ).run()
@@ -219,12 +219,12 @@ class TestXOA:
         executor_policy = _policy(net_allow=[])
 
         result = (
-            Sandbox(_policy()).cmd(
+            _policy().cmd(
                 [sys.executable, "-c",
                  "print('import socket; "
                  "socket.create_connection((\"1.1.1.1\", 80), timeout=1)')"]
             )
-            | Sandbox(executor_policy).cmd(
+            | executor_policy.cmd(
                 [sys.executable, "-c", "-"]
             )
         ).run()
@@ -237,32 +237,32 @@ class TestXOA:
 
 class TestGather:
     def test_as_returns_named_stage(self):
-        stage = Sandbox(_policy()).cmd(["echo", "hello"])
+        stage = _policy().cmd(["echo", "hello"])
         named = stage.as_("greeting")
         assert isinstance(named, NamedStage)
         assert named.name == "greeting"
 
     def test_add_returns_gather(self):
-        a = Sandbox(_policy()).cmd(["echo", "a"]).as_("a")
-        b = Sandbox(_policy()).cmd(["echo", "b"]).as_("b")
+        a = _policy().cmd(["echo", "a"]).as_("a")
+        b = _policy().cmd(["echo", "b"]).as_("b")
         g = a + b
         assert isinstance(g, Gather)
         assert len(g.sources) == 2
 
     def test_gather_or_stage_returns_pipeline(self):
         g = (
-            Sandbox(_policy()).cmd(["echo", "a"]).as_("a")
-            + Sandbox(_policy()).cmd(["echo", "b"]).as_("b")
+            _policy().cmd(["echo", "a"]).as_("a")
+            + _policy().cmd(["echo", "b"]).as_("b")
         )
-        gp = g | Sandbox(_policy()).cmd(["cat"])
+        gp = g | _policy().cmd(["cat"])
         assert isinstance(gp, GatherPipeline)
 
     def test_gather_two_sources(self):
         """Two producers pipe into one consumer via gather."""
         result = (
-            Sandbox(_policy()).cmd(["echo", "hello"]).as_("greeting")
-            + Sandbox(_policy()).cmd(["echo", "world"]).as_("name")
-            | Sandbox(_policy()).cmd(
+            _policy().cmd(["echo", "hello"]).as_("greeting")
+            + _policy().cmd(["echo", "world"]).as_("name")
+            | _policy().cmd(
                 ["sh", "-c",
                  'read name; greeting=$(cat <&3); echo "$greeting $name"']
             )
@@ -280,13 +280,13 @@ class TestGather:
         ] + python_paths)))
 
         result = (
-            Sandbox(policy).cmd(
+            policy.cmd(
                 [sys.executable, "-c", "print('DATA_CONTENT')"]
             ).as_("data")
-            + Sandbox(policy).cmd(
+            + policy.cmd(
                 [sys.executable, "-c", "print('CODE_CONTENT')"]
             ).as_("code")
-            | Sandbox(policy).cmd(
+            | policy.cmd(
                 [sys.executable, "-c",
                  "from sandlock import inputs; "
                  "print(f'code={inputs[\"code\"].strip()}'); "
@@ -313,11 +313,11 @@ class TestGather:
             consumer_policy = _policy()
 
             result = (
-                Sandbox(data_policy).cmd(["cat", secret]).as_("data")
-                + Sandbox(code_policy).cmd(
+                data_policy.cmd(["cat", secret]).as_("data")
+                + code_policy.cmd(
                     ["echo", "upper"]
                 ).as_("code")
-                | Sandbox(consumer_policy).cmd(
+                | consumer_policy.cmd(
                     [sys.executable, "-c",
                      "import os, sys\n"
                      "code = sys.stdin.read().strip()\n"
@@ -335,10 +335,10 @@ class TestGather:
     def test_gather_three_sources(self):
         """Three producers fan into one consumer."""
         result = (
-            Sandbox(_policy()).cmd(["echo", "aaa"]).as_("a")
-            + Sandbox(_policy()).cmd(["echo", "bbb"]).as_("b")
-            + Sandbox(_policy()).cmd(["echo", "ccc"]).as_("c")
-            | Sandbox(_policy()).cmd(
+            _policy().cmd(["echo", "aaa"]).as_("a")
+            + _policy().cmd(["echo", "bbb"]).as_("b")
+            + _policy().cmd(["echo", "ccc"]).as_("c")
+            | _policy().cmd(
                 ["sh", "-c",
                  # c on stdin, a on fd 3, b on fd 4
                  # Use read builtin (no fork) instead of $(cat) to avoid

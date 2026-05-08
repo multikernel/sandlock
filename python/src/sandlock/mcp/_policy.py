@@ -20,7 +20,7 @@ import sys
 from dataclasses import fields
 from typing import Any, Mapping, Sequence
 
-from ..policy import Policy
+from ..sandbox import Sandbox
 
 # Resolve the Python interpreter's installation prefix so that sandboxed
 # processes can always exec the current interpreter, even when it lives
@@ -28,7 +28,7 @@ from ..policy import Policy
 _PYTHON_PREFIX = sys.prefix
 
 
-_POLICY_FIELDS = frozenset(f.name for f in fields(Policy))
+_POLICY_FIELDS = frozenset(f.name for f in fields(Sandbox))
 _SANDLOCK_PREFIX = "sandlock:"
 
 
@@ -36,8 +36,8 @@ def policy_for_tool(
     *,
     workspace: str = "/tmp/sandlock",
     capabilities: Mapping[str, Any] | None = None,
-) -> Policy:
-    """Build a :class:`Policy` from explicit capabilities.
+) -> Sandbox:
+    """Build a :class:`Sandbox` from explicit capabilities.
 
     **Deny by default**: no capabilities = read-only access to system
     paths and the workspace.  Every permission must be granted.
@@ -49,7 +49,7 @@ def policy_for_tool(
 
     Args:
         workspace: Filesystem path the sandbox can read.
-        capabilities: Grants keyed by Policy field name.  Common keys:
+        capabilities: Grants keyed by Sandbox field name.  Common keys:
 
             - ``fs_writable: ["/tmp/workspace"]``
             - ``net_allow: ["api.example.com:443"]``
@@ -57,7 +57,7 @@ def policy_for_tool(
             - ``max_memory: "256M"``
 
     Returns:
-        A frozen :class:`Policy` instance.
+        A frozen :class:`Sandbox` instance.
     """
     # Fields that users cannot override — always enforced.
     _ENFORCED = {"clean_env"}
@@ -78,7 +78,7 @@ def policy_for_tool(
             if key in _POLICY_FIELDS and key not in _ENFORCED:
                 kwargs[key] = value
 
-    return Policy(**kwargs)
+    return Sandbox(**kwargs)
 
 
 def capabilities_from_mcp_tool(tool: Any) -> dict[str, Any]:

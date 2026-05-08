@@ -2,7 +2,7 @@ use std::os::fd::OwnedFd;
 use std::path::Path;
 
 use crate::error::{ConfinementError, SandlockError};
-use crate::policy::Policy;
+use crate::sandbox::Sandbox;
 use crate::sys::structs::{
     LandlockNetPortAttr, LandlockPathBeneathAttr, LandlockRulesetAttr,
     LANDLOCK_ACCESS_FS_EXECUTE, LANDLOCK_ACCESS_FS_IOCTL_DEV, LANDLOCK_ACCESS_FS_MAKE_BLOCK,
@@ -170,28 +170,28 @@ fn add_net_rule(ruleset_fd: &OwnedFd, port: u16, access: u64) -> Result<(), Conf
 /// Minimum Landlock ABI version required by sandlock.
 pub const MIN_ABI: u32 = 6;
 
-/// Apply Landlock confinement based on the given `Policy`.
+/// Apply Landlock confinement based on the given `Sandbox`.
 ///
 /// Requires Landlock ABI v6 or later. Returns an error if the kernel does
 /// not meet this requirement.
-pub fn confine(policy: &Policy) -> Result<(), SandlockError> {
+pub fn confine(policy: &Sandbox) -> Result<(), SandlockError> {
     confine_inner(policy, true)
 }
 
 /// Apply Landlock filesystem confinement without TCP bind/connect rules.
-pub fn confine_filesystem(policy: &Policy) -> Result<(), SandlockError> {
+pub fn confine_filesystem(policy: &Sandbox) -> Result<(), SandlockError> {
     confine_inner(policy, false)
 }
 
-fn confine_inner(policy: &Policy, handle_net: bool) -> Result<(), SandlockError> {
+fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError> {
     // Step 1 -- detect and validate ABI version.
     let abi = abi_version().map_err(|e| {
-        SandlockError::Sandbox(crate::error::SandboxError::Confinement(e))
+        SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
     })?;
 
     if abi < MIN_ABI {
-        return Err(SandlockError::Sandbox(
-            crate::error::SandboxError::Confinement(
+        return Err(SandlockError::Runtime(
+            crate::error::SandboxRuntimeError::Confinement(
                 ConfinementError::InsufficientAbi {
                     required: MIN_ABI,
                     actual: abi,
@@ -218,7 +218,7 @@ fn confine_inner(policy: &Policy, handle_net: bool) -> Result<(), SandlockError>
     // on-behalf path), so they're filtered out here — feeding them to
     // Landlock would either be a no-op (for unhandled protocols) or
     // wrongly install TCP rules from a UDP wildcard.
-    use crate::policy::Protocol;
+    use crate::sandbox::Protocol;
     let net_wildcard = policy
         .net_allow
         .iter()
@@ -243,7 +243,7 @@ fn confine_inner(policy: &Policy, handle_net: bool) -> Result<(), SandlockError>
 
     let ruleset_fd = syscall::landlock_create_ruleset(&attr, std::mem::size_of::<LandlockRulesetAttr>(), 0)
         .map_err(|e| {
-            SandlockError::Sandbox(crate::error::SandboxError::Confinement(
+            SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(
                 ConfinementError::Landlock(format!("create ruleset: {}", e)),
             ))
         })?;
@@ -267,7 +267,7 @@ fn confine_inner(policy: &Policy, handle_net: bool) -> Result<(), SandlockError>
             path.as_path()
         };
         add_path_rule(&ruleset_fd, rule_path, fs_write_mask).map_err(|e| {
-            SandlockError::Sandbox(crate::error::SandboxError::Confinement(e))
+            SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
         })?;
     }
 
@@ -281,7 +281,7 @@ fn confine_inner(policy: &Policy, handle_net: bool) -> Result<(), SandlockError>
             path.as_path()
         };
         add_path_rule(&ruleset_fd, rule_path, READ_ACCESS).map_err(|e| {
-            SandlockError::Sandbox(crate::error::SandboxError::Confinement(e))
+            SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
         })?;
     }
 
@@ -310,7 +310,7 @@ fn confine_inner(policy: &Policy, handle_net: bool) -> Result<(), SandlockError>
     if handle_net {
         for &port in &policy.net_bind {
             add_net_rule(&ruleset_fd, port, LANDLOCK_ACCESS_NET_BIND_TCP).map_err(|e| {
-                SandlockError::Sandbox(crate::error::SandboxError::Confinement(e))
+                SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
             })?;
         }
     }
@@ -340,14 +340,14 @@ fn confine_inner(policy: &Policy, handle_net: bool) -> Result<(), SandlockError>
         }
         for port in connect_ports {
             add_net_rule(&ruleset_fd, port, LANDLOCK_ACCESS_NET_CONNECT_TCP).map_err(|e| {
-                SandlockError::Sandbox(crate::error::SandboxError::Confinement(e))
+                SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
             })?;
         }
     }
 
     // Step 6 — enforce (irreversible).
     syscall::landlock_restrict_self(&ruleset_fd, 0).map_err(|e| {
-        SandlockError::Sandbox(crate::error::SandboxError::Confinement(
+        SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(
             ConfinementError::Landlock(format!("restrict_self: {}", e)),
         ))
     })?;

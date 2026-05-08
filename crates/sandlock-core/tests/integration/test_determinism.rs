@@ -1,11 +1,11 @@
-use sandlock_core::{Policy, Sandbox};
+use sandlock_core::{Sandbox};
 use std::time::{Duration, SystemTime};
 
 /// Test that random_seed produces deterministic output from /dev/urandom.
 /// Run the same command twice with the same seed — reads should match.
 #[tokio::test]
 async fn test_random_seed_deterministic() {
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
@@ -18,10 +18,10 @@ async fn test_random_seed_deterministic() {
         .unwrap();
 
     // Read 16 bytes from /dev/urandom via od — exercises the openat interception path.
-    let r1 = Sandbox::run(&policy, Some("test"), &["sh", "-c", "od -A n -N 16 -t x1 /dev/urandom"])
+    let r1 = policy.clone().with_name("test").run(&["sh", "-c", "od -A n -N 16 -t x1 /dev/urandom"])
         .await
         .unwrap();
-    let r2 = Sandbox::run(&policy, Some("test"), &["sh", "-c", "od -A n -N 16 -t x1 /dev/urandom"])
+    let r2 = policy.clone().with_name("test").run(&["sh", "-c", "od -A n -N 16 -t x1 /dev/urandom"])
         .await
         .unwrap();
 
@@ -44,7 +44,7 @@ async fn test_random_seed_deterministic() {
 /// Test that different seeds produce different /dev/urandom output.
 #[tokio::test]
 async fn test_random_seed_different_seeds() {
-    let p1 = Policy::builder()
+    let p1 = Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
@@ -54,7 +54,7 @@ async fn test_random_seed_different_seeds() {
         .random_seed(1)
         .build()
         .unwrap();
-    let p2 = Policy::builder()
+    let p2 = Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
@@ -66,8 +66,8 @@ async fn test_random_seed_different_seeds() {
         .unwrap();
 
     let cmd = &["sh", "-c", "od -A n -N 16 -t x1 /dev/urandom"];
-    let r1 = Sandbox::run(&p1, Some("test"), cmd).await.unwrap();
-    let r2 = Sandbox::run(&p2, Some("test"), cmd).await.unwrap();
+    let r1 = p1.clone().with_name("test").run(cmd).await.unwrap();
+    let r2 = p2.clone().with_name("test").run(cmd).await.unwrap();
     assert!(r1.success());
     assert!(r2.success());
 
@@ -90,7 +90,7 @@ async fn test_random_seed_different_seeds() {
 async fn test_time_start_frozen() {
     // Freeze to 2000-06-15T00:00:00Z (mid-year avoids timezone boundary issues)
     let y2k = SystemTime::UNIX_EPOCH + Duration::from_secs(961027200);
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
@@ -101,7 +101,7 @@ async fn test_time_start_frozen() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, Some("test"), &["date", "+%Y"]).await.unwrap();
+    let result = policy.clone().with_name("test").run(&["date", "+%Y"]).await.unwrap();
     assert!(result.success(), "date command failed");
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     assert_eq!(stdout.trim(), "2000", "Expected year 2000, got: {:?}", stdout.trim());
@@ -111,7 +111,7 @@ async fn test_time_start_frozen() {
 #[tokio::test]
 async fn test_time_start_basic_commands_work() {
     let past = SystemTime::UNIX_EPOCH + Duration::from_secs(1000000000); // 2001-09-09
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
@@ -121,7 +121,7 @@ async fn test_time_start_basic_commands_work() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, Some("test"), &["echo", "hello"]).await.unwrap();
+    let result = policy.clone().with_name("test").run(&["echo", "hello"]).await.unwrap();
     assert!(result.success());
 }
 
@@ -129,7 +129,7 @@ async fn test_time_start_basic_commands_work() {
 #[tokio::test]
 async fn test_combined_determinism() {
     let past = SystemTime::UNIX_EPOCH + Duration::from_secs(946684800);
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
@@ -141,7 +141,7 @@ async fn test_combined_determinism() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, Some("test"), &["echo", "deterministic"]).await.unwrap();
+    let result = policy.clone().with_name("test").run(&["echo", "deterministic"]).await.unwrap();
     assert!(result.success());
 }
 
@@ -149,7 +149,7 @@ async fn test_combined_determinism() {
 /// Run directory iteration twice — output should match and be sorted.
 #[tokio::test]
 async fn test_deterministic_dirs() {
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
@@ -164,8 +164,8 @@ async fn test_deterministic_dirs() {
     // the sandbox's getdents virtualization. Some minimal ls implementations
     // do not support `-f`, so avoid depending on ls option support here.
     let scan = "python3 - <<'PY'\nimport os\nprint('\\n'.join(e.name for e in os.scandir('/etc')))\nPY";
-    let r1 = Sandbox::run(&policy, Some("test"), &["sh", "-c", scan]).await.unwrap();
-    let r2 = Sandbox::run(&policy, Some("test"), &["sh", "-c", scan]).await.unwrap();
+    let r1 = policy.clone().with_name("test").run(&["sh", "-c", scan]).await.unwrap();
+    let r2 = policy.clone().with_name("test").run(&["sh", "-c", scan]).await.unwrap();
     assert!(
         r1.success(),
         "First directory scan failed: {}",
@@ -201,7 +201,7 @@ async fn test_deterministic_dirs() {
 /// Test that hostname virtualizes both uname() and /etc/hostname.
 #[tokio::test]
 async fn test_hostname_virtualization() {
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
@@ -211,13 +211,13 @@ async fn test_hostname_virtualization() {
         .unwrap();
 
     // Verify uname() returns the virtual hostname.
-    let result = Sandbox::run(&policy, Some("mybox"), &["hostname"]).await.unwrap();
+    let result = policy.clone().with_name("mybox").run(&["hostname"]).await.unwrap();
     assert!(result.success(), "hostname command failed");
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     assert_eq!(stdout.trim(), "mybox", "Expected hostname 'mybox', got: {:?}", stdout.trim());
 
     // Verify /etc/hostname also returns the virtual hostname.
-    let result = Sandbox::run(&policy, Some("mybox"), &["cat", "/etc/hostname"]).await.unwrap();
+    let result = policy.clone().with_name("mybox").run(&["cat", "/etc/hostname"]).await.unwrap();
     assert!(result.success(), "cat /etc/hostname failed");
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     assert_eq!(stdout.trim(), "mybox", "Expected /etc/hostname 'mybox', got: {:?}", stdout.trim());

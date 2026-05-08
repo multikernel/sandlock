@@ -1,9 +1,9 @@
-use sandlock_core::policy::Policy;
+use sandlock_core::sandbox::Sandbox;
 use sandlock_core::pipeline::{Stage, Pipeline, Gather};
 use std::time::Duration;
 
-fn base_policy() -> Policy {
-    Policy::builder()
+fn base_policy() -> Sandbox {
+    Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
         .fs_read("/etc").fs_read("/proc").fs_read("/dev")
         .fs_write("/tmp")
@@ -78,7 +78,7 @@ async fn test_disjoint_policies() {
     std::fs::write(&secret, "sensitive data").unwrap();
 
     // Stage 1: can read the temp dir
-    let reader_policy = Policy::builder()
+    let reader_policy = Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
         .fs_read("/etc").fs_read("/proc").fs_read("/dev")
         .fs_read(&tmp)
@@ -172,7 +172,7 @@ async fn test_xoa_data_flow() {
     let planner_policy = base_policy();
 
     // Executor: can read workspace
-    let executor_policy = Policy::builder()
+    let executor_policy = Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
         .fs_read("/etc").fs_read("/proc").fs_read("/dev")
         .fs_read(&tmp)
@@ -244,7 +244,7 @@ async fn test_gather_disjoint_policies() {
     std::fs::write(&secret, "secret data").unwrap();
 
     // Data source: can read the file
-    let data_policy = Policy::builder()
+    let data_policy = Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
         .fs_read("/etc").fs_read("/proc").fs_read("/dev")
         .fs_read(&tmp)

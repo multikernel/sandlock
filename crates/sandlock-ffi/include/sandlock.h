@@ -17,61 +17,53 @@ extern "C" {
 
 /* Opaque handle types */
 typedef void sandlock_builder_t;
-typedef void sandlock_policy_t;
+typedef void sandlock_sandbox_t;
 typedef void sandlock_result_t;
 typedef void sandlock_pipeline_t;
 
 /* ----------------------------------------------------------------
- * Policy Builder
+ * Sandbox Builder
  * ---------------------------------------------------------------- */
 
-sandlock_builder_t *sandlock_policy_builder_new(void);
+sandlock_builder_t *sandlock_sandbox_builder_new(void);
 
 /* Filesystem */
-sandlock_builder_t *sandlock_policy_builder_fs_read(sandlock_builder_t *b, const char *path);
-sandlock_builder_t *sandlock_policy_builder_fs_write(sandlock_builder_t *b, const char *path);
-sandlock_builder_t *sandlock_policy_builder_fs_deny(sandlock_builder_t *b, const char *path);
-sandlock_builder_t *sandlock_policy_builder_workdir(sandlock_builder_t *b, const char *path);
-sandlock_builder_t *sandlock_policy_builder_chroot(sandlock_builder_t *b, const char *path);
+sandlock_builder_t *sandlock_sandbox_builder_fs_read(sandlock_builder_t *b, const char *path);
+sandlock_builder_t *sandlock_sandbox_builder_fs_write(sandlock_builder_t *b, const char *path);
+sandlock_builder_t *sandlock_sandbox_builder_fs_deny(sandlock_builder_t *b, const char *path);
+sandlock_builder_t *sandlock_sandbox_builder_workdir(sandlock_builder_t *b, const char *path);
+sandlock_builder_t *sandlock_sandbox_builder_chroot(sandlock_builder_t *b, const char *path);
 
 /* Resource limits */
-sandlock_builder_t *sandlock_policy_builder_max_memory(sandlock_builder_t *b, uint64_t bytes);
-sandlock_builder_t *sandlock_policy_builder_max_processes(sandlock_builder_t *b, uint32_t n);
-sandlock_builder_t *sandlock_policy_builder_max_cpu(sandlock_builder_t *b, uint8_t pct);
-sandlock_builder_t *sandlock_policy_builder_num_cpus(sandlock_builder_t *b, uint32_t n);
+sandlock_builder_t *sandlock_sandbox_builder_max_memory(sandlock_builder_t *b, uint64_t bytes);
+sandlock_builder_t *sandlock_sandbox_builder_max_processes(sandlock_builder_t *b, uint32_t n);
+sandlock_builder_t *sandlock_sandbox_builder_max_cpu(sandlock_builder_t *b, uint8_t pct);
+sandlock_builder_t *sandlock_sandbox_builder_num_cpus(sandlock_builder_t *b, uint32_t n);
 
 /* Network */
 /* `spec` is `host:port[,port,...]` (IP-restricted) or `:port` / `*:port`
- * (any IP). Validated when the policy is built. */
-sandlock_builder_t *sandlock_policy_builder_net_allow(sandlock_builder_t *b, const char *spec);
-sandlock_builder_t *sandlock_policy_builder_net_bind_port(sandlock_builder_t *b, uint16_t port);
-sandlock_builder_t *sandlock_policy_builder_port_remap(sandlock_builder_t *b, bool v);
-/* UDP socket creation. Denied by default; opt in with v=true. */
-sandlock_builder_t *sandlock_policy_builder_allow_udp(sandlock_builder_t *b, bool v);
-/* Permit ICMP raw sockets only (AF_INET/AF_INET6 + SOCK_RAW + IPPROTO_ICMP[V6]).
- * All other raw socket types remain denied. */
-sandlock_builder_t *sandlock_policy_builder_allow_icmp(sandlock_builder_t *b, bool v);
-
-/* Mode */
-sandlock_builder_t *sandlock_policy_builder_privileged(sandlock_builder_t *b, bool v);
+ * (any IP). Validated when the sandbox is built. */
+sandlock_builder_t *sandlock_sandbox_builder_net_allow(sandlock_builder_t *b, const char *spec);
+sandlock_builder_t *sandlock_sandbox_builder_net_bind_port(sandlock_builder_t *b, uint16_t port);
+sandlock_builder_t *sandlock_sandbox_builder_port_remap(sandlock_builder_t *b, bool v);
+/* Protocol gating (UDP, ICMP) is expressed via net_allow rule schemes
+ * (`udp://`, `icmp://`) — there are no separate boolean setters. */
 
 /* Isolation & determinism */
-sandlock_builder_t *sandlock_policy_builder_isolate_ipc(sandlock_builder_t *b, bool v);
-sandlock_builder_t *sandlock_policy_builder_isolate_signals(sandlock_builder_t *b, bool v);
-sandlock_builder_t *sandlock_policy_builder_random_seed(sandlock_builder_t *b, uint64_t seed);
-sandlock_builder_t *sandlock_policy_builder_clean_env(sandlock_builder_t *b, bool v);
-sandlock_builder_t *sandlock_policy_builder_env_var(sandlock_builder_t *b, const char *key, const char *value);
-sandlock_builder_t *sandlock_policy_builder_no_randomize_memory(sandlock_builder_t *b, bool v);
-sandlock_builder_t *sandlock_policy_builder_no_huge_pages(sandlock_builder_t *b, bool v);
+sandlock_builder_t *sandlock_sandbox_builder_random_seed(sandlock_builder_t *b, uint64_t seed);
+sandlock_builder_t *sandlock_sandbox_builder_clean_env(sandlock_builder_t *b, bool v);
+sandlock_builder_t *sandlock_sandbox_builder_env_var(sandlock_builder_t *b, const char *key, const char *value);
+sandlock_builder_t *sandlock_sandbox_builder_no_randomize_memory(sandlock_builder_t *b, bool v);
+sandlock_builder_t *sandlock_sandbox_builder_no_huge_pages(sandlock_builder_t *b, bool v);
 
 /* Build & free */
 /* On failure, *err is set to -1 and *err_msg (if non-null) is set to a
  * heap-allocated C string with the error description. Caller frees it
  * via sandlock_string_free. Pass NULL for err_msg to discard. */
-sandlock_policy_t *sandlock_policy_build(sandlock_builder_t *b,
-                                         int *err,
-                                         char **err_msg);
-void sandlock_policy_free(sandlock_policy_t *p);
+sandlock_sandbox_t *sandlock_sandbox_build(sandlock_builder_t *b,
+                                           int *err,
+                                           char **err_msg);
+void sandlock_sandbox_free(sandlock_sandbox_t *p);
 /* sandlock_string_free is declared further down — used for any
  * heap-allocated C string the FFI returns to the caller. */
 
@@ -80,11 +72,15 @@ void sandlock_policy_free(sandlock_policy_t *p);
  * ---------------------------------------------------------------- */
 
 /** Run with captured stdout/stderr. Returns result handle (NULL on failure). */
-sandlock_result_t *sandlock_run(const sandlock_policy_t *policy,
+/* name may be NULL to auto-generate as "sandbox-{pid}". */
+sandlock_result_t *sandlock_run(const sandlock_sandbox_t *policy,
+                                const char *name,
                                 const char *const *argv, unsigned int argc);
 
 /** Run with inherited stdio. Returns exit code (-1 on failure). */
-int sandlock_run_interactive(const sandlock_policy_t *policy,
+/* name may be NULL to auto-generate as "sandbox-{pid}". */
+int sandlock_run_interactive(const sandlock_sandbox_t *policy,
+                             const char *name,
                              const char *const *argv, unsigned int argc);
 
 /* ----------------------------------------------------------------
@@ -114,7 +110,7 @@ void sandlock_string_free(char *s);
 sandlock_pipeline_t *sandlock_pipeline_new(void);
 
 void sandlock_pipeline_add_stage(sandlock_pipeline_t *pipe,
-                                 const sandlock_policy_t *policy,
+                                 const sandlock_sandbox_t *policy,
                                  const char *const *argv, unsigned int argc);
 
 /** Run pipeline (consumes pipe). timeout_ms=0 means no timeout. */

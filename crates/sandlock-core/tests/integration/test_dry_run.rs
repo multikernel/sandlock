@@ -1,4 +1,4 @@
-use sandlock_core::{Policy, Sandbox};
+use sandlock_core::{Sandbox};
 use sandlock_core::dry_run::ChangeKind;
 use std::fs;
 use std::path::PathBuf;
@@ -14,7 +14,7 @@ async fn test_dry_run_reports_added_file() {
     let workdir = temp_dir("add");
     fs::write(workdir.join("existing.txt"), "hello").unwrap();
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc").fs_read("/dev")
         .fs_write(&workdir)
@@ -24,7 +24,7 @@ async fn test_dry_run_reports_added_file() {
 
     let new_file = workdir.join("new.txt");
     let cmd = format!("echo created > {}", new_file.display());
-    let result = Sandbox::dry_run(&policy, Some("test"), &["sh", "-c", &cmd]).await;
+    let result = policy.clone().with_name("test").dry_run(&["sh", "-c", &cmd]).await;
     match result {
         Ok(dr) => {
             assert!(dr.run_result.success());
@@ -45,7 +45,7 @@ async fn test_dry_run_reports_modified_file() {
     let workdir = temp_dir("modify");
     fs::write(workdir.join("data.txt"), "original").unwrap();
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc").fs_read("/dev")
         .fs_write(&workdir)
@@ -54,7 +54,7 @@ async fn test_dry_run_reports_modified_file() {
         .unwrap();
 
     let cmd = format!("echo modified > {}/data.txt", workdir.display());
-    let result = Sandbox::dry_run(&policy, Some("test"), &["sh", "-c", &cmd]).await;
+    let result = policy.clone().with_name("test").dry_run(&["sh", "-c", &cmd]).await;
     match result {
         Ok(dr) => {
             assert!(dr.run_result.success());
@@ -76,7 +76,7 @@ async fn test_dry_run_reports_deleted_file() {
     let workdir = temp_dir("delete");
     fs::write(workdir.join("victim.txt"), "delete me").unwrap();
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc").fs_read("/dev")
         .fs_write(&workdir)
@@ -85,7 +85,7 @@ async fn test_dry_run_reports_deleted_file() {
         .unwrap();
 
     let cmd = format!("rm {}/victim.txt", workdir.display());
-    let result = Sandbox::dry_run(&policy, Some("test"), &["sh", "-c", &cmd]).await;
+    let result = policy.clone().with_name("test").dry_run(&["sh", "-c", &cmd]).await;
     match result {
         Ok(dr) => {
             assert!(dr.run_result.success());

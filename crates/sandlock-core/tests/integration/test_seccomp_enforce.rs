@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 
-use sandlock_core::{Policy, Sandbox};
+use sandlock_core::{Sandbox};
 
 /// Helper: base policy with standard FS paths for running commands.
-fn base_policy() -> sandlock_core::PolicyBuilder {
-    Policy::builder()
+fn base_policy() -> sandlock_core::SandboxBuilder {
+    Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
@@ -35,7 +35,7 @@ async fn test_mount_blocked() {
         out.display()
     );
     let policy = base_policy().build().unwrap();
-    let result = Sandbox::run_interactive(&policy, Some("test"), &["sh", "-c", &cmd_str])
+    let result = policy.clone().with_name("test").run_interactive(&["sh", "-c", &cmd_str])
         .await
         .unwrap();
 
@@ -60,7 +60,7 @@ async fn test_ptrace_blocked() {
         out.display()
     );
     let policy = base_policy().build().unwrap();
-    let result = Sandbox::run_interactive(&policy, Some("test"), &["sh", "-c", &cmd_str])
+    let result = policy.clone().with_name("test").run_interactive(&["sh", "-c", &cmd_str])
         .await
         .unwrap();
 
@@ -92,7 +92,7 @@ async fn test_personality_blocked() {
     ), out = out.display());
 
     let policy = base_policy().build().unwrap();
-    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -127,7 +127,7 @@ async fn test_raw_socket_blocked() {
     ), out = out.display());
 
     let policy = base_policy().build().unwrap();
-    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -170,7 +170,7 @@ async fn test_raw_icmp_always_denied() {
         .net_allow("icmp://*")
         .build()
         .unwrap();
-    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -209,7 +209,7 @@ async fn test_icmp_dgram_allowed_with_icmp_rule() {
         .net_allow("icmp://*")
         .build()
         .unwrap();
-    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -252,7 +252,7 @@ async fn test_udp_allowed_when_opted_in() {
         .net_allow("udp://*:*")
         .build()
         .unwrap();
-    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -287,7 +287,7 @@ async fn test_udp_denied_by_default() {
     ), out = out.display());
 
     let policy = base_policy().build().unwrap();
-    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -325,7 +325,7 @@ async fn test_sysv_shmget_denied_by_default() {
     ), out = out.display());
 
     let policy = base_policy().build().unwrap();
-    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -343,7 +343,7 @@ async fn test_sysv_shmget_denied_by_default() {
 }
 
 // ------------------------------------------------------------------
-// 7b. allow_sysv_ipc(true) restores SysV shm.
+// 7b. extra_allow_syscalls(["sysv_ipc"]) restores SysV shm.
 // ------------------------------------------------------------------
 #[tokio::test]
 async fn test_sysv_shmget_allowed_when_opted_in() {
@@ -361,10 +361,10 @@ async fn test_sysv_shmget_allowed_when_opted_in() {
     ), out = out.display());
 
     let policy = base_policy()
-        .allow_sysv_ipc(true)
+        .extra_allow_syscalls(vec!["sysv_ipc".into()])
         .build()
         .unwrap();
-    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -373,7 +373,7 @@ async fn test_sysv_shmget_allowed_when_opted_in() {
     assert_eq!(
         contents.trim(),
         "ALLOWED",
-        "shmget should be permitted under --allow-sysv-ipc; got: {}",
+        "shmget should be permitted under extra_allow_syscalls=[\"sysv_ipc\"]; got: {}",
         contents.trim()
     );
     assert!(result.success());
@@ -401,7 +401,7 @@ async fn test_tcp_always_allowed() {
     let policy = base_policy()
         .build()
         .unwrap();
-    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
 

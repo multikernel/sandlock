@@ -1,8 +1,9 @@
 use clap::{Parser, Subcommand};
-use sandlock_core::{Policy, Sandbox};
-use sandlock_core::policy::ByteSize;
+use sandlock_core::Sandbox;
+use sandlock_core::sandbox::{BranchAction, ByteSize, FsIsolation, SandboxBuilder};
 use sandlock_core::profile;
 use anyhow::{Result, anyhow};
+use std::path::PathBuf;
 use std::time::SystemTime;
 
 mod network_registry;
@@ -17,121 +18,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run a command in a sandbox
-    Run {
-        #[arg(short = 'r', long = "fs-read", value_name = "PATH")]
-        fs_read: Vec<String>,
-        #[arg(short = 'w', long = "fs-write", value_name = "PATH")]
-        fs_write: Vec<String>,
-        #[arg(short = 'm', long = "max-memory")]
-        max_memory: Option<String>,
-        #[arg(short = 'P', long = "max-processes")]
-        max_processes: Option<u32>,
-        #[arg(short = 't', long)]
-        timeout: Option<u64>,
-        /// Outbound endpoint allow rule (TCP, plus UDP when
-        /// `--allow-udp` is set). Repeatable. Each value is
-        /// `host:port[,port,...]` (IP-restricted), `:port` or `*:port`
-        /// (any IP). Examples: `api.openai.com:443`,
-        /// `github.com:22,443`, `:8080`, `1.1.1.1:53`.
-        /// See README "Network Model".
-        #[arg(long = "net-allow", value_name = "SPEC")]
-        net_allow: Vec<String>,
-        #[arg(long = "net-bind")]
-        net_bind: Vec<u16>,
-        #[arg(long)]
-        time_start: Option<String>,
-        #[arg(long)]
-        random_seed: Option<u64>,
-        #[arg(long)]
-        clean_env: bool,
-        #[arg(long)]
-        num_cpus: Option<u32>,
-        #[arg(short = 'p', long)]
-        profile: Option<String>,
-        #[arg(long = "status-fd", value_name = "FD")]
-        status_fd: Option<i32>,
-        #[arg(short = 'c', long = "cpu")]
-        max_cpu: Option<u8>,
-        #[arg(long)]
-        max_open_files: Option<u32>,
-        #[arg(long)]
-        chroot: Option<String>,
-        /// Map to the given UID inside a user namespace (e.g. --uid 0 for fake root)
-        #[arg(long)]
-        uid: Option<u32>,
-        #[arg(long)]
-        workdir: Option<String>,
-        #[arg(long)]
-        cwd: Option<String>,
-        #[arg(long = "fs-isolation", value_name = "MODE")]
-        fs_isolation: Option<String>,
-        #[arg(long = "fs-storage", value_name = "PATH")]
-        fs_storage: Option<String>,
-        #[arg(long = "max-disk")]
-        max_disk: Option<String>,
-        /// Allow SysV IPC syscalls (shared memory, message queues,
-        /// semaphores). Denied by default: sandlock does not use IPC
-        /// namespaces, so without this denial two sandboxes on the
-        /// same host share a SysV keyspace and can rendezvous via a
-        /// well-known key. Enable only when running software that
-        /// requires SysV IPC (e.g. Oracle, Sybase, MPI intra-node).
-        #[arg(long = "allow-sysv-ipc")]
-        allow_sysv_ipc: bool,
-        #[arg(long = "http-allow", value_name = "RULE")]
-        http_allow: Vec<String>,
-        #[arg(long = "http-deny", value_name = "RULE")]
-        http_deny: Vec<String>,
-        /// TCP ports to intercept for HTTP ACL (default: 80, plus 443 with --https-ca)
-        #[arg(long = "http-port", value_name = "PORT")]
-        http_ports: Vec<u16>,
-        /// PEM CA certificate for HTTPS MITM (enables port 443 interception)
-        #[arg(long = "https-ca", value_name = "PATH")]
-        https_ca: Option<String>,
-        /// PEM CA private key for HTTPS MITM (required with --https-ca)
-        #[arg(long = "https-key", value_name = "PATH")]
-        https_key: Option<String>,
-        #[arg(long)]
-        port_remap: bool,
-        #[arg(long)]
-        no_randomize_memory: bool,
-        #[arg(long)]
-        no_huge_pages: bool,
-        #[arg(long)]
-        deterministic_dirs: bool,
-        /// Sandbox name (also exposed as the virtual hostname; auto-generated if omitted)
-        #[arg(long)]
-        name: Option<String>,
-        #[arg(long)]
-        no_coredump: bool,
-        #[arg(long = "env", value_name = "KEY=VALUE")]
-        env_vars: Vec<String>,
-        #[arg(short = 'e', long = "exec-shell", value_name = "CMD")]
-        exec_shell: Option<String>,
-        #[arg(short = 'i', long)]
-        interactive: bool,
-        #[arg(long = "fs-deny", value_name = "PATH")]
-        fs_deny: Vec<String>,
-        /// Mount a host path inside the sandbox (e.g. --fs-mount /work:/host/path)
-        #[arg(long = "fs-mount", value_name = "VIRTUAL:HOST")]
-        fs_mount: Vec<String>,
-        /// CPU cores to pin the sandbox to (e.g. --cpu-cores 0,2,3)
-        #[arg(long = "cpu-cores", value_delimiter = ',')]
-        cpu_cores: Vec<u32>,
-        /// GPU device indices visible to the sandbox (e.g. --gpu 0,2)
-        #[arg(long = "gpu", value_delimiter = ',')]
-        gpu_devices: Vec<u32>,
-        /// Use a local Docker image as chroot rootfs
-        #[arg(long)]
-        image: Option<String>,
-        /// Dry-run: run the command, show filesystem changes, then discard
-        #[arg(long)]
-        dry_run: bool,
-        /// No-supervisor mode: apply Landlock rules + deny-only seccomp filter, then exec directly
-        #[arg(long)]
-        no_supervisor: bool,
-        #[arg(last = true)]
-        cmd: Vec<String>,
-    },
+    Run(RunArgs),
     /// Check kernel feature support
     Check,
     /// List all running sandboxes
@@ -146,6 +33,85 @@ enum Command {
         #[command(subcommand)]
         action: ProfileAction,
     },
+}
+
+/// Arguments for the `run` subcommand.
+///
+/// Sandbox-level flags come from `SandboxBuilder` via `#[clap(flatten)]`.
+/// CLI-only flags (profile, timeout, image, etc.) and non-clap-friendly
+/// sandbox fields (max_memory, fs_mount, env, gpu, cpu-cores) remain here.
+#[derive(clap::Args)]
+struct RunArgs {
+    // ── Sandbox flags (flattened from SandboxBuilder) ───────────────────────
+    #[clap(flatten)]
+    sandbox_builder: SandboxBuilder,
+
+    // ── Sandbox-builder fields that need special parsing (not in SandboxBuilder's clap derive) ──
+    #[arg(short = 'm', long = "max-memory")]
+    max_memory: Option<String>,
+
+    #[arg(long = "max-disk")]
+    max_disk: Option<String>,
+
+    #[arg(long = "fs-isolation", value_name = "MODE")]
+    fs_isolation: Option<String>,
+
+    #[arg(long)]
+    time_start: Option<String>,
+
+    /// Mount a host path inside the sandbox (e.g. --fs-mount /work:/host/path)
+    #[arg(long = "fs-mount", value_name = "VIRTUAL:HOST")]
+    fs_mount: Vec<String>,
+
+    #[arg(long = "env", value_name = "KEY=VALUE")]
+    env_vars: Vec<String>,
+
+    /// CPU cores to pin the sandbox to (e.g. --cpu-cores 0,2,3)
+    #[arg(long = "cpu-cores", value_delimiter = ',')]
+    cpu_cores: Vec<u32>,
+
+    /// GPU device indices visible to the sandbox (e.g. --gpu 0,2)
+    #[arg(long = "gpu", value_delimiter = ',')]
+    gpu_devices: Vec<u32>,
+
+    // ── CLI-only flags ───────────────────────────────────────────────────────
+    #[arg(short = 't', long)]
+    timeout: Option<u64>,
+
+    #[arg(short = 'p', long, conflicts_with = "profile_file")]
+    profile: Option<String>,
+
+    /// Load a profile directly from a file path (TOML format)
+    #[arg(long = "profile-file", value_name = "PATH", conflicts_with = "profile")]
+    profile_file: Option<PathBuf>,
+
+    #[arg(long = "status-fd", value_name = "FD")]
+    status_fd: Option<i32>,
+
+    /// Sandbox name (also exposed as the virtual hostname; auto-generated if omitted)
+    #[arg(long)]
+    name: Option<String>,
+
+    #[arg(short = 'e', long = "exec-shell", value_name = "CMD")]
+    exec_shell: Option<String>,
+
+    #[arg(short = 'i', long)]
+    interactive: bool,
+
+    /// Use a local Docker image as chroot rootfs
+    #[arg(long)]
+    image: Option<String>,
+
+    /// Dry-run: run the command, show filesystem changes, then discard
+    #[arg(long)]
+    dry_run: bool,
+
+    /// No-supervisor mode: apply Landlock rules + deny-only seccomp filter, then exec directly
+    #[arg(long)]
+    no_supervisor: bool,
+
+    #[arg(last = true)]
+    cmd: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -170,319 +136,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Run { fs_read, fs_write, max_memory, max_processes, timeout,
-            net_allow, net_bind, time_start, random_seed,
-            clean_env, num_cpus, profile: profile_name, status_fd,
-            max_cpu, max_open_files, chroot, uid, workdir, cwd,
-            fs_isolation, fs_storage, max_disk, allow_sysv_ipc,
-            http_allow, http_deny, http_ports, https_ca, https_key,
-            port_remap, no_randomize_memory, no_huge_pages, deterministic_dirs, name, no_coredump,
-            env_vars, exec_shell, interactive: _, fs_deny, fs_mount, cpu_cores, gpu_devices, image, dry_run, no_supervisor, cmd } =>
-        {
-            if no_supervisor {
-                validate_no_supervisor(
-                    &max_memory, &max_processes, &max_cpu, &max_open_files,
-                    &timeout, &net_allow, &net_bind,
-                    &http_allow, &http_deny, &http_ports,
-                    &num_cpus, &random_seed, &time_start, no_randomize_memory,
-                    no_huge_pages, deterministic_dirs, &name, &chroot,
-                    &image, &uid, &workdir, &cwd, &fs_isolation, &fs_storage,
-                    &max_disk, port_remap, &cpu_cores, &gpu_devices, dry_run,
-                    &status_fd, &fs_deny, &fs_mount,
-                )?;
-
-                // Build a minimal policy with only fs rules
-                let mut builder = if let Some(ref name) = profile_name {
-                    let base = sandlock_core::profile::load_profile(name)?;
-                    if !base.fs_denied.is_empty() {
-                        return Err(anyhow!(
-                            "--no-supervisor is incompatible with: --fs-deny (from profile {})",
-                            name
-                        ));
-                    }
-                    let mut b = Policy::builder();
-                    for p in &base.fs_readable { b = b.fs_read(p); }
-                    for p in &base.fs_writable { b = b.fs_write(p); }
-                    b = b.allow_sysv_ipc(base.allow_sysv_ipc);
-                    b
-                } else {
-                    Policy::builder()
-                };
-
-                for p in &fs_read { builder = builder.fs_read(p); }
-                for p in &fs_write { builder = builder.fs_write(p); }
-                for p in &fs_deny { builder = builder.fs_deny(p); }
-                if allow_sysv_ipc { builder = builder.allow_sysv_ipc(true); }
-                if clean_env { builder = builder.clean_env(true); }
-                for spec in &env_vars {
-                    if let Some((k, v)) = spec.split_once('=') {
-                        builder = builder.env_var(k, v);
-                    } else {
-                        return Err(anyhow!("--env requires KEY=VALUE, got: {}", spec));
-                    }
-                }
-
-                let policy = builder.build()?;
-
-                if exec_shell.is_none() && cmd.is_empty() {
-                    return Err(anyhow!("no command specified"));
-                }
-
-                let cmd_strs: Vec<&str> = if let Some(ref shell_cmd) = exec_shell {
-                    vec!["/bin/sh", "-c", shell_cmd.as_str()]
-                } else {
-                    cmd.iter().map(|s| s.as_str()).collect()
-                };
-
-                return no_supervisor_exec(&policy, &cmd_strs);
-            }
-
-            // Start from profile or default
-            let mut builder = if let Some(ref name) = profile_name {
-                let base = profile::load_profile(name)?;
-                // Rebuild builder from loaded profile as base
-                let mut b = Policy::builder();
-                for p in &base.fs_readable { b = b.fs_read(p); }
-                for p in &base.fs_writable { b = b.fs_write(p); }
-                for p in &base.fs_denied { b = b.fs_deny(p); }
-                for rule in &base.net_allow {
-                    let host_part = rule.host.as_deref().unwrap_or("*");
-                    let spec = match rule.protocol {
-                        sandlock_core::policy::Protocol::Tcp => {
-                            let ports = format_ports(&rule.ports, rule.all_ports);
-                            format!("tcp://{}:{}", host_part, ports)
-                        }
-                        sandlock_core::policy::Protocol::Udp => {
-                            let ports = format_ports(&rule.ports, rule.all_ports);
-                            format!("udp://{}:{}", host_part, ports)
-                        }
-                        sandlock_core::policy::Protocol::Icmp => {
-                            format!("icmp://{}", host_part)
-                        }
-                    };
-                    b = b.net_allow(spec);
-                }
-                for p in &base.net_bind { b = b.net_bind_port(*p); }
-                for rule in &base.http_allow {
-                    let s = format!("{} {}{}", rule.method, rule.host, rule.path);
-                    b = b.http_allow(&s);
-                }
-                for rule in &base.http_deny {
-                    let s = format!("{} {}{}", rule.method, rule.host, rule.path);
-                    b = b.http_deny(&s);
-                }
-                for port in &base.http_ports {
-                    b = b.http_port(*port);
-                }
-                if let Some(mem) = base.max_memory { b = b.max_memory(mem); }
-                b = b.max_processes(base.max_processes);
-                if let Some(cpu) = base.max_cpu { b = b.max_cpu(cpu); }
-                if let Some(seed) = base.random_seed { b = b.random_seed(seed); }
-                if let Some(n) = base.num_cpus { b = b.num_cpus(n); }
-                b = b.block_syscalls(base.block_syscalls.clone());
-                b = b.allow_sysv_ipc(base.allow_sysv_ipc);
-                b = b.clean_env(base.clean_env);
-                if let Some(ref w) = base.workdir { b = b.workdir(w); }
-                if let Some(ref c) = base.cwd { b = b.cwd(c); }
-                b
-            } else {
-                Policy::builder()
-            };
-
-            // CLI overrides
-            for p in &fs_read { builder = builder.fs_read(p); }
-            for p in &fs_write { builder = builder.fs_write(p); }
-            if let Some(ref m) = max_memory { builder = builder.max_memory(ByteSize::parse(m)?); }
-            if let Some(n) = max_processes { builder = builder.max_processes(n); }
-            for spec in &net_allow { builder = builder.net_allow(spec); }
-            for p in &net_bind { builder = builder.net_bind_port(*p); }
-            if let Some(seed) = random_seed { builder = builder.random_seed(seed); }
-            if clean_env { builder = builder.clean_env(true); }
-            if let Some(n) = num_cpus { builder = builder.num_cpus(n); }
-            if let Some(ref ts) = time_start {
-                let t = parse_time_start(ts)?;
-                builder = builder.time_start(t);
-            }
-            if let Some(cpu) = max_cpu { builder = builder.max_cpu(cpu); }
-            if let Some(n) = max_open_files { builder = builder.max_open_files(n); }
-            for p in &fs_deny { builder = builder.fs_deny(p); }
-            for spec in &fs_mount {
-                let (virt, host) = spec.split_once(':')
-                    .ok_or_else(|| anyhow!("--fs-mount requires VIRTUAL:HOST, got: {}", spec))?;
-                builder = builder.fs_mount(virt, host);
-            }
-            if let Some(ref path) = chroot { builder = builder.chroot(path); }
-            if let Some(id) = uid { builder = builder.uid(id); }
-            if let Some(ref path) = workdir { builder = builder.workdir(path); }
-            if let Some(ref path) = cwd { builder = builder.cwd(path); }
-            if let Some(ref mode) = fs_isolation {
-                use sandlock_core::policy::FsIsolation;
-                let iso = match mode.as_str() {
-                    "none" => FsIsolation::None,
-                    "overlayfs" => FsIsolation::OverlayFs,
-                    "branchfs" => FsIsolation::BranchFs,
-                    other => return Err(anyhow!("unknown --fs-isolation mode: {}", other)),
-                };
-                builder = builder.fs_isolation(iso);
-            }
-            if let Some(ref path) = fs_storage { builder = builder.fs_storage(path); }
-            if let Some(ref s) = max_disk { builder = builder.max_disk(ByteSize::parse(s)?); }
-            // UDP, the kernel ping socket (SOCK_DGRAM + IPPROTO_ICMP),
-            // and raw ICMP are all gated by `--net-allow` rule presence
-            // (`udp://...`, `icmp://...`, `icmp-raw://*` respectively).
-            if allow_sysv_ipc { builder = builder.allow_sysv_ipc(true); }
-            for rule in &http_allow { builder = builder.http_allow(rule); }
-            for rule in &http_deny { builder = builder.http_deny(rule); }
-            for port in &http_ports { builder = builder.http_port(*port); }
-            if let Some(ref ca) = https_ca { builder = builder.https_ca(ca); }
-            if let Some(ref key) = https_key { builder = builder.https_key(key); }
-            if port_remap { builder = builder.port_remap(true); }
-            if !cpu_cores.is_empty() { builder = builder.cpu_cores(cpu_cores); }
-            if !gpu_devices.is_empty() { builder = builder.gpu_devices(gpu_devices); }
-            if no_randomize_memory { builder = builder.no_randomize_memory(true); }
-            if no_huge_pages { builder = builder.no_huge_pages(true); }
-            if deterministic_dirs { builder = builder.deterministic_dirs(true); }
-            let sandbox_name = name.clone().unwrap_or_else(|| network_registry::next_name());
-            if no_coredump { builder = builder.no_coredump(true); }
-            for spec in &env_vars {
-                if let Some((k, v)) = spec.split_once('=') {
-                    builder = builder.env_var(k, v);
-                } else {
-                    return Err(anyhow!("--env requires KEY=VALUE, got: {}", spec));
-                }
-            }
-
-            // Handle --image: extract rootfs, set chroot, get default cmd
-            let image_cmd: Option<Vec<String>>;
-            if let Some(ref img) = image {
-                let rootfs = sandlock_core::image::extract(img, None)?;
-                builder = builder.chroot(rootfs);
-                // Add standard paths inside the chroot
-                builder = builder.fs_read("/usr").fs_read("/lib").fs_read("/lib64")
-                    .fs_read("/bin").fs_read("/sbin").fs_read("/etc")
-                    .fs_read("/proc").fs_read("/dev");
-                if cmd.is_empty() {
-                    image_cmd = Some(sandlock_core::image::inspect_cmd(img)?);
-                } else {
-                    image_cmd = None;
-                }
-            } else {
-                image_cmd = None;
-            }
-
-            if exec_shell.is_none() && cmd.is_empty() && image_cmd.is_none() {
-                return Err(anyhow!("no command specified"));
-            }
-
-            let policy = builder.build()?;
-            let cmd_strs: Vec<&str> = if let Some(ref shell_cmd) = exec_shell {
-                vec!["/bin/sh", "-c", shell_cmd.as_str()]
-            } else if let Some(ref ic) = image_cmd {
-                ic.iter().map(|s| s.as_str()).collect()
-            } else {
-                cmd.iter().map(|s| s.as_str()).collect()
-            };
-
-            let result = if dry_run {
-                if policy.workdir.is_none() {
-                    return Err(anyhow!("--dry-run requires --workdir"));
-                }
-                let dr = if let Some(secs) = timeout {
-                    tokio::time::timeout(
-                        std::time::Duration::from_secs(secs),
-                        Sandbox::dry_run_interactive(&policy, Some(sandbox_name.as_str()), &cmd_strs)
-                    ).await.unwrap_or_else(|_| {
-                        eprintln!("sandlock: timeout after {}s", secs);
-                        std::process::exit(124);
-                    })?
-                } else {
-                    Sandbox::dry_run_interactive(&policy, Some(sandbox_name.as_str()), &cmd_strs).await?
-                };
-
-                if dr.changes.is_empty() {
-                    eprintln!("sandlock: dry-run: no filesystem changes");
-                } else {
-                    eprintln!("sandlock: dry-run: filesystem changes:");
-                    for change in &dr.changes {
-                        eprintln!("{}", change);
-                    }
-                }
-                dr.run_result
-            } else if policy.port_remap {
-                // Use spawn+wait so we can register/unregister network state.
-                let mut sb = Sandbox::new(&policy, Some(sandbox_name.as_str()))?;
-
-                // Set up callback to update registry on each port bind.
-                let reg_name = sandbox_name.clone();
-                sb.set_on_bind(move |ports| {
-                    let _ = network_registry::update_ports(&reg_name, ports.clone());
-                });
-
-                sb.spawn(&cmd_strs).await?;
-
-                let pid = sb.pid().unwrap_or(0);
-                let registered_hosts: Vec<String> = policy
-                    .net_allow
-                    .iter()
-                    .filter_map(|r| r.host.clone())
-                    .collect();
-                if let Err(e) = network_registry::register(
-                    &sandbox_name, pid, std::collections::HashMap::new(),
-                    registered_hosts,
-                    None, // virtual_etc_hosts populated by core at runtime
-                ) {
-                    eprintln!("sandlock: network registry: {}", e);
-                }
-
-                let result = if let Some(secs) = timeout {
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(secs),
-                        sb.wait()
-                    ).await {
-                        Ok(r) => r?,
-                        Err(_) => {
-                            let _ = network_registry::unregister(&sandbox_name);
-                            eprintln!("sandlock: timeout after {}s", secs);
-                            std::process::exit(124);
-                        }
-                    }
-                } else {
-                    sb.wait().await?
-                };
-                let _ = network_registry::unregister(&sandbox_name);
-                result
-            } else if let Some(secs) = timeout {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(secs),
-                    Sandbox::run_interactive(&policy, Some(sandbox_name.as_str()), &cmd_strs)
-                ).await.unwrap_or_else(|_| {
-                    eprintln!("sandlock: timeout after {}s", secs);
-                    std::process::exit(124);
-                })?
-            } else {
-                Sandbox::run_interactive(&policy, Some(sandbox_name.as_str()), &cmd_strs).await?
-            };
-
-            if let Some(fd) = status_fd {
-                use std::io::Write as _;
-                use std::os::unix::io::FromRawFd;
-                use sandlock_core::ExitStatus as SandlockExitStatus;
-                let (code, signal) = match &result.exit_status {
-                    SandlockExitStatus::Code(c) => (*c, None),
-                    SandlockExitStatus::Signal(s) => (-1, Some(*s)),
-                    SandlockExitStatus::Killed => (-1, None),
-                    SandlockExitStatus::Timeout => (-1, None),
-                };
-                let status = SandboxStatus { exit_code: code, signal };
-                if let Ok(json) = serde_json::to_string(&status) {
-                    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-                    let _ = writeln!(file, "{}", json);
-                    std::mem::forget(file); // Don't close the fd
-                }
-            }
-
-            std::process::exit(result.code().unwrap_or(1));
-        }
+        Command::Run(args) => run_command(args).await?,
 
         Command::List => {
             match network_registry::list() {
@@ -589,76 +243,445 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Implementation of `sandlock run`.
+async fn run_command(args: RunArgs) -> Result<()> {
+    let pb = &args.sandbox_builder;
+
+    if args.no_supervisor {
+        validate_no_supervisor(&args)?;
+
+        // Load profile once (if any) and split into policy base + program spec.
+        let (ns_profile_base, ns_profile_spec) = if let Some(ref name) = args.profile {
+            let (base, spec) = sandlock_core::profile::load_profile(name)?;
+            (Some(base), Some(spec))
+        } else if let Some(ref path) = args.profile_file {
+            let content = std::fs::read_to_string(path)
+                .map_err(|e| anyhow!("failed to read profile file {}: {}", path.display(), e))?;
+            let (base, spec) = sandlock_core::profile::parse_profile(&content)?;
+            (Some(base), Some(spec))
+        } else {
+            (None, None)
+        };
+
+        // Build a minimal policy with only fs rules
+        let mut builder = if let Some(ref base) = ns_profile_base {
+            validate_no_supervisor_profile(base, &profile_source(&args))?;
+            let mut b = Sandbox::builder();
+            for p in &base.fs_readable { b = b.fs_read(p); }
+            for p in &base.fs_writable { b = b.fs_write(p); }
+            if !base.extra_allow_syscalls.is_empty() {
+                b = b.extra_allow_syscalls(base.extra_allow_syscalls.clone());
+            }
+            if !base.extra_deny_syscalls.is_empty() {
+                b = b.extra_deny_syscalls(base.extra_deny_syscalls.clone());
+            }
+            b = b.clean_env(base.clean_env);
+            for (k, v) in &base.env { b = b.env_var(k, v); }
+            b
+        } else {
+            Sandbox::builder()
+        };
+
+        // Derive the effective command: profile's [program] section supplies the
+        // default; a trailing positional command on the CLI overrides it.
+        let effective_cmd: Vec<String> = if !args.cmd.is_empty() || args.exec_shell.is_some() {
+            args.cmd.clone()
+        } else if let Some(spec) = ns_profile_spec {
+            if let Some(exec) = spec.exec {
+                let exec_str = exec.into_os_string().into_string()
+                    .map_err(|_| anyhow!("non-UTF-8 exec path in profile"))?;
+                let mut v = vec![exec_str];
+                v.extend(spec.args);
+                v
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        // Apply CLI fs/syscall/env flags on top of the profile base.
+        for p in &pb.fs_readable { builder = builder.fs_read(p); }
+        for p in &pb.fs_writable { builder = builder.fs_write(p); }
+        for p in &pb.fs_denied { builder = builder.fs_deny(p); }
+        if !pb.extra_allow_syscalls.is_empty() { builder = builder.extra_allow_syscalls(pb.extra_allow_syscalls.clone()); }
+        if !pb.extra_deny_syscalls.is_empty() { builder = builder.extra_deny_syscalls(pb.extra_deny_syscalls.clone()); }
+        if pb.clean_env { builder = builder.clean_env(true); }
+        for spec in &args.env_vars {
+            if let Some((k, v)) = spec.split_once('=') {
+                builder = builder.env_var(k, v);
+            } else {
+                return Err(anyhow!("--env requires KEY=VALUE, got: {}", spec));
+            }
+        }
+
+        let policy = builder.build()?;
+
+        if args.exec_shell.is_none() && effective_cmd.is_empty() {
+            return Err(anyhow!("no command specified (no trailing command and no [program].exec in profile)"));
+        }
+
+        let cmd_strs: Vec<&str> = if let Some(ref shell_cmd) = args.exec_shell {
+            vec!["/bin/sh", "-c", shell_cmd.as_str()]
+        } else {
+            effective_cmd.iter().map(|s| s.as_str()).collect()
+        };
+
+        return no_supervisor_exec(&policy, &cmd_strs);
+    }
+
+    // Hoist the profile load so we don't read+parse twice.
+    let (base_from_profile, profile_program_spec) = if let Some(ref name) = args.profile {
+        let (base, spec) = profile::load_profile(name)?;
+        (Some(base), Some(spec))
+    } else if let Some(ref path) = args.profile_file {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| anyhow!("failed to read profile file {}: {}", path.display(), e))?;
+        let (base, spec) = profile::parse_profile(&content)?;
+        (Some(base), Some(spec))
+    } else {
+        (None, None)
+    };
+
+    // Start from profile or default
+    let mut builder = if let Some(base) = base_from_profile {
+        // Rebuild builder from loaded profile as base
+        let mut b = Sandbox::builder();
+        for p in &base.fs_readable { b = b.fs_read(p); }
+        for p in &base.fs_writable { b = b.fs_write(p); }
+        for p in &base.fs_denied { b = b.fs_deny(p); }
+        for rule in &base.net_allow {
+            let host_part = rule.host.as_deref().unwrap_or("*");
+            let spec = match rule.protocol {
+                sandlock_core::sandbox::Protocol::Tcp => {
+                    let ports = format_ports(&rule.ports, rule.all_ports);
+                    format!("tcp://{}:{}", host_part, ports)
+                }
+                sandlock_core::sandbox::Protocol::Udp => {
+                    let ports = format_ports(&rule.ports, rule.all_ports);
+                    format!("udp://{}:{}", host_part, ports)
+                }
+                sandlock_core::sandbox::Protocol::Icmp => {
+                    format!("icmp://{}", host_part)
+                }
+            };
+            b = b.net_allow(spec);
+        }
+        for p in &base.net_bind { b = b.net_bind_port(*p); }
+        for rule in &base.http_allow {
+            let s = format!("{} {}{}", rule.method, rule.host, rule.path);
+            b = b.http_allow(&s);
+        }
+        for rule in &base.http_deny {
+            let s = format!("{} {}{}", rule.method, rule.host, rule.path);
+            b = b.http_deny(&s);
+        }
+        for port in &base.http_ports {
+            b = b.http_port(*port);
+        }
+        if let Some(mem) = base.max_memory { b = b.max_memory(mem); }
+        b = b.max_processes(base.max_processes);
+        if let Some(cpu) = base.max_cpu { b = b.max_cpu(cpu); }
+        if let Some(seed) = base.random_seed { b = b.random_seed(seed); }
+        if let Some(n) = base.num_cpus { b = b.num_cpus(n); }
+        if let Some(n) = base.max_open_files { b = b.max_open_files(n); }
+        if let Some(disk) = base.max_disk { b = b.max_disk(disk); }
+        if !base.extra_deny_syscalls.is_empty() { b = b.extra_deny_syscalls(base.extra_deny_syscalls.clone()); }
+        if !base.extra_allow_syscalls.is_empty() { b = b.extra_allow_syscalls(base.extra_allow_syscalls.clone()); }
+        b = b.clean_env(base.clean_env);
+        for (k, v) in &base.env { b = b.env_var(k, v); }
+        if let Some(ref w) = base.workdir { b = b.workdir(w); }
+        if let Some(ref c) = base.cwd { b = b.cwd(c); }
+        // HTTP MITM material
+        if let Some(ref ca) = base.http_ca { b = b.http_ca(ca); }
+        if let Some(ref key) = base.http_key { b = b.http_key(key); }
+        // Filesystem extras
+        if let Some(ref path) = base.chroot { b = b.chroot(path); }
+        if let Some(ref path) = base.fs_storage { b = b.fs_storage(path); }
+        if base.fs_isolation != sandlock_core::sandbox::FsIsolation::None {
+            b = b.fs_isolation(base.fs_isolation.clone());
+        }
+        for (virt, host) in &base.fs_mount { b = b.fs_mount(virt, host); }
+        b = b.on_exit(base.on_exit.clone());
+        b = b.on_error(base.on_error.clone());
+        b = b.deterministic_dirs(base.deterministic_dirs);
+        // Determinism / process knobs
+        b = b.no_randomize_memory(base.no_randomize_memory);
+        b = b.no_huge_pages(base.no_huge_pages);
+        b = b.no_coredump(base.no_coredump);
+        if let Some(t) = base.time_start { b = b.time_start(t); }
+        // Network virtualization
+        b = b.port_remap(base.port_remap);
+        // Process identity
+        if let Some(uid) = base.uid { b = b.uid(uid); }
+        // Hardware constraints
+        if let Some(ref devs) = base.gpu_devices { b = b.gpu_devices(devs.clone()); }
+        if let Some(ref cores) = base.cpu_cores { b = b.cpu_cores(cores.clone()); }
+        b
+    } else {
+        Sandbox::builder()
+    };
+
+    // CLI overrides — fields from flattened SandboxBuilder
+    for p in &pb.fs_readable { builder = builder.fs_read(p); }
+    for p in &pb.fs_writable { builder = builder.fs_write(p); }
+    if let Some(n) = pb.max_processes { builder = builder.max_processes(n); }
+    for spec in &pb.net_allow { builder = builder.net_allow(spec); }
+    for p in &pb.net_bind { builder = builder.net_bind_port(*p); }
+    if let Some(seed) = pb.random_seed { builder = builder.random_seed(seed); }
+    if pb.clean_env { builder = builder.clean_env(true); }
+    if let Some(n) = pb.num_cpus { builder = builder.num_cpus(n); }
+    if let Some(cpu) = pb.max_cpu { builder = builder.max_cpu(cpu); }
+    if let Some(n) = pb.max_open_files { builder = builder.max_open_files(n); }
+    for p in &pb.fs_denied { builder = builder.fs_deny(p); }
+    if let Some(ref path) = pb.chroot { builder = builder.chroot(path); }
+    if let Some(id) = pb.uid { builder = builder.uid(id); }
+    if let Some(ref path) = pb.workdir { builder = builder.workdir(path); }
+    if let Some(ref path) = pb.cwd { builder = builder.cwd(path); }
+    if let Some(ref path) = pb.fs_storage { builder = builder.fs_storage(path); }
+    if !pb.extra_allow_syscalls.is_empty() { builder = builder.extra_allow_syscalls(pb.extra_allow_syscalls.clone()); }
+    if !pb.extra_deny_syscalls.is_empty() { builder = builder.extra_deny_syscalls(pb.extra_deny_syscalls.clone()); }
+    for rule in &pb.http_allow { builder = builder.http_allow(rule); }
+    for rule in &pb.http_deny { builder = builder.http_deny(rule); }
+    for port in &pb.http_ports { builder = builder.http_port(*port); }
+    if let Some(ref ca) = pb.http_ca { builder = builder.http_ca(ca); }
+    if let Some(ref key) = pb.http_key { builder = builder.http_key(key); }
+    if pb.port_remap { builder = builder.port_remap(true); }
+    if pb.no_randomize_memory { builder = builder.no_randomize_memory(true); }
+    if pb.no_huge_pages { builder = builder.no_huge_pages(true); }
+    if pb.deterministic_dirs { builder = builder.deterministic_dirs(true); }
+    if pb.no_coredump { builder = builder.no_coredump(true); }
+
+    // CLI overrides — non-clap-friendly fields (still parsed here)
+    if let Some(ref m) = args.max_memory { builder = builder.max_memory(ByteSize::parse(m)?); }
+    if let Some(ref ts) = args.time_start {
+        let t = parse_time_start(ts)?;
+        builder = builder.time_start(t);
+    }
+    if let Some(ref mode) = args.fs_isolation {
+        use sandlock_core::sandbox::FsIsolation;
+        let iso = match mode.as_str() {
+            "none" => FsIsolation::None,
+            "overlayfs" => FsIsolation::OverlayFs,
+            "branchfs" => FsIsolation::BranchFs,
+            other => return Err(anyhow!("unknown --fs-isolation mode: {}", other)),
+        };
+        builder = builder.fs_isolation(iso);
+    }
+    if let Some(ref s) = args.max_disk { builder = builder.max_disk(ByteSize::parse(s)?); }
+    for spec in &args.fs_mount {
+        let (virt, host) = spec.split_once(':')
+            .ok_or_else(|| anyhow!("--fs-mount requires VIRTUAL:HOST, got: {}", spec))?;
+        builder = builder.fs_mount(virt, host);
+    }
+    if !args.cpu_cores.is_empty() { builder = builder.cpu_cores(args.cpu_cores.clone()); }
+    if !args.gpu_devices.is_empty() { builder = builder.gpu_devices(args.gpu_devices.clone()); }
+    for spec in &args.env_vars {
+        if let Some((k, v)) = spec.split_once('=') {
+            builder = builder.env_var(k, v);
+        } else {
+            return Err(anyhow!("--env requires KEY=VALUE, got: {}", spec));
+        }
+    }
+
+    let sandbox_name = args.name.clone().unwrap_or_else(|| network_registry::next_name());
+
+    // Handle --image: extract rootfs, set chroot, get default cmd
+    let image_cmd: Option<Vec<String>>;
+    if let Some(ref img) = args.image {
+        let rootfs = sandlock_core::image::extract(img, None)?;
+        builder = builder.chroot(rootfs);
+        // Add standard paths inside the chroot
+        builder = builder.fs_read("/usr").fs_read("/lib").fs_read("/lib64")
+            .fs_read("/bin").fs_read("/sbin").fs_read("/etc")
+            .fs_read("/proc").fs_read("/dev");
+        if args.cmd.is_empty() {
+            image_cmd = Some(sandlock_core::image::inspect_cmd(img)?);
+        } else {
+            image_cmd = None;
+        }
+    } else {
+        image_cmd = None;
+    }
+
+    // Derive the effective command: profile's [program] section supplies a
+    // default; a trailing positional command on the CLI overrides it.
+    let profile_cmd: Option<Vec<String>> = if args.cmd.is_empty() && args.exec_shell.is_none() && image_cmd.is_none() {
+        if let Some(spec) = profile_program_spec {
+            if let Some(exec) = spec.exec {
+                let exec_str = exec.into_os_string().into_string()
+                    .map_err(|_| anyhow!("non-UTF-8 exec path in profile"))?;
+                let mut v = vec![exec_str];
+                v.extend(spec.args);
+                Some(v)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if args.exec_shell.is_none() && args.cmd.is_empty() && image_cmd.is_none() && profile_cmd.is_none() {
+        return Err(anyhow!("no command specified (no trailing command and no [program].exec in profile)"));
+    }
+
+    let policy = builder.build()?;
+    let cmd_strs: Vec<&str> = if let Some(ref shell_cmd) = args.exec_shell {
+        vec!["/bin/sh", "-c", shell_cmd.as_str()]
+    } else if let Some(ref ic) = image_cmd {
+        ic.iter().map(|s| s.as_str()).collect()
+    } else if !args.cmd.is_empty() {
+        args.cmd.iter().map(|s| s.as_str()).collect()
+    } else if let Some(ref pc) = profile_cmd {
+        pc.iter().map(|s| s.as_str()).collect()
+    } else {
+        // Unreachable: the check above would have returned an error.
+        unreachable!("no command source available")
+    };
+
+    // Bake the instance name into the sandbox so all lifecycle methods use it.
+    let mut policy = policy.with_name(sandbox_name.clone());
+
+    let result = if args.dry_run {
+        if policy.workdir.is_none() {
+            return Err(anyhow!("--dry-run requires --workdir"));
+        }
+        let dr = if let Some(secs) = args.timeout {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(secs),
+                policy.dry_run_interactive(&cmd_strs)
+            ).await.unwrap_or_else(|_| {
+                eprintln!("sandlock: timeout after {}s", secs);
+                std::process::exit(124);
+            })?
+        } else {
+            policy.dry_run_interactive(&cmd_strs).await?
+        };
+
+        if dr.changes.is_empty() {
+            eprintln!("sandlock: dry-run: no filesystem changes");
+        } else {
+            eprintln!("sandlock: dry-run: filesystem changes:");
+            for change in &dr.changes {
+                eprintln!("{}", change);
+            }
+        }
+        dr.run_result
+    } else if policy.port_remap {
+        // Use spawn+wait so we can register/unregister network state.
+
+        // Set up callback to update registry on each port bind.
+        let reg_name = sandbox_name.clone();
+        policy.set_on_bind(move |ports| {
+            let _ = network_registry::update_ports(&reg_name, ports.clone());
+        });
+
+        policy.spawn(&cmd_strs).await?;
+
+        let pid = policy.pid().unwrap_or(0);
+        let registered_hosts: Vec<String> = policy
+            .net_allow
+            .iter()
+            .filter_map(|r| r.host.clone())
+            .collect();
+        if let Err(e) = network_registry::register(
+            &sandbox_name, pid, std::collections::HashMap::new(),
+            registered_hosts,
+            None, // virtual_etc_hosts populated by core at runtime
+        ) {
+            eprintln!("sandlock: network registry: {}", e);
+        }
+
+        let result = if let Some(secs) = args.timeout {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(secs),
+                policy.wait()
+            ).await {
+                Ok(r) => r?,
+                Err(_) => {
+                    let _ = network_registry::unregister(&sandbox_name);
+                    eprintln!("sandlock: timeout after {}s", secs);
+                    std::process::exit(124);
+                }
+            }
+        } else {
+            policy.wait().await?
+        };
+        let _ = network_registry::unregister(&sandbox_name);
+        result
+    } else if let Some(secs) = args.timeout {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(secs),
+            policy.run_interactive(&cmd_strs)
+        ).await.unwrap_or_else(|_| {
+            eprintln!("sandlock: timeout after {}s", secs);
+            std::process::exit(124);
+        })?
+    } else {
+        policy.run_interactive(&cmd_strs).await?
+    };
+
+    if let Some(fd) = args.status_fd {
+        use std::io::Write as _;
+        use std::os::unix::io::FromRawFd;
+        use sandlock_core::ExitStatus as SandlockExitStatus;
+        let (code, signal) = match &result.exit_status {
+            SandlockExitStatus::Code(c) => (*c, None),
+            SandlockExitStatus::Signal(s) => (-1, Some(*s)),
+            SandlockExitStatus::Killed => (-1, None),
+            SandlockExitStatus::Timeout => (-1, None),
+        };
+        let status = SandboxStatus { exit_code: code, signal };
+        if let Ok(json) = serde_json::to_string(&status) {
+            let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+            let _ = writeln!(file, "{}", json);
+            std::mem::forget(file); // Don't close the fd
+        }
+    }
+
+    std::process::exit(result.code().unwrap_or(1));
+}
+
 /// Validate that no flags incompatible with --no-supervisor are set.
-#[allow(clippy::too_many_arguments)]
-fn validate_no_supervisor(
-    max_memory: &Option<String>,
-    max_processes: &Option<u32>,
-    max_cpu: &Option<u8>,
-    max_open_files: &Option<u32>,
-    timeout: &Option<u64>,
-    net_allow: &[String],
-    net_bind: &[u16],
-    http_allow: &[String],
-    http_deny: &[String],
-    http_ports: &[u16],
-    num_cpus: &Option<u32>,
-    random_seed: &Option<u64>,
-    time_start: &Option<String>,
-    no_randomize_memory: bool,
-    no_huge_pages: bool,
-    deterministic_dirs: bool,
-    name: &Option<String>,
-    chroot: &Option<String>,
-    image: &Option<String>,
-    uid: &Option<u32>,
-    workdir: &Option<String>,
-    cwd: &Option<String>,
-    fs_isolation: &Option<String>,
-    fs_storage: &Option<String>,
-    max_disk: &Option<String>,
-    port_remap: bool,
-    cpu_cores: &[u32],
-    gpu_devices: &[u32],
-    dry_run: bool,
-    status_fd: &Option<i32>,
-    fs_deny: &[String],
-    fs_mount: &[String],
-) -> Result<()> {
+fn validate_no_supervisor(args: &RunArgs) -> Result<()> {
+    let pb = &args.sandbox_builder;
     let mut bad = Vec::new();
 
-    if max_memory.is_some() { bad.push("--max-memory"); }
-    if max_processes.is_some() { bad.push("--max-processes"); }
-    if max_cpu.is_some() { bad.push("--max-cpu"); }
-    if max_open_files.is_some() { bad.push("--max-open-files"); }
-    if timeout.is_some() { bad.push("--timeout"); }
-    if !net_allow.is_empty() { bad.push("--net-allow"); }
-    if !net_bind.is_empty() { bad.push("--net-bind"); }
-    if !http_allow.is_empty() { bad.push("--http-allow"); }
-    if !http_deny.is_empty() { bad.push("--http-deny"); }
-    if !http_ports.is_empty() { bad.push("--http-port"); }
-    if num_cpus.is_some() { bad.push("--num-cpus"); }
-    if random_seed.is_some() { bad.push("--random-seed"); }
-    if time_start.is_some() { bad.push("--time-start"); }
-    if no_randomize_memory { bad.push("--no-randomize-memory"); }
-    if no_huge_pages { bad.push("--no-huge-pages"); }
-    if deterministic_dirs { bad.push("--deterministic-dirs"); }
-    if name.is_some() { bad.push("--name"); }
-    if chroot.is_some() { bad.push("--chroot"); }
-    if image.is_some() { bad.push("--image"); }
-    if uid.is_some() { bad.push("--uid"); }
-    if workdir.is_some() { bad.push("--workdir"); }
-    if cwd.is_some() { bad.push("--cwd"); }
-    if fs_isolation.is_some() { bad.push("--fs-isolation"); }
-    if fs_storage.is_some() { bad.push("--fs-storage"); }
-    if max_disk.is_some() { bad.push("--max-disk"); }
-    if port_remap { bad.push("--port-remap"); }
-    if !cpu_cores.is_empty() { bad.push("--cpu-cores"); }
-    if !gpu_devices.is_empty() { bad.push("--gpu"); }
-    if dry_run { bad.push("--dry-run"); }
-    if status_fd.is_some() { bad.push("--status-fd"); }
-    if !fs_deny.is_empty() { bad.push("--fs-deny"); }
-    if !fs_mount.is_empty() { bad.push("--fs-mount"); }
+    if args.max_memory.is_some() { bad.push("--max-memory"); }
+    if pb.max_processes.is_some() { bad.push("--max-processes"); }
+    if pb.max_cpu.is_some() { bad.push("--max-cpu"); }
+    if pb.max_open_files.is_some() { bad.push("--max-open-files"); }
+    if args.timeout.is_some() { bad.push("--timeout"); }
+    if !pb.net_allow.is_empty() { bad.push("--net-allow"); }
+    if !pb.net_bind.is_empty() { bad.push("--net-bind"); }
+    if !pb.http_allow.is_empty() { bad.push("--http-allow"); }
+    if !pb.http_deny.is_empty() { bad.push("--http-deny"); }
+    if !pb.http_ports.is_empty() { bad.push("--http-port"); }
+    if pb.num_cpus.is_some() { bad.push("--num-cpus"); }
+    if pb.random_seed.is_some() { bad.push("--random-seed"); }
+    if args.time_start.is_some() { bad.push("--time-start"); }
+    if pb.no_randomize_memory { bad.push("--no-randomize-memory"); }
+    if pb.no_huge_pages { bad.push("--no-huge-pages"); }
+    if pb.deterministic_dirs { bad.push("--deterministic-dirs"); }
+    if args.name.is_some() { bad.push("--name"); }
+    if pb.chroot.is_some() { bad.push("--chroot"); }
+    if args.image.is_some() { bad.push("--image"); }
+    if pb.uid.is_some() { bad.push("--uid"); }
+    if pb.workdir.is_some() { bad.push("--workdir"); }
+    if pb.cwd.is_some() { bad.push("--cwd"); }
+    if args.fs_isolation.is_some() { bad.push("--fs-isolation"); }
+    if pb.fs_storage.is_some() { bad.push("--fs-storage"); }
+    if args.max_disk.is_some() { bad.push("--max-disk"); }
+    if pb.port_remap { bad.push("--port-remap"); }
+    if !args.cpu_cores.is_empty() { bad.push("--cpu-cores"); }
+    if !args.gpu_devices.is_empty() { bad.push("--gpu"); }
+    if args.dry_run { bad.push("--dry-run"); }
+    if args.status_fd.is_some() { bad.push("--status-fd"); }
+    if !pb.fs_denied.is_empty() { bad.push("--fs-deny"); }
+    if !args.fs_mount.is_empty() { bad.push("--fs-mount"); }
 
     if !bad.is_empty() {
         return Err(anyhow!(
@@ -670,9 +693,73 @@ fn validate_no_supervisor(
     Ok(())
 }
 
+fn profile_source(args: &RunArgs) -> String {
+    args.profile.as_deref()
+        .map(|n| format!("profile {n}"))
+        .unwrap_or_else(|| {
+            let path = args.profile_file
+                .as_ref()
+                .expect("profile_source called without a loaded profile");
+            format!("profile file {}", path.display())
+        })
+}
+
+/// Validate profile fields against the smaller no-supervisor execution model.
+///
+/// No-supervisor mode only applies Landlock filesystem allow rules, the
+/// deny-only seccomp blocklist, and environment changes before exec. Reject
+/// profile fields that require the supervisor or other setup paths so profile
+/// users do not get a silently weakened sandbox.
+fn validate_no_supervisor_profile(profile: &Sandbox, source: &str) -> Result<()> {
+    let mut bad = Vec::new();
+
+    if !profile.fs_denied.is_empty() { bad.push("[filesystem].deny"); }
+    if !profile.net_allow.is_empty() { bad.push("[network].allow"); }
+    if !profile.net_bind.is_empty() { bad.push("[network].bind"); }
+    if profile.port_remap { bad.push("[network].port_remap"); }
+    if !profile.http_allow.is_empty() { bad.push("[http].allow"); }
+    if !profile.http_deny.is_empty() { bad.push("[http].deny"); }
+    if !profile.http_ports.is_empty() { bad.push("[http].ports"); }
+    if profile.http_ca.is_some() { bad.push("[config].http_ca"); }
+    if profile.http_key.is_some() { bad.push("[config].http_key"); }
+    if profile.max_memory.is_some() { bad.push("[limits].memory"); }
+    if profile.max_processes != 64 { bad.push("[limits].processes"); }
+    if profile.max_open_files.is_some() { bad.push("[limits].open_files"); }
+    if profile.max_cpu.is_some() { bad.push("[limits].cpu"); }
+    if profile.max_disk.is_some() { bad.push("[limits].disk"); }
+    if profile.gpu_devices.is_some() { bad.push("[limits].gpu_devices"); }
+    if profile.cpu_cores.is_some() { bad.push("[limits].cpu_cores"); }
+    if profile.num_cpus.is_some() { bad.push("[limits].num_cpus"); }
+    if profile.random_seed.is_some() { bad.push("[determinism].random_seed"); }
+    if profile.time_start.is_some() { bad.push("[determinism].time_start"); }
+    if profile.deterministic_dirs { bad.push("[determinism].deterministic_dirs"); }
+    if profile.no_randomize_memory { bad.push("[determinism].no_randomize_memory"); }
+    if profile.no_huge_pages { bad.push("[program].no_huge_pages"); }
+    if profile.no_coredump { bad.push("[program].no_coredump"); }
+    if profile.fs_isolation != FsIsolation::None { bad.push("[filesystem].isolation"); }
+    if profile.workdir.is_some() { bad.push("[config].workdir"); }
+    if profile.fs_storage.is_some() { bad.push("[config].fs_storage"); }
+    if profile.cwd.is_some() { bad.push("[program].cwd"); }
+    if profile.uid.is_some() { bad.push("[program].uid"); }
+    if profile.chroot.is_some() { bad.push("[filesystem].chroot"); }
+    if !profile.fs_mount.is_empty() { bad.push("[filesystem].mount"); }
+    if profile.on_exit != BranchAction::Commit { bad.push("[filesystem].on_exit"); }
+    if profile.on_error != BranchAction::Abort { bad.push("[filesystem].on_error"); }
+
+    if !bad.is_empty() {
+        return Err(anyhow!(
+            "--no-supervisor is incompatible with {} field(s): {}",
+            source,
+            bad.join(", ")
+        ));
+    }
+
+    Ok(())
+}
+
 /// Execute a command with no-supervisor confinement.
 /// Applies Landlock + deny-only seccomp filter, handles env, then execs.
-fn no_supervisor_exec(policy: &Policy, cmd: &[&str]) -> Result<()> {
+fn no_supervisor_exec(policy: &Sandbox, cmd: &[&str]) -> Result<()> {
     use std::ffi::CString;
 
     // 1. Apply Landlock confinement (sets NO_NEW_PRIVS + Landlock rules)

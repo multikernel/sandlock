@@ -1,6 +1,6 @@
 use serde::{Serialize, Deserialize};
-use crate::policy::Policy;
-use crate::error::{SandlockError, SandboxError};
+use crate::sandbox::Sandbox;
+use crate::error::{SandlockError, SandboxRuntimeError};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Checkpoint {
     pub name: String,
-    pub policy: Policy,
+    pub policy: Sandbox,
     pub process_state: ProcessState,
     pub fd_table: Vec<FdInfo>,
     pub cow_snapshot: Option<PathBuf>,
@@ -294,32 +294,32 @@ fn parse_fdinfo(pid: i32, fd: i32) -> io::Result<(i32, u64)> {
 
 /// Capture a checkpoint from a running, stopped sandbox.
 /// The sandbox must already be frozen (SIGSTOP'd and fork-held).
-pub(crate) fn capture(pid: i32, policy: &Policy) -> Result<Checkpoint, SandlockError> {
+pub(crate) fn capture(pid: i32, policy: &Sandbox) -> Result<Checkpoint, SandlockError> {
     // Seize via ptrace (PTRACE_SEIZE + PTRACE_INTERRUPT — doesn't auto-SIGSTOP)
     ptrace_seize(pid).map_err(|e| {
-        SandlockError::Sandbox(SandboxError::Child(format!("ptrace seize: {}", e)))
+        SandlockError::Runtime(SandboxRuntimeError::Child(format!("ptrace seize: {}", e)))
     })?;
 
     // Capture registers
     let regs = ptrace_getregs(pid).map_err(|e| {
-        SandlockError::Sandbox(SandboxError::Child(format!("ptrace getregs: {}", e)))
+        SandlockError::Runtime(SandboxRuntimeError::Child(format!("ptrace getregs: {}", e)))
     })?;
 
     // Capture memory maps
     let maps =
-        parse_proc_maps(pid).map_err(|e| SandlockError::Sandbox(SandboxError::Io(e)))?;
+        parse_proc_maps(pid).map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
 
     // Capture memory data
     let memory_data =
-        capture_memory(pid, &maps).map_err(|e| SandlockError::Sandbox(SandboxError::Io(e)))?;
+        capture_memory(pid, &maps).map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
 
     // Capture fd table
     let fd_table =
-        capture_fd_table(pid).map_err(|e| SandlockError::Sandbox(SandboxError::Io(e)))?;
+        capture_fd_table(pid).map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
 
     // Detach
     ptrace_detach(pid).map_err(|e| {
-        SandlockError::Sandbox(SandboxError::Child(format!("ptrace detach: {}", e)))
+        SandlockError::Runtime(SandboxRuntimeError::Child(format!("ptrace detach: {}", e)))
     })?;
 
     // Capture cwd and exe from /proc
@@ -354,7 +354,7 @@ pub(crate) fn capture(pid: i32, policy: &Policy) -> Result<Checkpoint, SandlockE
 // Layout:
 //   <dir>/
 //   ├── meta.json            # name, cow_snapshot
-//   ├── policy.dat           # bincode-serialized Policy
+//   ├── policy.dat           # bincode-serialized Sandbox
 //   ├── app_state.bin        # optional raw app state
 //   └── process/
 //       ├── info.json        # pid, cwd, exe
@@ -366,17 +366,17 @@ pub(crate) fn capture(pid: i32, policy: &Policy) -> Result<Checkpoint, SandlockE
 //           └── <index>.bin  # raw memory contents per segment
 
 fn io_err(e: impl std::fmt::Display) -> SandlockError {
-    SandlockError::Sandbox(SandboxError::Child(e.to_string()))
+    SandlockError::Runtime(SandboxRuntimeError::Child(e.to_string()))
 }
 
 fn write_json<T: Serialize>(path: &Path, val: &T) -> Result<(), SandlockError> {
     let json = serde_json::to_string_pretty(val).map_err(io_err)?;
-    std::fs::write(path, json).map_err(|e| SandlockError::Sandbox(SandboxError::Io(e)))
+    std::fs::write(path, json).map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, SandlockError> {
     let data = std::fs::read_to_string(path)
-        .map_err(|e| SandlockError::Sandbox(SandboxError::Io(e)))?;
+        .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
     serde_json::from_str(&data).map_err(io_err)
 }
 
@@ -422,10 +422,10 @@ impl Checkpoint {
         let tmp = dir.with_extension("tmp");
         if tmp.exists() {
             std::fs::remove_dir_all(&tmp)
-                .map_err(|e| SandlockError::Sandbox(SandboxError::Io(e)))?;
+                .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
         }
         std::fs::create_dir_all(&tmp)
-            .map_err(|e| SandlockError::Sandbox(SandboxError::Io(e)))?;
+            .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
 
         let res = self.save_inner(&tmp);
         if res.is_err() {
@@ -436,10 +436,10 @@ impl Checkpoint {
         // Atomic rename into place
         if dir.exists() {
             std::fs::remove_dir_all(dir)
-                .map_err(|e| SandlockError::Sandbox(SandboxError::Io(e)))?;
+                .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
         }
         std::fs::rename(&tmp, dir)
-            .map_err(|e| SandlockError::Sandbox(SandboxError::Io(e)))?;
+            .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
 
         Ok(())
     }
@@ -454,18 +454,18 @@ impl Checkpoint {
         // policy.dat (bincode — complex struct, not human-readable anyway)
         let policy_bytes = bincode::serialize(&self.policy).map_err(io_err)?;
         std::fs::write(dir.join("policy.dat"), &policy_bytes)
-            .map_err(|e| SandlockError::Sandbox(SandboxError::Io(e)))?;
+            .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
 
         // app_state.bin
         if let Some(ref state) = self.app_state {
             std::fs::write(dir.join("app_state.bin"), state)
-                .map_err(|e| SandlockError::Sandbox(SandboxError::Io(e)))?;
+                .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
         }
 
         // process/
         let proc_dir = dir.join("process");
         std::fs::create_dir(&proc_dir)
-            .map_err(|e| SandlockError::Sandbox(SandboxError::Io(e)))?;
+            .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
 
         // process/info.json
         write_json(&proc_dir.join("info.json"), &InfoJson {
@@ -511,20 +511,20 @@ impl Checkpoint {
         // process/threads/0.bin — main thread register state
         let threads_dir = proc_dir.join("threads");
         std::fs::create_dir(&threads_dir)
-            .map_err(|e| SandlockError::Sandbox(SandboxError::Io(e)))?;
+            .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
         let reg_bytes: Vec<u8> = self.process_state.regs.iter()
             .flat_map(|r| r.to_le_bytes())
             .collect();
         std::fs::write(threads_dir.join("0.bin"), &reg_bytes)
-            .map_err(|e| SandlockError::Sandbox(SandboxError::Io(e)))?;
+            .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
 
         // process/memory/<index>.bin — 1:1 with memory_map.json entries
         let mem_dir = proc_dir.join("memory");
         std::fs::create_dir(&mem_dir)
-            .map_err(|e| SandlockError::Sandbox(SandboxError::Io(e)))?;
+            .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
         for (i, seg) in self.process_state.memory_data.iter().enumerate() {
             std::fs::write(mem_dir.join(format!("{}.bin", i)), &seg.data)
-                .map_err(|e| SandlockError::Sandbox(SandboxError::Io(e)))?;
+                .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
         }
 
         Ok(())
@@ -533,7 +533,7 @@ impl Checkpoint {
     /// Load a checkpoint from a directory.
     pub fn load(dir: &Path) -> Result<Self, SandlockError> {
         if !dir.is_dir() {
-            return Err(SandlockError::Sandbox(SandboxError::Child(
+            return Err(SandlockError::Runtime(SandboxRuntimeError::Child(
                 format!("Checkpoint not found: {}", dir.display()),
             )));
         }
@@ -543,14 +543,14 @@ impl Checkpoint {
 
         // policy.dat
         let policy_bytes = std::fs::read(dir.join("policy.dat"))
-            .map_err(|e| SandlockError::Sandbox(SandboxError::Io(e)))?;
-        let policy: Policy = bincode::deserialize(&policy_bytes).map_err(io_err)?;
+            .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
+        let policy: Sandbox = bincode::deserialize(&policy_bytes).map_err(io_err)?;
 
         // app_state.bin
         let app_state_path = dir.join("app_state.bin");
         let app_state = if app_state_path.exists() {
             Some(std::fs::read(&app_state_path)
-                .map_err(|e| SandlockError::Sandbox(SandboxError::Io(e)))?)
+                .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?)
         } else {
             None
         };
@@ -582,7 +582,7 @@ impl Checkpoint {
 
         // process/threads/0.bin
         let reg_bytes = std::fs::read(proc_dir.join("threads").join("0.bin"))
-            .map_err(|e| SandlockError::Sandbox(SandboxError::Io(e)))?;
+            .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
         let regs: Vec<u64> = reg_bytes.chunks_exact(8)
             .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
@@ -593,7 +593,7 @@ impl Checkpoint {
         for (i, map) in maps_json.iter().enumerate() {
             let seg_path = mem_dir.join(format!("{}.bin", i));
             let data = std::fs::read(&seg_path)
-                .map_err(|e| SandlockError::Sandbox(SandboxError::Io(e)))?;
+                .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
             memory_data.push(MemorySegment {
                 start: map.start,
                 data,

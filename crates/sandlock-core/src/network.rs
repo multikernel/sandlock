@@ -78,8 +78,8 @@ fn parse_port_from_sockaddr(bytes: &[u8]) -> Option<u16> {
 /// Returns `None` for protocols sandlock does not gate via `net_allow`
 /// (raw, SCTP, etc.) — the handler treats those as "no rule applies"
 /// which collapses to the default-deny path.
-fn query_socket_protocol(fd: RawFd) -> Option<crate::policy::Protocol> {
-    use crate::policy::Protocol;
+fn query_socket_protocol(fd: RawFd) -> Option<crate::sandbox::Protocol> {
+    use crate::sandbox::Protocol;
     let mut proto: libc::c_int = 0;
     let mut len: libc::socklen_t = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
     let rc = unsafe {
@@ -562,7 +562,7 @@ async fn send_msghdr_on_behalf(
     ctx: &Arc<SupervisorCtx>,
     notif_fd: RawFd,
     dup_fd: &std::os::unix::io::OwnedFd,
-    protocol: crate::policy::Protocol,
+    protocol: crate::sandbox::Protocol,
     msghdr_ptr: u64,
     flags: i32,
 ) -> Result<isize, i32> {
@@ -853,9 +853,9 @@ pub struct ResolvedNetAllowSet {
 /// (PortAllow::Any). A `*` host on ICMP becomes `any_ip_all_ports`,
 /// which the handler reads as "no destination check."
 pub async fn resolve_net_allow(
-    rules: &[crate::policy::NetAllow],
+    rules: &[crate::sandbox::NetAllow],
 ) -> io::Result<ResolvedNetAllowSet> {
-    use crate::policy::Protocol;
+    use crate::sandbox::Protocol;
 
     // Single shared etc_hosts for all protocols. Every concrete host
     // (regardless of protocol) ends up resolvable in the sandbox.
@@ -945,7 +945,7 @@ pub async fn resolve_net_allow(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::NetAllow;
+    use crate::sandbox::NetAllow;
 
     #[tokio::test]
     async fn test_resolve_net_allow_empty() {
@@ -960,7 +960,7 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_net_allow_concrete_host() {
         let rules = vec![NetAllow {
-            protocol: crate::policy::Protocol::Tcp,
+            protocol: crate::sandbox::Protocol::Tcp,
             host: Some("localhost".to_string()),
             ports: vec![80, 443],
             all_ports: false,
@@ -980,7 +980,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_net_allow_any_ip() {
-        let rules = vec![NetAllow { protocol: crate::policy::Protocol::Tcp, host: None, ports: vec![8080], all_ports: false }];
+        let rules = vec![NetAllow { protocol: crate::sandbox::Protocol::Tcp, host: None, ports: vec![8080], all_ports: false }];
         let resolved = resolve_net_allow(&rules).await.unwrap();
         assert!(resolved.tcp.per_ip.is_empty());
         assert!(resolved.tcp.any_ip_ports.contains(&8080));
@@ -991,7 +991,7 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_net_allow_any_ip_all_ports() {
         // `:*` — fully unrestricted egress, TCP-only.
-        let rules = vec![NetAllow { protocol: crate::policy::Protocol::Tcp, host: None, ports: vec![], all_ports: true }];
+        let rules = vec![NetAllow { protocol: crate::sandbox::Protocol::Tcp, host: None, ports: vec![], all_ports: true }];
         let resolved = resolve_net_allow(&rules).await.unwrap();
         assert!(resolved.tcp.any_ip_all_ports);
         assert!(resolved.tcp.per_ip.is_empty());
@@ -1006,7 +1006,7 @@ mod tests {
     async fn test_resolve_net_allow_concrete_host_all_ports() {
         // `localhost:*` — every port to localhost only, TCP.
         let rules = vec![NetAllow {
-            protocol: crate::policy::Protocol::Tcp,
+            protocol: crate::sandbox::Protocol::Tcp,
             host: Some("localhost".to_string()),
             ports: vec![],
             all_ports: true,
@@ -1028,9 +1028,9 @@ mod tests {
         // into per_ip (the runtime layer chooses Unrestricted, ignoring
         // the concrete entries).
         let rules = vec![
-            NetAllow { protocol: crate::policy::Protocol::Tcp, host: None, ports: vec![], all_ports: true },
+            NetAllow { protocol: crate::sandbox::Protocol::Tcp, host: None, ports: vec![], all_ports: true },
             NetAllow {
-                protocol: crate::policy::Protocol::Tcp,
+                protocol: crate::sandbox::Protocol::Tcp,
                 host: Some("localhost".to_string()),
                 ports: vec![22],
                 all_ports: false,
@@ -1051,13 +1051,13 @@ mod tests {
         // This is the property Phase 2 relies on for protocol routing.
         let rules = vec![
             NetAllow {
-                protocol: crate::policy::Protocol::Tcp,
+                protocol: crate::sandbox::Protocol::Tcp,
                 host: Some("localhost".to_string()),
                 ports: vec![443],
                 all_ports: false,
             },
             NetAllow {
-                protocol: crate::policy::Protocol::Udp,
+                protocol: crate::sandbox::Protocol::Udp,
                 host: None,
                 ports: vec![53],
                 all_ports: false,
@@ -1079,7 +1079,7 @@ mod tests {
         // ICMP rules carry no ports; concrete hosts go into per_ip with
         // PortAllow::Any-style empty port set, plus per_ip_all_ports.
         let rules = vec![NetAllow {
-            protocol: crate::policy::Protocol::Icmp,
+            protocol: crate::sandbox::Protocol::Icmp,
             host: Some("localhost".to_string()),
             ports: vec![],
             all_ports: false,
@@ -1098,7 +1098,7 @@ mod tests {
     async fn test_resolve_icmp_wildcard() {
         // `icmp://*` — any ICMP destination.
         let rules = vec![NetAllow {
-            protocol: crate::policy::Protocol::Icmp,
+            protocol: crate::sandbox::Protocol::Icmp,
             host: None,
             ports: vec![],
             all_ports: false,

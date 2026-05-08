@@ -3,11 +3,11 @@ use thiserror::Error;
 /// Root error type for all sandlock operations.
 #[derive(Debug, Error)]
 pub enum SandlockError {
-    #[error("policy error: {0}")]
-    Policy(#[from] PolicyError),
-
     #[error("sandbox error: {0}")]
     Sandbox(#[from] SandboxError),
+
+    #[error("process error: {0}")]
+    Runtime(#[from] SandboxRuntimeError),
 
     #[error("memory protection error: {0}")]
     MemoryProtect(String),
@@ -16,9 +16,10 @@ pub enum SandlockError {
     Handler(#[from] crate::seccomp::dispatch::HandlerError),
 }
 
+/// Errors from sandbox configuration validation and building.
 #[derive(Debug, Error)]
-pub enum PolicyError {
-    #[error("invalid policy: {0}")]
+pub enum SandboxError {
+    #[error("invalid sandbox: {0}")]
     Invalid(String),
 
     #[error("fs_isolation requires workdir to be set")]
@@ -31,8 +32,9 @@ pub enum PolicyError {
     UnsupportedForConfine(String),
 }
 
+/// Errors from the sandbox process runtime (fork, confinement, child, etc.).
 #[derive(Debug, Error)]
-pub enum SandboxError {
+pub enum SandboxRuntimeError {
     #[error("fork failed: {0}")]
     Fork(#[source] std::io::Error),
 

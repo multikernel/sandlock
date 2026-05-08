@@ -29,7 +29,7 @@ import textwrap
 import threading
 
 from openai import OpenAI
-from sandlock import Sandbox, Policy
+from sandlock import Sandbox
 
 # ---------------------------------------------------------------------------
 # Attacker's exfil listener
@@ -203,27 +203,27 @@ def demo_xoa_sandboxed(client: OpenAI, data_path: str):
         "/dev", python_prefix,
     ] + python_paths))
 
-    # Planner policy (shared by planner1 + planner2): reach OpenAI,
+    # Planner sandbox (shared by planner1 + planner2): reach OpenAI,
     # NO filesystem access to the data file.
-    planner_policy = Policy(
+    planner = Sandbox(
         fs_readable=base_readable,
         net_allow=["api.openai.com:443"],
         clean_env=True,
         env={"OPENAI_API_KEY": os.environ["OPENAI_API_KEY"]},
     )
 
-    # Searcher policy: can read the data file, NO network. Receives the
+    # Searcher sandbox: can read the data file, NO network. Receives the
     # query as a command-line arg from the orchestrator.
-    searcher_policy = Policy(
+    searcher = Sandbox(
         fs_readable=base_readable + [workspace],
         net_allow=[],
         clean_env=True,
         env={"DATA_FILE": data_path},
     )
 
-    # Executor policy: NO network, NO direct data access. Receives both
+    # Executor sandbox: NO network, NO direct data access. Receives both
     # the code and the raw results via gather pipes.
-    executor_policy = Policy(
+    executor = Sandbox(
         fs_readable=base_readable + ["/home"],  # for sandlock imports
         net_allow=[],
         clean_env=True,
@@ -255,7 +255,7 @@ def demo_xoa_sandboxed(client: OpenAI, data_path: str):
     print()
     print("[planner1] asking LLM for a search query (sees task only)...")
     sys.stdout.flush()
-    q_res = Sandbox(planner_policy).cmd(
+    q_res = planner.cmd(
         [sys.executable, "-c", planner1_script]
     ).run(timeout=30)
     query = (q_res.stdout.decode().strip().splitlines() or [""])[-1]
@@ -328,15 +328,9 @@ def demo_xoa_sandboxed(client: OpenAI, data_path: str):
     sys.stdout.flush()
 
     result = (
-        Sandbox(searcher_policy).cmd(
-            [sys.executable, "-c", searcher_script, query]
-        ).as_("data")
-        + Sandbox(planner_policy).cmd(
-            [sys.executable, "-c", planner2_script]
-        ).as_("code")
-        | Sandbox(executor_policy).cmd(
-            [sys.executable, "-c", executor_script]
-        )
+        searcher.cmd([sys.executable, "-c", searcher_script, query]).as_("data")
+        + planner.cmd([sys.executable, "-c", planner2_script]).as_("code")
+        | executor.cmd([sys.executable, "-c", executor_script])
     ).run(timeout=30)
 
     if result.stderr:

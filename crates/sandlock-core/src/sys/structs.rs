@@ -265,7 +265,7 @@ pub const ECONNREFUSED: i32 = 111;
 // ============================================================
 
 /// SysV IPC syscalls. Appended to the kernel-level blocklist when
-/// `policy.allow_sysv_ipc` is false. Sandlock does not use an IPC
+/// `policy.allows_sysv_ipc()` is false. Sandlock does not use an IPC
 /// namespace, so without these denials two sandboxes on the same host
 /// share a SysV keyspace and can rendezvous via a well-known key.
 ///

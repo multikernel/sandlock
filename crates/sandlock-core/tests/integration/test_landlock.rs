@@ -1,4 +1,4 @@
-use sandlock_core::{Policy, Sandbox};
+use sandlock_core::{Sandbox};
 use std::path::PathBuf;
 
 fn temp_file(name: &str) -> PathBuf {
@@ -18,7 +18,7 @@ async fn test_can_read_allowed_path() {
 
     let out = temp_file("read-allowed-out");
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
@@ -32,7 +32,7 @@ async fn test_can_read_allowed_path() {
         .unwrap();
 
     let cmd_str = format!("cat {} > {}", input.display(), out.display());
-    let result = Sandbox::run_interactive(&policy, Some("test"), &["sh", "-c", &cmd_str])
+    let result = policy.clone().with_name("test").run_interactive(&["sh", "-c", &cmd_str])
         .await
         .unwrap();
     assert!(result.success(), "cat should succeed for allowed path");
@@ -46,7 +46,7 @@ async fn test_can_read_allowed_path() {
 
 #[tokio::test]
 async fn test_cannot_read_outside_allowed() {
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
@@ -58,7 +58,7 @@ async fn test_cannot_read_outside_allowed() {
         .unwrap();
 
     // /etc is NOT in fs_read, so cat /etc/group should fail
-    let result = Sandbox::run(&policy, Some("test"), &["cat", "/etc/group"])
+    let result = policy.clone().with_name("test").run(&["cat", "/etc/group"])
         .await
         .unwrap();
     assert!(!result.success(), "cat should fail without /etc in fs_read");
@@ -68,7 +68,7 @@ async fn test_cannot_read_outside_allowed() {
 async fn test_can_write_to_writable_path() {
     let out = temp_file("write-ok");
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
@@ -81,7 +81,7 @@ async fn test_can_write_to_writable_path() {
         .unwrap();
 
     let cmd_str = format!("echo hello > {}", out.display());
-    let result = Sandbox::run_interactive(&policy, Some("test"), &["sh", "-c", &cmd_str])
+    let result = policy.clone().with_name("test").run_interactive(&["sh", "-c", &cmd_str])
         .await
         .unwrap();
     assert!(result.success(), "writing to /tmp should succeed");
@@ -99,7 +99,7 @@ async fn test_cannot_write_to_readonly_path() {
 
     let target = dir.join("nope.txt");
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
@@ -114,7 +114,7 @@ async fn test_cannot_write_to_readonly_path() {
 
     // dir is read-only, writing should fail
     let cmd_str = format!("echo nope > {} 2>/dev/null", target.display());
-    let result = Sandbox::run_interactive(&policy, Some("test"), &["sh", "-c", &cmd_str])
+    let result = policy.clone().with_name("test").run_interactive(&["sh", "-c", &cmd_str])
         .await
         .unwrap();
     assert!(!result.success(), "writing to read-only dir should fail");
@@ -129,7 +129,7 @@ async fn test_denied_path_blocks_read() {
     let input = dir.join("secret.txt");
     std::fs::write(&input, "secret-data").unwrap();
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
@@ -143,7 +143,7 @@ async fn test_denied_path_blocks_read() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, Some("test"), &["cat", input.to_str().unwrap()])
+    let result = policy.clone().with_name("test").run(&["cat", input.to_str().unwrap()])
         .await
         .unwrap();
     assert!(!result.success(), "cat should fail on denied path");
@@ -153,7 +153,7 @@ async fn test_denied_path_blocks_read() {
 
 #[tokio::test]
 async fn test_denied_path_blocks_exec() {
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
@@ -166,7 +166,7 @@ async fn test_denied_path_blocks_exec() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, Some("test"), &["/bin/cat", "/etc/hostname"]).await.unwrap();
+    let result = policy.clone().with_name("test").run(&["/bin/cat", "/etc/hostname"]).await.unwrap();
     assert!(!result.success(), "exec should fail on denied binary path");
 }
 
@@ -230,7 +230,7 @@ async fn test_isolate_ipc() {
         out = out.display(),
     );
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
@@ -243,7 +243,7 @@ async fn test_isolate_ipc() {
         .build()
         .unwrap();
 
-    let _result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &child_script])
+    let _result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &child_script])
         .await
         .unwrap();
 
@@ -284,7 +284,7 @@ async fn test_isolate_signals_blocks_parent() {
         out = out.display(),
     );
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
@@ -297,7 +297,7 @@ async fn test_isolate_signals_blocks_parent() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success(), "python script should exit 0");
@@ -335,7 +335,7 @@ async fn test_isolate_signals_allows_self() {
         out = out.display(),
     );
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
@@ -348,7 +348,7 @@ async fn test_isolate_signals_allows_self() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success(), "python script should exit 0");

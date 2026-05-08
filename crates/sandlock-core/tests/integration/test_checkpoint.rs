@@ -1,15 +1,15 @@
-use sandlock_core::{Policy, Sandbox, Checkpoint};
+use sandlock_core::{Sandbox, Checkpoint};
 
 /// Test that checkpoint save/load roundtrips correctly.
 #[tokio::test]
 async fn test_checkpoint_save_load() {
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc")
         .build().unwrap();
 
     // Start a long-running process
-    let mut sb = Sandbox::new(&policy, Some("test")).unwrap();
+    let mut sb = policy.clone().with_name("test");
     // We need to spawn something that stays alive long enough to checkpoint
     // Use "sleep 60" — we'll kill it after checkpoint
     sb.spawn(&["sleep", "60"]).await.unwrap();
@@ -52,12 +52,12 @@ async fn test_checkpoint_save_load() {
 /// Test that checkpoint captures memory maps correctly.
 #[tokio::test]
 async fn test_checkpoint_memory_maps() {
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc")
         .build().unwrap();
 
-    let mut sb = Sandbox::new(&policy, Some("test")).unwrap();
+    let mut sb = policy.clone().with_name("test");
     sb.spawn(&["sleep", "60"]).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -79,12 +79,12 @@ async fn test_checkpoint_memory_maps() {
 /// Test that app_state round-trips through save/load.
 #[tokio::test]
 async fn test_checkpoint_app_state_roundtrip() {
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc")
         .build().unwrap();
 
-    let mut sb = Sandbox::new(&policy, Some("test")).unwrap();
+    let mut sb = policy.clone().with_name("test");
     sb.spawn(&["sleep", "60"]).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -112,12 +112,12 @@ async fn test_checkpoint_app_state_roundtrip() {
 /// Test that checkpoint without app_state doesn't create app_state.bin.
 #[tokio::test]
 async fn test_checkpoint_no_app_state_file() {
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc")
         .build().unwrap();
 
-    let mut sb = Sandbox::new(&policy, Some("test")).unwrap();
+    let mut sb = policy.clone().with_name("test");
     sb.spawn(&["sleep", "60"]).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -139,12 +139,12 @@ async fn test_checkpoint_no_app_state_file() {
 /// Test that process info (pid, cwd, exe) is captured correctly.
 #[tokio::test]
 async fn test_checkpoint_process_info() {
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc")
         .build().unwrap();
 
-    let mut sb = Sandbox::new(&policy, Some("test")).unwrap();
+    let mut sb = policy.clone().with_name("test");
     sb.spawn(&["sleep", "60"]).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -169,8 +169,8 @@ async fn test_checkpoint_load_nonexistent() {
 /// Test checkpoint on a non-running sandbox fails gracefully.
 #[tokio::test]
 async fn test_checkpoint_not_running() {
-    let policy = Policy::builder().build().unwrap();
-    let sb = Sandbox::new(&policy, Some("test")).unwrap();
+    let policy = Sandbox::builder().build().unwrap();
+    let sb = policy.clone().with_name("test");
     let result = sb.checkpoint().await;
     assert!(result.is_err(), "Checkpoint on non-running sandbox should error");
 }

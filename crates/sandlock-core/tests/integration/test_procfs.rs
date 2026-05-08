@@ -1,10 +1,10 @@
-use sandlock_core::policy::ByteSize;
-use sandlock_core::{Policy, Sandbox};
+use sandlock_core::sandbox::ByteSize;
+use sandlock_core::{Sandbox};
 
 /// Test that num_cpus virtualizes both /proc/cpuinfo and sched_getaffinity.
 #[tokio::test]
 async fn test_num_cpus_virtualization() {
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
@@ -16,13 +16,13 @@ async fn test_num_cpus_virtualization() {
         .unwrap();
 
     // Verify /proc/cpuinfo shows 2 processors.
-    let result = Sandbox::run(&policy, Some("test"), &["sh", "-c", "grep -c ^processor /proc/cpuinfo"]).await.unwrap();
+    let result = policy.clone().with_name("test").run(&["sh", "-c", "grep -c ^processor /proc/cpuinfo"]).await.unwrap();
     assert!(result.success(), "grep /proc/cpuinfo should succeed");
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     assert_eq!(stdout.trim(), "2", "/proc/cpuinfo should show 2 processors, got: {:?}", stdout.trim());
 
     // Verify nproc (sched_getaffinity) also reports 2.
-    let result = Sandbox::run(&policy, Some("test"), &["nproc"]).await.unwrap();
+    let result = policy.clone().with_name("test").run(&["nproc"]).await.unwrap();
     assert!(result.success(), "nproc should succeed");
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     assert_eq!(stdout.trim(), "2", "nproc should report 2 CPUs, got: {:?}", stdout.trim());
@@ -31,7 +31,7 @@ async fn test_num_cpus_virtualization() {
 /// Test that max_memory virtualizes /proc/meminfo.
 #[tokio::test]
 async fn test_meminfo_virtualization() {
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
@@ -43,7 +43,7 @@ async fn test_meminfo_virtualization() {
         .unwrap();
 
     // Read meminfo — should show virtualized values
-    let result = Sandbox::run(&policy, Some("test"), &["cat", "/proc/meminfo"]).await.unwrap();
+    let result = policy.clone().with_name("test").run(&["cat", "/proc/meminfo"]).await.unwrap();
     assert!(result.success(), "cat /proc/meminfo should succeed");
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     // 256 MiB = 262144 kB
@@ -56,7 +56,7 @@ async fn test_meminfo_virtualization() {
 /// Test that sensitive /proc paths are blocked.
 #[tokio::test]
 async fn test_sensitive_proc_blocked() {
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
@@ -68,14 +68,14 @@ async fn test_sensitive_proc_blocked() {
         .unwrap();
 
     // /proc/kcore should be denied
-    let result = Sandbox::run(&policy, Some("test"), &["cat", "/proc/kcore"]).await.unwrap();
+    let result = policy.clone().with_name("test").run(&["cat", "/proc/kcore"]).await.unwrap();
     assert!(!result.success(), "/proc/kcore should be denied");
 }
 
 /// Test basic sandbox still works without /proc virtualization.
 #[tokio::test]
 async fn test_no_proc_virt_still_works() {
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
@@ -85,7 +85,7 @@ async fn test_no_proc_virt_still_works() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, Some("test"), &["cat", "/proc/version"]).await.unwrap();
+    let result = policy.clone().with_name("test").run(&["cat", "/proc/version"]).await.unwrap();
     assert!(result.success(), "Should work without proc virtualization");
 }
 
@@ -102,7 +102,7 @@ async fn test_proc_net_tcp_filtered() {
     let port = listener.local_addr().unwrap().port();
     drop(listener);
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
         .fs_read("/etc").fs_read("/proc").fs_read("/dev")
         .fs_write("/tmp")
@@ -129,7 +129,7 @@ async fn test_proc_net_tcp_filtered() {
         "open('{out}', 'w').write(str(len(ports)))\n",
     ), port = port, out = out.display());
 
-    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     let count: usize = content.parse().unwrap_or(999);
@@ -141,13 +141,13 @@ async fn test_proc_net_tcp_filtered() {
 /// Test that /proc/mounts is virtualized and only shows sandbox mounts.
 #[tokio::test]
 async fn test_proc_mounts_virtualized() {
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
         .fs_read("/etc").fs_read("/proc").fs_read("/dev")
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, Some("test"), &["cat", "/proc/mounts"]).await.unwrap();
+    let result = policy.clone().with_name("test").run(&["cat", "/proc/mounts"]).await.unwrap();
     assert!(result.success(), "cat /proc/mounts should succeed");
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     // Should contain the root entry (no chroot → rootfs)
@@ -160,13 +160,13 @@ async fn test_proc_mounts_virtualized() {
 /// Test that /proc/self/mountinfo is virtualized.
 #[tokio::test]
 async fn test_proc_self_mountinfo_virtualized() {
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
         .fs_read("/etc").fs_read("/proc").fs_read("/dev")
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, Some("test"), &["cat", "/proc/self/mountinfo"]).await.unwrap();
+    let result = policy.clone().with_name("test").run(&["cat", "/proc/self/mountinfo"]).await.unwrap();
     assert!(result.success(), "cat /proc/self/mountinfo should succeed");
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     // Should contain root entry in mountinfo format
@@ -182,7 +182,7 @@ async fn test_proc_parent_pid_blocked() {
         std::process::id()
     ));
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
         .fs_read("/etc").fs_read("/proc").fs_read("/dev")
         .fs_write("/tmp")
@@ -210,7 +210,7 @@ async fn test_proc_parent_pid_blocked() {
         "open('{out}', 'w').write(','.join(results))\n",
     ), out = out.display());
 
-    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "script should exit 0");
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
@@ -228,7 +228,7 @@ async fn test_proc_net_tcp_hides_host_ports() {
         std::process::id()
     ));
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
         .fs_read("/etc").fs_read("/proc").fs_read("/dev")
         .fs_write("/tmp")
@@ -248,7 +248,7 @@ async fn test_proc_net_tcp_hides_host_ports() {
         "open('{out}', 'w').write(str(len(ports)))\n",
     ), out = out.display());
 
-    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     let count: usize = content.parse().unwrap_or(999);

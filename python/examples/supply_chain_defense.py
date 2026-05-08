@@ -19,7 +19,7 @@ import sys
 import tempfile
 import threading
 
-from sandlock import Sandbox, Policy
+from sandlock import Sandbox
 
 
 def main():
@@ -73,16 +73,14 @@ print("[agent] done")
 """)
 
         python_paths = [p for p in sys.path if p and os.path.isdir(p)]
-        policy = Policy(
-            fs_readable=["/usr", "/lib", "/lib64", "/bin",
-                         "/etc", "/dev", "/tmp", workspace] + python_paths,
-            fs_writable=[workspace, "/tmp"],
-        )
+        fs_readable = ["/usr", "/lib", "/lib64", "/bin",
+                       "/etc", "/dev", "/tmp", workspace] + python_paths
+        fs_writable = [workspace, "/tmp"]
 
         # --- Run 1: no defense ---
         print("=== Without policy_fn ===", flush=True)
         received.clear()
-        with Sandbox(policy) as sb:
+        with Sandbox(fs_readable=fs_readable, fs_writable=fs_writable) as sb:
             result = sb.run(["python3", agent_py])
             print(result.stdout.decode(), end="", flush=True)
         print(f"Secret leaked: {bool(received)}\n", flush=True)
@@ -102,7 +100,11 @@ print("[agent] done")
                         ctx.restrict_pid_network(event.pid, [])
                         break
 
-        with Sandbox(policy, policy_fn=install_guard) as sb:
+        with Sandbox(
+            fs_readable=fs_readable,
+            fs_writable=fs_writable,
+            policy_fn=install_guard,
+        ) as sb:
             result = sb.run(["python3", agent_py])
             print(result.stdout.decode(), end="", flush=True)
         print(f"Secret leaked: {bool(received)}", flush=True)

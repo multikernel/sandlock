@@ -13,7 +13,7 @@ import os
 import sys
 import time
 import ctypes
-from sandlock import Sandbox, Policy
+from sandlock import Sandbox
 
 # Unique token set by init(), never re-set
 _TOKEN = None
@@ -85,14 +85,14 @@ def get_shared_pages(pid):
 
 
 def main():
-    policy = Policy(
-        fs_writable=["/tmp"],
-        fs_readable=[sys.prefix, "/usr", "/lib", "/etc", "/proc", "/dev"],
-    )
-
     print("=== COW Clone Proof ===\n", flush=True)
 
-    with Sandbox(policy, init_fn=init, work_fn=work) as sb:
+    with Sandbox(
+        fs_writable=["/tmp"],
+        fs_readable=[sys.prefix, "/usr", "/lib", "/etc", "/proc", "/dev"],
+        init_fn=init,
+        work_fn=work,
+    ) as sb:
         # Fork 3 clones
         fork_result = sb.fork(3)
 

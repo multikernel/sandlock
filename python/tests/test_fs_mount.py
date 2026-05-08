@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from sandlock import Policy, Sandbox
-from sandlock.policy import FsIsolation
+from sandlock import Sandbox
+from sandlock.sandbox import FsIsolation
 
 
 _HELPER_BIN = Path(__file__).resolve().parent.parent.parent / "tests" / "rootfs-helper"
@@ -50,7 +50,7 @@ def _mount_policy(rootfs, work_dir, cwd="/", extra_fs_readable=None):
     readable = list(_FS_READABLE)
     if extra_fs_readable:
         readable.extend(extra_fs_readable)
-    return Policy(
+    return Sandbox(
         chroot=str(rootfs),
         fs_mount={"/work": str(work_dir)},
         fs_readable=readable,
@@ -69,7 +69,7 @@ class TestFsMount:
         (work_dir / "hello.txt").write_text("hello from host\n")
 
         policy = _mount_policy(rootfs, work_dir)
-        result = Sandbox(policy).run(["cat", "/work/hello.txt"])
+        result = policy.run(["cat", "/work/hello.txt"])
         assert result.success, f"failed: {result.stderr}"
         assert b"hello from host" in result.stdout
 
@@ -79,7 +79,7 @@ class TestFsMount:
         work_dir.mkdir()
 
         policy = _mount_policy(rootfs, work_dir)
-        result = Sandbox(policy).run(["write", "/work/output.txt", "sandbox wrote this"])
+        result = policy.run(["write", "/work/output.txt", "sandbox wrote this"])
         assert result.success, f"failed: {result.stderr}"
         assert (work_dir / "output.txt").exists()
         assert "sandbox wrote this" in (work_dir / "output.txt").read_text()
@@ -92,7 +92,7 @@ class TestFsMount:
         (work_dir / "bbb.txt").write_text("b")
 
         policy = _mount_policy(rootfs, work_dir)
-        result = Sandbox(policy).run(["ls", "/work"])
+        result = policy.run(["ls", "/work"])
         assert result.success, f"failed: {result.stderr}"
         assert b"aaa.txt" in result.stdout
         assert b"bbb.txt" in result.stdout
@@ -106,7 +106,7 @@ class TestFsMount:
         (rootfs / "work").mkdir(exist_ok=True)
 
         policy = _mount_policy(rootfs, work_dir, cwd="/work")
-        result = Sandbox(policy).run(["cat", "file.txt"])
+        result = policy.run(["cat", "file.txt"])
         assert result.success, f"failed: {result.stderr}"
         assert b"relative access" in result.stdout
 
@@ -118,11 +118,11 @@ class TestFsMount:
         policy = _mount_policy(rootfs, work_dir)
 
         # Run 1: write
-        r1 = Sandbox(policy).run(["write", "/work/persist.txt", "persisted data"])
+        r1 = policy.run(["write", "/work/persist.txt", "persisted data"])
         assert r1.success, f"run 1 failed: {r1.stderr}"
 
         # Run 2: read
-        r2 = Sandbox(policy).run(["cat", "/work/persist.txt"])
+        r2 = policy.run(["cat", "/work/persist.txt"])
         assert r2.success, f"run 2 failed: {r2.stderr}"
         assert b"persisted data" in r2.stdout
 
@@ -136,10 +136,10 @@ class TestFsMount:
         policy_a = _mount_policy(rootfs, work_a)
         policy_b = _mount_policy(rootfs, work_b)
 
-        ra = Sandbox(policy_a).run(["write", "/work/id.txt", "sandbox_a"])
+        ra = policy_a.run(["write", "/work/id.txt", "sandbox_a"])
         assert ra.success, f"sandbox A failed: {ra.stderr}"
 
-        rb = Sandbox(policy_b).run(["write", "/work/id.txt", "sandbox_b"])
+        rb = policy_b.run(["write", "/work/id.txt", "sandbox_b"])
         assert rb.success, f"sandbox B failed: {rb.stderr}"
 
         assert (work_a / "id.txt").read_text().strip() == "sandbox_a"
@@ -156,7 +156,7 @@ class TestFsMount:
         work_dir.mkdir()
 
         policy = _mount_policy(rootfs, work_dir)
-        result = Sandbox(policy).run(["write", "/work/new.txt", "from sandbox"])
+        result = policy.run(["write", "/work/new.txt", "from sandbox"])
         assert result.success, f"failed: {result.stderr}"
 
         # The write should go to work_dir, not rootfs /work
@@ -188,7 +188,7 @@ class TestFsMountCow:
         )
         if max_disk is not None:
             kwargs["max_disk"] = max_disk
-        return Policy(**kwargs)
+        return Sandbox(**kwargs)
 
     def test_fs_mount_cow_commit(self, rootfs, tmp_path):
         """Write via fs_mount + COW with on_exit=commit, verify file persists."""
@@ -199,7 +199,7 @@ class TestFsMountCow:
 
         policy = self._cow_mount_policy(rootfs, work_dir, storage_dir,
                                         on_exit="commit")
-        result = Sandbox(policy).run(["write", "/work/committed.txt",
+        result = policy.run(["write", "/work/committed.txt",
                                       "cow commit data"])
         assert result.success, f"failed: {result.stderr}"
         assert (work_dir / "committed.txt").exists(), \
@@ -216,7 +216,7 @@ class TestFsMountCow:
 
         policy = self._cow_mount_policy(rootfs, work_dir, storage_dir,
                                         on_exit="abort")
-        result = Sandbox(policy).run(["write", "/work/new_file.txt",
+        result = policy.run(["write", "/work/new_file.txt",
                                       "should be discarded"])
         assert result.success, f"failed: {result.stderr}"
         assert not (work_dir / "new_file.txt").exists(), \
@@ -240,6 +240,6 @@ class TestFsMountCow:
                                         on_exit="abort", max_disk="1K")
         # The write applet opens the file with O_WRONLY|O_CREAT|O_TRUNC,
         # triggering a COW copy of the 8 KiB file against a 1 KiB quota.
-        result = Sandbox(policy).run(["write", "/work/big.bin", "overwrite"])
+        result = policy.run(["write", "/work/big.bin", "overwrite"])
         assert not result.success, \
             "Writing to a file exceeding COW quota should fail"

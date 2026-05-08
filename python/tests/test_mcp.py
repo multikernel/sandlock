@@ -4,7 +4,7 @@
 import pytest
 from types import SimpleNamespace
 
-from sandlock.policy import Policy
+from sandlock.sandbox import Sandbox
 from sandlock.mcp._policy import policy_for_tool, capabilities_from_mcp_tool
 
 

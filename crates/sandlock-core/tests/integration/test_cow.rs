@@ -1,5 +1,5 @@
-use sandlock_core::{Policy, Sandbox};
-use sandlock_core::policy::{FsIsolation, BranchAction};
+use sandlock_core::{Sandbox};
+use sandlock_core::sandbox::{FsIsolation, BranchAction};
 use std::fs;
 use std::path::PathBuf;
 
@@ -16,7 +16,7 @@ async fn test_overlayfs_basic_commands() {
     let storage = temp_dir("basic-storage");
     fs::write(workdir.join("hello.txt"), "original").unwrap();
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc")
         .fs_write(&workdir)
@@ -26,7 +26,7 @@ async fn test_overlayfs_basic_commands() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, Some("test"), &["cat", "hello.txt"]).await;
+    let result = policy.clone().with_name("test").run(&["cat", "hello.txt"]).await;
     // May fail on systems without unprivileged overlayfs support
     match result {
         Ok(r) => assert!(r.success(), "cat should succeed"),
@@ -44,7 +44,7 @@ async fn test_overlayfs_write_isolation() {
     let storage = temp_dir("isolation-storage");
     fs::write(workdir.join("data.txt"), "original").unwrap();
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc")
         .fs_write(&workdir)
@@ -57,7 +57,7 @@ async fn test_overlayfs_write_isolation() {
         .unwrap();
 
     // Write to a file inside the sandbox
-    let result = Sandbox::run(&policy, Some("test"), &["sh", "-c", "echo modified > data.txt"]).await;
+    let result = policy.clone().with_name("test").run(&["sh", "-c", "echo modified > data.txt"]).await;
     match result {
         Ok(_r) => {
             // Original file should still say "original" (COW aborted)
@@ -78,7 +78,7 @@ async fn test_overlayfs_commit() {
     let storage = temp_dir("commit-storage");
     fs::write(workdir.join("data.txt"), "original").unwrap();
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc")
         .fs_write(&workdir)
@@ -89,7 +89,7 @@ async fn test_overlayfs_commit() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, Some("test"), &["sh", "-c", "echo committed > data.txt"]).await;
+    let result = policy.clone().with_name("test").run(&["sh", "-c", "echo committed > data.txt"]).await;
     match result {
         Ok(r) => {
             if r.success() {
@@ -107,7 +107,7 @@ async fn test_overlayfs_commit() {
 /// Test that policy validation catches missing workdir.
 #[tokio::test]
 async fn test_cow_requires_workdir() {
-    let result = Policy::builder()
+    let result = Sandbox::builder()
         .fs_isolation(FsIsolation::OverlayFs)
         .build();
     assert!(result.is_err(), "Should fail without workdir");
@@ -123,7 +123,7 @@ async fn test_seccomp_cow_create_file() {
     let workdir = temp_dir("seccomp-create");
     fs::write(workdir.join("existing.txt"), "hello").unwrap();
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc")
         .fs_write(&workdir)
@@ -134,7 +134,7 @@ async fn test_seccomp_cow_create_file() {
 
     let new_file = workdir.join("new.txt");
     let cmd = format!("touch {}", new_file.display());
-    let result = Sandbox::run(&policy, Some("test"), &["sh", "-c", &cmd]).await;
+    let result = policy.clone().with_name("test").run(&["sh", "-c", &cmd]).await;
     match result {
         Ok(r) => {
             assert!(r.success(), "touch should succeed, stderr: {}", r.stderr_str().unwrap_or(""));
@@ -153,7 +153,7 @@ async fn test_seccomp_cow_abort() {
     let workdir = temp_dir("seccomp-abort");
     fs::write(workdir.join("existing.txt"), "original").unwrap();
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc")
         .fs_write(&workdir)
@@ -164,7 +164,7 @@ async fn test_seccomp_cow_abort() {
 
     let new_file = workdir.join("aborted.txt");
     let cmd = format!("touch {}", new_file.display());
-    let result = Sandbox::run(&policy, Some("test"), &["sh", "-c", &cmd]).await;
+    let result = policy.clone().with_name("test").run(&["sh", "-c", &cmd]).await;
     match result {
         Ok(_) => {
             // After abort, new file should NOT exist
@@ -190,7 +190,7 @@ async fn test_seccomp_cow_relative_path_abort() {
     let workdir = temp_dir("seccomp-relpath");
     fs::write(workdir.join("orig.txt"), "original\n").unwrap();
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc").fs_read("/dev")
         .fs_write(&workdir)
@@ -201,7 +201,7 @@ async fn test_seccomp_cow_relative_path_abort() {
         .unwrap();
 
     // Use relative paths (triggers AT_FDCWD in openat) — the child's cwd is set via .cwd().
-    let result = Sandbox::run(&policy, Some("test"), &[
+    let result = policy.clone().with_name("test").run(&[
         "sh", "-c", "echo MUTATED >> orig.txt; echo leak > leaked.txt"
     ]).await;
     match result {
@@ -225,7 +225,7 @@ async fn test_seccomp_cow_relative_path_commit() {
     let workdir = temp_dir("seccomp-relpath-commit");
     fs::write(workdir.join("orig.txt"), "original\n").unwrap();
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc").fs_read("/dev")
         .fs_write(&workdir)
@@ -235,7 +235,7 @@ async fn test_seccomp_cow_relative_path_commit() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run(&policy, Some("test"), &[
+    let result = policy.clone().with_name("test").run(&[
         "sh", "-c", "echo APPENDED >> orig.txt; echo new > created.txt"
     ]).await;
     match result {
@@ -265,7 +265,7 @@ async fn test_seccomp_cow_open_directory() {
     let workdir = temp_dir("seccomp-opendir");
     let out_file = workdir.join("opendir_ok.txt");
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc").fs_read("/dev")
         .fs_write(&workdir)
@@ -286,7 +286,7 @@ async fn test_seccomp_cow_open_directory() {
         ),
         out_file.display()
     );
-    let result = Sandbox::run(&policy, Some("test"), &["sh", "-c", &script]).await;
+    let result = policy.clone().with_name("test").run(&["sh", "-c", &script]).await;
     match result {
         Ok(r) => {
             assert!(r.success(), "script should succeed, stderr: {}", r.stderr_str().unwrap_or(""));
@@ -309,7 +309,7 @@ async fn test_seccomp_cow_chdir_to_created_dir() {
     let workdir = temp_dir("seccomp-chdir");
     let out_file = workdir.join("chdir_ok.txt");
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc").fs_read("/dev")
         .fs_write(&workdir)
@@ -333,7 +333,7 @@ async fn test_seccomp_cow_chdir_to_created_dir() {
         ),
         out_file.display()
     );
-    let result = Sandbox::run(&policy, Some("test"), &["sh", "-c", &script]).await;
+    let result = policy.clone().with_name("test").run(&["sh", "-c", &script]).await;
     match result {
         Ok(r) => {
             assert!(r.success(), "script should succeed, stderr: {}", r.stderr_str().unwrap_or(""));
@@ -364,7 +364,7 @@ async fn test_seccomp_cow_legacy_open_syscall() {
         "sandlock-test-legacy-open-{}", std::process::id()
     ));
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc").fs_read("/dev")
         .fs_write(&workdir).fs_write("/tmp")
@@ -396,7 +396,7 @@ async fn test_seccomp_cow_legacy_open_syscall() {
         "    open('{out}', 'w').write(f'FAILED:errno={{err}}')\n",
     ), wd = workdir.display(), out = out_file.display());
 
-    let result = Sandbox::run(&policy, Some("test"), &["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().with_name("test").run(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}, stderr={}", result.code(), result.stderr_str().unwrap_or(""));
     let content = fs::read_to_string(&out_file).unwrap_or_default();
     assert_eq!(content, "created via raw open", "raw open ABI should work with COW");
@@ -422,7 +422,7 @@ async fn test_seccomp_cow_excl_after_unlink() {
     ));
     fs::write(workdir.join("target.txt"), "original").unwrap();
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc").fs_read("/dev")
         .fs_write(&workdir).fs_write("/tmp")
@@ -455,7 +455,7 @@ async fn test_seccomp_cow_excl_after_unlink() {
         "    open('{out}', 'w').write(f'OPEN_FAILED:{{err}}')\n",
     ), wd = workdir.display(), out = out_file.display());
 
-    let result = Sandbox::run(&policy, Some("test"), &["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().with_name("test").run(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}, stderr={}", result.code(), result.stderr_str().unwrap_or(""));
     let content = fs::read_to_string(&out_file).unwrap_or_default();
     assert_eq!(content, "OK", "O_EXCL after unlink should succeed, got: {}", content);
@@ -473,7 +473,7 @@ async fn test_seccomp_cow_read_existing() {
     let workdir = temp_dir("seccomp-read");
     fs::write(workdir.join("data.txt"), "hello world").unwrap();
 
-    let policy = Policy::builder()
+    let policy = Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc")
         .fs_write(&workdir)
@@ -488,7 +488,7 @@ async fn test_seccomp_cow_read_existing() {
         workdir.join("data.txt").display(),
         out_file.display()
     );
-    let result = Sandbox::run(&policy, Some("test"), &["sh", "-c", &cmd]).await;
+    let result = policy.clone().with_name("test").run(&["sh", "-c", &cmd]).await;
     match result {
         Ok(r) => {
             assert!(r.success(), "cat should succeed");
