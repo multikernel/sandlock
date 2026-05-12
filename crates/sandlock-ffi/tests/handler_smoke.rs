@@ -161,3 +161,70 @@ fn handler_new_rejects_invalid_exception_policy() {
     };
     assert!(h.is_null(), "expected null handle on invalid on_exception");
 }
+
+use sandlock_core::seccomp::dispatch::{Handler, HandlerCtx};
+use sandlock_core::seccomp::notif::NotifAction;
+use sandlock_core::{SeccompData, SeccompNotif};
+use sandlock_ffi::handler::FfiHandler;
+
+fn fake_ctx() -> HandlerCtx {
+    HandlerCtx {
+        notif: SeccompNotif {
+            id: 1, pid: std::process::id(), flags: 0,
+            data: SeccompData { nr: 39, arch: 0xC000003E,
+                                instruction_pointer: 0, args: [0; 6] },
+        },
+        notif_fd: -1,
+    }
+}
+
+extern "C" fn return_value_42(
+    _ud: *mut std::ffi::c_void,
+    _notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
+    _mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
+    out: *mut sandlock_ffi::handler::sandlock_action_out_t,
+) -> i32 {
+    unsafe { sandlock_ffi::handler::sandlock_action_set_return_value(out, 42) };
+    0
+}
+
+extern "C" fn returns_error_with_unset_action(
+    _ud: *mut std::ffi::c_void,
+    _notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
+    _mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
+    _out: *mut sandlock_ffi::handler::sandlock_action_out_t,
+) -> i32 {
+    -1
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ffi_handler_translates_return_value() {
+    let raw = unsafe {
+        sandlock_ffi::handler::sandlock_handler_new(
+            Some(return_value_42),
+            std::ptr::null_mut(),
+            None,
+            sandlock_exception_policy_t::Kill as u32,
+        )
+    };
+    let h = unsafe { FfiHandler::from_raw(raw) };
+    let cx = fake_ctx();
+    let action = h.handle(&cx).await;
+    assert!(matches!(action, NotifAction::ReturnValue(42)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ffi_handler_applies_exception_policy_on_failure() {
+    let raw = unsafe {
+        sandlock_ffi::handler::sandlock_handler_new(
+            Some(returns_error_with_unset_action),
+            std::ptr::null_mut(),
+            None,
+            sandlock_exception_policy_t::DenyEperm as u32,
+        )
+    };
+    let h = unsafe { FfiHandler::from_raw(raw) };
+    let cx = fake_ctx();
+    let action = h.handle(&cx).await;
+    assert!(matches!(action, NotifAction::Errno(e) if e == libc::EPERM));
+}
