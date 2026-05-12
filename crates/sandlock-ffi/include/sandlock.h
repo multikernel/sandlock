@@ -210,6 +210,35 @@ void sandlock_action_set_inject_fd_send_tracked(sandlock_action_out_t *out,
 void sandlock_action_set_hold(sandlock_action_out_t *out);
 void sandlock_action_set_kill(sandlock_action_out_t *out, int32_t sig, int32_t pgid);
 
+typedef enum sandlock_exception_policy {
+    SANDLOCK_EXCEPTION_KILL       = 0,
+    SANDLOCK_EXCEPTION_DENY_EPERM = 1,
+    SANDLOCK_EXCEPTION_CONTINUE   = 2,
+} sandlock_exception_policy_t;
+
+typedef struct sandlock_handler_t sandlock_handler_t;
+
+/** C handler signature. Return 0 on success; a non-zero return triggers
+ *  the handler's exception policy. The callee MUST call exactly one
+ *  sandlock_action_set_*() on `out` before returning 0. */
+typedef int (*sandlock_handler_fn_t)(void *ud,
+                                     const sandlock_notif_data_t *notif,
+                                     sandlock_mem_handle_t *mem,
+                                     sandlock_action_out_t *out);
+
+typedef void (*sandlock_handler_ud_drop_t)(void *ud);
+
+/** Allocate a handler container. Returns NULL when `handler_fn` is NULL
+ *  or when `on_exception` is not one of the documented `SANDLOCK_EXCEPTION_*`
+ *  values. */
+sandlock_handler_t *sandlock_handler_new(sandlock_handler_fn_t handler_fn,
+                                         void *ud,
+                                         sandlock_handler_ud_drop_t ud_drop,
+                                         sandlock_exception_policy_t on_exception);
+
+/** Free a handler container that has not been handed to the supervisor. */
+void sandlock_handler_free(sandlock_handler_t *h);
+
 #ifdef __cplusplus
 }
 #endif

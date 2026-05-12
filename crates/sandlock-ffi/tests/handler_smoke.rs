@@ -110,3 +110,54 @@ fn action_out_layout_is_stable() {
     assert_eq!(std::mem::size_of::<sandlock_action_out_t>(), 24);
     assert_eq!(std::mem::align_of::<sandlock_action_out_t>(), 8);
 }
+
+use sandlock_ffi::handler::{
+    sandlock_exception_policy_t, sandlock_handler_free, sandlock_handler_fn_t,
+    sandlock_handler_new, sandlock_handler_t,
+};
+
+extern "C" fn test_handler(
+    _ud: *mut std::ffi::c_void,
+    _notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
+    _mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
+    out: *mut sandlock_ffi::handler::sandlock_action_out_t,
+) -> i32 {
+    unsafe { sandlock_ffi::handler::sandlock_action_set_continue(out) };
+    0
+}
+
+extern "C" fn dropper(ud: *mut std::ffi::c_void) {
+    // Reconstitute the Box we leaked in the test below.
+    unsafe { drop(Box::from_raw(ud as *mut u32)); }
+}
+
+#[test]
+fn handler_new_and_free_round_trip() {
+    let ud = Box::into_raw(Box::new(0xABCDu32)) as *mut std::ffi::c_void;
+    let on_ex = sandlock_exception_policy_t::Kill as u32;
+    let h: *mut sandlock_handler_t = unsafe {
+        sandlock_handler_new(
+            Some(test_handler as sandlock_handler_fn_t),
+            ud,
+            Some(dropper),
+            on_ex,
+        )
+    };
+    assert!(!h.is_null());
+    unsafe { sandlock_handler_free(h) };
+    // `dropper` runs and frees the Box; if it does not, leak-sanitizer
+    // (when enabled) will flag this test.
+}
+
+#[test]
+fn handler_new_rejects_invalid_exception_policy() {
+    let h = unsafe {
+        sandlock_handler_new(
+            Some(test_handler as sandlock_handler_fn_t),
+            std::ptr::null_mut(),
+            None,
+            99u32, // out of range
+        )
+    };
+    assert!(h.is_null(), "expected null handle on invalid on_exception");
+}

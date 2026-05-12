@@ -298,3 +298,133 @@ pub unsafe extern "C" fn sandlock_action_set_kill(
     (*out).kind = sandlock_action_kind_t::Kill as u32;
     (*out).payload.kill = sandlock_action_kill_t { sig, pgid };
 }
+
+/// Exception policy applied when the handler callback fails to set a
+/// valid action (returns non-zero rc, leaves `kind == Unset`, or panics
+/// across the FFI boundary).
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub enum sandlock_exception_policy_t {
+    /// Treat the failure as `NotifAction::Kill { sig: SIGKILL, pgid: child_pgid }`.
+    /// Default; "fail-closed" — the safe option.
+    Kill = 0,
+    /// Treat the failure as `NotifAction::Errno(EPERM)`. Useful for
+    /// audit-style handlers where the syscall is what failed rather than
+    /// the supervisor.
+    DenyEperm = 1,
+    /// Treat the failure as `NotifAction::Continue`. Explicit fail-open;
+    /// only safe when the syscall is *also* allowed by the BPF filter and
+    /// Landlock layer (e.g. observability handlers).
+    Continue = 2,
+}
+
+/// C-callable handler entry point.
+///
+/// Returns 0 on success (and must have called exactly one setter on
+/// `out`). Returns non-zero to signal a handler-internal error; the
+/// supervisor then applies the configured exception policy.
+#[allow(non_camel_case_types)]
+pub type sandlock_handler_fn_t = extern "C" fn(
+    ud: *mut std::ffi::c_void,
+    notif: *const crate::notif_repr::sandlock_notif_data_t,
+    mem: *mut sandlock_mem_handle_t,
+    out: *mut sandlock_action_out_t,
+) -> i32;
+
+/// Optional destructor invoked when the container is freed.
+#[allow(non_camel_case_types)]
+pub type sandlock_handler_ud_drop_t = extern "C" fn(ud: *mut std::ffi::c_void);
+
+/// Opaque handler container (B4 — opaque box).
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct sandlock_handler_t {
+    pub(crate) handler_fn: Option<sandlock_handler_fn_t>,
+    pub(crate) ud: *mut std::ffi::c_void,
+    pub(crate) ud_drop: Option<sandlock_handler_ud_drop_t>,
+    pub(crate) on_exception: sandlock_exception_policy_t,
+}
+
+// Safety:
+//
+// `Send`: required so the supervisor can move the handler container into a
+// `tokio::task::spawn_blocking` closure. The struct contains only pointers
+// (function pointer + `void*` user-data) and a `#[repr(u32)]` enum, all of
+// which are `Send`-safe to move across threads.
+//
+// `Sync`: required so `sandlock_handler_t` can live inside the
+// `Arc<dyn Handler>` storage that the dispatch table uses. This is a
+// stronger claim than `Send` — the supervisor may dispatch concurrent
+// notifications for the same syscall on different worker threads, meaning
+// the same `&sandlock_handler_t` (and the same `ud` pointer) may be read
+// from multiple threads at the same time. The C caller is responsible for
+// ensuring `ud` is either immutable or guarded by thread-safe state of its
+// own (atomics, mutex, etc.) — Rust offers no synchronization for opaque
+// `void*` user-data.
+unsafe impl Send for sandlock_handler_t {}
+unsafe impl Sync for sandlock_handler_t {}
+
+impl Drop for sandlock_handler_t {
+    fn drop(&mut self) {
+        if let Some(drop_fn) = self.ud_drop.take() {
+            if !self.ud.is_null() {
+                (drop_fn)(self.ud);
+                self.ud = std::ptr::null_mut();
+            }
+        }
+    }
+}
+
+/// Allocate a handler container. `handler_fn` must be non-null; passing
+/// `ud_drop = None` is legal when `ud` does not require cleanup.
+///
+/// # Safety
+/// `ud` is opaque to Rust — the caller guarantees that the pointer
+/// remains valid until either (a) `sandlock_handler_free` is called or
+/// (b) the supervisor takes ownership via `sandlock_run_with_handlers`
+/// and the run completes.
+/// If `on_exception` does not match a defined `sandlock_exception_policy_t`
+/// discriminant (0, 1, or 2), the call returns null and no allocation occurs.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_handler_new(
+    handler_fn: Option<sandlock_handler_fn_t>,
+    ud: *mut std::ffi::c_void,
+    ud_drop: Option<sandlock_handler_ud_drop_t>,
+    on_exception: u32,
+) -> *mut sandlock_handler_t {
+    if handler_fn.is_none() {
+        return std::ptr::null_mut();
+    }
+    let on_exception = match on_exception {
+        0 => sandlock_exception_policy_t::Kill,
+        1 => sandlock_exception_policy_t::DenyEperm,
+        2 => sandlock_exception_policy_t::Continue,
+        // Reject out-of-range discriminants at the FFI boundary so we never
+        // store an invalid enum value into the struct — reading one later
+        // via `match` would be undefined behaviour.
+        _ => return std::ptr::null_mut(),
+    };
+    let h = Box::new(sandlock_handler_t {
+        handler_fn,
+        ud,
+        ud_drop,
+        on_exception,
+    });
+    Box::into_raw(h)
+}
+
+/// Free a handler container that has *not* been registered with a
+/// sandbox. After successful registration the supervisor owns the
+/// handler; calling this on a registered handler is undefined behaviour
+/// (the supervisor's later free would double-free).
+///
+/// # Safety
+/// `h` must be either null or a pointer previously returned by
+/// `sandlock_handler_new` that has not yet been registered with the
+/// supervisor and has not already been freed.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_handler_free(h: *mut sandlock_handler_t) {
+    if h.is_null() { return; }
+    drop(Box::from_raw(h));
+}
