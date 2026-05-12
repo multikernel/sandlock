@@ -118,6 +118,22 @@ sandlock_result_t *sandlock_pipeline_run(sandlock_pipeline_t *pipe, uint64_t tim
 
 void sandlock_pipeline_free(sandlock_pipeline_t *pipe);
 
+/* ----------------------------------------------------------------
+ * Handler ABI — extension handlers for seccomp-notif syscalls.
+ * ---------------------------------------------------------------- */
+
+/** Snapshot of a kernel seccomp notification. Field layout must stay
+ *  in lock-step with `sandlock_ffi::notif_repr::sandlock_notif_data_t`. */
+typedef struct sandlock_notif_data_t {
+    uint64_t id;
+    uint32_t pid;
+    uint32_t flags;
+    int32_t  syscall_nr;
+    uint32_t arch;
+    uint64_t instruction_pointer;
+    uint64_t args[6];
+} sandlock_notif_data_t;
+
 #ifdef __cplusplus
 }
 #endif
