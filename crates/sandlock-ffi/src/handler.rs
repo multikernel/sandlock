@@ -269,8 +269,10 @@ pub unsafe extern "C" fn sandlock_action_set_hold(out: *mut sandlock_action_out_
     (*out).kind = sandlock_action_kind_t::Hold as u32;
 }
 
-/// Kill the target (`pgid > 0` for the whole process group, or the pid
-/// the supervisor records for the notification) with signal `sig`.
+/// Kill the target with signal `sig`. Pass `pgid > 0` to target an
+/// explicit process group; `pgid == 0` is a sentinel — the supervisor
+/// substitutes the child process group id resolved via `getpgid(pid)`
+/// on the notification's pid.
 ///
 /// # Safety
 /// Same constraints as `sandlock_action_set_continue`.
@@ -483,9 +485,19 @@ impl Handler for FfiHandler {
         let notif_fd = cx.notif_fd;
         let notif_id = cx.notif.id;
         let pid = cx.notif.pid;
-        let child_pgid = cx.notif.pid as i32; // best-effort placeholder;
-                                              // a future release plumbs
-                                              // the real child pgid in.
+        // Query the kernel for the child's real process-group id. The supervisor
+        // catches the notification synchronously, so the child is still alive at
+        // this point. `getpgid` returns -1 on ESRCH (child exited between notif
+        // and our query) — fall back to the child's pid in that case so a
+        // downstream Kill action has at least one valid target even if the
+        // process is already a zombie.
+        let child_pgid = {
+            let pid = cx.notif.pid as i32;
+            // SAFETY: `getpgid` is signal-safe and async-safe; no preconditions
+            // beyond passing a valid pid.
+            let pgid = unsafe { libc::getpgid(pid) };
+            if pgid < 0 { pid } else { pgid }
+        };
         let handler_fn = self.inner.handler_fn;
         let ud = UdPtr(self.inner.ud);
         let on_exception_fallback = self.exception_action(child_pgid);

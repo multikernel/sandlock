@@ -217,9 +217,9 @@ void sandlock_action_set_inject_fd_send(sandlock_action_out_t *out,
  * through the handler's exception policy. */
 void sandlock_action_set_hold(sandlock_action_out_t *out);
 /** Kill action setter. `pgid == 0` is a sentinel — the supervisor
- *  substitutes the child process's own pid as a best-effort pgid
- *  while the real-pgid wiring is being completed. To target a
- *  specific group, pass an explicit non-zero pgid. */
+ *  substitutes the child process group id (resolved via getpgid(pid)
+ *  on the notification's pid). To target a specific group, pass an
+ *  explicit non-zero pgid. */
 void sandlock_action_set_kill(sandlock_action_out_t *out, int32_t sig, int32_t pgid);
 
 typedef enum sandlock_exception_policy {

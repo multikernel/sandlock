@@ -531,6 +531,35 @@ async fn ffi_handler_translates_kill_with_explicit_pgid() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ffi_handler_translates_kill_zero_pgid_substitutes_child_pgid() {
+    // Spawn a real child so that getpgid(child.pid) is the test runner's
+    // pgid — distinct from child.pid (a fresh pid). This makes the test a
+    // genuine regression hook for the substitution: buggy production code
+    // that returns notif.pid would yield child.pid, but the production
+    // formula (getpgid(notif.pid)) yields the test runner's pgid. The
+    // mismatch causes the assertion to fail under the bug.
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep child");
+    let child_pid = child.id() as i32;
+    // Compute the expected pgid the same way production does. If `sleep`
+    // exited or was reaped between spawn and this call, fall back to the
+    // pid to mirror production's ESRCH branch.
+    let expected_pgid = {
+        // SAFETY: same as the production call — no preconditions.
+        let q = unsafe { libc::getpgid(child_pid) };
+        if q < 0 { child_pid } else { q }
+    };
+    // Sanity-check that this host actually exposes a meaningful pgid !=
+    // pid for the spawned child. Otherwise the assertion below is
+    // satisfied by both the buggy and fixed implementations, making the
+    // test useless on this host.
+    assert_ne!(
+        expected_pgid, child_pid,
+        "test precondition: getpgid(child_pid) must differ from child_pid for this test to catch regressions; \
+         got pgid={expected_pgid}, pid={child_pid}",
+    );
+
     let raw = unsafe {
         sandlock_ffi::handler::sandlock_handler_new(
             Some(handler_set_kill_sigkill_zero_pgid),
@@ -541,14 +570,34 @@ async fn ffi_handler_translates_kill_zero_pgid_substitutes_child_pgid() {
     };
     // Safety: see `ffi_handler_translates_continue`.
     let h = unsafe { FfiHandler::from_raw(raw) };
-    let cx = fake_ctx();
-    let expected_pgid = cx.notif.pid as i32;
+    let cx = HandlerCtx {
+        notif: SeccompNotif {
+            id: 1,
+            pid: child_pid as u32,
+            flags: 0,
+            data: SeccompData {
+                nr: 39,
+                arch: 0xC000_003E,
+                instruction_pointer: 0,
+                args: [0; 6],
+            },
+        },
+        notif_fd: -1,
+    };
     let action = h.handle(&cx).await;
-    assert!(matches!(
-        action,
-        NotifAction::Kill { sig, pgid }
-            if sig == libc::SIGKILL && pgid == expected_pgid
-    ));
+
+    // Reap the child regardless of assertion outcome.
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        matches!(
+            action,
+            NotifAction::Kill { sig, pgid }
+                if sig == libc::SIGKILL && pgid == expected_pgid
+        ),
+        "expected Kill {{ sig: SIGKILL, pgid: {expected_pgid} }}, got {action:?}",
+    );
 }
 
 // ---- Group C: exception policy fallbacks --------------------------------
