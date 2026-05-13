@@ -14,12 +14,14 @@
 //!   delete <id>              →  cleanup state dir, kill Supervisor/Child
 //! ```
 
+mod policy;
 mod spec;
 mod state;
 mod supervisor;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use serde::{Deserialize, Serialize};
 use state::{ContainerState, Status};
 use std::path::PathBuf;
 
@@ -100,34 +102,23 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        // ── create ───────────────────────────────────────────────────────────
         Command::Create { id, bundle, pid_file, console_socket: _ } => {
             cmd_create(&id, &bundle, pid_file.as_deref())?;
         }
-
-        // ── start ────────────────────────────────────────────────────────────
         Command::Start { id } => {
             cmd_start(&id)?;
         }
-
-        // ── state ────────────────────────────────────────────────────────────
         Command::State { id } => {
             let state = ContainerState::load(&id)
                 .with_context(|| format!("no such container: {}", id))?;
             println!("{}", serde_json::to_string_pretty(&state)?);
         }
-
-        // ── kill ─────────────────────────────────────────────────────────────
         Command::Kill { id, signal, all } => {
             cmd_kill(&id, &signal, all)?;
         }
-
-        // ── delete ───────────────────────────────────────────────────────────
         Command::Delete { id, force } => {
             cmd_delete(&id, force)?;
         }
-
-        // ── list ─────────────────────────────────────────────────────────────
         Command::List => {
             let ids = state::list_containers()?;
             if ids.is_empty() {
@@ -141,15 +132,17 @@ fn main() -> Result<()> {
                 }
             }
         }
-
-        // ── check ────────────────────────────────────────────────────────────
         Command::Check => {
             match sandlock_core::landlock_abi_version() {
                 Ok(v) => {
                     println!("Landlock ABI: v{}", v);
                     println!(
                         "Status: {}",
-                        if v >= sandlock_core::MIN_LANDLOCK_ABI { "OK" } else { "UNSUPPORTED" }
+                        if v >= sandlock_core::MIN_LANDLOCK_ABI {
+                            "OK"
+                        } else {
+                            "UNSUPPORTED"
+                        }
                     );
                 }
                 Err(e) => {
@@ -164,15 +157,13 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-// ── Command implementations ──────────────────────────────────────────────────
-
 /// `sandlock-oci create <id> -b <bundle>`
 ///
 /// 1. Parse OCI config.json from the bundle.
-/// 2. Map spec to sandlock Policy.
+/// 2. Map spec to an OciPolicy.
 /// 3. Save initial `Created` state.
-/// 4. Fork a Supervisor process (daemonized) which in turn forks the Child
-///    and parks it with SIGSTOP.
+/// 4. Fork a Supervisor (double-fork daemon) which forks the Child.
+/// 5. Child is SIGSTOP'd; supervisor writes PID to CLI via pipe (no sleep/race).
 fn cmd_create(id: &str, bundle: &PathBuf, pid_file: Option<&std::path::Path>) -> Result<()> {
     let bundle = bundle
         .canonicalize()
@@ -180,29 +171,51 @@ fn cmd_create(id: &str, bundle: &PathBuf, pid_file: Option<&std::path::Path>) ->
 
     // Load and validate spec
     let spec = spec::load_spec(&bundle)?;
-    let _builder = spec::spec_to_policy(&spec, &bundle)?;
+    let policy = spec::spec_to_policy(&spec, &bundle)?;
 
-    // Extract the command from the spec
+    // Extract the command from the spec — OCI requires non-empty args
     let cmd_args: Vec<String> = spec
         .process()
         .as_ref()
         .and_then(|p| p.args().clone())
-        .unwrap_or_else(|| vec!["sh".to_string()]);
+        .filter(|args| !args.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "OCI spec process.args is empty; cannot create container without a command"
+            )
+        })?;
 
     // Create initial state
     let state = ContainerState::new(id, &bundle, spec.version());
     state.save().with_context(|| format!("save state for container {}", id))?;
 
-    // Daemonize the supervisor into a background process.
-    // We double-fork so the supervisor is fully detached from the caller's
-    // process group (containerd / nerdctl don't want to wait for it).
+    // ── Pipe for synchronous PID notification ────────────────────────────────
+    // Supervisor writes the child PID here immediately after forking, so the
+    // parent can read it without sleeping or racing.
+    let mut pid_pipe: [i32; 2] = [0; 2];
+    unsafe {
+        if libc::pipe2(pid_pipe.as_mut_ptr(), libc::O_CLOEXEC) < 0 {
+            bail!("pipe2 failed: {}", std::io::Error::last_os_error());
+        }
+    }
+    let read_fd = pid_pipe[0];
+    let write_fd = pid_pipe[1];
+
+    // ── Double-fork daemonization ────────────────────────────────────────────
     let pid = unsafe { libc::fork() };
     if pid < 0 {
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
         bail!("fork failed: {}", std::io::Error::last_os_error());
     }
 
     if pid == 0 {
-        // ===== INTERMEDIATE CHILD (will become supervisor) =====
+        // ===== INTERMEDIATE CHILD (becomes daemon, then forks supervisor) =====
+
+        // Close read end — parent reads the PID
+        unsafe { libc::close(read_fd); }
 
         // Detach from the parent's session so we survive the parent exiting.
         unsafe { libc::setsid() };
@@ -210,50 +223,81 @@ fn cmd_create(id: &str, bundle: &PathBuf, pid_file: Option<&std::path::Path>) ->
         // Second fork to fully orphan the supervisor.
         let pid2 = unsafe { libc::fork() };
         if pid2 < 0 {
-            unsafe { libc::_exit(1) };
+            unsafe {
+                libc::close(write_fd);
+                libc::_exit(1);
+            }
         }
         if pid2 != 0 {
-            // Intermediate child exits immediately.
-            unsafe { libc::_exit(0) };
+            // Intermediate child — close write end and exit immediately.
+            unsafe {
+                libc::close(write_fd);
+                libc::_exit(0);
+            }
         }
 
-        // ===== SUPERVISOR PROCESS =====
+        // ===== SUPERVISOR PROCESS (grandchild) =====
+
+        // Close the read end (inherited from intermediate, not needed here)
+        unsafe { libc::close(read_fd); }
 
         // Redirect stdout/stderr to /dev/null to avoid polluting the caller.
         unsafe {
-            let devnull = libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_RDWR);
+            let devnull = libc::open(
+                b"/dev/null\0".as_ptr() as *const libc::c_char,
+                libc::O_RDWR,
+            );
             if devnull >= 0 {
                 libc::dup2(devnull, 0);
                 libc::dup2(devnull, 1);
                 libc::dup2(devnull, 2);
-                if devnull > 2 { libc::close(devnull); }
+                if devnull > 2 {
+                    libc::close(devnull);
+                }
             }
         }
 
-        // Build a minimal policy for the supervisor-managed child.
-        // The full policy mapping is applied when sandlock runs the actual process.
-        let policy = sandlock_core::Policy::builder()
-            .build()
-            .unwrap_or_else(|_| {
-                sandlock_core::Policy::builder().build().expect("minimal policy")
-            });
-
-        let _ = supervisor::run_supervisor(id, &cmd_args, policy);
-        unsafe { libc::_exit(0) };
+        let _ = supervisor::run_supervisor(id, &cmd_args, policy, write_fd);
+        unsafe {
+            libc::close(write_fd);
+            libc::_exit(0);
+        }
     }
 
     // ===== ORIGINAL PROCESS (caller) =====
-    // Wait for the intermediate child so we don't leave a zombie.
-    let mut status = 0i32;
-    unsafe { libc::waitpid(pid, &mut status, 0) };
 
-    // Give the supervisor a moment to start and update the state.
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    // Close unused write end — only the supervisor writes
+    unsafe { libc::close(write_fd) };
+
+    // Wait for the intermediate child so we don't leave a zombie.
+    let mut wstatus = 0i32;
+    unsafe { libc::waitpid(pid, &mut wstatus, 0) };
+
+    // Read the child PID from the pipe — blocks until the supervisor writes it.
+    let child_pid = {
+        let mut buf = [0u8; 32];
+        let n = unsafe {
+            libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+        };
+        unsafe { libc::close(read_fd) };
+        if n > 0 {
+            let s = String::from_utf8_lossy(&buf[..n as usize]);
+            s.trim().parse::<i32>().unwrap_or(0)
+        } else {
+            0
+        }
+    };
+
+    // Update the state file with the actual PID.
+    if child_pid > 0 {
+        let mut state = ContainerState::load(id)?;
+        state.set_created(child_pid);
+        state.save()?;
+    }
 
     // Write pid-file if requested (CRI-O / containerd expect this)
     if let Some(pf) = pid_file {
-        let state = ContainerState::load(id)?;
-        std::fs::write(pf, state.pid.to_string())
+        std::fs::write(pf, child_pid.to_string())
             .with_context(|| format!("write pid file {:?}", pf))?;
     }
 
@@ -290,7 +334,11 @@ fn cmd_kill(id: &str, signal: &str, all: bool) -> Result<()> {
         .with_context(|| format!("no such container: {}", id))?;
 
     if state.pid <= 0 {
-        bail!("container {} has no PID (status: {})", id, state.status);
+        bail!(
+            "container {} has no PID (status: {})",
+            id,
+            state.status
+        );
     }
 
     let signum = parse_signal(signal)?;
@@ -318,17 +366,11 @@ fn cmd_kill(id: &str, signal: &str, all: bool) -> Result<()> {
 fn cmd_delete(id: &str, force: bool) -> Result<()> {
     let state = match ContainerState::load(id) {
         Ok(s) => s,
-        Err(_) => {
-            // Already gone — that's OK.
-            return Ok(());
-        }
+        Err(_) => return Ok(()),
     };
 
     if state.status == Status::Running && !force {
-        bail!(
-            "container {} is still running; use --force or kill it first",
-            id
-        );
+        bail!("container {} is still running; use --force or kill it first", id);
     }
 
     // Kill if still alive.
@@ -359,8 +401,8 @@ fn parse_signal(s: &str) -> Result<i32> {
     let s_up = s.to_uppercase();
     let name = s_up.strip_prefix("SIG").unwrap_or(&s_up);
     let sig = match name {
-        "HUP"  => libc::SIGHUP,
-        "INT"  => libc::SIGINT,
+        "HUP" => libc::SIGHUP,
+        "INT" => libc::SIGINT,
         "QUIT" => libc::SIGQUIT,
         "KILL" => libc::SIGKILL,
         "TERM" => libc::SIGTERM,
@@ -368,7 +410,7 @@ fn parse_signal(s: &str) -> Result<i32> {
         "CONT" => libc::SIGCONT,
         "USR1" => libc::SIGUSR1,
         "USR2" => libc::SIGUSR2,
-        other  => bail!("unknown signal: {}", other),
+        other => bail!("unknown signal: {}", other),
     };
     Ok(sig)
 }

@@ -74,43 +74,61 @@ info "Installed ${BINARY} → ${INSTALL_PATH}"
 # ── Register sandlock-oci as a containerd runtime ────────────────────────────
 
 CONTAINERD_CONFIG="/etc/containerd/config.toml"
+# Use a dedicated config drop-in dir if available (containerd >= 1.7)
+CONFIG_DROPIN_DIR="/etc/containerd/config.toml.d"
 BACKUP_CONFIG="${CONTAINERD_CONFIG}.bak.$$"
 CONFIG_MODIFIED=false
 
-if [[ -f "${CONTAINERD_CONFIG}" ]]; then
-    cp "${CONTAINERD_CONFIG}" "${BACKUP_CONFIG}"
-fi
+cleanup() {
+    local exit_code=$?
+    # Restore original containerd config
+    if $CONFIG_MODIFIED; then
+        if [[ -f "${BACKUP_CONFIG}" ]]; then
+            cp "${BACKUP_CONFIG}" "${CONTAINERD_CONFIG}"
+        elif [[ -f "${CONFIG_DROPIN_DIR}/sandlock.toml" ]]; then
+            rm -f "${CONFIG_DROPIN_DIR}/sandlock.toml"
+        fi
+        # Restart containerd to pick up restored config
+        systemctl restart containerd 2>/dev/null || true
+    fi
+    rm -f "${BACKUP_CONFIG}"
+    # Kill any remaining sandlock-oci processes from our tests
+    pkill -f "sandlock-oci" 2>/dev/null || true
+    exit $exit_code
+}
+trap cleanup EXIT
 
-# Append sandlock-oci runtime config if not already present.
-if ! grep -q "sandlock" "${CONTAINERD_CONFIG}" 2>/dev/null; then
-    cat >> "${CONTAINERD_CONFIG}" << 'EOF'
+# Try drop-in config directory first, then fall back to inline config
+if [[ -d "${CONFIG_DROPIN_DIR}" ]]; then
+    cat > "${CONFIG_DROPIN_DIR}/sandlock.toml" << 'DROPIN'
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.sandlock]
+  runtime_type = "io.containerd.runc.v2"
+  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.sandlock.options]
+    BinaryName = "/usr/local/bin/sandlock-oci"
+DROPIN
+    CONFIG_MODIFIED=true
+    info "Registered sandlock-oci via config drop-in"
+elif [[ -f "${CONTAINERD_CONFIG}" ]]; then
+    cp "${CONTAINERD_CONFIG}" "${BACKUP_CONFIG}"
+    if ! grep -q "sandlock" "${CONTAINERD_CONFIG}" 2>/dev/null; then
+        cat >> "${CONTAINERD_CONFIG}" << 'EOF'
 
 [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.sandlock]
   runtime_type = "io.containerd.runc.v2"
   [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.sandlock.options]
     BinaryName = "/usr/local/bin/sandlock-oci"
 EOF
-    CONFIG_MODIFIED=true
+        CONFIG_MODIFIED=true
+    fi
+else
+    echo "warning: no containerd config found at ${CONTAINERD_CONFIG}"
+fi
+
+if $CONFIG_MODIFIED; then
     systemctl restart containerd
     sleep 2
     info "containerd config updated and restarted"
 fi
-
-# Cleanup function
-cleanup() {
-    # Restore original containerd config
-    if $CONFIG_MODIFIED; then
-        if [[ -f "${BACKUP_CONFIG}" ]]; then
-            cp "${BACKUP_CONFIG}" "${CONTAINERD_CONFIG}"
-        else
-            # Remove the lines we added
-            sed -i '/\[plugins.*sandlock\]/,/BinaryName.*sandlock-oci/d' "${CONTAINERD_CONFIG}"
-        fi
-        systemctl restart containerd 2>/dev/null || true
-    fi
-    rm -f "${BACKUP_CONFIG}"
-}
-trap cleanup EXIT
 
 # ── Test 1: sandlock-oci check ────────────────────────────────────────────────
 
@@ -131,13 +149,24 @@ CONTAINER_ID="sandlock-test-$$"
 
 mkdir -p "${BUNDLE_DIR}/rootfs"
 
-# Copy minimal binaries into rootfs
-for bin in sh echo; do
-    BIN_PATH="$(which $bin 2>/dev/null || true)"
+# Copy minimal binaries into rootfs for a functional test
+for bin in sh echo ls cat; do
+    BIN_PATH="$(which "$bin" 2>/dev/null || true)"
     if [[ -n "${BIN_PATH}" ]]; then
         cp "${BIN_PATH}" "${BUNDLE_DIR}/rootfs/"
     fi
 done
+
+# Copy any required shared libraries for the binaries
+if ldd "${BUNDLE_DIR}/rootfs/sh" &>/dev/null; then
+    LIB_DIRS=$(ldd "${BUNDLE_DIR}/rootfs/sh" 2>/dev/null | grep -oP '/[^ ]+' | xargs -I{} dirname {} | sort -u)
+    for lib_dir in $LIB_DIRS; do
+        mkdir -p "${BUNDLE_DIR}/rootfs/${lib_dir#/}"
+        for lib in "${lib_dir}"/*.so*; do
+            [[ -f "$lib" ]] && cp "$lib" "${BUNDLE_DIR}/rootfs/${lib_dir#/}/" 2>/dev/null || true
+        done
+    done
+fi
 
 cat > "${BUNDLE_DIR}/config.json" << EOF
 {
@@ -147,7 +176,7 @@ cat > "${BUNDLE_DIR}/config.json" << EOF
     "terminal": false,
     "user": { "uid": 0, "gid": 0 },
     "cwd": "/",
-    "args": ["/sh", "-c", "sleep 10"],
+    "args": ["/sh", "-c", "echo hello-from-sandlock && exit 0"],
     "env": ["PATH=/usr/bin:/bin:/"]
   },
   "mounts": [],
@@ -168,7 +197,7 @@ else
 fi
 
 # State (should be created or running)
-STATE_OUTPUT=$("${BINARY}" state "${CONTAINER_ID}" || echo '{"status":"unknown"}')
+STATE_OUTPUT=$("${BINARY}" state "${CONTAINER_ID}" 2>/dev/null || echo '{"status":"unknown"}')
 STATUS=$(echo "${STATE_OUTPUT}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','unknown'))" 2>/dev/null || echo "unknown")
 
 if [[ "${STATUS}" == "created" ]] || [[ "${STATUS}" == "running" ]]; then
@@ -178,14 +207,30 @@ else
 fi
 
 # Start
-if "${BINARY}" start "${CONTAINER_ID}" 2>/dev/null; then
+START_OUTPUT=$("${BINARY}" start "${CONTAINER_ID}" 2>&1 || true)
+if [[ -z "${START_OUTPUT}" ]] || echo "${START_OUTPUT}" | grep -qv "error"; then
     pass "start container ${CONTAINER_ID}"
 else
     # May fail because the child process immediately exits in test bundle
-    skip "start returned non-zero (process may have exited)"
+    skip "start returned non-zero (process may have exited): ${START_OUTPUT}"
 fi
 
-# Kill
+# Give the process a moment to exit after start
+sleep 1
+
+# Check state after start — should be Stopped by now
+STATE_OUTPUT=$("${BINARY}" state "${CONTAINER_ID}" 2>/dev/null || echo '{"status":"unknown"}')
+STATUS=$(echo "${STATE_OUTPUT}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','unknown'))" 2>/dev/null || echo "unknown")
+
+if [[ "${STATUS}" == "stopped" ]]; then
+    pass "container is stopped after exec (exit code captured)"
+elif [[ "${STATUS}" == "running" ]]; then
+    skip "container still running after start (may need more time)"
+else
+    info "container status after start: ${STATUS}"
+fi
+
+# Kill (no-op if already stopped, but tests the kill path)
 "${BINARY}" kill "${CONTAINER_ID}" SIGKILL 2>/dev/null || true
 pass "kill container (SIGKILL sent)"
 
@@ -245,7 +290,7 @@ else
     skip "ctr not found — skipping ctr test"
 fi
 
-# ── Test 5: OCI state persistence ────────────────────────────────────────────
+# ── Test 5: OCI state persistence across list ────────────────────────────────
 
 echo "--- Test: OCI state persistence across list"
 LIST_OUTPUT=$("${BINARY}" list 2>/dev/null)

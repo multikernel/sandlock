@@ -8,7 +8,15 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Default state directory root — matches the OCI runtime spec.
+///
+/// Can be overridden at runtime with the `SANDLOCK_OCI_STATE_DIR` environment
+/// variable (useful for integration tests that don't run as root).
 pub const STATE_DIR: &str = "/run/sandlock-oci";
+
+/// Return the effective state directory, respecting the env override.
+pub fn state_dir() -> String {
+    std::env::var("SANDLOCK_OCI_STATE_DIR").unwrap_or_else(|_| STATE_DIR.to_string())
+}
 
 /// OCI container status as defined by the runtime spec.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +61,41 @@ pub struct ContainerState {
     /// Optional annotations from the OCI spec.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub annotations: std::collections::HashMap<String, String>,
+    /// Exit code or signal that terminated the container.
+    /// `None` while the container is Created or Running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_info: Option<ExitInfo>,
+}
+
+/// Captures how the container's init process exited.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExitInfo {
+    /// Exit code if the process exited normally.
+    pub code: Option<i32>,
+    /// Signal number if the process was killed by a signal.
+    pub signal: Option<i32>,
+}
+
+impl ExitInfo {
+    /// Create from a raw waitpid status value.
+    pub fn from_status(status: i32) -> Self {
+        if libc::WIFEXITED(status) {
+            ExitInfo {
+                code: Some(unsafe { libc::WEXITSTATUS(status) }),
+                signal: None,
+            }
+        } else if libc::WIFSIGNALED(status) {
+            ExitInfo {
+                code: None,
+                signal: Some(unsafe { libc::WTERMSIG(status) }),
+            }
+        } else {
+            ExitInfo {
+                code: None,
+                signal: None,
+            }
+        }
+    }
 }
 
 impl ContainerState {
@@ -70,12 +113,13 @@ impl ContainerState {
             bundle: bundle.to_path_buf(),
             created,
             annotations: Default::default(),
+            exit_info: None,
         }
     }
 
     /// Path to the state directory for this container.
     pub fn state_dir(&self) -> PathBuf {
-        Path::new(STATE_DIR).join(&self.id)
+        Path::new(&state_dir()).join(&self.id)
     }
 
     /// Path to the state JSON file.
@@ -96,7 +140,7 @@ impl ContainerState {
 
     /// Load state from disk.
     pub fn load(id: &str) -> Result<Self> {
-        let path = Path::new(STATE_DIR).join(id).join("state.json");
+        let path = Path::new(&state_dir()).join(id).join("state.json");
         let data = std::fs::read_to_string(&path)
             .with_context(|| format!("read state from {:?}", path))?;
         serde_json::from_str(&data)
@@ -113,19 +157,21 @@ impl ContainerState {
         Ok(())
     }
 
-    /// Transition to Running status with the given PID.
+    /// Record the PID in Created state (SIGSTOP'd child).
     pub fn set_created(&mut self, pid: i32) {
         self.status = Status::Created;
         self.pid = pid;
     }
 
+    /// Mark the container as running.
     pub fn set_running(&mut self) {
         self.status = Status::Running;
     }
 
-    /// Transition to Stopped status.
-    pub fn set_stopped(&mut self) {
+    /// Transition to Stopped status with exit information.
+    pub fn set_stopped(&mut self, exit_info: Option<ExitInfo>) {
         self.status = Status::Stopped;
+        self.exit_info = exit_info;
     }
 
     /// Returns true if the container process is still alive.
@@ -138,14 +184,9 @@ impl ContainerState {
     }
 }
 
-/// Return a JSON string suitable for `sandlock-oci state` output.
-pub fn state_json(state: &ContainerState) -> Result<String> {
-    serde_json::to_string_pretty(state).context("serialize state")
-}
-
 /// List all container IDs currently tracked in STATE_DIR.
 pub fn list_containers() -> Result<Vec<String>> {
-    let dir = Path::new(STATE_DIR);
+    let dir = Path::new(&state_dir());
     if !dir.exists() {
         return Ok(vec![]);
     }
@@ -166,22 +207,10 @@ pub fn list_containers() -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    use std::env;
 
-    /// Override STATE_DIR for unit tests via the state_dir helper.
-    fn _make_state(id: &str, bundle: &Path, _tmp: &Path) -> ContainerState {
-        let s = ContainerState::new(id, bundle, "1.0.2");
-        // Redirect state_dir to a temp location for tests
-        let _ = s; // just verify construction
-        ContainerState {
-            oci_version: "1.0.2".into(),
-            id: id.to_string(),
-            status: Status::Created,
-            pid: 0,
-            bundle: bundle.to_path_buf(),
-            created: 0,
-            annotations: Default::default(),
-        }
+    fn _make_state(id: &str) -> ContainerState {
+        ContainerState::new(id, Path::new("/tmp"), "1.0.2")
     }
 
     #[test]
@@ -193,8 +222,7 @@ mod tests {
 
     #[test]
     fn state_roundtrip_json() {
-        let dir = tempdir().unwrap();
-        let state = ContainerState::new("test-ctr", dir.path(), "1.0.2");
+        let state = ContainerState::new("test-ctr", Path::new("/tmp"), "1.0.2");
         let json = serde_json::to_string(&state).unwrap();
         let loaded: ContainerState = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.id, "test-ctr");
@@ -203,26 +231,59 @@ mod tests {
 
     #[test]
     fn is_alive_returns_false_for_zero_pid() {
-        let dir = tempdir().unwrap();
-        let state = ContainerState::new("dead-ctr", dir.path(), "1.0.2");
+        let state = ContainerState::new("dead-ctr", Path::new("/tmp"), "1.0.2");
         assert!(!state.is_alive());
     }
 
     #[test]
-    fn set_running_updates_status() {
-        let dir = tempdir().unwrap();
-        let mut state = ContainerState::new("run-ctr", dir.path(), "1.0.2");
-        state.set_running(12345);
-        assert_eq!(state.status, Status::Running);
+    fn set_created_sets_pid() {
+        let mut state = _make_state("test");
+        state.set_created(12345);
+        assert_eq!(state.status, Status::Created);
         assert_eq!(state.pid, 12345);
     }
 
     #[test]
-    fn set_stopped_updates_status() {
-        let dir = tempdir().unwrap();
-        let mut state = ContainerState::new("stop-ctr", dir.path(), "1.0.2");
-        state.set_running(1);
-        state.set_stopped();
+    fn set_running_updates_status() {
+        let mut state = _make_state("run-ctr");
+        state.set_created(9999);
+        state.set_running();
+        assert_eq!(state.status, Status::Running);
+        assert_eq!(state.pid, 9999);
+    }
+
+    #[test]
+    fn set_stopped_with_exit_info() {
+        let mut state = _make_state("stop-ctr");
+        state.set_created(1);
+        state.set_running();
+        let info = ExitInfo {
+            code: Some(0),
+            signal: None,
+        };
+        state.set_stopped(Some(info));
         assert_eq!(state.status, Status::Stopped);
+        assert_eq!(state.exit_info.as_ref().unwrap().code, Some(0));
+    }
+
+    #[test]
+    fn exit_info_from_status_exited() {
+        let info = ExitInfo::from_status(0 << 8); // exit code 0
+        assert_eq!(info.code, Some(0));
+        assert!(info.signal.is_none());
+    }
+
+    #[test]
+    fn exit_info_from_status_signaled() {
+        let info = ExitInfo::from_status(libc::SIGKILL); // killed by SIGKILL
+        assert!(info.code.is_none());
+        assert_eq!(info.signal, Some(libc::SIGKILL));
+    }
+
+    #[test]
+    fn state_dir_respects_env_override() {
+        env::set_var("SANDLOCK_OCI_STATE_DIR", "/tmp/sandlock-test-dir");
+        assert_eq!(state_dir(), "/tmp/sandlock-test-dir");
+        env::remove_var("SANDLOCK_OCI_STATE_DIR");
     }
 }

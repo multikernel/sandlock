@@ -18,9 +18,9 @@ fn oci_bin() -> std::path::PathBuf {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     // Use the workspace target directory.
     let workspace_root = Path::new(&manifest)
-        .parent()   // crates/
+        .parent() // crates/
         .unwrap()
-        .parent()   // workspace root
+        .parent() // workspace root
         .unwrap()
         .to_path_buf();
     workspace_root
@@ -59,7 +59,8 @@ fn create_bundle(dir: &Path, cmd: &[&str]) {
     fs::write(
         dir.join("config.json"),
         serde_json::to_string_pretty(&config).unwrap(),
-    ).unwrap();
+    )
+    .unwrap();
 }
 
 // ── spec / state unit tests (always run) ────────────────────────────────────
@@ -70,20 +71,28 @@ fn spec_load_and_policy_mapping() {
     create_bundle(dir.path(), &["sh", "-c", "exit 0"]);
 
     // Load spec via the library API.
-    let spec = sandlock_oci_test_helpers::load_spec(dir.path())
+    let spec = sandlock_oci::spec::load_spec(dir.path())
         .map_err(|e| panic!("load_spec failed: {}", e))
         .unwrap();
     assert_eq!(spec.version(), "1.0.2");
 
-    let builder = sandlock_oci_test_helpers::spec_to_policy(&spec, dir.path()).unwrap();
-    let policy = builder.build().unwrap();
+    let policy = sandlock_oci::spec::spec_to_policy(&spec, dir.path()).unwrap();
     // PATH env is forwarded
     assert!(policy.env.contains_key("PATH"));
+    // Cwd is forwarded
+    assert_eq!(policy.cwd.as_deref(), Some(Path::new("/")));
+    // Default rootfs is set
+    assert!(policy.rootfs.is_some());
 }
 
 #[test]
 fn state_created_lifecycle() {
-    use sandlock_oci_test_helpers::state::{ContainerState, Status};
+    use sandlock_oci::state::{ContainerState, Status};
+    use std::env;
+
+    // Use a temp-friendly state dir for tests
+    env::set_var("SANDLOCK_OCI_STATE_DIR", "/tmp/sandlock-oci-test-state");
+
     let dir = tempdir().unwrap();
     let mut state = ContainerState::new("test-lifecycle", dir.path(), "1.0.2");
     assert_eq!(state.status, Status::Created);
@@ -95,8 +104,44 @@ fn state_created_lifecycle() {
     state.set_running();
     assert_eq!(state.status, Status::Running);
 
-    state.set_stopped();
+    state.set_stopped(Some(sandlock_oci::state::ExitInfo {
+        code: Some(0),
+        signal: None,
+    }));
     assert_eq!(state.status, Status::Stopped);
+    assert!(state.exit_info.is_some());
+    assert_eq!(state.exit_info.as_ref().unwrap().code, Some(0));
+
+    env::remove_var("SANDLOCK_OCI_STATE_DIR");
+}
+
+#[test]
+fn state_exit_info_from_status() {
+    use libc;
+    use sandlock_oci::state::ExitInfo;
+
+    // Normal exit
+    let info = ExitInfo::from_status(0 << 8);
+    assert_eq!(info.code, Some(0));
+    assert!(info.signal.is_none());
+
+    // Signal kill
+    let info = ExitInfo::from_status(libc::SIGKILL);
+    assert!(info.code.is_none());
+    assert_eq!(info.signal, Some(libc::SIGKILL));
+}
+
+#[test]
+fn policy_from_spec_builds_sandbox() {
+    let dir = tempdir().unwrap();
+    create_bundle(dir.path(), &["sh", "-c", "exit 0"]);
+
+    let spec = sandlock_oci::spec::load_spec(dir.path()).unwrap();
+    let policy = sandlock_oci::spec::spec_to_policy(&spec, dir.path()).unwrap();
+
+    // Can convert to sandbox config
+    let sandbox = policy.to_sandbox().unwrap();
+    assert!(sandbox.chroot.is_some());
 }
 
 // ── CLI binary integration tests (require binary to be built) ────────────────
@@ -163,69 +208,4 @@ fn oci_delete_nonexistent_is_ok() {
     // Deleting a container that doesn't exist should not fail.
     let out = run_oci(&["delete", "ghost-container-xyz-99"]);
     assert!(out.status.success());
-}
-
-// ── Helpers module re-exported for test access ───────────────────────────────
-// We expose the core types through a thin helper mod.
-mod sandlock_oci_test_helpers {
-    pub use crate_spec::*;
-    pub mod state {
-        pub use super::crate_state::*;
-    }
-
-    pub mod crate_spec {
-        use std::path::Path;
-        use anyhow::Result;
-        use oci_spec::runtime::Spec;
-        use sandlock_core::policy::PolicyBuilder;
-
-        pub fn load_spec(bundle: &Path) -> Result<Spec> {
-            let config_path = bundle.join("config.json");
-            Spec::load(&config_path).map_err(|e| anyhow::anyhow!("{}", e))
-        }
-
-        pub fn spec_to_policy(spec: &Spec, bundle: &Path) -> Result<PolicyBuilder> {
-            let mut builder = PolicyBuilder::default();
-
-            if let Some(process) = spec.process() {
-                if let Some(env) = process.env() {
-                    for var in env {
-                        if let Some((key, val)) = var.split_once('=') {
-                            builder = builder.env_var(key, val);
-                        }
-                    }
-                }
-                let cwd = process.cwd();
-                if !cwd.as_os_str().is_empty() {
-                    builder = builder.cwd(cwd);
-                }
-            }
-            Ok(builder)
-        }
-    }
-
-    pub mod crate_state {
-        use serde::{Deserialize, Serialize};
-        use std::path::{Path, PathBuf};
-
-        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-        #[serde(rename_all = "lowercase")]
-        pub enum Status { Created, Running, Stopped }
-
-        #[derive(Debug, Clone, Serialize, Deserialize)]
-        pub struct ContainerState {
-            pub id: String,
-            pub status: Status,
-            pub pid: i32,
-            pub bundle: PathBuf,
-        }
-        impl ContainerState {
-            pub fn new(id: &str, bundle: &Path, _ver: &str) -> Self {
-                Self { id: id.to_string(), status: Status::Created, pid: 0, bundle: bundle.to_path_buf() }
-            }
-            pub fn set_created(&mut self, pid: i32) { self.status = Status::Created; self.pid = pid; }
-            pub fn set_running(&mut self) { self.status = Status::Running; }
-            pub fn set_stopped(&mut self) { self.status = Status::Stopped; }
-        }
-    }
 }
