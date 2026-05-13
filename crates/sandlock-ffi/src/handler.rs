@@ -324,8 +324,14 @@ pub enum sandlock_exception_policy_t {
 /// Returns 0 on success (and must have called exactly one setter on
 /// `out`). Returns non-zero to signal a handler-internal error; the
 /// supervisor then applies the configured exception policy.
+///
+/// The ABI is `extern "C-unwind"` rather than plain `extern "C"`. Pure-C
+/// callers see no difference (C has no unwinding); Rust handlers plugged
+/// into this C ABI surface may panic and the supervisor's `catch_unwind`
+/// in [`FfiHandler::handle`] will route the panic to the configured
+/// exception policy instead of aborting the process.
 #[allow(non_camel_case_types)]
-pub type sandlock_handler_fn_t = extern "C" fn(
+pub type sandlock_handler_fn_t = extern "C-unwind" fn(
     ud: *mut std::ffi::c_void,
     notif: *const crate::notif_repr::sandlock_notif_data_t,
     mem: *mut sandlock_mem_handle_t,
@@ -333,8 +339,13 @@ pub type sandlock_handler_fn_t = extern "C" fn(
 ) -> i32;
 
 /// Optional destructor invoked when the container is freed.
+///
+/// Uses `extern "C-unwind"` for consistency with [`sandlock_handler_fn_t`]
+/// and so that a Rust-side destructor panicking through this pointer
+/// unwinds rather than aborts (panic-safety in destructors is good
+/// practice even though no in-tree caller currently relies on it).
 #[allow(non_camel_case_types)]
-pub type sandlock_handler_ud_drop_t = extern "C" fn(ud: *mut std::ffi::c_void);
+pub type sandlock_handler_ud_drop_t = extern "C-unwind" fn(ud: *mut std::ffi::c_void);
 
 /// Opaque handler container (B4 — opaque box).
 #[repr(C)]

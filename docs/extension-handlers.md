@@ -628,6 +628,11 @@ A C handler must:
 2. Return non-zero on any internal error. The supervisor then applies
    the handler's `on_exception` policy (default: `SANDLOCK_EXCEPTION_KILL`).
 3. Not retain `notif`, `mem`, or `out` past the return statement.
+4. May panic from inside a Rust-side handler exposed through the
+   C ABI — the supervisor catches the unwind via `catch_unwind` and
+   applies the configured exception policy. Pure-C callers cannot
+   panic (C has no unwinding); this clause is for Rust handlers
+   plugged into the C ABI surface.
 
 ### Minimal example
 

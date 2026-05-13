@@ -116,7 +116,7 @@ use sandlock_ffi::handler::{
     sandlock_handler_new, sandlock_handler_t,
 };
 
-extern "C" fn test_handler(
+extern "C-unwind" fn test_handler(
     _ud: *mut std::ffi::c_void,
     _notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
     _mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
@@ -126,7 +126,7 @@ extern "C" fn test_handler(
     0
 }
 
-extern "C" fn dropper(ud: *mut std::ffi::c_void) {
+extern "C-unwind" fn dropper(ud: *mut std::ffi::c_void) {
     // Reconstitute the Box we leaked in the test below.
     unsafe { drop(Box::from_raw(ud as *mut u32)); }
 }
@@ -178,7 +178,7 @@ fn fake_ctx() -> HandlerCtx {
     }
 }
 
-extern "C" fn return_value_42(
+extern "C-unwind" fn return_value_42(
     _ud: *mut std::ffi::c_void,
     _notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
     _mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
@@ -188,7 +188,7 @@ extern "C" fn return_value_42(
     0
 }
 
-extern "C" fn returns_error_with_unset_action(
+extern "C-unwind" fn returns_error_with_unset_action(
     _ud: *mut std::ffi::c_void,
     _notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
     _mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
@@ -234,7 +234,7 @@ use sandlock_ffi::handler::{
     sandlock_handler_registration_t, sandlock_run_with_handlers,
 };
 
-extern "C" fn force_getpid_to_777(
+extern "C-unwind" fn force_getpid_to_777(
     _ud: *mut std::ffi::c_void,
     _notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
     _mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
@@ -359,8 +359,9 @@ fn run_with_handlers_intercepts_getpid() {
 //   * Group H: multiple handlers each firing for their own syscall.
 //   * Group I: live-fd `sandlock_mem_read_cstr` via an intercepted `openat`.
 //
-// Style mirrors the existing end-to-end test: explicit `extern "C"` handler
-// fns, no helper macros, `assert!(matches!(...))` for action variants.
+// Style mirrors the existing end-to-end test: explicit `extern "C-unwind"`
+// handler fns, no helper macros, `assert!(matches!(...))` for action
+// variants.
 
 use sandlock_ffi::handler::{
     sandlock_action_set_inject_fd_send, sandlock_action_set_inject_fd_send_tracked,
@@ -410,11 +411,11 @@ fn action_setters_are_null_safe() {
 
 // ---- Group B: FfiHandler translation ------------------------------------
 //
-// Each variant gets its own explicit `extern "C"` handler so the test
-// retains the line-by-line transparency of the existing tests rather than
-// hiding setup behind a macro.
+// Each variant gets its own explicit `extern "C-unwind"` handler so the
+// test retains the line-by-line transparency of the existing tests rather
+// than hiding setup behind a macro.
 
-extern "C" fn handler_set_continue(
+extern "C-unwind" fn handler_set_continue(
     _ud: *mut std::ffi::c_void,
     _notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
     _mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
@@ -424,7 +425,7 @@ extern "C" fn handler_set_continue(
     0
 }
 
-extern "C" fn handler_set_errno_eacces(
+extern "C-unwind" fn handler_set_errno_eacces(
     _ud: *mut std::ffi::c_void,
     _notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
     _mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
@@ -434,7 +435,7 @@ extern "C" fn handler_set_errno_eacces(
     0
 }
 
-extern "C" fn handler_set_hold(
+extern "C-unwind" fn handler_set_hold(
     _ud: *mut std::ffi::c_void,
     _notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
     _mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
@@ -444,7 +445,7 @@ extern "C" fn handler_set_hold(
     0
 }
 
-extern "C" fn handler_set_kill_sigterm_1234(
+extern "C-unwind" fn handler_set_kill_sigterm_1234(
     _ud: *mut std::ffi::c_void,
     _notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
     _mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
@@ -454,7 +455,7 @@ extern "C" fn handler_set_kill_sigterm_1234(
     0
 }
 
-extern "C" fn handler_set_kill_sigkill_zero_pgid(
+extern "C-unwind" fn handler_set_kill_sigkill_zero_pgid(
     _ud: *mut std::ffi::c_void,
     _notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
     _mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
@@ -590,7 +591,7 @@ async fn ffi_handler_continue_policy_on_callback_rc_nonzero() {
 
 // ---- Group D: panic recovery --------------------------------------------
 
-extern "C" fn panicking_handler(
+extern "C-unwind" fn panicking_handler(
     _ud: *mut std::ffi::c_void,
     _notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
     _mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
@@ -599,18 +600,13 @@ extern "C" fn panicking_handler(
     panic!("test panic from extern C handler");
 }
 
-// Ignored: the `extern "C"` ABI on current Rust (since 1.71 stabilising
-// `C-unwind`) aborts the process when an unwinding panic crosses the
-// boundary — `std::panic::catch_unwind` cannot intercept that. The
-// `catch_unwind` in `FfiHandler::handle` is therefore only useful for
-// panics that happen *outside* the C callback (e.g. in adapter glue or
-// in safe-Rust handlers that the user wrote and called as `extern "C"`
-// via a wrapper). Promoting `sandlock_handler_fn_t` to `extern
-// "C-unwind"` would make this test pass and the documented panic
-// recovery actually deliver — but that is a production ABI change and
-// belongs in a separate commit. Until then this test stays here as the
-// regression hook.
-#[ignore = "extern \"C\" panic aborts (Rust ABI); needs C-unwind ABI change in handler type"]
+// `sandlock_handler_fn_t` is `extern "C-unwind" fn`, so a panic raised
+// inside the Rust handler unwinds across the C ABI boundary and is
+// caught by the `std::panic::catch_unwind` in `FfiHandler::handle`. The
+// dispatcher then falls back to the configured exception policy — here
+// `Kill` — which the assertion below verifies. Pure-C callers cannot
+// panic, so this stability claim is exclusively for Rust handlers
+// exposed through the C ABI (the integration-test pattern here).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ffi_handler_recovers_from_callback_panic() {
     let raw = unsafe {
@@ -631,7 +627,7 @@ async fn ffi_handler_recovers_from_callback_panic() {
 
 // ---- Group E: Unset action with zero rc ---------------------------------
 
-extern "C" fn never_sets_action(
+extern "C-unwind" fn never_sets_action(
     _ud: *mut std::ffi::c_void,
     _notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
     _mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
@@ -660,7 +656,7 @@ async fn ffi_handler_callback_returns_zero_but_never_sets_action_triggers_fallba
 
 // ---- Group F: handler_new edge cases ------------------------------------
 
-extern "C" fn panicking_dropper(_ud: *mut std::ffi::c_void) {
+extern "C-unwind" fn panicking_dropper(_ud: *mut std::ffi::c_void) {
     panic!("dropper invoked when it should not have been");
 }
 
@@ -826,7 +822,7 @@ fn run_with_handlers_empty_registrations_runs_normally() {
 static ONE_SHOT_DROPPER_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-extern "C" fn one_shot_dropper(ud: *mut std::ffi::c_void) {
+extern "C-unwind" fn one_shot_dropper(ud: *mut std::ffi::c_void) {
     ONE_SHOT_DROPPER_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     if !ud.is_null() {
         // Reclaim the leaked Box so leak-sanitizer builds stay clean.
@@ -900,7 +896,7 @@ fn run_with_handlers_null_handler_in_array_returns_null() {
 
 // ---- Group H: multiple handlers -----------------------------------------
 
-extern "C" fn force_getpid_to_111(
+extern "C-unwind" fn force_getpid_to_111(
     _ud: *mut std::ffi::c_void,
     _notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
     _mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
@@ -910,7 +906,7 @@ extern "C" fn force_getpid_to_111(
     0
 }
 
-extern "C" fn force_getppid_to_222(
+extern "C-unwind" fn force_getppid_to_222(
     _ud: *mut std::ffi::c_void,
     _notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
     _mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
@@ -1031,7 +1027,7 @@ fn run_with_handlers_two_handlers_each_fires_for_own_syscall() {
 
 // ---- Group I: live-fd mem_read_cstr -------------------------------------
 
-extern "C" fn deny_magic_marker_path(
+extern "C-unwind" fn deny_magic_marker_path(
     _ud: *mut std::ffi::c_void,
     notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
     mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
