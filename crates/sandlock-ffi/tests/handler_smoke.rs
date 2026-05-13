@@ -126,27 +126,44 @@ extern "C-unwind" fn test_handler(
     0
 }
 
-extern "C-unwind" fn dropper(ud: *mut std::ffi::c_void) {
-    // Reconstitute the Box we leaked in the test below.
+static ROUND_TRIP_DROPPER_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+extern "C-unwind" fn round_trip_dropper(ud: *mut std::ffi::c_void) {
+    // Reclaim the leaked Box so its destructor runs (real drop path).
     unsafe { drop(Box::from_raw(ud as *mut u32)); }
+    ROUND_TRIP_DROPPER_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
 #[test]
 fn handler_new_and_free_round_trip() {
+    // Reset in case another test in the binary touched this counter.
+    ROUND_TRIP_DROPPER_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+
     let ud = Box::into_raw(Box::new(0xABCDu32)) as *mut std::ffi::c_void;
     let on_ex = sandlock_exception_policy_t::Kill as u32;
     let h: *mut sandlock_handler_t = unsafe {
         sandlock_handler_new(
             Some(test_handler as sandlock_handler_fn_t),
             ud,
-            Some(dropper),
+            Some(round_trip_dropper),
             on_ex,
         )
     };
     assert!(!h.is_null());
+    assert_eq!(
+        ROUND_TRIP_DROPPER_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "dropper must not fire before sandlock_handler_free",
+    );
+
     unsafe { sandlock_handler_free(h) };
-    // `dropper` runs and frees the Box; if it does not, leak-sanitizer
-    // (when enabled) will flag this test.
+
+    assert_eq!(
+        ROUND_TRIP_DROPPER_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "dropper must fire exactly once during Drop",
+    );
 }
 
 #[test]
