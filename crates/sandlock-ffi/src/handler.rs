@@ -417,12 +417,18 @@ pub unsafe extern "C" fn sandlock_handler_new(
 /// handler; calling this on a registered handler is undefined behaviour
 /// (the supervisor's later free would double-free).
 ///
+/// The ABI is `extern "C-unwind"` rather than plain `extern "C"` so a
+/// panic propagated from a Rust-side `ud_drop` (declared as
+/// [`sandlock_handler_ud_drop_t`], itself `extern "C-unwind"`) unwinds
+/// the caller rather than aborting the process. Pure-C callers see no
+/// difference (C has no unwinding).
+///
 /// # Safety
 /// `h` must be either null or a pointer previously returned by
 /// `sandlock_handler_new` that has not yet been registered with the
 /// supervisor and has not already been freed.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_handler_free(h: *mut sandlock_handler_t) {
+pub unsafe extern "C-unwind" fn sandlock_handler_free(h: *mut sandlock_handler_t) {
     if h.is_null() { return; }
     drop(Box::from_raw(h));
 }
@@ -529,25 +535,100 @@ impl Handler for FfiHandler {
             };
 
             match rc_or_panic {
-                Ok(0) => translate_action(out, child_pgid)
-                    .unwrap_or(on_exception_fallback),
-                _ => on_exception_fallback,
+                Ok(0) => match translate_action(&out, child_pgid) {
+                    Some(action) => action,
+                    None => {
+                        // Action kind ended up Unset, unknown, or the
+                        // reserved InjectFdSendTracked discriminant.
+                        // Drain any inject-fd payload before falling
+                        // back to the exception policy — otherwise the
+                        // supervisor leaks the srcfd that was armed by
+                        // the (failed) callback.
+                        // SAFETY: `drain_pending_inject_fd` inspects
+                        // `out.kind` itself before touching the union,
+                        // and `out.kind` matches the union variant per
+                        // the action setters' contract.
+                        unsafe { drain_pending_inject_fd(&out) };
+                        on_exception_fallback
+                    }
+                },
+                _ => {
+                    // Either the callback returned a non-zero rc OR
+                    // `catch_unwind` caught a panic. The callback may
+                    // have armed an InjectFdSend{,Tracked} payload
+                    // before failing; drain it so its srcfd doesn't
+                    // leak in the supervisor.
+                    // SAFETY: see the `Ok(0) -> None` branch above.
+                    unsafe { drain_pending_inject_fd(&out) };
+                    on_exception_fallback
+                }
             }
         })
     }
 }
 
+/// Drains a still-pending `InjectFdSend` or `InjectFdSendTracked`
+/// payload by consuming the contained `srcfd` into an `OwnedFd` and
+/// dropping it (which closes the fd). Called from error paths in
+/// [`FfiHandler::handle`] that fall back to the exception policy
+/// without dispatching the action — without this, the supervisor
+/// silently leaks fds armed by a C handler that subsequently panicked
+/// or returned a non-zero rc.
+///
+/// No-op for any other action kind (including `Unset`).
+///
+/// # Safety
+/// `out` must point at a fully-initialised `sandlock_action_out_t`.
+/// The function inspects only `out.kind` and the union arm matching
+/// that kind, which is sound because the action setters establish the
+/// invariant "the `kind` tag selects the union arm".
+unsafe fn drain_pending_inject_fd(out: &sandlock_action_out_t) {
+    use sandlock_action_kind_t as K;
+    if out.kind == K::InjectFdSend as u32 {
+        // SAFETY: `kind == InjectFdSend` selects the `inject_send`
+        // arm per the setter contract. Wrapping the raw fd in an
+        // `OwnedFd` and dropping it closes the fd.
+        drop(std::os::unix::io::OwnedFd::from_raw_fd(
+            out.payload.inject_send.srcfd,
+        ));
+    } else if out.kind == K::InjectFdSendTracked as u32 {
+        // The C header exposes the discriminant value publicly even
+        // though we don't ship a setter for it. A C caller can still
+        // assign `out->kind = 5; out->payload.inject_send_tracked.srcfd = X;`
+        // by hand. Treat it like `InjectFdSend` for cleanup purposes:
+        // the srcfd was armed and must be released.
+        // SAFETY: see `InjectFdSend` arm above.
+        drop(std::os::unix::io::OwnedFd::from_raw_fd(
+            out.payload.inject_send_tracked.srcfd,
+        ));
+    }
+}
+
 /// Convert the C-side decision into a `NotifAction`. Returns `None` if
-/// the kind is `Unset` or unknown — the caller then falls back to the
-/// exception policy.
-fn translate_action(out: sandlock_action_out_t, child_pgid: i32) -> Option<NotifAction> {
+/// the kind is `Unset`, unknown, or `InjectFdSendTracked` (no setter
+/// exposed; treated as fallback). The caller then falls back to the
+/// exception policy, and is responsible for invoking
+/// [`drain_pending_inject_fd`] to release any armed inject-fd payload.
+///
+/// Note: this function takes `&sandlock_action_out_t` rather than
+/// consuming the struct so that the caller can still inspect `out.kind`
+/// on the `None` branch and drain any pending fd payload. The
+/// `InjectFdSend` arm uses `OwnedFd::from_raw_fd` on the union field,
+/// which is what materialises the ownership transfer from the C caller
+/// to the supervisor when this branch is taken.
+fn translate_action(out: &sandlock_action_out_t, child_pgid: i32) -> Option<NotifAction> {
     use sandlock_action_kind_t as K;
     let kind = match out.kind {
         x if x == K::Continue as u32 => K::Continue,
         x if x == K::Errno as u32 => K::Errno,
         x if x == K::ReturnValue as u32 => K::ReturnValue,
         x if x == K::InjectFdSend as u32 => K::InjectFdSend,
-        x if x == K::InjectFdSendTracked as u32 => K::InjectFdSendTracked,
+        // Discriminant reserved for a future tracker-injection ABI; no
+        // setter is exposed in this release. A C caller can still set
+        // it by hand (the value is public in the C header). Return
+        // `None` so the caller drains the srcfd and falls back to the
+        // exception policy.
+        x if x == K::InjectFdSendTracked as u32 => return None,
         x if x == K::Hold as u32 => K::Hold,
         x if x == K::Kill as u32 => K::Kill,
         _ => return None, // Unset or unknown
@@ -557,10 +638,10 @@ fn translate_action(out: sandlock_action_out_t, child_pgid: i32) -> Option<Notif
     // selected by the `kind` discriminant above. The C action setters
     // documented in this module pair each `kind` value with exactly one
     // payload variant, so reading that variant is the only legal access.
-    // For `InjectFdSend{,Tracked}` the documented contract on
-    // `sandlock_action_set_inject_fd_send{,_tracked}` transfers
-    // ownership of `srcfd` to the supervisor; wrapping it in an
-    // `OwnedFd` here is what materialises that transfer.
+    // For `InjectFdSend` the documented contract on
+    // `sandlock_action_set_inject_fd_send` transfers ownership of
+    // `srcfd` to the supervisor; wrapping it in an `OwnedFd` here is
+    // what materialises that transfer.
     let action = unsafe {
         match kind {
             K::Continue => NotifAction::Continue,
@@ -579,12 +660,7 @@ fn translate_action(out: sandlock_action_out_t, child_pgid: i32) -> Option<Notif
                 srcfd: std::os::unix::io::OwnedFd::from_raw_fd(out.payload.inject_send.srcfd),
                 newfd_flags: out.payload.inject_send.newfd_flags,
             },
-            // Discriminant reserved for future tracker-injection ABI; no
-            // setter is exposed in this release, so this kind should
-            // never be set legitimately. Treat it as Unset → exception
-            // policy fallback.
-            K::InjectFdSendTracked => return None,
-            K::Unset => unreachable!(),
+            K::InjectFdSendTracked | K::Unset => unreachable!(),
         }
     };
     Some(action)
@@ -752,6 +828,32 @@ pub unsafe extern "C" fn sandlock_run_interactive_with_handlers(
     run_with_handlers_inner(policy, name, argv, argc, registrations, nregistrations, true)
 }
 
+/// Drops every non-null handler pointer in the registration array.
+/// Used by [`run_with_handlers_inner`] on early-return paths where
+/// `collect_registrations` was not reached — guarantees the C ABI
+/// contract "all handler pointers are consumed by this call".
+///
+/// # Safety
+/// `regs` is either null (no-op) or points to `nregs` valid
+/// `sandlock_handler_registration_t` slots whose `handler` pointer is
+/// either null or comes from `sandlock_handler_new` and has not been
+/// freed by anyone else.
+unsafe fn release_registrations(
+    regs: *const sandlock_handler_registration_t,
+    nregs: usize,
+) {
+    if regs.is_null() || nregs == 0 {
+        return;
+    }
+    let slice = slice::from_raw_parts(regs, nregs);
+    for r in slice {
+        if !r.handler.is_null() {
+            // Reclaim and drop the container so its `ud_drop` runs.
+            drop(Box::from_raw(r.handler));
+        }
+    }
+}
+
 unsafe fn run_with_handlers_inner(
     policy: *const crate::sandlock_sandbox_t,
     name: *const std::os::raw::c_char,
@@ -762,6 +864,9 @@ unsafe fn run_with_handlers_inner(
     interactive: bool,
 ) -> *mut crate::sandlock_result_t {
     if policy.is_null() {
+        // Honour the documented contract: ownership of every handler
+        // pointer transfers in on entry, regardless of return value.
+        release_registrations(registrations, nregistrations);
         return std::ptr::null_mut();
     }
     // Decode the optional name eagerly so a malformed (non-UTF-8) C
@@ -773,13 +878,22 @@ unsafe fn run_with_handlers_inner(
     } else {
         match CStr::from_ptr(name).to_str() {
             Ok(s) => Some(s.to_owned()),
-            Err(_) => return std::ptr::null_mut(),
+            Err(_) => {
+                release_registrations(registrations, nregistrations);
+                return std::ptr::null_mut();
+            }
         }
     };
     let cmd = match argv_from_c(argv, argc) {
         Some(v) => v,
-        None => return std::ptr::null_mut(),
+        None => {
+            release_registrations(registrations, nregistrations);
+            return std::ptr::null_mut();
+        }
     };
+    // `collect_registrations` is itself transactional: on failure it
+    // doesn't consume any handlers. Preserve that contract — the
+    // caller still owns them on a `None` return from this point.
     let handlers = match collect_registrations(registrations, nregistrations) {
         Some(v) => v,
         None => return std::ptr::null_mut(),

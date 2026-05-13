@@ -261,18 +261,15 @@ typedef struct sandlock_handler_registration_t {
  * `name` may be NULL to auto-generate as `sandbox-{pid}`, mirroring the
  * convention used by `sandlock_run`.
  *
- * Ownership of `registrations[i].handler` is transferred into the call
- * after the function has validated and accepted the registration array.
- * On success (non-NULL return) all handler pointers are owned by the
- * supervisor and must not be freed by the caller.
+ * Ownership of every `registrations[i].handler` pointer transfers into
+ * the call on entry. After this function returns, the caller MUST NOT
+ * call `sandlock_handler_free` on any handler pointer that was passed
+ * in — successful or not, the supervisor is responsible for freeing
+ * the containers (which also invokes the registered `ud_drop`).
  *
- * On NULL return the transfer status of handler pointers is not
- * defined: depending on which internal validation step failed, the
- * supervisor may or may not have taken ownership of some handlers.
- * The conservative and safe approach is to ABANDON all handler
- * pointers after a NULL return — do not call `sandlock_handler_free`
- * on them. The cost of the resulting leak is bounded (one allocation
- * per handler) and the alternative risks double-free. */
+ * Null handler pointers in the array are treated as a validation error
+ * and the call returns NULL; non-null entries in the same array are
+ * still freed by the supervisor (the array is consumed as a whole). */
 sandlock_result_t *sandlock_run_with_handlers(
     const sandlock_sandbox_t *policy,
     const char *name,
@@ -286,18 +283,15 @@ sandlock_result_t *sandlock_run_with_handlers(
  * `name` may be NULL to auto-generate as `sandbox-{pid}`, mirroring the
  * convention used by `sandlock_run_interactive`.
  *
- * Ownership of `registrations[i].handler` is transferred into the call
- * after the function has validated and accepted the registration array.
- * On success (non-NULL return) all handler pointers are owned by the
- * supervisor and must not be freed by the caller.
+ * Ownership of every `registrations[i].handler` pointer transfers into
+ * the call on entry. After this function returns, the caller MUST NOT
+ * call `sandlock_handler_free` on any handler pointer that was passed
+ * in — successful or not, the supervisor is responsible for freeing
+ * the containers (which also invokes the registered `ud_drop`).
  *
- * On NULL return the transfer status of handler pointers is not
- * defined: depending on which internal validation step failed, the
- * supervisor may or may not have taken ownership of some handlers.
- * The conservative and safe approach is to ABANDON all handler
- * pointers after a NULL return — do not call `sandlock_handler_free`
- * on them. The cost of the resulting leak is bounded (one allocation
- * per handler) and the alternative risks double-free. */
+ * Null handler pointers in the array are treated as a validation error
+ * and the call returns NULL; non-null entries in the same array are
+ * still freed by the supervisor (the array is consumed as a whole). */
 sandlock_result_t *sandlock_run_interactive_with_handlers(
     const sandlock_sandbox_t *policy,
     const char *name,

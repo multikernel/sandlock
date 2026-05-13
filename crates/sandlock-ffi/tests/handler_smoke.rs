@@ -1247,3 +1247,262 @@ fn mem_read_cstr_reads_path_from_intercepted_openat() {
     unsafe { sandlock_result_free(rr); }
     unsafe { sandlock_sandbox_free(policy); }
 }
+
+// ---------------------------------------------------------------------------
+// Ownership regression tests (A1, A2, A3, A5)
+// ---------------------------------------------------------------------------
+//
+// These exercise the four ownership/leak gaps that adversarial review
+// surfaced after the initial handler ABI landed:
+//
+//   * A1: a callback that arms `InjectFdSend` then panics or returns
+//     non-zero must NOT leak the supervisor-side srcfd.
+//   * A2: a callback that writes the `InjectFdSendTracked` discriminant
+//     by hand (no setter is exposed but the value is public in the C
+//     header) must NOT leak the supervisor-side srcfd.
+//   * A3: `sandlock_run_with_handlers` early-return paths (null policy,
+//     invalid argv, invalid name) must still consume the registered
+//     handler containers — the documented contract is "ownership
+//     transfers on entry, regardless of return value".
+//   * A5: `sandlock_handler_free` was `extern "C"`, so a panicking
+//     `ud_drop` would abort. Switched to `extern "C-unwind"`; verify a
+//     panic propagates back instead of aborting the process.
+
+// A small pipe helper used by the inject-fd drain tests below. Returns
+// `(read_end, write_end)`. The write end is what the handler hands to
+// the supervisor as the "inject" srcfd; the read end stays in this
+// test and observes EOF once the drain path closes the write end.
+fn make_pipe() -> (i32, i32) {
+    // SAFETY: `libc::pipe` writes exactly two fds into the array on
+    // success and returns 0; we assert success below.
+    let mut fds = [0i32; 2];
+    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    assert_eq!(rc, 0, "pipe() failed: errno={}", std::io::Error::last_os_error());
+    (fds[0], fds[1])
+}
+
+// Reads up to one byte from `fd` with `O_NONBLOCK` set first. Returns
+// the value `libc::read` returned (>=0 byte count, or -1 on error;
+// `errno` is preserved in that case so the caller can distinguish EOF
+// from EAGAIN).
+fn read_eof_or_eagain(fd: i32) -> isize {
+    // SAFETY: `F_SETFL` with `O_NONBLOCK` is a simple flag set; `read`
+    // reads at most one byte into the on-stack buffer.
+    unsafe {
+        libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+        let mut buf = [0u8; 1];
+        libc::read(fd, buf.as_mut_ptr() as *mut std::ffi::c_void, 1)
+    }
+}
+
+extern "C-unwind" fn arm_inject_fd_then_panic(
+    ud: *mut std::ffi::c_void,
+    _notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
+    _mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
+    out: *mut sandlock_ffi::handler::sandlock_action_out_t,
+) -> i32 {
+    // The test stashes the write-end fd in a heap-allocated i32 and
+    // passes its pointer as `ud`. Read the fd, arm the inject action,
+    // then panic — the dispatcher must still drain the fd.
+    // SAFETY: `ud` points to a live `i32` for the duration of this call
+    // (owned by the test).
+    let fd = unsafe { *(ud as *const i32) };
+    unsafe { sandlock_ffi::handler::sandlock_action_set_inject_fd_send(out, fd, 0) };
+    panic!("test panic after arming InjectFdSend");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a1_ffi_handler_drains_inject_fd_on_panic() {
+    // Bug A1 regression hook: a C handler that calls
+    // `sandlock_action_set_inject_fd_send` and then panics used to leak
+    // the supervisor-side srcfd. After the fix, the dispatcher's
+    // catch-unwind path drains the pending payload, closing the fd.
+    let (read_fd, write_fd) = make_pipe();
+    // Heap-allocated so the pointer stays valid across spawn_blocking.
+    let fd_holder: Box<i32> = Box::new(write_fd);
+    let fd_ptr = Box::into_raw(fd_holder) as *mut std::ffi::c_void;
+
+    let raw = unsafe {
+        sandlock_ffi::handler::sandlock_handler_new(
+            Some(arm_inject_fd_then_panic),
+            fd_ptr,
+            None,
+            sandlock_exception_policy_t::Kill as u32,
+        )
+    };
+    // SAFETY: `raw` was just produced and is non-null.
+    let h = unsafe { FfiHandler::from_raw(raw) };
+    let action = h.handle(&fake_ctx()).await;
+    assert!(
+        matches!(action, NotifAction::Kill { sig, .. } if sig == libc::SIGKILL),
+        "panic must route to the exception policy fallback",
+    );
+
+    // After `handle` returns, the drain path should have closed
+    // `write_fd`. Reading from `read_fd` (with O_NONBLOCK) returns 0
+    // (EOF). If the leak were still present, the write end would
+    // remain open and `read` would return -1/EAGAIN.
+    let n = read_eof_or_eagain(read_fd);
+    let errno = std::io::Error::last_os_error();
+    assert_eq!(
+        n, 0,
+        "expected EOF on read end (write end closed by drain); got n={n} errno={errno}",
+    );
+
+    // Reclaim the heap allocation for the fd holder so the test is
+    // leak-clean. `write_fd` itself is owned by the drain path; do NOT
+    // close it here.
+    // SAFETY: `fd_ptr` came from `Box::into_raw` on a `Box<i32>`.
+    unsafe { drop(Box::from_raw(fd_ptr as *mut i32)); }
+    // SAFETY: `read_fd` is still open; close it.
+    unsafe { libc::close(read_fd); }
+}
+
+extern "C-unwind" fn arm_inject_fd_send_tracked_discriminant(
+    ud: *mut std::ffi::c_void,
+    _notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
+    _mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
+    out: *mut sandlock_ffi::handler::sandlock_action_out_t,
+) -> i32 {
+    // Write the InjectFdSendTracked discriminant by hand. The setter
+    // is not exposed in this release, but the discriminant value is
+    // public in the C header, so a C caller could do exactly this.
+    // SAFETY: `ud` and `out` are valid for the duration of this call.
+    let fd = unsafe { *(ud as *const i32) };
+    unsafe {
+        (*out).kind = sandlock_ffi::handler::sandlock_action_kind_t::InjectFdSendTracked as u32;
+        (*out).payload.inject_send_tracked =
+            sandlock_ffi::handler::sandlock_action_inject_tracked_t {
+                srcfd: fd,
+                newfd_flags: 0,
+                tracker: 0,
+            };
+    }
+    0
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a2_ffi_handler_drains_inject_fd_tracked_discriminant() {
+    // Bug A2 regression hook: a C handler that writes the
+    // `InjectFdSendTracked` discriminant directly used to leak the
+    // srcfd because `translate_action`'s `K::InjectFdSendTracked` arm
+    // returned None and dropped the value without reclaiming the fd.
+    let (read_fd, write_fd) = make_pipe();
+    let fd_holder: Box<i32> = Box::new(write_fd);
+    let fd_ptr = Box::into_raw(fd_holder) as *mut std::ffi::c_void;
+
+    let raw = unsafe {
+        sandlock_ffi::handler::sandlock_handler_new(
+            Some(arm_inject_fd_send_tracked_discriminant),
+            fd_ptr,
+            None,
+            sandlock_exception_policy_t::Kill as u32,
+        )
+    };
+    // SAFETY: `raw` was just produced and is non-null.
+    let h = unsafe { FfiHandler::from_raw(raw) };
+    let action = h.handle(&fake_ctx()).await;
+    assert!(
+        matches!(action, NotifAction::Kill { sig, .. } if sig == libc::SIGKILL),
+        "unsupported tracked discriminant must route to the exception policy fallback",
+    );
+
+    let n = read_eof_or_eagain(read_fd);
+    let errno = std::io::Error::last_os_error();
+    assert_eq!(
+        n, 0,
+        "expected EOF on read end (write end closed by drain); got n={n} errno={errno}",
+    );
+
+    // SAFETY: `fd_ptr` came from `Box::into_raw` on a `Box<i32>`.
+    unsafe { drop(Box::from_raw(fd_ptr as *mut i32)); }
+    // SAFETY: `read_fd` is still open; close it.
+    unsafe { libc::close(read_fd); }
+}
+
+static A3_UD_DROPPER_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+extern "C-unwind" fn a3_counter_dropper(_ud: *mut std::ffi::c_void) {
+    A3_UD_DROPPER_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[test]
+fn a3_run_with_handlers_releases_registrations_on_null_policy() {
+    // Bug A3 regression hook: the null-policy early-return path used to
+    // abandon the registration array. After the fix, the supervisor
+    // consumes every non-null handler pointer on entry, regardless of
+    // return value.
+    A3_UD_DROPPER_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+    // Non-null ud — the `Drop` impl on `sandlock_handler_t` only fires
+    // the dropper when `ud` is non-null. The dropper itself ignores
+    // the value, so any non-null bit pattern works.
+    let h = unsafe {
+        sandlock_handler_new(
+            Some(test_handler as sandlock_handler_fn_t),
+            0xFEED_FACEusize as *mut std::ffi::c_void,
+            Some(a3_counter_dropper),
+            sandlock_exception_policy_t::Kill as u32,
+        )
+    };
+    assert!(!h.is_null(), "handler_new must produce a valid container");
+    let regs = [sandlock_handler_registration_t {
+        syscall_nr: libc::SYS_getpid,
+        handler: h,
+    }];
+    let rr = unsafe {
+        sandlock_run_with_handlers(
+            std::ptr::null(), // null policy triggers the early-return path
+            std::ptr::null(), // name
+            std::ptr::null(), // argv
+            0,                // argc
+            regs.as_ptr(),
+            regs.len(),
+        )
+    };
+    assert!(rr.is_null(), "expected null result for null policy");
+    assert_eq!(
+        A3_UD_DROPPER_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "ud_drop must fire on the early-return path (handler consumed by supervisor)",
+    );
+}
+
+extern "C-unwind" fn a5_panicking_dropper(_ud: *mut std::ffi::c_void) {
+    panic!("test panic from dropper");
+}
+
+#[test]
+fn a5_handler_free_unwinds_on_panicking_dropper() {
+    // Bug A5 regression hook: `sandlock_handler_free` used to be
+    // `extern "C"`, which aborts on unwind. After the fix it is
+    // `extern "C-unwind"` and a panicking `ud_drop` propagates back to
+    // the caller's `catch_unwind`.
+    //
+    // Note: with the bug still present, the process aborts here and
+    // the test binary dies — `catch_unwind` cannot recover from an
+    // abort. So we write the test against the FIXED code; the
+    // destructive sanity check (manually flipping the ABI back to
+    // `extern "C"`) is a one-shot manual confirmation.
+    let h = unsafe {
+        sandlock_handler_new(
+            Some(test_handler as sandlock_handler_fn_t),
+            // Non-null ud so the `Drop` impl invokes the dropper. Any
+            // non-null bit pattern works because the dropper itself
+            // never reads through the pointer — it just panics.
+            0xDEAD_BEEFusize as *mut std::ffi::c_void,
+            Some(a5_panicking_dropper),
+            sandlock_exception_policy_t::Kill as u32,
+        )
+    };
+    assert!(!h.is_null(), "handler_new must produce a valid container");
+    let result = std::panic::catch_unwind(|| {
+        // SAFETY: `h` is a valid, unregistered container; we
+        // intentionally trigger the panicking dropper by freeing it.
+        unsafe { sandlock_handler_free(h) };
+    });
+    assert!(
+        result.is_err(),
+        "expected sandlock_handler_free to unwind a panicking dropper instead of aborting",
+    );
+}
