@@ -100,10 +100,31 @@ sandlock run -i -r /usr -r /lib -r /lib64 -r /bin -r /etc -w /tmp -- /bin/sh
 # Resource limits + timeout
 sandlock run -m 512M -P 20 -t 30 -- ./compute.sh
 
-# Domain-based network isolation
-sandlock run --net-allow-host api.openai.com -r /usr -r /lib -r /etc -- python3 agent.py
+# Outbound allowlist — restrict to one host on one port
+sandlock run --net-allow api.openai.com:443 -r /usr -r /lib -r /etc -- python3 agent.py
+
+# Multiple ports for one host, plus a separate any-IP port
+sandlock run --net-allow github.com:22,443 --net-allow :8080 \
+  -r /usr -r /lib -r /etc -- python3 agent.py
+
+# Wildcard port — `host:*` permits every port to the host
+sandlock run --net-allow github.com:* -r /usr -r /lib -r /etc -- ssh user@github.com
+
+# Unrestricted outbound — `:*` opens any host and any TCP port. For full
+# egress add a UDP wildcard via the `udp://*:*` scheme.
+sandlock run --net-allow :* --net-allow udp://*:* \
+  -r /usr -r /lib -r /etc -- ./client
+
+# UDP — scheme prefix gates the protocol and scopes the destination
+# (e.g. DNS to 1.1.1.1, plus TCP HTTPS to anywhere)
+sandlock run --net-allow udp://1.1.1.1:53 --net-allow :443 \
+  -r /usr -r /lib -r /etc -- ./client
+
+# Ping — kernel ping socket (SOCK_DGRAM) gated by net.ipv4.ping_group_range
+sandlock run --net-allow icmp://github.com -r /usr -r /lib -r /etc -- ping github.com
 
 # HTTP-level ACL (method + host + path rules via transparent proxy)
+# HTTP rules with concrete hosts auto-extend --net-allow with host:80,443
 sandlock run \
   --http-allow "GET docs.python.org/*" \
   --http-allow "POST api.openai.com/v1/chat/completions" \
@@ -111,13 +132,15 @@ sandlock run \
   -r /usr -r /lib -r /etc -- python3 agent.py
 
 # HTTPS MITM with user-provided CA (enables ACL on port 443)
+# Generate a CA, add the cert to the sandbox's trust store
+# (e.g. /etc/ssl/certs/), then pass both files here.
 sandlock run \
   --http-allow "POST api.openai.com/v1/*" \
-  --https-ca ca.pem --https-key ca-key.pem \
+  --http-ca ca.pem --http-key ca-key.pem \
   -r /usr -r /lib -r /etc -- python3 agent.py
 
-# TCP port restrictions (Landlock)
-sandlock run --net-bind 8080 --net-connect 443 -r /usr -r /lib -r /etc -- python3 server.py
+# Server listening on a port (Landlock --net-bind, separate from --net-allow)
+sandlock run --net-bind 8080 -r /usr -r /lib -r /etc -- python3 server.py
 
 # Clean environment
 sandlock run --clean-env --env CC=gcc \
@@ -162,9 +185,9 @@ sandlock run --no-supervisor -r /proc -r /usr -r /lib -r /lib64 -r /bin -r /etc 
 ### Python API
 
 ```python
-from sandlock import Sandbox, Policy, confine
+from sandlock import Sandbox, confine
 
-policy = Policy(
+sandbox = Sandbox(
     fs_writable=["/tmp/sandbox"],
     fs_readable=["/usr", "/lib", "/etc"],
     max_memory="256M",
@@ -173,37 +196,37 @@ policy = Policy(
 )
 
 # Run a command (with optional timeout in seconds)
-result = Sandbox(policy).run(["python3", "-c", "print('hello')"], timeout=30)
+result = sandbox.run(["python3", "-c", "print('hello')"], timeout=30)
 assert result.success
 assert b"hello" in result.stdout
 
 # HTTP ACL: only allow specific API calls
-agent_policy = Policy(
+agent = Sandbox(
     fs_readable=["/usr", "/lib", "/etc"],
     http_allow=["POST api.openai.com/v1/chat/completions"],
     http_deny=["* */admin/*"],
 )
-result = Sandbox(agent_policy).run(["python3", "agent.py"])
+result = agent.run(["python3", "agent.py"])
 
 # Chroot with per-sandbox mount (Docker-style -v, no root needed)
-chroot_policy = Policy(
+chrooted = Sandbox(
     chroot="/opt/rootfs",
     fs_mount={"/work": "/tmp/sandbox-1/work"},  # maps /work inside chroot
     fs_readable=["/usr", "/bin", "/lib", "/etc"],
     cwd="/work",
 )
-result = Sandbox(chroot_policy).run(["python3", "task.py"])
+result = chrooted.run(["python3", "task.py"])
 
 # Port virtualization: query port mappings while sandbox is running
-sb = Sandbox(Policy(port_remap=True, fs_readable=["/usr", "/lib", "/etc"]), name="api.local")
+sb = Sandbox(port_remap=True, fs_readable=["/usr", "/lib", "/etc"], name="api.local")
 # sb.ports() returns {virtual_port: real_port} while running
 
 # Confine the current process (Landlock filesystem only, irreversible)
-confine(Policy(fs_readable=["/usr", "/lib"], fs_writable=["/tmp"]))
+confine(Sandbox(fs_readable=["/usr", "/lib"], fs_writable=["/tmp"]))
 
 # Dry-run: see what files would change, then discard
-policy = Policy(fs_writable=["."], workdir=".", fs_readable=["/usr", "/lib", "/bin", "/etc"])
-result = Sandbox(policy).dry_run(["make", "build"])
+sandbox = Sandbox(fs_writable=["."], workdir=".", fs_readable=["/usr", "/lib", "/bin", "/etc"])
+result = sandbox.dry_run(["make", "build"])
 for c in result.changes:
     print(f"{c.kind}  {c.path}")  # A=added, M=modified, D=deleted
 ```
@@ -211,18 +234,18 @@ for c in result.changes:
 ### Pipeline
 
 Chain sandboxed stages with the `|` operator — each stage has its own
-independent policy. Data flows through kernel pipes.
+independent sandbox config. Data flows through kernel pipes.
 
 ```python
-from sandlock import Sandbox, Policy
+from sandlock import Sandbox
 
-trusted = Policy(fs_readable=["/usr", "/lib", "/bin", "/etc", "/opt/data"])
-restricted = Policy(fs_readable=["/usr", "/lib", "/bin", "/etc"])
+trusted = Sandbox(fs_readable=["/usr", "/lib", "/bin", "/etc", "/opt/data"])
+restricted = Sandbox(fs_readable=["/usr", "/lib", "/bin", "/etc"])
 
 # Reader can access data, processor cannot
 result = (
-    Sandbox(trusted).cmd(["cat", "/opt/data/secret.csv"])
-    | Sandbox(restricted).cmd(["tr", "a-z", "A-Z"])
+    trusted.cmd(["cat", "/opt/data/secret.csv"])
+    | restricted.cmd(["tr", "a-z", "A-Z"])
 ).run()
 assert b"SECRET" in result.stdout
 ```
@@ -231,12 +254,12 @@ assert b"SECRET" in result.stdout
 executor runs it with data access but no network:
 
 ```python
-planner = Policy(fs_readable=["/usr", "/lib", "/bin", "/etc"])
-executor = Policy(fs_readable=["/usr", "/lib", "/bin", "/etc", "/data"])
+planner = Sandbox(fs_readable=["/usr", "/lib", "/bin", "/etc"])
+executor = Sandbox(fs_readable=["/usr", "/lib", "/bin", "/etc", "/data"])
 
 result = (
-    Sandbox(planner).cmd(["python3", "-c", "print('cat /data/input.txt')"])
-    | Sandbox(executor).cmd(["sh"])
+    planner.cmd(["python3", "-c", "print('cat /data/input.txt')"])
+    | executor.cmd(["sh"])
 ).run()
 ```
 
@@ -248,7 +271,7 @@ Events carry syscall name, category, PID, network destination (for
 returns a verdict to allow, deny, or audit.
 
 ```python
-from sandlock import Sandbox, Policy
+from sandlock import Sandbox
 import errno
 
 def on_event(event, ctx):
@@ -271,11 +294,12 @@ def on_event(event, ctx):
 
     return 0  # allow
 
-policy = Policy(
+sandbox = Sandbox(
     fs_readable=["/usr", "/lib", "/etc"],
-    net_allow_hosts=["api.example.com"],
+    net_allow=["api.example.com:443"],
+    policy_fn=on_event,
 )
-result = Sandbox(policy, policy_fn=on_event).run(["python3", "agent.py"])
+result = sandbox.run(["python3", "agent.py"])
 ```
 
 **Verdicts:** `0`/`False` = allow, `True`/`-1` = deny (EPERM),
@@ -284,7 +308,7 @@ positive int = deny with errno, `"audit"`/`-2` = allow + flag.
 **Event fields:** `syscall`, `category` (file/network/process/memory),
 `pid`, `parent_pid`, `host`, `port`, `argv`, `denied`.
 
-> **TOCTOU NOTE ** Per `seccomp_unotify(2)`, the kernel
+> **TOCTOU NOTE** Per `seccomp_unotify(2)`, the kernel
 > re-reads user-memory pointers after `Continue`. Sandlock handles this
 > in two places:
 >
@@ -292,14 +316,15 @@ positive int = deny with errno, `"audit"`/`-2` = allow + flag.
 >   belongs in static Landlock rules (`fs_readable` / `fs_writable` /
 >   `fs_denied`) — kernel-enforced and TOCTOU-immune. Use
 >   `ctx.deny_path()` for runtime additions.
-> - **`event.argv` is exposed and TOCTOU-safe.** Before returning
->   `Continue` for an `execve`, the supervisor `PTRACE_SEIZE` +
->   `PTRACE_INTERRUPT`s every sibling thread of the calling tid so the
->   kernel's re-read happens with no other writer running. The pause
->   has no observable cost: `execve`'s `de_thread` step kills sibling
->   threads anyway. If the freeze cannot be established (e.g., YAMA
->   blocks ptrace), the execve is denied with `EPERM` — the safety
->   invariant is never silently relaxed.
+> - **`event.argv` is exposed and TOCTOU-safe.** Before exposing
+>   `argv` to `policy_fn` or returning `Continue` for an
+>   `execve`, the supervisor freezes every task in `ProcessIndex`,
+>   including peer processes that may alias argv through shared memory.
+>   With `policy_fn` active, fork-like syscalls are traced for one
+>   ptrace creation event, so children are registered in `ProcessIndex`
+>   before they can run user code. If the freeze or creation tracking
+>   cannot be established (e.g., YAMA blocks ptrace), the syscall is
+>   denied with `EPERM`; the safety invariant is never silently relaxed.
 
 **Context methods:**
 - `ctx.restrict_network(ips)` / `ctx.grant_network(ips)` — network control
@@ -313,41 +338,48 @@ positive int = deny with errno, `"audit"`/`-2` = allow + flag.
 ### Rust API
 
 ```rust
-use sandlock_core::{Policy, Sandbox, Pipeline, Stage, confine_current_process};
+use sandlock_core::{confine, Confinement, Sandbox, Stage};
+use sandlock_core::sandbox::ByteSize;
+use sandlock_core::policy_fn::Verdict;
 
 // Basic run
-let policy = Policy::builder()
+let mut sandbox = Sandbox::builder()
     .fs_read("/usr").fs_read("/lib")
     .fs_write("/tmp")
     .max_memory(ByteSize::mib(256))
+    .name("hello-box")
     .build()?;
-let result = Sandbox::run(&policy, &["echo", "hello"]).await?;
+let result = sandbox.run(&["echo", "hello"]).await?;
 assert!(result.success());
 
 // HTTP ACL: restrict API access at the HTTP level
-let policy = Policy::builder()
+let mut agent = Sandbox::builder()
     .fs_read("/usr").fs_read("/lib").fs_read("/etc")
     .http_allow("POST api.openai.com/v1/chat/completions")
     .http_deny("* */admin/*")
+    .name("agent-box")
     .build()?;
-let result = Sandbox::run(&policy, &["python3", "agent.py"]).await?;
+let result = agent.run(&["python3", "agent.py"]).await?;
 
 // Confine the current process (Landlock filesystem only, irreversible)
-let policy = Policy::builder()
+let confinement = Confinement::builder()
     .fs_read("/usr").fs_read("/lib")
     .fs_write("/tmp")
-    .build()?;
-confine_current_process(&policy)?;
+    .build();
+confine(&confinement)?;
 
 // Pipeline
+let producer = Sandbox::builder()
+    .fs_read("/usr").fs_read("/lib").fs_read("/bin")
+    .build()?;
+let consumer = producer.clone();
 let result = (
-    Stage::new(&policy_a, &["echo", "hello"])
-    | Stage::new(&policy_b, &["tr", "a-z", "A-Z"])
+    Stage::new(&producer, &["echo", "hello"])
+    | Stage::new(&consumer, &["tr", "a-z", "A-Z"])
 ).run(None).await?;
 
 // Dynamic policy
-use sandlock_core::policy_fn::Verdict;
-let policy = Policy::builder()
+let mut dynamic = Sandbox::builder()
     .fs_read("/usr").fs_read("/lib")
     .policy_fn(|event, ctx| {
         if event.argv_contains("curl") {
@@ -360,29 +392,41 @@ let policy = Policy::builder()
         Verdict::Allow
     })
     .build()?;
+let result = dynamic.run(&["python3", "agent.py"]).await?;
 ```
 
 ## Profiles
 
-Save reusable policies as TOML files in `~/.config/sandlock/profiles/`:
+Save reusable sandbox profiles as TOML files in
+`~/.config/sandlock/profiles/`. Profiles use a sectioned schema; top-level
+flat keys such as `fs_readable = [...]` are rejected. Pass a sandbox instance
+name with `--name` when you need a stable virtual hostname.
 
 ```toml
 # ~/.config/sandlock/profiles/build.toml
-fs_writable = ["/tmp/work"]
-fs_readable = ["/usr", "/lib", "/lib64", "/bin", "/etc"]
+[program]
+exec = "make"
+args = ["-j4"]
 clean_env = true
-max_memory = "512M"
-max_processes = 50
+env = { CC = "gcc", LANG = "C.UTF-8" }
 
-[env]
-CC = "gcc"
-LANG = "C.UTF-8"
+[filesystem]
+read = ["/usr", "/lib", "/lib64", "/bin", "/etc"]
+write = ["/tmp/work"]
+
+[limits]
+memory = "512M"
+processes = 50
+
+[syscalls]
+extra_deny = []
 ```
 
 ```bash
 sandlock profile list
 sandlock profile show build
-sandlock run -p build -- make -j4
+sandlock run -p build        # uses [program].exec + args
+sandlock run -p build -- make test  # trailing command overrides [program]
 ```
 
 ## How It Works
@@ -444,15 +488,15 @@ what a command would do before committing.
 ### COW Fork & Map-Reduce
 
 Initialize expensive state once, then fork COW clones that share memory.
-Each fork uses raw `fork(2)` (bypasses seccomp notification) for minimal
-overhead. 1000 clones in ~530ms, ~1,900 forks/sec.
+Each clone uses raw `fork(2)` with shared copy-on-write pages. 1000
+clones in ~530ms, ~1,900 forks/sec.
 
 Each clone's stdout is captured via its own pipe. `reduce()` reads all
 pipes and feeds combined output to a reducer's stdin — fully pipe-based
 data flow with no temp files.
 
 ```python
-from sandlock import Sandbox, Policy
+from sandlock import Sandbox
 
 def init():
     global model, data
@@ -463,12 +507,17 @@ def work(clone_id):
     shard = data[clone_id::4]
     print(sum(shard))             # stdout → per-clone pipe
 
-# Map: fork 4 clones with separate policies
-mapper = Sandbox(data_policy, init_fn=init, work_fn=work)
+# Map: fork 4 clones with a separate sandbox config
+mapper = Sandbox(
+    fs_readable=["/usr", "/lib", "/bin", "/etc", "/data"],
+    init_fn=init,
+    work_fn=work,
+)
 clones = mapper.fork(4)
 
 # Reduce: pipe clone outputs to reducer stdin
-result = Sandbox(reduce_policy).reduce(
+reducer = Sandbox(fs_readable=["/usr", "/lib", "/bin", "/etc"])
+result = reducer.reduce(
     ["python3", "-c", "import sys; print(sum(int(l) for l in sys.stdin))"],
     clones,
 )
@@ -476,22 +525,113 @@ print(result.stdout)  # b"total\n"
 ```
 
 ```rust
-let mut mapper = Sandbox::new_with_fns(&map_policy,
-    || { load_data(); },
-    |id| { println!("{}", compute(id)); },
-)?;
+let mut mapper = Sandbox::builder()
+    .fs_read("/usr").fs_read("/lib").fs_read("/bin").fs_read("/etc")
+    .fs_read("/data")
+    .name("mapper")
+    .init_fn(|| { load_data(); })
+    .work_fn(|id| { println!("{}", compute(id)); })
+    .build()?;
 let mut clones = mapper.fork(4).await?;
 
-let reducer = Sandbox::new(&reduce_policy)?;
+let reducer = Sandbox::builder()
+    .fs_read("/usr").fs_read("/lib").fs_read("/bin").fs_read("/etc")
+    .name("reducer")
+    .build()?;
 let result = reducer.reduce(
     &["python3", "-c", "import sys; print(sum(int(l) for l in sys.stdin))"],
     &mut clones,
 ).await?;
 ```
 
-Map and reduce run in separate sandboxes with independent policies —
+Map and reduce run in separate sandboxes with independent configs —
 the mapper has data access, the reducer doesn't. Each clone inherits
 Landlock + seccomp confinement. `CLONE_ID=0..N-1` is set automatically.
+
+### Network Model
+
+Outbound traffic is gated by a single endpoint allowlist that names
+**protocol × destination**. Each `--net-allow` rule is one of:
+
+```
+--net-allow <spec>          repeatable; no rules = deny all outbound
+  bare form  host:port[,port,...] / :port / *:port / host:* / :* / *:*   (TCP)
+  tcp://     same suffix grammar — explicit TCP
+  udp://     same suffix grammar — UDP (`udp://*:*` opens any UDP)
+  icmp://    host or `*`, no port — kernel ping socket (SOCK_DGRAM)
+```
+
+Multiple rules are OR'd. A destination is permitted iff some rule
+matches the **same protocol** as the socket plus the destination IP
+and port (port is N/A for ICMP).
+
+**Protocol gating** falls out of rule presence per scheme:
+
+  * No UDP rule → UDP socket creation is denied at the seccomp layer.
+  * No ICMP rule → kernel ping socket creation (SOCK_DGRAM + IPPROTO_ICMP)
+    is denied at the seccomp layer.
+  * Raw ICMP (SOCK_RAW + IPPROTO_ICMP) is **never exposed** — packet
+    crafting is out of scope. Workloads that need ping should rely on
+    the host's `net.ipv4.ping_group_range` and use the dgram path
+    above (`--net-allow icmp://...`).
+  * TCP is always permitted at the syscall level; destinations are
+    governed by Landlock and/or the on-behalf path.
+
+**Defaults.** With no `--net-allow` and no HTTP ACL flags, Landlock
+denies every TCP `connect()`, UDP / ICMP / raw socket creation are
+denied at the seccomp layer, and there is no on-behalf path active.
+For unrestricted TCP egress, opt in explicitly with
+`--net-allow :*`; for any UDP, add `--net-allow udp://*:*`.
+
+**Resolution.** Concrete hostnames are resolved once at sandbox start
+and pinned in a synthetic `/etc/hosts` (across all protocols). The
+synthetic file replaces the real one only when at least one rule has
+a concrete host; pure `:port` / `udp://*:*` / `icmp://*` rules leave
+the real `/etc/hosts` and DNS visible.
+
+**Wildcards.** Hostnames are matched literally — `--net-allow
+*.example.com:443` is **not** supported, list each domain you need.
+The `*` token is allowed as the host (alias for empty: `*:port` ≡
+`:port`) and as the port for TCP/UDP rules (`host:*`, `:*`, `*:*`,
+`udp://*:*`). Mixing `*` with concrete ports (`host:80,*`) is
+rejected. When any TCP rule uses the all-ports wildcard, Landlock no
+longer filters TCP connect at the kernel level (it cannot express
+"every port" without enumerating 65535 rules); the on-behalf path
+becomes the sole enforcer, and for `:*` it short-circuits to
+allow-all.
+
+**Implementation.** Two enforcement paths:
+
+  * **Direct path** — pure `:port` TCP policies (no concrete host)
+    and no HTTP ACL. Landlock enforces the TCP port allowlist at the
+    kernel level; no per-syscall overhead. UDP and ICMP are not
+    covered by Landlock and always use the on-behalf path when allowed.
+  * **On-behalf path** — any concrete host, any HTTP ACL rule, or any
+    UDP / ICMP rule. Seccomp traps `connect()`, `sendto()`, `sendmsg()`,
+    and `sendmmsg()`; the supervisor dups the child fd, queries
+    `getsockopt(SOL_SOCKET, SO_PROTOCOL)` to learn whether the socket
+    is TCP / UDP / ICMP, then checks the destination against that
+    protocol's resolved allowlist before performing the syscall.
+    The HTTP/HTTPS proxy redirect (when configured) happens here too.
+
+**HTTP / HTTPS interception.** `--http-allow` / `--http-deny` route
+matching ports through a transparent proxy. Each rule with a concrete
+host auto-extends `--net-allow` with `host:80` (and `host:443` when
+`--http-ca` is set) so the proxy's intercept ports are reachable;
+wildcard hosts auto-add `:80` / `:443` (any IP). All auto-added
+entries are TCP. HTTPS MITM is opt-in: pass `--http-ca <cert>` and
+`--http-key <key>` for a CA *you generate* and trust inside the
+sandbox (typically install the cert into the workload's
+`/etc/ssl/certs/`). Without `--http-ca`, port 443 is not intercepted
+— `--net-allow host:443` permits raw TLS to the host with no content
+inspection.
+
+**Bind.** `--net-bind <port>` is independent from `--net-allow` and
+governs server-side `bind()`. Landlock enforces it (TCP only);
+`--port-remap` adds on-behalf virtualization for binding.
+
+**AF_UNIX sockets** are governed by Landlock's
+`LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`, independent from `--net-allow`.
 
 ### Port Virtualization
 
@@ -540,34 +680,40 @@ cargo test --release
 cd python && pip install -e . && pytest tests/
 ```
 
-## Policy Reference
+## Sandbox Reference
 
 ```python
-Policy(
+Sandbox(
     # Filesystem (Landlock)
     fs_writable=["/tmp"],          # Read/write access
     fs_readable=["/usr", "/lib"],  # Read-only access
     fs_denied=["/proc/kcore"],     # Explicitly denied
 
     # Syscall filtering (seccomp)
-    deny_syscalls=None,            # None = default blocklist
-    allow_syscalls=None,           # Allowlist mode (stricter)
+    extra_deny_syscalls=[],         # Extra syscalls to block in addition to Sandlock defaults
 
-    # Network
-    net_allow_hosts=["api.example.com"],  # Domain allowlist
-    net_bind=[8080],               # TCP bind ports (Landlock ABI v4+)
-    net_connect=[443],             # TCP connect ports
+    # Network — see "Network Model" above. Each entry is one of:
+    #   bare host:port[,port,...]  — TCP (default scheme)
+    #   tcp://host:port            — explicit TCP
+    #   udp://host:port            — UDP (`udp://*:*` for any UDP)
+    #   icmp://host                — kernel ping socket (`icmp://*` = any)
+    # Empty list = deny all outbound. Protocol gating falls out of rule
+    # presence: with no UDP/ICMP rule, the corresponding socket creation
+    # is denied at the seccomp layer. Raw ICMP is not exposed.
+    net_allow=[
+        "api.example.com:443",
+        "github.com:22,443",
+        "udp://1.1.1.1:53",        # DNS over UDP
+        "icmp://github.com",       # ping (gated by ping_group_range)
+    ],
+    net_bind=[8080],               # TCP bind ports (Landlock; ABI v4+)
 
     # HTTP ACL (transparent proxy)
     http_allow=["POST api.openai.com/v1/*"],  # Allow rules (METHOD host/path)
-    http_deny=["* */admin/*"],     # Deny rules (checked first)
+    http_deny=["* */admin/*"],     # Block rules (checked first)
     http_ports=[80],               # Ports to intercept (default: [80])
-    https_ca="ca.pem",             # CA cert for HTTPS MITM (adds port 443)
-    https_key="ca-key.pem",        # CA key for HTTPS MITM
-
-    # Socket restrictions
-    no_raw_sockets=True,           # Block SOCK_RAW (default)
-    no_udp=False,                  # Block SOCK_DGRAM
+    http_ca="ca.pem",              # CA cert for HTTPS MITM (adds port 443)
+    http_key="ca-key.pem",         # CA key for HTTPS MITM
 
     # Resources
     max_memory="512M",             # Memory limit

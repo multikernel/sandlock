@@ -47,10 +47,10 @@ impl ResourceState {
 // ProcfsState — /proc virtualization state
 // ============================================================
 
-/// /proc virtualization runtime state. Sandbox membership lives in
-/// `ProcessIndex`; per-process getdents caches live in
-/// `PerProcessState::procfs_dir_cache`. This struct only holds
-/// truly global virtualization state.
+/// /proc virtualization runtime state. Per-notification process state
+/// lives in `ProcessIndex`; per-process getdents caches live in
+/// `PerProcessState::procfs_dir_cache`. This struct only holds truly
+/// global virtualization state.
 pub struct ProcfsState {
     /// Base address of the last vDSO we patched (0 = not yet patched).
     pub vdso_patched_addr: u64,
@@ -117,10 +117,17 @@ pub struct PerProcessState {
 }
 
 // ============================================================
-// ProcessIndex — sandbox membership + per-process state
+// ProcessIndex — tracked processes + per-process state
 // ============================================================
 
-/// Source-of-truth registry for processes inside the sandbox.
+/// Registry for tracked sandbox processes plus their per-process
+/// supervisor state.
+///
+/// In the default supervisor this is populated lazily from seccomp
+/// notifications. When `policy_fn` is active, fork-like syscalls are
+/// additionally traced for one ptrace creation event so children are
+/// inserted here before they can run user code; this makes the index
+/// complete for argv-safety freezes.
 ///
 /// Maps the kernel's numeric `pid` (the value that arrives in seccomp
 /// notifications) to the canonical `PidKey` plus an
@@ -188,8 +195,8 @@ impl ProcessIndex {
             .map(|e| (e.key, Arc::clone(&e.state)))
     }
 
-    /// Cheap membership test — used by /proc virtualization to gate
-    /// access to `/proc/<pid>/...` paths and by getdents filtering.
+    /// Cheap tracked-process test — used by /proc virtualization to
+    /// gate access to `/proc/<pid>/...` paths and by getdents filtering.
     pub fn contains(&self, pid: i32) -> bool {
         self.inner
             .read()
@@ -289,13 +296,22 @@ impl CowState {
 // NetworkState — network policy and port remapping state
 // ============================================================
 
-/// Network policy and port-remapping state.
+/// Network policy and port-remapping state. Holds one
+/// `NetworkPolicy` per L4 protocol — the on-behalf handler picks the
+/// matching one based on the dup'd fd's `SO_PROTOCOL`.
 pub struct NetworkState {
-    /// Global network policy: unrestricted or limited to a set of IPs.
-    pub network_policy: crate::seccomp::notif::NetworkPolicy,
+    /// Allowlist for TCP destinations (`tcp://...` and bare-form rules).
+    pub tcp_policy: crate::seccomp::notif::NetworkPolicy,
+    /// Allowlist for UDP destinations (`udp://...` rules).
+    pub udp_policy: crate::seccomp::notif::NetworkPolicy,
+    /// Allowlist for ICMP destinations (`icmp://...` rules). ICMP rules
+    /// carry no ports, so every entry uses `PortAllow::Any` and the
+    /// effective check is IP-only.
+    pub icmp_policy: crate::seccomp::notif::NetworkPolicy,
     /// Port binding and remapping tracker.
     pub port_map: crate::port_remap::PortMap,
-    /// Per-PID network overrides from policy_fn.
+    /// Per-PID network overrides from policy_fn (IP-only via the legacy
+    /// `restrict_network(ips)` API; any port is permitted to listed IPs).
     pub pid_ip_overrides: std::sync::Arc<std::sync::RwLock<HashMap<u32, HashSet<std::net::IpAddr>>>>,
     /// HTTP ACL proxy address (None if HTTP ACL not active).
     pub http_acl_addr: Option<std::net::SocketAddr>,
@@ -308,7 +324,9 @@ pub struct NetworkState {
 impl NetworkState {
     pub fn new() -> Self {
         Self {
-            network_policy: crate::seccomp::notif::NetworkPolicy::Unrestricted,
+            tcp_policy: crate::seccomp::notif::NetworkPolicy::Unrestricted,
+            udp_policy: crate::seccomp::notif::NetworkPolicy::Unrestricted,
+            icmp_policy: crate::seccomp::notif::NetworkPolicy::Unrestricted,
             port_map: crate::port_remap::PortMap::new(),
             pid_ip_overrides: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
             http_acl_addr: None,
@@ -317,29 +335,45 @@ impl NetworkState {
         }
     }
 
-    /// Get the effective network policy for a PID.
+    /// Get the effective network policy for a PID and protocol.
     ///
-    /// Priority: per-PID override > live policy (from PolicyFnState) > global network_policy.
-    /// The `live_policy` parameter allows checking the live policy without needing
-    /// to lock the PolicyFnState mutex.
+    /// Priority: per-PID override > live policy (from PolicyFnState) >
+    /// the per-protocol allowlist for `protocol`.
+    /// PID/live overrides are IP-only — any port is permitted to listed
+    /// IPs (legacy `policy_fn` semantics) — and they apply across all
+    /// protocols, since the legacy API didn't distinguish them.
     pub fn effective_network_policy(
         &self,
         pid: u32,
+        protocol: crate::sandbox::Protocol,
         live_policy: Option<&std::sync::Arc<std::sync::RwLock<crate::policy_fn::LivePolicy>>>,
     ) -> crate::seccomp::notif::NetworkPolicy {
+        use crate::sandbox::Protocol;
+        use crate::seccomp::notif::{NetworkPolicy, PortAllow};
+        let ip_only_allow = |ips: &HashSet<std::net::IpAddr>| {
+            let per_ip = ips.iter().map(|&ip| (ip, PortAllow::Any)).collect();
+            NetworkPolicy::AllowList {
+                per_ip,
+                any_ip_ports: HashSet::new(),
+            }
+        };
         if let Ok(overrides) = self.pid_ip_overrides.read() {
             if let Some(ips) = overrides.get(&pid) {
-                return crate::seccomp::notif::NetworkPolicy::AllowList(ips.clone());
+                return ip_only_allow(ips);
             }
         }
         if let Some(lp) = live_policy {
             if let Ok(live) = lp.read() {
                 if !live.allowed_ips.is_empty() {
-                    return crate::seccomp::notif::NetworkPolicy::AllowList(live.allowed_ips.clone());
+                    return ip_only_allow(&live.allowed_ips);
                 }
             }
         }
-        self.network_policy.clone()
+        match protocol {
+            Protocol::Tcp => self.tcp_policy.clone(),
+            Protocol::Udp => self.udp_policy.clone(),
+            Protocol::Icmp => self.icmp_policy.clone(),
+        }
     }
 }
 

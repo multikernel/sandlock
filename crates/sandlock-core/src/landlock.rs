@@ -2,7 +2,7 @@ use std::os::fd::OwnedFd;
 use std::path::Path;
 
 use crate::error::{ConfinementError, SandlockError};
-use crate::policy::Policy;
+use crate::sandbox::Sandbox;
 use crate::sys::structs::{
     LandlockNetPortAttr, LandlockPathBeneathAttr, LandlockRulesetAttr,
     LANDLOCK_ACCESS_FS_EXECUTE, LANDLOCK_ACCESS_FS_IOCTL_DEV, LANDLOCK_ACCESS_FS_MAKE_BLOCK,
@@ -170,19 +170,28 @@ fn add_net_rule(ruleset_fd: &OwnedFd, port: u16, access: u64) -> Result<(), Conf
 /// Minimum Landlock ABI version required by sandlock.
 pub const MIN_ABI: u32 = 6;
 
-/// Apply Landlock confinement based on the given `Policy`.
+/// Apply Landlock confinement based on the given `Sandbox`.
 ///
 /// Requires Landlock ABI v6 or later. Returns an error if the kernel does
 /// not meet this requirement.
-pub fn confine(policy: &Policy) -> Result<(), SandlockError> {
+pub fn confine(policy: &Sandbox) -> Result<(), SandlockError> {
+    confine_inner(policy, true)
+}
+
+/// Apply Landlock filesystem confinement without TCP bind/connect rules.
+pub fn confine_filesystem(policy: &Sandbox) -> Result<(), SandlockError> {
+    confine_inner(policy, false)
+}
+
+fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError> {
     // Step 1 -- detect and validate ABI version.
     let abi = abi_version().map_err(|e| {
-        SandlockError::Sandbox(crate::error::SandboxError::Confinement(e))
+        SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
     })?;
 
     if abi < MIN_ABI {
-        return Err(SandlockError::Sandbox(
-            crate::error::SandboxError::Confinement(
+        return Err(SandlockError::Runtime(
+            crate::error::SandboxRuntimeError::Confinement(
                 ConfinementError::InsufficientAbi {
                     required: MIN_ABI,
                     actual: abi,
@@ -195,9 +204,32 @@ pub fn confine(policy: &Policy) -> Result<(), SandlockError> {
     // Step 2 -- build handled_access_fs / handled_access_net / scoped.
     let handled_access_fs = base_fs_access(abi);
 
-    // Always restrict TCP bind/connect via Landlock.  Empty net_bind/net_connect
-    // means deny all — same semantics as fs_readable/fs_writable.
-    let handled_access_net = LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP;
+    // Restrict TCP bind/connect via Landlock by default. When any
+    // `--net-allow` rule has the all-ports wildcard (`host:*` or
+    // `:*`), Landlock cannot express "every port" without enumerating
+    // 65535 rules, so we drop CONNECT_TCP from the handled set —
+    // unhandled access is unrestricted by Landlock. The on-behalf
+    // path (seccomp notif on connect/sendto/sendmsg) still enforces
+    // the per-rule IP allowlist when the rule is `host:*`. For `:*`
+    // the on-behalf path becomes `NetworkPolicy::Unrestricted` (no
+    // additional check). Bind enforcement is unaffected.
+    // Landlock's net hooks only cover TCP (CONNECT_TCP / BIND_TCP).
+    // UDP and ICMP rules are enforced elsewhere (BPF gates plus the
+    // on-behalf path), so they're filtered out here — feeding them to
+    // Landlock would either be a no-op (for unhandled protocols) or
+    // wrongly install TCP rules from a UDP wildcard.
+    use crate::sandbox::Protocol;
+    let net_wildcard = policy
+        .net_allow
+        .iter()
+        .any(|r| r.protocol == Protocol::Tcp && r.all_ports);
+    let handled_access_net = if !handle_net {
+        0
+    } else if net_wildcard {
+        LANDLOCK_ACCESS_NET_BIND_TCP
+    } else {
+        LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP
+    };
 
     // IPC and signal isolation are always enabled.
     let scoped = LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET | LANDLOCK_SCOPE_SIGNAL;
@@ -211,7 +243,7 @@ pub fn confine(policy: &Policy) -> Result<(), SandlockError> {
 
     let ruleset_fd = syscall::landlock_create_ruleset(&attr, std::mem::size_of::<LandlockRulesetAttr>(), 0)
         .map_err(|e| {
-            SandlockError::Sandbox(crate::error::SandboxError::Confinement(
+            SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(
                 ConfinementError::Landlock(format!("create ruleset: {}", e)),
             ))
         })?;
@@ -235,7 +267,7 @@ pub fn confine(policy: &Policy) -> Result<(), SandlockError> {
             path.as_path()
         };
         add_path_rule(&ruleset_fd, rule_path, fs_write_mask).map_err(|e| {
-            SandlockError::Sandbox(crate::error::SandboxError::Confinement(e))
+            SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
         })?;
     }
 
@@ -249,7 +281,7 @@ pub fn confine(policy: &Policy) -> Result<(), SandlockError> {
             path.as_path()
         };
         add_path_rule(&ruleset_fd, rule_path, READ_ACCESS).map_err(|e| {
-            SandlockError::Sandbox(crate::error::SandboxError::Confinement(e))
+            SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
         })?;
     }
 
@@ -275,20 +307,47 @@ pub fn confine(policy: &Policy) -> Result<(), SandlockError> {
     }
 
     // Step 5 -- add network port rules.
-    for &port in &policy.net_bind {
-        add_net_rule(&ruleset_fd, port, LANDLOCK_ACCESS_NET_BIND_TCP).map_err(|e| {
-            SandlockError::Sandbox(crate::error::SandboxError::Confinement(e))
-        })?;
+    if handle_net {
+        for &port in &policy.net_bind {
+            add_net_rule(&ruleset_fd, port, LANDLOCK_ACCESS_NET_BIND_TCP).map_err(|e| {
+                SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
+            })?;
+        }
     }
-    for &port in &policy.net_connect {
-        add_net_rule(&ruleset_fd, port, LANDLOCK_ACCESS_NET_CONNECT_TCP).map_err(|e| {
-            SandlockError::Sandbox(crate::error::SandboxError::Confinement(e))
-        })?;
+    // For TCP connect, Landlock is the only enforcer on the direct path.
+    // The on-behalf path (when enabled) re-checks (ip, port) against the
+    // resolved allowlist, but Landlock must already permit the port or
+    // the kernel rejects before seccomp gets a chance to dispatch. Allow
+    // every port that any --net-allow rule mentions, plus every HTTP
+    // intercept port; the on-behalf check ensures the IP also matches.
+    //
+    // When `net_wildcard` is set we already excluded CONNECT_TCP from
+    // `handled_access_net`, so adding rules here would fail with EINVAL.
+    // Skip — the on-behalf path is the sole enforcer.
+    if handle_net && !net_wildcard {
+        let mut connect_ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
+        for rule in &policy.net_allow {
+            // TCP-only — see net_wildcard comment above.
+            if rule.protocol != Protocol::Tcp {
+                continue;
+            }
+            for &p in &rule.ports {
+                connect_ports.insert(p);
+            }
+        }
+        for &p in &policy.http_ports {
+            connect_ports.insert(p);
+        }
+        for port in connect_ports {
+            add_net_rule(&ruleset_fd, port, LANDLOCK_ACCESS_NET_CONNECT_TCP).map_err(|e| {
+                SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
+            })?;
+        }
     }
 
     // Step 6 — enforce (irreversible).
     syscall::landlock_restrict_self(&ruleset_fd, 0).map_err(|e| {
-        SandlockError::Sandbox(crate::error::SandboxError::Confinement(
+        SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(
             ConfinementError::Landlock(format!("restrict_self: {}", e)),
         ))
     })?;

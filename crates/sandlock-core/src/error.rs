@@ -3,33 +3,38 @@ use thiserror::Error;
 /// Root error type for all sandlock operations.
 #[derive(Debug, Error)]
 pub enum SandlockError {
-    #[error("policy error: {0}")]
-    Policy(#[from] PolicyError),
-
     #[error("sandbox error: {0}")]
     Sandbox(#[from] SandboxError),
 
+    #[error("process error: {0}")]
+    Runtime(#[from] SandboxRuntimeError),
+
     #[error("memory protection error: {0}")]
     MemoryProtect(String),
+
+    #[error("handler error: {0}")]
+    Handler(#[from] crate::seccomp::dispatch::HandlerError),
 }
 
+/// Errors from sandbox configuration validation and building.
 #[derive(Debug, Error)]
-pub enum PolicyError {
-    #[error("invalid policy: {0}")]
+pub enum SandboxError {
+    #[error("invalid sandbox: {0}")]
     Invalid(String),
-
-    #[error("deny_syscalls and allow_syscalls are mutually exclusive")]
-    MutuallyExclusiveSyscalls,
 
     #[error("fs_isolation requires workdir to be set")]
     FsIsolationRequiresWorkdir,
 
     #[error("max_cpu must be 1-100, got {0}")]
     InvalidCpuPercent(u8),
+
+    #[error("confine() only accepts Landlock filesystem policy; unsupported fields: {0}")]
+    UnsupportedForConfine(String),
 }
 
+/// Errors from the sandbox process runtime (fork, confinement, child, etc.).
 #[derive(Debug, Error)]
-pub enum SandboxError {
+pub enum SandboxRuntimeError {
     #[error("fork failed: {0}")]
     Fork(#[source] std::io::Error),
 

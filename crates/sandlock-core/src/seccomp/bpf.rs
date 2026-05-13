@@ -5,7 +5,7 @@
 //   [arg filter block]          variable length (pre-built SockFilter instructions)
 //   [LD syscall nr]             1 instruction
 //   [notif JEQ instructions]    1 per notif syscall
-//   [deny JEQ instructions]     1 per deny syscall
+//   [deny JEQ instructions]     1 per blocklisted syscall
 //   [RET ALLOW]                 index = ret_allow_idx   (default fall-through)
 //   [RET USER_NOTIF]            index = ret_notif_idx
 //   [RET ERRNO(EPERM)]          index = ret_errno_idx
@@ -45,7 +45,7 @@ pub(crate) fn jump(code: u16, k: u32, jt: u8, jf: u8) -> SockFilter {
 /// Assemble a cBPF program for `seccomp(SECCOMP_SET_MODE_FILTER, ...)`.
 ///
 /// * `notif_syscalls`  — syscalls that generate SECCOMP_RET_USER_NOTIF
-/// * `deny_syscalls`   — syscalls that return ERRNO(EPERM)
+/// * `block_syscalls`   — syscalls that return ERRNO(EPERM)
 /// * `arg_block`       — pre-built arg filter instructions (from `context::arg_filters`)
 ///
 /// Returns an error if the resulting program would exceed the kernel's
@@ -56,7 +56,7 @@ pub(crate) fn jump(code: u16, k: u32, jt: u8, jf: u8) -> SockFilter {
 /// changes could silently truncate offsets.
 pub fn assemble_filter(
     notif_syscalls: &[u32],
-    deny_syscalls: &[u32],
+    block_syscalls: &[u32],
     arg_block: &[SockFilter],
 ) -> Result<Vec<SockFilter>, std::io::Error> {
     // ---- compute final layout sizes ----
@@ -64,7 +64,7 @@ pub fn assemble_filter(
     let arg_block_len = arg_block.len();
     let load_nr = 1usize;
     let notif_jmps = notif_syscalls.len();
-    let deny_jmps = deny_syscalls.len();
+    let deny_jmps = block_syscalls.len();
     let ret_section = 4usize;                      // ALLOW, USER_NOTIF, ERRNO, KILL
 
     let total = arch_block + arg_block_len + load_nr + notif_jmps + deny_jmps + ret_section;
@@ -106,7 +106,7 @@ pub fn assemble_filter(
     // ---- 5. Deny syscall JEQ instructions ----
     let ret_errno_idx = total - 2;
     let deny_base = notif_base + notif_jmps;
-    for (i, &nr) in deny_syscalls.iter().enumerate() {
+    for (i, &nr) in block_syscalls.iter().enumerate() {
         let pos = deny_base + i;
         let jt = (ret_errno_idx - (pos + 1)) as u8;
         prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr, jt, 0));

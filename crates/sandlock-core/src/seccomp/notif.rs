@@ -2,7 +2,7 @@
 // notifications from the kernel, dispatches them to handler functions, and
 // sends responses.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::IpAddr;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -78,13 +78,52 @@ pub enum NotifAction {
 // NetworkPolicy — network access policy enum
 // ============================================================
 
+/// Per-IP port allowlist. `Any` is used by `policy_fn` IP-only
+/// overrides (legacy `restrict_network(ips)` API where the user
+/// restricts the destination IP set but not ports).
+#[derive(Debug, Clone)]
+pub enum PortAllow {
+    /// Any port permitted to this IP.
+    Any,
+    /// Only these ports permitted to this IP.
+    Specific(HashSet<u16>),
+}
+
 /// Global network policy for the sandbox.
 #[derive(Debug, Clone)]
 pub enum NetworkPolicy {
-    /// All IPs allowed (no net_allow_hosts configured).
+    /// No IP-level restriction (no `--net-allow` configured and no
+    /// `policy_fn` override). The Landlock direct path enforces ports.
     Unrestricted,
-    /// Only these IPs are allowed (from resolved net_allow_hosts).
-    AllowList(HashSet<IpAddr>),
+    /// Endpoint-level allowlist: a connection is permitted iff the
+    /// destination IP and port match at least one entry below.
+    AllowList {
+        /// Per-IP port rules. From `--net-allow host:ports` after
+        /// hostname resolution, or from `policy_fn` overrides.
+        per_ip: HashMap<IpAddr, PortAllow>,
+        /// Ports permitted for any IP (from `--net-allow :port` /
+        /// `*:port`).
+        any_ip_ports: HashSet<u16>,
+    },
+}
+
+impl NetworkPolicy {
+    /// True iff a connection to (ip, port) should be permitted.
+    pub fn allows(&self, ip: IpAddr, port: u16) -> bool {
+        match self {
+            NetworkPolicy::Unrestricted => true,
+            NetworkPolicy::AllowList { per_ip, any_ip_ports } => {
+                if any_ip_ports.contains(&port) {
+                    return true;
+                }
+                match per_ip.get(&ip) {
+                    Some(PortAllow::Any) => true,
+                    Some(PortAllow::Specific(s)) => s.contains(&port),
+                    None => false,
+                }
+            }
+        }
+    }
 }
 
 /// Check if a path-bearing notification targets a denied path.
@@ -171,6 +210,13 @@ pub struct NotifPolicy {
     pub has_net_allowlist: bool,
     pub has_random_seed: bool,
     pub has_time_start: bool,
+    /// Argv-safety gate: the supervisor must freeze every task that
+    /// could mutate argv before any consumer reads it. True when
+    /// `policy_fn` is active or when an extra handler is bound to
+    /// execve/execveat (such handlers can call `read_child_mem`).
+    /// Also gates ptrace fork-event tracking so `ProcessIndex` is
+    /// complete when the freeze enumerates it.
+    pub argv_safety_required: bool,
     pub time_offset: i64,
     pub num_cpus: Option<u32>,
     pub port_remap: bool,
@@ -185,7 +231,7 @@ pub struct NotifPolicy {
     /// Mount mappings: (virtual_path, host_path) pairs.
     pub chroot_mounts: Vec<(std::path::PathBuf, std::path::PathBuf)>,
     pub deterministic_dirs: bool,
-    pub hostname: Option<String>,
+    pub virtual_hostname: Option<String>,
     pub has_http_acl: bool,
     /// Synthetic `/etc/hosts` content for `net_allow_hosts` virtualization.
     /// When set, `openat("/etc/hosts")` returns a memfd with this content
@@ -371,11 +417,16 @@ fn write_child_mem_vm(pid: u32, addr: u64, data: &[u8]) -> Result<(), NotifError
     }
 }
 
-/// Read bytes from a child process via process_vm_readv.
+/// Read bytes from a child process via `process_vm_readv` with TOCTOU validation.
 ///
-/// Performs TOCTOU validation by calling `id_valid` before and after
-/// the read to ensure the notification is still live.
-pub(crate) fn read_child_mem(
+/// Calls `id_valid` before and after the read to ensure the notification is
+/// still live (kernel did not abort or release the trapped syscall while the
+/// supervisor was reading guest memory).
+///
+/// Public — used by downstream `Handler` implementations to read syscall
+/// arguments that the kernel passes by pointer (paths in `openat`, buffers
+/// in `write`/`writev`, etc.).
+pub fn read_child_mem(
     notif_fd: RawFd,
     id: u64,
     pid: u32,
@@ -390,7 +441,19 @@ pub(crate) fn read_child_mem(
 
 /// Read a NUL-terminated string from child memory without crossing unmapped
 /// page boundaries in a single `process_vm_readv` call.
-pub(crate) fn read_child_cstr(
+///
+/// TOCTOU-safe — internally calls [`read_child_mem`], inheriting the
+/// `id_valid` checks bracketing each `process_vm_readv` call.
+///
+/// Page-aware: reads up to a page boundary at a time and stops at the
+/// first NUL byte, never crossing into unmapped memory.  Returns
+/// `None` for `addr == 0`, `max_len == 0`, a read failure, or a string
+/// that exceeds `max_len` without a NUL.
+///
+/// Public — used by downstream `Handler` implementations that read
+/// path arguments from notifications (`openat`, `unlinkat`, `statx`,
+/// `newfstatat`, etc.).
+pub fn read_child_cstr(
     notif_fd: RawFd,
     id: u64,
     pid: u32,
@@ -420,11 +483,13 @@ pub(crate) fn read_child_cstr(
     String::from_utf8(result).ok()
 }
 
-/// Write bytes to a child process via process_vm_writev.
+/// Write bytes to a child process via `process_vm_writev` with TOCTOU validation.
 ///
-/// Performs TOCTOU validation by calling `id_valid` before and after
-/// the write to ensure the notification is still live.
-pub(crate) fn write_child_mem(
+/// Same TOCTOU contract as [`read_child_mem`].  Public for downstream
+/// `Handler` implementations that synthesise syscall results into
+/// guest memory (e.g. fake `getdents64` listings populated from a
+/// virtual directory index, or synthesised `stat` buffers).
+pub fn write_child_mem(
     notif_fd: RawFd,
     id: u64,
     pid: u32,
@@ -510,10 +575,12 @@ fn syscall_name(nr: i64) -> &'static str {
         n if n == libc::SYS_connect => "connect",
         n if n == libc::SYS_sendto => "sendto",
         n if n == libc::SYS_sendmsg => "sendmsg",
+        n if n == libc::SYS_sendmmsg => "sendmmsg",
         n if n == libc::SYS_bind => "bind",
         n if n == libc::SYS_clone => "clone",
         n if n == libc::SYS_clone3 => "clone3",
         n if Some(n) == arch::SYS_VFORK => "vfork",
+        n if Some(n) == arch::SYS_FORK => "fork",
         n if n == libc::SYS_execve => "execve",
         n if n == libc::SYS_execveat => "execveat",
         n if n == libc::SYS_mmap => "mmap",
@@ -539,11 +606,12 @@ fn syscall_category(nr: i64) -> crate::policy_fn::SyscallCategory {
             || n == libc::SYS_faccessat || n == libc::SYS_getdents64
             || Some(n) == arch::SYS_GETDENTS => SyscallCategory::File,
         n if n == libc::SYS_connect || n == libc::SYS_sendto
-            || n == libc::SYS_sendmsg || n == libc::SYS_bind
+            || n == libc::SYS_sendmsg || n == libc::SYS_sendmmsg
+            || n == libc::SYS_bind
             || n == libc::SYS_getsockname => SyscallCategory::Network,
         n if n == libc::SYS_clone || n == libc::SYS_clone3
-            || Some(n) == arch::SYS_VFORK || n == libc::SYS_execve
-            || n == libc::SYS_execveat => SyscallCategory::Process,
+            || Some(n) == arch::SYS_VFORK || Some(n) == arch::SYS_FORK
+            || n == libc::SYS_execve || n == libc::SYS_execveat => SyscallCategory::Process,
         n if n == libc::SYS_mmap || n == libc::SYS_munmap
             || n == libc::SYS_brk || n == libc::SYS_mremap
             => SyscallCategory::Memory,
@@ -780,9 +848,11 @@ async fn emit_policy_event(
     // decision is racy (issue #27). Path-based access control belongs
     // in static Landlock rules.
     //
-    // argv IS extracted for execve/execveat: the supervisor freezes
-    // sibling threads before returning Continue (sibling_freeze module),
-    // so the post-Continue re-read sees the same memory we read here.
+    // argv IS extracted for allowed execve/execveat notifications:
+    // the supervisor freezes every task in the sandbox (siblings +
+    // peers) before this callback reads argv and keeps that freeze
+    // through Continue, so the post-Continue re-read sees the same
+    // memory we read here.
     //
     // Network fields are TOCTOU-safe because connect/sendto/bind are
     // performed on-behalf via pidfd_getfd; the kernel never re-reads
@@ -792,7 +862,7 @@ async fn emit_policy_event(
     let mut size = None;
     let mut argv = None;
 
-    if nr == libc::SYS_execve || nr == libc::SYS_execveat {
+    if !denied && (nr == libc::SYS_execve || nr == libc::SYS_execveat) {
         // execve(pathname, argv, envp):       args[1] = argv ptr
         // execveat(dirfd, pathname, argv, ..): args[2] = argv ptr
         let argv_ptr = if nr == libc::SYS_execveat {
@@ -868,10 +938,11 @@ async fn handle_notification(
 ) {
     let policy = &ctx.policy;
 
-    // Ensure every pid that produces a notification is tracked in the
-    // ProcessIndex with an exit watcher. The fork handler runs on the
-    // *parent* pid (the child doesn't exist yet at clone-time), so the
-    // child gets registered the first time it issues its own syscall.
+    // Ensure every pid that produces a notification has per-process
+    // supervisor state and an exit watcher. The fork handler runs on
+    // the *parent* pid (the child doesn't exist yet at clone-time), so
+    // the child gets registered the first time it issues a notified
+    // syscall.
     crate::resource::register_child_if_new(ctx, notif.pid as i32).await;
 
     // Re-patch vDSO if needed (exec replaces it with a fresh copy).
@@ -898,14 +969,56 @@ async fn handle_notification(
                 NotifAction::Errno(libc::EACCES)
             } else {
                 drop(pfs);
-                dispatch_table.dispatch(notif, ctx, fd).await
+                dispatch_table.dispatch(notif, fd).await
             }
         } else {
-            dispatch_table.dispatch(notif, ctx, fd).await
+            dispatch_table.dispatch(notif, fd).await
         }
     };
 
-    // Emit event to policy_fn callback if active
+    let nr = notif.data.nr as i64;
+    let fork_counted = matches!(action, NotifAction::Continue)
+        && crate::resource::fork_counted_on_continue(&notif, fd);
+
+    // TOCTOU-close for execve (issue #27): freeze every sandbox task
+    // that could mutate argv before policy_fn reads argv and before the
+    // kernel re-reads it after Continue. This covers two writer classes:
+    //   1. Sibling threads of the calling tid (same TGID, share mm).
+    //   2. Peer processes in other TGIDs that alias argv pages via
+    //      MAP_SHARED mappings or share mm via clone(CLONE_VM).
+    //
+    // The freeze enumerates ProcessIndex. With policy_fn active, that
+    // index is complete: fork-like syscalls are traced at creation time
+    // below, before new children can run user code.
+    //
+    // Strict on failure: if we cannot establish the freeze, we cannot
+    // safely expose argv or allow execve, so we deny with EPERM.
+    let mut exec_freeze = None;
+    if matches!(action, NotifAction::Continue)
+        && policy.argv_safety_required
+        && crate::sandbox_freeze::requires_freeze_on_continue(nr)
+    {
+        match crate::sandbox_freeze::freeze_sandbox_for_execve(
+            &ctx.processes,
+            notif.pid as i32,
+        ) {
+            Ok(outcome) => {
+                exec_freeze = Some(outcome);
+            }
+            Err(e) => {
+                eprintln!(
+                    "sandlock: argv-safety freeze failed for pid {}: {} \
+                     — denying execve to preserve TOCTOU invariant",
+                    notif.pid, e
+                );
+                action = NotifAction::Errno(libc::EPERM);
+            }
+        }
+    }
+
+    // Emit event to policy_fn callback if active. For execve, argv is
+    // only populated after `exec_freeze` has stopped every possible
+    // writer, and those tasks stay stopped until after NOTIF_SEND.
     if let Some(verdict) = emit_policy_event(&notif, &action, &ctx.policy_fn, fd).await {
         use crate::policy_fn::Verdict;
         match verdict {
@@ -916,35 +1029,68 @@ async fn handle_notification(
         }
     }
 
-    // TOCTOU-close for execve (issue #27): freeze sibling threads of
-    // the calling tid before the kernel re-reads pathname/argv from
-    // child memory.  Cheap because the kernel's de_thread step in
-    // execve kills the siblings anyway — we're just stopping them
-    // moments earlier, closing the race window for the supervisor's
-    // argv inspection in policy_fn.
-    //
-    // Only relevant when we're sending Continue: a denial response
-    // (Errno) means the kernel never re-reads, so no freeze needed.
-    //
-    // Strict on failure: if we cannot freeze the siblings, we cannot
-    // uphold the argv-safety invariant, so we deny the execve with
-    // EPERM rather than letting it through unprotected.
-    let nr = notif.data.nr as i64;
+    if fork_counted && !matches!(action, NotifAction::Continue) {
+        crate::resource::rollback_fork_count(&ctx.resource).await;
+    }
+
+    // With policy_fn active, fork-like syscalls are traced for exactly
+    // one ptrace event so ProcessIndex becomes complete before the new
+    // child can run user code. That closes the race where a peer
+    // process could exist without ever having produced a notification.
+    let mut creation_trace = None;
     if matches!(action, NotifAction::Continue)
-        && crate::sibling_freeze::requires_freeze_on_continue(nr)
+        && crate::resource::requires_process_creation_tracking(&notif, fd, policy)
     {
-        if let Err(e) = crate::sibling_freeze::freeze_siblings_for_execve(notif.pid as i32) {
-            eprintln!(
-                "sandlock: argv-safety freeze failed for pid {}: {} \
-                 — denying execve to preserve TOCTOU invariant",
-                notif.pid, e
-            );
-            action = NotifAction::Errno(libc::EPERM);
+        match crate::resource::prepare_process_creation_tracking(notif.pid as i32).await {
+            Ok(trace) => {
+                creation_trace = Some(trace);
+            }
+            Err(e) => {
+                eprintln!(
+                    "sandlock: process-creation tracking failed for pid {}: {} \
+                     — denying fork-like syscall to preserve argv TOCTOU invariant",
+                    notif.pid, e
+                );
+                if fork_counted {
+                    crate::resource::rollback_fork_count(&ctx.resource).await;
+                }
+                action = NotifAction::Errno(libc::EPERM);
+            }
         }
     }
 
     // Ignore error — child may have exited between recv and response.
-    let _ = send_response(fd, notif.id, action);
+    let exec_continued = exec_freeze.is_some() && matches!(action, NotifAction::Continue);
+    let send_result = send_response(fd, notif.id, action);
+
+    if let Some(trace) = creation_trace {
+        if send_result.is_ok() {
+            match crate::resource::finish_process_creation_tracking(ctx, trace).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    crate::resource::rollback_fork_count(&ctx.resource).await;
+                }
+                Err(e) => {
+                    crate::resource::rollback_fork_count(&ctx.resource).await;
+                    eprintln!(
+                        "sandlock: process-creation tracking completion failed for pid {}: {}",
+                        notif.pid, e
+                    );
+                }
+            }
+        } else {
+            crate::resource::rollback_fork_count(&ctx.resource).await;
+            crate::resource::abort_process_creation_tracking(trace).await;
+        }
+    }
+
+    if let Some(freeze) = exec_freeze {
+        if exec_continued && send_result.is_ok() {
+            crate::sandbox_freeze::detach_peers(&freeze.peer_tids);
+        } else {
+            crate::sandbox_freeze::detach_all(&freeze);
+        }
+    }
 }
 
 // ============================================================
@@ -954,14 +1100,24 @@ async fn handle_notification(
 /// Async event loop that processes seccomp notifications.
 ///
 /// Runs until the notification fd is closed (child exits or filter is removed).
+///
+/// `pending_handlers` are user-supplied syscall handlers registered after all
+/// builtin handlers.  For the default behaviour without any custom handlers
+/// pass an empty `Vec`.
 pub async fn supervisor(
     notif_fd: OwnedFd,
     ctx: Arc<super::ctx::SupervisorCtx>,
+    pending_handlers: Vec<(i64, std::sync::Arc<dyn super::dispatch::Handler>)>,
 ) {
     let fd = notif_fd.as_raw_fd();
 
     // Build the dispatch table once at startup.
-    let dispatch_table = Arc::new(super::dispatch::build_dispatch_table(&ctx.policy, &ctx.resource));
+    let dispatch_table = Arc::new(super::dispatch::build_dispatch_table(
+        &ctx.policy,
+        &ctx.resource,
+        &ctx,
+        pending_handlers,
+    ));
 
     // Try to enable sync wakeup (Linux 6.7+, ignore error on older kernels).
     try_set_sync_wakeup(fd);
@@ -1073,6 +1229,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn read_child_cstr_returns_none_for_null_addr_or_zero_max_len() {
+        // Smoke: addr == 0 short-circuits without touching the child.
+        assert!(read_child_cstr(-1, 0, 0, 0, 4096).is_none());
+        // max_len == 0 also short-circuits.
+        assert!(read_child_cstr(-1, 0, 0, 0xdeadbeef, 0).is_none());
+    }
+
+    #[test]
     fn test_notif_action_debug() {
         // Ensure all variants implement Debug.
         let _ = format!("{:?}", NotifAction::Continue);
@@ -1089,7 +1253,9 @@ mod tests {
     #[test]
     fn test_network_state_new() {
         let ns = super::super::state::NetworkState::new();
-        assert!(matches!(ns.network_policy, NetworkPolicy::Unrestricted));
+        assert!(matches!(ns.tcp_policy, NetworkPolicy::Unrestricted));
+        assert!(matches!(ns.udp_policy, NetworkPolicy::Unrestricted));
+        assert!(matches!(ns.icmp_policy, NetworkPolicy::Unrestricted));
         assert!(ns.port_map.bound_ports.is_empty());
     }
 

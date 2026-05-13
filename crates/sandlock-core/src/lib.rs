@@ -1,8 +1,8 @@
 pub mod error;
-pub mod policy;
+pub mod sandbox;     // formerly `policy`; contains Sandbox + SandboxBuilder + Confinement
 pub mod profile;
 pub mod result;
-pub mod sandbox;
+pub mod process;     // runtime helpers (is_nested, CONFINED); SandboxProcess removed
 pub(crate) mod arch;
 pub(crate) mod sys;
 pub mod landlock;
@@ -15,7 +15,7 @@ pub(crate) mod random;
 pub(crate) mod time;
 pub(crate) mod cow;
 pub(crate) mod checkpoint;
-pub(crate) mod sibling_freeze;
+pub(crate) mod sandbox_freeze;
 pub mod netlink;
 pub(crate) mod procfs;
 pub(crate) mod port_remap;
@@ -29,11 +29,17 @@ pub(crate) mod http_acl;
 
 pub use error::SandlockError;
 pub use checkpoint::Checkpoint;
-pub use policy::{Policy, PolicyBuilder};
+pub use sandbox::{Confinement, ConfinementBuilder, Sandbox, SandboxBuilder};
 pub use result::{RunResult, ExitStatus};
-pub use sandbox::Sandbox;
 pub use pipeline::{Stage, Pipeline, Gather};
 pub use dry_run::{Change, ChangeKind, DryRunResult};
+// Sectioned-profile parsing types: ProfileInput is the top-level deserialization
+// target; ProgramSpec carries [program].exec/args (not a Sandbox field).
+pub use crate::profile::{ProfileInput, ProgramSpec};
+
+// Public extension API — see docs/extension-handlers.md.
+pub use seccomp::dispatch::{Handler, HandlerCtx, HandlerError};
+pub use seccomp::syscall::{Syscall, SyscallError};
 
 /// Query the Landlock ABI version supported by the running kernel.
 pub fn landlock_abi_version() -> Result<u32, error::ConfinementError> {
@@ -45,21 +51,16 @@ pub const MIN_LANDLOCK_ABI: u32 = landlock::MIN_ABI;
 
 /// Confine the calling process with Landlock restrictions.
 ///
-/// This applies `PR_SET_NO_NEW_PRIVS` and Landlock rules from the policy's
-/// filesystem (`fs_readable`, `fs_writable`) fields. IPC and signal
-/// isolation are always enabled. The confinement is **irreversible**.
-///
-/// `fs_denied` is not enforced here because it requires supervisor-mediated
-/// path interception rather than Landlock's allowlist model.
-///
-/// Network, seccomp, resource limits, and other policy fields are ignored.
+/// This applies `PR_SET_NO_NEW_PRIVS` and Landlock rules from the sandbox's
+/// filesystem fields. IPC and signal isolation are always enabled. The
+/// confinement is **irreversible**.
 ///
 /// This does NOT fork or exec — it confines the current process in-place.
-pub fn confine_current_process(policy: &Policy) -> Result<(), SandlockError> {
+pub fn confine(confinement: &Confinement) -> Result<(), SandlockError> {
     // Set NO_NEW_PRIVS (required for Landlock)
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-        return Err(SandlockError::Sandbox(
-            error::SandboxError::Confinement(
+        return Err(SandlockError::Runtime(
+            error::SandboxRuntimeError::Confinement(
                 error::ConfinementError::Landlock(format!(
                     "prctl(PR_SET_NO_NEW_PRIVS): {}",
                     std::io::Error::last_os_error()
@@ -68,13 +69,15 @@ pub fn confine_current_process(policy: &Policy) -> Result<(), SandlockError> {
         ));
     }
 
-    // Build a stripped policy with only Landlock-native fields that
-    // confine_current_process supports: filesystem + IPC + signals.
-    // Network port rules are excluded — they require the full sandbox.
-    let mut stripped = policy.clone();
-    stripped.net_bind.clear();
-    stripped.net_connect.clear();
+    let mut builder = Sandbox::builder();
+    for path in &confinement.fs_readable {
+        builder = builder.fs_read(path.clone());
+    }
+    for path in &confinement.fs_writable {
+        builder = builder.fs_write(path.clone());
+    }
+    let stripped = builder.build()?;
 
-    // Apply Landlock rules
-    landlock::confine(&stripped)
+    // Apply Landlock filesystem rules.
+    landlock::confine_filesystem(&stripped)
 }

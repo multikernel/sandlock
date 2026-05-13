@@ -1,8 +1,8 @@
 use std::path::PathBuf;
-use sandlock_core::{Policy, Sandbox};
+use sandlock_core::{Sandbox};
 
-fn base_policy() -> sandlock_core::PolicyBuilder {
-    Policy::builder()
+fn base_policy() -> sandlock_core::SandboxBuilder {
+    Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
         .fs_read("/bin").fs_read("/etc").fs_read("/proc")
         .fs_read("/dev").fs_write("/tmp")
@@ -24,7 +24,7 @@ async fn if_nameindex_returns_only_lo() {
     ), out = out.display());
 
     let policy = base_policy().build().unwrap();
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await.unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
@@ -54,7 +54,7 @@ async fn loopback_bind_succeeds() {
 
     // port 0 in Landlock net rules means "allow any port"
     let policy = base_policy().net_bind_port(0).build().unwrap();
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await.unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
@@ -79,7 +79,7 @@ async fn getaddrinfo_ai_addrconfig_returns_v4_and_v6() {
     ), out = out.display());
 
     let policy = base_policy().build().unwrap();
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await.unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
@@ -104,7 +104,7 @@ async fn proc_net_dev_shows_only_lo() {
     ), out = out.display());
 
     let policy = base_policy().build().unwrap();
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await.unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
@@ -124,7 +124,7 @@ async fn proc_net_if_inet6_shows_only_lo() {
     ), out = out.display());
 
     let policy = base_policy().build().unwrap();
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await.unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
@@ -154,7 +154,7 @@ async fn ioctl_siocgifconf_blocked() {
     ), out = out.display());
 
     let policy = base_policy().build().unwrap();
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await.unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
@@ -187,7 +187,7 @@ async fn ioctl_siocethtool_blocked() {
     ), out = out.display());
 
     let policy = base_policy().build().unwrap();
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await.unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
@@ -215,7 +215,7 @@ async fn sys_class_net_blocked() {
     ), out = out.display());
 
     let policy = base_policy().build().unwrap();
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await.unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
@@ -225,6 +225,81 @@ async fn sys_class_net_blocked() {
         "/sys/class/net should be blocked, got: {}", contents
     );
     assert!(result.success());
+}
+
+/// Regression for Copy Fail (CVE-2026-31431). The exploit's first step is
+/// `socket(AF_ALG, SOCK_SEQPACKET, 0)`, then `bind()` to a sockaddr_alg
+/// naming "authencesn(hmac(sha256),cbc(aes))". If `socket()` is denied
+/// with EAFNOSUPPORT the page-cache corruption primitive is unreachable.
+#[tokio::test]
+async fn af_alg_socket_blocked() {
+    let out = temp_out("af-alg-blocked");
+    let script = format!(concat!(
+        "import socket, errno\n",
+        "AF_ALG = 38\n",
+        "try:\n",
+        "  s = socket.socket(AF_ALG, socket.SOCK_SEQPACKET, 0)\n",
+        "  s.close()\n",
+        "  result = 'ALLOWED'\n",
+        "except OSError as e:\n",
+        "  result = f'BLOCKED:{{e.errno}}'\n",
+        "open('{out}', 'w').write(result)\n",
+    ), out = out.display());
+
+    let policy = base_policy().build().unwrap();
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+        .await.unwrap();
+
+    let contents = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    // EAFNOSUPPORT == 97 on Linux. We assert the exact errno so a future
+    // accidental switch to EPERM/EACCES (which would surface differently
+    // to callers) is caught.
+    assert_eq!(
+        contents, "BLOCKED:97",
+        "AF_ALG socket() must return EAFNOSUPPORT, got: {contents}"
+    );
+    assert!(result.success());
+}
+
+/// Other niche socket families — same threat model as AF_ALG (kernel LPE
+/// surface that XOA agents have no business reaching). AF_ALG has its own
+/// dedicated test above; this one guards the broader class.
+#[tokio::test]
+async fn niche_socket_families_blocked() {
+    // (name, AF_* numeric value)
+    let families: &[(&str, i32)] = &[
+        ("AF_PACKET", 17),    // PACKET_MMAP has had UAFs
+        ("AF_VSOCK", 40),     // recurring use-after-frees
+        ("AF_XDP", 44),
+        ("AF_TIPC", 30),
+    ];
+
+    for (name, af) in families {
+        let out = temp_out(&format!("family-blocked-{}", name));
+        let script = format!(concat!(
+            "import socket\n",
+            "try:\n",
+            "  s = socket.socket({af}, socket.SOCK_RAW, 0)\n",
+            "  s.close()\n",
+            "  result = 'ALLOWED'\n",
+            "except OSError as e:\n",
+            "  result = f'BLOCKED:{{e.errno}}'\n",
+            "open('{out}', 'w').write(result)\n",
+        ), af = af, out = out.display());
+
+        let policy = base_policy().build().unwrap();
+        let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+            .await.unwrap();
+
+        let contents = std::fs::read_to_string(&out).unwrap_or_default();
+        let _ = std::fs::remove_file(&out);
+        assert!(
+            contents.starts_with("BLOCKED:"),
+            "{name} should be blocked, got: {contents}"
+        );
+        assert!(result.success());
+    }
 }
 
 #[tokio::test]
@@ -243,7 +318,7 @@ async fn non_route_netlink_still_blocked() {
     ), out = out.display());
 
     let policy = base_policy().build().unwrap();
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await.unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();

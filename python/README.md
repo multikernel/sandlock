@@ -13,13 +13,13 @@ pip install sandlock
 ## Quick start
 
 ```python
-from sandlock import Sandbox, Policy
+from sandlock import Sandbox
 
-policy = Policy(
+sandbox = Sandbox(
     fs_readable=["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev"],
     fs_writable=["/tmp"],
 )
-result = Sandbox(policy).run(["echo", "hello"], timeout=10)
+result = sandbox.run(["echo", "hello"], timeout=10)
 assert result.success
 print(result.stdout)  # b"hello\n"
 ```
@@ -37,14 +37,37 @@ Returns -1 if Landlock is unavailable.
 
 Return the minimum Landlock ABI version required by sandlock (currently 6).
 
-### Policy
+### Sandbox
 
 ```python
-sandlock.Policy(**kwargs)
+sandlock.Sandbox(**kwargs)
 ```
 
-An immutable (frozen dataclass) sandbox policy. All fields are optional.
-Unset fields mean "no restriction" unless noted otherwise.
+Sandbox configuration and runtime handle. Holds both the policy (filesystem,
+network, resource limits, etc.) and runtime state. Construct once, then call
+`run()`, `start()` + lifecycle methods, or use as a context manager.
+
+All config fields are optional. Unset fields mean "no restriction" unless
+noted otherwise. Runtime kwargs (`name`, `policy_fn`, `init_fn`, `work_fn`)
+are set at construction time alongside config fields.
+
+A single `Sandbox` instance holds at most one running process at a time.
+For concurrent execution, create multiple instances.
+
+**Runtime kwargs:**
+
+- `name` -- sandbox name (also its virtual hostname inside the sandbox).
+  Auto-generated as `sandbox-{pid}` when omitted.
+- `policy_fn` -- optional callback for dynamic per-event policy decisions
+  (see [Dynamic policy](#dynamic-policy)).
+- `init_fn` / `work_fn` -- callbacks for COW fork mode (see [Fork](#fork)).
+
+`Sandbox` is a context manager:
+
+```python
+with Sandbox(fs_readable=["/usr", "/lib"]) as sb:
+    result = sb.run(["echo", "hello"])
+```
 
 #### Filesystem (Landlock)
 
@@ -62,26 +85,23 @@ Unset fields mean "no restriction" unless noted otherwise.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `net_allow_hosts` | `list[str] \| None` | `None` | Allowed domains. `None` = unrestricted; `[]` = deny all; `["host", ...]` = allowlist |
-| `net_bind` | `list[int \| str]` | `[]` | TCP ports the sandbox may bind (empty = unrestricted) |
-| `net_connect` | `list[int \| str]` | `[]` | TCP ports the sandbox may connect to (empty = unrestricted) |
+| `net_allow` | `list[str]` | `[]` | Outbound endpoint rules. Bare `host:port` is TCP; protocol prefixes opt others in: `tcp://host:port`, `udp://host:port` (or `udp://*:*` for any UDP), `icmp://host` (or `icmp://*` for any ICMP echo via the kernel ping socket — gated by `net.ipv4.ping_group_range` on the host). Empty = deny all. Raw ICMP is not exposed. |
+| `net_bind` | `list[int \| str]` | `[]` | TCP ports the sandbox may bind (empty = deny all) |
 | `port_remap` | `bool` | `False` | Transparent TCP port virtualization |
-| `no_raw_sockets` | `bool` | `True` | Block raw IP sockets |
-| `no_udp` | `bool` | `False` | Block UDP sockets |
 
 #### HTTP ACL
 
 Enforce method + host + path rules on HTTP traffic via a transparent
 MITM proxy. When `http_allow` is set, all non-matching HTTP requests are
-denied by default. Deny rules are checked first and take precedence.
+denied by default. Block rules are checked first and take precedence.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `http_allow` | `list[str]` | `[]` | Allow rules in `"METHOD host/path"` format |
-| `http_deny` | `list[str]` | `[]` | Deny rules in `"METHOD host/path"` format |
-| `http_ports` | `list[int]` | `[80]` | TCP ports to intercept (443 added when `https_ca` is set) |
-| `https_ca` | `str \| None` | `None` | CA certificate for HTTPS MITM |
-| `https_key` | `str \| None` | `None` | CA private key for HTTPS MITM |
+| `http_deny` | `list[str]` | `[]` | Block rules in `"METHOD host/path"` format |
+| `http_ports` | `list[int]` | `[80]` | TCP ports to intercept (443 added when `http_ca` is set) |
+| `http_ca` | `str \| None` | `None` | CA certificate for HTTPS MITM |
+| `http_key` | `str \| None` | `None` | CA private key for HTTPS MITM |
 
 Rule format: `"METHOD host/path"` where method and host can be `*` for
 wildcard, and path supports trailing `*` for prefix matching. Paths are
@@ -89,7 +109,7 @@ normalized (percent-decoding, `..` resolution, `//` collapsing) before
 matching to prevent bypasses.
 
 ```python
-policy = Policy(
+sandbox = Sandbox(
     fs_readable=["/usr", "/lib", "/etc"],
     http_allow=[
         "GET docs.python.org/*",
@@ -97,7 +117,7 @@ policy = Policy(
     ],
     http_deny=["* */admin/*"],
 )
-result = Sandbox(policy).run(["python3", "agent.py"])
+result = sandbox.run(["python3", "agent.py"])
 ```
 
 #### Chroot with mount mapping
@@ -107,19 +127,19 @@ but without kernel bind mounts or root privileges. Each sandbox gets its
 own persistent workspace while sharing a read-only rootfs.
 
 ```python
-policy = Policy(
+sandbox = Sandbox(
     chroot="/opt/rootfs",
     fs_mount={"/work": "/tmp/sandbox-1/work"},
     fs_readable=["/usr", "/bin", "/lib", "/etc"],
     cwd="/work",
 )
-result = Sandbox(policy).run(["python3", "task.py"])
+result = sandbox.run(["python3", "task.py"])
 ```
 
 Combine with `workdir` + `max_disk` for quota-enforced writes:
 
 ```python
-policy = Policy(
+sandbox = Sandbox(
     chroot="/opt/rootfs",
     fs_mount={"/work": "/tmp/sandbox-1/work"},
     workdir="/tmp/sandbox-1/work",
@@ -145,10 +165,10 @@ policy = Policy(
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `deny_syscalls` | `list[str] \| None` | `None` | Syscall names to block (blocklist mode) |
-| `allow_syscalls` | `list[str] \| None` | `None` | Syscall names to allow (allowlist mode) |
+| `extra_deny_syscalls` | `list[str]` | `[]` | Extra syscall names to block in addition to Sandlock defaults |
+| `extra_allow_syscalls` | `list[str]` | `[]` | Syscall groups to allow that are blocked by default (e.g. `"sysv_ipc"` to enable SysV shared memory, semaphores, and message queues) |
 
-Set one or neither, not both.
+Sandlock always applies its default syscall blocklist.
 
 #### Deterministic execution
 
@@ -190,28 +210,6 @@ Set one or neither, not both.
 | `on_exit` | `BranchAction` | `COMMIT` | `COMMIT`, `ABORT`, or `KEEP` |
 | `on_error` | `BranchAction` | `ABORT` | `COMMIT`, `ABORT`, or `KEEP` |
 
-### Sandbox
-
-```python
-sandlock.Sandbox(policy, policy_fn=None, init_fn=None, work_fn=None, name=None)
-```
-
-Create a sandbox from a `Policy`.
-
-- `policy` -- a `Policy` instance.
-- `name` -- sandbox name (also sets UTS hostname inside the sandbox).
-  Auto-generated as `sandbox-{pid}` when omitted.
-- `policy_fn` -- optional callback for dynamic per-event decisions (see
-  [Dynamic policy](#dynamic-policy)).
-- `init_fn` / `work_fn` -- callbacks for COW fork mode (see [Fork](#fork)).
-
-Sandbox is a context manager:
-
-```python
-with Sandbox(policy) as sb:
-    result = sb.run(["echo", "hello"])
-```
-
 #### `sandbox.run(cmd, timeout=None) -> Result`
 
 Run a command, capturing stdout and stderr.
@@ -220,8 +218,19 @@ Run a command, capturing stdout and stderr.
 - `timeout` -- max execution time in seconds (float). `None` = no timeout.
 
 ```python
-result = Sandbox(policy).run(["python3", "-c", "print(42)"], timeout=10.0)
+result = sandbox.run(["python3", "-c", "print(42)"], timeout=10.0)
 ```
+
+#### `sandbox.start(cmd) -> None`
+
+Spawn `cmd` without waiting. Use `pid`, `pause()`, `resume()`, `kill()`,
+and `wait()` to manage the process lifecycle.
+
+Raises `RuntimeError` if a process is already running.
+
+#### `sandbox.wait() -> Result`
+
+Wait for the running process to finish and return its `Result`.
 
 #### `sandbox.dry_run(cmd, timeout=None) -> DryRunResult`
 
@@ -229,7 +238,7 @@ Run a command in a temporary COW layer, then discard all writes.
 Returns the list of filesystem changes that would have been made.
 
 ```python
-result = Sandbox(policy).dry_run(["sh", "-c", "echo hi > /tmp/out.txt"])
+result = sandbox.dry_run(["sh", "-c", "echo hi > /tmp/out.txt"])
 for change in result.changes:
     print(change.kind, change.path)  # "A /tmp/out.txt"
 ```
@@ -246,14 +255,18 @@ The sandbox name.
 
 The child PID while running, `None` otherwise.
 
+#### `sandbox.is_running -> bool`
+
+`True` if a process is currently running in this sandbox.
+
 #### `sandbox.ports() -> dict[int, int]`
 
 Current port mappings `{virtual_port: real_port}` while running.
 Only contains entries where port remapping occurred. Requires `port_remap=True`.
 
-#### `sandbox.pause()` / `sandbox.resume()`
+#### `sandbox.pause()` / `sandbox.resume()` / `sandbox.kill()`
 
-Send SIGSTOP / SIGCONT to the sandbox process group.
+Send SIGSTOP / SIGCONT / SIGKILL to the sandbox process group.
 Raises `RuntimeError` if the sandbox is not running.
 
 #### `sandbox.checkpoint(save_fn=None) -> Checkpoint`
@@ -295,8 +308,8 @@ Chain sandboxed commands with pipes using the `|` operator:
 
 ```python
 result = (
-    Sandbox(policy_a).cmd(["echo", "hello"])
-    | Sandbox(policy_b).cmd(["tr", "a-z", "A-Z"])
+    sandbox_a.cmd(["echo", "hello"])
+    | sandbox_b.cmd(["tr", "a-z", "A-Z"])
 ).run()
 assert result.stdout == b"HELLO\n"
 ```
@@ -314,7 +327,7 @@ Run the pipeline. Each stage's stdout feeds the next stage's stdin.
 Use `policy_fn` to make per-syscall decisions at runtime:
 
 ```python
-from sandlock import Sandbox, Policy, SyscallEvent, PolicyContext
+from sandlock import Sandbox, SyscallEvent, PolicyContext
 
 def my_policy(event: SyscallEvent, ctx: PolicyContext):
     if event.category == "network" and event.host == "evil.com":
@@ -324,7 +337,7 @@ def my_policy(event: SyscallEvent, ctx: PolicyContext):
         return True   # deny
     return False      # allow
 
-sb = Sandbox(Policy(...), policy_fn=my_policy)
+sb = Sandbox(..., policy_fn=my_policy)
 ```
 
 #### SyscallEvent
@@ -374,7 +387,8 @@ Callback return values:
 COW fork for parallel execution with shared initialization:
 
 ```python
-sb = Sandbox(policy,
+sb = Sandbox(
+    fs_readable=[...],
     init_fn=lambda: load_model(),
     work_fn=lambda clone_id: process(clone_id),
 )
@@ -386,7 +400,7 @@ clones = sb.fork(4)  # returns ForkResult with .pids
 Pipe combined clone output into a reducer command:
 
 ```python
-result = Sandbox(policy).reduce(["python3", "sum.py"], clones)
+result = sandbox.reduce(["python3", "sum.py"], clones)
 ```
 
 ### Checkpoint
@@ -394,7 +408,7 @@ result = Sandbox(policy).reduce(["python3", "sum.py"], clones)
 Save and restore sandbox state:
 
 ```python
-sb = Sandbox(policy)
+sb = Sandbox(...)
 # ... start a long-running process ...
 cp = sb.checkpoint(save_fn=lambda: my_state_bytes())
 cp.save("my-snapshot")
@@ -418,12 +432,13 @@ Default store: `~/.sandlock/checkpoints/`.
 
 ### Profiles
 
-Load policies from TOML files:
+Load sandbox configuration from TOML files:
+Profiles contain sandbox config only; pass the sandbox name at construction: `Sandbox(..., name=...)`.
 
 ```python
 from sandlock import load_profile, list_profiles
 
-policy = load_profile("web-scraper")
+sandbox = load_profile("web-scraper")
 names = list_profiles()
 ```
 
@@ -431,8 +446,8 @@ names = list_profiles()
 
 ```
 SandlockError (base)
-  +-- PolicyError          invalid policy configuration
-  +-- SandboxError         sandbox lifecycle errors
+  +-- SandboxError         invalid sandbox configuration
+  +-- SandboxRuntimeError  sandbox lifecycle errors
         +-- ForkError          fork failed
         +-- ChildError         child exited abnormally
         +-- BranchError        BranchFS operation failed
@@ -448,7 +463,7 @@ All exceptions are importable from `sandlock.exceptions` or directly from
 `sandlock`:
 
 ```python
-from sandlock import SandlockError, SandboxError, PolicyError
+from sandlock import SandlockError, SandboxError, SandboxRuntimeError
 ```
 
 ### Enums
@@ -509,12 +524,11 @@ permissions explicitly:
 | Capability | Example | Description |
 |------------|---------|-------------|
 | `fs_writable` | `["/tmp/agent"]` | Paths the tool can write to |
-| `net_connect` | `[443]` | TCP ports the tool can connect to |
-| `net_allow_hosts` | `["api.example.com"]` | Allowed domains (implies ports 80, 443) |
+| `net_allow` | `["api.example.com:443", "udp://1.1.1.1:53"]` | Outbound endpoints. Bare `host:port` is TCP; `udp://...` / `icmp://...` schemes opt UDP / ICMP echo in. |
 | `env` | `{"KEY": "val"}` | Environment variables to pass |
 | `max_memory` | `"256M"` | Memory limit |
 
-Any `Policy` field name is accepted as a capability key.
+Any `Sandbox` field name is accepted as a capability key.
 
 #### `await mcp.add_mcp_session(session)`
 
@@ -530,9 +544,9 @@ are forwarded to their server session.
 result = await mcp.call_tool("read_file", {"path": "data.txt"})
 ```
 
-#### `mcp.get_policy(tool_name) -> Policy`
+#### `mcp.get_policy(tool_name) -> Sandbox`
 
-Return the computed `Policy` for a registered tool.
+Return the computed `Sandbox` for a registered tool.
 
 #### `mcp.tool_definitions_openai() -> list[dict]`
 
@@ -570,9 +584,9 @@ Claude Desktop configuration:
 }
 ```
 
-#### `policy_for_tool(*, workspace, capabilities=None) -> Policy`
+#### `policy_for_tool(*, workspace, capabilities=None) -> Sandbox`
 
-Build a deny-by-default `Policy` from explicit capabilities. Used
+Build a deny-by-default `Sandbox` from explicit capabilities. Used
 internally by `McpSandbox` but available for direct use.
 
 #### `capabilities_from_mcp_tool(tool) -> dict`

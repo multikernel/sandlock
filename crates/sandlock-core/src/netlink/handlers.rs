@@ -18,8 +18,26 @@ use crate::netlink::{proxy, state::NetlinkState};
 use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction, OnInjectSuccess};
 use crate::sys::structs::SeccompNotif;
 
+const AF_UNIX: u64 = 1;
+const AF_INET: u64 = 2;
+const AF_INET6: u64 = 10;
 const AF_NETLINK: u64 = 16;
 const NETLINK_ROUTE: u64 = 0;
+
+/// Socket families allowed to reach the kernel. Everything else returns
+/// EAFNOSUPPORT — the same errno the kernel itself uses for unknown
+/// families, so callers see a normal "not supported" error rather than a
+/// sandbox-flavored one.
+///
+/// The set is intentionally tiny: an XOA agent has no legitimate need for
+/// AF_ALG, AF_PACKET, AF_VSOCK, AF_XDP, AF_TIPC, AF_RDS, AF_BLUETOOTH, and
+/// the rest of the niche families that have historically yielded LPEs
+/// (Copy Fail / CVE-2026-31431 via AF_ALG, Dirty Pipe-adjacent splice
+/// primitives, AF_PACKET PACKET_MMAP UAFs, etc.). Closing the surface
+/// once is cheaper than chasing one CVE per family.
+fn family_allowed(domain: u64) -> bool {
+    matches!(domain, AF_UNIX | AF_INET | AF_INET6 | AF_NETLINK)
+}
 
 /// Resolve `notif.pid` (which is a TID per the kernel's `task_pid_vnr`) to
 /// the enclosing thread group id.  fds are shared across all threads of a
@@ -56,7 +74,8 @@ fn read_struct<T: Copy>(
 /// Intercept `socket(AF_NETLINK, *, NETLINK_ROUTE)` and substitute one end
 /// of a `socketpair(AF_UNIX, SOCK_SEQPACKET)`. A tokio task takes the
 /// supervisor-side end and speaks synthesized NETLINK_ROUTE replies.
-/// Other domains pass through; other netlink protocols are denied.
+/// Allowed domains pass through; AF_NETLINK is virtualized; everything
+/// else (and non-NETLINK_ROUTE netlink protocols) returns EAFNOSUPPORT.
 pub async fn handle_socket(
     notif: &SeccompNotif,
     state: &Arc<NetlinkState>,
@@ -64,6 +83,9 @@ pub async fn handle_socket(
     let domain   = notif.data.args[0];
     let protocol = notif.data.args[2];
 
+    if !family_allowed(domain) {
+        return NotifAction::Errno(libc::EAFNOSUPPORT);
+    }
     if domain != AF_NETLINK {
         return NotifAction::Continue;
     }

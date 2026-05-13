@@ -6,8 +6,8 @@ import sys
 
 import pytest
 
-from sandlock import Sandbox, Policy, Checkpoint
-from sandlock._sdk import _lib, _make_argv
+from sandlock import Sandbox, Checkpoint
+from sandlock._sdk import _encode, _lib, _make_argv
 
 
 _PYTHON_READABLE = list(dict.fromkeys([
@@ -19,15 +19,21 @@ _PYTHON_READABLE = list(dict.fromkeys([
 def _policy(**overrides):
     defaults = {"fs_readable": _PYTHON_READABLE}
     defaults.update(overrides)
-    return Policy(**defaults)
+    return Sandbox(**defaults)
 
 
 @pytest.fixture
 def running_sandbox():
     """A sandbox with a long-running process for checkpoint tests."""
-    sb = Sandbox(_policy())
+    sb = _policy()
     argv, argc = _make_argv(["sleep", "60"])
-    sb._handle = _lib.sandlock_spawn(sb._native.ptr, argv, argc)
+    native = sb._ensure_native()
+    sb._handle = _lib.sandlock_spawn(
+        native.ptr,
+        _encode(sb._resolve_name()),
+        argv,
+        argc,
+    )
     assert sb._handle, "spawn failed"
     yield sb
     if sb._handle:
@@ -53,7 +59,7 @@ class TestCheckpointCapture:
         assert cp.app_state is None
 
     def test_checkpoint_not_running_raises(self):
-        sb = Sandbox(_policy())
+        sb = _policy()
         with pytest.raises(RuntimeError, match="not running"):
             sb.checkpoint()
 

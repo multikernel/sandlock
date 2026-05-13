@@ -3,6 +3,7 @@
 #[cfg(target_arch = "x86_64")]
 mod imp {
     pub const AUDIT_ARCH: u32 = 0xC000_003E;
+    pub const MAX_SYSCALL_NR: i64 = 462;
     pub const SYS_SECCOMP: i64 = 317;
     pub const SYS_MEMFD_CREATE: i64 = 319;
     pub const SYS_PIDFD_OPEN: i64 = 434;
@@ -29,11 +30,23 @@ mod imp {
     pub const SYS_IOPERM: Option<i64> = Some(libc::SYS_ioperm);
     pub const SYS_IOPL: Option<i64> = Some(libc::SYS_iopl);
     pub const SYS_TIME: Option<i64> = Some(libc::SYS_time);
+
+    /// Every syscall the kernel will dispatch through `handle_fork`.
+    /// Single source of truth for callers that enumerate fork-class
+    /// syscalls (BPF notif registration in `seccomp::dispatch`,
+    /// classification in `resource::is_process_creation_notif`).
+    pub const FORK_LIKE_SYSCALLS: &[i64] = &[
+        libc::SYS_clone,
+        libc::SYS_clone3,
+        libc::SYS_vfork,
+        libc::SYS_fork,
+    ];
 }
 
 #[cfg(target_arch = "aarch64")]
 mod imp {
     pub const AUDIT_ARCH: u32 = 0xC000_00B7;
+    pub const MAX_SYSCALL_NR: i64 = 463;
     pub const SYS_SECCOMP: i64 = 277;
     pub const SYS_MEMFD_CREATE: i64 = 279;
     pub const SYS_PIDFD_OPEN: i64 = 434;
@@ -60,9 +73,26 @@ mod imp {
     pub const SYS_IOPERM: Option<i64> = None;
     pub const SYS_IOPL: Option<i64> = None;
     pub const SYS_TIME: Option<i64> = None;
+
+    /// Every syscall the kernel will dispatch through `handle_fork`.
+    /// aarch64 has no `fork`/`vfork` (glibc emulates via `clone`).
+    pub const FORK_LIKE_SYSCALLS: &[i64] = &[
+        libc::SYS_clone,
+        libc::SYS_clone3,
+    ];
 }
 
 pub use imp::*;
+
+/// True if `nr` is plausibly a syscall number on the current architecture.
+/// Used by [`crate::seccomp::syscall::Syscall::checked`] to reject foot-gun
+/// cases like negative or arch-mismatched numbers.
+///
+/// Conservative: validates `0 <= nr <= MAX_SYSCALL_NR`. Doesn't enumerate
+/// every nr — kernel's seccomp filter rejects unknowns at JEQ stage anyway.
+pub fn is_known_syscall(nr: i64) -> bool {
+    nr >= 0 && nr <= imp::MAX_SYSCALL_NR
+}
 
 pub fn push_optional_syscall(v: &mut Vec<u32>, nr: Option<i64>) {
     if let Some(nr) = nr {

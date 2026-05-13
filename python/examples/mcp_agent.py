@@ -156,7 +156,7 @@ async def run_agent(user_prompt: str, workspace: str):
         "web_fetch", web_fetch,
         description="Fetch a URL and return the response body. Only httpbin.org is allowed.",
         capabilities={
-            "net_allow_hosts": ["httpbin.org"],  # implies net_connect: [80, 443]
+            "net_allow": ["httpbin.org:80,443"],
         },
         input_schema={
             "type": "object",
@@ -171,9 +171,8 @@ async def run_agent(user_prompt: str, workspace: str):
     for name in mcp.tools:
         p = mcp.get_policy(name)
         rw = "read-only" if not p.fs_writable else "read-write"
-        net = f"ports {list(p.net_connect)}" if p.net_connect else "none"
-        hosts = f"  hosts={list(p.net_allow_hosts)}" if p.net_allow_hosts else ""
-        print(f"  {name:15s}  fs={rw:10s}  net={net}{hosts}")
+        net = f"endpoints {list(p.net_allow)}" if p.net_allow else "none"
+        print(f"  {name:15s}  fs={rw:10s}  net={net}")
     print()
 
     # -- OpenAI agent loop --

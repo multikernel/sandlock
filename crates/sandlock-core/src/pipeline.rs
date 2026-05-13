@@ -15,10 +15,9 @@
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::time::Duration;
 
-use crate::error::{SandboxError, SandlockError};
-use crate::policy::Policy;
-use crate::result::{ExitStatus, RunResult};
+use crate::error::{SandboxRuntimeError, SandlockError};
 use crate::sandbox::Sandbox;
+use crate::result::{ExitStatus, RunResult};
 
 // ============================================================
 // Stage
@@ -28,15 +27,15 @@ use crate::sandbox::Sandbox;
 ///
 /// Not executed until `.run()` is called or the stage is part of a pipeline.
 pub struct Stage {
-    pub policy: Policy,
+    pub sandbox: Sandbox,
     pub args: Vec<String>,
 }
 
 impl Stage {
     /// Create a new stage with the given policy and command.
-    pub fn new(policy: &Policy, args: &[&str]) -> Self {
+    pub fn new(sandbox: &Sandbox, args: &[&str]) -> Self {
         Self {
-            policy: policy.clone(),
+            sandbox: sandbox.clone(),
             args: args.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -44,9 +43,9 @@ impl Stage {
     /// Run this single stage and return the result.
     pub async fn run(self, timeout: Option<Duration>) -> Result<RunResult, SandlockError> {
         let cmd_refs: Vec<&str> = self.args.iter().map(|s| s.as_str()).collect();
+        let mut sb = self.sandbox.with_name("stage");
         if let Some(dur) = timeout {
-            match tokio::time::timeout(dur, Sandbox::run_interactive(&self.policy, &cmd_refs)).await
-            {
+            match tokio::time::timeout(dur, sb.run_interactive(&cmd_refs)).await {
                 Ok(result) => result,
                 Err(_) => Ok(RunResult {
                     exit_status: ExitStatus::Timeout,
@@ -55,7 +54,7 @@ impl Stage {
                 }),
             }
         } else {
-            Sandbox::run_interactive(&self.policy, &cmd_refs).await
+            sb.run_interactive(&cmd_refs).await
         }
     }
 }
@@ -85,7 +84,7 @@ impl Pipeline {
     /// Create a pipeline from a list of stages (must have >= 2).
     pub fn new(stages: Vec<Stage>) -> Result<Self, SandlockError> {
         if stages.len() < 2 {
-            return Err(SandlockError::Sandbox(SandboxError::Child(
+            return Err(SandlockError::Runtime(SandboxRuntimeError::Child(
                 "Pipeline requires at least 2 stages".into(),
             )));
         }
@@ -144,18 +143,19 @@ async fn run_pipeline(stages: Vec<Stage>) -> Result<RunResult, SandlockError> {
     // Create inter-stage pipes: pipe[i] connects stage[i] stdout → stage[i+1] stdin
     let mut inter_pipes: Vec<(OwnedFd, OwnedFd)> = Vec::with_capacity(n - 1);
     for _ in 0..n - 1 {
-        inter_pipes.push(make_pipe().map_err(SandboxError::Io)?);
+        inter_pipes.push(make_pipe().map_err(SandboxRuntimeError::Io)?);
     }
 
     // Create capture pipes for last stage's stdout and stderr
-    let (cap_stdout_r, cap_stdout_w) = make_pipe().map_err(SandboxError::Io)?;
-    let (cap_stderr_r, cap_stderr_w) = make_pipe().map_err(SandboxError::Io)?;
+    let (cap_stdout_r, cap_stdout_w) = make_pipe().map_err(SandboxRuntimeError::Io)?;
+    let (cap_stderr_r, cap_stderr_w) = make_pipe().map_err(SandboxRuntimeError::Io)?;
 
     // Spawn each stage
     let mut sandboxes: Vec<Sandbox> = Vec::with_capacity(n);
 
     for (i, stage) in stages.into_iter().enumerate() {
-        let mut sb = Sandbox::new(&stage.policy)?;
+        let name = format!("pipeline-stage-{}", i);
+        let mut sb = stage.sandbox.clone().with_name(name);
 
         // Determine stdin for this stage
         let stdin_fd: Option<RawFd> = if i == 0 {
@@ -276,10 +276,10 @@ impl Gather {
 
     pub async fn run(self, timeout: Option<Duration>) -> Result<RunResult, SandlockError> {
         let consumer = self.consumer.ok_or_else(|| {
-            SandlockError::Sandbox(SandboxError::Child("Gather requires a consumer".into()))
+            SandlockError::Runtime(SandboxRuntimeError::Child("Gather requires a consumer".into()))
         })?;
         if self.sources.is_empty() {
-            return Err(SandlockError::Sandbox(SandboxError::Child(
+            return Err(SandlockError::Runtime(SandboxRuntimeError::Child(
                 "Gather requires at least one source".into(),
             )));
         }
@@ -310,7 +310,7 @@ async fn run_gather(
     // Last source → consumer stdin (fd 0), others → fd 3, 4, 5, ...
     let mut source_pipes: Vec<(OwnedFd, OwnedFd)> = Vec::with_capacity(n);
     for _ in 0..n {
-        source_pipes.push(make_pipe().map_err(SandboxError::Io)?);
+        source_pipes.push(make_pipe().map_err(SandboxRuntimeError::Io)?);
     }
 
     // Assign consumer fds: last source → fd 0, others → fd 3, 4, ...
@@ -329,13 +329,14 @@ async fn run_gather(
         .join(",");
 
     // Capture pipes for consumer stdout/stderr
-    let (cap_stdout_r, cap_stdout_w) = make_pipe().map_err(SandboxError::Io)?;
-    let (cap_stderr_r, cap_stderr_w) = make_pipe().map_err(SandboxError::Io)?;
+    let (cap_stdout_r, cap_stdout_w) = make_pipe().map_err(SandboxRuntimeError::Io)?;
+    let (cap_stderr_r, cap_stderr_w) = make_pipe().map_err(SandboxRuntimeError::Io)?;
 
     // Spawn producers: each writes stdout to its pipe
     let mut sandboxes: Vec<Sandbox> = Vec::with_capacity(n + 1);
     for (i, ns) in sources.into_iter().enumerate() {
-        let mut sb = Sandbox::new(&ns.stage.policy)?;
+        let name = format!("gather-source-{}", ns.name);
+        let mut sb = ns.stage.sandbox.clone().with_name(name);
         let stdout_fd = source_pipes[i].1.as_raw_fd();
         let cmd_refs: Vec<&str> = ns.stage.args.iter().map(|s| s.as_str()).collect();
         sb.spawn_with_io(&cmd_refs, None, Some(stdout_fd), None).await?;
@@ -343,11 +344,11 @@ async fn run_gather(
     }
 
     // Spawn consumer with extra fds from source pipes
-    let mut consumer_policy = consumer.policy.clone();
+    let mut consumer_sandbox = consumer.sandbox.clone();
     // Inject _SANDLOCK_GATHER env var
-    consumer_policy.env.insert("_SANDLOCK_GATHER".to_string(), gather_env);
+    consumer_sandbox.env.insert("_SANDLOCK_GATHER".to_string(), gather_env);
 
-    let mut consumer_sb = Sandbox::new(&consumer_policy)?;
+    let mut consumer_sb = consumer_sandbox.clone().with_name("gather-consumer");
     let stdin_fd = source_pipes[n - 1].0.as_raw_fd();
 
     // Build extra fd mappings for non-stdin sources

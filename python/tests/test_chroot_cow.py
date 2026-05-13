@@ -14,8 +14,8 @@ from pathlib import Path
 
 import pytest
 
-from sandlock import Policy, Sandbox
-from sandlock.policy import FsIsolation
+from sandlock import Sandbox
+from sandlock.sandbox import FsIsolation
 
 
 _HELPER_BIN = Path(__file__).resolve().parent.parent.parent / "tests" / "rootfs-helper"
@@ -30,7 +30,7 @@ _FS_READABLE = ["/usr", "/usr/bin", "/bin", "/sbin", "/etc", "/proc", "/dev"]
 def _overlayfs_available():
     """Check if unprivileged overlayfs is usable (needs user+mount ns)."""
     try:
-        p = Policy(
+        p = Sandbox(
             chroot=None,
             workdir="/tmp",
             cwd="/tmp",
@@ -41,7 +41,7 @@ def _overlayfs_available():
             clean_env=True,
             env={"PATH": "/bin:/usr/bin"},
         )
-        r = Sandbox(p).run(["true"])
+        r = p.run(["true"])
         return r.success
     except Exception:
         return False
@@ -96,7 +96,7 @@ def _cow_policy(rootfs, on_exit="abort", fs_storage=None, backend="seccomp"):
     # seccomp backend: fs_isolation left as NONE -- workdir triggers
     # the seccomp COW path.  overlayfs: explicit.
     fs_isolation = FsIsolation.OVERLAYFS if backend == "overlayfs" else FsIsolation.NONE
-    return Policy(
+    return Sandbox(
         chroot=str(rootfs),
         workdir=str(rootfs),
         cwd="/",
@@ -119,7 +119,7 @@ class TestCowAbort:
 
     def test_abort_no_leak(self, rootfs, backend):
         p = _cow_policy(rootfs, on_exit="abort", backend=backend)
-        r = Sandbox(p).run(["sh", "-c", "echo marker > /tmp/marker.txt"])
+        r = p.run(["sh", "-c", "echo marker > /tmp/marker.txt"])
         assert r.success, f"[{backend}] failed: {r.stderr}"
         assert not (rootfs / "tmp" / "marker.txt").exists(), \
             f"[{backend}] file should not leak to rootfs with on_exit=abort"
@@ -128,7 +128,7 @@ class TestCowAbort:
         """Abort must actually remove the upper dir, not just skip cleanup."""
         storage = tempfile.mkdtemp()
         p = _cow_policy(rootfs, on_exit="abort", fs_storage=storage, backend=backend)
-        r = Sandbox(p).run(["sh", "-c", "echo data > /tmp/data.txt"])
+        r = p.run(["sh", "-c", "echo data > /tmp/data.txt"])
         assert r.success, f"[{backend}] failed: {r.stderr}"
         # The storage dir should be empty (UUID subdir removed by abort).
         remaining = os.listdir(storage)
@@ -138,7 +138,7 @@ class TestCowAbort:
     def test_abort_write_visible_during_run(self, rootfs, backend):
         """Writes should be visible to the child during execution."""
         p = _cow_policy(rootfs, on_exit="abort", backend=backend)
-        r = Sandbox(p).run([
+        r = p.run([
             "sh", "-c", "echo hello > /tmp/test.txt && cat /tmp/test.txt"
         ])
         assert r.success, f"[{backend}] failed: {r.stderr}"
@@ -146,7 +146,7 @@ class TestCowAbort:
 
     def test_abort_multiple_files(self, rootfs, backend):
         p = _cow_policy(rootfs, on_exit="abort", backend=backend)
-        r = Sandbox(p).run([
+        r = p.run([
             "sh", "-c",
             "echo a > /tmp/a.txt && echo b > /tmp/b.txt && cat /tmp/a.txt /tmp/b.txt"
         ])
@@ -166,7 +166,7 @@ class TestCowCommit:
 
     def test_commit_persists(self, rootfs, backend):
         p = _cow_policy(rootfs, on_exit="commit", backend=backend)
-        r = Sandbox(p).run(["sh", "-c", "echo persisted > /tmp/persist.txt"])
+        r = p.run(["sh", "-c", "echo persisted > /tmp/persist.txt"])
         assert r.success, f"[{backend}] failed: {r.stderr}"
         assert (rootfs / "tmp" / "persist.txt").exists(), \
             f"[{backend}] file should persist to rootfs with on_exit=commit"
@@ -178,7 +178,7 @@ class TestCowCommit:
         """Commit must copy to rootfs AND remove the upper dir afterward."""
         storage = tempfile.mkdtemp()
         p = _cow_policy(rootfs, on_exit="commit", fs_storage=storage, backend=backend)
-        r = Sandbox(p).run(["sh", "-c", "echo committed > /tmp/committed.txt"])
+        r = p.run(["sh", "-c", "echo committed > /tmp/committed.txt"])
         assert r.success, f"[{backend}] failed: {r.stderr}"
         # File must be in rootfs (commit actually ran)
         assert (rootfs / "tmp" / "committed.txt").exists(), \
@@ -202,7 +202,7 @@ class TestCowKeep:
     def test_keep_not_in_rootfs(self, rootfs, backend):
         storage = tempfile.mkdtemp()
         p = _cow_policy(rootfs, on_exit="keep", fs_storage=storage, backend=backend)
-        r = Sandbox(p).run(["sh", "-c", "echo kept > /tmp/kept.txt"])
+        r = p.run(["sh", "-c", "echo kept > /tmp/kept.txt"])
         assert r.success, f"[{backend}] failed: {r.stderr}"
         assert not (rootfs / "tmp" / "kept.txt").exists(), \
             f"[{backend}] file should not be in rootfs with on_exit=keep"
@@ -211,7 +211,7 @@ class TestCowKeep:
         """With keep, writes should be visible during execution."""
         storage = tempfile.mkdtemp()
         p = _cow_policy(rootfs, on_exit="keep", fs_storage=storage, backend=backend)
-        r = Sandbox(p).run([
+        r = p.run([
             "sh", "-c", "echo kept > /tmp/kept.txt && cat /tmp/kept.txt"
         ])
         assert r.success, f"[{backend}] failed: {r.stderr}"
@@ -235,7 +235,7 @@ class TestCowIsolation:
             try:
                 storage = tempfile.mkdtemp()
                 p = _cow_policy(rootfs, on_exit="abort", fs_storage=storage, backend=backend)
-                r = Sandbox(p).run([
+                r = p.run([
                     "sh", "-c",
                     f"echo {name} > /tmp/id.txt && cat /tmp/id.txt"
                 ])
@@ -263,7 +263,7 @@ class TestCowIsolation:
         def run_sandbox(name):
             storage = tempfile.mkdtemp()
             p = _cow_policy(rootfs, on_exit="abort", fs_storage=storage, backend=backend)
-            Sandbox(p).run([
+            p.run([
                 "sh", "-c", f"echo {name} > /tmp/{name}.txt"
             ])
 

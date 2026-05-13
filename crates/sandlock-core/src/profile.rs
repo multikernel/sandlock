@@ -1,6 +1,261 @@
-use crate::policy::{Policy, ByteSize};
+use crate::sandbox::{ByteSize, Sandbox};
 use crate::error::SandlockError;
+use serde::Deserialize;
 use std::path::PathBuf;
+use std::collections::HashMap;
+use std::time::SystemTime;
+
+/// Program identity supplied by a profile alongside the policy.
+/// Not a `Sandbox` field — passed separately to the sandbox runner.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProgramSpec {
+    pub exec: Option<PathBuf>,
+    pub args: Vec<String>,
+}
+
+/// Top-level profile input. Each section maps to one schema section.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct ProfileInput {
+    pub config: ConfigSection,
+    pub determinism: DeterminismSection,
+    pub program: ProgramSection,
+    pub filesystem: FilesystemSection,
+    pub network: NetworkSection,
+    pub http: HttpSection,
+    pub syscalls: SyscallsSection,
+    pub limits: LimitsSection,
+}
+
+// Field names follow the schema vocabulary and match `Sandbox`'s field names 1:1.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct ConfigSection {
+    pub http_ca: Option<PathBuf>,
+    pub http_key: Option<PathBuf>,
+    pub fs_storage: Option<PathBuf>,
+    pub workdir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct DeterminismSection {
+    pub random_seed: Option<u64>,
+    /// RFC3339 timestamp string. Maps to `Sandbox::time_start`.
+    pub time_start: Option<String>,
+    pub deterministic_dirs: bool,
+    pub no_randomize_memory: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct ProgramSection {
+    pub exec: Option<PathBuf>,
+    pub args: Vec<String>,
+    pub env: HashMap<String, String>,
+    pub cwd: Option<PathBuf>,
+    pub uid: Option<u32>,
+    pub clean_env: bool,
+    pub no_coredump: bool,
+    pub no_huge_pages: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct FilesystemSection {
+    pub read: Vec<PathBuf>,
+    pub write: Vec<PathBuf>,
+    pub deny: Vec<PathBuf>,
+    /// One of `"none"`, `"overlayfs"`, `"branchfs"`. Maps to `Sandbox::fs_isolation`.
+    pub isolation: Option<String>,
+    pub chroot: Option<PathBuf>,
+    /// Each entry has the form `"VIRTUAL:HOST"`, matching `--fs-mount` syntax.
+    pub mount: Vec<String>,
+    /// One of `"commit"`, `"abort"`, `"keep"`. Maps to `Sandbox::on_exit`.
+    pub on_exit: Option<String>,
+    /// One of `"commit"`, `"abort"`, `"keep"`. Maps to `Sandbox::on_error`.
+    pub on_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct NetworkSection {
+    pub bind: Vec<u16>,
+    pub allow: Vec<String>,
+    pub port_remap: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct HttpSection {
+    pub ports: Vec<u16>,
+    pub allow: Vec<String>,
+    pub deny: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct SyscallsSection {
+    pub extra_allow: Vec<String>,
+    pub extra_deny: Vec<String>,
+}
+
+// Field names drop the `max_` prefix that `Sandbox` uses (`memory`, not
+// `max_memory`) — the section name `[limits]` makes the prefix redundant.
+// `parse_input` maps each of these to the corresponding `Sandbox::max_*` field.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct LimitsSection {
+    /// `ByteSize` string, e.g. `"512M"` (suffixes K/M/G only; IEC `MiB`/`GiB`
+    /// not yet supported). Maps to `Sandbox::max_memory`.
+    pub memory: Option<String>,
+    pub processes: Option<u32>,
+    pub open_files: Option<u32>,
+    /// CPU cap as a percentage (0–100). Maps to `Sandbox::max_cpu`.
+    pub cpu: Option<u8>,
+    /// `ByteSize` string, e.g. `"256M"` (suffixes K/M/G only; IEC `MiB`/`GiB`
+    /// not yet supported). Maps to `Sandbox::max_disk`.
+    pub disk: Option<String>,
+    pub gpu_devices: Option<Vec<u32>>,
+    pub cpu_cores: Option<Vec<u32>>,
+    pub num_cpus: Option<u32>,
+}
+
+/// Convert a parsed `ProfileInput` into a `(Sandbox, ProgramSpec)` pair.
+///
+/// Forwards each schema section's fields to the corresponding `SandboxBuilder`
+/// method calls. The three private helpers (`parse_fs_isolation`,
+/// `parse_branch_action`, `parse_mount_spec`) handle string-to-typed-value
+/// conversions for fields that lack `FromStr` impls on their target types.
+pub fn parse_input(input: ProfileInput) -> Result<(Sandbox, ProgramSpec), SandlockError> {
+    let mut b = Sandbox::builder();
+
+    // [config]
+    if let Some(p) = input.config.http_ca       { b = b.http_ca(p); }
+    if let Some(p) = input.config.http_key      { b = b.http_key(p); }
+    if let Some(p) = input.config.fs_storage    { b = b.fs_storage(p); }
+    if let Some(p) = input.config.workdir       { b = b.workdir(p); }
+
+    // [determinism]
+    if let Some(s) = input.determinism.random_seed { b = b.random_seed(s); }
+    if let Some(s) = input.determinism.time_start.as_deref() {
+        b = b.time_start(parse_time_start(s)?);
+    }
+    if input.determinism.deterministic_dirs        { b = b.deterministic_dirs(true); }
+    if input.determinism.no_randomize_memory       { b = b.no_randomize_memory(true); }
+
+    // [program] — process knobs go to Sandbox; exec/args go to ProgramSpec.
+    for (k, v) in input.program.env.iter() { b = b.env_var(k, v); }
+    if let Some(c) = input.program.cwd             { b = b.cwd(c); }
+    if let Some(u) = input.program.uid             { b = b.uid(u); }
+    if input.program.clean_env                     { b = b.clean_env(true); }
+    if input.program.no_coredump                   { b = b.no_coredump(true); }
+    if input.program.no_huge_pages                 { b = b.no_huge_pages(true); }
+
+    // [filesystem]
+    for p in input.filesystem.read.iter()  { b = b.fs_read(p); }
+    for p in input.filesystem.write.iter() { b = b.fs_write(p); }
+    for p in input.filesystem.deny.iter()  { b = b.fs_deny(p); }
+    if let Some(s) = input.filesystem.isolation.as_deref() {
+        b = b.fs_isolation(parse_fs_isolation(s)?);
+    }
+    if let Some(c) = input.filesystem.chroot         { b = b.chroot(c); }
+    for spec in input.filesystem.mount.iter() {
+        let (virt, host) = parse_mount_spec(spec)?;
+        b = b.fs_mount(virt, host);
+    }
+    if let Some(s) = input.filesystem.on_exit.as_deref()  { b = b.on_exit(parse_branch_action(s)?); }
+    if let Some(s) = input.filesystem.on_error.as_deref() { b = b.on_error(parse_branch_action(s)?); }
+
+    // [network]
+    for p in input.network.bind.iter()  { b = b.net_bind_port(*p); }
+    for r in input.network.allow.iter() { b = b.net_allow(r.as_str()); }
+    if input.network.port_remap         { b = b.port_remap(true); }
+
+    // [http]
+    for p in input.http.ports.iter() { b = b.http_port(*p); }
+    for r in input.http.allow.iter() { b = b.http_allow(r); }
+    for r in input.http.deny.iter()  { b = b.http_deny(r); }
+
+    // [syscalls]
+    if !input.syscalls.extra_allow.is_empty() {
+        b = b.extra_allow_syscalls(input.syscalls.extra_allow);
+    }
+    if !input.syscalls.extra_deny.is_empty() {
+        b = b.extra_deny_syscalls(input.syscalls.extra_deny);
+    }
+
+    // [limits]
+    if let Some(s) = input.limits.memory.as_deref()    {
+        b = b.max_memory(ByteSize::parse(s).map_err(SandlockError::Sandbox)?);
+    }
+    if let Some(n) = input.limits.processes            { b = b.max_processes(n); }
+    if let Some(n) = input.limits.open_files           { b = b.max_open_files(n); }
+    if let Some(p) = input.limits.cpu                  { b = b.max_cpu(p); }
+    if let Some(s) = input.limits.disk.as_deref()      {
+        b = b.max_disk(ByteSize::parse(s).map_err(SandlockError::Sandbox)?);
+    }
+    if let Some(g) = input.limits.gpu_devices  { b = b.gpu_devices(g); }
+    if let Some(c) = input.limits.cpu_cores    { b = b.cpu_cores(c); }
+    if let Some(n) = input.limits.num_cpus             { b = b.num_cpus(n); }
+
+    let policy = b.build()?;
+    let spec = ProgramSpec { exec: input.program.exec, args: input.program.args };
+    Ok((policy, spec))
+}
+
+/// Parses the `[filesystem].isolation` schema string into a `FsIsolation`.
+fn parse_fs_isolation(s: &str) -> Result<crate::sandbox::FsIsolation, SandlockError> {
+    use crate::error::SandboxError;
+    use crate::sandbox::FsIsolation;
+    Ok(match s {
+        "none"      => FsIsolation::None,
+        "overlayfs" => FsIsolation::OverlayFs,
+        "branchfs"  => FsIsolation::BranchFs,
+        other       => return Err(SandlockError::Sandbox(SandboxError::Invalid(
+            format!("invalid fs isolation {other:?}; expected \"none\" | \"overlayfs\" | \"branchfs\""),
+        ))),
+    })
+}
+
+/// Parses an `[filesystem].on_exit` / `on_error` string into a `BranchAction`.
+fn parse_branch_action(s: &str) -> Result<crate::sandbox::BranchAction, SandlockError> {
+    use crate::error::SandboxError;
+    use crate::sandbox::BranchAction;
+    Ok(match s {
+        "commit" => BranchAction::Commit,
+        "abort"  => BranchAction::Abort,
+        "keep"   => BranchAction::Keep,
+        other    => return Err(SandlockError::Sandbox(SandboxError::Invalid(
+            format!("invalid branch action {other:?}; expected \"commit\" | \"abort\" | \"keep\""),
+        ))),
+    })
+}
+
+/// Parses a `"VIRTUAL:HOST"` mount spec string into a `(virtual, host)` pair.
+fn parse_mount_spec(s: &str) -> Result<(PathBuf, PathBuf), SandlockError> {
+    use crate::error::SandboxError;
+    let (virt, host) = s.split_once(':').ok_or_else(|| SandlockError::Sandbox(SandboxError::Invalid(
+        format!("invalid mount spec {s:?}; expected \"VIRTUAL:HOST\""),
+    )))?;
+    if virt.is_empty() || host.is_empty() {
+        return Err(SandlockError::Sandbox(SandboxError::Invalid(
+            format!("invalid mount spec {s:?}; both VIRTUAL and HOST must be non-empty"),
+        )));
+    }
+    Ok((PathBuf::from(virt), PathBuf::from(host)))
+}
+
+/// Parses an RFC3339 timestamp string into `SystemTime`.
+fn parse_time_start(s: &str) -> Result<SystemTime, SandlockError> {
+    use crate::error::SandboxError;
+    let ts: jiff::Timestamp = s.parse().map_err(|e| {
+        SandlockError::Sandbox(SandboxError::Invalid(
+            format!("invalid [determinism].time_start {s:?}: {e}"),
+        ))
+    })?;
+    Ok(ts.into())
+}
 
 /// Default profile directory.
 pub fn profile_dir() -> PathBuf {
@@ -17,112 +272,23 @@ fn dirs_or_fallback() -> PathBuf {
         .join("sandlock")
 }
 
-/// Load a profile by name.
-pub fn load_profile(name: &str) -> Result<Policy, SandlockError> {
-    let path = profile_dir().join(format!("{}.toml", name));
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| SandlockError::Policy(crate::error::PolicyError::Invalid(
-            format!("profile '{}': {}", name, e)
+/// Parse a TOML profile string into a Sandbox + ProgramSpec.
+pub fn parse_profile(content: &str) -> Result<(Sandbox, ProgramSpec), SandlockError> {
+    let input: ProfileInput = toml::from_str(content)
+        .map_err(|e| SandlockError::Sandbox(crate::error::SandboxError::Invalid(
+            format!("TOML parse error: {e}"),
         )))?;
-    parse_profile(&content)
+    parse_input(input)
 }
 
-/// Parse a TOML profile string into a Policy.
-pub fn parse_profile(content: &str) -> Result<Policy, SandlockError> {
-    let table: toml::Table = content.parse()
-        .map_err(|e| SandlockError::Policy(crate::error::PolicyError::Invalid(
-            format!("TOML parse error: {}", e)
+/// Load a profile by name.
+pub fn load_profile(name: &str) -> Result<(Sandbox, ProgramSpec), SandlockError> {
+    let path = profile_dir().join(format!("{}.toml", name));
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| SandlockError::Sandbox(crate::error::SandboxError::Invalid(
+            format!("profile '{}': {}", name, e),
         )))?;
-
-    // Accept both [sandbox] section and flat format (Python-compatible)
-    let sandbox = table.get("sandbox")
-        .and_then(|v| v.as_table())
-        .unwrap_or(&table);
-
-    let mut builder = Policy::builder();
-
-    // Parse string arrays
-    if let Some(paths) = sandbox.get("fs_readable").and_then(|v| v.as_array()) {
-        for p in paths { if let Some(s) = p.as_str() { builder = builder.fs_read(s); } }
-    }
-    if let Some(paths) = sandbox.get("fs_writable").and_then(|v| v.as_array()) {
-        for p in paths { if let Some(s) = p.as_str() { builder = builder.fs_write(s); } }
-    }
-    if let Some(paths) = sandbox.get("fs_denied").and_then(|v| v.as_array()) {
-        for p in paths { if let Some(s) = p.as_str() { builder = builder.fs_deny(s); } }
-    }
-    if let Some(hosts) = sandbox.get("net_allow_hosts").and_then(|v| v.as_array()) {
-        // Presence of the key enables host restriction, even if the array is
-        // empty (empty array = deny all, matching net_bind/net_connect semantics).
-        builder = builder.net_restrict_hosts();
-        for h in hosts { if let Some(s) = h.as_str() { builder = builder.net_allow_host(s); } }
-    }
-    if let Some(rules) = sandbox.get("http_allow").and_then(|v| v.as_array()) {
-        for r in rules { if let Some(s) = r.as_str() { builder = builder.http_allow(s); } }
-    }
-    if let Some(rules) = sandbox.get("http_deny").and_then(|v| v.as_array()) {
-        for r in rules { if let Some(s) = r.as_str() { builder = builder.http_deny(s); } }
-    }
-    if let Some(ports) = sandbox.get("http_ports").and_then(|v| v.as_array()) {
-        for p in ports { if let Some(v) = p.as_integer() { builder = builder.http_port(v as u16); } }
-    }
-
-    // Parse integers
-    if let Some(v) = sandbox.get("max_processes").and_then(|v| v.as_integer()) {
-        builder = builder.max_processes(v as u32);
-    }
-    if let Some(v) = sandbox.get("max_cpu").and_then(|v| v.as_integer()) {
-        builder = builder.max_cpu(v as u8);
-    }
-    if let Some(v) = sandbox.get("num_cpus").and_then(|v| v.as_integer()) {
-        builder = builder.num_cpus(v as u32);
-    }
-    if let Some(v) = sandbox.get("random_seed").and_then(|v| v.as_integer()) {
-        builder = builder.random_seed(v as u64);
-    }
-
-    // Parse string values
-    if let Some(v) = sandbox.get("max_memory").and_then(|v| v.as_str()) {
-        builder = builder.max_memory(ByteSize::parse(v)?);
-    }
-
-    // Parse booleans
-    if let Some(v) = sandbox.get("no_raw_sockets").and_then(|v| v.as_bool()) {
-        builder = builder.no_raw_sockets(v);
-    }
-    if let Some(v) = sandbox.get("no_udp").and_then(|v| v.as_bool()) {
-        builder = builder.no_udp(v);
-    }
-if let Some(v) = sandbox.get("clean_env").and_then(|v| v.as_bool()) {
-        builder = builder.clean_env(v);
-    }
-    if let Some(v) = sandbox.get("deterministic_dirs").and_then(|v| v.as_bool()) {
-        builder = builder.deterministic_dirs(v);
-    }
-    if let Some(v) = sandbox.get("name").and_then(|v| v.as_str()) {
-        builder = builder.hostname(v);
-    }
-    if let Some(v) = sandbox.get("workdir").and_then(|v| v.as_str()) {
-        builder = builder.workdir(v);
-    }
-    if let Some(v) = sandbox.get("cwd").and_then(|v| v.as_str()) {
-        builder = builder.cwd(v);
-    }
-    // Parse port arrays
-    if let Some(ports) = sandbox.get("net_bind").and_then(|v| v.as_array()) {
-        for p in ports { if let Some(n) = p.as_integer() { builder = builder.net_bind_port(n as u16); } }
-    }
-    if let Some(ports) = sandbox.get("net_connect").and_then(|v| v.as_array()) {
-        for p in ports { if let Some(n) = p.as_integer() { builder = builder.net_connect_port(n as u16); } }
-    }
-
-    // Parse syscall lists
-    if let Some(syscalls) = sandbox.get("deny_syscalls").and_then(|v| v.as_array()) {
-        let names: Vec<String> = syscalls.iter().filter_map(|v| v.as_str().map(String::from)).collect();
-        builder = builder.deny_syscalls(names);
-    }
-
-    builder.build().map_err(|e| SandlockError::Policy(e))
+    parse_profile(&content)
 }
 
 /// List available profile names.
@@ -131,7 +297,7 @@ pub fn list_profiles() -> Result<Vec<String>, SandlockError> {
     if !dir.exists() { return Ok(Vec::new()); }
     let mut names = Vec::new();
     for entry in std::fs::read_dir(&dir)
-        .map_err(|e| SandlockError::Policy(crate::error::PolicyError::Invalid(format!("read dir: {}", e))))? {
+        .map_err(|e| SandlockError::Sandbox(crate::error::SandboxError::Invalid(format!("read dir: {}", e))))? {
         if let Ok(entry) = entry {
             if let Some(name) = entry.path().file_stem() {
                 if entry.path().extension().map_or(false, |e| e == "toml") {
@@ -149,58 +315,236 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_basic_profile() {
-        let toml = r#"
-[sandbox]
-fs_readable = ["/usr", "/lib", "/bin"]
-fs_writable = ["/tmp"]
-max_memory = "2G"
-max_processes = 64
-"#;
-        let policy = parse_profile(toml).unwrap();
-        assert_eq!(policy.fs_readable.len(), 3);
-        assert_eq!(policy.fs_writable.len(), 1);
-        assert_eq!(policy.max_memory, Some(ByteSize::gib(2)));
-        assert_eq!(policy.max_processes, 64);
-    }
-
-    #[test]
-    fn parse_flat_format() {
-        // Flat format (no [sandbox] section) should work
-        let toml = r#"
-fs_readable = ["/usr", "/lib"]
-clean_env = true
-"#;
-        let policy = parse_profile(toml).unwrap();
-        assert_eq!(policy.fs_readable.len(), 2);
-        assert!(policy.clean_env);
-    }
-
-    #[test]
-    fn parse_sandbox_section_format() {
-        // [sandbox] section format should also work
-        let toml = r#"
-[sandbox]
-fs_readable = ["/usr"]
-max_processes = 10
-"#;
-        let policy = parse_profile(toml).unwrap();
-        assert_eq!(policy.fs_readable.len(), 1);
-        assert_eq!(policy.max_processes, 10);
-    }
-
-    #[test]
-    fn parse_invalid_toml() {
-        let err = parse_profile("not valid toml {{{").unwrap_err();
-        assert!(err.to_string().contains("TOML parse error"));
-    }
-
-    #[test]
     fn list_profiles_empty_dir() {
-        // With no profile dir, should return empty vec
+        // With no profile dir, list_profiles() should return an empty vec.
         std::env::set_var("XDG_CONFIG_HOME", "/tmp/sandlock-test-nonexistent");
         let profiles = list_profiles().unwrap();
         assert!(profiles.is_empty());
         std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn profile_input_deserializes_minimal() {
+        let toml = r#"
+            [program]
+            exec = "/bin/true"
+        "#;
+        let parsed: ProfileInput = toml::from_str(toml).unwrap();
+        assert_eq!(parsed.program.exec, Some("/bin/true".into()));
+        assert!(parsed.program.args.is_empty());
+        assert_eq!(parsed.config, ConfigSection::default());
+        assert_eq!(parsed.filesystem, FilesystemSection::default());
+    }
+
+    #[test]
+    fn config_section_maps_to_policy_http_fields() {
+        let toml = r#"
+            [config]
+            http_ca  = "/tmp/ca.pem"
+            http_key = "/tmp/ca.key"
+            [program]
+            exec = "/bin/true"
+        "#;
+        let input: ProfileInput = toml::from_str(toml).unwrap();
+        let (policy, _spec) = parse_input(input).unwrap();
+        assert_eq!(policy.http_ca.as_deref(), Some(std::path::Path::new("/tmp/ca.pem")));
+        assert_eq!(policy.http_key.as_deref(), Some(std::path::Path::new("/tmp/ca.key")));
+    }
+
+    #[test]
+    fn syscalls_extra_allow_sysv_ipc_sets_vec() {
+        let toml = r#"
+            [program]
+            exec = "/bin/true"
+            [syscalls]
+            extra_allow = ["sysv_ipc"]
+            extra_deny  = ["ptrace"]
+        "#;
+        let input: ProfileInput = toml::from_str(toml).unwrap();
+        let (policy, _spec) = parse_input(input).unwrap();
+        assert!(policy.allows_sysv_ipc());
+        assert_eq!(policy.extra_deny_syscalls, vec!["ptrace".to_string()]);
+    }
+
+    #[test]
+    fn parse_mount_spec_rejects_missing_colon() {
+        let toml = r#"
+            [program]
+            exec = "/bin/true"
+            [filesystem]
+            mount = ["nocolon"]
+        "#;
+        let input: ProfileInput = toml::from_str(toml).unwrap();
+        let err = parse_input(input).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("VIRTUAL:HOST"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_mount_spec_rejects_empty_half() {
+        let toml = r#"
+            [program]
+            exec = "/bin/true"
+            [filesystem]
+            mount = [":/host"]
+        "#;
+        let input: ProfileInput = toml::from_str(toml).unwrap();
+        let err = parse_input(input).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("non-empty"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_profile_full_example() {
+        let toml = r#"
+            [config]
+            http_ca    = "/etc/sandlock/ca.pem"
+            http_key   = "/etc/sandlock/ca.key"
+            fs_storage = "/var/sandlock/redis-worker"
+            workdir    = "/var/sandlock/redis-worker/work"
+
+            [determinism]
+            random_seed         = 42
+            deterministic_dirs  = true
+            no_randomize_memory = true
+
+            [program]
+            exec      = "/usr/bin/redis-cli"
+            args      = ["-h", "cache.internal", "-p", "6379"]
+            cwd       = "/var/lib/redis"
+            uid       = 1000
+            clean_env = true
+            no_coredump = true
+
+            [filesystem]
+            read      = ["/usr", "/etc/redis"]
+            write     = ["/var/lib/redis/state"]
+            deny      = ["/proc/sys"]
+            isolation = "overlayfs"
+            chroot    = "/var/lib/redis-rootfs"
+            mount     = ["/data:/srv/redis-data"]
+            on_exit   = "commit"
+            on_error  = "abort"
+
+            [network]
+            bind       = [8080]
+            allow      = ["tcp://cache.internal:6379"]
+            port_remap = true
+
+            [http]
+            ports = [80, 443]
+            allow = ["GET api.internal/v1/*"]
+            deny  = ["* */admin/*"]
+
+            [syscalls]
+            extra_allow = ["sysv_ipc"]
+            extra_deny  = ["ptrace", "mount"]
+
+            [limits]
+            memory    = "512M"
+            processes = 32
+            cpu       = 80
+        "#;
+
+        let (policy, spec) = parse_profile(toml).unwrap();
+        assert_eq!(spec.exec.as_deref(), Some(std::path::Path::new("/usr/bin/redis-cli")));
+        assert_eq!(spec.args.len(), 4);
+        assert!(policy.allows_sysv_ipc());
+        assert_eq!(policy.extra_deny_syscalls.len(), 2);
+        assert_eq!(policy.fs_readable.len(), 2);
+        // 1 user rule (tcp://cache.internal:6379) + at least 1 http-port-derived
+        // rule that the builder auto-merges (api.internal on http.ports). The
+        // merge is the contract being verified here.
+        assert!(policy.net_allow.len() >= 2);
+        assert_eq!(policy.http_allow.len(), 1);
+        assert_eq!(policy.fs_mount.len(), 1);
+    }
+
+    #[test]
+    fn parse_profile_unknown_section_field_is_error() {
+        let toml = r#"
+            [program]
+            exec = "/bin/true"
+            bogus = 1
+        "#;
+        let err = parse_profile(toml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("unknown field"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_profile_old_flat_format_is_error() {
+        // Old format used top-level "fs_readable = [...]"; we no longer accept it.
+        let toml = r#"
+            fs_readable = ["/usr"]
+        "#;
+        let err = parse_profile(toml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("unknown field"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_profile_time_start_sets_policy_field() {
+        let toml = r#"
+            [program]
+            exec = "/bin/true"
+            [determinism]
+            time_start = "2026-01-01T00:00:00Z"
+        "#;
+        let (policy, _spec) = parse_profile(toml).unwrap();
+        assert!(policy.time_start.is_some());
+    }
+
+    #[test]
+    fn parse_profile_invalid_time_start_is_error() {
+        let toml = r#"
+            [program]
+            exec = "/bin/true"
+            [determinism]
+            time_start = "not-a-time"
+        "#;
+        let err = parse_profile(toml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("time_start"), "got: {msg}");
+    }
+
+    #[test]
+    fn isolation_overlayfs_without_workdir_is_error() {
+        let toml = r#"
+            [program]
+            exec = "/bin/true"
+            [filesystem]
+            isolation = "overlayfs"
+        "#;
+        let err = parse_profile(toml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.to_lowercase().contains("workdir"),
+            "expected error to mention workdir; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn isolation_none_without_workdir_is_ok() {
+        let toml = r#"
+            [program]
+            exec = "/bin/true"
+            [filesystem]
+            isolation = "none"
+        "#;
+        let (_p, _s) = parse_profile(toml).unwrap();
+    }
+
+    #[test]
+    fn isolation_overlayfs_with_workdir_is_ok() {
+        let toml = r#"
+            [program]
+            exec = "/bin/true"
+            [config]
+            workdir = "/tmp/wd"
+            [filesystem]
+            isolation = "overlayfs"
+        "#;
+        let (_p, _s) = parse_profile(toml).unwrap();
     }
 }

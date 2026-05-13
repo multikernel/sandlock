@@ -1,4 +1,4 @@
-use sandlock_core::{Policy, Sandbox};
+use sandlock_core::{Sandbox};
 use sandlock_core::policy_fn::{Verdict, SyscallCategory};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -7,8 +7,8 @@ fn temp_file(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("sandlock-test-policyfn-{}-{}", name, std::process::id()))
 }
 
-fn base_policy() -> sandlock_core::PolicyBuilder {
-    Policy::builder()
+fn base_policy() -> sandlock_core::SandboxBuilder {
+    Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
         .fs_read("/etc").fs_read("/proc").fs_read("/dev")
         .fs_write("/tmp")
@@ -28,8 +28,7 @@ async fn test_policy_fn_receives_events_with_metadata() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run_interactive(
-        &policy, &["python3", "-c", "print('hello')"],
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", "print('hello')"],
     ).await.unwrap();
     assert!(result.success());
 
@@ -49,7 +48,7 @@ async fn test_policy_fn_deny_connect() {
     let out = temp_file("deny-connect");
 
     let policy = base_policy()
-        .net_allow_host("127.0.0.1")
+        .net_allow("127.0.0.1:443")
         .policy_fn(move |event, _ctx| {
             // Deny all connect attempts
             if event.syscall == "connect" {
@@ -72,7 +71,7 @@ async fn test_policy_fn_deny_connect() {
         "  open('{out}', 'w').write(f'BLOCKED:{{e.errno}}')\n",
     ), out = out.display());
 
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success());
 
     let content = std::fs::read_to_string(&out).unwrap_or_default();
@@ -87,7 +86,7 @@ async fn test_policy_fn_restrict_network_takes_effect() {
     let out = temp_file("restrict-net-effect");
 
     let policy = base_policy()
-        .net_allow_host("127.0.0.1")
+        .net_allow("127.0.0.1:443")
         .policy_fn(move |event, ctx| {
             if event.syscall == "execve" {
                 ctx.restrict_network(&[]); // block all
@@ -111,7 +110,7 @@ async fn test_policy_fn_restrict_network_takes_effect() {
         "  open('{out}', 'w').write(f'BLOCKED:{{e.errno}}')\n",
     ), out = out.display());
 
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success());
 
     let content = std::fs::read_to_string(&out).unwrap_or_default();
@@ -148,7 +147,7 @@ async fn test_policy_fn_deny_path() {
         "  open('{out}', 'w').write(f'BLOCKED:{{e.errno}}')\n",
     ), out = out.display());
 
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success());
 
     let content = std::fs::read_to_string(&out).unwrap_or_default();
@@ -171,8 +170,7 @@ async fn test_policy_fn_passthrough() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run_interactive(
-        &policy, &["python3", "-c", "print('hello')"],
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", "print('hello')"],
     ).await.unwrap();
     assert!(result.success());
 
@@ -198,8 +196,7 @@ async fn test_policy_fn_execve_argv() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run_interactive(
-        &policy, &["python3", "-c", "print('argv test')"],
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", "print('argv test')"],
     ).await.unwrap();
     assert!(result.success());
 
@@ -224,8 +221,7 @@ async fn test_policy_fn_deny_by_argv() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run_interactive(
-        &policy, &["echo", "malicious"],
+    let result = policy.clone().with_name("test").run_interactive(&["echo", "malicious"],
     ).await.unwrap();
     assert!(!result.success(), "execve with 'malicious' in argv should be denied");
 }
@@ -238,7 +234,7 @@ async fn test_policy_fn_connect_metadata() {
     let events_clone = events.clone();
 
     let policy = base_policy()
-        .net_allow_host("127.0.0.1")
+        .net_allow("127.0.0.1:443")
         .policy_fn(move |event, _ctx| {
             if event.syscall == "connect" {
                 events_clone.lock().unwrap().push((event.host, event.port));
@@ -248,7 +244,7 @@ async fn test_policy_fn_connect_metadata() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run_interactive(&policy, &[
+    let result = policy.clone().with_name("test").run_interactive(&[
         "python3", "-c",
         "import socket; s=socket.socket(); s.settimeout(0.1); \
          s.connect_ex(('127.0.0.1', 9999)); s.close()",
@@ -274,7 +270,7 @@ async fn test_policy_fn_event_categories() {
     let cats_clone = categories.clone();
 
     let policy = base_policy()
-        .net_allow_host("127.0.0.1")
+        .net_allow("127.0.0.1:443")
         .policy_fn(move |event, _ctx| {
             cats_clone.lock().unwrap().push((event.syscall.clone(), event.category));
             Verdict::Allow
@@ -282,8 +278,7 @@ async fn test_policy_fn_event_categories() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run_interactive(
-        &policy, &["python3", "-c", "print('categories')"],
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", "print('categories')"],
     ).await.unwrap();
     assert!(result.success());
 
@@ -316,8 +311,7 @@ async fn test_policy_fn_parent_pid() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run_interactive(
-        &policy, &["python3", "-c", "print('ppid')"],
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", "print('ppid')"],
     ).await.unwrap();
     assert!(result.success());
 
@@ -338,7 +332,7 @@ async fn test_policy_fn_deny_with_eacces() {
     let out = temp_file("deny-eacces");
 
     let policy = base_policy()
-        .net_allow_host("127.0.0.1")
+        .net_allow("127.0.0.1:443")
         .policy_fn(move |event, _ctx| {
             if event.syscall == "connect" {
                 return Verdict::DenyWith(libc::EACCES);
@@ -361,7 +355,7 @@ async fn test_policy_fn_deny_with_eacces() {
         "  s.close()\n",
     ), out = out.display());
 
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success());
 
     let content = std::fs::read_to_string(&out).unwrap_or_default();
@@ -392,8 +386,7 @@ async fn test_policy_fn_audit() {
         .build()
         .unwrap();
 
-    let result = Sandbox::run_interactive(
-        &policy, &["cat", "/etc/hostname"],
+    let result = policy.clone().with_name("test").run_interactive(&["cat", "/etc/hostname"],
     ).await.unwrap();
     // Audit should allow the syscall — cat should succeed
     assert!(result.success(), "Audit should allow, not deny");
@@ -441,7 +434,7 @@ sys.exit(1)
 "#).unwrap();
     std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
 
-    let result = Sandbox::run(&policy, &[script.to_str().unwrap()])
+    let result = policy.clone().with_name("test").run(&[script.to_str().unwrap()])
         .await
         .unwrap();
 

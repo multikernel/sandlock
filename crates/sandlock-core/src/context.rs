@@ -6,12 +6,12 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use crate::arch;
-use crate::policy::{FsIsolation, Policy};
+use crate::sandbox::{FsIsolation, Sandbox};
 use crate::seccomp::bpf::{self, stmt, jump};
 use crate::sys::structs::{
     AF_INET, AF_INET6,
     BPF_ABS, BPF_ALU, BPF_AND, BPF_JEQ, BPF_JSET, BPF_JMP, BPF_K, BPF_LD, BPF_RET, BPF_W,
-    CLONE_NS_FLAGS, DEFAULT_DENY_SYSCALLS, EPERM,
+    CLONE_NS_FLAGS, DEFAULT_BLOCKLIST_SYSCALLS, EPERM, SYSV_IPC_BLOCKLIST_SYSCALLS,
     SECCOMP_RET_ALLOW, SECCOMP_RET_ERRNO,
     SIOCETHTOOL, SIOCGIFADDR, SIOCGIFBRDADDR, SIOCGIFCONF, SIOCGIFDSTADDR,
     SIOCGIFFLAGS, SIOCGIFHWADDR, SIOCGIFINDEX, SIOCGIFNAME, SIOCGIFNETMASK,
@@ -125,7 +125,7 @@ pub(crate) fn read_u32_fd(fd: RawFd) -> io::Result<u32> {
 
 /// Map a syscall name to its `libc::SYS_*` number.
 ///
-/// Covers all names in `DEFAULT_DENY_SYSCALLS` plus extras needed for
+/// Covers all names in `DEFAULT_BLOCKLIST_SYSCALLS` plus extras needed for
 /// notif and arg-filter lists.
 pub fn syscall_name_to_nr(name: &str) -> Option<u32> {
     let nr: i64 = match name {
@@ -175,6 +175,7 @@ pub fn syscall_name_to_nr(name: &str) -> Option<u32> {
         "connect" => libc::SYS_connect,
         "sendto" => libc::SYS_sendto,
         "sendmsg" => libc::SYS_sendmsg,
+        "sendmmsg" => libc::SYS_sendmmsg,
         "ioctl" => libc::SYS_ioctl,
         "socket" => libc::SYS_socket,
         "prctl" => libc::SYS_prctl,
@@ -222,17 +223,30 @@ pub fn syscall_name_to_nr(name: &str) -> Option<u32> {
         "readlink" => arch::SYS_READLINK?,
         "futimesat" => arch::SYS_FUTIMESAT?,
         "fork" => arch::SYS_FORK?,
+        // SysV IPC (gated by extra_allow_syscalls=["sysv_ipc"]; denied by default)
+        "shmget" => libc::SYS_shmget,
+        "shmat" => libc::SYS_shmat,
+        "shmdt" => libc::SYS_shmdt,
+        "shmctl" => libc::SYS_shmctl,
+        "msgget" => libc::SYS_msgget,
+        "msgsnd" => libc::SYS_msgsnd,
+        "msgrcv" => libc::SYS_msgrcv,
+        "msgctl" => libc::SYS_msgctl,
+        "semget" => libc::SYS_semget,
+        "semop" => libc::SYS_semop,
+        "semctl" => libc::SYS_semctl,
+        "semtimedop" => libc::SYS_semtimedop,
         _ => return None,
     };
     Some(nr as u32)
 }
 
 // ============================================================
-// Policy → syscall lists
+// Sandbox → syscall lists
 // ============================================================
 
 /// Determine which syscalls need `SECCOMP_RET_USER_NOTIF`.
-pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
+pub fn notif_syscalls(policy: &Sandbox, sandbox_name: Option<&str>) -> Vec<u32> {
     let mut nrs = vec![
         libc::SYS_clone as u32,
         libc::SYS_clone3 as u32,
@@ -240,16 +254,32 @@ pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
         libc::SYS_waitid as u32,
     ];
     arch::push_optional_syscall(&mut nrs, arch::SYS_VFORK);
+    // Bare fork(2) carries none of the namespace/process-limit risk of
+    // clone/clone3 and was historically left out of the BPF filter so
+    // hot fork-loops (COW map-reduce) bypass the supervisor entirely.
+    // It only needs interception when policy_fn is active, so the
+    // supervisor can register the new child via ptrace fork events
+    // before it can run user code (argv-safety invariant).
+    if policy.policy_fn.is_some() {
+        arch::push_optional_syscall(&mut nrs, arch::SYS_FORK);
+    }
 
     if policy.max_memory.is_some() {
         nrs.push(libc::SYS_mmap as u32);
         nrs.push(libc::SYS_munmap as u32);
         nrs.push(libc::SYS_brk as u32);
         nrs.push(libc::SYS_mremap as u32);
-        nrs.push(libc::SYS_shmget as u32);
+        // shmget is in notif only when SysV IPC is allowed. The BPF
+        // layout puts notif JEQs before deny JEQs, so a syscall on
+        // both lists would notify (RET_USER_NOTIF) and silently
+        // bypass the kernel-level deny. When extra_allow_syscalls does not contain "sysv_ipc",
+        // shmget belongs only on the blocklist.
+        if policy.allows_sysv_ipc() {
+            nrs.push(libc::SYS_shmget as u32);
+        }
     }
 
-    if policy.net_allow_hosts.is_some()
+    if !policy.net_allow.is_empty()
         || policy.policy_fn.is_some()
         || !policy.http_allow.is_empty()
         || !policy.http_deny.is_empty()
@@ -257,6 +287,7 @@ pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
         nrs.push(libc::SYS_connect as u32);
         nrs.push(libc::SYS_sendto as u32);
         nrs.push(libc::SYS_sendmsg as u32);
+        nrs.push(libc::SYS_sendmmsg as u32);
         nrs.push(libc::SYS_bind as u32);
     }
 
@@ -300,7 +331,7 @@ pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
     if policy.num_cpus.is_some() {
         nrs.push(libc::SYS_sched_getaffinity as u32);
     }
-    if policy.hostname.is_some() {
+    if sandbox_name.is_some() {
         nrs.push(libc::SYS_uname as u32);
         nrs.push(libc::SYS_openat as u32);
     }
@@ -413,34 +444,53 @@ pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
     nrs
 }
 
-/// Resolve `NO_SUPERVISOR_DENY_SYSCALLS` names to numbers.
-pub fn no_supervisor_deny_syscall_numbers() -> Vec<u32> {
-    use crate::sys::structs::NO_SUPERVISOR_DENY_SYSCALLS;
-    NO_SUPERVISOR_DENY_SYSCALLS
+/// Resolve `NO_SUPERVISOR_BLOCKLIST_SYSCALLS` names to numbers, plus
+/// SysV IPC syscalls when `policy.allows_sysv_ipc()` is false.
+pub fn no_supervisor_blocklist_syscall_numbers(policy: &Sandbox) -> Vec<u32> {
+    use crate::sys::structs::NO_SUPERVISOR_BLOCKLIST_SYSCALLS;
+    let mut nrs: Vec<u32> = NO_SUPERVISOR_BLOCKLIST_SYSCALLS
         .iter()
+        .copied()
+        .chain(policy.extra_deny_syscalls.iter().map(String::as_str))
         .filter_map(|n| syscall_name_to_nr(n))
-        .collect()
+        .collect();
+    if !policy.allows_sysv_ipc() {
+        for name in SYSV_IPC_BLOCKLIST_SYSCALLS {
+            if let Some(nr) = syscall_name_to_nr(name) {
+                if !nrs.contains(&nr) {
+                    nrs.push(nr);
+                }
+            }
+        }
+    }
+    nrs.sort_unstable();
+    nrs.dedup();
+    nrs
 }
 
-/// Resolve `deny_syscalls` names to numbers.
+/// Resolve the default syscall blocklist plus policy extras to numbers.
 ///
-/// If both `deny_syscalls` and `allow_syscalls` are `None`, returns the
-/// numbers for `DEFAULT_DENY_SYSCALLS`.
-pub fn deny_syscall_numbers(policy: &Policy) -> Vec<u32> {
-    if let Some(ref names) = policy.deny_syscalls {
-        names
-            .iter()
-            .filter_map(|n| syscall_name_to_nr(n))
-            .collect()
-    } else if policy.allow_syscalls.is_none() {
-        DEFAULT_DENY_SYSCALLS
-            .iter()
-            .filter_map(|n| syscall_name_to_nr(n))
-            .collect()
-    } else {
-        // allow_syscalls is set — no deny list
-        Vec::new()
+/// SysV IPC syscalls are appended to the resolved blocklist when
+/// `policy.allows_sysv_ipc()` is false.
+pub fn blocklist_syscall_numbers(policy: &Sandbox) -> Vec<u32> {
+    let mut nrs: Vec<u32> = DEFAULT_BLOCKLIST_SYSCALLS
+        .iter()
+        .copied()
+        .chain(policy.extra_deny_syscalls.iter().map(String::as_str))
+        .filter_map(|n| syscall_name_to_nr(n))
+        .collect();
+    if !policy.allows_sysv_ipc() {
+        for name in SYSV_IPC_BLOCKLIST_SYSCALLS {
+            if let Some(nr) = syscall_name_to_nr(name) {
+                if !nrs.contains(&nr) {
+                    nrs.push(nr);
+                }
+            }
+        }
     }
+    nrs.sort_unstable();
+    nrs.dedup();
+    nrs
 }
 
 /// Build argument-level seccomp filter instructions matching the Python
@@ -451,7 +501,7 @@ pub fn deny_syscall_numbers(policy: &Policy) -> Vec<u32> {
 ///   - ioctl: block TIOCSTI, TIOCLINUX, SIOCGIF*, SIOCETHTOOL
 ///   - prctl: block PR_SET_DUMPABLE, PR_SET_SECUREBITS, PR_SET_PTRACER
 ///   - socket: block SOCK_RAW/SOCK_DGRAM on AF_INET/AF_INET6 (with type mask)
-pub fn arg_filters(policy: &Policy) -> Vec<SockFilter> {
+pub fn arg_filters(policy: &Sandbox) -> Vec<SockFilter> {
     let ret_errno = SECCOMP_RET_ERRNO | EPERM as u32;
     let nr_clone = libc::SYS_clone as u32;
     let nr_ioctl = libc::SYS_ioctl as u32;
@@ -516,11 +566,24 @@ pub fn arg_filters(policy: &Policy) -> Vec<SockFilter> {
     }
 
     // --- socket: block SOCK_RAW and/or SOCK_DGRAM on AF_INET/AF_INET6 ---
+    //
+    // SOCK_RAW is unconditionally denied. Sandlock does not expose
+    // raw ICMP — packet-crafting capabilities aren't part of the XOA
+    // threat model, and destination filtering at `sendto` can't be
+    // honestly enforced for raw sockets (the agent controls the IP
+    // header). Workloads that need ping should use the kernel ping
+    // socket (SOCK_DGRAM + IPPROTO_ICMP) via an `icmp://...` rule.
+    //
+    // SOCK_DGRAM is denied unless a UDP or ICMP rule exists in
+    // net_allow. The kernel ping socket uses SOCK_DGRAM with
+    // IPPROTO_ICMP, so the same type bit gates both — destination
+    // filtering at sendto (Phase 2) is what separates them per-rule.
+    use crate::sandbox::Protocol;
+    let any_udp_rule = policy.net_allow.iter().any(|r| r.protocol == Protocol::Udp);
+    let any_icmp_rule = policy.net_allow.iter().any(|r| r.protocol == Protocol::Icmp);
     let mut blocked_types: Vec<u32> = Vec::new();
-    if policy.no_raw_sockets {
-        blocked_types.push(SOCK_RAW);
-    }
-    if policy.no_udp {
+    blocked_types.push(SOCK_RAW);
+    if !any_udp_rule && !any_icmp_rule {
         blocked_types.push(SOCK_DGRAM);
     }
 
@@ -554,6 +617,11 @@ pub fn arg_filters(policy: &Policy) -> Vec<SockFilter> {
         // Deny return (reached by any matching JEQ)
         insns.push(stmt(BPF_RET | BPF_K, ret_errno));
     }
+
+    // (raw ICMP carve-out removed — SOCK_RAW is unconditionally denied
+    // by the blocked_types block above. Sandlock does not expose raw
+    // sockets; ping uses the SOCK_DGRAM kernel ping socket via an
+    // `icmp://...` rule, gated by host `ping_group_range`.)
 
     // --- wait4: skip notification for WNOHANG/WNOWAIT (non-blocking) ---
     // wait4(pid, status, options, rusage) — options is arg2
@@ -645,11 +713,44 @@ fn write_id_maps_overflow() {
 // Child-side confinement (never returns)
 // ============================================================
 
+/// Arguments threaded from the parent's `do_spawn` into the child-side
+/// `confine_child`.  Packed into a struct because `confine_child` historically
+/// grew to seven positional parameters and a struct keeps the call site
+/// readable when new flags get added (e.g. `extra_syscalls` for user
+/// handlers).  Lifetimes tie everything to the parent's stack frame — the
+/// child never outlives the fork point because `confine_child` either execs
+/// or exits.
+pub(crate) struct ChildSpawnArgs<'a> {
+    pub sandbox: &'a Sandbox,
+    pub cmd: &'a [CString],
+    pub pipes: &'a PipePair,
+    pub cow_config: Option<&'a ChildMountConfig>,
+    pub nested: bool,
+    pub keep_fds: &'a [RawFd],
+    /// Sandbox instance name. When set, it is also exposed as the
+    /// sandbox's virtual hostname.
+    pub sandbox_name: Option<&'a str>,
+    /// Syscall numbers for which the parent registered user `Handler`s.
+    /// Merged into the child's BPF notif list so the kernel actually
+    /// raises USER_NOTIF for them.
+    pub extra_syscalls: &'a [u32],
+}
+
 /// Apply irreversible confinement (Landlock + seccomp) then exec the command.
 ///
 /// This function **never returns**: it calls `execvp` on success or
 /// `_exit(127)` on any error.
-pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, cow_config: Option<&ChildMountConfig>, nested: bool, keep_fds: &[RawFd]) -> ! {
+pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
+    let ChildSpawnArgs {
+        sandbox,
+        cmd,
+        pipes,
+        cow_config,
+        nested,
+        keep_fds,
+        sandbox_name,
+        extra_syscalls,
+    } = args;
     // Helper: abort child on error. Includes the OS error automatically.
     macro_rules! fail {
         ($msg:expr) => {{
@@ -689,7 +790,7 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
     }
 
     // 4. Optional: disable ASLR
-    if policy.no_randomize_memory {
+    if sandbox.no_randomize_memory {
         const ADDR_NO_RANDOMIZE: libc::c_ulong = 0x0040000;
         // Read current personality first (0xffffffff = query), then OR in the flag.
         let current = unsafe { libc::personality(0xffffffff) };
@@ -702,7 +803,7 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
     }
 
     // 4b. Optional: CPU core binding
-    if let Some(ref cores) = policy.cpu_cores {
+    if let Some(ref cores) = sandbox.cpu_cores {
         if !cores.is_empty() {
             let mut set = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
             unsafe { libc::CPU_ZERO(&mut set) };
@@ -723,14 +824,14 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
     }
 
     // 5. Optional: disable THP
-    if policy.no_huge_pages {
+    if sandbox.no_huge_pages {
         if unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0) } != 0 {
             fail!("prctl(PR_SET_THP_DISABLE)");
         }
     }
 
     // 5c. Optional: disable core dumps
-    if policy.no_coredump {
+    if sandbox.no_coredump {
         // Set RLIMIT_CORE to 0 — the kernel will not write a core file.
         // We intentionally do NOT call prctl(PR_SET_DUMPABLE, 0) because
         // that would break pidfd_getfd which the supervisor needs.
@@ -748,7 +849,7 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
 
     // 5b. User namespace for --uid mapping (when not using OverlayFS COW,
     //     which sets up its own user namespace)
-    if let Some(target_uid) = policy.uid {
+    if let Some(target_uid) = sandbox.uid {
         if cow_config.is_none() {
             if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
                 fail!("unshare(CLONE_NEWUSER)");
@@ -809,16 +910,16 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
 
     // 6. Optional: change working directory
     // cwd controls where the child starts; workdir is only for COW
-    let effective_cwd = if let Some(ref cwd) = policy.cwd {
-        if let Some(ref chroot_root) = policy.chroot {
+    let effective_cwd = if let Some(ref cwd) = sandbox.cwd {
+        if let Some(ref chroot_root) = sandbox.chroot {
             Some(chroot_root.join(cwd.strip_prefix("/").unwrap_or(cwd)))
         } else {
             Some(cwd.clone())
         }
-    } else if let Some(ref chroot_root) = policy.chroot {
+    } else if let Some(ref chroot_root) = sandbox.chroot {
         // Default to chroot root
         Some(chroot_root.to_path_buf())
-    } else if let Some(ref workdir) = policy.workdir {
+    } else if let Some(ref workdir) = sandbox.workdir {
         // Default to workdir when set (COW working directory)
         Some(workdir.clone())
     } else {
@@ -841,13 +942,13 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
     }
 
     // 8. Apply Landlock confinement (IRREVERSIBLE)
-    if let Err(e) = crate::landlock::confine(policy) {
+    if let Err(e) = crate::landlock::confine(sandbox) {
         fail!(format!("landlock: {}", e));
     }
 
     // 9. Assemble and install seccomp filter (IRREVERSIBLE)
-    let deny = deny_syscall_numbers(policy);
-    let args = arg_filters(policy);
+    let deny = blocklist_syscall_numbers(sandbox);
+    let args = arg_filters(sandbox);
     let mut keep_fd: i32 = -1;
 
     if nested {
@@ -866,7 +967,30 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
         }
     } else {
         // First-level sandbox: notif + deny filter with NEW_LISTENER.
-        let notif = notif_syscalls(policy);
+        //
+        // Caller-supplied extra handlers must have their syscalls registered in
+        // the BPF filter, otherwise the kernel never raises a notification for
+        // them and the handler silently never fires.  We merge `extra_syscalls`
+        // into the notif list and dedup so each syscall produces exactly one
+        // JEQ in the assembled program.
+        let mut notif = notif_syscalls(sandbox, sandbox_name);
+        if !extra_syscalls.is_empty() {
+            notif.extend_from_slice(extra_syscalls);
+        }
+        // Argv-safety gate (companion to the policy_fn case in
+        // notif_syscalls): an extra handler bound to execve/execveat
+        // can call `read_child_mem` to inspect argv, so the supervisor
+        // must register newly forked children before they can run user
+        // code — same invariant policy_fn relies on. Bare fork(2)
+        // therefore needs to be intercepted here too.
+        let exec_extra = extra_syscalls.iter().any(|&n| {
+            n == libc::SYS_execve as u32 || n == libc::SYS_execveat as u32
+        });
+        if exec_extra {
+            arch::push_optional_syscall(&mut notif, arch::SYS_FORK);
+        }
+        notif.sort_unstable();
+        notif.dedup();
         let filter = match bpf::assemble_filter(&notif, &deny, &args) {
             Ok(f) => f,
             Err(e) => fail!(format!("seccomp assemble: {}", e)),
@@ -883,7 +1007,7 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
     }
 
     // Mark this process as confined for in-process nesting detection
-    crate::sandbox::CONFINED.store(true, std::sync::atomic::Ordering::Relaxed);
+    crate::process::CONFINED.store(true, std::sync::atomic::Ordering::Relaxed);
 
     // 10. Wait for parent to signal ready
     match read_u32_fd(pipes.ready_r.as_raw_fd()) {
@@ -899,18 +1023,18 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
     close_fds_above(2, &fds_to_keep);
 
     // 13. Apply environment
-    if policy.clean_env {
+    if sandbox.clean_env {
         // Clear all env vars first
         for (key, _) in std::env::vars_os() {
             std::env::remove_var(&key);
         }
     }
-    for (key, value) in &policy.env {
+    for (key, value) in &sandbox.env {
         std::env::set_var(key, value);
     }
 
     // 13b. GPU device visibility
-    if let Some(ref devices) = policy.gpu_devices {
+    if let Some(ref devices) = sandbox.gpu_devices {
         if !devices.is_empty() {
             let vis = devices.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",");
             std::env::set_var("CUDA_VISIBLE_DEVICES", &vis);
@@ -927,7 +1051,7 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
         .chain(std::iter::once(std::ptr::null()))
         .collect();
 
-    if policy.chroot.is_some() {
+    if sandbox.chroot.is_some() {
         // With chroot the seccomp handler rewrites the filename to a host path
         // (or /proc/self/fd/N).  Pass a separate PATH_MAX buffer as the `file`
         // argument so the rewrite does not corrupt argv[0] — which must stay as
@@ -1001,22 +1125,45 @@ mod tests {
 
     #[test]
     fn test_notif_syscalls_always_has_clone() {
-        let policy = Policy::builder().build().unwrap();
-        let nrs = notif_syscalls(&policy);
+        let policy = Sandbox::builder().build().unwrap();
+        let nrs = notif_syscalls(&policy, None);
         assert!(nrs.contains(&(libc::SYS_clone as u32)));
         assert!(nrs.contains(&(libc::SYS_clone3 as u32)));
         if let Some(vfork) = arch::SYS_VFORK {
             assert!(nrs.contains(&(vfork as u32)));
         }
+        // Bare fork(2) is intercepted only when policy_fn is active —
+        // see notif_syscalls. The default policy has no policy_fn, so
+        // fork stays out of the BPF filter and hot fork-loops keep
+        // bypassing the supervisor.
+        if let Some(fork) = arch::SYS_FORK {
+            assert!(!nrs.contains(&(fork as u32)));
+        }
+    }
+
+    #[test]
+    fn test_notif_syscalls_fork_gated_on_policy_fn() {
+        let Some(fork) = arch::SYS_FORK else { return };
+        let policy = Sandbox::builder()
+            .policy_fn(|_event, _ctx| crate::policy_fn::Verdict::Allow)
+            .build()
+            .unwrap();
+        let nrs = notif_syscalls(&policy, None);
+        assert!(nrs.contains(&(fork as u32)));
     }
 
     #[test]
     fn test_notif_syscalls_memory() {
-        let policy = Policy::builder()
-            .max_memory(crate::policy::ByteSize::mib(256))
+        // shmget only appears in notif when SysV IPC is allowed —
+        // otherwise it is on the kernel blocklist and notifying would
+        // bypass the deny (notif JEQs precede deny JEQs in the BPF
+        // layout).
+        let policy = Sandbox::builder()
+            .max_memory(crate::sandbox::ByteSize::mib(256))
+            .extra_allow_syscalls(vec!["sysv_ipc".into()])
             .build()
             .unwrap();
-        let nrs = notif_syscalls(&policy);
+        let nrs = notif_syscalls(&policy, None);
         assert!(nrs.contains(&(libc::SYS_mmap as u32)));
         assert!(nrs.contains(&(libc::SYS_munmap as u32)));
         assert!(nrs.contains(&(libc::SYS_brk as u32)));
@@ -1025,15 +1172,41 @@ mod tests {
     }
 
     #[test]
-    fn test_notif_syscalls_net() {
-        let policy = Policy::builder()
-            .net_allow_host("example.com")
+    fn test_notif_syscalls_memory_excludes_shmget_when_sysv_ipc_denied() {
+        // With max_memory but allows_sysv_ipc()=false (the default),
+        // shmget must NOT be in notif: if it were, the BPF filter
+        // would route it to RET_USER_NOTIF before reaching the deny
+        // JEQ, silently bypassing the kernel-level deny.
+        let policy = Sandbox::builder()
+            .max_memory(crate::sandbox::ByteSize::mib(256))
             .build()
             .unwrap();
-        let nrs = notif_syscalls(&policy);
+        let nrs = notif_syscalls(&policy, None);
+        assert!(!nrs.contains(&(libc::SYS_shmget as u32)));
+        // Other memory syscalls remain notified — they are not denied.
+        assert!(nrs.contains(&(libc::SYS_mmap as u32)));
+        assert!(nrs.contains(&(libc::SYS_brk as u32)));
+    }
+
+    #[test]
+    fn test_notif_syscalls_net() {
+        let policy = Sandbox::builder()
+            .net_allow("example.com:443")
+            .build()
+            .unwrap();
+        let nrs = notif_syscalls(&policy, None);
         assert!(nrs.contains(&(libc::SYS_connect as u32)));
         assert!(nrs.contains(&(libc::SYS_sendto as u32)));
         assert!(nrs.contains(&(libc::SYS_sendmsg as u32)));
+        assert!(nrs.contains(&(libc::SYS_sendmmsg as u32)));
+    }
+
+    #[test]
+    fn test_notif_syscalls_sandbox_name_enables_hostname_virtualization() {
+        let policy = Sandbox::builder().build().unwrap();
+        let nrs = notif_syscalls(&policy, Some("api.local"));
+        assert!(nrs.contains(&(libc::SYS_uname as u32)));
+        assert!(nrs.contains(&(libc::SYS_openat as u32)));
     }
 
     /// SYS_faccessat2 (439) must be in the notification filter for both
@@ -1043,58 +1216,105 @@ mod tests {
         const SYS_FACCESSAT2: u32 = 439;
 
         // Chroot mode
-        let policy = Policy::builder()
+        let policy = Sandbox::builder()
             .chroot("/tmp")
             .build()
             .unwrap();
-        let nrs = notif_syscalls(&policy);
+        let nrs = notif_syscalls(&policy, None);
         assert!(nrs.contains(&(libc::SYS_faccessat as u32)));
         assert!(nrs.contains(&SYS_FACCESSAT2),
                 "chroot notif filter must include SYS_faccessat2 (439)");
 
         // COW mode
-        let policy = Policy::builder()
+        let policy = Sandbox::builder()
             .workdir("/tmp")
             .build()
             .unwrap();
-        let nrs = notif_syscalls(&policy);
+        let nrs = notif_syscalls(&policy, None);
         assert!(nrs.contains(&(libc::SYS_faccessat as u32)));
         assert!(nrs.contains(&SYS_FACCESSAT2),
                 "COW notif filter must include SYS_faccessat2 (439)");
     }
 
     #[test]
-    fn test_deny_syscall_numbers_default() {
-        let policy = Policy::builder().build().unwrap();
-        let nrs = deny_syscall_numbers(&policy);
+    fn test_blocklist_syscall_numbers_default() {
+        let policy = Sandbox::builder().build().unwrap();
+        let nrs = blocklist_syscall_numbers(&policy);
         // Should contain mount, ptrace, etc.
         assert!(nrs.contains(&(libc::SYS_mount as u32)));
         assert!(nrs.contains(&(libc::SYS_ptrace as u32)));
         assert!(nrs.contains(&(libc::SYS_bpf as u32)));
+        // SysV IPC denied by default (no IPC namespace in sandlock)
+        assert!(nrs.contains(&(libc::SYS_shmget as u32)));
+        assert!(nrs.contains(&(libc::SYS_shmat as u32)));
+        assert!(nrs.contains(&(libc::SYS_msgget as u32)));
+        assert!(nrs.contains(&(libc::SYS_semget as u32)));
         // nfsservctl has no libc constant, so it is skipped
         assert!(!nrs.is_empty());
     }
 
     #[test]
-    fn test_deny_syscall_numbers_custom() {
-        let policy = Policy::builder()
-            .deny_syscalls(vec!["mount".into(), "ptrace".into()])
+    fn test_blocklist_syscall_numbers_custom() {
+        let policy = Sandbox::builder()
+            .extra_deny_syscalls(vec!["mount".into(), "ptrace".into()])
             .build()
             .unwrap();
-        let nrs = deny_syscall_numbers(&policy);
-        assert_eq!(nrs.len(), 2);
+        let nrs = blocklist_syscall_numbers(&policy);
+        // User-supplied blocklist still gets SysV IPC appended
+        // (allows_sysv_ipc() defaults to false).
         assert!(nrs.contains(&(libc::SYS_mount as u32)));
         assert!(nrs.contains(&(libc::SYS_ptrace as u32)));
+        assert!(nrs.contains(&(libc::SYS_shmget as u32)));
     }
 
     #[test]
-    fn test_deny_syscall_numbers_empty_when_allow_set() {
-        let policy = Policy::builder()
-            .allow_syscalls(vec!["read".into(), "write".into()])
+    fn test_blocklist_syscall_numbers_custom_with_sysv_ipc_allowed() {
+        let policy = Sandbox::builder()
+            .extra_deny_syscalls(vec!["mount".into(), "ptrace".into()])
+            .extra_allow_syscalls(vec!["sysv_ipc".into()])
             .build()
             .unwrap();
-        let nrs = deny_syscall_numbers(&policy);
-        assert!(nrs.is_empty());
+        let nrs = blocklist_syscall_numbers(&policy);
+        // Default blocklist plus user extras — no SysV IPC append.
+        assert!(nrs.contains(&(libc::SYS_mount as u32)));
+        assert!(nrs.contains(&(libc::SYS_ptrace as u32)));
+        assert!(nrs.contains(&(libc::SYS_bpf as u32)));
+        assert!(!nrs.contains(&(libc::SYS_shmget as u32)));
+    }
+
+    #[test]
+    fn test_blocklist_syscall_numbers_default_with_sysv_ipc_allowed() {
+        let policy = Sandbox::builder()
+            .extra_allow_syscalls(vec!["sysv_ipc".into()])
+            .build()
+            .unwrap();
+        let nrs = blocklist_syscall_numbers(&policy);
+        // Default blocklist still present, but SysV IPC is permitted.
+        assert!(nrs.contains(&(libc::SYS_mount as u32)));
+        assert!(!nrs.contains(&(libc::SYS_shmget as u32)));
+        assert!(!nrs.contains(&(libc::SYS_msgget as u32)));
+        assert!(!nrs.contains(&(libc::SYS_semget as u32)));
+    }
+
+    #[test]
+    fn test_no_supervisor_blocklist_includes_sysv_ipc_by_default() {
+        let policy = Sandbox::builder().build().unwrap();
+        let nrs = no_supervisor_blocklist_syscall_numbers(&policy);
+        assert!(nrs.contains(&(libc::SYS_shmget as u32)));
+        assert!(nrs.contains(&(libc::SYS_msgget as u32)));
+        assert!(nrs.contains(&(libc::SYS_semget as u32)));
+    }
+
+    #[test]
+    fn test_no_supervisor_blocklist_excludes_sysv_ipc_when_allowed() {
+        let policy = Sandbox::builder()
+            .extra_allow_syscalls(vec!["sysv_ipc".into()])
+            .build()
+            .unwrap();
+        let nrs = no_supervisor_blocklist_syscall_numbers(&policy);
+        assert!(!nrs.contains(&(libc::SYS_shmget as u32)));
+        assert!(!nrs.contains(&(libc::SYS_msgget as u32)));
+        assert!(!nrs.contains(&(libc::SYS_semget as u32)));
     }
 
     #[test]
@@ -1102,7 +1322,7 @@ mod tests {
         use crate::sys::structs::{
             BPF_JEQ, BPF_JSET, BPF_JMP, BPF_K,
         };
-        let policy = Policy::builder().build().unwrap();
+        let policy = Sandbox::builder().build().unwrap();
         let filters = arg_filters(&policy);
         // Should contain JEQ for clone syscall nr
         assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
@@ -1133,7 +1353,8 @@ mod tests {
     #[test]
     fn test_arg_filters_raw_sockets() {
         use crate::sys::structs::{BPF_ALU, BPF_AND, BPF_JEQ, BPF_JMP, BPF_K};
-        let policy = Policy::builder().no_raw_sockets(true).build().unwrap();
+        // Raw sockets are blocked by default — no `icmp-raw://*` rule.
+        let policy = Sandbox::builder().build().unwrap();
         let filters = arg_filters(&policy);
         // Should have AF_INET check
         assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
@@ -1150,9 +1371,10 @@ mod tests {
     }
 
     #[test]
-    fn test_arg_filters_no_udp() {
+    fn test_arg_filters_udp_denied_by_default() {
         use crate::sys::structs::{BPF_JEQ, BPF_JMP, BPF_K};
-        let policy = Policy::builder().no_udp(true).build().unwrap();
+        // UDP is denied by default — no `udp://...` rule in net_allow.
+        let policy = Sandbox::builder().build().unwrap();
         let filters = arg_filters(&policy);
         // Should have JEQ SOCK_DGRAM
         assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
@@ -1161,7 +1383,7 @@ mod tests {
 
     #[test]
     fn test_syscall_name_to_nr_covers_defaults() {
-        // Every name in DEFAULT_DENY_SYSCALLS should resolve unless the
+        // Every name in DEFAULT_BLOCKLIST_SYSCALLS should resolve unless the
         // running architecture does not expose that syscall.
         let expected_unresolved: &[&str] = &[
             "nfsservctl",
@@ -1171,7 +1393,7 @@ mod tests {
             "iopl",
         ];
         let mut skipped = 0;
-        for name in DEFAULT_DENY_SYSCALLS {
+        for name in DEFAULT_BLOCKLIST_SYSCALLS {
             match syscall_name_to_nr(name) {
                 Some(_) => {}
                 None => {

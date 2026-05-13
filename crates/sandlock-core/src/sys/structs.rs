@@ -261,10 +261,34 @@ pub const EAGAIN: i32 = 11;
 pub const ECONNREFUSED: i32 = 111;
 
 // ============================================================
-// Default deny syscall list
+// Default blocklisted syscall list
 // ============================================================
 
-pub const DEFAULT_DENY_SYSCALLS: &[&str] = &[
+/// SysV IPC syscalls. Appended to the kernel-level blocklist when
+/// `policy.allows_sysv_ipc()` is false. Sandlock does not use an IPC
+/// namespace, so without these denials two sandboxes on the same host
+/// share a SysV keyspace and can rendezvous via a well-known key.
+///
+/// POSIX shared memory (`shm_open`) is intentionally not here — it is
+/// just `open("/dev/shm/<name>")`, gated by Landlock filesystem rules.
+/// POSIX message queues (`mq_open` and friends) are also out of scope
+/// for this flag.
+pub const SYSV_IPC_BLOCKLIST_SYSCALLS: &[&str] = &[
+    "shmget",
+    "shmat",
+    "shmdt",
+    "shmctl",
+    "msgget",
+    "msgsnd",
+    "msgrcv",
+    "msgctl",
+    "semget",
+    "semop",
+    "semctl",
+    "semtimedop",
+];
+
+pub const DEFAULT_BLOCKLIST_SYSCALLS: &[&str] = &[
     "mount",
     "umount2",
     "pivot_root",
@@ -304,12 +328,12 @@ pub const DEFAULT_DENY_SYSCALLS: &[&str] = &[
 
 /// Deny list for --no-supervisor mode.
 ///
-/// More relaxed than DEFAULT_DENY_SYSCALLS because a full sandbox supervisor
+/// More relaxed than DEFAULT_BLOCKLIST_SYSCALLS because a full sandbox supervisor
 /// may run inside the outer no-supervisor sandbox and needs syscalls like
 /// ptrace, process_vm_readv/writev, unshare, mount, and setns.
 ///
 /// Only blocks syscalls that could damage the host or escape all containment.
-pub const NO_SUPERVISOR_DENY_SYSCALLS: &[&str] = &[
+pub const NO_SUPERVISOR_BLOCKLIST_SYSCALLS: &[&str] = &[
     // Swap / reboot / shutdown — host-wide damage
     "swapon",
     "swapoff",

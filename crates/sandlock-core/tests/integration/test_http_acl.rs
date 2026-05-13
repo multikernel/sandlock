@@ -1,4 +1,4 @@
-use sandlock_core::{Policy, Sandbox};
+use sandlock_core::{Sandbox};
 use std::io::{BufRead, BufReader, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -12,8 +12,8 @@ fn temp_file(name: &str) -> PathBuf {
     ))
 }
 
-fn base_policy() -> sandlock_core::PolicyBuilder {
-    Policy::builder()
+fn base_policy() -> sandlock_core::SandboxBuilder {
+    Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
@@ -137,7 +137,7 @@ async fn test_http_allow_get() {
         .unwrap();
 
     let script = http_script(&format!("http://127.0.0.1:{}/get", port), &out);
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
@@ -162,7 +162,7 @@ async fn test_http_deny_non_matching() {
         .unwrap();
 
     let script = http_script(&format!("http://127.0.0.1:{}/denied", port), &out);
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
@@ -188,7 +188,7 @@ async fn test_http_deny_precedence() {
 
     // GET /public — should succeed
     let script = http_script(&format!("http://127.0.0.1:{}/public", port), &out_allowed);
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
@@ -197,7 +197,7 @@ async fn test_http_deny_precedence() {
 
     // GET /secret — should be denied
     let script = http_script(&format!("http://127.0.0.1:{}/secret", port), &out_denied);
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
@@ -216,10 +216,13 @@ async fn test_http_no_acl_unrestricted() {
     let out = temp_file("no-acl");
     let (port, srv) = spawn_http_server(1);
 
-    let policy = base_policy().net_connect_port(port).build().unwrap();
+    let policy = base_policy()
+        .net_allow(format!(":{}", port))
+        .build()
+        .unwrap();
 
     let script = http_script(&format!("http://127.0.0.1:{}/get", port), &out);
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
@@ -245,7 +248,7 @@ async fn test_http_method_filtering() {
 
     // GET should succeed
     let script = http_script(&format!("http://127.0.0.1:{}/anything", port), &out_get);
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
@@ -254,7 +257,7 @@ async fn test_http_method_filtering() {
 
     // POST should be denied
     let script = post_script(&format!("http://127.0.0.1:{}/anything", port), &out_post);
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
@@ -282,7 +285,7 @@ async fn test_http_multiple_allow_rules() {
 
     // GET /get — should succeed (matches first rule)
     let script = http_script(&format!("http://127.0.0.1:{}/get", port), &out_get);
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
@@ -291,7 +294,7 @@ async fn test_http_multiple_allow_rules() {
 
     // GET /anything — should be denied (not in allow list)
     let script = http_script(&format!("http://127.0.0.1:{}/anything", port), &out_other);
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
@@ -319,7 +322,7 @@ async fn test_http_wildcard_host() {
 
     // GET /get — should succeed
     let script = http_script(&format!("http://127.0.0.1:{}/get", port), &out_get);
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
@@ -328,7 +331,7 @@ async fn test_http_wildcard_host() {
 
     // GET /admin/settings — should be denied
     let script = http_script(&format!("http://127.0.0.1:{}/admin/settings", port), &out_denied);
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
@@ -341,46 +344,50 @@ async fn test_http_wildcard_host() {
 }
 
 /// Non-intercepted port traffic should NOT go through the proxy.
+/// The port must be in `net_connect` (per AND semantics — see Network
+/// Model in README); the proxy still leaves it alone because it is not
+/// in `http_ports`.
 #[tokio::test]
 async fn test_http_non_intercepted_port() {
     let out = temp_file("non-intercept");
 
-    // ACL intercepts port 80 by default, not random ports
+    // Bind the listener in the test process so we know the port up
+    // front and can plumb it through `--net-allow`.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let srv = std::thread::spawn(move || {
+        if let Ok((mut conn, _)) = listener.accept() {
+            let _ = std::io::Write::write_all(&mut conn, b"HELLO");
+        }
+    });
+
     let policy = base_policy()
         .http_allow("GET example.com/get")
+        .net_allow(format!(":{}", port))
         .build()
         .unwrap();
 
     let script = format!(
         concat!(
-            "import socket, threading\n",
+            "import socket\n",
             "try:\n",
-            "    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-            "    srv.bind(('127.0.0.1', 0))\n",
-            "    port = srv.getsockname()[1]\n",
-            "    srv.listen(1)\n",
-            "    def accept_one():\n",
-            "        conn, _ = srv.accept()\n",
-            "        conn.send(b'HELLO')\n",
-            "        conn.close()\n",
-            "    t = threading.Thread(target=accept_one, daemon=True)\n",
-            "    t.start()\n",
             "    c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
             "    c.settimeout(2)\n",
-            "    c.connect(('127.0.0.1', port))\n",
+            "    c.connect(('127.0.0.1', {port}))\n",
             "    data = c.recv(10)\n",
             "    c.close()\n",
-            "    srv.close()\n",
             "    open('{out}', 'w').write('OK:' + data.decode())\n",
             "except Exception as e:\n",
             "    open('{out}', 'w').write('ERR:' + str(e))\n",
         ),
         out = out.display(),
+        port = port,
     );
 
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
+    srv.join().unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     assert!(content.starts_with("OK:HELLO"), "expected OK:HELLO, got: {}", content);
@@ -405,7 +412,7 @@ async fn test_http_acl_ipv6_allow() {
         .unwrap();
 
     let script = http_script(&format!("http://[::1]:{}/get", port), &out);
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
@@ -429,7 +436,7 @@ async fn test_http_acl_ipv6_deny() {
         .unwrap();
 
     let script = http_script(&format!("http://[::1]:{}/denied", port), &out);
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
@@ -440,46 +447,46 @@ async fn test_http_acl_ipv6_deny() {
 }
 
 /// IPv6 non-intercepted port should pass through without proxy interference.
+/// (Same AND-semantics requirement as the IPv4 sibling test.)
 #[tokio::test]
 async fn test_http_ipv6_non_intercepted_port() {
     let out = temp_file("ipv6-non-intercept");
 
+    let listener = std::net::TcpListener::bind("[::1]:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let srv = std::thread::spawn(move || {
+        if let Ok((mut conn, _)) = listener.accept() {
+            let _ = std::io::Write::write_all(&mut conn, b"HELLO6");
+        }
+    });
+
     let policy = base_policy()
         .http_allow("GET example.com/get")
+        .net_allow(format!(":{}", port))
         .build()
         .unwrap();
 
     let script = format!(
         concat!(
-            "import socket, threading\n",
+            "import socket\n",
             "try:\n",
-            "    srv = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)\n",
-            "    srv.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)\n",
-            "    srv.bind(('::1', 0))\n",
-            "    port = srv.getsockname()[1]\n",
-            "    srv.listen(1)\n",
-            "    def accept_one():\n",
-            "        conn, _ = srv.accept()\n",
-            "        conn.send(b'HELLO6')\n",
-            "        conn.close()\n",
-            "    t = threading.Thread(target=accept_one, daemon=True)\n",
-            "    t.start()\n",
             "    c = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)\n",
             "    c.settimeout(2)\n",
-            "    c.connect(('::1', port))\n",
+            "    c.connect(('::1', {port}))\n",
             "    data = c.recv(10)\n",
             "    c.close()\n",
-            "    srv.close()\n",
             "    open('{out}', 'w').write('OK:' + data.decode())\n",
             "except Exception as e:\n",
             "    open('{out}', 'w').write('ERR:' + str(e))\n",
         ),
         out = out.display(),
+        port = port,
     );
 
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
+    srv.join().unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     assert!(content.starts_with("OK:HELLO6"), "expected OK:HELLO6, got: {}", content);
@@ -502,7 +509,7 @@ async fn test_http_acl_ipv6_method_filtering() {
 
     // GET should succeed
     let script = http_script(&format!("http://[::1]:{}/anything", port), &out_get);
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
@@ -511,7 +518,7 @@ async fn test_http_acl_ipv6_method_filtering() {
 
     // POST should be denied
     let script = post_script(&format!("http://[::1]:{}/anything", port), &out_post);
-    let result = Sandbox::run_interactive(&policy, &["python3", "-c", &script])
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
