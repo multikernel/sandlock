@@ -202,15 +202,19 @@ typedef struct sandlock_action_out_t {
 void sandlock_action_set_continue(sandlock_action_out_t *out);
 void sandlock_action_set_errno(sandlock_action_out_t *out, int32_t errno_value);
 void sandlock_action_set_return_value(sandlock_action_out_t *out, int64_t value);
+/** Ownership of `srcfd` transfers from the caller to the supervisor
+ *  only when the resulting action is actually dispatched. If the
+ *  caller subsequently calls a different setter on the same
+ *  `sandlock_action_out_t` (overwriting the kind tag before the
+ *  supervisor reads it), `srcfd` is NOT closed and leaks. Pick one
+ *  setter per action. */
 void sandlock_action_set_inject_fd_send(sandlock_action_out_t *out,
                                         int32_t srcfd, uint32_t newfd_flags);
-/** NOTE: PR 1 of this feature accepts the tracker token for ABI
- *  completeness but the tracker callback is not yet wired and will
- *  not fire — the supervisor degrades this to a plain InjectFdSend.
- *  Do not synchronously wait on a tracker callback. */
-void sandlock_action_set_inject_fd_send_tracked(sandlock_action_out_t *out,
-                                                int32_t srcfd, uint32_t newfd_flags,
-                                                sandlock_inject_tracker_t tracker);
+/* NOTE: `SANDLOCK_ACTION_INJECT_FD_SEND_TRACKED` (= 5) and
+ * `sandlock_action_inject_tracked_t` are reserved for a future
+ * tracker-aware inject variant. No setter is exposed in this release;
+ * actions left with that kind tag are treated as `UNSET` and routed
+ * through the handler's exception policy. */
 void sandlock_action_set_hold(sandlock_action_out_t *out);
 /** Kill action setter. `pgid == 0` is a sentinel — the supervisor
  *  substitutes the child process's own pid as a best-effort pgid
@@ -254,6 +258,9 @@ typedef struct sandlock_handler_registration_t {
 
 /** Run the policy with extra C handlers. Returns NULL on failure.
  *
+ * `name` may be NULL to auto-generate as `sandbox-{pid}`, mirroring the
+ * convention used by `sandlock_run`.
+ *
  * Ownership of `registrations[i].handler` is transferred into the call
  * after the function has validated and accepted the registration array.
  * On success (non-NULL return) all handler pointers are owned by the
@@ -268,12 +275,16 @@ typedef struct sandlock_handler_registration_t {
  * per handler) and the alternative risks double-free. */
 sandlock_result_t *sandlock_run_with_handlers(
     const sandlock_sandbox_t *policy,
+    const char *name,
     const char *const *argv, unsigned int argc,
     const sandlock_handler_registration_t *registrations,
     size_t nregistrations);
 
 /** Interactive-stdio variant of `sandlock_run_with_handlers`. Returns
  * NULL on failure.
+ *
+ * `name` may be NULL to auto-generate as `sandbox-{pid}`, mirroring the
+ * convention used by `sandlock_run_interactive`.
  *
  * Ownership of `registrations[i].handler` is transferred into the call
  * after the function has validated and accepted the registration array.
@@ -289,6 +300,7 @@ sandlock_result_t *sandlock_run_with_handlers(
  * per handler) and the alternative risks double-free. */
 sandlock_result_t *sandlock_run_interactive_with_handlers(
     const sandlock_sandbox_t *policy,
+    const char *name,
     const char *const *argv, unsigned int argc,
     const sandlock_handler_registration_t *registrations,
     size_t nregistrations);

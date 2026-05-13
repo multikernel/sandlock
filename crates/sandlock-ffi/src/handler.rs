@@ -5,8 +5,6 @@ use std::slice;
 
 use sandlock_core::seccomp::notif::{read_child_cstr, read_child_mem, write_child_mem};
 
-pub const SANDLOCK_HANDLER_MODULE_BUILT: bool = true;
-
 /// Opaque child-memory accessor handed to a C handler callback.
 ///
 /// Constructed on the stack inside the Rust adapter just before the
@@ -120,7 +118,8 @@ pub unsafe extern "C" fn sandlock_mem_write(
 #[allow(non_camel_case_types)]
 pub enum sandlock_action_kind_t {
     /// No action set yet; the supervisor treats this as "fall through to
-    /// the handler's on_exception policy" (Task 6 wires this up).
+    /// the handler's on_exception policy" (see `exception_action` in
+    /// `FfiHandler`).
     Unset = 0,
     Continue = 1,
     Errno = 2,
@@ -149,10 +148,10 @@ pub struct sandlock_action_inject_t {
     pub newfd_flags: u32,
 }
 
-/// Token used by `InjectFdSendTracked` so the C side can correlate the
-/// callback that fires after `SECCOMP_IOCTL_NOTIF_ADDFD` returns the
-/// child-side fd number. Wired through to a Rust `OnInjectSuccess`
-/// closure built in Task 6.
+/// Token reserved for a future tracker-aware inject variant. Currently
+/// unimplemented — kept as a type alias so the ABI of the
+/// `sandlock_action_inject_tracked_t` payload stays stable across the
+/// future release that wires the tracker callback.
 #[allow(non_camel_case_types)]
 pub type sandlock_inject_tracker_t = u64;
 
@@ -238,6 +237,13 @@ pub unsafe extern "C" fn sandlock_action_set_return_value(
 /// Inject the supervisor-side fd `srcfd` into the traced child as a new
 /// fd (number chosen by the kernel via `SECCOMP_IOCTL_NOTIF_ADDFD`).
 ///
+/// Note: ownership of `srcfd` transfers from the C caller to the
+/// supervisor only when the resulting action is actually dispatched.
+/// If the C caller subsequently calls a different setter on the same
+/// `sandlock_action_out_t` (overwriting the kind tag before the
+/// supervisor reads it), `srcfd` is NOT closed and leaks. Pick one
+/// setter per action.
+///
 /// # Safety
 /// Same constraints as `sandlock_action_set_continue`; `srcfd` must be
 /// a valid open fd in the supervisor process at the moment of the
@@ -251,26 +257,6 @@ pub unsafe extern "C" fn sandlock_action_set_inject_fd_send(
     if out.is_null() { return; }
     (*out).kind = sandlock_action_kind_t::InjectFdSend as u32;
     (*out).payload.inject_send = sandlock_action_inject_t { srcfd, newfd_flags };
-}
-
-/// Tracked variant of `sandlock_action_set_inject_fd_send` — the
-/// supervisor will fire a Rust-side callback identified by `tracker`
-/// once the kernel reports the child-side fd number.
-///
-/// # Safety
-/// Same constraints as `sandlock_action_set_inject_fd_send`.
-#[no_mangle]
-pub unsafe extern "C" fn sandlock_action_set_inject_fd_send_tracked(
-    out: *mut sandlock_action_out_t,
-    srcfd: RawFd,
-    newfd_flags: u32,
-    tracker: sandlock_inject_tracker_t,
-) {
-    if out.is_null() { return; }
-    (*out).kind = sandlock_action_kind_t::InjectFdSendTracked as u32;
-    (*out).payload.inject_send_tracked = sandlock_action_inject_tracked_t {
-        srcfd, newfd_flags, tracker,
-    };
 }
 
 /// Hold the syscall pending until the supervisor explicitly releases it.
@@ -364,15 +350,14 @@ pub struct sandlock_handler_t {
 // (function pointer + `void*` user-data) and a `#[repr(u32)]` enum, all of
 // which are `Send`-safe to move across threads.
 //
-// `Sync`: required so `sandlock_handler_t` can live inside the
-// `Arc<dyn Handler>` storage that the dispatch table uses. This is a
-// stronger claim than `Send` — the supervisor may dispatch concurrent
-// notifications for the same syscall on different worker threads, meaning
-// the same `&sandlock_handler_t` (and the same `ud` pointer) may be read
-// from multiple threads at the same time. The C caller is responsible for
-// ensuring `ud` is either immutable or guarded by thread-safe state of its
-// own (atomics, mutex, etc.) — Rust offers no synchronization for opaque
-// `void*` user-data.
+// `Sync`: required because the supervisor's dispatch table stores
+// handlers as `Arc<dyn Handler>`, and `Arc<T>` requires `T: Send +
+// Sync` even when actual dispatch is serial. In practice the
+// supervisor's seccomp loop drives one notification at a time per
+// handler instance, so the C caller's `ud` is touched from at most
+// one worker thread at any given moment. The C caller is still
+// responsible for ensuring `ud` is at least minimally thread-safe
+// (no aliasing with other threads outside the supervisor loop).
 unsafe impl Send for sandlock_handler_t {}
 unsafe impl Sync for sandlock_handler_t {}
 
@@ -448,7 +433,7 @@ use std::pin::Pin;
 
 /// Rust adapter wrapping an owned `sandlock_handler_t` and implementing
 /// `Handler`. Constructed when the supervisor accepts handlers passed
-/// through `sandlock_run_with_handlers` (Task 7).
+/// through `sandlock_run_with_handlers`.
 pub struct FfiHandler {
     inner: Box<sandlock_handler_t>,
 }
@@ -498,8 +483,9 @@ impl Handler for FfiHandler {
         let notif_fd = cx.notif_fd;
         let notif_id = cx.notif.id;
         let pid = cx.notif.pid;
-        let child_pgid = cx.notif.pid as i32; // best-effort; supervisor
-                                              // wires real pgid in Task 7.
+        let child_pgid = cx.notif.pid as i32; // best-effort placeholder;
+                                              // a future release plumbs
+                                              // the real child pgid in.
         let handler_fn = self.inner.handler_fn;
         let ud = UdPtr(self.inner.ud);
         let on_exception_fallback = self.exception_action(child_pgid);
@@ -581,16 +567,11 @@ fn translate_action(out: sandlock_action_out_t, child_pgid: i32) -> Option<Notif
                 srcfd: std::os::unix::io::OwnedFd::from_raw_fd(out.payload.inject_send.srcfd),
                 newfd_flags: out.payload.inject_send.newfd_flags,
             },
-            K::InjectFdSendTracked => {
-                // Tracker callbacks are not yet wired — PR 1 accepts the
-                // variant for ABI completeness but degrades to plain
-                // InjectFdSend until Task 7 adds the tracker registry.
-                NotifAction::InjectFdSend {
-                    srcfd: std::os::unix::io::OwnedFd::from_raw_fd(
-                        out.payload.inject_send_tracked.srcfd),
-                    newfd_flags: out.payload.inject_send_tracked.newfd_flags,
-                }
-            }
+            // Discriminant reserved for future tracker-injection ABI; no
+            // setter is exposed in this release, so this kind should
+            // never be set legitimately. Treat it as Unset → exception
+            // policy fallback.
+            K::InjectFdSendTracked => return None,
             K::Unset => unreachable!(),
         }
     };
@@ -598,7 +579,7 @@ fn translate_action(out: sandlock_action_out_t, child_pgid: i32) -> Option<Notif
 }
 
 // ----------------------------------------------------------------
-// Run entry points (Task 7)
+// Run entry points
 // ----------------------------------------------------------------
 
 use sandlock_core::{Sandbox, RunResult, SandlockError};
@@ -628,6 +609,13 @@ fn argv_from_c(
     argc: u32,
 ) -> Option<Vec<String>> {
     if argv.is_null() {
+        return None;
+    }
+    // Reject argc == 0 here: an empty argv would have us hand the
+    // sandbox an empty command vector, which the supervisor cannot
+    // execute. Failing fast keeps the error surfacing at the FFI
+    // boundary where the C caller can react.
+    if argc == 0 {
         return None;
     }
     let mut out = Vec::with_capacity(argc as usize);
@@ -679,6 +667,7 @@ fn collect_registrations(
 
 fn block_on_run(
     sandbox: &Sandbox,
+    name: Option<String>,
     cmd: Vec<String>,
     handlers: Vec<(i64, FfiHandler)>,
     interactive: bool,
@@ -693,7 +682,13 @@ fn block_on_run(
         .build()
         .ok()?;
     let cmd_refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
-    let mut sb = sandbox.clone();
+    // Apply `name` via the builder method on a clone — mirrors the
+    // pattern used by `sandlock_run` in lib.rs. A `None` here means
+    // "auto-generate `sandbox-{pid}`", matching the C ABI contract.
+    let mut sb = match name {
+        Some(n) => sandbox.clone().with_name(n),
+        None => sandbox.clone(),
+    };
     Some(rt.block_on(async move {
         if interactive {
             sb.run_interactive_with_extra_handlers(&cmd_refs, handlers).await
@@ -705,6 +700,10 @@ fn block_on_run(
 
 /// Run the policy with extra C handlers. Returns NULL on failure.
 ///
+/// `name` may be NULL to auto-generate `sandbox-{pid}`, or a valid
+/// NUL-terminated UTF-8 C string; the placement mirrors the existing
+/// `sandlock_run` entry point in `lib.rs`.
+///
 /// # Safety
 /// All pointer arguments must be valid for their documented lifetimes:
 /// `policy` must come from `sandlock_sandbox_build`, `argv` must be a
@@ -714,31 +713,36 @@ fn block_on_run(
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_run_with_handlers(
     policy: *const crate::sandlock_sandbox_t,
+    name: *const std::os::raw::c_char,
     argv: *const *const std::os::raw::c_char,
     argc: u32,
     registrations: *const sandlock_handler_registration_t,
     nregistrations: usize,
 ) -> *mut crate::sandlock_result_t {
-    run_with_handlers_inner(policy, argv, argc, registrations, nregistrations, false)
+    run_with_handlers_inner(policy, name, argv, argc, registrations, nregistrations, false)
 }
 
 /// Interactive-stdio variant of `sandlock_run_with_handlers`.
+///
+/// `name` follows the same convention as `sandlock_run_with_handlers`.
 ///
 /// # Safety
 /// Same constraints as `sandlock_run_with_handlers`.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_run_interactive_with_handlers(
     policy: *const crate::sandlock_sandbox_t,
+    name: *const std::os::raw::c_char,
     argv: *const *const std::os::raw::c_char,
     argc: u32,
     registrations: *const sandlock_handler_registration_t,
     nregistrations: usize,
 ) -> *mut crate::sandlock_result_t {
-    run_with_handlers_inner(policy, argv, argc, registrations, nregistrations, true)
+    run_with_handlers_inner(policy, name, argv, argc, registrations, nregistrations, true)
 }
 
 unsafe fn run_with_handlers_inner(
     policy: *const crate::sandlock_sandbox_t,
+    name: *const std::os::raw::c_char,
     argv: *const *const std::os::raw::c_char,
     argc: u32,
     registrations: *const sandlock_handler_registration_t,
@@ -748,6 +752,18 @@ unsafe fn run_with_handlers_inner(
     if policy.is_null() {
         return std::ptr::null_mut();
     }
+    // Decode the optional name eagerly so a malformed (non-UTF-8) C
+    // string fails the call fast, before we take ownership of any
+    // handler containers via `collect_registrations`. Matches the
+    // contract used by `sandlock_run`.
+    let name_opt: Option<String> = if name.is_null() {
+        None
+    } else {
+        match CStr::from_ptr(name).to_str() {
+            Ok(s) => Some(s.to_owned()),
+            Err(_) => return std::ptr::null_mut(),
+        }
+    };
     let cmd = match argv_from_c(argv, argc) {
         Some(v) => v,
         None => return std::ptr::null_mut(),
@@ -757,7 +773,7 @@ unsafe fn run_with_handlers_inner(
         None => return std::ptr::null_mut(),
     };
     let sandbox_ref: &Sandbox = (*policy).inner();
-    match block_on_run(sandbox_ref, cmd, handlers, interactive) {
+    match block_on_run(sandbox_ref, name_opt, cmd, handlers, interactive) {
         Some(Ok(rr)) => {
             let boxed = Box::new(crate::sandlock_result_t::from_run_result(rr));
             Box::into_raw(boxed)

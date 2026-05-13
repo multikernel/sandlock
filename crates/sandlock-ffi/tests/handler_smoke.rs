@@ -1,12 +1,4 @@
-//! Integration smoke test for the FFI handler ABI introduced in PR 1.
-//! Subsequent tasks expand this file as the surface is built up.
-
-#[test]
-fn handler_module_is_exposed() {
-    // This forces the `handler` module to be referenced from the cdylib
-    // public surface. Replaced by real tests in later tasks.
-    let _ = sandlock_ffi::handler::SANDLOCK_HANDLER_MODULE_BUILT;
-}
+//! Integration smoke tests for the FFI handler ABI.
 
 use sandlock_ffi::notif_repr::sandlock_notif_data_t;
 
@@ -50,7 +42,8 @@ use sandlock_ffi::handler::{
 #[test]
 fn mem_accessors_reject_null_arguments() {
     // Verifies the null-pointer guards in each accessor. Happy-path
-    // coverage comes in Task 7 with a live notif_fd.
+    // coverage with a live notif_fd is exercised by the end-to-end
+    // tests further down this file.
     let mut buf = [0u8; 4];
     let mut out_len: usize = 0;
     let p = std::ptr::null();
@@ -332,6 +325,7 @@ fn run_with_handlers_intercepts_getpid() {
     let rr = unsafe {
         sandlock_run_with_handlers(
             policy,
+            std::ptr::null(), // name: auto-generate `sandbox-{pid}`
             argv.as_ptr(),
             argv.len() as u32,
             registrations.as_ptr(),
@@ -361,7 +355,7 @@ fn run_with_handlers_intercepts_getpid() {
 }
 
 // ---------------------------------------------------------------------------
-// Expanded coverage (Task 10)
+// Expanded coverage
 // ---------------------------------------------------------------------------
 //
 // The tests below probe each remaining branch of the handler ABI surface:
@@ -380,9 +374,7 @@ fn run_with_handlers_intercepts_getpid() {
 // handler fns, no helper macros, `assert!(matches!(...))` for action
 // variants.
 
-use sandlock_ffi::handler::{
-    sandlock_action_set_inject_fd_send, sandlock_action_set_inject_fd_send_tracked,
-};
+use sandlock_ffi::handler::sandlock_action_set_inject_fd_send;
 
 // ---- Group A: action setters --------------------------------------------
 
@@ -399,18 +391,6 @@ fn action_inject_fd_send_setter_records_payload() {
 }
 
 #[test]
-fn action_inject_fd_send_tracked_setter_records_payload() {
-    let mut a = sandlock_action_out_t::zeroed();
-    unsafe { sandlock_action_set_inject_fd_send_tracked(&mut a, 17, 0, 0xDEAD_BEEF) };
-    assert_eq!(a.kind, sandlock_action_kind_t::InjectFdSendTracked as u32);
-    // Safety: kind == InjectFdSendTracked selects the `inject_send_tracked`
-    // union arm.
-    assert_eq!(unsafe { a.payload.inject_send_tracked.srcfd }, 17);
-    assert_eq!(unsafe { a.payload.inject_send_tracked.newfd_flags }, 0);
-    assert_eq!(unsafe { a.payload.inject_send_tracked.tracker }, 0xDEAD_BEEF);
-}
-
-#[test]
 fn action_setters_are_null_safe() {
     // Safety: each setter documents null as a no-op; this test is the
     // executable form of that contract. If any setter dereferences null
@@ -422,7 +402,6 @@ fn action_setters_are_null_safe() {
         sandlock_action_set_hold(std::ptr::null_mut());
         sandlock_action_set_kill(std::ptr::null_mut(), libc::SIGKILL, 0);
         sandlock_action_set_inject_fd_send(std::ptr::null_mut(), 0, 0);
-        sandlock_action_set_inject_fd_send_tracked(std::ptr::null_mut(), 0, 0, 0);
     }
 }
 
@@ -718,6 +697,7 @@ fn run_with_handlers_null_policy_returns_null() {
     let rr = unsafe {
         sandlock_run_with_handlers(
             std::ptr::null(),
+            std::ptr::null(), // name: auto-generate `sandbox-{pid}`
             argv.as_ptr(),
             argv.len() as u32,
             std::ptr::null(),
@@ -740,6 +720,7 @@ fn run_with_handlers_null_argv_returns_null() {
     let rr = unsafe {
         sandlock_run_with_handlers(
             policy,
+            std::ptr::null(), // name: auto-generate `sandbox-{pid}`
             std::ptr::null(),
             3, // argc > 0 with null argv must fail validation
             std::ptr::null(),
@@ -747,6 +728,36 @@ fn run_with_handlers_null_argv_returns_null() {
         )
     };
     assert!(rr.is_null(), "expected null result for null argv with argc > 0");
+
+    unsafe { sandlock_sandbox_free(policy); }
+}
+
+#[test]
+fn run_with_handlers_zero_argc_returns_null() {
+    // argc == 0 means "no command to execute" — the sandbox cannot
+    // exec an empty argv, so the FFI must reject it at the boundary
+    // before consuming handler containers.
+    use sandlock_ffi::*;
+    let builder = sandlock_sandbox_builder_new();
+    let policy = {
+        let mut err: i32 = 0;
+        unsafe { sandlock_sandbox_build(builder, &mut err, std::ptr::null_mut()) }
+    };
+    assert!(!policy.is_null(), "policy build failed");
+
+    let arg0 = CString::new("/bin/true").unwrap();
+    let argv = [arg0.as_ptr()];
+    let rr = unsafe {
+        sandlock_run_with_handlers(
+            policy,
+            std::ptr::null(), // name: auto-generate `sandbox-{pid}`
+            argv.as_ptr(),
+            0, // zero argc must reject
+            std::ptr::null(),
+            0,
+        )
+    };
+    assert!(rr.is_null(), "expected null result for argc == 0");
 
     unsafe { sandlock_sandbox_free(policy); }
 }
@@ -766,6 +777,7 @@ fn run_with_handlers_null_registrations_with_nonzero_count_returns_null() {
     let rr = unsafe {
         sandlock_run_with_handlers(
             policy,
+            std::ptr::null(), // name: auto-generate `sandbox-{pid}`
             argv.as_ptr(),
             argv.len() as u32,
             std::ptr::null(), // null registrations with nregistrations > 0
@@ -821,6 +833,7 @@ fn run_with_handlers_empty_registrations_runs_normally() {
     let rr = unsafe {
         sandlock_run_with_handlers(
             policy,
+            std::ptr::null(), // name: auto-generate `sandbox-{pid}`
             argv.as_ptr(),
             argv.len() as u32,
             std::ptr::null(),
@@ -892,6 +905,7 @@ fn run_with_handlers_null_handler_in_array_returns_null() {
     let rr = unsafe {
         sandlock_run_with_handlers(
             policy,
+            std::ptr::null(), // name: auto-generate `sandbox-{pid}`
             argv.as_ptr(),
             argv.len() as u32,
             regs.as_ptr(),
@@ -1012,6 +1026,7 @@ fn run_with_handlers_two_handlers_each_fires_for_own_syscall() {
     let rr = unsafe {
         sandlock_run_with_handlers(
             policy,
+            std::ptr::null(), // name: auto-generate `sandbox-{pid}`
             argv.as_ptr(),
             argv.len() as u32,
             registrations.as_ptr(),
@@ -1148,6 +1163,7 @@ fn mem_read_cstr_reads_path_from_intercepted_openat() {
     let rr = unsafe {
         sandlock_run_with_handlers(
             policy,
+            std::ptr::null(), // name: auto-generate `sandbox-{pid}`
             argv.as_ptr(),
             argv.len() as u32,
             registrations.as_ptr(),

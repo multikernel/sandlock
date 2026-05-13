@@ -73,7 +73,7 @@ int main(void) {
     };
 
     sandlock_result_t *rr = sandlock_run_with_handlers(
-        p, argv, 3, regs, 1);
+        p, NULL /* name: auto-generate sandbox-{pid} */, argv, 3, regs, 1);
     if (rr == NULL) {
         fprintf(stderr, "sandlock: run_with_handlers returned NULL\n");
         /* Per sandlock.h: on NULL return, do NOT free handler `h` —
