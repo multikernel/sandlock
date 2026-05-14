@@ -253,6 +253,24 @@ and `wait()` to manage the process lifecycle.
 
 Raises `RuntimeError` if a process is already running.
 
+Sugar for `create(cmd) + start()`; use those directly when you need the
+fork-park-exec split (e.g. starting several sandboxes in lockstep, or
+attaching external tracing to the parked PID before the child execs).
+
+#### `sandbox.create(cmd) -> None`
+
+Fork the sandboxed child and install policy. The child is parked between
+policy install and `execve`; call `start()` to release it. `pid` is
+available after this call but the child is not yet running user code.
+
+Raises `RuntimeError` if a process is already running.
+
+#### `sandbox.start() -> None`
+
+Release a previously `create()`d child to `execve`.
+
+Raises `RuntimeError` if no child has been created.
+
 #### `sandbox.wait() -> Result`
 
 Wait for the running process to finish and return its `Result`.

@@ -518,11 +518,14 @@ class Sandbox:
             stderr=stderr,
         )
 
-    def spawn(self, cmd: Sequence[str]) -> None:
-        """Spawn ``cmd`` in the sandbox without waiting for it to finish.
+    def create(self, cmd: Sequence[str]) -> None:
+        """Fork the sandboxed child and install policy. The child is
+        parked between policy install and ``execve``; call ``start()``
+        to release it.
 
-        After calling ``spawn()``, use ``pid``, ``pause()``, ``resume()``,
-        ``kill()``, and ``wait()`` to manage the process lifecycle.
+        ``pid`` is available after this call. The child is not running
+        user code yet -- it is blocked inside the sandlock supervisor
+        waiting for ``start()``.
 
         Raises:
             RuntimeError: If a process is already running.
@@ -541,10 +544,35 @@ class Sandbox:
         )
         if not self._handle:
             raise RuntimeError("sandlock_create failed")
+
+    def start(self) -> None:
+        """Release a previously ``create()``d child to ``execve`` the
+        configured command.
+
+        Raises:
+            RuntimeError: If no child has been created.
+        """
+        from ._sdk import _lib
+
+        if self._handle is None:
+            raise RuntimeError("sandbox has not been created")
         if _lib.sandlock_start(self._handle) != 0:
             _lib.sandlock_handle_free(self._handle)
             self._handle = None
             raise RuntimeError("sandlock_start failed")
+
+    def spawn(self, cmd: Sequence[str]) -> None:
+        """Spawn ``cmd`` in the sandbox without waiting for it to finish.
+
+        Sugar for ``create(cmd) + start()``. After calling ``spawn()``,
+        use ``pid``, ``pause()``, ``resume()``, ``kill()``, and ``wait()``
+        to manage the process lifecycle.
+
+        Raises:
+            RuntimeError: If a process is already running.
+        """
+        self.create(cmd)
+        self.start()
 
     def wait(self):
         """Wait for the running process to finish and return its Result.
