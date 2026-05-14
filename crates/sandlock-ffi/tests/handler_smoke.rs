@@ -1858,6 +1858,88 @@ extern "C-unwind" fn a5_panicking_dropper(_ud: *mut std::ffi::c_void) {
     panic!("test panic from dropper");
 }
 
+static C_NEW_1_DROPPER_A: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static C_NEW_1_DROPPER_B: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+extern "C-unwind" fn c_new_1_dropper_a(_ud: *mut std::ffi::c_void) {
+    C_NEW_1_DROPPER_A.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    panic!("c_new_1 dropper_a panic");
+}
+
+extern "C-unwind" fn c_new_1_dropper_b(_ud: *mut std::ffi::c_void) {
+    C_NEW_1_DROPPER_B.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[test]
+fn release_registrations_continues_after_mid_loop_panic() {
+    // Bug C-new-1 regression hook: `release_registrations` used to
+    // drop each container in a bare loop. A mid-loop panic from a
+    // user-supplied `ud_drop` would unwind past the remaining slots,
+    // leaving handler containers leaked (partial-consume — violates
+    // the "array consumed as a whole" C-ABI contract). After the fix,
+    // each drop runs inside `catch_unwind`, the first panic is
+    // captured, the loop completes, and the panic is then re-raised
+    // through the `extern "C-unwind"` entry point.
+    C_NEW_1_DROPPER_A.store(0, std::sync::atomic::Ordering::SeqCst);
+    C_NEW_1_DROPPER_B.store(0, std::sync::atomic::Ordering::SeqCst);
+
+    let h1 = unsafe {
+        sandlock_handler_new(
+            Some(test_handler as sandlock_handler_fn_t),
+            // Non-null ud so the `Drop` impl fires the dropper. The
+            // dropper does not read the pointer.
+            0xDEAD_BEEFusize as *mut std::ffi::c_void,
+            Some(c_new_1_dropper_a),
+            sandlock_exception_policy_t::Kill as u32,
+        )
+    };
+    let h2 = unsafe {
+        sandlock_handler_new(
+            Some(test_handler as sandlock_handler_fn_t),
+            0xCAFE_F00Dusize as *mut std::ffi::c_void,
+            Some(c_new_1_dropper_b),
+            sandlock_exception_policy_t::Kill as u32,
+        )
+    };
+    assert!(!h1.is_null() && !h2.is_null(), "handler_new must succeed");
+    let regs = [
+        sandlock_handler_registration_t { syscall_nr: libc::SYS_getpid, handler: h1 },
+        sandlock_handler_registration_t { syscall_nr: libc::SYS_getppid, handler: h2 },
+    ];
+    // Null policy triggers `release_registrations` on the
+    // early-return path. With the fix, `sandlock_run_with_handlers`
+    // unwinds (extern "C-unwind") because dropper_a panics;
+    // `catch_unwind` here captures it.
+    let result = std::panic::catch_unwind(|| {
+        unsafe {
+            sandlock_run_with_handlers(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                regs.as_ptr(),
+                regs.len(),
+            )
+        }
+    });
+    assert!(
+        result.is_err(),
+        "expected sandlock_run_with_handlers to propagate the captured panic out of release_registrations",
+    );
+    assert_eq!(
+        C_NEW_1_DROPPER_A.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "dropper_a must have fired exactly once",
+    );
+    assert_eq!(
+        C_NEW_1_DROPPER_B.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "dropper_b must have fired despite dropper_a panicking (no partial-consume leak)",
+    );
+}
+
 #[test]
 fn a5_handler_free_unwinds_on_panicking_dropper() {
     // Bug A5 regression hook: `sandlock_handler_free` used to be

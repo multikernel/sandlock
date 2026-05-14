@@ -112,6 +112,16 @@ fn block_on_run(
 /// NUL-terminated UTF-8 C string; the placement mirrors the existing
 /// `sandlock_run` entry point in `lib.rs`.
 ///
+/// Declared `extern "C-unwind"` because the handler containers reach
+/// this entry point as part of the registration array and their
+/// user-supplied `ud_drop` may panic when the supervisor frees them
+/// (either during a normal Box-drop or on the early-return cleanup in
+/// `release_registrations`). Unwinding across an `extern "C"` boundary
+/// is undefined behaviour and aborts the process under modern
+/// rustc — `extern "C-unwind"` is the only legal way to let such a
+/// panic propagate to the caller, who can then decide whether to
+/// catch it.
+///
 /// # Safety
 /// All pointer arguments must be valid for their documented lifetimes:
 /// `policy` must come from `sandlock_sandbox_build`, `argv` must be a
@@ -119,7 +129,7 @@ fn block_on_run(
 /// pointer must come from `sandlock_handler_new` and must not be reused
 /// after this call (ownership transfers in).
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_run_with_handlers(
+pub unsafe extern "C-unwind" fn sandlock_run_with_handlers(
     policy: *const crate::sandlock_sandbox_t,
     name: *const std::os::raw::c_char,
     argv: *const *const std::os::raw::c_char,
@@ -133,11 +143,14 @@ pub unsafe extern "C" fn sandlock_run_with_handlers(
 /// Interactive-stdio variant of `sandlock_run_with_handlers`.
 ///
 /// `name` follows the same convention as `sandlock_run_with_handlers`.
+/// The `extern "C-unwind"` declaration carries the same rationale: a
+/// panicking `ud_drop` must be able to unwind out of this entry point
+/// without process abort.
 ///
 /// # Safety
 /// Same constraints as `sandlock_run_with_handlers`.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_run_interactive_with_handlers(
+pub unsafe extern "C-unwind" fn sandlock_run_interactive_with_handlers(
     policy: *const crate::sandlock_sandbox_t,
     name: *const std::os::raw::c_char,
     argv: *const *const std::os::raw::c_char,
@@ -153,6 +166,15 @@ pub unsafe extern "C" fn sandlock_run_interactive_with_handlers(
 /// `collect_registrations` was not reached — guarantees the C ABI
 /// contract "all handler pointers are consumed by this call".
 ///
+/// Each per-element drop runs an arbitrary, user-supplied `ud_drop`
+/// that may panic. Without protection, a panic mid-loop would unwind
+/// past the remaining handlers — leaving them allocated and violating
+/// the "array consumed as a whole" contract (partial-consume leak).
+/// We wrap each drop in `catch_unwind`, remember the first panic, and
+/// re-raise it after the loop completes via `resume_unwind`. The
+/// caller is `extern "C-unwind"` so the propagated panic is legal at
+/// the FFI boundary, while every handler container is still released.
+///
 /// # Safety
 /// `regs` is either null (no-op) or points to `nregs` valid
 /// `sandlock_handler_registration_t` slots whose `handler` pointer is
@@ -166,11 +188,34 @@ unsafe fn release_registrations(
         return;
     }
     let slice = slice::from_raw_parts(regs, nregs);
+    let mut first_panic: Option<Box<dyn std::any::Any + Send>> = None;
     for r in slice {
         if !r.handler.is_null() {
-            // Reclaim and drop the container so its `ud_drop` runs.
-            drop(Box::from_raw(r.handler));
+            let h = r.handler;
+            // SAFETY: `h` is non-null and came from `sandlock_handler_new`
+            // per the type contract. The closure is `AssertUnwindSafe`
+            // because the only state crossing the unwind boundary is the
+            // raw pointer (consumed by `Box::from_raw`) — no shared
+            // references with broken invariants.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                drop(Box::from_raw(h));
+            }));
+            if let Err(payload) = result {
+                if first_panic.is_none() {
+                    first_panic = Some(payload);
+                }
+                // Subsequent panics are dropped: they would compose
+                // into "panic during panic" → abort. Keeping only the
+                // first preserves the original failure context for the
+                // outer caller while still finishing the loop.
+            }
         }
+    }
+    if let Some(payload) = first_panic {
+        // Re-raise the first captured panic. The outer entry point is
+        // `extern "C-unwind"` so this propagates legally to the C
+        // caller, who can decide whether to catch it.
+        std::panic::resume_unwind(payload);
     }
 }
 
