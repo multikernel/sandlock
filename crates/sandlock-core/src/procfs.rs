@@ -605,9 +605,10 @@ pub(crate) fn handle_hostname_open(
 
 /// Intercept `openat("/etc/hosts")` and return a memfd with virtual content.
 ///
-/// When `net_allow_hosts` is set, the supervisor pre-resolves allowed domains
-/// and builds a synthetic `/etc/hosts`.  This lets sandboxed processes resolve
-/// hostnames via glibc's `files` NSS backend without contacting a DNS server.
+/// When `net_allow` contains concrete hostnames, the supervisor pre-resolves
+/// them and builds a synthetic `/etc/hosts`.  This lets sandboxed processes
+/// resolve allowed hostnames via glibc's `files` NSS backend without contacting
+/// a DNS server.
 pub(crate) fn handle_etc_hosts_open(
     notif: &SeccompNotif,
     etc_hosts_content: &str,

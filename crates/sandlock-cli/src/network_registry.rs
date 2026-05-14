@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 pub struct NetworkEntry {
     pub pid: i32,
     pub ports: HashMap<u16, u16>,
-    /// Allowed hostnames (from `net_allow_hosts`).
+    /// Allowed hostnames (resolved from concrete-host entries in `net_allow`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_hosts: Vec<String>,
     /// Virtual `/etc/hosts` content injected into the sandbox.

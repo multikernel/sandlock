@@ -487,7 +487,7 @@ pub(crate) fn build_dispatch_table(
     }
 
     // ------------------------------------------------------------------
-    // /etc/hosts virtualization (for net_allow_hosts)
+    // /etc/hosts virtualization (for concrete-host entries in net_allow)
     // ------------------------------------------------------------------
     if let Some(ref etc_hosts) = policy.virtual_etc_hosts {
         let etc_hosts_for_open = etc_hosts.clone();
