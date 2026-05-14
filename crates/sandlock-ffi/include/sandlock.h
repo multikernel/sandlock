@@ -228,11 +228,29 @@ typedef enum sandlock_exception_policy {
     SANDLOCK_EXCEPTION_CONTINUE   = 2,
 } sandlock_exception_policy_t;
 
+/** Opaque handler container.
+ *
+ * Ownership: allocated by `sandlock_handler_new` and freed by either
+ * `sandlock_handler_free` (if never registered) or by the supervisor
+ * after a successful or failed `sandlock_run_with_handlers` call.
+ *
+ * Thread safety: the supervisor MAY invoke the handler callback from
+ * multiple worker threads concurrently across different notifications
+ * (today's dispatch loop is largely serial; the public ABI makes no
+ * concurrency guarantee, so a future dispatcher could parallelise
+ * without breaking compatibility). The caller MUST ensure their `ud`
+ * pointer is thread-safe — either immutable, or guarded by their own
+ * synchronization primitives (atomics, mutex, etc.). Rust provides no
+ * synchronization for an opaque `void*`. */
 typedef struct sandlock_handler_t sandlock_handler_t;
 
 /** C handler signature. Return 0 on success; a non-zero return triggers
  *  the handler's exception policy. The callee MUST call exactly one
- *  sandlock_action_set_*() on `out` before returning 0. */
+ *  sandlock_action_set_*() on `out` before returning 0.
+ *
+ *  Thread safety: see `sandlock_handler_t` — this function may be
+ *  invoked concurrently from multiple worker threads. Any state
+ *  reachable through `ud` must be thread-safe. */
 typedef int (*sandlock_handler_fn_t)(void *ud,
                                      const sandlock_notif_data_t *notif,
                                      sandlock_mem_handle_t *mem,
@@ -242,7 +260,11 @@ typedef void (*sandlock_handler_ud_drop_t)(void *ud);
 
 /** Allocate a handler container. Returns NULL when `handler_fn` is NULL
  *  or when `on_exception` is not one of the documented `SANDLOCK_EXCEPTION_*`
- *  values. */
+ *  values.
+ *
+ *  `ud` must be thread-safe to access — see `sandlock_handler_t` for
+ *  the concurrency contract. `ud_drop`, if non-NULL, is invoked exactly
+ *  once when the container is freed. */
 sandlock_handler_t *sandlock_handler_new(sandlock_handler_fn_t handler_fn,
                                          void *ud,
                                          sandlock_handler_ud_drop_t ud_drop,

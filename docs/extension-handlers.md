@@ -380,15 +380,18 @@ The contract is exercised at two layers:
 
 ### Continue-site safety
 
-The supervisor processes notifications sequentially in a single tokio task, so the response sent
-for one notification gates the kernel resumption of the trapped syscall.  Sandlock-internal
-locks (`tokio::sync::Mutex`/`RwLock`) live on the supervisor; user handlers do not have access
-to them through `HandlerCtx`, so the contract here is local to handler-owned state on `&self`:
-a `tokio::sync::Mutex<T>` or `RwLock<T>` field on your handler must not be held across an
-`.await` point.  If the guard is alive when control returns to the supervisor loop, the next
-notification that needs the same lock parks, the response for the current notification is not
-sent, and the child stays trapped in the syscall.  Acquire, mutate, drop — `await` only after
-the guard is out of scope.
+Today's supervisor processes notifications sequentially in a single tokio task, so the response
+sent for one notification gates the kernel resumption of the trapped syscall. Treat this as an
+implementation detail, not a contract — the public API makes no promise that a future
+dispatcher will not parallelise. The `Handler` trait already requires `Send + Sync`, and the C
+ABI requires `ud` to be thread-safe (see [C ABI → Thread safety](#thread-safety)) for exactly
+this reason. Sandlock-internal locks (`tokio::sync::Mutex`/`RwLock`) live on the supervisor;
+user handlers do not have access to them through `HandlerCtx`, so the contract here is local to
+handler-owned state on `&self`: a `tokio::sync::Mutex<T>` or `RwLock<T>` field on your handler
+must not be held across an `.await` point. If the guard is alive when control returns to the
+supervisor loop, the next notification that needs the same lock parks, the response for the
+current notification is not sent, and the child stays trapped in the syscall. Acquire, mutate,
+drop — `await` only after the guard is out of scope.
 
 See [issue #27][i27] for the underlying supervisor-loop contract that this convention extends to
 user handlers.
@@ -633,6 +636,17 @@ A C handler must:
    applies the configured exception policy. Pure-C callers cannot
    panic (C has no unwinding); this clause is for Rust handlers
    plugged into the C ABI surface.
+
+### Thread safety
+
+The supervisor MAY invoke a C handler callback from multiple worker
+threads concurrently across different notifications. Today's dispatch
+loop is largely serial, but the public C ABI makes no concurrency
+guarantee — a future dispatcher could parallelise without an ABI
+break. Consequently the caller MUST ensure their `ud` pointer is
+thread-safe: either immutable, or guarded by their own synchronization
+primitives (atomics, mutex, etc.). Rust offers no synchronization for
+an opaque `void*`; the responsibility is on the C side.
 
 ### Minimal example
 

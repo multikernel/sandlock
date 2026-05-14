@@ -347,19 +347,21 @@ pub struct sandlock_handler_t {
 
 // Safety:
 //
-// `Send`: required so the supervisor can move the handler container into a
-// `tokio::task::spawn_blocking` closure. The struct contains only pointers
-// (function pointer + `void*` user-data) and a `#[repr(u32)]` enum, all of
-// which are `Send`-safe to move across threads.
+// `Send`: required so the supervisor can move the handler container into
+// a `tokio::task::spawn_blocking` closure. The struct contains only
+// pointers (function pointer + `void*` user-data) and a `#[repr(u32)]`
+// enum, all of which are `Send`-safe to move across threads.
 //
-// `Sync`: required because the supervisor's dispatch table stores
-// handlers as `Arc<dyn Handler>`, and `Arc<T>` requires `T: Send +
-// Sync` even when actual dispatch is serial. In practice the
-// supervisor's seccomp loop drives one notification at a time per
-// handler instance, so the C caller's `ud` is touched from at most
-// one worker thread at any given moment. The C caller is still
-// responsible for ensuring `ud` is at least minimally thread-safe
-// (no aliasing with other threads outside the supervisor loop).
+// `Sync`: required because the dispatch table stores handlers as
+// `Arc<dyn Handler>`, and `Arc<T>` requires `T: Send + Sync`. The
+// supervisor MAY dispatch handler invocations concurrently across
+// different notifications (today's loop is largely serial, but the
+// contract makes no guarantee — a future dispatcher could parallelise
+// without breaking the public ABI). Consequently the C caller MUST
+// ensure their `ud` is either immutable, or guarded by thread-safe
+// state of their own (atomics, mutex, etc.). Rust offers no
+// synchronization for an opaque `void*` — the responsibility is on
+// the C side.
 unsafe impl Send for sandlock_handler_t {}
 unsafe impl Sync for sandlock_handler_t {}
 
