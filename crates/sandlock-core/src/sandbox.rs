@@ -538,6 +538,7 @@ struct Runtime {
     #[allow(clippy::type_complexity)]
     on_bind: Option<Box<dyn Fn(&HashMap<u16, u16>) + Send + Sync>>,
     extra_handlers: Vec<(i64, Arc<dyn crate::seccomp::dispatch::Handler>)>,
+    ready_w: Option<std::os::fd::OwnedFd>,
 }
 
 /// Lifecycle state for the runtime.
@@ -949,22 +950,31 @@ impl Sandbox {
         Ok(RunResult { exit_status, stdout, stderr })
     }
 
-    /// Spawn a sandboxed process without waiting for it to exit.
-    /// Use `wait()` to collect the exit status when done.
-    #[doc(hidden)]
-    pub async fn spawn(&mut self, cmd: &[&str]) -> Result<(), crate::error::SandlockError> {
-        self.do_spawn(cmd, false).await
+    /// Fork the sandboxed child and install policy (seccomp + notif
+    /// supervisor + rlimits + landlock + COW + network/HTTP proxies).
+    /// The child is parked between policy install and `execve`; call
+    /// `start()` to release it. Stdout/stderr are captured for later
+    /// retrieval via `wait()`.
+    pub async fn create(&mut self, cmd: &[&str]) -> Result<(), crate::error::SandlockError> {
+        self.do_create(cmd, true).await
     }
 
-    /// Like `spawn` but captures stdout and stderr (available via `wait()`).
-    #[doc(hidden)]
-    pub async fn spawn_captured(&mut self, cmd: &[&str]) -> Result<(), crate::error::SandlockError> {
-        self.do_spawn(cmd, true).await
+    /// Like `create` but inherits stdio (no capture).
+    pub async fn create_interactive(&mut self, cmd: &[&str]) -> Result<(), crate::error::SandlockError> {
+        self.do_create(cmd, false).await
     }
 
-    /// Spawn with explicit stdin/stdout/stderr fd redirection.
+    /// Release a previously `create()`d child to `execve` the configured
+    /// command. Returns immediately; use `wait()` to collect the exit
+    /// status when the child finishes.
+    pub fn start(&mut self) -> Result<(), crate::error::SandlockError> {
+        self.do_start()
+    }
+
+    /// Create with explicit stdin/stdout/stderr fd redirection. Child is
+    /// parked after policy install; call `start()` to release.
     #[doc(hidden)]
-    pub async fn spawn_with_io(
+    pub async fn create_with_io(
         &mut self,
         cmd: &[&str],
         stdin_fd: Option<std::os::unix::io::RawFd>,
@@ -973,12 +983,12 @@ impl Sandbox {
     ) -> Result<(), crate::error::SandlockError> {
         self.ensure_runtime()?;
         self.rt_mut().io_overrides = Some((stdin_fd, stdout_fd, stderr_fd));
-        self.do_spawn(cmd, false).await
+        self.do_create(cmd, false).await
     }
 
-    /// Like `spawn_with_io` but also maps extra fds into the child.
+    /// Like `create_with_io` but also maps extra fds into the child.
     #[doc(hidden)]
-    pub async fn spawn_with_gather_io(
+    pub async fn create_with_gather_io(
         &mut self,
         cmd: &[&str],
         stdin_fd: Option<std::os::unix::io::RawFd>,
@@ -989,7 +999,7 @@ impl Sandbox {
         self.ensure_runtime()?;
         self.rt_mut().io_overrides = Some((stdin_fd, stdout_fd, stderr_fd));
         self.rt_mut().extra_fds = extra_fds;
-        self.do_spawn(cmd, false).await
+        self.do_create(cmd, false).await
     }
 
     /// Commit COW writes to the original directory.
@@ -1073,7 +1083,8 @@ impl Sandbox {
         &mut self,
         cmd: &[&str],
     ) -> Result<crate::result::RunResult, crate::error::SandlockError> {
-        self.do_spawn(cmd, true).await?;
+        self.do_create(cmd, true).await?;
+        self.do_start()?;
         self.wait().await
     }
 
@@ -1082,7 +1093,8 @@ impl Sandbox {
         &mut self,
         cmd: &[&str],
     ) -> Result<crate::result::RunResult, crate::error::SandlockError> {
-        self.do_spawn(cmd, false).await?;
+        self.do_create(cmd, false).await?;
+        self.do_start()?;
         self.wait().await
     }
 
@@ -1100,7 +1112,8 @@ impl Sandbox {
         let pending = sandbox_collect_extra_handlers(extra_handlers, self)?;
         self.ensure_runtime()?;
         self.rt_mut().extra_handlers = pending;
-        self.do_spawn(cmd, true).await?;
+        self.do_create(cmd, true).await?;
+        self.do_start()?;
         self.wait().await
     }
 
@@ -1118,18 +1131,20 @@ impl Sandbox {
         let pending = sandbox_collect_extra_handlers(extra_handlers, self)?;
         self.ensure_runtime()?;
         self.rt_mut().extra_handlers = pending;
-        self.do_spawn(cmd, false).await?;
+        self.do_create(cmd, false).await?;
+        self.do_start()?;
         self.wait().await
     }
 
-    /// Dry-run: spawn, wait, collect filesystem changes, then abort.
+    /// Dry-run: create, start, wait, collect filesystem changes, then abort.
     pub async fn dry_run(
         &mut self,
         cmd: &[&str],
     ) -> Result<crate::dry_run::DryRunResult, crate::error::SandlockError> {
         self.on_exit = BranchAction::Keep;
         self.on_error = BranchAction::Keep;
-        self.do_spawn(cmd, true).await?;
+        self.do_create(cmd, true).await?;
+        self.do_start()?;
         let run_result = self.wait().await?;
         let changes = self.collect_changes().await;
         self.do_abort().await;
@@ -1143,7 +1158,8 @@ impl Sandbox {
     ) -> Result<crate::dry_run::DryRunResult, crate::error::SandlockError> {
         self.on_exit = BranchAction::Keep;
         self.on_error = BranchAction::Keep;
-        self.do_spawn(cmd, false).await?;
+        self.do_create(cmd, false).await?;
+        self.do_start()?;
         let run_result = self.wait().await?;
         let changes = self.collect_changes().await;
         self.do_abort().await;
@@ -1288,6 +1304,7 @@ impl Sandbox {
                 http_acl_handle: None,
                 on_bind: None,
                 extra_handlers: Vec::new(),
+                ready_w: None,
             }));
             clones.push(clone_sb);
         }
@@ -1332,7 +1349,8 @@ impl Sandbox {
         let mut reducer = self.clone().with_name(reducer_name);
         reducer.ensure_runtime()?;
         reducer.rt_mut().io_overrides = Some((Some(stdin_fds[0]), None, None));
-        reducer.do_spawn(cmd, true).await?;
+        reducer.do_create(cmd, true).await?;
+        reducer.do_start()?;
         unsafe { libc::close(stdin_fds[0]) };
 
         let _ = write_handle.await;
@@ -1371,6 +1389,7 @@ impl Sandbox {
             http_acl_handle: None,
             on_bind: None,
             extra_handlers: Vec::new(),
+            ready_w: None,
         }));
         Ok(())
     }
@@ -1403,14 +1422,15 @@ impl Sandbox {
     }
 
     // ================================================================
-    // Internal: do_spawn (the main fork/confinement entry point)
+    // Internal: do_create (fork + policy install; child parks at the
+    // ready_r read, awaiting do_start to release it to execve).
     // ================================================================
 
-    async fn do_spawn(&mut self, cmd: &[&str], capture: bool) -> Result<(), crate::error::SandlockError> {
+    async fn do_create(&mut self, cmd: &[&str], capture: bool) -> Result<(), crate::error::SandlockError> {
         use std::ffi::CString;
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use crate::error::SandboxRuntimeError;
-        use crate::context::{PipePair, read_u32_fd, write_u32_fd};
+        use crate::context::{PipePair, read_u32_fd};
         use crate::cow::{CowBranch, overlayfs::OverlayBranch, branchfs::BranchFsBranch};
         use crate::network;
         use crate::seccomp::ctx::SupervisorCtx;
@@ -1563,7 +1583,8 @@ impl Sandbox {
         self.rt_mut()._stderr_read = stderr_r.map(|(r, _w)| r);
 
         self.rt_mut().child_pid = Some(pid);
-        self.rt_mut().state = RuntimeState::Running;
+        // State remains `Created` until `do_start` writes ready_w to release
+        // the child to execve.
 
         let pidfd = match syscall::pidfd_open(pid as u32, 0) {
             Ok(fd) => Some(fd),
@@ -1788,11 +1809,30 @@ impl Sandbox {
             }
         }
 
-        write_u32_fd(pipes.ready_w.as_raw_fd(), 1)
-            .map_err(|e| SandboxRuntimeError::Child(format!("write ready signal: {}", e)))?;
-
         self.rt_mut().pidfd = pidfd;
+        self.rt_mut().ready_w = Some(pipes.ready_w);
 
+        Ok(())
+    }
+
+    // ================================================================
+    // Internal: do_start (release the parked child to execve)
+    // ================================================================
+
+    fn do_start(&mut self) -> Result<(), crate::error::SandlockError> {
+        use std::os::fd::AsRawFd;
+        use crate::context::write_u32_fd;
+        use crate::error::SandboxRuntimeError;
+
+        if !matches!(self.rt().state, RuntimeState::Created) {
+            return Err(SandboxRuntimeError::Child("start() requires a created sandbox".into()).into());
+        }
+        let ready_w = self.rt_mut().ready_w.take()
+            .ok_or_else(|| SandboxRuntimeError::Child("start() called without a prior create()".into()))?;
+        write_u32_fd(ready_w.as_raw_fd(), 1)
+            .map_err(|e| SandboxRuntimeError::Child(format!("write ready signal: {}", e)))?;
+        drop(ready_w);
+        self.rt_mut().state = RuntimeState::Running;
         Ok(())
     }
 }
@@ -1805,7 +1845,7 @@ impl Drop for Sandbox {
     fn drop(&mut self) {
         if let Some(ref mut rt) = self.runtime {
             if let Some(pid) = rt.child_pid {
-                if matches!(rt.state, RuntimeState::Running | RuntimeState::Paused) {
+                if matches!(rt.state, RuntimeState::Created | RuntimeState::Running | RuntimeState::Paused) {
                     unsafe { libc::killpg(pid, libc::SIGKILL) };
                     let mut status: i32 = 0;
                     unsafe { libc::waitpid(pid, &mut status, 0) };

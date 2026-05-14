@@ -484,12 +484,16 @@ class Sandbox:
         argv, argc = _make_argv(list(cmd))
         resolved_name = self._resolve_name()
 
-        # Spawn (non-blocking) so PID is available for pause/resume
-        self._handle = _lib.sandlock_spawn(
+        # Create (parked) so PID is available for pause/resume, then start.
+        self._handle = _lib.sandlock_create(
             native.ptr, _encode(resolved_name), argv, argc,
         )
         if not self._handle:
-            return Result(success=False, exit_code=-1, error="sandlock_spawn failed")
+            return Result(success=False, exit_code=-1, error="sandlock_create failed")
+        if _lib.sandlock_start(self._handle) != 0:
+            _lib.sandlock_handle_free(self._handle)
+            self._handle = None
+            return Result(success=False, exit_code=-1, error="sandlock_start failed")
 
         try:
             timeout_ms = int(timeout * 1000) if timeout else 0
@@ -532,11 +536,15 @@ class Sandbox:
         argv, argc = _make_argv(list(cmd))
         resolved_name = self._resolve_name()
 
-        self._handle = _lib.sandlock_spawn(
+        self._handle = _lib.sandlock_create(
             native.ptr, _encode(resolved_name), argv, argc,
         )
         if not self._handle:
-            raise RuntimeError("sandlock_spawn failed")
+            raise RuntimeError("sandlock_create failed")
+        if _lib.sandlock_start(self._handle) != 0:
+            _lib.sandlock_handle_free(self._handle)
+            self._handle = None
+            raise RuntimeError("sandlock_start failed")
 
     def wait(self):
         """Wait for the running process to finish and return its Result.
