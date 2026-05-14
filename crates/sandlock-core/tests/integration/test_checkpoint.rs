@@ -12,7 +12,8 @@ async fn test_checkpoint_save_load() {
     let mut sb = policy.clone().with_name("test");
     // We need to spawn something that stays alive long enough to checkpoint
     // Use "sleep 60" — we'll kill it after checkpoint
-    sb.spawn(&["sleep", "60"]).await.unwrap();
+    sb.create_interactive(&["sleep", "60"]).await.unwrap();
+    sb.start().unwrap();
 
     // Give it a moment to start
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -58,7 +59,8 @@ async fn test_checkpoint_memory_maps() {
         .build().unwrap();
 
     let mut sb = policy.clone().with_name("test");
-    sb.spawn(&["sleep", "60"]).await.unwrap();
+    sb.create_interactive(&["sleep", "60"]).await.unwrap();
+    sb.start().unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     let cp = sb.checkpoint().await.unwrap();
@@ -85,7 +87,8 @@ async fn test_checkpoint_app_state_roundtrip() {
         .build().unwrap();
 
     let mut sb = policy.clone().with_name("test");
-    sb.spawn(&["sleep", "60"]).await.unwrap();
+    sb.create_interactive(&["sleep", "60"]).await.unwrap();
+    sb.start().unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     let mut cp = sb.checkpoint().await.unwrap();
@@ -118,7 +121,8 @@ async fn test_checkpoint_no_app_state_file() {
         .build().unwrap();
 
     let mut sb = policy.clone().with_name("test");
-    sb.spawn(&["sleep", "60"]).await.unwrap();
+    sb.create_interactive(&["sleep", "60"]).await.unwrap();
+    sb.start().unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     let cp = sb.checkpoint().await.unwrap();
@@ -145,7 +149,8 @@ async fn test_checkpoint_process_info() {
         .build().unwrap();
 
     let mut sb = policy.clone().with_name("test");
-    sb.spawn(&["sleep", "60"]).await.unwrap();
+    sb.create_interactive(&["sleep", "60"]).await.unwrap();
+    sb.start().unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     let expected_pid = sb.pid().unwrap();

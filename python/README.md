@@ -70,7 +70,7 @@ sandlock.Sandbox(**kwargs)
 
 Sandbox configuration and runtime handle. Holds both the policy (filesystem,
 network, resource limits, etc.) and runtime state. Construct once, then call
-`run()`, `start()` + lifecycle methods, or use as a context manager.
+`run()` (blocking) or `spawn()` + lifecycle methods, or use as a context manager.
 
 All config fields are optional. Unset fields mean "no restriction" unless
 noted otherwise. Runtime kwargs (`name`, `policy_fn`, `init_fn`, `work_fn`)
@@ -246,12 +246,30 @@ Run a command, capturing stdout and stderr.
 result = sandbox.run(["python3", "-c", "print(42)"], timeout=10.0)
 ```
 
-#### `sandbox.start(cmd) -> None`
+#### `sandbox.spawn(cmd) -> None`
 
 Spawn `cmd` without waiting. Use `pid`, `pause()`, `resume()`, `kill()`,
 and `wait()` to manage the process lifecycle.
 
 Raises `RuntimeError` if a process is already running.
+
+Sugar for `create(cmd) + start()`; use those directly when you need the
+fork-park-exec split (e.g. starting several sandboxes in lockstep, or
+attaching external tracing to the parked PID before the child execs).
+
+#### `sandbox.create(cmd) -> None`
+
+Fork the sandboxed child and install policy. The child is parked between
+policy install and `execve`; call `start()` to release it. `pid` is
+available after this call but the child is not yet running user code.
+
+Raises `RuntimeError` if a process is already running.
+
+#### `sandbox.start() -> None`
+
+Release a previously `create()`d child to `execve`.
+
+Raises `RuntimeError` if no child has been created.
 
 #### `sandbox.wait() -> Result`
 

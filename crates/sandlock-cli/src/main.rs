@@ -579,7 +579,8 @@ async fn run_command(args: RunArgs) -> Result<()> {
             let _ = network_registry::update_ports(&reg_name, ports.clone());
         });
 
-        policy.spawn(&cmd_strs).await?;
+        policy.create_interactive(&cmd_strs).await?;
+        policy.start()?;
 
         let pid = policy.pid().unwrap_or(0);
         let registered_hosts: Vec<String> = policy

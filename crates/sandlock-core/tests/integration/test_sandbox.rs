@@ -152,7 +152,8 @@ async fn test_nested_sandbox() {
 
     // Spawn outer, then nest inner inside it
     let mut outer_sb = outer.clone().with_name("test");
-    outer_sb.spawn(&["sleep", "10"]).await.unwrap();
+    outer_sb.create_interactive(&["sleep", "10"]).await.unwrap();
+    outer_sb.start().unwrap();
 
     // The inner sandbox runs in the same parent process context —
     // Landlock from the outer is NOT applied to the parent, only to

@@ -685,10 +685,10 @@ pub unsafe extern "C" fn sandlock_run(
 }
 
 // ----------------------------------------------------------------
-// Sandbox handle (spawn / wait — for pause/resume via PID)
+// Sandbox handle (create / start / wait — for pause/resume via PID)
 // ----------------------------------------------------------------
 
-/// Opaque handle for a live (spawned) sandbox.
+/// Opaque handle for a live sandbox.
 /// Owns both the Sandbox and the tokio Runtime that drives its supervisor.
 #[allow(non_camel_case_types)]
 pub struct sandlock_handle_t {
@@ -696,16 +696,16 @@ pub struct sandlock_handle_t {
     runtime: tokio::runtime::Runtime,
 }
 
-/// Spawn a sandboxed process without waiting. Returns a live handle.
-/// Use `sandlock_handle_pid` to get the PID, then `sandlock_handle_wait`
-/// to collect the result when done.
+/// Fork the child and install policy; the child is parked between policy
+/// install and execve. Returns a live handle. Call `sandlock_start` to
+/// release the child to execve.
 ///
 /// # Safety
 /// `policy` must be a valid policy pointer. `name` may be NULL to
 /// auto-generate a sandbox name, or a valid NUL-terminated string.
 /// `argv` must point to `argc` C strings.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_spawn(
+pub unsafe extern "C" fn sandlock_create(
     policy: *const sandlock_sandbox_t,
     name: *const c_char,
     argv: *const *const c_char,
@@ -730,17 +730,30 @@ pub unsafe extern "C" fn sandlock_spawn(
         None => policy.clone(),
     };
 
-    if rt.block_on(sb.spawn_captured(&arg_refs)).is_err() {
+    if rt.block_on(sb.create(&arg_refs)).is_err() {
         return ptr::null_mut();
     }
 
     Box::into_raw(Box::new(sandlock_handle_t { sandbox: sb, runtime: rt }))
 }
 
+/// Release a previously `sandlock_create`d child to execve. Returns 0 on
+/// success, -1 on error.
+///
+/// # Safety
+/// `h` must be a valid handle from `sandlock_create`.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_start(h: *mut sandlock_handle_t) -> c_int {
+    if h.is_null() { return -1; }
+    let h = &mut *h;
+    if h.sandbox.start().is_err() { return -1; }
+    0
+}
+
 /// Get the child PID. Returns 0 if not available.
 ///
 /// # Safety
-/// `h` must be a valid handle from `sandlock_spawn`.
+/// `h` must be a valid handle from `sandlock_create`.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_handle_pid(h: *const sandlock_handle_t) -> i32 {
     if h.is_null() { return 0; }
@@ -750,7 +763,7 @@ pub unsafe extern "C" fn sandlock_handle_pid(h: *const sandlock_handle_t) -> i32
 /// Wait for the sandbox to exit. Returns a result handle with stdout/stderr.
 ///
 /// # Safety
-/// `h` must be a valid handle from `sandlock_spawn`.
+/// `h` must be a valid handle from `sandlock_create`.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_handle_wait(h: *mut sandlock_handle_t) -> *mut sandlock_result_t {
     if h.is_null() { return ptr::null_mut(); }
@@ -766,7 +779,7 @@ pub unsafe extern "C" fn sandlock_handle_wait(h: *mut sandlock_handle_t) -> *mut
 /// killed and a result with `ExitStatus::Timeout` is returned.
 ///
 /// # Safety
-/// `h` must be a valid handle from `sandlock_spawn`.
+/// `h` must be a valid handle from `sandlock_create`.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_handle_wait_timeout(
     h: *mut sandlock_handle_t,
@@ -803,7 +816,7 @@ pub unsafe extern "C" fn sandlock_handle_wait_timeout(
 /// Returns null if port_remap is not active or no ports are mapped.
 ///
 /// # Safety
-/// `h` must be a valid handle from `sandlock_spawn`.
+/// `h` must be a valid handle from `sandlock_create`.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_handle_port_mappings(
     h: *const sandlock_handle_t,
@@ -822,7 +835,7 @@ pub unsafe extern "C" fn sandlock_handle_port_mappings(
 /// Free a sandbox handle. Kills the process if still running.
 ///
 /// # Safety
-/// `h` must be null or a valid handle from `sandlock_spawn`.
+/// `h` must be null or a valid handle from `sandlock_create`.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_handle_free(h: *mut sandlock_handle_t) {
     if !h.is_null() {
@@ -1708,7 +1721,7 @@ pub struct sandlock_checkpoint_t {
 /// then thawed. Returns NULL on error.
 ///
 /// # Safety
-/// `h` must be a valid handle from `sandlock_spawn`.
+/// `h` must be a valid handle from `sandlock_create`.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_handle_checkpoint(
     h: *mut sandlock_handle_t,

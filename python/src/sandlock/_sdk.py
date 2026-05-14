@@ -226,11 +226,14 @@ _lib.sandlock_run.argtypes = [_c_policy_p, ctypes.c_char_p, ctypes.POINTER(ctype
 _lib.sandlock_run_interactive.restype = ctypes.c_int
 _lib.sandlock_run_interactive.argtypes = [_c_policy_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
 
-# Spawn handle
+# Sandbox handle (create / start / wait)
 _c_handle_p = ctypes.c_void_p
 
-_lib.sandlock_spawn.restype = _c_handle_p
-_lib.sandlock_spawn.argtypes = [_c_policy_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
+_lib.sandlock_create.restype = _c_handle_p
+_lib.sandlock_create.argtypes = [_c_policy_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
+
+_lib.sandlock_start.restype = ctypes.c_int
+_lib.sandlock_start.argtypes = [_c_handle_p]
 
 _lib.sandlock_handle_pid.restype = ctypes.c_int
 _lib.sandlock_handle_pid.argtypes = [_c_handle_p]
@@ -525,7 +528,7 @@ class Checkpoint:
     Usage::
 
         sb = Sandbox(fs_readable=["/usr", "/lib"])
-        sb.start(["sleep", "60"])
+        sb.spawn(["sleep", "60"])
         cp = sb.checkpoint()
         cp.save("my-checkpoint")
 
