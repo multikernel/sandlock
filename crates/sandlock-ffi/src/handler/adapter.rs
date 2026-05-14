@@ -16,6 +16,23 @@ use super::abi::{
     sandlock_handler_t, sandlock_mem_handle_t,
 };
 
+/// Sentinel for "we cannot safely resolve a process-group id for the
+/// trapped child." `i32::MIN` is not a valid pgid: `killpg(i32::MIN, _)`
+/// returns `ESRCH` rather than harming the supervisor or any real
+/// process group. Used in two places:
+///
+///   * adapter.rs `child_pgid` resolution falls back to this when the
+///     bare pid would otherwise be `0` (POSIX `killpg(0)` would target
+///     the supervisor's own group) or whenever `getpgid(pid)` failed or
+///     produced the supervisor's pgid.
+///   * `translate_action`'s `Kill` arm refuses to produce an action
+///     with this pgid, routing the dispatcher onto the configured
+///     exception policy instead.
+///   * `exception_action`'s `Kill` arm degrades to `Errno(EPERM)` if
+///     it sees the sentinel, so the policy default never lets the
+///     suicide vector through either.
+pub(crate) const UNSAFE_PGID: i32 = i32::MIN;
+
 /// Rust adapter wrapping an owned `sandlock_handler_t` and implementing
 /// `Handler`. Constructed when the supervisor accepts handlers passed
 /// through `sandlock_run_with_handlers`.
@@ -39,7 +56,18 @@ impl FfiHandler {
     fn exception_action(&self, child_pgid: i32) -> NotifAction {
         match self.inner.on_exception {
             sandlock_exception_policy_t::Kill => {
-                NotifAction::Kill { sig: libc::SIGKILL, pgid: child_pgid }
+                if child_pgid == UNSAFE_PGID {
+                    // No safe pgid is available (nested PID namespace,
+                    // ESRCH, or supervisor-pgid collision). Degrading
+                    // to EPERM keeps the suicide vector closed: the
+                    // syscall is rejected with EPERM and the child can
+                    // retry. Killing the supervisor would be strictly
+                    // worse than letting the sandboxed process see one
+                    // failed syscall.
+                    NotifAction::Errno(libc::EPERM)
+                } else {
+                    NotifAction::Kill { sig: libc::SIGKILL, pgid: child_pgid }
+                }
             }
             sandlock_exception_policy_t::DenyEperm => NotifAction::Errno(libc::EPERM),
             sandlock_exception_policy_t::Continue => NotifAction::Continue,
@@ -70,15 +98,19 @@ impl Handler for FfiHandler {
         let pid = cx.notif.pid;
         // Resolve the trapped child's process group id for use as a fallback
         // pgid in Kill actions where the caller passed pgid == 0. Three guard
-        // rails:
+        // rails, all routed through the `UNSAFE_PGID` sentinel when they
+        // trip:
         //
-        //   1. `notif.pid == 0` can occur in nested PID namespaces (e.g.,
-        //      Kubernetes pod-in-pod, KubeVirt, DinD). `getpgid(0)` returns
-        //      the supervisor's own pgid — substituting that into a Kill
-        //      action would be a supervisor-suicide vector.
+        //   1. `notif.pid <= 0` can occur in nested PID namespaces (e.g.,
+        //      Kubernetes pod-in-pod, KubeVirt, DinD). The kernel reports
+        //      the trapped task as invisible. The bare pid is unusable
+        //      (POSIX `killpg(0)` targets the caller's group — supervisor
+        //      suicide) and there is no other safe substitute. Signal
+        //      failure via `UNSAFE_PGID`.
         //
         //   2. `getpgid(pid) <= 0` indicates ESRCH (child exited between
-        //      notif and our query) or another kernel-side failure.
+        //      notif and our query) or another kernel-side failure — no
+        //      pgid we can safely use.
         //
         //   3. Even on success, the resolved pgid must differ from the
         //      supervisor's own pgid. If sandlock-core does not call
@@ -86,22 +118,26 @@ impl Handler for FfiHandler {
         //      pgid — sending `killpg(supervisor_pgid)` would kill the
         //      supervisor along with the child.
         //
-        // In all three failure cases, fall back to the bare pid. A `killpg(pid)`
-        // when `pid` does not name a valid process group will fail with ESRCH
-        // inside the supervisor's response path — safer than killing the
-        // supervisor.
+        // Earlier versions fell back to the bare `pid`. That looked safe
+        // for guards 2 and 3 (kernel rejects `killpg(pid)` with ESRCH if
+        // it does not name a group), but for guard 1 the bare pid is `0`
+        // or negative; `killpg(0, sig)` is supervisor suicide per POSIX,
+        // and `killpg(-1, sig)` broadcasts to every process the caller
+        // can signal. Routing all three branches through `UNSAFE_PGID`
+        // is the only way to keep guard 1 from re-introducing the very
+        // suicide vector this resolution exists to close.
         let child_pgid = {
             let pid = cx.notif.pid as i32;
-            // SAFETY: `getpgid(0)` is signal-safe and has no preconditions.
-            let supervisor_pgid = unsafe { libc::getpgid(0) };
             if pid <= 0 {
-                pid
+                UNSAFE_PGID
             } else {
                 // SAFETY: `getpgid` is signal-safe; positive pid is the only
-                // documented precondition.
+                // documented precondition. `getpgid(0)` reports the caller's
+                // (supervisor's) pgid; both calls have no other preconditions.
+                let supervisor_pgid = unsafe { libc::getpgid(0) };
                 let pgid = unsafe { libc::getpgid(pid) };
                 if pgid <= 0 || pgid == supervisor_pgid {
-                    pid
+                    UNSAFE_PGID
                 } else {
                     pgid
                 }
@@ -252,12 +288,31 @@ fn translate_action(out: &sandlock_action_out_t, child_pgid: i32) -> Option<Noti
             K::ReturnValue => NotifAction::ReturnValue(out.payload.return_value),
             K::Hold => NotifAction::Hold,
             K::Kill => {
-                let pgid = if out.payload.kill.pgid == 0 {
-                    child_pgid
+                let user_pgid = out.payload.kill.pgid;
+                if user_pgid == 0 {
+                    // Caller asked us to substitute the child's pgid.
+                    // Refuse if we have no safe value: routing through
+                    // `None` falls back to the configured exception
+                    // policy, whose `Kill` arm also checks for the
+                    // sentinel and degrades to EPERM.
+                    if child_pgid == UNSAFE_PGID {
+                        return None;
+                    }
+                    NotifAction::Kill { sig: out.payload.kill.sig, pgid: child_pgid }
                 } else {
-                    out.payload.kill.pgid
-                };
-                NotifAction::Kill { sig: out.payload.kill.sig, pgid }
+                    // Caller passed an explicit pgid. Defence in depth:
+                    // refuse if it matches the supervisor's own group
+                    // (malicious or confused caller). `getpgid(0)` is
+                    // safe and signal-safe; we re-query here because
+                    // the earlier resolution path only computes
+                    // supervisor_pgid in the `pid > 0` branch. Already
+                    // inside the outer `unsafe` block.
+                    let supervisor_pgid = libc::getpgid(0);
+                    if user_pgid == supervisor_pgid {
+                        return None;
+                    }
+                    NotifAction::Kill { sig: out.payload.kill.sig, pgid: user_pgid }
+                }
             }
             K::InjectFdSend => NotifAction::InjectFdSend {
                 srcfd: std::os::unix::io::OwnedFd::from_raw_fd(out.payload.inject_send.srcfd),

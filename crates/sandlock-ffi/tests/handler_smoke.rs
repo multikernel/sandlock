@@ -256,6 +256,66 @@ fn fake_ctx() -> HandlerCtx {
     }
 }
 
+/// Spawn a `sleep 30` child that immediately calls `setpgid(0, 0)` so
+/// it becomes its own pgid leader (distinct from the supervisor's
+/// pgid). Returns a `HandlerCtx` carrying the child's pid plus the
+/// `Child` handle so the caller can reap it.
+///
+/// Use this in tests that need `FfiHandler::handle` to produce
+/// `child_pgid != UNSAFE_PGID` — i.e., where the exception policy's
+/// `Kill` arm must remain observable. `fake_ctx()` cannot satisfy
+/// that requirement because the test process IS the supervisor, so
+/// `getpgid(std::process::id()) == getpgid(0)` and the
+/// `pgid == supervisor_pgid` guard would trip, yielding `UNSAFE_PGID`
+/// and degrading the policy to `Errno(EPERM)`.
+fn fake_ctx_with_isolated_child() -> (HandlerCtx, std::process::Child) {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new("sleep");
+    cmd.arg("30");
+    // SAFETY: `setpgid` is async-signal-safe; pid=0 acts on the
+    // calling process; pgid=0 creates a new group whose leader is the
+    // calling process.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = cmd.spawn().expect("spawn sleep child");
+    let child_pid = child.id() as i32;
+    // pre_exec runs after fork; poll briefly for the kernel to
+    // observe the pgid change.
+    let supervisor_pgid = unsafe { libc::getpgid(0) };
+    for _ in 0..50 {
+        // SAFETY: signal-safe; positive pid.
+        let resolved = unsafe { libc::getpgid(child_pid) };
+        if resolved == child_pid && resolved != supervisor_pgid {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let resolved = unsafe { libc::getpgid(child_pid) };
+    assert_eq!(
+        resolved, child_pid,
+        "precondition: pre_exec setpgid(0,0) did not take effect (resolved={resolved})",
+    );
+    assert_ne!(
+        resolved, supervisor_pgid,
+        "precondition: child's pgid must differ from supervisor's",
+    );
+    let ctx = HandlerCtx {
+        notif: SeccompNotif {
+            id: 1, pid: child_pid as u32, flags: 0,
+            data: SeccompData { nr: 39, arch: 0xC000003E,
+                                instruction_pointer: 0, args: [0; 6] },
+        },
+        notif_fd: -1,
+    };
+    (ctx, child)
+}
+
 extern "C-unwind" fn return_value_42(
     _ud: *mut std::ffi::c_void,
     _notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
@@ -724,14 +784,16 @@ extern "C-unwind" fn k_handler_set_kill_sigkill_zero_pgid(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn k1_pgid_resolution_rejects_pid_zero() {
     // notif.pid == 0 can occur in nested PID namespaces (Kubernetes
-    // pod-in-pod). Without the `pid <= 0` guard, `getpgid(0)` would
-    // return the supervisor's own pgid, and a Kill { pgid: 0 } action
-    // would be substituted with `pgid == supervisor_pgid`, turning a
-    // killpg into supervisor suicide.
+    // pod-in-pod, KubeVirt, DinD). The earlier resolution fell back to
+    // the bare pid (`0`) here, and `translate_action`'s `Kill` arm then
+    // produced `Kill { pgid: 0 }`. POSIX `killpg(0, sig)` is "signal
+    // the caller's process group" — supervisor suicide, the very
+    // vector this resolution exists to close.
     //
-    // With the guard: we fall back to the bare pid (here `0`). The
-    // kernel will reject `killpg(0)` inside the response path, but the
-    // supervisor survives.
+    // The new resolution flags this case via `UNSAFE_PGID`.
+    // `translate_action`'s `Kill` arm refuses substitution and returns
+    // `None`, which routes the dispatcher onto the configured
+    // exception policy (here `Continue`).
     let raw = unsafe {
         sandlock_ffi::handler::sandlock_handler_new(
             Some(k_handler_set_kill_sigkill_zero_pgid),
@@ -744,8 +806,73 @@ async fn k1_pgid_resolution_rejects_pid_zero() {
     let cx = fake_ctx_with_pid(0);
     let action = handler.handle(&cx).await;
     assert!(
-        matches!(action, NotifAction::Kill { pgid: 0, .. }),
-        "expected Kill {{ pgid: 0 }} (guard refused getpgid(0) substitution), got {action:?}",
+        matches!(action, NotifAction::Continue),
+        "expected exception-policy fallback (Continue) when no safe pgid available, got {action:?}",
+    );
+}
+
+// Defence-in-depth: in addition to the unit-level assertion above,
+// verify directly that the supervisor's process group is NOT signalled
+// when the lethal-pgid path triggers. We register a SIGURG handler on
+// the test process (a signal not used by tokio or by the test runtime),
+// run a callback that arms a `Kill { sig: SIGURG, pgid: 0 }` action
+// through the FFI handler dispatch, and assert the counter never
+// increments. If the old behaviour (substitute pgid=0 and dispatch)
+// regressed, the supervisor's group would receive SIGURG and the
+// assertion would fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k1_no_supervisor_signal_on_pid_zero_kill() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SIGURG_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn sigurg_handler(_: libc::c_int) {
+        SIGURG_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
+    // SAFETY: installing a signal handler is signal-safe; the handler
+    // itself touches only an AtomicUsize (lock-free, async-signal-safe
+    // on Linux).
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = sigurg_handler as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGURG, &sa, std::ptr::null_mut());
+    }
+    SIGURG_COUNT.store(0, Ordering::SeqCst);
+
+    extern "C-unwind" fn arm_lethal_kill(
+        _ud: *mut std::ffi::c_void,
+        _notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
+        _mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
+        out: *mut sandlock_ffi::handler::sandlock_action_out_t,
+    ) -> i32 {
+        unsafe { sandlock_ffi::handler::sandlock_action_set_kill(out, libc::SIGURG, 0) };
+        0
+    }
+    let raw = unsafe {
+        sandlock_ffi::handler::sandlock_handler_new(
+            Some(arm_lethal_kill),
+            std::ptr::null_mut(),
+            None,
+            sandlock_exception_policy_t::Continue as u32,
+        )
+    };
+    let handler = unsafe { FfiHandler::from_raw(raw) };
+    let cx = fake_ctx_with_pid(0); // pid=0 -> UNSAFE_PGID
+    let action = handler.handle(&cx).await;
+
+    // The action must be Continue (exception-policy fallback), NOT a
+    // Kill that send_response would forward to killpg(0).
+    assert!(
+        matches!(action, NotifAction::Continue),
+        "action must not be Kill when no safe pgid is available; got {action:?}",
+    );
+
+    // Give the OS a moment in case SIGURG was actually delivered.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        SIGURG_COUNT.load(Ordering::SeqCst),
+        0,
+        "supervisor's process group must NOT receive the signal",
     );
 }
 
@@ -753,10 +880,13 @@ async fn k1_pgid_resolution_rejects_pid_zero() {
 async fn k2_pgid_resolution_rejects_supervisor_pgid_match() {
     // Spawn a child WITHOUT pre_exec setpgid, so it inherits the
     // supervisor's process group. `getpgid(child_pid) == getpgid(0) ==
-    // supervisor_pgid`. Without the `pgid == supervisor_pgid` guard,
-    // the substitution would yield Kill { pgid: supervisor_pgid }, the
-    // supervisor-suicide vector. With the guard, we fall back to the
-    // bare child pid.
+    // supervisor_pgid`. Earlier versions fell back to the bare pid here
+    // (Kill { pgid: child_pid }), but that left the substitution
+    // semantics under-defined: `killpg(child_pid)` succeeds only if
+    // child_pid happens to also be a pgid. With the new resolution
+    // we flag the case via `UNSAFE_PGID`, and `translate_action`'s
+    // `Kill` arm refuses substitution — routing the dispatcher onto
+    // the exception policy (here `Continue`).
     let supervisor_pgid = unsafe { libc::getpgid(0) };
     let mut child = std::process::Command::new("sleep")
         .arg("30")
@@ -770,10 +900,6 @@ async fn k2_pgid_resolution_rejects_supervisor_pgid_match() {
     assert_eq!(
         resolved_pgid, supervisor_pgid,
         "precondition: child should inherit supervisor's pgid; got {resolved_pgid}, supervisor={supervisor_pgid}",
-    );
-    assert_ne!(
-        child_pid, supervisor_pgid,
-        "precondition: child_pid must differ from supervisor_pgid; otherwise the assertion cannot discriminate substitution vs fallback",
     );
 
     let raw = unsafe {
@@ -793,17 +919,22 @@ async fn k2_pgid_resolution_rejects_supervisor_pgid_match() {
     let _ = child.wait();
 
     assert!(
-        matches!(action, NotifAction::Kill { pgid, .. } if pgid == child_pid),
-        "expected Kill {{ pgid: child_pid={child_pid} }} (guard refused supervisor_pgid={supervisor_pgid} substitution), got {action:?}",
+        matches!(action, NotifAction::Continue),
+        "expected exception-policy fallback (Continue) when child's pgid matches supervisor's (supervisor_pgid={supervisor_pgid}), got {action:?}",
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn k3_pgid_resolution_falls_back_on_esrch() {
     // Use a clearly-dead pid that will never exist on this host.
-    // `getpgid(i32::MAX)` returns -1 with ESRCH on Linux. Without the
-    // `pgid <= 0` guard, the action would be Kill { pgid: -1 }; with
-    // the guard, we fall back to the bare pid.
+    // `getpgid(i32::MAX)` returns -1 with ESRCH on Linux. Earlier
+    // versions fell back to the bare pid here, producing
+    // `Kill { pgid: i32::MAX }` — which the kernel would reject with
+    // ESRCH in the response path, but only after `translate_action`
+    // had emitted a Kill action. The new resolution flags the case
+    // via `UNSAFE_PGID`; `translate_action`'s `Kill` arm refuses
+    // substitution and routes through the exception policy
+    // (here `Continue`).
     let dead_pid: u32 = i32::MAX as u32;
 
     let raw = unsafe {
@@ -818,8 +949,8 @@ async fn k3_pgid_resolution_falls_back_on_esrch() {
     let cx = fake_ctx_with_pid(dead_pid);
     let action = handler.handle(&cx).await;
     assert!(
-        matches!(action, NotifAction::Kill { pgid, .. } if pgid == dead_pid as i32),
-        "expected Kill {{ pgid: dead_pid={dead_pid} }} (ESRCH fallback to bare pid), got {action:?}",
+        matches!(action, NotifAction::Continue),
+        "expected exception-policy fallback (Continue) on ESRCH, got {action:?}",
     );
 }
 
@@ -837,7 +968,15 @@ async fn ffi_handler_kill_policy_on_callback_rc_nonzero() {
     };
     // Safety: see `ffi_handler_translates_continue`.
     let h = unsafe { FfiHandler::from_raw(raw) };
-    let action = h.handle(&fake_ctx()).await;
+    // Use an isolated child so the resolved child_pgid is not
+    // UNSAFE_PGID — otherwise the exception policy's Kill arm
+    // (correctly) degrades to Errno(EPERM) to avoid supervisor
+    // suicide, and the assertion below would not exercise the
+    // Kill-path the test exists to cover.
+    let (cx, mut child) = fake_ctx_with_isolated_child();
+    let action = h.handle(&cx).await;
+    let _ = child.kill();
+    let _ = child.wait();
     assert!(matches!(action, NotifAction::Kill { sig, .. } if sig == libc::SIGKILL));
 }
 
@@ -887,7 +1026,12 @@ async fn ffi_handler_recovers_from_callback_panic() {
     };
     // Safety: see `ffi_handler_translates_continue`.
     let h = unsafe { FfiHandler::from_raw(raw) };
-    let action = h.handle(&fake_ctx()).await;
+    // Use an isolated child so the Kill exception policy is observable
+    // (rationale identical to `ffi_handler_kill_policy_on_callback_rc_nonzero`).
+    let (cx, mut child) = fake_ctx_with_isolated_child();
+    let action = h.handle(&cx).await;
+    let _ = child.kill();
+    let _ = child.wait();
     // The `catch_unwind` inside `spawn_blocking` swallows the panic and
     // the dispatcher falls back to the configured exception policy.
     assert!(matches!(action, NotifAction::Kill { sig, .. } if sig == libc::SIGKILL));
@@ -1495,11 +1639,19 @@ fn mem_read_cstr_reads_path_from_intercepted_openat() {
 // the supervisor as the "inject" srcfd; the read end stays in this
 // test and observes EOF once the drain path closes the write end.
 fn make_pipe() -> (i32, i32) {
-    // SAFETY: `libc::pipe` writes exactly two fds into the array on
+    // Use `pipe2` with `O_CLOEXEC` so concurrent tests that spawn
+    // children (via std::process::Command, including
+    // `fake_ctx_with_isolated_child`) do not inherit a copy of the
+    // write end. Without this, an inherited duplicate keeps the read
+    // end from observing EOF even after the supervisor's drain path
+    // closes its own copy — the EOF-drain assertion would then hang
+    // on EAGAIN instead of returning 0.
+    //
+    // SAFETY: `libc::pipe2` writes exactly two fds into the array on
     // success and returns 0; we assert success below.
     let mut fds = [0i32; 2];
-    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
-    assert_eq!(rc, 0, "pipe() failed: errno={}", std::io::Error::last_os_error());
+    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    assert_eq!(rc, 0, "pipe2() failed: errno={}", std::io::Error::last_os_error());
     (fds[0], fds[1])
 }
 
@@ -1539,6 +1691,15 @@ async fn a1_ffi_handler_drains_inject_fd_on_panic() {
     // `sandlock_action_set_inject_fd_send` and then panics used to leak
     // the supervisor-side srcfd. After the fix, the dispatcher's
     // catch-unwind path drains the pending payload, closing the fd.
+    //
+    // The exception policy below is `Kill`. With `fake_ctx()` (test
+    // process's own pid), the pgid resolution sees
+    // `pgid == supervisor_pgid` and yields `UNSAFE_PGID`. The Kill
+    // exception arm then degrades to `Errno(EPERM)` (D-new-1: avoid
+    // supervisor suicide via killpg(0)). The drain assertion below is
+    // the load-bearing one for this regression hook — the exception
+    // action just demonstrates that the dispatcher routed onto the
+    // policy fallback at all.
     let (read_fd, write_fd) = make_pipe();
     // Heap-allocated so the pointer stays valid across spawn_blocking.
     let fd_holder: Box<i32> = Box::new(write_fd);
@@ -1556,8 +1717,8 @@ async fn a1_ffi_handler_drains_inject_fd_on_panic() {
     let h = unsafe { FfiHandler::from_raw(raw) };
     let action = h.handle(&fake_ctx()).await;
     assert!(
-        matches!(action, NotifAction::Kill { sig, .. } if sig == libc::SIGKILL),
-        "panic must route to the exception policy fallback",
+        matches!(action, NotifAction::Errno(e) if e == libc::EPERM),
+        "panic must route to the exception-policy fallback (Kill degraded to EPERM under UNSAFE_PGID), got {action:?}",
     );
 
     // After `handle` returns, the drain path should have closed
@@ -1609,6 +1770,9 @@ async fn a2_ffi_handler_drains_inject_fd_tracked_discriminant() {
     // `InjectFdSendTracked` discriminant directly used to leak the
     // srcfd because `translate_action`'s `K::InjectFdSendTracked` arm
     // returned None and dropped the value without reclaiming the fd.
+    //
+    // See `a1_ffi_handler_drains_inject_fd_on_panic` for why the
+    // exception action below is `Errno(EPERM)` rather than `Kill`.
     let (read_fd, write_fd) = make_pipe();
     let fd_holder: Box<i32> = Box::new(write_fd);
     let fd_ptr = Box::into_raw(fd_holder) as *mut std::ffi::c_void;
@@ -1625,8 +1789,8 @@ async fn a2_ffi_handler_drains_inject_fd_tracked_discriminant() {
     let h = unsafe { FfiHandler::from_raw(raw) };
     let action = h.handle(&fake_ctx()).await;
     assert!(
-        matches!(action, NotifAction::Kill { sig, .. } if sig == libc::SIGKILL),
-        "unsupported tracked discriminant must route to the exception policy fallback",
+        matches!(action, NotifAction::Errno(e) if e == libc::EPERM),
+        "unsupported tracked discriminant must route to the exception-policy fallback (Kill degraded to EPERM under UNSAFE_PGID), got {action:?}",
     );
 
     let n = read_eof_or_eagain(read_fd);
