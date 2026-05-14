@@ -468,6 +468,18 @@ The async notification supervisor (tokio) handles intercepted syscalls:
 | `getdents64` | PID filtering, COW directory merging |
 | `getsockname` | Port remap translation |
 
+### Custom Handlers
+
+Downstream Rust crates can append their own seccomp-notification
+handlers to the supervisor chain alongside the builtins, registering
+for any syscall they care about via the `Handler` trait and
+`Sandbox::run_with_extra_handlers`. The builtin chain runs first, so
+user handlers cannot subvert confinement; the registration step also
+rejects handlers on syscalls in the default blocklist or
+`extra_deny_syscalls`. See
+[`docs/extension-handlers.md`](docs/extension-handlers.md) for the
+full API, ordering semantics, and state patterns.
+
 ### COW Filesystem
 
 Two modes of copy-on-write filesystem isolation:
