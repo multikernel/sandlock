@@ -70,7 +70,7 @@ sandlock.Sandbox(**kwargs)
 
 Sandbox configuration and runtime handle. Holds both the policy (filesystem,
 network, resource limits, etc.) and runtime state. Construct once, then call
-`run()`, `start()` + lifecycle methods, or use as a context manager.
+`run()` (blocking) or `spawn()` + lifecycle methods, or use as a context manager.
 
 All config fields are optional. Unset fields mean "no restriction" unless
 noted otherwise. Runtime kwargs (`name`, `policy_fn`, `init_fn`, `work_fn`)
@@ -246,7 +246,7 @@ Run a command, capturing stdout and stderr.
 result = sandbox.run(["python3", "-c", "print(42)"], timeout=10.0)
 ```
 
-#### `sandbox.start(cmd) -> None`
+#### `sandbox.spawn(cmd) -> None`
 
 Spawn `cmd` without waiting. Use `pid`, `pause()`, `resume()`, `kill()`,
 and `wait()` to manage the process lifecycle.

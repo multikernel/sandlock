@@ -528,7 +528,7 @@ class Checkpoint:
     Usage::
 
         sb = Sandbox(fs_readable=["/usr", "/lib"])
-        sb.start(["sleep", "60"])
+        sb.spawn(["sleep", "60"])
         cp = sb.checkpoint()
         cp.save("my-checkpoint")
 

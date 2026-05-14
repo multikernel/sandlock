@@ -518,10 +518,10 @@ class Sandbox:
             stderr=stderr,
         )
 
-    def start(self, cmd: Sequence[str]) -> None:
+    def spawn(self, cmd: Sequence[str]) -> None:
         """Spawn ``cmd`` in the sandbox without waiting for it to finish.
 
-        After calling ``start()``, use ``pid``, ``pause()``, ``resume()``,
+        After calling ``spawn()``, use ``pid``, ``pause()``, ``resume()``,
         ``kill()``, and ``wait()`` to manage the process lifecycle.
 
         Raises:
