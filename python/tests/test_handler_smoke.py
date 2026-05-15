@@ -219,6 +219,57 @@ def test_smoke_audit_openat():
 # ----------------------------------------------------------------
 
 
+def test_handler_ctx_mem_handle_invalidated_after_handle():
+    """A HandlerCtx that escapes its handle() call must have its mem
+    accessors fail safe (return None/False) rather than dereference a
+    dangling C pointer."""
+    if not os.path.exists(_SYSTEM_PYTHON):
+        pytest.skip(f"{_SYSTEM_PYTHON} not available")
+
+    SYS_openat = 257  # x86_64
+
+    captured = {}
+
+    class _EscapingHandler(Handler):
+        on_exception = ExceptionPolicy.CONTINUE
+
+        def handle(self, ctx):
+            captured["ctx"] = ctx          # escape the HandlerCtx
+            # While inside handle(), the handle is live — a read may
+            # succeed or fail depending on the address, but it must not
+            # be inert yet:
+            captured["live_during"] = (
+                ctx._mem_handle is not None and ctx._mem_handle.live
+            )
+            return NotifAction.continue_()
+
+    sb = sandlock.Sandbox(fs_readable=_PYTHON_READABLE)
+    handler = _EscapingHandler()
+    result = sb.run_with_handlers(
+        cmd=[_SYSTEM_PYTHON, "-c",
+             "import os\nfd = os.open('/etc/hostname', os.O_RDONLY)\nos.close(fd)\n"],
+        handlers=[(SYS_openat, handler)],
+    )
+    assert result.success, result
+
+    escaped = captured["ctx"]
+    assert captured["live_during"] is True, "mem handle should be live during handle()"
+    # After the run, the escaped ctx must be INERT — the trampoline's
+    # finally must have invalidated the cell. This is the load-bearing
+    # assertion: if the cell is still 'live' the accessors would
+    # dereference a dangling supervisor pointer (use-after-free).
+    assert escaped._mem_handle is not None
+    assert escaped._mem_handle.live is False, (
+        "trampoline must invalidate the mem handle once handle() returns; "
+        "a live cell here means accessors deref freed memory (UAF)"
+    )
+    assert escaped._mem_handle.ptr is None
+    # And the accessors must fail safe rather than deref a dangling ptr.
+    assert escaped.read_cstr(0x1000, 64) is None
+    assert escaped.read(0x1000, 16) is None
+    assert escaped.write(0x1000, b"x") is False
+
+
 class _RaisingHandler(Handler):
     """Handler that always raises — exercises the trampoline's
     exception path. on_exception is set per-test."""

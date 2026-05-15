@@ -36,7 +36,7 @@ import threading
 from typing import Dict
 
 from . import _sdk
-from .handler import Handler, HandlerCtx, NotifAction, _ActionKind
+from .handler import Handler, HandlerCtx, NotifAction, _ActionKind, _MemHandle
 
 
 # ----------------------------------------------------------------
@@ -89,6 +89,12 @@ def _trampoline_impl(ud, notif_ptr, mem_ptr, out_ptr) -> int:
         return -1  # registration gone — race with sandbox teardown
 
     notif = notif_ptr.contents
+    # ``mem_ptr`` is a raw sandlock_mem_handle_t* pointing at a stack
+    # local in the supervisor — valid ONLY while handle() is running.
+    # Wrap it in a fresh liveness cell and invalidate that cell in the
+    # finally below, so a HandlerCtx that escapes the callback fails
+    # safe instead of dereferencing a dangling pointer.
+    mem_cell = _MemHandle(mem_ptr)
     ctx = HandlerCtx(
         id=notif.id,
         pid=notif.pid,
@@ -97,37 +103,43 @@ def _trampoline_impl(ud, notif_ptr, mem_ptr, out_ptr) -> int:
         arch=notif.arch,
         instruction_pointer=notif.instruction_pointer,
         args=tuple(notif.args),
-        _mem_handle=mem_ptr,
+        _mem_handle=mem_cell,
     )
 
     try:
-        action = handler.handle(ctx)
-    except BaseException:
-        # Any exception → defer to the configured on_exception policy.
-        return -1
+        try:
+            action = handler.handle(ctx)
+        except BaseException:
+            # Any exception → defer to the configured on_exception policy.
+            return -1
 
-    if not isinstance(action, NotifAction):
-        return -1  # contract violation: handle() must return a NotifAction
+        if not isinstance(action, NotifAction):
+            return -1  # contract violation: handle() must return a NotifAction
 
-    kind = action.kind
-    if kind == int(_ActionKind.CONTINUE):
-        _sdk._lib.sandlock_action_set_continue(out_ptr)
-    elif kind == int(_ActionKind.ERRNO):
-        _sdk._lib.sandlock_action_set_errno(out_ptr, action.errno_value)
-    elif kind == int(_ActionKind.RETURN_VALUE):
-        _sdk._lib.sandlock_action_set_return_value(out_ptr, action.return_value)
-    elif kind == int(_ActionKind.HOLD):
-        _sdk._lib.sandlock_action_set_hold(out_ptr)
-    elif kind == int(_ActionKind.KILL):
-        _sdk._lib.sandlock_action_set_kill(out_ptr, action.sig, action.pgid)
-    elif kind == int(_ActionKind.INJECT_FD_SEND):
-        _sdk._lib.sandlock_action_set_inject_fd_send(
-            out_ptr, action.srcfd, action.newfd_flags,
-        )
-    else:
-        # UNSET, INJECT_FD_SEND_TRACKED (no setter), or an unknown tag.
-        return -1
-    return 0
+        kind = action.kind
+        if kind == int(_ActionKind.CONTINUE):
+            _sdk._lib.sandlock_action_set_continue(out_ptr)
+        elif kind == int(_ActionKind.ERRNO):
+            _sdk._lib.sandlock_action_set_errno(out_ptr, action.errno_value)
+        elif kind == int(_ActionKind.RETURN_VALUE):
+            _sdk._lib.sandlock_action_set_return_value(out_ptr, action.return_value)
+        elif kind == int(_ActionKind.HOLD):
+            _sdk._lib.sandlock_action_set_hold(out_ptr)
+        elif kind == int(_ActionKind.KILL):
+            _sdk._lib.sandlock_action_set_kill(out_ptr, action.sig, action.pgid)
+        elif kind == int(_ActionKind.INJECT_FD_SEND):
+            _sdk._lib.sandlock_action_set_inject_fd_send(
+                out_ptr, action.srcfd, action.newfd_flags,
+            )
+        else:
+            # UNSET, INJECT_FD_SEND_TRACKED (no setter), or an unknown tag.
+            return -1
+        return 0
+    finally:
+        # The mem handle is dead the instant the callback returns.
+        # Runs on every exit path — exception, normal return, all of
+        # it — so any HandlerCtx the handler stashed becomes inert.
+        mem_cell.invalidate()
 
 
 def _ud_drop_impl(ud) -> None:
