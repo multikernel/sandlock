@@ -153,3 +153,121 @@ def test_handler_ctx_is_frozen():
         pass
     else:
         raise AssertionError("HandlerCtx must be frozen (immutable)")
+
+
+# ----------------------------------------------------------------
+# End-to-end audit smoke test (RFC #43 §Phasing item 2).
+# ----------------------------------------------------------------
+
+import os
+
+import pytest
+
+import sandlock
+
+
+# Standard readable paths for a sandboxed python3 child, mirroring
+# tests/test_sandbox.py's _PYTHON_READABLE helper.
+_PYTHON_READABLE = ["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev"]
+
+# Use a system interpreter that lives inside the readable tree above.
+# sys.executable may point at a venv outside the sandbox (e.g. under
+# the developer's home directory), which the child cannot exec.
+_SYSTEM_PYTHON = "/usr/bin/python3"
+
+
+class _OpenatCounter(Handler):
+    on_exception = ExceptionPolicy.CONTINUE  # audit-only — never block
+
+    def __init__(self):
+        self.count = 0
+
+    def handle(self, ctx):
+        self.count += 1
+        return NotifAction.continue_()
+
+
+def test_smoke_audit_openat():
+    """RFC #43 phasing item 2: audit handler counting SYS_openat."""
+    if not os.path.exists(_SYSTEM_PYTHON):
+        pytest.skip(f"{_SYSTEM_PYTHON} not available")
+
+    SYS_openat = 257  # x86_64
+
+    sb = sandlock.Sandbox(fs_readable=_PYTHON_READABLE)
+    counter = _OpenatCounter()
+
+    result = sb.run_with_handlers(
+        cmd=[_SYSTEM_PYTHON, "-c",
+             "import os\n"
+             "for _ in range(3):\n"
+             "    fd = os.open('/etc/hostname', os.O_RDONLY)\n"
+             "    os.close(fd)\n"],
+        handlers=[(SYS_openat, counter)],
+    )
+
+    assert result.success, result
+    assert counter.count >= 3, (
+        f"expected >=3 openat intercepts, got {counter.count}"
+    )
+
+
+# ----------------------------------------------------------------
+# End-to-end failure-path tests: a handler that raises exercises the
+# trampoline's exception path (handler raises -> rc -1 -> the
+# supervisor applies the configured on_exception policy).
+# ----------------------------------------------------------------
+
+
+class _RaisingHandler(Handler):
+    """Handler that always raises — exercises the trampoline's
+    exception path. on_exception is set per-test."""
+
+    def __init__(self, on_exception):
+        self.on_exception = on_exception
+
+    def handle(self, ctx):
+        raise RuntimeError("intentional handler failure")
+
+
+def test_handler_exception_continue_policy_lets_child_run():
+    """A handler that raises, with on_exception=CONTINUE, must let the
+    child run to completion — the trampoline catches the exception and
+    the supervisor applies the Continue policy."""
+    if not os.path.exists(_SYSTEM_PYTHON):
+        pytest.skip(f"{_SYSTEM_PYTHON} not available")
+
+    SYS_openat = 257  # x86_64
+    sb = sandlock.Sandbox(fs_readable=_PYTHON_READABLE)
+    handler = _RaisingHandler(ExceptionPolicy.CONTINUE)
+    result = sb.run_with_handlers(
+        cmd=[_SYSTEM_PYTHON, "-c",
+             "import os\nfd = os.open('/etc/hostname', os.O_RDONLY)\nos.close(fd)\n"],
+        handlers=[(SYS_openat, handler)],
+    )
+    # Continue policy: the openat proceeds despite the handler raising,
+    # so the child completes normally.
+    assert result.success, result
+
+
+def test_handler_exception_kill_policy_terminates_child():
+    """A handler that raises, with on_exception=KILL, must terminate the
+    child — the trampoline catches the exception and the supervisor
+    applies the Kill policy."""
+    if not os.path.exists(_SYSTEM_PYTHON):
+        pytest.skip(f"{_SYSTEM_PYTHON} not available")
+
+    SYS_openat = 257
+    sb = sandlock.Sandbox(fs_readable=_PYTHON_READABLE)
+    handler = _RaisingHandler(ExceptionPolicy.KILL)
+    result = sb.run_with_handlers(
+        cmd=[_SYSTEM_PYTHON, "-c",
+             "import os\nfd = os.open('/etc/hostname', os.O_RDONLY)\nos.close(fd)\n"],
+        handlers=[(SYS_openat, handler)],
+    )
+    # Kill policy: the first intercepted openat that the raising handler
+    # touches kills the child's process group, so the run does not
+    # succeed.
+    assert not result.success, (
+        f"expected child terminated by Kill policy, got success: {result}"
+    )

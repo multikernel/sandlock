@@ -399,6 +399,149 @@ _lib.sandlock_checkpoint_free.argtypes = [_c_checkpoint_p]
 
 
 # ----------------------------------------------------------------
+# Handler ABI — extension handlers for seccomp-notif syscalls.
+#
+# Structures mirror the C ABI in crates/sandlock-ffi/include/sandlock.h;
+# the trampoline that drives these bindings lives in _handler_ffi.py.
+# ----------------------------------------------------------------
+
+# sandlock_notif_data_t — kernel seccomp-notification snapshot. The
+# `args` array is fixed at 6 entries (the syscall ABI maximum).
+class _SandlockNotifData(ctypes.Structure):
+    _fields_ = [
+        ("id", ctypes.c_uint64),
+        ("pid", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("syscall_nr", ctypes.c_int32),
+        ("arch", ctypes.c_uint32),
+        ("instruction_pointer", ctypes.c_uint64),
+        ("args", ctypes.c_uint64 * 6),
+    ]
+
+
+# sandlock_action_payload_t — the tagged union the setters fill in. The
+# trampoline never reads these fields directly (it only ever calls the
+# setters), but the layout must match so the struct is sized correctly.
+class _SandlockActionPayload(ctypes.Union):
+    _fields_ = [
+        ("none", ctypes.c_uint64),
+        ("errno_value", ctypes.c_int32),
+        ("return_value", ctypes.c_int64),
+        # inject_send: { int32 srcfd; uint32 newfd_flags; }
+        ("inject_send", ctypes.c_uint32 * 2),
+        # inject_send_tracked: { int32; uint32; uint64; } — reserved.
+        ("inject_send_tracked", ctypes.c_uint64 * 2),
+        # kill: { int32 sig; int32 pgid; }
+        ("kill", ctypes.c_int32 * 2),
+    ]
+
+
+# sandlock_action_out_t — the slot a handler writes its decision into.
+class _SandlockActionOut(ctypes.Structure):
+    _fields_ = [
+        ("kind", ctypes.c_uint32),
+        ("payload", _SandlockActionPayload),
+    ]
+
+
+# sandlock_handler_registration_t — one (syscall_nr, handler) pair.
+class _SandlockHandlerRegistration(ctypes.Structure):
+    _fields_ = [
+        ("syscall_nr", ctypes.c_int64),
+        ("handler", ctypes.c_void_p),
+    ]
+
+
+_c_mem_handle_p = ctypes.c_void_p
+
+# C handler signature:
+#   int (*)(void *ud, const sandlock_notif_data_t *notif,
+#           sandlock_mem_handle_t *mem, sandlock_action_out_t *out)
+_HANDLER_FN_TYPE = ctypes.CFUNCTYPE(
+    ctypes.c_int,
+    ctypes.c_void_p,                          # ud
+    ctypes.POINTER(_SandlockNotifData),       # notif
+    _c_mem_handle_p,                          # mem
+    ctypes.POINTER(_SandlockActionOut),       # out
+)
+
+# void (*)(void *ud)
+_UD_DROP_FN_TYPE = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
+
+_c_handler_p = ctypes.c_void_p
+
+_lib.sandlock_handler_new.restype = _c_handler_p
+_lib.sandlock_handler_new.argtypes = [
+    _HANDLER_FN_TYPE, ctypes.c_void_p, _UD_DROP_FN_TYPE, ctypes.c_uint32,
+]
+
+_lib.sandlock_handler_free.restype = None
+_lib.sandlock_handler_free.argtypes = [_c_handler_p]
+
+_lib.sandlock_run_with_handlers.restype = _c_result_p
+_lib.sandlock_run_with_handlers.argtypes = [
+    _c_policy_p, ctypes.c_char_p,
+    ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint,
+    ctypes.POINTER(_SandlockHandlerRegistration), ctypes.c_size_t,
+]
+
+_lib.sandlock_run_interactive_with_handlers.restype = _c_result_p
+_lib.sandlock_run_interactive_with_handlers.argtypes = [
+    _c_policy_p, ctypes.c_char_p,
+    ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint,
+    ctypes.POINTER(_SandlockHandlerRegistration), ctypes.c_size_t,
+]
+
+# Action setters — exactly one per action, called from the trampoline.
+_lib.sandlock_action_set_continue.restype = None
+_lib.sandlock_action_set_continue.argtypes = [ctypes.POINTER(_SandlockActionOut)]
+
+_lib.sandlock_action_set_errno.restype = None
+_lib.sandlock_action_set_errno.argtypes = [
+    ctypes.POINTER(_SandlockActionOut), ctypes.c_int32,
+]
+
+_lib.sandlock_action_set_return_value.restype = None
+_lib.sandlock_action_set_return_value.argtypes = [
+    ctypes.POINTER(_SandlockActionOut), ctypes.c_int64,
+]
+
+_lib.sandlock_action_set_inject_fd_send.restype = None
+_lib.sandlock_action_set_inject_fd_send.argtypes = [
+    ctypes.POINTER(_SandlockActionOut), ctypes.c_int32, ctypes.c_uint32,
+]
+
+_lib.sandlock_action_set_hold.restype = None
+_lib.sandlock_action_set_hold.argtypes = [ctypes.POINTER(_SandlockActionOut)]
+
+_lib.sandlock_action_set_kill.restype = None
+_lib.sandlock_action_set_kill.argtypes = [
+    ctypes.POINTER(_SandlockActionOut), ctypes.c_int32, ctypes.c_int32,
+]
+
+# Child-memory accessors — valid only for the duration of a callback.
+_lib.sandlock_mem_read_cstr.restype = ctypes.c_int
+_lib.sandlock_mem_read_cstr.argtypes = [
+    _c_mem_handle_p, ctypes.c_uint64,
+    ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_size_t),
+]
+
+_lib.sandlock_mem_read.restype = ctypes.c_int
+_lib.sandlock_mem_read.argtypes = [
+    _c_mem_handle_p, ctypes.c_uint64,
+    ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_size_t),
+]
+
+_lib.sandlock_mem_write.restype = ctypes.c_int
+_lib.sandlock_mem_write.argtypes = [
+    _c_mem_handle_p, ctypes.c_uint64,
+    ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t,
+]
+
+
+# ----------------------------------------------------------------
 # SyscallEvent & PolicyContext (Python wrappers for policy_fn)
 # ----------------------------------------------------------------
 

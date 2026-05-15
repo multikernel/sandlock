@@ -518,6 +518,135 @@ class Sandbox:
             stderr=stderr,
         )
 
+    def run_with_handlers(
+        self,
+        cmd: Sequence[str],
+        handlers: Sequence,
+        name: str | None = None,
+    ):
+        """Run ``cmd`` under this sandbox with extra seccomp-notif handlers.
+
+        ``handlers`` is a sequence of ``(syscall_nr, Handler)`` pairs;
+        ``syscall_nr`` is the kernel syscall number to intercept (e.g.
+        ``257`` for ``openat`` on x86_64) and ``Handler`` is an instance
+        of :class:`sandlock.handler.Handler`. See that class for handler
+        semantics.
+
+        Ownership of every ``Handler`` is held by the sandlock supervisor
+        for the duration of the run; the Python-side reference is held in
+        an internal registry and released when the run completes (success
+        or failure).
+
+        The underlying C ABI builds and drives its own runtime for each
+        call. Do not invoke this method from a thread that already runs a
+        Tokio runtime — the FFI panics in that case, and the panic
+        propagates as a Python exception via ``extern "C-unwind"``.
+
+        Args:
+            cmd: Command and arguments to execute.
+            handlers: Sequence of ``(syscall_nr, Handler)`` pairs.
+            name: Optional sandbox name. ``None`` resolves to the same
+                auto-generated name as :meth:`run`.
+
+        Returns:
+            A :class:`Result` describing the run.
+        """
+        import ctypes
+
+        from . import _handler_ffi
+        from ._sdk import (
+            _SandlockHandlerRegistration,
+            _encode,
+            _lib,
+            _make_argv,
+            _read_result_bytes,
+            Result,
+        )
+
+        if self._handle is not None:
+            raise RuntimeError("sandbox is already running")
+
+        handlers = list(handlers)
+        native = self._ensure_native()
+        argv, argc = _make_argv(list(cmd))
+        resolved_name = name if name is not None else self._resolve_name()
+
+        trampoline = _handler_ffi._make_trampoline()
+        ud_drop = _handler_ffi._make_ud_drop()
+
+        # Build the registration array. Handler containers allocated here
+        # are consumed by sandlock_run_with_handlers — on a successful or
+        # failed call the supervisor frees them (and fires ud_drop). We
+        # must NOT call sandlock_handler_free on any container handed in.
+        regs = (_SandlockHandlerRegistration * len(handlers))()
+        registered_ids: list[int] = []
+        try:
+            for i, (syscall_nr, handler) in enumerate(handlers):
+                hid = _handler_ffi._register_handler(handler)
+                registered_ids.append(hid)
+                container = _lib.sandlock_handler_new(
+                    trampoline,
+                    ctypes.c_void_p(hid),
+                    ud_drop,
+                    int(handler.on_exception),
+                )
+                if not container:
+                    raise RuntimeError(
+                        "sandlock_handler_new returned NULL for syscall "
+                        f"{syscall_nr}"
+                    )
+                regs[i].syscall_nr = int(syscall_nr)
+                regs[i].handler = container
+        except BaseException:
+            # Roll back: free every handler container already allocated
+            # in this loop. sandlock_handler_free fires the container's
+            # ud_drop, which removes that handler from the registry — so
+            # we must NOT also call _unregister_handler for those.
+            #
+            # BaseException (not Exception) so a KeyboardInterrupt or
+            # SystemExit raised mid-loop still triggers cleanup before it
+            # propagates.
+            for j in range(i):
+                if regs[j].handler:
+                    _lib.sandlock_handler_free(regs[j].handler)
+            # The current slot `i` registered a handler id but never got
+            # a container (sandlock_handler_new failed or a later line
+            # raised), so its ud_drop will never fire — drop it by hand.
+            if i < len(registered_ids):
+                _handler_ffi._unregister_handler(registered_ids[i])
+            raise
+
+        result_p = _lib.sandlock_run_with_handlers(
+            native.ptr,
+            _encode(resolved_name),
+            argv,
+            argc,
+            regs,
+            len(handlers),
+        )
+        # Ownership of every container has transferred to the supervisor;
+        # it has also invoked each ud_drop, clearing the registry entries.
+
+        if not result_p:
+            return Result(
+                success=False,
+                exit_code=-1,
+                error="sandlock_run_with_handlers failed",
+            )
+
+        exit_code = _lib.sandlock_result_exit_code(result_p)
+        success = _lib.sandlock_result_success(result_p)
+        stdout = _read_result_bytes(result_p, _lib.sandlock_result_stdout_bytes)
+        stderr = _read_result_bytes(result_p, _lib.sandlock_result_stderr_bytes)
+        _lib.sandlock_result_free(result_p)
+
+        return Result(
+            success=bool(success),
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
     def create(self, cmd: Sequence[str]) -> None:
         """Fork the sandboxed child and install policy. The child is
         parked between policy install and ``execve``; call ``start()``
