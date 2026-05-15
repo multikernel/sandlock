@@ -328,3 +328,199 @@ def test_handler_exception_kill_policy_terminates_child():
     assert not result.success, (
         f"expected child terminated by Kill policy, got success: {result}"
     )
+
+
+# ----------------------------------------------------------------
+# End-to-end coverage for the trampoline's NotifAction kind-dispatch.
+#
+# The tests above only ever return NotifAction.continue_() or exercise
+# the exception-POLICY path. The branch in _handler_ffi.py that
+# translates a RETURNED non-Continue action (errno / return_value /
+# kill / inject_fd) into the matching sandlock_action_set_* call had no
+# end-to-end coverage — a trampoline reduced to "always Continue" passed
+# the whole suite. The tests below make a handler RETURN a non-Continue
+# action and observe the child behave accordingly, so a neutered
+# kind-dispatch fails them.
+# ----------------------------------------------------------------
+
+
+def test_handler_errno_action_makes_child_observe_eperm(tmp_dir):
+    """A handler returning NotifAction.errno(EPERM) must make the child's
+    openat fail with errno EPERM — only reachable if the trampoline
+    translates the Errno action into sandlock_action_set_errno.
+
+    The handler targets one probe file by path: denying *every* openat
+    would kill the dynamic loader before the child runs (the test would
+    then observe EPERM from ld.so, not from the child's own open). It
+    also avoids /etc/hostname and other supervisor-virtualized paths,
+    which a builtin handler intercepts before any user handler runs.
+    """
+    if not os.path.exists(_SYSTEM_PYTHON):
+        pytest.skip(f"{_SYSTEM_PYTHON} not available")
+
+    SYS_openat = 257  # x86_64
+    import errno as _errno
+
+    probe = tmp_dir / "probe.txt"
+    probe.write_text("payload\n")
+
+    class _DenyProbe(Handler):
+        on_exception = ExceptionPolicy.KILL  # handler is correct; policy unused
+
+        def handle(self, ctx):
+            # openat(dirfd, pathname, flags, ...) -> pathname is args[1].
+            path = ctx.read_cstr(ctx.args[1], max_len=4096)
+            if path == str(probe):
+                return NotifAction.errno(_errno.EPERM)
+            return NotifAction.continue_()
+
+    sb = sandlock.Sandbox(fs_readable=[*_PYTHON_READABLE, str(tmp_dir)])
+    # Child opens the probe file and reports the errno it gets.
+    script = (
+        "import os, sys\n"
+        "try:\n"
+        "    os.open(%r, os.O_RDONLY)\n"
+        "    sys.exit(0)\n"
+        "except OSError as e:\n"
+        "    sys.stderr.write('errno=%%d' %% e.errno)\n"
+        "    sys.exit(3)\n" % str(probe)
+    )
+    result = sb.run_with_handlers(
+        cmd=[_SYSTEM_PYTHON, "-c", script],
+        handlers=[(SYS_openat, _DenyProbe())],
+    )
+    # Child caught OSError(EPERM) -> exit 3, stderr 'errno=1'.
+    assert not result.success, result
+    assert b"errno=%d" % _errno.EPERM in result.stderr, result.stderr
+
+
+def test_handler_return_value_action_overrides_getpid():
+    """A handler returning NotifAction.return_value_(777) must make the
+    child's os.getpid() return the synthetic 777 — only reachable if the
+    trampoline translates the ReturnValue action into
+    sandlock_action_set_return_value."""
+    if not os.path.exists(_SYSTEM_PYTHON):
+        pytest.skip(f"{_SYSTEM_PYTHON} not available")
+
+    SYS_getpid = 39  # x86_64
+
+    class _FakePid(Handler):
+        on_exception = ExceptionPolicy.KILL
+
+        def handle(self, ctx):
+            return NotifAction.return_value_(777)
+
+    sb = sandlock.Sandbox(fs_readable=_PYTHON_READABLE)
+    result = sb.run_with_handlers(
+        cmd=[_SYSTEM_PYTHON, "-c", "import os; print(os.getpid())"],
+        handlers=[(SYS_getpid, _FakePid())],
+    )
+    assert result.success, result
+    assert result.stdout.strip() == b"777", result.stdout
+
+
+def test_handler_kill_action_terminates_child():
+    """A handler returning NotifAction.kill(SIGKILL, 0) directly must
+    terminate the child. on_exception is CONTINUE here deliberately: if
+    the trampoline failed to translate the Kill action, the action would
+    be Unset, the exception policy CONTINUE would let the child survive,
+    and this test would fail — which makes it discriminating."""
+    if not os.path.exists(_SYSTEM_PYTHON):
+        pytest.skip(f"{_SYSTEM_PYTHON} not available")
+
+    SYS_openat = 257
+    import signal
+
+    class _KillOnOpen(Handler):
+        on_exception = ExceptionPolicy.CONTINUE  # NOT used — handler returns cleanly
+
+        def handle(self, ctx):
+            return NotifAction.kill(signal.SIGKILL, 0)  # pgid 0 -> supervisor resolves
+
+    sb = sandlock.Sandbox(fs_readable=_PYTHON_READABLE)
+    result = sb.run_with_handlers(
+        cmd=[_SYSTEM_PYTHON, "-c",
+             "import os; os.open('/etc/hostname', os.O_RDONLY)"],
+        handlers=[(SYS_openat, _KillOnOpen())],
+    )
+    assert not result.success, (
+        f"child must be killed by the handler's Kill action; got {result}"
+    )
+
+
+def test_handler_mem_read_cstr_reads_child_path(tmp_dir):
+    """A handler reads the openat path argument from child memory via
+    ctx.read_cstr and denies a specific file. This exercises the real
+    sandlock_mem_read_cstr ctypes round-trip (the other tests only cover
+    read_cstr with _mem_handle=None).
+
+    The probe is a plain file under tmp_dir, not /etc/hostname: the
+    supervisor virtualizes /etc/hostname with a builtin openat handler
+    that intercepts the notification before any user handler runs, so a
+    user handler never observes that path.
+    """
+    if not os.path.exists(_SYSTEM_PYTHON):
+        pytest.skip(f"{_SYSTEM_PYTHON} not available")
+
+    SYS_openat = 257
+    import errno as _errno
+
+    probe = tmp_dir / "probe.txt"
+    probe.write_text("payload\n")
+
+    seen_paths = []
+
+    class _PathReader(Handler):
+        on_exception = ExceptionPolicy.CONTINUE
+
+        def handle(self, ctx):
+            # openat(dirfd, pathname, flags, ...) -> pathname is args[1].
+            path = ctx.read_cstr(ctx.args[1], max_len=4096)
+            seen_paths.append(path)
+            if path == str(probe):
+                return NotifAction.errno(_errno.EACCES)
+            return NotifAction.continue_()
+
+    sb = sandlock.Sandbox(fs_readable=[*_PYTHON_READABLE, str(tmp_dir)])
+    script = (
+        "import os, sys\n"
+        "try:\n"
+        "    os.open(%r, os.O_RDONLY)\n"
+        "    sys.exit(0)\n"
+        "except OSError as e:\n"
+        "    sys.exit(7 if e.errno == %d else 8)\n" % (str(probe), _errno.EACCES)
+    )
+    result = sb.run_with_handlers(
+        cmd=[_SYSTEM_PYTHON, "-c", script],
+        handlers=[(SYS_openat, _PathReader())],
+    )
+    # Handler read the real probe path from child memory and denied it.
+    assert str(probe) in seen_paths, seen_paths
+    assert not result.success, result
+
+
+def test_run_with_handlers_empty_handler_list():
+    """An empty handler list should run cleanly (degenerate but valid)."""
+    if not os.path.exists(_SYSTEM_PYTHON):
+        pytest.skip(f"{_SYSTEM_PYTHON} not available")
+
+    sb = sandlock.Sandbox(fs_readable=_PYTHON_READABLE)
+    result = sb.run_with_handlers(
+        cmd=[_SYSTEM_PYTHON, "-c", "pass"],
+        handlers=[],
+    )
+    assert result.success, result
+
+
+def test_run_with_handlers_rejects_non_handler():
+    """A non-Handler object in the list must raise a clear error, not
+    crash deep in ctypes."""
+    if not os.path.exists(_SYSTEM_PYTHON):
+        pytest.skip(f"{_SYSTEM_PYTHON} not available")
+
+    sb = sandlock.Sandbox(fs_readable=_PYTHON_READABLE)
+    with pytest.raises((TypeError, AttributeError, ValueError)):
+        sb.run_with_handlers(
+            cmd=[_SYSTEM_PYTHON, "-c", "pass"],
+            handlers=[(257, "not a handler")],
+        )
