@@ -638,16 +638,30 @@ class Sandbox:
             raise
 
         name_b = _encode(resolved_name)
-        result_p = _lib.sandlock_run_with_handlers(
-            native.ptr,
-            name_b,
-            argv,
-            argc,
-            regs,
-            len(handlers),
-        )
-        # Ownership of every container has transferred to the supervisor;
-        # it has also invoked each ud_drop, clearing the registry entries.
+        try:
+            result_p = _lib.sandlock_run_with_handlers(
+                native.ptr,
+                name_b,
+                argv,
+                argc,
+                regs,
+                len(handlers),
+            )
+        finally:
+            # The registry exists only to route dispatch DURING the run;
+            # once sandlock_run_with_handlers returns, no handler can be
+            # invoked again. On the normal and early-return paths the
+            # supervisor has already fired every ud_drop, emptying these
+            # slots. On a panic — the entry point is extern "C-unwind",
+            # so a panic (e.g. called from within an existing Tokio
+            # runtime) propagates here as a Python exception — it may
+            # not have. Sweep unconditionally so a panic cannot orphan
+            # entries in the process-global registry;
+            # _unregister_handler is idempotent (pop(.., None)), so this
+            # is a no-op on the paths where ud_drop already ran.
+            for hid in registered_ids:
+                _handler_ffi._unregister_handler(hid)
+        # Ownership of every container has transferred to the supervisor.
 
         if not result_p:
             return Result(

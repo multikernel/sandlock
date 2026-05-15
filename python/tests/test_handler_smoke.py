@@ -144,15 +144,15 @@ def test_action_kind_enum_values_match_c_header():
 
 
 def test_handler_ctx_dataclass_stores_fields():
-    """Pure unit test of HandlerCtx as a dataclass: _for_test stores the
-    kwargs 1:1. This covers storage only — the trampoline's notification
-    unpacking is covered by
+    """Pure unit test of HandlerCtx as a dataclass: the constructor
+    stores the kwargs 1:1. This covers storage only — the trampoline's
+    notification unpacking is covered by
     test_handler_ctx_notif_fields_populated_from_real_notification."""
     from sandlock.handler import HandlerCtx
 
-    # Construct via the test helper; the production constructor is
-    # called only from the trampoline.
-    ctx = HandlerCtx._for_test(
+    # ``_mem_handle`` defaults to None, so the dataclass constructor is
+    # usable directly here; the trampoline is its only other caller.
+    ctx = HandlerCtx(
         id=42, pid=1234, flags=0,
         syscall_nr=39, arch=0xC000003E,
         instruction_pointer=0xDEADBEEF,
@@ -170,9 +170,9 @@ def test_handler_ctx_dataclass_stores_fields():
 def test_handler_ctx_mem_methods_return_falsy_without_handle():
     from sandlock.handler import HandlerCtx
 
-    # _for_test ctx has no mem handle — accessors must degrade safely,
-    # not crash.
-    ctx = HandlerCtx._for_test(
+    # A ctx built without a mem handle (_mem_handle defaults to None) —
+    # accessors must degrade safely, not crash.
+    ctx = HandlerCtx(
         id=1, pid=1, flags=0, syscall_nr=0, arch=0,
         instruction_pointer=0, args=(0, 0, 0, 0, 0, 0),
     )
@@ -186,7 +186,7 @@ def test_handler_ctx_is_frozen():
 
     from sandlock.handler import HandlerCtx
 
-    ctx = HandlerCtx._for_test(
+    ctx = HandlerCtx(
         id=1, pid=1, flags=0, syscall_nr=0, arch=0,
         instruction_pointer=0, args=(0, 0, 0, 0, 0, 0),
     )
@@ -679,3 +679,76 @@ def test_run_with_handlers_rejects_non_handler():
             cmd=[_SYSTEM_PYTHON, "-c", "pass"],
             handlers=[(257, "not a handler")],
         )
+
+
+# ----------------------------------------------------------------
+# Handler-registry hygiene. run_with_handlers inserts each Handler
+# into a process-global registry keyed by integer id; the C ABI's
+# ud_drop removes the entry when the supervisor frees the container.
+# These tests pin the "no orphaned entry" invariant the PR body
+# claims — on both the mid-loop rollback path and a completed run.
+# ----------------------------------------------------------------
+
+
+def test_run_with_handlers_rollback_leaves_registry_clean():
+    """A mid-loop registration failure must roll back cleanly: every
+    handler container freed and the process-global handler registry
+    left with no orphaned entries.
+
+    The second entry carries a syscall_nr that ``int()`` rejects, so
+    handler 0 is fully registered while handler 1 fails AFTER
+    _register_handler + sandlock_handler_new but before the regs store
+    — the exact mid-loop window the rollback code in run_with_handlers
+    handles. The failure is raised before sandlock_run_with_handlers is
+    reached, so no kernel/child is involved.
+
+    Destructive check: deleting the rollback ``except`` block in
+    run_with_handlers leaves handler 0's id orphaned and the assert
+    fails with a count of before+1.
+    """
+    from sandlock import _handler_ffi
+
+    class _Noop(Handler):
+        def handle(self, ctx):
+            return NotifAction.continue_()
+
+    sb = sandlock.Sandbox(fs_readable=_PYTHON_READABLE)
+    before = len(_handler_ffi._HANDLERS)
+    with pytest.raises(ValueError):
+        sb.run_with_handlers(
+            cmd=["/bin/true"],
+            handlers=[(257, _Noop()), ("not-a-syscall-number", _Noop())],
+        )
+    assert len(_handler_ffi._HANDLERS) == before, (
+        "mid-loop rollback orphaned handler registry entries: "
+        f"{len(_handler_ffi._HANDLERS)} != {before}"
+    )
+
+
+def test_run_with_handlers_clears_registry_after_run():
+    """After a completed run, the process-global handler registry must
+    be empty again — no entry survives the run that registered it.
+    Guards against unbounded registry growth across repeated
+    run_with_handlers calls."""
+    if not os.path.exists(_SYSTEM_PYTHON):
+        pytest.skip(f"{_SYSTEM_PYTHON} not available")
+
+    from sandlock import _handler_ffi
+
+    class _Noop(Handler):
+        on_exception = ExceptionPolicy.CONTINUE
+
+        def handle(self, ctx):
+            return NotifAction.continue_()
+
+    sb = sandlock.Sandbox(fs_readable=_PYTHON_READABLE)
+    before = len(_handler_ffi._HANDLERS)
+    result = sb.run_with_handlers(
+        cmd=[_SYSTEM_PYTHON, "-c", "pass"],
+        handlers=[(257, _Noop())],
+    )
+    assert result.success, result
+    assert len(_handler_ffi._HANDLERS) == before, (
+        "a registry entry survived a completed run: "
+        f"{len(_handler_ffi._HANDLERS)} != {before}"
+    )

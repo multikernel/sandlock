@@ -205,9 +205,15 @@ def mem_read_cstr(mem_handle, addr: int, max_len: int) -> str | None:
 def mem_read(mem_handle, addr: int, length: int) -> bytes | None:
     """Read ``length`` raw bytes from the child at ``addr``.
 
-    Returns the bytes copied on success, or None on failure.
+    Returns the bytes copied on success, or None on failure. A null
+    handle always fails (returns None), mirroring ``mem_write`` — a
+    dead/absent context yields no child-memory access regardless of
+    the requested length. A zero-length read on a live handle is the
+    trivial success ``b""``.
     """
-    if mem_handle is None or length < 1:
+    if mem_handle is None:
+        return None
+    if length < 1:
         return b"" if length == 0 else None
     buf = (ctypes.c_uint8 * length)()
     out_len = ctypes.c_size_t(0)

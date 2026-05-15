@@ -209,27 +209,9 @@ class HandlerCtx:
     args: tuple[int, int, int, int, int, int]  # the six syscall args
 
     # Set by the trampoline to a ``_MemHandle`` liveness cell; opaque to
-    # user code. None in test contexts.
+    # user code. Defaults to None — a HandlerCtx built without one (the
+    # trampoline always supplies it) has inert child-memory accessors.
     _mem_handle: object = None
-
-    @classmethod
-    def _for_test(
-        cls,
-        *,
-        id: int,
-        pid: int,
-        flags: int,
-        syscall_nr: int,
-        arch: int,
-        instruction_pointer: int,
-        args: tuple[int, int, int, int, int, int],
-    ) -> HandlerCtx:
-        """Test-only constructor with no mem handle."""
-        return cls(
-            id=id, pid=pid, flags=flags, syscall_nr=syscall_nr,
-            arch=arch, instruction_pointer=instruction_pointer,
-            args=args, _mem_handle=None,
-        )
 
     def read_cstr(self, addr: int, max_len: int) -> str | None:
         """Read a NUL-terminated string from the child at ``addr``.
