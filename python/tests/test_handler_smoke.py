@@ -59,11 +59,28 @@ def test_notif_action_is_frozen():
 
 
 def test_exception_policy_enum_values_match_c_header():
-    # Must match include/sandlock.h SANDLOCK_EXCEPTION_* discriminants.
-    assert ExceptionPolicy.KILL == 0
-    assert ExceptionPolicy.DENY_EPERM == 1
-    assert ExceptionPolicy.CONTINUE == 2
-    assert ExceptionPolicy.DENY_EIO == 3
+    """ExceptionPolicy discriminants must match SANDLOCK_EXCEPTION_* in
+    the C header. Parse the real header so an ABI drift is caught."""
+    import re
+    from pathlib import Path
+
+    header = (
+        Path(__file__).resolve().parents[2]
+        / "crates" / "sandlock-ffi" / "include" / "sandlock.h"
+    )
+    text = header.read_text()
+    pairs = dict(
+        (m.group(1), int(m.group(2)))
+        for m in re.finditer(r"SANDLOCK_EXCEPTION_(\w+)\s*=\s*(\d+)", text)
+    )
+    assert pairs, "no SANDLOCK_EXCEPTION_* discriminants found in sandlock.h"
+    for c_name, c_val in pairs.items():
+        py_member = getattr(ExceptionPolicy, c_name)
+        assert int(py_member) == c_val, (
+            f"ExceptionPolicy.{c_name}={int(py_member)} != C header {c_val}"
+        )
+    for member in ExceptionPolicy:
+        assert member.name in pairs, f"ExceptionPolicy.{member.name} not in C header"
 
 
 def test_handler_subclass_has_default_kill_policy():
@@ -97,20 +114,40 @@ def test_base_handler_handle_raises_not_implemented():
 
 
 def test_action_kind_enum_values_match_c_header():
-    # Must match SANDLOCK_ACTION_* in crates/sandlock-ffi/include/sandlock.h.
+    """_ActionKind discriminants must match SANDLOCK_ACTION_* in the C
+    header. Parse the real header so an ABI drift is caught."""
+    import re
+    from pathlib import Path
+
     from sandlock.handler import _ActionKind
 
-    assert _ActionKind.UNSET == 0
-    assert _ActionKind.CONTINUE == 1
-    assert _ActionKind.ERRNO == 2
-    assert _ActionKind.RETURN_VALUE == 3
-    assert _ActionKind.INJECT_FD_SEND == 4
-    assert _ActionKind.INJECT_FD_SEND_TRACKED == 5
-    assert _ActionKind.HOLD == 6
-    assert _ActionKind.KILL == 7
+    header = (
+        Path(__file__).resolve().parents[2]
+        / "crates" / "sandlock-ffi" / "include" / "sandlock.h"
+    )
+    text = header.read_text()
+    # Extract `SANDLOCK_ACTION_<NAME> = <N>` pairs.
+    pairs = dict(
+        (m.group(1), int(m.group(2)))
+        for m in re.finditer(r"SANDLOCK_ACTION_(\w+)\s*=\s*(\d+)", text)
+    )
+    assert pairs, "no SANDLOCK_ACTION_* discriminants found in sandlock.h"
+    # Map C name -> Python _ActionKind member.
+    for c_name, c_val in pairs.items():
+        py_member = getattr(_ActionKind, c_name)
+        assert int(py_member) == c_val, (
+            f"_ActionKind.{c_name}={int(py_member)} != C header {c_val}"
+        )
+    # And every _ActionKind member must exist in the header.
+    for member in _ActionKind:
+        assert member.name in pairs, f"_ActionKind.{member.name} not in C header"
 
 
-def test_handler_ctx_exposes_notif_fields():
+def test_handler_ctx_dataclass_stores_fields():
+    """Pure unit test of HandlerCtx as a dataclass: _for_test stores the
+    kwargs 1:1. This covers storage only — the trampoline's notification
+    unpacking is covered by
+    test_handler_ctx_notif_fields_populated_from_real_notification."""
     from sandlock.handler import HandlerCtx
 
     # Construct via the test helper; the production constructor is
@@ -182,39 +219,57 @@ _PYTHON_READABLE = ["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev"]
 _SYSTEM_PYTHON = "/usr/bin/python3"
 
 
-class _OpenatCounter(Handler):
-    on_exception = ExceptionPolicy.CONTINUE  # audit-only — never block
+def test_smoke_audit_openat(tmp_dir):
+    """RFC #43 phasing item 2: an audit handler counts the child's
+    SYS_openat calls. Counts only opens of a unique probe file so the
+    assertion is not satisfiable by interpreter-startup openat noise.
 
-    def __init__(self):
-        self.count = 0
-
-    def handle(self, ctx):
-        self.count += 1
-        return NotifAction.continue_()
-
-
-def test_smoke_audit_openat():
-    """RFC #43 phasing item 2: audit handler counting SYS_openat."""
+    The probe is a plain file under tmp_dir, mirroring
+    test_handler_mem_read_cstr_reads_child_path: /etc/hostname is
+    virtualized by a builtin supervisor handler that intercepts the
+    notification before any user handler runs.
+    """
     if not os.path.exists(_SYSTEM_PYTHON):
         pytest.skip(f"{_SYSTEM_PYTHON} not available")
 
     SYS_openat = 257  # x86_64
 
-    sb = sandlock.Sandbox(fs_readable=_PYTHON_READABLE)
-    counter = _OpenatCounter()
+    probe = tmp_dir / "audit-probe-file"
+    probe.write_text("x")
+    probe_path = str(probe)
 
+    class _OpenatCounter(Handler):
+        on_exception = ExceptionPolicy.CONTINUE  # audit-only — never block
+
+        def __init__(self, target):
+            self.target = target
+            self.count = 0
+
+        def handle(self, ctx):
+            # openat(dirfd, pathname, flags, ...) -> pathname is args[1].
+            path = ctx.read_cstr(ctx.args[1], max_len=4096)
+            if path == self.target:
+                self.count += 1
+            return NotifAction.continue_()
+
+    sb = sandlock.Sandbox(fs_readable=[*_PYTHON_READABLE, str(tmp_dir)])
+    counter = _OpenatCounter(probe_path)
+    script = (
+        "import os\n"
+        "for _ in range(3):\n"
+        "    fd = os.open(%r, os.O_RDONLY)\n"
+        "    os.close(fd)\n" % probe_path
+    )
     result = sb.run_with_handlers(
-        cmd=[_SYSTEM_PYTHON, "-c",
-             "import os\n"
-             "for _ in range(3):\n"
-             "    fd = os.open('/etc/hostname', os.O_RDONLY)\n"
-             "    os.close(fd)\n"],
+        cmd=[_SYSTEM_PYTHON, "-c", script],
         handlers=[(SYS_openat, counter)],
     )
 
     assert result.success, result
-    assert counter.count >= 3, (
-        f"expected >=3 openat intercepts, got {counter.count}"
+    # Counts only opens of the unique probe path — interpreter-startup
+    # openat noise targets other paths and is excluded.
+    assert counter.count == 3, (
+        f"expected exactly 3 opens of the probe file, got {counter.count}"
     )
 
 
@@ -276,58 +331,101 @@ def test_handler_ctx_mem_handle_invalidated_after_handle():
     assert escaped.write(0x1000, b"x") is False
 
 
-class _RaisingHandler(Handler):
-    """Handler that always raises — exercises the trampoline's
-    exception path. on_exception is set per-test."""
+def test_handler_exception_continue_policy_lets_child_run(tmp_dir):
+    """A handler that RAISES, with on_exception=CONTINUE, lets the child
+    complete — and we verify the exception path was actually exercised,
+    not just that the child happened to succeed.
 
-    def __init__(self, on_exception):
-        self.on_exception = on_exception
-
-    def handle(self, ctx):
-        raise RuntimeError("intentional handler failure")
-
-
-def test_handler_exception_continue_policy_lets_child_run():
-    """A handler that raises, with on_exception=CONTINUE, must let the
-    child run to completion — the trampoline catches the exception and
-    the supervisor applies the Continue policy."""
+    The handler targets a probe file under tmp_dir, not /etc/hostname:
+    that path is virtualized by a builtin supervisor handler that
+    intercepts the notification before any user handler runs.
+    """
     if not os.path.exists(_SYSTEM_PYTHON):
         pytest.skip(f"{_SYSTEM_PYTHON} not available")
 
     SYS_openat = 257  # x86_64
-    sb = sandlock.Sandbox(fs_readable=_PYTHON_READABLE)
-    handler = _RaisingHandler(ExceptionPolicy.CONTINUE)
+
+    probe = tmp_dir / "probe.txt"
+    probe.write_text("payload\n")
+    probe_path = str(probe)
+
+    class _RaisingHandler(Handler):
+        on_exception = ExceptionPolicy.CONTINUE
+
+        def __init__(self, target):
+            self.target = target
+            self.raised = 0
+
+        def handle(self, ctx):
+            # Only act on the probe path; the loader's own openat calls
+            # hit other paths and must not be raised on.
+            path = ctx.read_cstr(ctx.args[1], max_len=4096)
+            if path == self.target:
+                self.raised += 1
+                raise RuntimeError("intentional handler failure")
+            return NotifAction.continue_()
+
+    sb = sandlock.Sandbox(fs_readable=[*_PYTHON_READABLE, str(tmp_dir)])
+    handler = _RaisingHandler(probe_path)
     result = sb.run_with_handlers(
         cmd=[_SYSTEM_PYTHON, "-c",
-             "import os\nfd = os.open('/etc/hostname', os.O_RDONLY)\nos.close(fd)\n"],
+             "import os; fd = os.open(%r, os.O_RDONLY); os.close(fd)" % probe_path],
         handlers=[(SYS_openat, handler)],
     )
-    # Continue policy: the openat proceeds despite the handler raising,
-    # so the child completes normally.
+    # The handler must have been called and must have raised — proving
+    # the trampoline's except-path + CONTINUE policy were exercised.
+    assert handler.raised >= 1, "handler.handle was never invoked / never raised"
+    # And with CONTINUE the raised exception did not block the child.
     assert result.success, result
 
 
-def test_handler_exception_kill_policy_terminates_child():
-    """A handler that raises, with on_exception=KILL, must terminate the
-    child — the trampoline catches the exception and the supervisor
-    applies the Kill policy."""
+def test_handler_exception_kill_policy_terminates_child(tmp_dir):
+    """A raising handler with on_exception=KILL terminates the child AT
+    the intercepted syscall — not merely 'the run failed somehow'.
+
+    The handler targets a probe file under tmp_dir, not /etc/hostname:
+    that path is virtualized by a builtin supervisor handler that
+    intercepts the notification before any user handler runs.
+    """
     if not os.path.exists(_SYSTEM_PYTHON):
         pytest.skip(f"{_SYSTEM_PYTHON} not available")
 
-    SYS_openat = 257
-    sb = sandlock.Sandbox(fs_readable=_PYTHON_READABLE)
-    handler = _RaisingHandler(ExceptionPolicy.KILL)
+    SYS_openat = 257  # x86_64
+
+    probe = tmp_dir / "probe.txt"
+    probe.write_text("payload\n")
+    probe_path = str(probe)
+
+    class _RaisingHandler(Handler):
+        on_exception = ExceptionPolicy.KILL
+
+        def __init__(self, target):
+            self.target = target
+
+        def handle(self, ctx):
+            path = ctx.read_cstr(ctx.args[1], max_len=4096)
+            if path == self.target:
+                raise RuntimeError("intentional handler failure")
+            return NotifAction.continue_()
+
+    sb = sandlock.Sandbox(fs_readable=[*_PYTHON_READABLE, str(tmp_dir)])
+    # BEFORE proves the child reached the open; AFTER proves it did NOT
+    # proceed past it. A run that crashes before the child starts shows
+    # neither marker -> the test fails, as it should.
+    script = (
+        "import os, sys\n"
+        "sys.stdout.write('BEFORE\\n'); sys.stdout.flush()\n"
+        "os.open(%r, os.O_RDONLY)\n"
+        "sys.stdout.write('AFTER\\n'); sys.stdout.flush()\n" % probe_path
+    )
     result = sb.run_with_handlers(
-        cmd=[_SYSTEM_PYTHON, "-c",
-             "import os\nfd = os.open('/etc/hostname', os.O_RDONLY)\nos.close(fd)\n"],
-        handlers=[(SYS_openat, handler)],
+        cmd=[_SYSTEM_PYTHON, "-c", script],
+        handlers=[(SYS_openat, _RaisingHandler(probe_path))],
     )
-    # Kill policy: the first intercepted openat that the raising handler
-    # touches kills the child's process group, so the run does not
-    # succeed.
-    assert not result.success, (
-        f"expected child terminated by Kill policy, got success: {result}"
-    )
+    stdout = result.stdout
+    assert b"BEFORE" in stdout, f"child never reached the syscall: {stdout!r}"
+    assert b"AFTER" not in stdout, f"child proceeded past the kill point: {stdout!r}"
+    assert not result.success, result
 
 
 # ----------------------------------------------------------------
@@ -497,6 +595,63 @@ def test_handler_mem_read_cstr_reads_child_path(tmp_dir):
     # Handler read the real probe path from child memory and denied it.
     assert str(probe) in seen_paths, seen_paths
     assert not result.success, result
+
+
+def test_handler_ctx_notif_fields_populated_from_real_notification(tmp_dir):
+    """HandlerCtx fields must be unpacked correctly from the C
+    notification by the trampoline — not just stored by the dataclass.
+    Exercise the real run_with_handlers -> trampoline path.
+
+    The child opens a probe file under tmp_dir, not /etc/hostname:
+    that path is virtualized by a builtin supervisor handler that
+    intercepts the notification before any user handler runs.
+    """
+    if not os.path.exists(_SYSTEM_PYTHON):
+        pytest.skip(f"{_SYSTEM_PYTHON} not available")
+
+    SYS_openat = 257  # x86_64
+
+    probe = tmp_dir / "probe.txt"
+    probe.write_text("payload\n")
+    probe_path = str(probe)
+
+    seen = {}
+
+    class _FieldInspector(Handler):
+        on_exception = ExceptionPolicy.CONTINUE
+
+        def __init__(self, target):
+            self.target = target
+
+        def handle(self, ctx):
+            # Record the notification the trampoline built — but only for
+            # the probe open, so the loader's own openat calls (other
+            # paths) do not overwrite the recorded fields.
+            path = ctx.read_cstr(ctx.args[1], max_len=4096)
+            if path == self.target:
+                seen["syscall_nr"] = ctx.syscall_nr
+                seen["pid"] = ctx.pid
+                seen["args_len"] = len(ctx.args)
+                seen["arg1_is_ptr"] = ctx.args[1]  # openat pathname pointer
+            return NotifAction.continue_()
+
+    sb = sandlock.Sandbox(fs_readable=[*_PYTHON_READABLE, str(tmp_dir)])
+    result = sb.run_with_handlers(
+        cmd=[_SYSTEM_PYTHON, "-c",
+             "import os; fd = os.open(%r, os.O_RDONLY); os.close(fd)" % probe_path],
+        handlers=[(SYS_openat, _FieldInspector(probe_path))],
+    )
+    assert result.success, result
+    # The handler ran for the probe's SYS_openat: syscall_nr must equal
+    # the registered number — a field-swap in the trampoline (e.g.
+    # syscall_nr <- arch) would make this fail.
+    assert seen.get("syscall_nr") == SYS_openat, seen
+    # pid must be a real, positive child pid.
+    assert isinstance(seen.get("pid"), int) and seen["pid"] > 0, seen
+    # openat takes 6 syscall args; args[1] (pathname pointer) must be a
+    # non-zero userspace address.
+    assert seen.get("args_len") == 6, seen
+    assert isinstance(seen.get("arg1_is_ptr"), int) and seen["arg1_is_ptr"] > 0, seen
 
 
 def test_run_with_handlers_empty_handler_list():
