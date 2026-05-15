@@ -333,6 +333,11 @@ pub enum sandlock_exception_policy_t {
     /// only safe when the syscall is *also* allowed by the BPF filter and
     /// Landlock layer (e.g. observability handlers).
     Continue = 2,
+    /// Treat the failure as `NotifAction::Errno(EIO)`. Idiomatic for
+    /// audit-only handlers: EIO propagates to the caller as a plain
+    /// `OSError` rather than `PermissionError`, which is closer to what
+    /// callers expect from a failed syscall.
+    DenyEio = 3,
 }
 
 /// C-callable handler entry point.
@@ -417,7 +422,7 @@ impl Drop for sandlock_handler_t {
 /// (b) the supervisor takes ownership via `sandlock_run_with_handlers`
 /// and the run completes.
 /// If `on_exception` does not match a defined `sandlock_exception_policy_t`
-/// discriminant (0, 1, or 2), the call returns null and no allocation occurs.
+/// discriminant (0, 1, 2, or 3), the call returns null and no allocation occurs.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_handler_new(
     handler_fn: Option<sandlock_handler_fn_t>,
@@ -432,6 +437,7 @@ pub unsafe extern "C" fn sandlock_handler_new(
         0 => sandlock_exception_policy_t::Kill,
         1 => sandlock_exception_policy_t::DenyEperm,
         2 => sandlock_exception_policy_t::Continue,
+        3 => sandlock_exception_policy_t::DenyEio,
         // Reject out-of-range discriminants at the FFI boundary so we never
         // store an invalid enum value into the struct — reading one later
         // via `match` would be undefined behaviour.

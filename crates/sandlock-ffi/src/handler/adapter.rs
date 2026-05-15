@@ -77,6 +77,7 @@ impl FfiHandler {
                 }
             }
             sandlock_exception_policy_t::DenyEperm => NotifAction::Errno(libc::EPERM),
+            sandlock_exception_policy_t::DenyEio => NotifAction::Errno(libc::EIO),
             sandlock_exception_policy_t::Continue => NotifAction::Continue,
         }
     }

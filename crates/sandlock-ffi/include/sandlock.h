@@ -245,6 +245,10 @@ typedef enum sandlock_exception_policy {
     SANDLOCK_EXCEPTION_DENY_EPERM = 1,
     /** Let the syscall continue unchanged (explicit fail-open). */
     SANDLOCK_EXCEPTION_CONTINUE   = 2,
+    /** Fail the syscall with EIO. Idiomatic for audit-only handlers that
+     *  propagate the failure as a plain OSError rather than
+     *  PermissionError. */
+    SANDLOCK_EXCEPTION_DENY_EIO   = 3,
 } sandlock_exception_policy_t;
 
 /** Opaque handler container.

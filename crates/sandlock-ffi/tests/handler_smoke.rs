@@ -241,10 +241,10 @@ fn handler_new_and_free_round_trip() {
 
 #[test]
 fn handler_new_rejects_invalid_exception_policy() {
-    // Cover the boundary (one past the highest valid Continue=2),
+    // Cover the boundary (one past the highest valid DenyEio=3),
     // a mid-range value, and the extreme u32::MAX. A mutation that
     // rejects only specific values would fail at least one of these.
-    for bad in [3u32, 4u32, 99u32, u32::MAX] {
+    for bad in [4u32, 5u32, 99u32, u32::MAX] {
         let h = unsafe {
             sandlock_handler_new(
                 Some(test_handler as sandlock_handler_fn_t),
@@ -2111,4 +2111,29 @@ fn a5_handler_free_unwinds_on_panicking_dropper() {
         result.is_err(),
         "expected sandlock_handler_free to unwind a panicking dropper instead of aborting",
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ffi_handler_deny_eio_policy_on_callback_rc_nonzero() {
+    extern "C-unwind" fn returns_error(
+        _ud: *mut std::ffi::c_void,
+        _n: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
+        _m: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
+        _out: *mut sandlock_ffi::handler::sandlock_action_out_t,
+    ) -> i32 {
+        -1
+    }
+    let raw = unsafe {
+        sandlock_ffi::handler::sandlock_handler_new(
+            Some(returns_error),
+            std::ptr::null_mut(),
+            None,
+            sandlock_ffi::handler::sandlock_exception_policy_t::DenyEio as u32,
+        )
+    };
+    let h = unsafe { sandlock_ffi::handler::FfiHandler::from_raw(raw) };
+    let cx = fake_ctx();
+    let action = h.handle(&cx).await;
+    assert!(matches!(action, NotifAction::Errno(e) if e == libc::EIO),
+            "expected Errno(EIO), got {:?}", action);
 }
