@@ -88,6 +88,11 @@ class NotifAction:
         returning this action, regardless of whether the dispatch
         actually fires (the supervisor handles cleanup on all paths).
         """
+        if not isinstance(srcfd, int) or srcfd < 0:
+            raise ValueError(
+                f"inject_fd_send: srcfd must be a non-negative int, "
+                f"got {srcfd!r}"
+            )
         return cls(
             kind=int(_ActionKind.INJECT_FD_SEND),
             srcfd=srcfd,
@@ -120,6 +125,17 @@ class Handler:
     registered with. The Sandbox holds a Python-side reference for the
     duration of the run; the underlying C container's ``ud_drop``
     releases that reference when the run completes (or fails).
+
+    Concurrency: the supervisor MAY invoke ``handle()`` concurrently for
+    the same Handler instance, on different worker threads, for
+    different notifications. If ``handle()`` mutates instance state,
+    guard it with your own synchronization — the wrapper does not
+    serialize handler dispatch.
+
+    Promptness: ``handle()`` must return quickly. It runs synchronously
+    inside the supervisor's dispatch path while holding the GIL; a
+    handler that blocks (a long sleep, a blocking I/O call, an infinite
+    loop) stalls the supervisor and can wedge the entire run.
     """
 
     on_exception: ExceptionPolicy = ExceptionPolicy.KILL

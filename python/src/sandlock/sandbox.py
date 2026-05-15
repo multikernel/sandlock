@@ -580,6 +580,14 @@ class Sandbox:
         # must NOT call sandlock_handler_free on any container handed in.
         regs = (_SandlockHandlerRegistration * len(handlers))()
         registered_ids: list[int] = []
+        # ``i`` is referenced in the rollback path; keep it bound even if
+        # ``handlers`` is empty and the loop never runs.
+        i = 0
+        # A container produced by sandlock_handler_new but not yet stored
+        # into ``regs`` is owned by neither the regs array nor the
+        # supervisor. Track it here so the rollback path can free it;
+        # clear it back to None the instant ownership moves into regs.
+        container = None
         try:
             for i, (syscall_nr, handler) in enumerate(handlers):
                 hid = _handler_ffi._register_handler(handler)
@@ -597,6 +605,10 @@ class Sandbox:
                     )
                 regs[i].syscall_nr = int(syscall_nr)
                 regs[i].handler = container
+                # Ownership now lives in regs[i]; clear the pending ref so
+                # the rollback path does not double-free it (regs[i] is
+                # already covered by the range(i) loop below).
+                container = None
         except BaseException:
             # Roll back: free every handler container already allocated
             # in this loop. sandlock_handler_free fires the container's
@@ -609,16 +621,26 @@ class Sandbox:
             for j in range(i):
                 if regs[j].handler:
                     _lib.sandlock_handler_free(regs[j].handler)
-            # The current slot `i` registered a handler id but never got
-            # a container (sandlock_handler_new failed or a later line
-            # raised), so its ud_drop will never fire — drop it by hand.
+            # A container created by sandlock_handler_new in the failing
+            # iteration but not yet stored into regs[i] (e.g.
+            # int(syscall_nr) raised between the alloc and the store).
+            # It is owned by nothing else — free it here. After a
+            # successful store ``container`` is None, so this branch
+            # never double-frees a container already covered above.
+            if container:
+                _lib.sandlock_handler_free(container)
+            # The current slot `i` registered a handler id but its
+            # container's ud_drop will never fire (either no container
+            # was created, or the one created above is freed by hand and
+            # its ud_drop only clears that same id) — drop it by hand.
             if i < len(registered_ids):
                 _handler_ffi._unregister_handler(registered_ids[i])
             raise
 
+        name_b = _encode(resolved_name)
         result_p = _lib.sandlock_run_with_handlers(
             native.ptr,
-            _encode(resolved_name),
+            name_b,
             argv,
             argc,
             regs,

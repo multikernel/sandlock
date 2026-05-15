@@ -39,6 +39,13 @@ from . import _sdk
 from .handler import Handler, HandlerCtx, NotifAction, _ActionKind, _MemHandle
 
 
+# ``ctypes.pythonapi`` is a process-global ``PyDLL``; its function
+# objects are shared with every other module in the process. Pin
+# ``Py_IsInitialized``'s restype explicitly so dispatch never relies on
+# the default (``c_int``) that another module could overwrite.
+ctypes.pythonapi.Py_IsInitialized.restype = ctypes.c_int
+
+
 # ----------------------------------------------------------------
 # Handler registry
 # ----------------------------------------------------------------

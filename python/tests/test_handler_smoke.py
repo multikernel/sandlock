@@ -41,6 +41,12 @@ def test_notif_action_inject_fd_send_with_flags():
     assert a.newfd_flags == 0o2000000
 
 
+def test_inject_fd_send_rejects_negative_srcfd():
+    import pytest
+    with pytest.raises(ValueError):
+        NotifAction.inject_fd_send(-1)
+
+
 def test_notif_action_is_frozen():
     import dataclasses
     a = NotifAction.continue_()
