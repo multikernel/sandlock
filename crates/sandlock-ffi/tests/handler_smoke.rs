@@ -855,7 +855,7 @@ async fn k1_no_supervisor_signal_on_pid_zero_kill() {
     // on Linux).
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = sigurg_handler as usize;
+        sa.sa_sigaction = sigurg_handler as *const () as usize;
         libc::sigemptyset(&mut sa.sa_mask);
         libc::sigaction(libc::SIGURG, &sa, std::ptr::null_mut());
     }
