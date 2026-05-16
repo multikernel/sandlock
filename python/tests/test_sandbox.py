@@ -25,6 +25,17 @@ def _policy(**overrides):
     return Sandbox(**defaults)
 
 
+def _join_threads_or_fail(threads, timeout: float):
+    deadline = time.monotonic() + timeout
+    for thread in threads:
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+
+    alive = [thread.name for thread in threads if thread.is_alive()]
+    assert not alive, (
+        f"threads did not finish within {timeout:g}s: {', '.join(alive)}"
+    )
+
+
 class TestSandboxRun:
     def test_simple_command(self):
         result = _policy().run(["echo", "hello"])
@@ -74,6 +85,126 @@ class TestSandboxRun:
         result = policy.run(["cat", str(secret)])
 
         assert not result.success
+
+
+class TestSandlockRunCAbiMultiThreaded:
+    """Regression for issue #47 covering only the C ABI ``sandlock_run`` path.
+
+    Tests here invoke ``_lib.sandlock_run`` directly through ctypes from
+    multiple threads, then assert all calls succeed and produce the
+    expected output. The Python ``Sandbox.run()`` user-facing path is
+    covered by :class:`TestSandboxRunMultiThreaded` below; it uses
+    ``sandlock_create_for_run`` so the parked handle still exposes
+    PID/pause/resume during ``run()``.
+
+    Note: these tests assert "concurrent multi-threaded callers do not
+    deadlock or corrupt each other"; they are not red-on-pristine
+    against a regression that re-introduces the eager multi-thread
+    worker-spawn pattern, because glibc transparently falls back from
+    ``clone3`` to ``clone(2)`` on an unrestricted dev box. The original
+    failure mode requires a host with ``clone3`` blocked by seccomp
+    (Kubernetes ``RuntimeDefault``).
+    """
+
+    @staticmethod
+    def _run_via_c_abi(name: str, cmd):
+        """Invoke ``sandlock_run`` directly, bypassing Python ``Sandbox.run``."""
+        import ctypes
+        from sandlock._sdk import _lib, _make_argv, _read_result_bytes, Result
+
+        sb = Sandbox(name=name, fs_readable=_PYTHON_READABLE)
+        native = sb._ensure_native()
+        argv, argc = _make_argv(list(cmd))
+        name_b = name.encode("utf-8") + b"\x00"
+
+        result_p = _lib.sandlock_run(
+            native.ptr, ctypes.c_char_p(name_b), argv, argc,
+        )
+        if not result_p:
+            return Result(success=False, exit_code=-1, error="sandlock_run returned NULL")
+
+        exit_code = _lib.sandlock_result_exit_code(result_p)
+        success = _lib.sandlock_result_success(result_p)
+        stdout = _read_result_bytes(result_p, _lib.sandlock_result_stdout_bytes)
+        stderr = _read_result_bytes(result_p, _lib.sandlock_result_stderr_bytes)
+        _lib.sandlock_result_free(result_p)
+        return Result(
+            success=bool(success), exit_code=exit_code,
+            stdout=stdout, stderr=stderr,
+        )
+
+    def test_concurrent_sandlock_run_from_many_threads(self):
+        N = 8
+        results = [None] * N
+        errors = [None] * N
+
+        def worker(i: int):
+            try:
+                results[i] = self._run_via_c_abi(
+                    f"issue47-cabi-{i}", ["echo", f"hello from thread {i}"],
+                )
+            except Exception as e:
+                errors[i] = e
+
+        threads = [
+            threading.Thread(
+                target=worker,
+                args=(i,),
+                name=f"issue47-cabi-{i}",
+                daemon=True,
+            )
+            for i in range(N)
+        ]
+        for t in threads:
+            t.start()
+        _join_threads_or_fail(threads, timeout=30)
+
+        for i in range(N):
+            assert errors[i] is None, f"thread {i} raised: {errors[i]}"
+            assert results[i] is not None, f"thread {i} produced no result"
+            assert results[i].success, (
+                f"thread {i}: success=False exit={results[i].exit_code} "
+                f"error={results[i].error!r}"
+            )
+            assert f"hello from thread {i}".encode() in results[i].stdout
+
+
+class TestSandboxRunMultiThreaded:
+    """Regression for issue #47 on the Python user-facing ``Sandbox.run`` path."""
+
+    def test_concurrent_run_from_many_threads(self):
+        N = 8
+        results = [None] * N
+        errors = [None] * N
+
+        def worker(i: int):
+            try:
+                sb = Sandbox(name=f"issue47-python-{i}", fs_readable=_PYTHON_READABLE)
+                results[i] = sb.run(["echo", f"hello from thread {i}"])
+            except Exception as e:
+                errors[i] = e
+
+        threads = [
+            threading.Thread(
+                target=worker,
+                args=(i,),
+                name=f"issue47-python-{i}",
+                daemon=True,
+            )
+            for i in range(N)
+        ]
+        for t in threads:
+            t.start()
+        _join_threads_or_fail(threads, timeout=30)
+
+        for i in range(N):
+            assert errors[i] is None, f"thread {i} raised: {errors[i]}"
+            assert results[i] is not None, f"thread {i} produced no result"
+            assert results[i].success, (
+                f"thread {i}: success=False exit={results[i].exit_code} "
+                f"error={results[i].error!r}"
+            )
+            assert f"hello from thread {i}".encode() in results[i].stdout
 
 
 class TestPortRemap:
