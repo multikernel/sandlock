@@ -232,6 +232,9 @@ _c_handle_p = ctypes.c_void_p
 _lib.sandlock_create.restype = _c_handle_p
 _lib.sandlock_create.argtypes = [_c_policy_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
 
+_lib.sandlock_create_for_run.restype = _c_handle_p
+_lib.sandlock_create_for_run.argtypes = [_c_policy_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
+
 _lib.sandlock_start.restype = ctypes.c_int
 _lib.sandlock_start.argtypes = [_c_handle_p]
 

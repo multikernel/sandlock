@@ -16,7 +16,7 @@ pub mod handler;
 pub mod notif_repr;
 mod runtime;
 
-use runtime::{block_on_runtime, build_live_runtime, with_runtime};
+use runtime::{block_on_runtime, build_live_runtime, build_runtime, with_runtime};
 
 // ----------------------------------------------------------------
 // Opaque wrapper types
@@ -727,12 +727,12 @@ pub struct sandlock_handle_t {
 /// `policy` must be a valid policy pointer. `name` may be NULL to
 /// auto-generate a sandbox name, or a valid NUL-terminated string.
 /// `argv` must point to `argc` C strings.
-#[no_mangle]
-pub unsafe extern "C" fn sandlock_create(
+unsafe fn sandlock_create_with_runtime(
     policy: *const sandlock_sandbox_t,
     name: *const c_char,
     argv: *const *const c_char,
     argc: c_uint,
+    build_rt: fn() -> Option<tokio::runtime::Runtime>,
 ) -> *mut sandlock_handle_t {
     if policy.is_null() || argv.is_null() { return ptr::null_mut(); }
     let policy = &(*policy)._private;
@@ -743,7 +743,7 @@ pub unsafe extern "C" fn sandlock_create(
     let args = read_argv(argv, argc);
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
-    let rt = match build_live_runtime() {
+    let rt = match build_rt() {
         Some(rt) => rt,
         None => return ptr::null_mut(),
     };
@@ -758,6 +758,37 @@ pub unsafe extern "C" fn sandlock_create(
     }
 
     Box::into_raw(Box::new(sandlock_handle_t { sandbox: sb, runtime: rt }))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_create(
+    policy: *const sandlock_sandbox_t,
+    name: *const c_char,
+    argv: *const *const c_char,
+    argc: c_uint,
+) -> *mut sandlock_handle_t {
+    sandlock_create_with_runtime(policy, name, argv, argc, build_live_runtime)
+}
+
+/// Create a sandbox handle for immediate start+wait use on the calling
+/// FFI thread. Unlike `sandlock_create`, this uses the thread-local
+/// `current_thread` runtime and does not create Tokio worker threads.
+///
+/// This is intended for blocking one-shot wrappers that call
+/// `sandlock_start` and `sandlock_handle_wait*` immediately from the
+/// same thread. Long-lived handles should use `sandlock_create` so the
+/// supervisor keeps progressing between FFI calls.
+///
+/// # Safety
+/// Same constraints as `sandlock_create`.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_create_for_run(
+    policy: *const sandlock_sandbox_t,
+    name: *const c_char,
+    argv: *const *const c_char,
+    argc: c_uint,
+) -> *mut sandlock_handle_t {
+    sandlock_create_with_runtime(policy, name, argv, argc, build_runtime)
 }
 
 /// Release a previously `sandlock_create`d child to execve. Returns 0 on

@@ -485,7 +485,10 @@ class Sandbox:
         resolved_name = self._resolve_name()
 
         # Create (parked) so PID is available for pause/resume, then start.
-        self._handle = _lib.sandlock_create(
+        # The one-shot run path immediately drives wait on this same Python
+        # thread, so it can use the FFI current-thread runtime and avoid
+        # eager Tokio worker-thread creation.
+        self._handle = _lib.sandlock_create_for_run(
             native.ptr, _encode(resolved_name), argv, argc,
         )
         if not self._handle:
