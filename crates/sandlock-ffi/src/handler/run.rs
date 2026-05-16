@@ -107,15 +107,6 @@ fn block_on_run(
     handlers: Vec<(i64, FfiHandler)>,
     interactive: bool,
 ) -> Option<Result<RunResult, SandlockError>> {
-    // Use a fresh runtime — sandlock-core already pulls in tokio with
-    // rt-multi-thread; this matches the pattern used by the existing
-    // `sandlock_run` path. A panic in an `extern "C"`-reachable path is
-    // UB, so we report runtime-build failure to the caller via `None`
-    // instead of unwrapping.
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .ok()?;
     let cmd_refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
     // Apply `name` via the builder method on a clone — mirrors the
     // pattern used by `sandlock_run` in lib.rs. A `None` here means
@@ -124,7 +115,11 @@ fn block_on_run(
         Some(n) => sandbox.clone().with_name(n),
         None => sandbox.clone(),
     };
-    Some(rt.block_on(async move {
+    // Drives the supervisor on the shared per-thread runtime; see
+    // `crate::runtime` for why this is `current_thread`. This path is
+    // reached from `extern "C-unwind"` entry points, so user callback
+    // panics are intentionally allowed to propagate.
+    crate::runtime::with_runtime_unwind(|rt| rt.block_on(async move {
         if interactive {
             sb.run_interactive_with_extra_handlers(&cmd_refs, handlers).await
         } else {

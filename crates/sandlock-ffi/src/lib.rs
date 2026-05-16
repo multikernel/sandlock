@@ -14,6 +14,9 @@ use sandlock_core::{Sandbox, RunResult};
 
 pub mod handler;
 pub mod notif_repr;
+mod runtime;
+
+use runtime::{block_on_runtime, build_live_runtime, with_runtime};
 
 // ----------------------------------------------------------------
 // Opaque wrapper types
@@ -691,17 +694,13 @@ pub unsafe extern "C" fn sandlock_run(
     let args = read_argv(argv, argc);
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(_) => return ptr::null_mut(),
-    };
     let mut sb = match name {
         Some(ref n) => policy.clone().with_name(n.clone()),
         None => policy.clone(),
     };
-    match rt.block_on(sb.run(&arg_refs)) {
-        Ok(result) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
-        Err(_) => ptr::null_mut(),
+    match with_runtime(|rt| rt.block_on(sb.run(&arg_refs))) {
+        Some(Ok(result)) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
+        _ => ptr::null_mut(),
     }
 }
 
@@ -710,7 +709,10 @@ pub unsafe extern "C" fn sandlock_run(
 // ----------------------------------------------------------------
 
 /// Opaque handle for a live sandbox.
-/// Owns both the Sandbox and the tokio Runtime that drives its supervisor.
+///
+/// Owns both the Sandbox and a small Tokio runtime that drives its
+/// supervisor. Live handles need a runtime whose spawned tasks keep
+/// progressing after `sandlock_start` returns.
 #[allow(non_camel_case_types)]
 pub struct sandlock_handle_t {
     sandbox: Sandbox,
@@ -741,9 +743,9 @@ pub unsafe extern "C" fn sandlock_create(
     let args = read_argv(argv, argc);
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(_) => return ptr::null_mut(),
+    let rt = match build_live_runtime() {
+        Some(rt) => rt,
+        None => return ptr::null_mut(),
     };
 
     let mut sb = match name {
@@ -751,7 +753,7 @@ pub unsafe extern "C" fn sandlock_create(
         None => policy.clone(),
     };
 
-    if rt.block_on(sb.create(&arg_refs)).is_err() {
+    if !matches!(block_on_runtime(&rt, sb.create(&arg_refs)), Some(Ok(()))) {
         return ptr::null_mut();
     }
 
@@ -789,9 +791,9 @@ pub unsafe extern "C" fn sandlock_handle_pid(h: *const sandlock_handle_t) -> i32
 pub unsafe extern "C" fn sandlock_handle_wait(h: *mut sandlock_handle_t) -> *mut sandlock_result_t {
     if h.is_null() { return ptr::null_mut(); }
     let h = &mut *h;
-    match h.runtime.block_on(h.sandbox.wait()) {
-        Ok(result) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
-        Err(_) => ptr::null_mut(),
+    match block_on_runtime(&h.runtime, h.sandbox.wait()) {
+        Some(Ok(result)) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
+        _ => ptr::null_mut(),
     }
 }
 
@@ -811,19 +813,19 @@ pub unsafe extern "C" fn sandlock_handle_wait_timeout(
 
     if timeout_ms == 0 {
         // No timeout -- same as sandlock_handle_wait.
-        return match h.runtime.block_on(h.sandbox.wait()) {
-            Ok(result) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
-            Err(_) => ptr::null_mut(),
+        return match block_on_runtime(&h.runtime, h.sandbox.wait()) {
+            Some(Ok(result)) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
+            _ => ptr::null_mut(),
         };
     }
 
     let dur = Duration::from_millis(timeout_ms);
-    match h.runtime.block_on(async {
+    match block_on_runtime(&h.runtime, async {
         tokio::time::timeout(dur, h.sandbox.wait()).await
     }) {
-        Ok(Ok(result)) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
-        Ok(Err(_)) => ptr::null_mut(),
-        Err(_) => {
+        Some(Ok(Ok(result))) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
+        Some(Ok(Err(_))) | None => ptr::null_mut(),
+        Some(Err(_)) => {
             // Timeout -- kill the process and return a timeout result.
             let _ = h.sandbox.kill();
             let result = RunResult::timeout();
@@ -844,7 +846,10 @@ pub unsafe extern "C" fn sandlock_handle_port_mappings(
 ) -> *mut c_char {
     if h.is_null() { return ptr::null_mut(); }
     let h = &*h;
-    let map = h.runtime.block_on(h.sandbox.port_mappings());
+    let map = match block_on_runtime(&h.runtime, h.sandbox.port_mappings()) {
+        Some(map) => map,
+        None => return ptr::null_mut(),
+    };
     if map.is_empty() { return ptr::null_mut(); }
     let json = serde_json::to_string(&map).unwrap_or_default();
     match CString::new(json) {
@@ -887,17 +892,13 @@ pub unsafe extern "C" fn sandlock_run_interactive(
     let args = read_argv(argv, argc);
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(_) => return -1,
-    };
     let mut sb = match name {
         Some(ref n) => policy.clone().with_name(n.clone()),
         None => policy.clone(),
     };
-    match rt.block_on(sb.run_interactive(&arg_refs)) {
-        Ok(result) => result.code().unwrap_or(-1),
-        Err(_) => -1,
+    match with_runtime(|rt| rt.block_on(sb.run_interactive(&arg_refs))) {
+        Some(Ok(result)) => result.code().unwrap_or(-1),
+        _ => -1,
     }
 }
 
@@ -1039,17 +1040,13 @@ pub unsafe extern "C" fn sandlock_dry_run(
     let args = read_argv(argv, argc);
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(_) => return ptr::null_mut(),
-    };
     let mut sb = match name {
         Some(ref n) => policy.clone().with_name(n.clone()),
         None => policy.clone(),
     };
-    match rt.block_on(sb.dry_run(&arg_refs)) {
-        Ok(result) => Box::into_raw(Box::new(sandlock_dry_run_result_t { _private: result })),
-        Err(_) => ptr::null_mut(),
+    match with_runtime(|rt| rt.block_on(sb.dry_run(&arg_refs))) {
+        Some(Ok(result)) => Box::into_raw(Box::new(sandlock_dry_run_result_t { _private: result })),
+        _ => ptr::null_mut(),
     }
 }
 
@@ -1221,14 +1218,9 @@ pub unsafe extern "C" fn sandlock_pipeline_run(
         None
     };
 
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(_) => return ptr::null_mut(),
-    };
-
-    match rt.block_on(pipeline.run(timeout)) {
-        Ok(result) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
-        Err(_) => ptr::null_mut(),
+    match with_runtime(|rt| rt.block_on(pipeline.run(timeout))) {
+        Some(Ok(result)) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
+        _ => ptr::null_mut(),
     }
 }
 
@@ -1327,14 +1319,9 @@ pub unsafe extern "C" fn sandlock_gather_run(
         None
     };
 
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(_) => return ptr::null_mut(),
-    };
-
-    match rt.block_on(gather.run(timeout)) {
-        Ok(result) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
-        Err(_) => ptr::null_mut(),
+    match with_runtime(|rt| rt.block_on(gather.run(timeout))) {
+        Some(Ok(result)) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
+        _ => ptr::null_mut(),
     }
 }
 
@@ -1625,14 +1612,9 @@ pub unsafe extern "C" fn sandlock_fork(
     if sb.is_null() { return ptr::null_mut(); }
     let sb = &mut *sb;
 
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(_) => return ptr::null_mut(),
-    };
-
-    match rt.block_on(sb.fork(n)) {
-        Ok(clones) => Box::into_raw(Box::new(sandlock_fork_result_t { clones })),
-        Err(_) => ptr::null_mut(),
+    match with_runtime(|rt| rt.block_on(sb.fork(n))) {
+        Some(Ok(clones)) => Box::into_raw(Box::new(sandlock_fork_result_t { clones })),
+        _ => ptr::null_mut(),
     }
 }
 
@@ -1676,19 +1658,14 @@ pub unsafe extern "C" fn sandlock_reduce(
     let args = read_argv(argv, argc);
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(_) => return ptr::null_mut(),
-    };
-
     let reducer = match name {
         Some(ref n) => policy.clone().with_name(n.clone()),
         None => policy.clone(),
     };
 
-    match rt.block_on(reducer.reduce(&arg_refs, &mut fr.clones.as_mut_slice())) {
-        Ok(result) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
-        Err(_) => ptr::null_mut(),
+    match with_runtime(|rt| rt.block_on(reducer.reduce(&arg_refs, &mut fr.clones.as_mut_slice()))) {
+        Some(Ok(result)) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
+        _ => ptr::null_mut(),
     }
 }
 
@@ -1707,14 +1684,9 @@ pub unsafe extern "C" fn sandlock_wait(sb: *mut Sandbox) -> c_int {
     if sb.is_null() { return -1; }
     let sb = &mut *sb;
 
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(_) => return -1,
-    };
-
-    match rt.block_on(sb.wait()) {
-        Ok(r) => r.code().unwrap_or(-1),
-        Err(_) => -1,
+    match with_runtime(|rt| rt.block_on(sb.wait())) {
+        Some(Ok(r)) => r.code().unwrap_or(-1),
+        _ => -1,
     }
 }
 
@@ -1749,9 +1721,9 @@ pub unsafe extern "C" fn sandlock_handle_checkpoint(
 ) -> *mut sandlock_checkpoint_t {
     if h.is_null() { return ptr::null_mut(); }
     let h = &mut *h;
-    match h.runtime.block_on(h.sandbox.checkpoint()) {
-        Ok(cp) => Box::into_raw(Box::new(sandlock_checkpoint_t { _private: cp })),
-        Err(_) => ptr::null_mut(),
+    match block_on_runtime(&h.runtime, h.sandbox.checkpoint()) {
+        Some(Ok(cp)) => Box::into_raw(Box::new(sandlock_checkpoint_t { _private: cp })),
+        _ => ptr::null_mut(),
     }
 }
 
