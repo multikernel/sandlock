@@ -113,11 +113,18 @@ fn set_port_in_sockaddr(bytes: &mut [u8], port: u16) {
 /// Handle bind syscalls on behalf of the child process (TOCTOU-safe).
 ///
 /// Performs bind() in the supervisor using a duplicated copy of the child's
-/// socket fd (via pidfd_getfd). For AF_INET/AF_INET6 with a non-zero port,
-/// the supervisor binds the child's actual socket directly: it tries the
-/// virtual port first, and on EADDRINUSE retries with port 0 to let the
-/// kernel pick a free ephemeral port. Recording in `port_map` happens only
-/// after the bind succeeds, so a failed bind leaves no stale mapping.
+/// socket fd (via pidfd_getfd). For AF_INET/AF_INET6 with a non-zero port:
+///
+///   1. Pick a first-attempt port: the cached real port if `port_map` has
+///      one for this virtual port, else the virtual port itself.
+///   2. Bind the child's socket to that port. On `EADDRINUSE`, retry with
+///      port 0 so the kernel picks a fresh real port. The retry covers
+///      both the first-time host conflict and the stale-cache case where
+///      our previously-allocated real port was reclaimed by another
+///      process after the prior socket was closed.
+///   3. `record_bind` runs only after the bind succeeds, and only when
+///      the mapping actually changed — failed binds leave no stale
+///      forward-map entry.
 ///
 /// bind(sockfd, addr, addrlen): args[0]=fd, args[1]=addr_ptr, args[2]=addrlen
 pub(crate) async fn handle_bind(
@@ -152,20 +159,17 @@ pub(crate) async fn handle_bind(
         _ => return bind_verbatim(&dup_fd, &bytes, addr_len),
     };
 
-    // Cached mapping: this virtual port has already been bound in this
-    // sandbox. Reuse the same real port so getsockname/connect stay
-    // consistent with the original mapping.
+    // Pick a first-attempt port: cached real port if known, else the
+    // virtual port itself. The cached real port keeps repeat binds of
+    // the same virtual port consistent across the sandbox; the virtual
+    // port itself is the natural identity-bind target.
     let cached_real = {
         let ns = network.lock().await;
         ns.port_map.get_real(virtual_port)
     };
-    if let Some(real) = cached_real {
-        set_port_in_sockaddr(&mut bytes, real);
-        return bind_verbatim(&dup_fd, &bytes, addr_len);
-    }
+    let attempt_port = cached_real.unwrap_or(virtual_port);
+    set_port_in_sockaddr(&mut bytes, attempt_port);
 
-    // First time binding this virtual port. Try it directly on the
-    // child's socket — single atomic syscall, no probe-and-close race.
     let ret = unsafe {
         libc::bind(
             dup_fd.as_raw_fd(),
@@ -174,7 +178,11 @@ pub(crate) async fn handle_bind(
         )
     };
     if ret == 0 {
-        network.lock().await.port_map.record_bind(virtual_port, virtual_port);
+        // The cached mapping (if any) is already correct. Record only
+        // when this is a first-time identity bind.
+        if cached_real.is_none() {
+            network.lock().await.port_map.record_bind(virtual_port, virtual_port);
+        }
         return NotifAction::ReturnValue(0);
     }
     let err = unsafe { *libc::__errno_location() };
@@ -182,9 +190,12 @@ pub(crate) async fn handle_bind(
         return NotifAction::Errno(err);
     }
 
-    // Port is taken on the host. Let the kernel pick a free real port
-    // by binding with port 0; the same fd remains the source of truth,
-    // so there is no window for another process to steal the choice.
+    // EADDRINUSE on the chosen real port. Two cases:
+    //   - First-time bind: another process owns the virtual port on the
+    //     host.
+    //   - Cached bind: our previously-allocated real port was reclaimed
+    //     while the sandbox's earlier socket was closed.
+    // In both cases let the kernel pick a fresh real port via bind(0).
     set_port_in_sockaddr(&mut bytes, 0);
     let ret = unsafe {
         libc::bind(
