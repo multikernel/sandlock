@@ -1525,6 +1525,10 @@ impl Sandbox {
             (None, None)
         };
 
+        // Capture our PID before fork so the child can detect parent death
+        // without assuming PID 1 is always init (wrong in containers).
+        let parent_pid = unsafe { libc::getpid() };
+
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             return Err(SandboxRuntimeError::Fork(std::io::Error::last_os_error()).into());
@@ -1570,6 +1574,7 @@ impl Sandbox {
                 keep_fds: &gather_keep_fds,
                 sandbox_name: Some(sandbox_name.as_str()),
                 extra_syscalls: &extra_syscalls,
+                parent_pid,
             });
         }
 
