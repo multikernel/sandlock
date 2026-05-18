@@ -734,6 +734,10 @@ pub(crate) struct ChildSpawnArgs<'a> {
     /// Merged into the child's BPF notif list so the kernel actually
     /// raises USER_NOTIF for them.
     pub extra_syscalls: &'a [u32],
+    /// PID of the parent process captured before fork. Used to detect
+    /// parent death in the child without assuming PID 1 is always init
+    /// (incorrect in containers where the entrypoint runs as PID 1).
+    pub parent_pid: libc::pid_t,
 }
 
 /// Apply irreversible confinement (Landlock + seccomp) then exec the command.
@@ -750,6 +754,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         keep_fds,
         sandbox_name,
         extra_syscalls,
+        parent_pid,
     } = args;
     // Helper: abort child on error. Includes the OS error automatically.
     macro_rules! fail {
@@ -784,8 +789,11 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         fail!("prctl(PR_SET_PDEATHSIG)");
     }
 
-    // 3. Check parent didn't die between fork and prctl
-    if unsafe { libc::getppid() } == 1 {
+    // 3. Check parent didn't die between fork and prctl.
+    // Compare against the actual parent PID captured before fork rather than
+    // hardcoding 1, since containers often run the entrypoint as PID 1 and a
+    // child forked from it legitimately has getppid() == 1.
+    if unsafe { libc::getppid() } != parent_pid {
         fail!("parent died before confinement");
     }
 
