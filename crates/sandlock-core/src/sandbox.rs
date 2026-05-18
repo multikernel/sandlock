@@ -971,6 +971,51 @@ impl Sandbox {
         self.do_start()
     }
 
+    /// Sugar for `create()` + `start()` that also blocks until the child
+    /// has completed `execve()` and is executing user code. After this
+    /// returns, operations that read user-code state (e.g. `checkpoint()`,
+    /// `/proc/<pid>/exe`) observe the requested binary rather than the
+    /// supervisor.
+    pub async fn spawn(&mut self, cmd: &[&str]) -> Result<(), crate::error::SandlockError> {
+        self.create(cmd).await?;
+        self.start()?;
+        self.wait_until_exec().await
+    }
+
+    /// Like `spawn` but inherits stdio (no capture).
+    pub async fn spawn_interactive(&mut self, cmd: &[&str]) -> Result<(), crate::error::SandlockError> {
+        self.create_interactive(cmd).await?;
+        self.start()?;
+        self.wait_until_exec().await
+    }
+
+    /// Wait for the child to finish `execve`. Detected by `/proc/<pid>/exe`
+    /// no longer matching `/proc/self/exe` (before execve the child still
+    /// shares the supervisor's binary). The kernel offers no direct event
+    /// for execve completion, so this polls every 1ms with a 5s ceiling.
+    async fn wait_until_exec(&self) -> Result<(), crate::error::SandlockError> {
+        use crate::error::SandboxRuntimeError;
+        let pid = self.pid().ok_or(SandboxRuntimeError::NotRunning)?;
+        let Some(our_exe) = std::fs::read_link("/proc/self/exe").ok() else {
+            return Ok(());
+        };
+        let child_link = format!("/proc/{}/exe", pid);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Ok(child_exe) = std::fs::read_link(&child_link) {
+                if child_exe != our_exe {
+                    return Ok(());
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(SandboxRuntimeError::Child(
+                    "child did not exec() within 5s".into(),
+                ).into());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+
     /// Create with explicit stdin/stdout/stderr fd redirection. Child is
     /// parked after policy install; call `start()` to release.
     #[doc(hidden)]
