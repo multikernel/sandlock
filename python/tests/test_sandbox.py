@@ -5,7 +5,6 @@ import json
 import os
 import socket
 import sys
-import threading
 import time
 
 import pytest
@@ -267,46 +266,29 @@ class TestCpuThrottle:
 
 
 class TestPauseResume:
-    def test_pause_resume_from_thread(self):
+    def test_pause_resume(self):
         sb = _policy()
-
-        def run_in_thread():
-            return sb.run(["python3", "-c",
-                "import time\n"
-                "for i in range(5):\n"
-                "    print(i, flush=True)\n"
-                "    time.sleep(0.1)\n"
-            ])
-
-        t = threading.Thread(target=run_in_thread)
-        t.start()
-        time.sleep(0.15)  # let it start
+        sb.spawn(["python3", "-c",
+            "import time\n"
+            "for i in range(5):\n"
+            "    print(i, flush=True)\n"
+            "    time.sleep(0.1)\n"
+        ])
 
         sb.pause()
-        time.sleep(0.3)  # paused — should not progress
+        time.sleep(0.3)  # paused, should not progress
         sb.resume()
-
-        t.join(timeout=10)
-        # Process should have completed after resume
+        sb.wait()
 
     def test_pid_available_during_run(self):
         sb = _policy()
-        pid_seen = []
-
-        def run_in_thread():
-            sb.run(["sleep", "1"])
-
-        t = threading.Thread(target=run_in_thread)
-        t.start()
-        time.sleep(0.1)
+        sb.spawn(["sleep", "1"])
 
         pid = sb.pid
         assert pid is not None
         assert pid > 0
-        pid_seen.append(pid)
 
-        # After run completes, pid should be None
-        t.join(timeout=10)
+        sb.wait()
         assert sb.pid is None
 
     def test_pause_not_running_raises(self):
