@@ -1,0 +1,24 @@
+# Kubernetes RuntimeClass for sandlock-oci
+# Apply with: kubectl apply -f runtimeclass.yaml
+#
+# This tells Kubernetes to use the "sandlock" handler name when scheduling
+# pods with runtimeClassName: sandlock. The handler must match the
+# runtime name in /etc/containerd/config.toml on each node.
+#
+# containerd config excerpt (on each node):
+#
+#   [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.sandlock]
+#     runtime_type = "io.containerd.runc.v2"
+#     [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.sandlock.options]
+#       BinaryName = "/usr/local/bin/sandlock-oci"
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: sandlock
+# handler must match the key in containerd's runtime config
+handler: sandlock
+# Optional scheduling hints (uncomment to restrict to labelled nodes)
+# scheduling:
+#   nodeSelector:
+#     sandlock.io/runtime: "true"
