@@ -197,6 +197,14 @@ class KillOnEtc(Handler):
         return NotifAction.continue_()
 ```
 
+**Caveat:** `ctx.read_path()` without an explicit `arg=` raises
+`ValueError` for syscalls not in the known path table (see the
+`read_path` accessor section). Under the default
+`on_exception=KILL` policy that `ValueError` becomes a kill signal
+to the child. Either register the handler only against syscalls in
+`COMMON_PATH_SYSCALLS`, pass `arg=` explicitly, or set
+`on_exception=ExceptionPolicy.CONTINUE` on your handler.
+
 ### Combine multiple handlers on one syscall
 
 Register multiple handlers on the same syscall — the supervisor calls
