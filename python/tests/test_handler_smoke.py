@@ -951,3 +951,59 @@ def test_presets_not_reexported_from_root():
     import sandlock
     assert not hasattr(sandlock, "AuditPathsHandler")
     assert not hasattr(sandlock, "COMMON_PATH_SYSCALLS")
+
+
+def test_path_deny_handler_default_policy_is_kill():
+    from sandlock.presets import PathDenyHandler
+    assert PathDenyHandler(deny=[]).on_exception == ExceptionPolicy.KILL
+
+
+def test_path_deny_handler_rejects_non_list_deny():
+    from sandlock.presets import PathDenyHandler
+    with pytest.raises(TypeError):
+        PathDenyHandler(deny="/etc/*")  # type: ignore[arg-type]
+
+
+def test_path_deny_handler_denies_matching_path(monkeypatch):
+    from sandlock.handler import HandlerCtx
+    from sandlock.presets import PathDenyHandler
+    import errno as _e
+    monkeypatch.setattr(HandlerCtx, "read_path",
+                        lambda self, max_len=4096: "/etc/shadow")
+    handler = PathDenyHandler(deny=["/etc/*"])
+    assert handler.handle(_make_ctx(syscall_nr=_openat_nr())) == \
+        NotifAction.errno(_e.EPERM)
+
+
+def test_path_deny_handler_passes_non_matching_path(monkeypatch):
+    from sandlock.handler import HandlerCtx
+    from sandlock.presets import PathDenyHandler
+    monkeypatch.setattr(HandlerCtx, "read_path",
+                        lambda self, max_len=4096: "/tmp/ok")
+    handler = PathDenyHandler(deny=["/etc/*"])
+    assert handler.handle(_make_ctx(syscall_nr=_openat_nr())) == \
+        NotifAction.continue_()
+
+
+def test_path_deny_handler_continues_on_none_path(monkeypatch):
+    """Deny-list contract: cannot classify -> defer (continue), not deny."""
+    from sandlock.handler import HandlerCtx
+    from sandlock.presets import PathDenyHandler
+    monkeypatch.setattr(HandlerCtx, "read_path",
+                        lambda self, max_len=4096: None)
+    handler = PathDenyHandler(deny=["/etc/*"])
+    assert handler.handle(_make_ctx(syscall_nr=_openat_nr())) == \
+        NotifAction.continue_()
+
+
+def test_path_deny_handler_uses_custom_errno(monkeypatch):
+    """The errno= constructor parameter is the value returned on a match —
+    not always EPERM. Pins the public-API surface."""
+    from sandlock.handler import HandlerCtx
+    from sandlock.presets import PathDenyHandler
+    import errno as _e
+    monkeypatch.setattr(HandlerCtx, "read_path",
+                        lambda self, max_len=4096: "/etc/shadow")
+    handler = PathDenyHandler(deny=["/etc/*"], errno=_e.EACCES)
+    assert handler.handle(_make_ctx(syscall_nr=_openat_nr())) == \
+        NotifAction.errno(_e.EACCES)

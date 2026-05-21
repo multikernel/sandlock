@@ -53,3 +53,42 @@ class AuditPathsHandler(Handler):
         path = ctx.read_path(max_len=self.max_len)
         self.callback(path, ctx)
         return NotifAction.continue_()
+
+
+class PathDenyHandler(Handler):
+    """Deny syscalls whose path matches any ``fnmatch`` pattern in ``deny``.
+
+    ``on_exception=KILL`` — security handler, fail-closed if it itself errors.
+
+    The ``path is None`` case is deliberately permissive: a deny-list does
+    not claim "everything else is allowed", only "these patterns are
+    denied". When the path cannot be classified we defer to Landlock and
+    any other handlers in the chain (``continue_()``).
+
+    Patterns are tested in the order given; the first match wins.
+    """
+
+    on_exception = ExceptionPolicy.KILL
+
+    def __init__(
+        self,
+        deny: list[str],
+        errno: int = _errno.EPERM,
+        max_len: int = 4096,
+    ) -> None:
+        if not isinstance(deny, list):
+            raise TypeError(
+                f"deny must be a list of str patterns, got {type(deny).__name__}"
+            )
+        self.deny = deny
+        self.errno = errno
+        self.max_len = max_len
+
+    def handle(self, ctx: HandlerCtx) -> NotifAction:
+        path = ctx.read_path(max_len=self.max_len)
+        if path is None:
+            return NotifAction.continue_()
+        for pattern in self.deny:
+            if fnmatch.fnmatchcase(path, pattern):
+                return NotifAction.errno(self.errno)
+        return NotifAction.continue_()
