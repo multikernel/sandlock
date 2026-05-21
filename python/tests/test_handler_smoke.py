@@ -1082,3 +1082,47 @@ def test_log_syscalls_handler_emits_one_line_and_continues():
     assert f"syscall={_openat_nr()}" in lines[0]
     assert "pid=1" in lines[0]
     assert "args=(3, 43981, 0, 0, 0, 0)" in lines[0]
+
+
+def test_audit_paths_handler_e2e_counts_probe_opens(tmp_dir):
+    """Success criterion: AuditPathsHandler + COMMON_PATH_SYSCALLS observes
+    the child's opens of a unique probe file the expected number of times.
+    Exercises the public preset API plus HandlerCtx.read_path() through the
+    live trampoline."""
+    if not os.path.exists(_SYSTEM_PYTHON):
+        pytest.skip(f"{_SYSTEM_PYTHON} not available")
+
+    from sandlock.presets import AuditPathsHandler, COMMON_PATH_SYSCALLS
+
+    probe = tmp_dir / "preset-probe-file"
+    probe.write_text("x")
+    probe_path = str(probe)
+
+    seen: list[str] = []
+    seen_all: list[str | None] = []
+
+    def _cb(path, _ctx):
+        seen_all.append(path)
+        if path == probe_path:
+            seen.append(path)
+
+    audit = AuditPathsHandler(callback=_cb)
+
+    sb = sandlock.Sandbox(fs_readable=[*_PYTHON_READABLE, str(tmp_dir)])
+    script = (
+        "import os\n"
+        "for _ in range(3):\n"
+        "    fd = os.open(%r, os.O_RDONLY)\n"
+        "    os.close(fd)\n" % probe_path
+    )
+    result = sb.run_with_handlers(
+        cmd=[_SYSTEM_PYTHON, "-c", script],
+        handlers=[(s, audit) for s in COMMON_PATH_SYSCALLS],
+    )
+
+    assert result.success, result
+    assert len(seen) == 3, (
+        f"expected 3 opens of probe at {probe_path!r}; got {len(seen)} matched. "
+        f"Total handler invocations: {len(seen_all)}; "
+        f"first few paths seen: {seen_all[:10]}"
+    )
