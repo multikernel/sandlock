@@ -1126,3 +1126,37 @@ def test_audit_paths_handler_e2e_counts_probe_opens(tmp_dir):
         f"Total handler invocations: {len(seen_all)}; "
         f"first few paths seen: {seen_all[:10]}"
     )
+
+
+def test_log_syscalls_handler_e2e_observes_openat(tmp_dir):
+    """LogSyscallsHandler captures one line per intercepted syscall
+    through the live trampoline. Pin syscall=, pid=, args= structure."""
+    if not os.path.exists(_SYSTEM_PYTHON):
+        pytest.skip(f"{_SYSTEM_PYTHON} not available")
+
+    from sandlock.presets import LogSyscallsHandler
+
+    probe = tmp_dir / "log-syscalls-probe"
+    probe.write_text("x")
+    probe_path = str(probe)
+
+    lines: list[str] = []
+    handler = LogSyscallsHandler(logger=lines.append)
+
+    sb = sandlock.Sandbox(fs_readable=[*_PYTHON_READABLE, str(tmp_dir)])
+    script = (
+        "import os\n"
+        "fd = os.open(%r, os.O_RDONLY)\n"
+        "os.close(fd)\n" % probe_path
+    )
+    result = sb.run_with_handlers(
+        cmd=[_SYSTEM_PYTHON, "-c", script],
+        handlers=[("openat", handler)],
+    )
+
+    assert result.success, result
+    # At least one openat line was captured (the supervisor may also see
+    # other openat calls from the child's runtime initialization, so
+    # exact count is not pinned).
+    assert any("syscall=" in line and "pid=" in line and "args=(" in line
+               for line in lines), f"no recognizable log line; got {lines[:5]}"
