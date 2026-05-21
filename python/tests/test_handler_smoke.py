@@ -861,6 +861,8 @@ def test_read_path_auto_arg_resolves_openat_to_args1(monkeypatch):
 
 def test_read_path_multi_path_syscall_requires_explicit_arg():
     """renameat2 has two path args; read_path() without arg= must raise."""
+    if _renameat2_nr() < 0:
+        pytest.skip("renameat2 not known to host kernel")
     ctx = _make_ctx(syscall_nr=_renameat2_nr())
     with pytest.raises(ValueError, match="renameat2"):
         ctx.read_path()
