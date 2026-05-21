@@ -819,3 +819,86 @@ def test_run_with_handlers_rejects_unknown_syscall_name():
             cmd=["/bin/true"],
             handlers=[("definitely_not_a_real_syscall", _Noop())],
         )
+
+
+# ----------------------------------------------------------------
+# HandlerCtx.read_path — name-keyed path-arg resolution.
+# ----------------------------------------------------------------
+
+
+def _openat_nr() -> int:
+    from sandlock._sdk import _lib
+    return _lib.sandlock_syscall_nr(b"openat")
+
+
+def _renameat2_nr() -> int:
+    from sandlock._sdk import _lib
+    return _lib.sandlock_syscall_nr(b"renameat2")
+
+
+def _make_ctx(*, syscall_nr: int, args=(0, 0, 0, 0, 0, 0)):
+    from sandlock.handler import HandlerCtx
+    return HandlerCtx(
+        id=1, pid=1, flags=0, syscall_nr=syscall_nr, arch=0,
+        instruction_pointer=0, args=args,
+    )
+
+
+def test_read_path_auto_arg_resolves_openat_to_args1(monkeypatch):
+    """For openat, read_path() with no arg= must read the path from args[1]."""
+    from sandlock.handler import HandlerCtx
+    captured = []
+    monkeypatch.setattr(
+        HandlerCtx, "read_cstr",
+        lambda self, addr, max_len: (captured.append((addr, max_len)) or "/tmp/x"),
+    )
+    ctx = _make_ctx(syscall_nr=_openat_nr(),
+                    args=(0, 0xCAFEBABE, 0, 0, 0, 0))
+    result = ctx.read_path()
+    assert result == "/tmp/x"
+    assert captured == [(0xCAFEBABE, 4096)]
+
+
+def test_read_path_multi_path_syscall_requires_explicit_arg():
+    """renameat2 has two path args; read_path() without arg= must raise."""
+    ctx = _make_ctx(syscall_nr=_renameat2_nr())
+    with pytest.raises(ValueError, match="renameat2"):
+        ctx.read_path()
+
+
+def test_read_path_unknown_syscall_requires_explicit_arg():
+    """A syscall_nr no path-table entry knows about must raise with
+    instructions to pass arg= explicitly."""
+    ctx = _make_ctx(syscall_nr=99999)
+    with pytest.raises(ValueError, match="pass arg= explicitly"):
+        ctx.read_path()
+
+
+def test_read_path_rejects_arg_out_of_range():
+    ctx = _make_ctx(syscall_nr=_openat_nr())
+    for bad in (-1, 6, 99):
+        with pytest.raises(ValueError, match="arg"):
+            ctx.read_path(arg=bad)
+
+
+def test_read_path_explicit_arg_works_for_multi_path(monkeypatch):
+    """An explicit arg= bypasses the multi-path / unknown check."""
+    from sandlock.handler import HandlerCtx
+    monkeypatch.setattr(HandlerCtx, "read_cstr",
+                        lambda self, addr, max_len: "/from")
+    ctx = _make_ctx(syscall_nr=_renameat2_nr(),
+                    args=(0, 0x1, 0, 0x2, 0, 0))
+    assert ctx.read_path(arg=1) == "/from"
+
+
+def test_reverse_path_table_only_contains_known_names():
+    """The lazily-built reverse map must contain only names from the two
+    source tables — locks the contract so a future change cannot leak
+    other names into auto-arg resolution."""
+    from sandlock.handler import (
+        _PATH_ARG, _MULTI_PATH, _reverse_path_table,
+    )
+    rev = _reverse_path_table()
+    known = set(_PATH_ARG) | _MULTI_PATH
+    for nr, name in rev.items():
+        assert name in known, f"reverse map leaked unknown name {name!r} for nr={nr}"
