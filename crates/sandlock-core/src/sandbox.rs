@@ -428,8 +428,6 @@ pub struct Sandbox {
     /// PEM CA key for HTTPS MITM. Required when http_ca is set.
     pub http_key: Option<PathBuf>,
 
-    // Namespace isolation — always enabled, not user-configurable.
-
     // Resource limits
     pub max_memory: Option<ByteSize>,
     pub max_processes: u32,
