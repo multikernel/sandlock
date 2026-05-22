@@ -28,7 +28,7 @@ sb.run_with_handlers(
   `flags`, `syscall_nr`, `arch`, `instruction_pointer`, `args`) plus
   child-memory accessors.
 - `NotifAction` — frozen value-object. Construct via factory classmethods:
-  `continue_()`, `errno(value)`, `return_value_(value)`, `hold()`,
+  `continue_()`, `errno(value)`, `returns(value)`, `hold()`,
   `kill(sig, pgid)`, `inject_fd_send(srcfd, newfd_flags)`.
 - `ExceptionPolicy` — IntEnum: `KILL` (default), `DENY_EPERM`, `CONTINUE`,
   `DENY_EIO`.
@@ -178,7 +178,7 @@ class FakePid(Handler):
     on_exception = ExceptionPolicy.KILL
 
     def handle(self, ctx):
-        return NotifAction.return_value_(777)
+        return NotifAction.returns(777)
 
 sb.run_with_handlers(cmd, [("getpid", FakePid())])
 ```

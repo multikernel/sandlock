@@ -23,7 +23,7 @@ def test_notif_action_kill_carries_sig_and_pgid():
 
 
 def test_notif_action_return_value_carries_value():
-    a = NotifAction.return_value_(42)
+    a = NotifAction.returns(42)
     assert a.kind == 3
     assert a.return_value == 42  # field, not the classmethod
 
@@ -491,7 +491,7 @@ def test_handler_errno_action_makes_child_observe_eperm(tmp_dir):
 
 
 def test_handler_return_value_action_overrides_getpid():
-    """A handler returning NotifAction.return_value_(777) must make the
+    """A handler returning NotifAction.returns(777) must make the
     child's os.getpid() return the synthetic 777 — only reachable if the
     trampoline translates the ReturnValue action into
     sandlock_action_set_return_value."""
@@ -507,7 +507,7 @@ def test_handler_return_value_action_overrides_getpid():
         on_exception = ExceptionPolicy.KILL
 
         def handle(self, ctx):
-            return NotifAction.return_value_(777)
+            return NotifAction.returns(777)
 
     sb = sandlock.Sandbox(fs_readable=_PYTHON_READABLE)
     result = sb.run_with_handlers(

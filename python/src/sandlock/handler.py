@@ -38,7 +38,7 @@ class NotifAction:
 
     - CONTINUE: no payload fields used.
     - ERRNO: ``errno_value`` set.
-    - RETURN_VALUE: ``return_value`` set (factory: ``return_value_``).
+    - RETURN_VALUE: ``return_value`` set (factory: ``returns``).
     - INJECT_FD_SEND: ``srcfd``, ``newfd_flags`` set; the supervisor
       takes ownership of the fd on dispatch.
     - HOLD: no payload fields used.
@@ -68,7 +68,7 @@ class NotifAction:
         return cls(kind=int(_ActionKind.ERRNO), errno_value=value)
 
     @classmethod
-    def return_value_(cls, value: int) -> NotifAction:
+    def returns(cls, value: int) -> NotifAction:
         return cls(kind=int(_ActionKind.RETURN_VALUE), return_value=value)
 
     @classmethod
