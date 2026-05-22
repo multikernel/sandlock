@@ -268,3 +268,19 @@ def test_nested_function_rejected():
         return inner
     with pytest.raises(ValueError):
         McpSandbox().add_tool("bad", outer())
+
+
+def test_workspace_injected(tmp_path):
+    import _worker_fixture
+    mcp = McpSandbox(workspace=str(tmp_path))
+    mcp.add_tool("whereami", _worker_fixture.whereami)  # no env wiring
+    out = asyncio.run(mcp.call_tool("whereami", {}))
+    assert out.strip() == str(tmp_path)
+
+
+def test_llm_cannot_override_workspace(tmp_path):
+    import _worker_fixture
+    mcp = McpSandbox(workspace=str(tmp_path))
+    mcp.add_tool("whereami", _worker_fixture.whereami)
+    out = asyncio.run(mcp.call_tool("whereami", {"workspace": "/evil"}))
+    assert out.strip() == str(tmp_path)

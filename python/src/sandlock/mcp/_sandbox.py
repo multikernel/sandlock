@@ -233,6 +233,7 @@ class McpSandbox:
         cmd = [
             sys.executable, _WORKER,
             "--syspath", entry.syspath,
+            "--workspace", self._workspace,
             entry.module, entry.qualname,
             json.dumps(args),
         ]

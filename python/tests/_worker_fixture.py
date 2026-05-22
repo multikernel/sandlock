@@ -19,3 +19,7 @@ def echo(text: str) -> str:
 
 def read_env(var: str) -> str:
     return os.environ[var]
+
+
+def whereami(*, workspace: str) -> str:
+    return workspace
