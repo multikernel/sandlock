@@ -473,7 +473,7 @@ The async notification supervisor (tokio) handles intercepted syscalls:
 Downstream Rust crates can append their own seccomp-notification
 handlers to the supervisor chain alongside the builtins, registering
 for any syscall they care about via the `Handler` trait and
-`Sandbox::run_with_extra_handlers`. The builtin chain runs first, so
+`Sandbox::run_with_handlers`. The builtin chain runs first, so
 user handlers cannot subvert confinement; the registration step also
 rejects handlers on syscalls in the default blocklist or
 `extra_deny_syscalls`. See

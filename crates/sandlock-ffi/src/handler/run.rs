@@ -121,14 +121,14 @@ fn block_on_run(
     // panics are intentionally allowed to propagate.
     crate::runtime::with_runtime_unwind(|rt| rt.block_on(async move {
         if interactive {
-            sb.run_interactive_with_extra_handlers(&cmd_refs, handlers).await
+            sb.run_interactive_with_handlers(&cmd_refs, handlers).await
         } else {
-            sb.run_with_extra_handlers(&cmd_refs, handlers).await
+            sb.run_with_handlers(&cmd_refs, handlers).await
         }
     }))
 }
 
-/// Run the policy with extra C handlers. Returns NULL on failure.
+/// Run the policy with C handlers. Returns NULL on failure.
 ///
 /// `name` may be NULL to auto-generate `sandbox-{pid}`, or a valid
 /// NUL-terminated UTF-8 C string; the placement mirrors the existing

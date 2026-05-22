@@ -976,7 +976,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     } else {
         // First-level sandbox: notif + deny filter with NEW_LISTENER.
         //
-        // Caller-supplied extra handlers must have their syscalls registered in
+        // Caller-supplied handlers must have their syscalls registered in
         // the BPF filter, otherwise the kernel never raises a notification for
         // them and the handler silently never fires.  We merge `extra_syscalls`
         // into the notif list and dedup so each syscall produces exactly one
@@ -986,7 +986,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
             notif.extend_from_slice(extra_syscalls);
         }
         // Argv-safety gate (companion to the policy_fn case in
-        // notif_syscalls): an extra handler bound to execve/execveat
+        // notif_syscalls): a handler bound to execve/execveat
         // can call `read_child_mem` to inspect argv, so the supervisor
         // must register newly forked children before they can run user
         // code — same invariant policy_fn relies on. Bare fork(2)

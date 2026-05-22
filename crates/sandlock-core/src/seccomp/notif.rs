@@ -212,7 +212,7 @@ pub struct NotifPolicy {
     pub has_time_start: bool,
     /// Argv-safety gate: the supervisor must freeze every task that
     /// could mutate argv before any consumer reads it. True when
-    /// `policy_fn` is active or when an extra handler is bound to
+    /// `policy_fn` is active or when a handler is bound to
     /// execve/execveat (such handlers can call `read_child_mem`).
     /// Also gates ptrace fork-event tracking so `ProcessIndex` is
     /// complete when the freeze enumerates it.

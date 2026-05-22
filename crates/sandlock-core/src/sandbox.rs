@@ -200,7 +200,7 @@ struct Runtime {
     http_acl_handle: Option<crate::http_acl::HttpAclProxyHandle>,
     #[allow(clippy::type_complexity)]
     on_bind: Option<Box<dyn Fn(&HashMap<u16, u16>) + Send + Sync>>,
-    extra_handlers: Vec<(i64, Arc<dyn crate::seccomp::dispatch::Handler>)>,
+    handlers: Vec<(i64, Arc<dyn crate::seccomp::dispatch::Handler>)>,
     ready_w: Option<std::os::fd::OwnedFd>,
 }
 
@@ -805,38 +805,38 @@ impl Sandbox {
     }
 
     /// One-shot run with user-supplied syscall handlers.
-    pub async fn run_with_extra_handlers<I, S, H>(
+    pub async fn run_with_handlers<I, S, H>(
         &mut self,
         cmd: &[&str],
-        extra_handlers: I,
+        handlers: I,
     ) -> Result<crate::result::RunResult, crate::error::SandlockError>
     where
         I: IntoIterator<Item = (S, H)>,
         S: TryInto<crate::seccomp::syscall::Syscall, Error = crate::seccomp::syscall::SyscallError>,
         H: crate::seccomp::dispatch::Handler,
     {
-        let pending = sandbox_collect_extra_handlers(extra_handlers, self)?;
+        let pending = sandbox_collect_handlers(handlers, self)?;
         self.ensure_runtime()?;
-        self.rt_mut().extra_handlers = pending;
+        self.rt_mut().handlers = pending;
         self.do_create(cmd, true).await?;
         self.do_start()?;
         self.wait().await
     }
 
-    /// Interactive-stdio counterpart of `run_with_extra_handlers`.
-    pub async fn run_interactive_with_extra_handlers<I, S, H>(
+    /// Interactive-stdio counterpart of `run_with_handlers`.
+    pub async fn run_interactive_with_handlers<I, S, H>(
         &mut self,
         cmd: &[&str],
-        extra_handlers: I,
+        handlers: I,
     ) -> Result<crate::result::RunResult, crate::error::SandlockError>
     where
         I: IntoIterator<Item = (S, H)>,
         S: TryInto<crate::seccomp::syscall::Syscall, Error = crate::seccomp::syscall::SyscallError>,
         H: crate::seccomp::dispatch::Handler,
     {
-        let pending = sandbox_collect_extra_handlers(extra_handlers, self)?;
+        let pending = sandbox_collect_handlers(handlers, self)?;
         self.ensure_runtime()?;
-        self.rt_mut().extra_handlers = pending;
+        self.rt_mut().handlers = pending;
         self.do_create(cmd, false).await?;
         self.do_start()?;
         self.wait().await
@@ -1009,7 +1009,7 @@ impl Sandbox {
                 extra_fds: Vec::new(),
                 http_acl_handle: None,
                 on_bind: None,
-                extra_handlers: Vec::new(),
+                handlers: Vec::new(),
                 ready_w: None,
             }));
             clones.push(clone_sb);
@@ -1094,7 +1094,7 @@ impl Sandbox {
             extra_fds: Vec::new(),
             http_acl_handle: None,
             on_bind: None,
-            extra_handlers: Vec::new(),
+            handlers: Vec::new(),
             ready_w: None,
         }));
         Ok(())
@@ -1265,7 +1265,7 @@ impl Sandbox {
 
             let gather_keep_fds: Vec<i32> = extra_fds_copy.iter().map(|&(target, _)| target).collect();
 
-            let extra_syscalls: Vec<u32> = self.rt().extra_handlers
+            let extra_syscalls: Vec<u32> = self.rt().handlers
                 .iter()
                 .map(|h| h.0 as u32)
                 .collect();
@@ -1346,7 +1346,7 @@ impl Sandbox {
                 has_random_seed: self.random_seed.is_some(),
                 has_time_start: self.time_start.is_some(),
                 argv_safety_required: self.policy_fn.is_some()
-                    || self.rt().extra_handlers.iter().any(|h| {
+                    || self.rt().handlers.iter().any(|h| {
                         h.0 == libc::SYS_execve || h.0 == libc::SYS_execveat
                     }),
                 time_offset: time_offset_val,
@@ -1495,10 +1495,10 @@ impl Sandbox {
                 notif_fd: notif_raw_fd,
             });
 
-            let extra_handlers = std::mem::take(&mut self.rt_mut().extra_handlers);
+            let handlers = std::mem::take(&mut self.rt_mut().handlers);
             let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
             self.rt_mut().notif_handle = Some(tokio::spawn(
-                notif::supervisor(notif_fd, ctx, extra_handlers, startup_tx),
+                notif::supervisor(notif_fd, ctx, handlers, startup_tx),
             ));
             // Wait for the supervisor to register the notif fd with the IO
             // driver before we release the child to execve. Otherwise an
@@ -1696,8 +1696,8 @@ fn sandbox_wait_status_to_exit(status: i32) -> crate::result::ExitStatus {
     }
 }
 
-fn sandbox_collect_extra_handlers<I, S, H>(
-    extra_handlers: I,
+fn sandbox_collect_handlers<I, S, H>(
+    handlers: I,
     sandbox: &Sandbox,
 ) -> Result<Vec<(i64, Arc<dyn crate::seccomp::dispatch::Handler>)>, crate::error::SandlockError>
 where
@@ -1707,7 +1707,7 @@ where
 {
     use crate::seccomp::dispatch::{Handler, HandlerError};
 
-    let pending: Vec<(i64, Arc<dyn Handler>)> = extra_handlers
+    let pending: Vec<(i64, Arc<dyn Handler>)> = handlers
         .into_iter()
         .map(|(syscall, handler)| {
             let nr = syscall.try_into().map_err(HandlerError::from)?.raw();

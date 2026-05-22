@@ -1,5 +1,5 @@
 //! Integration tests for the user-supplied `Handler` extension API
-//! (`Sandbox::run_with_extra_handlers`).
+//! (`Sandbox::run_with_handlers`).
 //!
 //! These tests exercise the full plumbing through the kernel: the guest
 //! issues a syscall, the BPF filter raises a `USER_NOTIF`, the supervisor
@@ -35,7 +35,7 @@ use sandlock_core::{
 /// Read a NUL-terminated path from the sandboxed child's address space.
 ///
 /// Used by tests that need to inspect which `openat`s actually reached
-/// their extra handler.  Works without `CAP_SYS_PTRACE` because the test
+/// their handler.  Works without `CAP_SYS_PTRACE` because the test
 /// process and the sandboxed child share the same UID, which is the
 /// permission `process_vm_readv(2)` actually checks.
 fn read_path_from_child(pid: u32, addr: u64) -> Option<String> {
@@ -87,14 +87,14 @@ fn temp_out(name: &str) -> PathBuf {
     ))
 }
 
-/// An extra handler registered on a syscall that the default policy
+/// A handler registered on a syscall that the default policy
 /// does not intercept (`SYS_getcwd`) MUST receive notifications and its
 /// `NotifAction::Errno` MUST surface in the guest as the corresponding
 /// errno.  This is the security contract: without BPF plumbing the
 /// kernel would never raise USER_NOTIF for `getcwd` and the handler
 /// would silently never fire — the maintainer-cited footgun.
 #[tokio::test]
-async fn extra_handler_intercepts_syscall_outside_builtin_set() {
+async fn handler_intercepts_syscall_outside_builtin_set() {
     let policy = base_policy().build().unwrap();
     let out = temp_out("getcwd-eacces");
     let cmd = format!("/bin/pwd; echo $? > {}", out.display());
@@ -109,7 +109,7 @@ async fn extra_handler_intercepts_syscall_outside_builtin_set() {
         }
     };
 
-    let result = policy.clone().run_with_extra_handlers(&["sh", "-c", &cmd],
+    let result = policy.clone().run_with_handlers(&["sh", "-c", &cmd],
         [(libc::SYS_getcwd, handler)],
     )
     .await
@@ -122,11 +122,11 @@ async fn extra_handler_intercepts_syscall_outside_builtin_set() {
     assert!(result.success(), "shell wrapper should exit 0");
     assert!(
         calls.load(Ordering::SeqCst) >= 1,
-        "extra handler must have fired at least once for SYS_getcwd"
+        "handler must have fired at least once for SYS_getcwd"
     );
     assert_ne!(
         code, 0,
-        "getcwd must observe the errno injected by the extra handler"
+        "getcwd must observe the errno injected by the handler"
     );
 }
 
@@ -134,7 +134,7 @@ async fn extra_handler_intercepts_syscall_outside_builtin_set() {
 /// the guest receives the kernel's natural outcome.  This guards an
 /// observe-only audit handler from accidentally wedging the guest.
 #[tokio::test]
-async fn extra_handler_continue_lets_syscall_proceed() {
+async fn handler_continue_lets_syscall_proceed() {
     let policy = base_policy().build().unwrap();
     let out = temp_out("getcwd-continue");
     let cmd = format!("/bin/pwd; echo $? > {}", out.display());
@@ -149,7 +149,7 @@ async fn extra_handler_continue_lets_syscall_proceed() {
         }
     };
 
-    let result = policy.clone().run_with_extra_handlers(&["sh", "-c", &cmd],
+    let result = policy.clone().run_with_handlers(&["sh", "-c", &cmd],
         [(libc::SYS_getcwd, handler)],
     )
     .await
@@ -170,7 +170,7 @@ async fn extra_handler_continue_lets_syscall_proceed() {
     );
 }
 
-/// `Sandbox::run_with_extra_handlers(_, _, vec![])` must be observably
+/// `Sandbox::run_with_handlers(_, _, vec![])` must be observably
 /// identical to `Sandbox::run(_, _)`.  Guards the documented backwards
 /// compatibility contract.
 #[tokio::test]
@@ -179,7 +179,7 @@ async fn empty_extras_preserves_default_behaviour() {
 
     let baseline = policy.clone().run(&["/bin/pwd"]).await.unwrap();
     let no_handlers: [(i64, fn(&HandlerCtx) -> std::future::Ready<NotifAction>); 0] = [];
-    let with_extras = policy.clone().run_with_extra_handlers(&["/bin/pwd"], no_handlers)
+    let with_extras = policy.clone().run_with_handlers(&["/bin/pwd"], no_handlers)
         .await
         .unwrap();
 
@@ -197,7 +197,7 @@ async fn empty_extras_preserves_default_behaviour() {
 /// Verifies the ordering contract end-to-end through the kernel — the
 /// unit tests only check `Vec` index ordering inside the dispatch table.
 #[tokio::test]
-async fn extra_handler_runs_after_builtin_returns_continue() {
+async fn handler_runs_after_builtin_returns_continue() {
     let policy = base_policy().build().unwrap();
     let out = temp_out("openat-cross");
     let cmd = format!("cat /etc/group; echo $? > {}", out.display());
@@ -215,7 +215,7 @@ async fn extra_handler_runs_after_builtin_returns_continue() {
         }
     };
 
-    let result = policy.clone().run_with_extra_handlers(&["sh", "-c", &cmd],
+    let result = policy.clone().run_with_handlers(&["sh", "-c", &cmd],
         [(libc::SYS_openat, handler)],
     )
     .await
@@ -271,7 +271,7 @@ async fn builtin_non_continue_blocks_extra() {
         }
     };
 
-    let _ = policy.clone().run_with_extra_handlers(&["sh", "-c", &cmd],
+    let _ = policy.clone().run_with_handlers(&["sh", "-c", &cmd],
         [(libc::SYS_openat, handler)],
     )
     .await
@@ -347,7 +347,7 @@ async fn chain_of_extras_runs_in_insertion_order() {
         action: NotifAction::Errno(libc::EACCES),
     };
 
-    let result = policy.clone().run_with_extra_handlers(&["sh", "-c", &cmd],
+    let result = policy.clone().run_with_handlers(&["sh", "-c", &cmd],
         [(libc::SYS_getcwd, h1), (libc::SYS_getcwd, h2)],
     )
     .await
@@ -381,11 +381,11 @@ async fn chain_of_extras_runs_in_insertion_order() {
 /// `SECCOMP_USER_NOTIF_FLAG_CONTINUE` and the kernel would actually run
 /// `mount` — silently bypassing default blocklist.
 #[tokio::test]
-async fn extra_handler_on_default_blocklist_syscall_is_rejected() {
+async fn handler_on_default_blocklist_syscall_is_rejected() {
     let policy = base_policy().build().unwrap();
     let handler = |_cx: &HandlerCtx| async { NotifAction::Continue };
 
-    let result = policy.clone().run_with_extra_handlers(&["true"],
+    let result = policy.clone().run_with_handlers(&["true"],
         [(libc::SYS_mount, handler)],
     )
     .await;
@@ -408,21 +408,21 @@ async fn extra_handler_on_default_blocklist_syscall_is_rejected() {
 /// handler reach the deny-JEQ via the notif path and bypass the kernel
 /// rejection at user-space discretion.
 ///
-/// Counterpart to `extra_handler_on_default_blocklist_syscall_is_rejected`,
+/// Counterpart to `handler_on_default_blocklist_syscall_is_rejected`,
 /// driving the user-list branch of `blocklist_syscall_numbers` (see
 /// `crates/sandlock-core/src/context.rs`).  Uses `SYS_mremap` because it is
 /// in `syscall_name_to_nr` but **not** in DEFAULT_BLOCKLIST — putting it into
 /// `extra_deny_syscalls` is the only way it lands on the blocklist, isolating the
 /// user-supplied branch under test from the default-blocklist branch.
 #[tokio::test]
-async fn extra_handler_on_user_specified_blocklist_is_rejected() {
+async fn handler_on_user_specified_blocklist_is_rejected() {
     let policy = base_policy()
         .extra_deny_syscalls(vec!["mremap".into()])
         .build()
         .unwrap();
     let handler = |_cx: &HandlerCtx| async { NotifAction::Continue };
 
-    let result = policy.clone().run_with_extra_handlers(&["true"],
+    let result = policy.clone().run_with_handlers(&["true"],
         [(libc::SYS_mremap, handler)],
     )
     .await;
@@ -450,9 +450,9 @@ async fn extra_handler_on_user_specified_blocklist_is_rejected() {
 // ============================================================
 
 /// A closure-shaped handler (via the blanket `impl<F, Fut> Handler for F`)
-/// passed to `run_with_extra_handlers` MUST observe notifications and the
+/// passed to `run_with_handlers` MUST observe notifications and the
 /// guest MUST see the handler's `Errno`.  This verifies the parameter-type
-/// rework on `run_with_extra_handlers` doesn't drop notifications.
+/// rework on `run_with_handlers` doesn't drop notifications.
 #[tokio::test]
 async fn handler_via_blanket_impl_dispatches_in_sandbox() {
     let policy = base_policy().build().unwrap();
@@ -469,11 +469,11 @@ async fn handler_via_blanket_impl_dispatches_in_sandbox() {
         }
     };
 
-    let _result = policy.clone().run_with_extra_handlers(&["sh", "-c", &cmd],
+    let _result = policy.clone().run_with_handlers(&["sh", "-c", &cmd],
         [(libc::SYS_getcwd, handler)],
     )
     .await
-    .expect("run_with_extra_handlers");
+    .expect("run_with_handlers");
 
     assert!(
         calls.load(Ordering::SeqCst) > 0,
@@ -491,7 +491,7 @@ async fn handler_via_blanket_impl_dispatches_in_sandbox() {
 }
 
 /// A struct-based `Handler` (with state on `&self`, not captured `Arc`)
-/// MUST be invocable through `run_with_extra_handlers` and accumulate
+/// MUST be invocable through `run_with_handlers` and accumulate
 /// state across multiple notifications within one sandbox run.
 ///
 /// This exercises the full struct-impl-Handler shape end-to-end: the
@@ -500,7 +500,7 @@ async fn handler_via_blanket_impl_dispatches_in_sandbox() {
 /// `GetcwdCounter::handle` on every notification.  Returning `Errno(EPERM)`
 /// serialises the notification cycle (kernel waits for the response before
 /// letting the child proceed), so the counter is guaranteed observable
-/// after `run_with_extra_handlers` returns.
+/// after `run_with_handlers` returns.
 ///
 /// Without this test, a regression where dispatch dropped the
 /// struct-`Arc<dyn Handler>` path but kept closures-via-blanket-impl
@@ -532,11 +532,11 @@ async fn struct_handler_state_persists_across_sandbox_calls() {
     let out = temp_out("struct-handler-counter");
     let cmd = format!("/bin/pwd; /bin/pwd; echo done > {}", out.display());
 
-    policy.clone().run_with_extra_handlers(&["sh", "-c", &cmd],
+    policy.clone().run_with_handlers(&["sh", "-c", &cmd],
         [(libc::SYS_getcwd, handler)],
     )
     .await
-    .expect("run_with_extra_handlers");
+    .expect("run_with_handlers");
     let _ = std::fs::remove_file(&out);
 
     assert!(
@@ -547,16 +547,16 @@ async fn struct_handler_state_persists_across_sandbox_calls() {
     );
 }
 
-/// `run_with_extra_handlers` with a negative syscall number MUST return
+/// `run_with_handlers` with a negative syscall number MUST return
 /// `HandlerError::InvalidSyscall(SyscallError::Negative)` up-front, before
 /// fork.  Closes the silent-never-fires footgun.
 #[tokio::test]
-async fn run_with_extra_handlers_rejects_negative_syscall() {
+async fn run_with_handlers_rejects_negative_syscall() {
     let policy = base_policy().build().unwrap();
     let handler = |_cx: &HandlerCtx| async { NotifAction::Continue };
 
     let result =
-        policy.clone().run_with_extra_handlers(&["true"], [(-5i64, handler)]).await;
+        policy.clone().run_with_handlers(&["true"], [(-5i64, handler)]).await;
 
     match result {
         Err(SandlockError::Handler(HandlerError::InvalidSyscall(SyscallError::Negative(-5)))) => {}
@@ -569,12 +569,12 @@ async fn run_with_extra_handlers_rejects_negative_syscall() {
 
 /// Same as above but for an arch-unknown syscall number.
 #[tokio::test]
-async fn run_with_extra_handlers_rejects_arch_unknown_syscall() {
+async fn run_with_handlers_rejects_arch_unknown_syscall() {
     let policy = base_policy().build().unwrap();
     let handler = |_cx: &HandlerCtx| async { NotifAction::Continue };
 
     let result =
-        policy.clone().run_with_extra_handlers(&["true"], [(99_999i64, handler)]).await;
+        policy.clone().run_with_handlers(&["true"], [(99_999i64, handler)]).await;
 
     match result {
         Err(SandlockError::Handler(HandlerError::InvalidSyscall(
@@ -595,7 +595,7 @@ async fn run_with_extra_handlers_rejects_arch_unknown_syscall() {
 /// `IntoIterator<Item = (S, H)>` parameter shape.  Two instances of the
 /// same struct keep the iterator's `H` type homogeneous.
 #[tokio::test]
-async fn run_with_extra_handlers_preserves_insertion_order_in_sandbox_chain() {
+async fn run_with_handlers_preserves_insertion_order_in_sandbox_chain() {
     struct OrderTracker {
         id: u8,
         order: Arc<Mutex<Vec<u8>>>,
@@ -634,11 +634,11 @@ async fn run_with_extra_handlers_preserves_insertion_order_in_sandbox_chain() {
         action: NotifAction::Errno(libc::EACCES),
     };
 
-    policy.clone().run_with_extra_handlers(&["sh", "-c", &cmd],
+    policy.clone().run_with_handlers(&["sh", "-c", &cmd],
         [(libc::SYS_getcwd, h1), (libc::SYS_getcwd, h2)],
     )
     .await
-    .expect("run_with_extra_handlers");
+    .expect("run_with_handlers");
 
     let order = order.lock().unwrap();
     assert!(order.len() >= 2, "expected at least 2 dispatches, got {:?}", *order);
@@ -648,17 +648,17 @@ async fn run_with_extra_handlers_preserves_insertion_order_in_sandbox_chain() {
     let _ = std::fs::remove_file(&out);
 }
 
-/// `run_with_extra_handlers` on a default-blocklist syscall MUST return
+/// `run_with_handlers` on a default-blocklist syscall MUST return
 /// `HandlerError::OnDenySyscall` up-front (before fork) — closes the
 /// kernel-deny -> NOTIF_FLAG_CONTINUE bypass attack.
 #[tokio::test]
-async fn run_with_extra_handlers_rejects_handler_on_default_blocklist_syscall() {
+async fn run_with_handlers_rejects_handler_on_default_blocklist_syscall() {
     let policy = base_policy().build().unwrap();
     let handler = |_cx: &HandlerCtx| async { NotifAction::Continue };
 
     // SYS_mount is in DEFAULT_BLOCKLIST_SYSCALLS.
     let result =
-        policy.clone().run_with_extra_handlers(&["true"], [(libc::SYS_mount, handler)]).await;
+        policy.clone().run_with_handlers(&["true"], [(libc::SYS_mount, handler)]).await;
 
     match result {
         Err(SandlockError::Handler(HandlerError::OnDenySyscall { syscall_nr })) => {

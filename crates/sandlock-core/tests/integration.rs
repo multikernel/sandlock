@@ -55,5 +55,5 @@ mod test_dry_run;
 #[path = "integration/test_http_acl.rs"]
 mod test_http_acl;
 
-#[path = "integration/test_extra_handlers.rs"]
-mod test_extra_handlers;
+#[path = "integration/test_handlers.rs"]
+mod test_handlers;

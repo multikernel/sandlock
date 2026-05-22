@@ -41,8 +41,8 @@ use tokio::sync::Mutex;
 /// Public extension trait for sandlock seccomp-notif handlers.
 ///
 /// Each implementor is registered against a [`crate::seccomp::syscall::Syscall`]
-/// through [`crate::Sandbox::run_with_extra_handlers`] /
-/// [`crate::Sandbox::run_interactive_with_extra_handlers`].  Receives
+/// through [`crate::Sandbox::run_with_handlers`] /
+/// [`crate::Sandbox::run_interactive_with_handlers`].  Receives
 /// `&HandlerCtx` borrowed for the call; cannot outlive the dispatch
 /// invocation.
 ///
@@ -99,7 +99,7 @@ where
 // Concrete impls for `Box<dyn Handler>` and `Arc<dyn Handler>` so callers
 // can erase concrete handler types behind a smart pointer when mixing
 // different handler shapes in one `IntoIterator` passed to
-// `run_with_extra_handlers` — e.g. `Vec<(i64, Box<dyn Handler>)>` lets a
+// `run_with_handlers` — e.g. `Vec<(i64, Box<dyn Handler>)>` lets a
 // downstream register handlers of different concrete types without
 // writing a per-crate wrapper enum.
 //
@@ -126,7 +126,7 @@ impl Handler for std::sync::Arc<dyn Handler> {
 }
 
 /// Errors raised when registering user handlers via
-/// [`crate::Sandbox::run_with_extra_handlers`].
+/// [`crate::Sandbox::run_with_handlers`].
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum HandlerError {
     #[error("invalid syscall in handler registration: {0}")]
@@ -153,7 +153,7 @@ pub enum HandlerError {
 /// resolves from Sandlock's default syscall blocklist plus policy extras.
 ///
 /// Takes only the syscall numbers because that's all it needs to check.
-/// Called from the `run_with_extra_handlers` entry points before any
+/// Called from the `run_with_handlers` entry points before any
 /// handler is registered against the dispatch table.
 ///
 /// Returns the offending syscall number on rejection so the caller can
@@ -203,7 +203,7 @@ impl DispatchTable {
     /// Register a pre-`Arc`'d handler.  Used both by builtin chunks
     /// that share state via `Arc::clone` (one `ForkHandler` instance
     /// registers against `SYS_clone`/`SYS_clone3`/`SYS_vfork`) and by
-    /// `run_with_extra_handlers` when each item already arrives as
+    /// `run_with_handlers` when each item already arrives as
     /// `Arc<dyn Handler>`.
     pub(crate) fn register_arc(
         &mut self,
@@ -942,7 +942,7 @@ fn register_cow_handlers(table: &mut DispatchTable, ctx: &Arc<SupervisorCtx>) {
 // ============================================================
 
 #[cfg(test)]
-mod extra_handler_tests {
+mod handler_tests {
     //! Unit tests for the user-supplied handler extension API.
     //!
     //! Drive the actual `DispatchTable::dispatch` walker against a minimal
@@ -952,7 +952,7 @@ mod extra_handler_tests {
     //! short-circuit on first non-`Continue`, append-after-builtin
     //! placement) are exercised end-to-end without needing a live
     //! Landlock+seccomp sandbox — those scenarios live under
-    //! `crates/sandlock-core/tests/integration/test_extra_handlers.rs`.
+    //! `crates/sandlock-core/tests/integration/test_handlers.rs`.
     use super::*;
     use crate::netlink::NetlinkState;
     use crate::seccomp::ctx::SupervisorCtx;
@@ -1175,7 +1175,7 @@ mod extra_handler_tests {
     /// `DEFAULT_BLOCKLIST_SYSCALLS` — putting it into `extra_deny_syscalls` is the only
     /// way it ends up on the extra blocklist, so the test isolates the user-supplied
     /// path of `blocklist_syscall_numbers` from the default branch covered by
-    /// `extra_handler_on_default_blocklist_syscall_is_rejected`.
+    /// `handler_on_default_blocklist_syscall_is_rejected`.
     ///
     /// Pure-logic counterpart to the integration test of the same name —
     /// runs without a live sandbox so the contract is enforced even on
