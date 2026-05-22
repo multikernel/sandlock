@@ -1037,9 +1037,9 @@ async fn handle_notification(
     let mut exec_freeze = None;
     if matches!(action, NotifAction::Continue)
         && policy.argv_safety_required
-        && crate::sandbox_freeze::requires_freeze_on_continue(nr)
+        && crate::freeze::requires_freeze_on_continue(nr)
     {
-        match crate::sandbox_freeze::freeze_sandbox_for_execve(
+        match crate::freeze::freeze_sandbox_for_execve(
             &ctx.processes,
             notif.pid as i32,
         ) {
@@ -1127,9 +1127,9 @@ async fn handle_notification(
 
     if let Some(freeze) = exec_freeze {
         if exec_continued && send_result.is_ok() {
-            crate::sandbox_freeze::detach_peers(&freeze.peer_tids);
+            crate::freeze::detach_peers(&freeze.peer_tids);
         } else {
-            crate::sandbox_freeze::detach_all(&freeze);
+            crate::freeze::detach_all(&freeze);
         }
     }
 }

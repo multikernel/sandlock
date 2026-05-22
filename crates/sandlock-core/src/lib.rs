@@ -16,7 +16,7 @@ pub(crate) mod random;
 pub(crate) mod time;
 pub(crate) mod cow;
 pub(crate) mod checkpoint;
-pub(crate) mod sandbox_freeze;
+pub(crate) mod freeze;
 pub mod netlink;
 pub(crate) mod procfs;
 pub(crate) mod port_remap;
