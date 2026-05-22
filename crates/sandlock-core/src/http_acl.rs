@@ -10,7 +10,7 @@ use hudsucker::{Body, HttpContext, HttpHandler, Proxy, RequestOrResponse};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
-use crate::sandbox::{http_acl_check, HttpRule};
+use crate::http::{http_acl_check, HttpRule};
 
 /// Shared map from proxy client address to the original destination IP
 /// that the sandboxed process tried to connect to. Written by the seccomp
