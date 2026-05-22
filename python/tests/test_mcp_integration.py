@@ -132,23 +132,21 @@ class TestMcpSandboxLocalTools:
     def test_env_capability_passes_vars(self, tmp_path):
         """Only explicitly granted env vars are visible."""
         workspace = str(tmp_path)
-        ws_env = {"SANDLOCK_WORKSPACE": workspace}
 
         mcp = McpSandbox(workspace=workspace)
-        mcp.add_tool("read_file", _read_file_tool,
-                      capabilities={"env": ws_env})
+        mcp.add_tool("run_python", _run_python_tool,
+                      capabilities={"env": {"MY_TOKEN": "granted"}})
 
-        (tmp_path / "test.txt").write_text("hello")
-        result = self._run(mcp.call_tool("read_file", {"path": "test.txt"}))
-        assert "hello" in result
+        result = self._run(mcp.call_tool("run_python", {
+            "code": "import os; print(os.environ.get('MY_TOKEN', 'MISSING'))",
+        }))
+        assert "granted" in result
 
     def test_write_requires_capability(self, tmp_path):
         workspace = str(tmp_path)
-        ws_env = {"SANDLOCK_WORKSPACE": workspace}
 
         mcp = McpSandbox(workspace=workspace)
-        mcp.add_tool("write_file", _write_file_tool,
-                      capabilities={"env": ws_env})  # env but no fs_writable
+        mcp.add_tool("write_file", _write_file_tool)  # no fs_writable
 
         with pytest.raises(RuntimeError, match="failed"):
             self._run(mcp.call_tool(
@@ -157,13 +155,11 @@ class TestMcpSandboxLocalTools:
 
     def test_write_with_capability(self, tmp_path):
         workspace = str(tmp_path)
-        ws_env = {"SANDLOCK_WORKSPACE": workspace}
 
         mcp = McpSandbox(workspace=workspace)
         mcp.add_tool("write_file", _write_file_tool,
-                      capabilities={"fs_writable": [workspace], "env": ws_env})
-        mcp.add_tool("read_file", _read_file_tool,
-                      capabilities={"env": ws_env})
+                      capabilities={"fs_writable": [workspace]})
+        mcp.add_tool("read_file", _read_file_tool)
 
         self._run(mcp.call_tool(
             "write_file", {"path": "test.txt", "content": "hello"},
@@ -198,16 +194,13 @@ class TestMcpSandboxLocalTools:
 
     def test_full_workflow(self, tmp_path):
         workspace = str(tmp_path)
-        ws_env = {"SANDLOCK_WORKSPACE": workspace}
 
         mcp = McpSandbox(workspace=workspace)
         mcp.add_tool("write_file", _write_file_tool,
-                      capabilities={"fs_writable": [workspace], "env": ws_env})
-        mcp.add_tool("read_file", _read_file_tool,
-                      capabilities={"env": ws_env})
+                      capabilities={"fs_writable": [workspace]})
+        mcp.add_tool("read_file", _read_file_tool)
         mcp.add_tool("run_python", _run_python_tool)
-        mcp.add_tool("list_files", _list_files_tool,
-                      capabilities={"env": ws_env})
+        mcp.add_tool("list_files", _list_files_tool)
 
         async def workflow():
             await mcp.call_tool("write_file",

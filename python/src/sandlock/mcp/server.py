@@ -84,21 +84,19 @@ def python(code: str) -> str:
     return buf.getvalue()
 
 
-def read_file(path: str) -> str:
+def read_file(path: str, *, workspace: str) -> str:
     """Read a file from the workspace."""
     import os
 
-    workspace = os.environ["SANDLOCK_WORKSPACE"]
     full = os.path.join(workspace, path)
     with open(full) as f:
         return f.read()
 
 
-def write_file(path: str, content: str) -> str:
+def write_file(path: str, content: str, *, workspace: str) -> str:
     """Write content to a file in the workspace."""
     import os
 
-    workspace = os.environ["SANDLOCK_WORKSPACE"]
     full = os.path.join(workspace, path)
     parent = os.path.dirname(full)
     if parent:
@@ -108,11 +106,10 @@ def write_file(path: str, content: str) -> str:
     return f"Wrote {len(content)} bytes to {path}"
 
 
-def list_files(subdir: str = "") -> str:
+def list_files(subdir: str = "", *, workspace: str) -> str:
     """List files in the workspace directory."""
     import os
 
-    workspace = os.environ["SANDLOCK_WORKSPACE"]
     target = os.path.join(workspace, subdir) if subdir else workspace
     entries = sorted(os.listdir(target))
     lines = []
@@ -227,16 +224,12 @@ _TOOL_DEFS: list[dict] = [
 
 def _register_tools(sandbox: McpSandbox, workspace: str) -> None:
     """Register built-in tools on the McpSandbox."""
-    ws_env = {"SANDLOCK_WORKSPACE": workspace}
-
     for td in _TOOL_DEFS:
-        caps = {"env": ws_env}
-        caps.update(td["capabilities_extra"](workspace))
         sandbox.add_tool(
             td["name"],
             td["func"],
             description=td["description"],
-            capabilities=caps,
+            capabilities=td["capabilities_extra"](workspace),
             input_schema=td["input_schema"],
         )
 

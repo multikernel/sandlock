@@ -7,16 +7,14 @@ should structure its tools.
 """
 
 
-def _read_file_tool(path: str) -> str:
+def _read_file_tool(path: str, *, workspace: str) -> str:
     import os
-    workspace = os.environ["SANDLOCK_WORKSPACE"]
     with open(os.path.join(workspace, path)) as f:
         return f.read()
 
 
-def _write_file_tool(path: str, content: str) -> str:
+def _write_file_tool(path: str, content: str, *, workspace: str) -> str:
     import os
-    workspace = os.environ["SANDLOCK_WORKSPACE"]
     with open(os.path.join(workspace, path), "w") as f:
         f.write(content)
     return f"wrote {len(content)} bytes"
@@ -30,7 +28,6 @@ def _run_python_tool(code: str) -> str:
     return buf.getvalue()
 
 
-def _list_files_tool() -> str:
+def _list_files_tool(*, workspace: str) -> str:
     import os, json
-    workspace = os.environ["SANDLOCK_WORKSPACE"]
     return json.dumps(sorted(os.listdir(workspace)))
