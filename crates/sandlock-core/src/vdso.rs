@@ -68,7 +68,7 @@ fn parse_vdso_symbols(vdso_bytes: &[u8]) -> HashMap<String, u64> {
     symbols
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 fn push_insn(stub: &mut Vec<u8>, insn: u32) {
     stub.extend_from_slice(&insn.to_le_bytes());
 }
@@ -96,7 +96,7 @@ fn arm64_b_insn(from: u64, to: u64) -> Result<u32, SandlockError> {
 
 /// Compute the offset within the vDSO mapping where the trampoline area starts —
 /// just past the last symbol, rounded up to a 16-byte boundary.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 fn vdso_tramp_start(vdso_bytes: &[u8]) -> Option<u64> {
     let elf = goblin::elf::Elf::parse(vdso_bytes).ok()?;
     let highest_end = elf
@@ -254,6 +254,93 @@ fn vdso_targets() -> Vec<(&'static str, &'static str, u32)> {
     ]
 }
 
+// ============================================================
+// riscv64 vDSO codegen
+//
+// Like aarch64, riscv64 places a full stub in the slack space at the tail of
+// the vDSO mapping and patches each function entry with a single 4-byte `j`
+// (jal x0) that jumps to its stub. Inline time-offset virtualization is not
+// yet implemented on riscv64; the offset stubs simply force a real syscall so
+// that seccomp can intercept it (the offset is not applied in the vDSO).
+// ============================================================
+
+/// Emit `li a7, value` (load syscall number into a7/x17). Uses a single `addi`
+/// for the 12-bit case (all syscall numbers sandlock patches fit), falling back
+/// to `lui`+`addiw` for larger 32-bit values.
+#[cfg(target_arch = "riscv64")]
+fn riscv_li_a7(stub: &mut Vec<u8>, value: u32) {
+    const A7: u32 = 17;
+    if value < 2048 {
+        // addi a7, x0, value
+        push_insn(stub, (value << 20) | (A7 << 7) | 0x13);
+    } else {
+        let lo12 = value & 0xfff;
+        // sign-extend lo12: if bit 11 is set, addiw subtracts, so bump hi20.
+        let hi20 = if lo12 & 0x800 != 0 {
+            (value >> 12).wrapping_add(1) & 0xf_ffff
+        } else {
+            (value >> 12) & 0xf_ffff
+        };
+        push_insn(stub, (hi20 << 12) | (A7 << 7) | 0x37); // lui a7, hi20
+        push_insn(stub, ((lo12 & 0xfff) << 20) | (A7 << 15) | (A7 << 7) | 0x1b); // addiw a7, a7, lo12
+    }
+}
+
+/// Encode a riscv64 unconditional `j target` (jal x0, offset) located at `from`.
+/// The JAL immediate is signed and scaled by 2, so the reachable range is ±1 MiB.
+#[cfg(target_arch = "riscv64")]
+fn riscv_j_insn(from: u64, to: u64) -> Result<u32, SandlockError> {
+    let delta = to as i64 - from as i64;
+    if delta % 2 != 0 {
+        return Err(SandlockError::MemoryProtect(format!(
+            "riscv64 J target {:#x} not 2-byte aligned from {:#x}",
+            to, from
+        )));
+    }
+    if !(-(1i64 << 20)..(1i64 << 20)).contains(&delta) {
+        return Err(SandlockError::MemoryProtect(format!(
+            "riscv64 J {:#x}->{:#x} out of ±1 MiB range",
+            from, to
+        )));
+    }
+    let imm = delta as u32;
+    let b20 = (imm >> 20) & 0x1;
+    let b10_1 = (imm >> 1) & 0x3ff;
+    let b11 = (imm >> 11) & 0x1;
+    let b19_12 = (imm >> 12) & 0xff;
+    // jal x0, offset (rd = x0)
+    Ok((b20 << 31) | (b10_1 << 21) | (b11 << 20) | (b19_12 << 12) | 0x6f)
+}
+
+#[cfg(target_arch = "riscv64")]
+fn simple_stub(syscall_nr: u32) -> Vec<u8> {
+    let mut stub = Vec::new();
+    riscv_li_a7(&mut stub, syscall_nr);
+    push_insn(&mut stub, 0x0000_0073); // ecall
+    push_insn(&mut stub, 0x0000_8067); // ret (jalr x0, 0(ra))
+    stub
+}
+
+#[cfg(target_arch = "riscv64")]
+fn offset_stub_clock_gettime(_offset_secs: i64) -> Vec<u8> {
+    // Inline offset application is not implemented on riscv64; force a real
+    // syscall so seccomp can intercept it.
+    simple_stub(libc::SYS_clock_gettime as u32)
+}
+
+#[cfg(target_arch = "riscv64")]
+fn offset_stub_gettimeofday(_offset_secs: i64) -> Vec<u8> {
+    simple_stub(libc::SYS_gettimeofday as u32)
+}
+
+#[cfg(target_arch = "riscv64")]
+fn vdso_targets() -> Vec<(&'static str, &'static str, u32)> {
+    vec![
+        ("clock_gettime", "__vdso_clock_gettime", libc::SYS_clock_gettime as u32),
+        ("gettimeofday", "__vdso_gettimeofday", libc::SYS_gettimeofday as u32),
+    ]
+}
+
 /// Patch the vDSO of a target process to force real syscalls (interceptable by seccomp).
 /// If `time_offset_secs` is provided, clock_gettime and gettimeofday stubs will add
 /// the offset to the returned time.
@@ -280,10 +367,10 @@ pub(crate) fn patch(
             SandlockError::MemoryProtect(format!("failed to open /proc/{}/mem: {}", pid, e))
         })?;
 
-    // arm64: place full stubs in slack space at the tail of the vDSO mapping and
-    // patch each function entry with a single 4-byte B that jumps to its stub.
+    // arm64/riscv64: place full stubs in slack space at the tail of the vDSO
+    // mapping and patch each function entry with a single 4-byte jump to its stub.
     // x86_64: stubs are short and inter-symbol gaps are wide; patch inline.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     let mut tramp_offset = vdso_tramp_start(&vdso_bytes).unwrap_or(0);
 
     for (name, alt_name, syscall_nr) in vdso_targets() {
@@ -311,7 +398,7 @@ pub(crate) fn patch(
                 })?;
             }
 
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             {
                 if tramp_offset + stub.len() as u64 > mapping_size {
                     return Err(SandlockError::MemoryProtect(format!(
@@ -334,7 +421,10 @@ pub(crate) fn patch(
                     ))
                 })?;
 
+                #[cfg(target_arch = "aarch64")]
                 let b_insn = arm64_b_insn(entry_addr, tramp_addr)?;
+                #[cfg(target_arch = "riscv64")]
+                let b_insn = riscv_j_insn(entry_addr, tramp_addr)?;
                 mem.seek(SeekFrom::Start(entry_addr)).map_err(|e| {
                     SandlockError::MemoryProtect(format!(
                         "failed to seek to {} entry at {:#x}: {}",
@@ -396,6 +486,17 @@ mod tests {
         let stub = simple_stub(228);
         // movz x8, #228 / svc #0 / ret — three 4-byte instructions.
         assert_eq!(stub.len(), 12);
+    }
+
+    #[test]
+    #[cfg(target_arch = "riscv64")]
+    fn test_simple_stub_size() {
+        let stub = simple_stub(228);
+        // addi a7, x0, 228 / ecall / ret — three 4-byte instructions.
+        assert_eq!(stub.len(), 12);
+        // ecall and ret are fixed encodings.
+        assert_eq!(&stub[4..8], &0x0000_0073u32.to_le_bytes());
+        assert_eq!(&stub[8..12], &0x0000_8067u32.to_le_bytes());
     }
 
     #[test]

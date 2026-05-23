@@ -30,9 +30,10 @@ fn raw_fork() -> std::io::Result<i32> {
         }
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(not(target_arch = "x86_64"))]
     {
-        // aarch64 doesn't have fork(2), use clone with SIGCHLD only
+        // Generic-ABI arches (aarch64, riscv64) have no fork(2); glibc's
+        // fork() emulates it via clone with SIGCHLD.
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             Err(std::io::Error::last_os_error())

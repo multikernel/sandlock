@@ -1365,9 +1365,9 @@ mod tests {
         // running architecture does not expose that syscall.
         let expected_unresolved: &[&str] = &[
             "nfsservctl",
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             "ioperm",
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             "iopl",
         ];
         let mut skipped = 0;
