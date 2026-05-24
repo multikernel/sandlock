@@ -171,6 +171,74 @@ async fn test_denied_path_blocks_exec() {
 }
 
 #[tokio::test]
+async fn test_path_rule_on_regular_file() {
+    // A path rule targeting a regular file (not a directory) must not crash
+    // child setup. Landlock rejects directory-only access rights (READ_DIR,
+    // MAKE_*, REMOVE_*, REFER) on a non-directory with EINVAL, so sandlock
+    // must mask the requested access down to the file-applicable set.
+    let dir = temp_file("regfile-read-dir");
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join("data.txt");
+    std::fs::write(&file, "regfile-contents").unwrap();
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_read(file.to_str().unwrap()) // regular file, not a directory
+        .fs_write("/tmp")
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .with_name("test")
+        .run(&["cat", file.to_str().unwrap()])
+        .await
+        .unwrap();
+    assert!(
+        result.success(),
+        "a read rule on a regular file should not crash confinement"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_path_rule_on_device_node() {
+    // A write rule targeting a device node (/dev/null is a char device, not a
+    // directory) must not crash child setup, and the grant must let the child
+    // write to it.
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write("/tmp")
+        .fs_write("/dev/null") // char device, not a directory
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .with_name("test")
+        .run_interactive(&["sh", "-c", "echo hi > /dev/null"])
+        .await
+        .unwrap();
+    assert!(
+        result.success(),
+        "a write rule on a device node should not crash confinement"
+    );
+}
+
+#[tokio::test]
 async fn test_isolate_ipc() {
     if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 {
         eprintln!("Skipping: Landlock ABI v6 required");
