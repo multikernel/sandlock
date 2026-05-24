@@ -239,6 +239,49 @@ async fn test_path_rule_on_device_node() {
 }
 
 #[tokio::test]
+async fn test_path_rule_on_fifo_does_not_block() {
+    // Opening a FIFO with O_RDONLY blocks until a writer appears. add_path_rule
+    // must reference the path with O_PATH so a read rule on a FIFO does not hang
+    // child setup.
+    let dir = temp_file("fifo-dir");
+    let _ = std::fs::create_dir_all(&dir);
+    let fifo = dir.join("pipe");
+    let _ = std::fs::remove_file(&fifo);
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("spawn mkfifo");
+    assert!(status.success(), "mkfifo should create the FIFO");
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_read(fifo.to_str().unwrap()) // FIFO, not a directory
+        .fs_write("/tmp")
+        .build()
+        .unwrap();
+
+    let mut sandbox = policy.clone().with_name("test");
+    let run = sandbox.run(&["/bin/true"]);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(20), run).await;
+    assert!(
+        result.is_ok(),
+        "a read rule on a FIFO must not block child setup (open with O_PATH)"
+    );
+    assert!(
+        result.unwrap().unwrap().success(),
+        "child should run with a FIFO read rule present"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn test_isolate_ipc() {
     if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 {
         eprintln!("Skipping: Landlock ABI v6 required");

@@ -131,8 +131,15 @@ pub fn abi_version() -> Result<u32, ConfinementError> {
 
 /// Open `path` and add a Landlock path-beneath rule to `ruleset_fd`.
 fn add_path_rule(ruleset_fd: &OwnedFd, path: &Path, access: u64) -> Result<(), ConfinementError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // Reference the path with O_PATH rather than opening it for I/O: O_PATH does
+    // not block on FIFOs and needs no read permission on the target, so a rule
+    // on a FIFO or a write-only/no-read path neither hangs nor fails here. An
+    // O_PATH fd still supports fstat (the file-type check below) and serves as a
+    // valid parent_fd for landlock_add_rule.
     let file = std::fs::OpenOptions::new()
         .read(true)
+        .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
         .open(path)
         .map_err(|e| {
             ConfinementError::Landlock(format!("open path {:?} failed: {}", path, e))
