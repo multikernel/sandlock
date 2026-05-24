@@ -500,3 +500,88 @@ async fn test_seccomp_cow_read_existing() {
 
     let _ = fs::remove_dir_all(&workdir);
 }
+
+/// Regression test: statx on a COW-created file must succeed.
+///
+/// statx is what `ls`, `stat`, and most modern coreutils use. The COW
+/// statx handler returned Continue when the file existed in the upper
+/// layer, so the kernel re-ran statx against the un-redirected lower path
+/// and returned ENOENT for files that live only in upper.
+#[tokio::test]
+async fn test_seccomp_cow_statx_created_file() {
+    let workdir = temp_dir("seccomp-statx");
+    let out_file = std::env::temp_dir().join(format!(
+        "sandlock-test-statx-{}", std::process::id()
+    ));
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc").fs_read("/dev")
+        .fs_write(&workdir).fs_write("/tmp")
+        .workdir(&workdir)
+        .cwd(&workdir)
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+
+    // Create a file that lives only in the COW upper layer, then statx it
+    // via the raw syscall (the path coreutils `stat`/`ls` take).
+    let script = format!(concat!(
+        "import ctypes, os, platform\n",
+        "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
+        "libc.syscall.restype = ctypes.c_long\n",
+        "open('created.txt', 'w').write('hi')\n",
+        "buf = ctypes.create_string_buffer(256)\n",
+        "AT_FDCWD = -100\n",
+        "STATX_BASIC_STATS = 0x7ff\n",
+        "nr = 291 if platform.machine() == 'aarch64' else 332\n",
+        "ret = libc.syscall(nr, AT_FDCWD, b'created.txt', 0, STATX_BASIC_STATS, buf)\n",
+        "err = ctypes.get_errno()\n",
+        "open('{out}', 'w').write('OK' if ret == 0 else f'FAIL:errno={{err}}')\n",
+    ), out = out_file.display());
+
+    let result = policy.clone().with_name("test").run(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "exit={:?}, stderr={}", result.code(), result.stderr_str().unwrap_or(""));
+    let content = fs::read_to_string(&out_file).unwrap_or_default();
+    assert_eq!(content, "OK", "statx on COW-created file should succeed, got: {}", content);
+
+    let _ = fs::remove_dir_all(&workdir);
+    let _ = fs::remove_file(&out_file);
+}
+
+/// Regression test: a binary created inside the COW workdir must
+/// be executable. execve had no COW redirect, so the kernel resolved the
+/// un-redirected lower path and returned ENOENT for binaries that live
+/// only in the upper layer.
+#[tokio::test]
+async fn test_seccomp_cow_exec_created_file() {
+    let workdir = temp_dir("seccomp-exec");
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc").fs_read("/dev")
+        .fs_write(&workdir)
+        .workdir(&workdir)
+        .cwd(&workdir)
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+
+    // Copy a real binary into the COW workdir (lands in upper), then exec it.
+    let result = policy.clone().with_name("test").run(&[
+        "sh", "-c", "cp /bin/echo m && ./m EXEC_OK",
+    ]).await.unwrap();
+
+    assert!(
+        result.success(),
+        "exec of COW-created binary should succeed, exit={:?}, stderr={}",
+        result.code(), result.stderr_str().unwrap_or("")
+    );
+    assert!(
+        result.stdout_str().unwrap_or("").contains("EXEC_OK"),
+        "exec'd binary should print EXEC_OK, stdout={:?}",
+        result.stdout_str()
+    );
+
+    let _ = fs::remove_dir_all(&workdir);
+}

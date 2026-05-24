@@ -1204,6 +1204,29 @@ impl Sandbox {
 
         let cow_config = cow_branch.as_ref().and_then(|b| b.child_mount_config());
 
+        // Seccomp COW: create the branch before fork so the child's Landlock
+        // ruleset can include the upper layer. Binaries created inside the
+        // workdir live in the upper dir, and Landlock checks EXECUTE on the
+        // file's real path at execve time — so the upper dir must be granted
+        // read+execute (READ_ACCESS) or `./created-binary` fails with EACCES.
+        let seccomp_cow_branch = if !nested && self.workdir.is_some() && self.fs_isolation == FsIsolation::None {
+            let workdir = self.workdir.as_ref().unwrap().clone();
+            let storage = self.fs_storage.clone();
+            let max_disk = self.max_disk.map(|b| b.0).unwrap_or(0);
+            match crate::cow::seccomp::SeccompCowBranch::create(&workdir, storage.as_deref(), max_disk) {
+                Ok(branch) => {
+                    self.fs_readable.push(branch.upper_dir().to_path_buf());
+                    Some(branch)
+                }
+                Err(e) => {
+                    eprintln!("sandlock: seccomp COW branch creation failed: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let (stdout_r, stderr_r) = if capture {
             let mut stdout_fds = [0i32; 2];
             let mut stderr_fds = [0i32; 2];
@@ -1418,15 +1441,7 @@ impl Sandbox {
             res_state.proc_count = 1;
 
             let mut cow_state = CowState::new();
-            if self.workdir.is_some() && self.fs_isolation == FsIsolation::None {
-                let workdir = self.workdir.as_ref().unwrap();
-                let storage = self.fs_storage.as_deref();
-                let max_disk = self.max_disk.map(|b| b.0).unwrap_or(0);
-                match crate::cow::seccomp::SeccompCowBranch::create(workdir, storage, max_disk) {
-                    Ok(branch) => { cow_state.branch = Some(branch); }
-                    Err(e) => { eprintln!("sandlock: seccomp COW branch creation failed: {}", e); }
-                }
-            }
+            cow_state.branch = seccomp_cow_branch;
 
             let mut policy_fn_state = PolicyFnState::new();
 

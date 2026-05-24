@@ -935,6 +935,10 @@ fn register_cow_handlers(table: &mut DispatchTable, ctx: &Arc<SupervisorCtx>) {
 
     table.register(libc::SYS_chdir, cow_call!(crate::cow::dispatch::handle_cow_chdir));
     table.register(libc::SYS_getcwd, cow_call!(crate::cow::dispatch::handle_cow_getcwd));
+
+    for &nr in &[libc::SYS_execve, libc::SYS_execveat] {
+        table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_exec));
+    }
 }
 
 // ============================================================

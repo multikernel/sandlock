@@ -340,6 +340,8 @@ pub fn notif_syscalls(policy: &Sandbox, sandbox_name: Option<&str>) -> Vec<u32> 
     if policy.workdir.is_some() && policy.fs_isolation == FsIsolation::None {
         nrs.extend_from_slice(&[
             libc::SYS_openat as u32,
+            libc::SYS_execve as u32,
+            libc::SYS_execveat as u32,
             libc::SYS_unlinkat as u32,
             libc::SYS_mkdirat as u32,
             libc::SYS_renameat2 as u32,
