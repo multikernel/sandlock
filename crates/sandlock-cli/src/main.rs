@@ -18,7 +18,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run a command in a sandbox
-    Run(RunArgs),
+    Run(Box<RunArgs>),
     /// Check kernel feature support
     Check,
     /// List all running sandboxes
@@ -37,9 +37,14 @@ enum Command {
 
 /// Arguments for the `run` subcommand.
 ///
+/// `sandlock run` is a drop-in for `docker run`: the first positional is the
+/// image, the rest is the command, and the common Docker flags below are
+/// honoured. To sandbox a *host* command (no image) put it after `--`, e.g.
+/// `sandlock run --fs-write /tmp -- ./script.sh`.
+///
 /// Sandbox-level flags come from `SandboxBuilder` via `#[clap(flatten)]`.
-/// CLI-only flags (profile, timeout, image, etc.) and non-clap-friendly
-/// sandbox fields (max_memory, fs_mount, env, gpu, cpu-cores) remain here.
+/// CLI-only flags and non-clap-friendly sandbox fields (max_memory, fs_mount,
+/// env, gpu, cpu-cores) remain here.
 #[derive(clap::Args)]
 struct RunArgs {
     // ── Sandbox flags (flattened from SandboxBuilder) ───────────────────────
@@ -47,7 +52,8 @@ struct RunArgs {
     sandbox_builder: SandboxBuilder,
 
     // ── Sandbox-builder fields that need special parsing (not in SandboxBuilder's clap derive) ──
-    #[arg(short = 'm', long = "max-memory")]
+    /// Memory limit, e.g. 512M, 1G (Docker: -m/--memory)
+    #[arg(short = 'm', long = "memory", visible_alias = "max-memory", value_name = "SIZE")]
     max_memory: Option<String>,
 
     #[arg(long = "max-disk")]
@@ -63,7 +69,8 @@ struct RunArgs {
     #[arg(long = "fs-mount", value_name = "VIRTUAL:HOST")]
     fs_mount: Vec<String>,
 
-    #[arg(long = "env", value_name = "KEY=VALUE")]
+    /// Set an environment variable (Docker: -e/--env)
+    #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     env_vars: Vec<String>,
 
     /// CPU cores to pin the sandbox to (e.g. --cpu-cores 0,2,3)
@@ -74,11 +81,69 @@ struct RunArgs {
     #[arg(long = "gpu", value_delimiter = ',')]
     gpu_devices: Vec<u32>,
 
+    // ── Docker-compatible flags ───────────────────────────────────────────────
+    /// Bind mount a volume: HOST:CONTAINER[:ro|:rw] (Docker: -v/--volume)
+    #[arg(short = 'v', long = "volume", value_name = "HOST:CONTAINER")]
+    volume: Vec<String>,
+
+    /// Working directory inside the container (Docker: -w/--workdir)
+    #[arg(short = 'w', long = "workdir", value_name = "DIR")]
+    docker_workdir: Option<String>,
+
+    /// Publish/allow a port: [HOST:]CONTAINER (Docker: -p/--publish)
+    #[arg(short = 'p', long = "publish", value_name = "PORT")]
+    publish: Vec<String>,
+
+    /// Username or UID to run as (Docker: -u/--user)
+    #[arg(short = 'u', long = "user", value_name = "UID")]
+    user: Option<String>,
+
+    /// Read environment variables from a file (Docker: --env-file)
+    #[arg(long = "env-file", value_name = "PATH")]
+    env_file: Vec<PathBuf>,
+
+    /// Container hostname; also used as the sandbox name (Docker: --hostname)
+    #[arg(long = "hostname", value_name = "NAME")]
+    hostname: Option<String>,
+
+    /// Override the image ENTRYPOINT (Docker: --entrypoint)
+    #[arg(long = "entrypoint", value_name = "CMD")]
+    entrypoint: Option<String>,
+
+    /// Number of CPUs (Docker: --cpus)
+    #[arg(long = "cpus", value_name = "N")]
+    cpus: Option<f64>,
+
+    /// Network mode: `none` (default deny) or `host` (allow all egress) (Docker: --network)
+    #[arg(long = "network", visible_alias = "net", value_name = "MODE")]
+    network: Option<String>,
+
+    /// Allocate a pseudo-TTY; implies --interactive (Docker: -t/--tty)
+    #[arg(short = 't', long = "tty")]
+    tty: bool,
+
+    /// Accepted for Docker compatibility; sandboxes are always ephemeral (Docker: --rm)
+    #[arg(long = "rm")]
+    rm: bool,
+
+    /// Accepted for Docker compatibility but ignored: --detach/-d, --privileged,
+    /// --cap-add, --cap-drop, --pull are not supported by the sandbox model.
+    #[arg(short = 'd', long = "detach")]
+    detach: bool,
+    #[arg(long = "privileged")]
+    privileged: bool,
+    #[arg(long = "cap-add", value_name = "CAP")]
+    cap_add: Vec<String>,
+    #[arg(long = "cap-drop", value_name = "CAP")]
+    cap_drop: Vec<String>,
+    #[arg(long = "pull", value_name = "POLICY")]
+    pull: Option<String>,
+
     // ── CLI-only flags ───────────────────────────────────────────────────────
-    #[arg(short = 't', long)]
+    #[arg(long = "timeout")]
     timeout: Option<u64>,
 
-    #[arg(short = 'p', long, conflicts_with = "profile_file")]
+    #[arg(long = "profile", conflicts_with = "profile_file")]
     profile: Option<String>,
 
     /// Load a profile directly from a file path (TOML format)
@@ -92,13 +157,14 @@ struct RunArgs {
     #[arg(long)]
     name: Option<String>,
 
-    #[arg(short = 'e', long = "exec-shell", value_name = "CMD")]
+    #[arg(long = "exec-shell", value_name = "CMD")]
     exec_shell: Option<String>,
 
     #[arg(short = 'i', long)]
     interactive: bool,
 
-    /// Use a local Docker image as chroot rootfs
+    /// Use a local Docker/OCI image as the rootfs. Usually given as the first
+    /// positional argument (Docker style); this flag is an explicit alternative.
     #[arg(long)]
     image: Option<String>,
 
@@ -110,8 +176,95 @@ struct RunArgs {
     #[arg(long)]
     no_supervisor: bool,
 
-    #[arg(last = true)]
+    /// `IMAGE [COMMAND] [ARG...]` (Docker style), or — after `--` — a host
+    /// command to sandbox with no image.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "IMAGE | COMMAND")]
+    image_and_cmd: Vec<String>,
+}
+
+/// Resolved run target: which image to use (if any) and the command to run.
+struct RunTarget {
+    image: Option<String>,
     cmd: Vec<String>,
+}
+
+/// Did the invocation use the `--` options terminator? When present, the
+/// trailing positionals are a host command (native mode) rather than a Docker
+/// `IMAGE [CMD...]` sequence.
+fn had_options_terminator() -> bool {
+    std::env::args().any(|a| a == "--")
+}
+
+/// Decide whether we are running a Docker image or a host command, and split
+/// the trailing positionals accordingly.
+///
+/// * `--image IMG`  → image mode; positionals are the command.
+/// * `... -- CMD`   → native mode; positionals are the host command, no image.
+/// * `IMG [CMD...]` → Docker mode; first positional is the image.
+fn resolve_run_target(args: &RunArgs) -> RunTarget {
+    split_run_target(args.image.as_deref(), &args.image_and_cmd, had_options_terminator())
+}
+
+/// Pure core of [`resolve_run_target`], split out for testing.
+fn split_run_target(image_flag: Option<&str>, positionals: &[String], had_terminator: bool) -> RunTarget {
+    if let Some(img) = image_flag {
+        return RunTarget { image: Some(img.to_string()), cmd: positionals.to_vec() };
+    }
+    if had_terminator {
+        return RunTarget { image: None, cmd: positionals.to_vec() };
+    }
+    match positionals.split_first() {
+        Some((first, rest)) => RunTarget { image: Some(first.clone()), cmd: rest.to_vec() },
+        None => RunTarget { image: None, cmd: Vec::new() },
+    }
+}
+
+/// A parsed Docker `-v/--volume` spec.
+struct Volume {
+    host: PathBuf,
+    container: PathBuf,
+    read_only: bool,
+}
+
+/// Parse a Docker volume spec `HOST:CONTAINER[:ro|:rw]`. Relative host paths are
+/// resolved against the current directory (as `docker` does for bind mounts).
+fn parse_volume(spec: &str) -> Result<Volume> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    let (host, container, mode) = match parts.as_slice() {
+        [h, c] => (*h, *c, "rw"),
+        [h, c, m] => (*h, *c, *m),
+        _ => return Err(anyhow!(
+            "-v/--volume requires HOST:CONTAINER[:ro|:rw], got: {}", spec
+        )),
+    };
+    let read_only = match mode {
+        "ro" => true,
+        "rw" => false,
+        other => return Err(anyhow!("volume mode must be ro or rw, got: {}", other)),
+    };
+    let host = if host.starts_with('/') {
+        PathBuf::from(host)
+    } else {
+        std::env::current_dir()?.join(host)
+    };
+    Ok(Volume { host, container: PathBuf::from(container), read_only })
+}
+
+/// Parse a Docker `-p/--publish` spec `[IP:][HOST:]CONTAINER[/proto]`, returning
+/// the container port (the port the process binds inside the sandbox).
+fn parse_publish(spec: &str) -> Result<u16> {
+    let without_proto = spec.split('/').next().unwrap_or(spec);
+    let container_port = without_proto.rsplit(':').next().unwrap_or(without_proto);
+    container_port
+        .parse::<u16>()
+        .map_err(|_| anyhow!("invalid --publish port in {:?}", spec))
+}
+
+/// Parse a Docker `-u/--user` value (`UID` or `UID:GID`, or a `name`), returning
+/// the numeric UID if it is numeric. Names cannot be resolved without the
+/// image's /etc/passwd, so they yield `None`.
+fn parse_user(user: &str) -> Option<u32> {
+    user.split(':').next().unwrap_or(user).parse::<u32>().ok()
 }
 
 #[derive(Subcommand)]
@@ -136,7 +289,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Run(args) => run_command(args).await?,
+        Command::Run(args) => run_command(*args).await?,
 
         Command::List => {
             match network_registry::list() {
@@ -247,7 +400,28 @@ async fn main() -> Result<()> {
 async fn run_command(args: RunArgs) -> Result<()> {
     let pb = &args.sandbox_builder;
 
+    // Warn on Docker flags we accept but cannot honour.
+    if args.detach {
+        return Err(anyhow!("--detach/-d is not supported: sandlock runs in the foreground"));
+    }
+    for (set, flag) in [
+        (args.privileged, "--privileged"),
+        (!args.cap_add.is_empty(), "--cap-add"),
+        (!args.cap_drop.is_empty(), "--cap-drop"),
+        (args.pull.is_some(), "--pull"),
+    ] {
+        if set {
+            eprintln!("sandlock: warning: {} is ignored (no Docker compatibility for it)", flag);
+        }
+    }
+
+    // Resolve Docker-style `IMAGE [CMD...]` vs native `-- CMD` up front.
+    let target = resolve_run_target(&args);
+
     if args.no_supervisor {
+        if target.image.is_some() {
+            return Err(anyhow!("--no-supervisor is incompatible with running an image"));
+        }
         validate_no_supervisor(&args)?;
 
         // Load profile once (if any) and split into policy base + program spec.
@@ -284,8 +458,8 @@ async fn run_command(args: RunArgs) -> Result<()> {
 
         // Derive the effective command: profile's [program] section supplies the
         // default; a trailing positional command on the CLI overrides it.
-        let effective_cmd: Vec<String> = if !args.cmd.is_empty() || args.exec_shell.is_some() {
-            args.cmd.clone()
+        let effective_cmd: Vec<String> = if !target.cmd.is_empty() || args.exec_shell.is_some() {
+            target.cmd.clone()
         } else if let Some(spec) = ns_profile_spec {
             if let Some(exec) = spec.exec {
                 let exec_str = exec.into_os_string().into_string()
@@ -307,11 +481,22 @@ async fn run_command(args: RunArgs) -> Result<()> {
         if !pb.extra_allow_syscalls.is_empty() { builder = builder.extra_allow_syscalls(pb.extra_allow_syscalls.clone()); }
         if !pb.extra_deny_syscalls.is_empty() { builder = builder.extra_deny_syscalls(pb.extra_deny_syscalls.clone()); }
         if pb.clean_env { builder = builder.clean_env(true); }
+        for path in &args.env_file {
+            let content = std::fs::read_to_string(path)
+                .map_err(|e| anyhow!("failed to read --env-file {}: {}", path.display(), e))?;
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') { continue; }
+                if let Some((k, v)) = line.split_once('=') {
+                    builder = builder.env_var(k.trim(), v);
+                }
+            }
+        }
         for spec in &args.env_vars {
             if let Some((k, v)) = spec.split_once('=') {
                 builder = builder.env_var(k, v);
-            } else {
-                return Err(anyhow!("--env requires KEY=VALUE, got: {}", spec));
+            } else if let Ok(v) = std::env::var(spec) {
+                builder = builder.env_var(spec, v);
             }
         }
 
@@ -476,33 +661,126 @@ async fn run_command(args: RunArgs) -> Result<()> {
     }
     if !args.cpu_cores.is_empty() { builder = builder.cpu_cores(args.cpu_cores.clone()); }
     if !args.gpu_devices.is_empty() { builder = builder.gpu_devices(args.gpu_devices.clone()); }
+    // ── Image: extract rootfs, then layer in the image's baked-in config ──────
+    // (env, working dir, user) the way `docker run` does. The image's defaults
+    // sit at the lowest precedence; the CLI flags below override them.
+    let image_config = if let Some(ref img) = target.image {
+        let rootfs = sandlock_core::image::extract(img, None)?;
+        builder = builder.chroot(rootfs).fs_read("/");
+        Some(sandlock_core::image::inspect_config(img)?)
+    } else {
+        None
+    };
+    let mut effective_cwd: Option<String> = None;
+    let mut effective_uid: Option<u32> = None;
+    if let Some(ref cfg) = image_config {
+        for kv in &cfg.env {
+            if let Some((k, v)) = kv.split_once('=') { builder = builder.env_var(k, v); }
+        }
+        effective_cwd = cfg.workdir.clone();
+        effective_uid = cfg.user.as_deref().and_then(parse_user);
+    }
+
+    // ── Environment: --env-file, then -e/--env (later wins, like Docker) ──────
+    for path in &args.env_file {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| anyhow!("failed to read --env-file {}: {}", path.display(), e))?;
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') { continue; }
+            if let Some((k, v)) = line.split_once('=') {
+                builder = builder.env_var(k.trim(), v);
+            }
+        }
+    }
     for spec in &args.env_vars {
         if let Some((k, v)) = spec.split_once('=') {
             builder = builder.env_var(k, v);
-        } else {
-            return Err(anyhow!("--env requires KEY=VALUE, got: {}", spec));
+        } else if let Ok(v) = std::env::var(spec) {
+            // Docker: `-e VAR` (no `=value`) forwards the host's value.
+            builder = builder.env_var(spec, v);
         }
     }
 
-    let sandbox_name = args.name.clone().unwrap_or_else(|| network_registry::next_name());
-
-    // Handle --image: extract rootfs, set chroot, get default cmd
-    let image_cmd: Option<Vec<String>>;
-    if let Some(ref img) = args.image {
-        let rootfs = sandlock_core::image::extract(img, None)?;
-        builder = builder.chroot(rootfs).fs_read("/");
-        if args.cmd.is_empty() {
-            image_cmd = Some(sandlock_core::image::inspect_cmd(img)?);
+    // ── Docker -v/--volume → per-sandbox mount + filesystem access ────────────
+    for spec in &args.volume {
+        let vol = parse_volume(spec)?;
+        builder = builder.fs_mount(&vol.container, &vol.host);
+        builder = if vol.read_only {
+            builder.fs_read(&vol.container)
         } else {
-            image_cmd = None;
+            builder.fs_write(&vol.container)
+        };
+    }
+
+    // ── Docker -w/--workdir and -u/--user (override image defaults) ───────────
+    if let Some(ref wd) = args.docker_workdir { effective_cwd = Some(wd.clone()); }
+    if let Some(ref u) = args.user {
+        effective_uid = Some(parse_user(u)
+            .ok_or_else(|| anyhow!("--user must be a numeric UID or UID:GID, got: {}", u))?);
+    }
+    if let Some(ref wd) = effective_cwd { builder = builder.cwd(wd); }
+    if let Some(uid) = effective_uid { builder = builder.uid(uid); }
+
+    // ── Docker -p/--publish → allow binding + port virtualization ─────────────
+    if !args.publish.is_empty() {
+        for spec in &args.publish {
+            builder = builder.net_bind_port(parse_publish(spec)?);
         }
+        builder = builder.port_remap(true);
+    }
+
+    // ── Docker --network (none = default deny, host = allow all egress) ───────
+    if let Some(ref mode) = args.network {
+        match mode.as_str() {
+            "none" => {}
+            "host" => { builder = builder.net_allow(":*").net_allow("udp://*:*"); }
+            other => return Err(anyhow!("unsupported --network mode: {} (use none or host)", other)),
+        }
+    }
+
+    // ── Docker --cpus → CPU count ─────────────────────────────────────────────
+    if let Some(n) = args.cpus {
+        if n <= 0.0 { return Err(anyhow!("--cpus must be positive, got: {}", n)); }
+        builder = builder.max_cpu(n.ceil() as u8);
+    }
+
+    // Sandbox name: --name, else --hostname, else auto-generated.
+    let sandbox_name = args.name.clone()
+        .or_else(|| args.hostname.clone())
+        .unwrap_or_else(network_registry::next_name);
+
+    // ── Resolve the command ───────────────────────────────────────────────────
+    // Precedence: --exec-shell > CLI command > image ENTRYPOINT/CMD > profile.
+    // --entrypoint overrides the image ENTRYPOINT for both forms.
+    let cli_cmd: Option<Vec<String>> = if !target.cmd.is_empty() {
+        Some(match &args.entrypoint {
+            Some(ep) => {
+                let mut v = vec![ep.clone()];
+                v.extend(target.cmd.clone());
+                v
+            }
+            None => target.cmd.clone(),
+        })
     } else {
-        image_cmd = None;
-    }
+        None
+    };
+    let image_cmd: Option<Vec<String>> = match (&image_config, cli_cmd.is_some()) {
+        (Some(cfg), false) => Some(match &args.entrypoint {
+            // Override ENTRYPOINT but keep the image's default CMD as arguments.
+            Some(ep) => {
+                let mut v = vec![ep.clone()];
+                if let Some(ref c) = cfg.cmd { v.extend(c.clone()); }
+                v
+            }
+            None => cfg.default_command(),
+        }),
+        _ => None,
+    };
 
     // Derive the effective command: profile's [program] section supplies a
-    // default; a trailing positional command on the CLI overrides it.
-    let profile_cmd: Option<Vec<String>> = if args.cmd.is_empty() && args.exec_shell.is_none() && image_cmd.is_none() {
+    // default; a CLI command, an image, or --exec-shell overrides it.
+    let profile_cmd: Option<Vec<String>> = if cli_cmd.is_none() && image_cmd.is_none() && args.exec_shell.is_none() {
         if let Some(spec) = profile_program_spec {
             if let Some(exec) = spec.exec {
                 let exec_str = exec.into_os_string().into_string()
@@ -520,17 +798,17 @@ async fn run_command(args: RunArgs) -> Result<()> {
         None
     };
 
-    if args.exec_shell.is_none() && args.cmd.is_empty() && image_cmd.is_none() && profile_cmd.is_none() {
-        return Err(anyhow!("no command specified (no trailing command and no [program].exec in profile)"));
+    if args.exec_shell.is_none() && cli_cmd.is_none() && image_cmd.is_none() && profile_cmd.is_none() {
+        return Err(anyhow!("no command specified (no image, no trailing command, and no [program].exec in profile)"));
     }
 
     let policy = builder.build()?;
     let cmd_strs: Vec<&str> = if let Some(ref shell_cmd) = args.exec_shell {
         vec!["/bin/sh", "-c", shell_cmd.as_str()]
+    } else if let Some(ref cc) = cli_cmd {
+        cc.iter().map(|s| s.as_str()).collect()
     } else if let Some(ref ic) = image_cmd {
         ic.iter().map(|s| s.as_str()).collect()
-    } else if !args.cmd.is_empty() {
-        args.cmd.iter().map(|s| s.as_str()).collect()
     } else if let Some(ref pc) = profile_cmd {
         pc.iter().map(|s| s.as_str()).collect()
     } else {
@@ -679,6 +957,14 @@ fn validate_no_supervisor(args: &RunArgs) -> Result<()> {
     if args.status_fd.is_some() { bad.push("--status-fd"); }
     if !pb.fs_denied.is_empty() { bad.push("--fs-deny"); }
     if !args.fs_mount.is_empty() { bad.push("--fs-mount"); }
+    // Docker-compatible flags that map onto supervisor-only features.
+    if !args.volume.is_empty() { bad.push("--volume"); }
+    if !args.publish.is_empty() { bad.push("--publish"); }
+    if args.docker_workdir.is_some() { bad.push("--workdir"); }
+    if args.user.is_some() { bad.push("--user"); }
+    if args.hostname.is_some() { bad.push("--hostname"); }
+    if args.network.is_some() { bad.push("--network"); }
+    if args.cpus.is_some() { bad.push("--cpus"); }
 
     if !bad.is_empty() {
         return Err(anyhow!(
@@ -836,4 +1122,78 @@ fn parse_time_start(s: &str) -> Result<SystemTime> {
     let ts: jiff::Timestamp = s.parse()
         .map_err(|e| anyhow!("invalid --time-start '{}': {}", s, e))?;
     Ok(ts.into())
+}
+
+#[cfg(test)]
+mod docker_compat_tests {
+    use super::*;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn docker_mode_first_positional_is_image() {
+        // `sandlock run ubuntu bash` → image=ubuntu, cmd=[bash]
+        let t = split_run_target(None, &s(&["ubuntu", "bash"]), false);
+        assert_eq!(t.image.as_deref(), Some("ubuntu"));
+        assert_eq!(t.cmd, s(&["bash"]));
+    }
+
+    #[test]
+    fn docker_mode_image_only_uses_default_cmd() {
+        let t = split_run_target(None, &s(&["python:3.12"]), false);
+        assert_eq!(t.image.as_deref(), Some("python:3.12"));
+        assert!(t.cmd.is_empty());
+    }
+
+    #[test]
+    fn terminator_selects_native_host_command() {
+        // `sandlock run --fs-write /tmp -- echo hi` → no image, cmd=[echo, hi]
+        let t = split_run_target(None, &s(&["echo", "hi"]), true);
+        assert_eq!(t.image, None);
+        assert_eq!(t.cmd, s(&["echo", "hi"]));
+    }
+
+    #[test]
+    fn explicit_image_flag_takes_all_positionals_as_cmd() {
+        let t = split_run_target(Some("alpine"), &s(&["sh", "-c", "true"]), true);
+        assert_eq!(t.image.as_deref(), Some("alpine"));
+        assert_eq!(t.cmd, s(&["sh", "-c", "true"]));
+    }
+
+    #[test]
+    fn parse_volume_forms() {
+        let cwd = std::env::current_dir().unwrap();
+        let v = parse_volume("/data:/app").unwrap();
+        assert_eq!(v.host, std::path::PathBuf::from("/data"));
+        assert_eq!(v.container, std::path::PathBuf::from("/app"));
+        assert!(!v.read_only);
+
+        let v = parse_volume("/data:/app:ro").unwrap();
+        assert!(v.read_only);
+
+        // relative host path is resolved against cwd
+        let v = parse_volume("src:/app").unwrap();
+        assert_eq!(v.host, cwd.join("src"));
+
+        assert!(parse_volume("/app").is_err());
+        assert!(parse_volume("/h:/c:bogus").is_err());
+    }
+
+    #[test]
+    fn parse_publish_extracts_container_port() {
+        assert_eq!(parse_publish("8080").unwrap(), 8080);
+        assert_eq!(parse_publish("8080:80").unwrap(), 80);
+        assert_eq!(parse_publish("127.0.0.1:8080:80").unwrap(), 80);
+        assert_eq!(parse_publish("80/tcp").unwrap(), 80);
+        assert!(parse_publish("notaport").is_err());
+    }
+
+    #[test]
+    fn parse_user_numeric_only() {
+        assert_eq!(parse_user("1000"), Some(1000));
+        assert_eq!(parse_user("1000:1000"), Some(1000));
+        assert_eq!(parse_user("node"), None);
+    }
 }

@@ -176,7 +176,7 @@ fn test_no_supervisor_rejects_incompatible_flags() {
 #[test]
 fn test_no_supervisor_writable_path() {
     let output = sandlock_bin()
-        .args(["run", "--no-supervisor", "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "-w", "/tmp", "--",
+        .args(["run", "--no-supervisor", "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "--fs-write", "/tmp", "--",
                "sh", "-c", "echo no-supervisor-write > /tmp/sandlock-no-supervisor-test && cat /tmp/sandlock-no-supervisor-test"])
         .output()
         .expect("failed to run");
@@ -193,7 +193,7 @@ fn test_no_supervisor_nested_sandbox() {
     let output = sandlock_bin()
         .args(["run", "--no-supervisor",
                "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "-r", "/etc",
-               "-r", "/proc", "-r", "/dev", "-w", "/tmp",
+               "-r", "/proc", "-r", "/dev", "--fs-write", "/tmp",
                "-r", sandlock_dir,
                "--", sandlock_path, "run",
                "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "-r", "/etc",
@@ -214,3 +214,74 @@ fn test_no_supervisor_exit_code() {
     assert_eq!(output.status.code(), Some(42));
 }
 
+
+// ── Docker CLI compatibility ─────────────────────────────────────────────────
+
+/// True when the local Docker daemon can be reached and `alpine:latest` is
+/// available. Docker-mode tests skip (pass as no-ops) otherwise so CI without a
+/// Docker daemon stays green.
+fn docker_alpine_available() -> bool {
+    Command::new("docker")
+        .args(["image", "inspect", "alpine:latest"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[test]
+fn docker_help_lists_compat_flags() {
+    let output = sandlock_bin().args(["run", "--help"]).output().expect("run --help");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for flag in ["--volume", "--publish", "--workdir", "--user", "--network", "--tty", "--entrypoint"] {
+        assert!(stdout.contains(flag), "run --help should mention {}", flag);
+    }
+}
+
+#[test]
+fn docker_run_image_positional() {
+    if !docker_alpine_available() { eprintln!("skipping: alpine not available"); return; }
+    let output = sandlock_bin()
+        .args(["run", "alpine", "echo", "hello-docker"])
+        .output()
+        .expect("failed to run image");
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("hello-docker"));
+}
+
+#[test]
+fn docker_run_env_and_workdir() {
+    if !docker_alpine_available() { eprintln!("skipping: alpine not available"); return; }
+    let output = sandlock_bin()
+        .args(["run", "-e", "FOO=bar", "-w", "/tmp", "alpine", "sh", "-c", "echo $FOO@$(pwd)"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "bar@/tmp");
+}
+
+#[test]
+fn docker_run_applies_image_default_path() {
+    if !docker_alpine_available() { eprintln!("skipping: alpine not available"); return; }
+    // The image's baked-in PATH should be applied even without --env.
+    let output = sandlock_bin()
+        .args(["run", "alpine", "sh", "-c", "echo $PATH"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("/usr/bin"));
+}
+
+#[test]
+fn docker_run_volume_readonly() {
+    if !docker_alpine_available() { eprintln!("skipping: alpine not available"); return; }
+    let dir = std::env::temp_dir().join("sandlock-vol-it");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("f.txt"), "mounted").unwrap();
+    let output = sandlock_bin()
+        .args(["run", "-v", &format!("{}:/mnt:ro", dir.display()), "alpine", "cat", "/mnt/f.txt"])
+        .output()
+        .expect("failed to run");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("mounted"));
+}
