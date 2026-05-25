@@ -1,0 +1,155 @@
+//! Integration tests for the per-protection availability resolution
+//! in `landlock::confine_inner`.
+//!
+//! These tests exercise the policy-driven resolution path directly via
+//! the `pub(crate)` `resolve()` helper with synthetic ABI values, so
+//! they are independent of the host kernel's actual Landlock ABI.
+
+use sandlock_core::landlock::{resolve, Resolved};
+use sandlock_core::{Protection, ProtectionPolicy, ProtectionState};
+
+// ----------------------------------------------------------------------
+// resolve() — Strict
+// ----------------------------------------------------------------------
+
+#[test]
+fn strict_on_supporting_host_resolves_to_active() {
+    // SignalScope needs ABI v6; host claims v6.
+    let pol = ProtectionPolicy::strict_all();
+    assert_eq!(
+        resolve(Protection::SignalScope, 6, &pol),
+        Resolved::Active,
+        "Strict + available host must resolve to Active"
+    );
+}
+
+#[test]
+fn strictly_unavailable_returns_protection_unavailable() {
+    // SignalScope needs ABI v6; host only has v5.
+    let pol = ProtectionPolicy::strict_all();
+    let r = resolve(Protection::SignalScope, 5, &pol);
+    assert_eq!(
+        r,
+        Resolved::StrictlyUnavailable,
+        "Strict + unavailable host must resolve to StrictlyUnavailable"
+    );
+}
+
+#[test]
+fn strict_all_on_v6_host_resolves_every_protection_active() {
+    // Default strict_all() policy on a kernel meeting the highest floor
+    // (v6) yields Active for every protection — this is the load-bearing
+    // invariant that preserves pre-refactor confine_inner behaviour.
+    let pol = ProtectionPolicy::strict_all();
+    for p in Protection::all() {
+        assert_eq!(
+            resolve(p, 6, &pol),
+            Resolved::Active,
+            "{:?} under strict_all on v6 host must be Active",
+            p
+        );
+    }
+}
+
+// ----------------------------------------------------------------------
+// resolve() — Degradable
+// ----------------------------------------------------------------------
+
+#[test]
+fn degradable_on_unavailable_host_resolves_to_degraded() {
+    let mut pol = ProtectionPolicy::strict_all();
+    pol.set(Protection::SignalScope, ProtectionState::Degradable);
+    let r = resolve(Protection::SignalScope, 5, &pol);
+    assert_eq!(
+        r,
+        Resolved::Degraded,
+        "Degradable + unavailable host must resolve to Degraded (silent skip)"
+    );
+}
+
+#[test]
+fn degradable_on_supporting_host_resolves_to_active() {
+    let mut pol = ProtectionPolicy::strict_all();
+    pol.set(Protection::FsTruncate, ProtectionState::Degradable);
+    // FsTruncate needs v3.
+    assert_eq!(
+        resolve(Protection::FsTruncate, 6, &pol),
+        Resolved::Active,
+        "Degradable + available host must enforce (Active)"
+    );
+}
+
+// ----------------------------------------------------------------------
+// resolve() — Disabled
+// ----------------------------------------------------------------------
+
+#[test]
+fn disabled_on_supporting_host_resolves_to_disabled() {
+    let mut pol = ProtectionPolicy::strict_all();
+    pol.set(Protection::SignalScope, ProtectionState::Disabled);
+    let r = resolve(Protection::SignalScope, 6, &pol);
+    assert_eq!(
+        r,
+        Resolved::Disabled,
+        "Disabled must resolve to Disabled regardless of host support"
+    );
+}
+
+#[test]
+fn disabled_on_unavailable_host_resolves_to_disabled() {
+    let mut pol = ProtectionPolicy::strict_all();
+    pol.set(Protection::SignalScope, ProtectionState::Disabled);
+    let r = resolve(Protection::SignalScope, 5, &pol);
+    assert_eq!(
+        r,
+        Resolved::Disabled,
+        "Disabled wins over host availability — never StrictlyUnavailable"
+    );
+}
+
+// ----------------------------------------------------------------------
+// Per-protection ABI floor matrix
+// ----------------------------------------------------------------------
+
+#[test]
+fn strict_all_on_v4_host_fails_only_for_v5_plus_protections() {
+    // Host with ABI v4 supports FsRefer (v2), FsTruncate (v3), NetTcp
+    // (v4); fails on FsIoctlDev (v5), SignalScope (v6),
+    // AbstractUnixScope (v6).
+    let pol = ProtectionPolicy::strict_all();
+    assert_eq!(resolve(Protection::FsRefer, 4, &pol), Resolved::Active);
+    assert_eq!(resolve(Protection::FsTruncate, 4, &pol), Resolved::Active);
+    assert_eq!(resolve(Protection::NetTcp, 4, &pol), Resolved::Active);
+    assert_eq!(
+        resolve(Protection::FsIoctlDev, 4, &pol),
+        Resolved::StrictlyUnavailable
+    );
+    assert_eq!(
+        resolve(Protection::SignalScope, 4, &pol),
+        Resolved::StrictlyUnavailable
+    );
+    assert_eq!(
+        resolve(Protection::AbstractUnixScope, 4, &pol),
+        Resolved::StrictlyUnavailable
+    );
+}
+
+#[test]
+fn fully_degradable_policy_never_returns_strictly_unavailable_even_on_v1() {
+    // A policy that marks every protection Degradable must never
+    // produce StrictlyUnavailable, even on a host so old it only
+    // supports the v1 base set (no fs-extension protections).
+    let mut pol = ProtectionPolicy::strict_all();
+    for p in Protection::all() {
+        pol.set(p, ProtectionState::Degradable);
+    }
+    for p in Protection::all() {
+        let r = resolve(p, 1, &pol);
+        assert!(
+            matches!(r, Resolved::Active | Resolved::Degraded),
+            "{:?} on v1 host with Degradable must not be StrictlyUnavailable, got {:?}",
+            p,
+            r
+        );
+    }
+}

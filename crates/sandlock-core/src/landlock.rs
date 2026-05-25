@@ -2,6 +2,7 @@ use std::os::fd::OwnedFd;
 use std::path::Path;
 
 use crate::error::{ConfinementError, SandlockError};
+use crate::protection::{Protection, ProtectionPolicy, ProtectionState};
 use crate::sandbox::Sandbox;
 use crate::sys::structs::{
     LandlockNetPortAttr, LandlockPathBeneathAttr, LandlockRulesetAttr,
@@ -189,10 +190,111 @@ fn add_net_rule(ruleset_fd: &OwnedFd, port: u16, access: u64) -> Result<(), Conf
 }
 
 // ============================================================
+// Per-protection availability resolution
+// ============================================================
+
+/// Resolution for a single `Protection` against the host's Landlock
+/// ABI and the policy's state for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum Resolved {
+    /// Enforce: protection is available on the host and the policy
+    /// requires (or allows) it.
+    Active,
+    /// Enforce-not: protection is unavailable on the host but the
+    /// policy named it `Degradable`, so we skip it silently.
+    Degraded,
+    /// Off: the policy disabled this protection (regardless of host
+    /// support).
+    Disabled,
+    /// Error: the policy is `Strict` but the host kernel cannot
+    /// provide this protection.
+    StrictlyUnavailable,
+}
+
+/// Resolve a single `Protection` against the host ABI and a
+/// `ProtectionPolicy` into one of four states.
+#[doc(hidden)]
+pub fn resolve(p: Protection, host_abi: u32, policy: &ProtectionPolicy) -> Resolved {
+    let available = host_abi >= p.min_abi();
+    match (policy.state(p), available) {
+        (ProtectionState::Disabled, _) => Resolved::Disabled,
+        (ProtectionState::Strict, true) => Resolved::Active,
+        (ProtectionState::Strict, false) => Resolved::StrictlyUnavailable,
+        (ProtectionState::Degradable, true) => Resolved::Active,
+        (ProtectionState::Degradable, false) => Resolved::Degraded,
+    }
+}
+
+/// Compute the `scoped` mask from the per-protection resolutions of
+/// the two scope protections.
+pub(crate) fn compute_scope_mask(abi: u32, pol: &ProtectionPolicy) -> u64 {
+    let mut mask: u64 = 0;
+    if resolve(Protection::AbstractUnixScope, abi, pol) == Resolved::Active {
+        mask |= LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET;
+    }
+    if resolve(Protection::SignalScope, abi, pol) == Resolved::Active {
+        mask |= LANDLOCK_SCOPE_SIGNAL;
+    }
+    mask
+}
+
+/// Compute the `handled_access_fs` mask. Starts from the ABI-cumulative
+/// base set and masks off bits whose corresponding `Protection` is
+/// `Disabled` in the policy.
+pub(crate) fn compute_fs_mask(abi: u32, pol: &ProtectionPolicy) -> u64 {
+    let mut mask = base_fs_access(abi);
+    if resolve(Protection::FsRefer, abi, pol) == Resolved::Disabled {
+        mask &= !LANDLOCK_ACCESS_FS_REFER;
+    }
+    if resolve(Protection::FsTruncate, abi, pol) == Resolved::Disabled {
+        mask &= !LANDLOCK_ACCESS_FS_TRUNCATE;
+    }
+    if resolve(Protection::FsIoctlDev, abi, pol) == Resolved::Disabled {
+        mask &= !LANDLOCK_ACCESS_FS_IOCTL_DEV;
+    }
+    mask
+}
+
+/// Compute the `handled_access_net` mask, preserving the wildcard
+/// behaviour: when any TCP `--net-allow` rule covers every port we
+/// drop `CONNECT_TCP` from the handled set (the on-behalf path is then
+/// the sole enforcer). Returns `0` when `Protection::NetTcp` is not
+/// `Active` (either disabled by policy or degraded on a kernel that
+/// does not provide TCP network hooks).
+pub(crate) fn compute_net_mask(
+    abi: u32,
+    pol: &ProtectionPolicy,
+    sandbox: &Sandbox,
+    handle_net: bool,
+) -> u64 {
+    if !handle_net {
+        return 0;
+    }
+    if resolve(Protection::NetTcp, abi, pol) != Resolved::Active {
+        return 0;
+    }
+    use crate::sandbox::Protocol;
+    let net_wildcard = sandbox
+        .net_allow
+        .iter()
+        .any(|r| r.protocol == Protocol::Tcp && r.all_ports);
+    if net_wildcard {
+        LANDLOCK_ACCESS_NET_BIND_TCP
+    } else {
+        LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP
+    }
+}
+
+// ============================================================
 // Main entry point
 // ============================================================
 
-/// Minimum Landlock ABI version required by sandlock.
+/// Minimum Landlock ABI version required by sandlock when every
+/// protection is in the default `ProtectionState::Strict`. The
+/// authoritative per-protection floors live in
+/// `Protection::min_abi()`; this constant is kept for backward
+/// compatibility with downstream code that re-exports it.
 pub const MIN_ABI: u32 = 6;
 
 /// Apply Landlock confinement based on the given `Sandbox`.
@@ -209,27 +311,40 @@ pub fn confine_filesystem(policy: &Sandbox) -> Result<(), SandlockError> {
 }
 
 fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError> {
-    // Step 1 -- detect and validate ABI version.
+    // Step 1 — detect host ABI version.
     let abi = abi_version().map_err(|e| {
         SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
     })?;
 
-    if abi < MIN_ABI {
-        return Err(SandlockError::Runtime(
-            crate::error::SandboxRuntimeError::Confinement(
-                ConfinementError::InsufficientAbi {
-                    required: MIN_ABI,
-                    actual: abi,
-                    feature: "full sandlock support".into(),
-                },
-            ),
-        ));
+    // Step 2 — per-protection availability resolution. Any protection
+    // in `ProtectionState::Strict` that the host kernel cannot provide
+    // is a hard error here; `Degradable` becomes a silent skip and
+    // `Disabled` is honoured regardless of host support. With the
+    // default `ProtectionPolicy::strict_all()` on a v6+ host this
+    // produces `Resolved::Active` for every protection — preserving
+    // the historical `MIN_ABI = 6` floor exactly.
+    let pol = &policy.protection_policy;
+    for protection in Protection::all() {
+        if resolve(protection, abi, pol) == Resolved::StrictlyUnavailable {
+            return Err(SandlockError::Runtime(
+                crate::error::SandboxRuntimeError::Confinement(
+                    ConfinementError::ProtectionUnavailable {
+                        protection,
+                        required_abi: protection.min_abi(),
+                        host_abi: abi,
+                    },
+                ),
+            ));
+        }
     }
 
-    // Step 2 -- build handled_access_fs / handled_access_net / scoped.
-    let handled_access_fs = base_fs_access(abi);
+    // Step 3 — build handled_access_fs / handled_access_net / scoped.
+    //
+    // FS: cumulative ABI base set, with `Disabled` protections masked
+    // off (FsRefer/FsTruncate/FsIoctlDev).
+    let handled_access_fs = compute_fs_mask(abi, pol);
 
-    // Restrict TCP bind/connect via Landlock by default. When any
+    // Net: TCP bind/connect via Landlock by default. When any
     // `--net-allow` rule has the all-ports wildcard (`host:*` or
     // `:*`), Landlock cannot express "every port" without enumerating
     // 65535 rules, so we drop CONNECT_TCP from the handled set —
@@ -248,16 +363,11 @@ fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError
         .net_allow
         .iter()
         .any(|r| r.protocol == Protocol::Tcp && r.all_ports);
-    let handled_access_net = if !handle_net {
-        0
-    } else if net_wildcard {
-        LANDLOCK_ACCESS_NET_BIND_TCP
-    } else {
-        LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP
-    };
+    let handled_access_net = compute_net_mask(abi, pol, policy, handle_net);
 
-    // IPC and signal isolation are always enabled.
-    let scoped = LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET | LANDLOCK_SCOPE_SIGNAL;
+    // Scope: IPC + signal isolation, each gated on its protection's
+    // resolved state.
+    let scoped = compute_scope_mask(abi, pol);
 
     // Step 3 — create ruleset.
     let attr = LandlockRulesetAttr {
@@ -331,8 +441,12 @@ fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError
         }
     }
 
-    // Step 5 -- add network port rules.
-    if handle_net {
+    // Step 5 -- add network port rules. Skip entirely when
+    // `Protection::NetTcp` is not `Active` (either policy-disabled or
+    // degraded on a host without TCP network hooks) — `handled_access_net`
+    // is 0 in that case and the kernel would reject any rule with EINVAL.
+    let net_tcp_active = resolve(Protection::NetTcp, abi, pol) == Resolved::Active;
+    if handle_net && net_tcp_active {
         for &port in &policy.net_bind {
             add_net_rule(&ruleset_fd, port, LANDLOCK_ACCESS_NET_BIND_TCP).map_err(|e| {
                 SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
@@ -349,7 +463,7 @@ fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError
     // When `net_wildcard` is set we already excluded CONNECT_TCP from
     // `handled_access_net`, so adding rules here would fail with EINVAL.
     // Skip — the on-behalf path is the sole enforcer.
-    if handle_net && !net_wildcard {
+    if handle_net && net_tcp_active && !net_wildcard {
         let mut connect_ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
         for rule in &policy.net_allow {
             // TCP-only — see net_wildcard comment above.

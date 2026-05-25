@@ -128,8 +128,11 @@ impl ProtectionPolicy {
 
     /// Set the state for a single protection. Internal API — public
     /// builder methods (in the polarity-dependent layer landing later)
-    /// call this.
-    pub(crate) fn set(&mut self, protection: Protection, state: ProtectionState) {
+    /// call this. Marked `#[doc(hidden)] pub` so integration tests in
+    /// the `tests/` directory can drive the resolver directly; not part
+    /// of the stable public surface.
+    #[doc(hidden)]
+    pub fn set(&mut self, protection: Protection, state: ProtectionState) {
         self.states.insert(protection, state);
     }
 
