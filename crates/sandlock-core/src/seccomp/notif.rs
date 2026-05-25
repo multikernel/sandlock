@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::IpAddr;
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 use crate::error::NotifError;
@@ -177,25 +177,29 @@ fn is_denied_with_symlink_resolve(
     false
 }
 
+/// Read the thread-group leader (Tgid) of a thread from `/proc/<tid>/status`.
+fn tgid_of(tid: u32) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{}/status", tid)).ok()?;
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Tgid:").and_then(|r| r.trim().parse().ok()))
+}
+
 /// Duplicate a file descriptor from an arbitrary process (by PID/TID) into the supervisor.
-/// Uses PIDFD_THREAD so pidfd_open works for any thread, not just the group leader.
-pub(crate) fn dup_fd_from_pid(pid: u32, target_fd: i32) -> Result<OwnedFd, io::Error> {
-    const SYS_PIDFD_OPEN: i64 = 434;
-    const SYS_PIDFD_GETFD: i64 = 438;
-    const PIDFD_THREAD: i64 = libc::O_EXCL as i64; // Linux 6.9+
-    let pidfd = unsafe { libc::syscall(SYS_PIDFD_OPEN, pid as i64, PIDFD_THREAD) };
-    if pidfd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let pidfd_owned = unsafe { OwnedFd::from_raw_fd(pidfd as i32) };
-    let ret = unsafe {
-        libc::syscall(SYS_PIDFD_GETFD, pidfd_owned.as_raw_fd() as i64, target_fd as i64, 0i64)
-    };
-    if ret < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(unsafe { OwnedFd::from_raw_fd(ret as i32) })
-    }
+///
+/// `pidfd_getfd` (Linux 5.6+) needs a pidfd for the owning *process*. All threads
+/// of a process share one fd table, so the process's pidfd dups any thread's fd:
+/// `pidfd_open(pid, 0)` gives it directly when `pid` is a thread-group leader,
+/// otherwise we resolve the leader via `Tgid` in `/proc/<pid>/status` and open
+/// that. The triggering thread is frozen on the seccomp notification, so its
+/// Tgid cannot race with pid reuse. Works on any kernel with `pidfd_getfd`.
+pub(crate) fn dup_fd_from_pid(pid: u32, target_fd: i32) -> io::Result<OwnedFd> {
+    use crate::sys::syscall::{pidfd_getfd, pidfd_open};
+    let pidfd = pidfd_open(pid, 0).or_else(|e| match tgid_of(pid) {
+        Some(tgid) if tgid != pid => pidfd_open(tgid, 0),
+        _ => Err(e),
+    })?;
+    pidfd_getfd(&pidfd, target_fd, 0)
 }
 
 // ============================================================
@@ -1292,6 +1296,55 @@ pub(crate) async fn cleanup_pid(ctx: &super::ctx::SupervisorCtx, key: super::sta
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::io::FromRawFd;
+
+    fn gettid() -> u32 {
+        (unsafe { libc::syscall(libc::SYS_gettid) }) as u32
+    }
+
+    #[test]
+    fn tgid_of_main_thread_is_own_pid() {
+        // The main thread's tid equals the process pid, and its Tgid is the pid.
+        assert_eq!(tgid_of(gettid()), Some(std::process::id()));
+    }
+
+    #[test]
+    fn tgid_of_worker_thread_resolves_to_process() {
+        // A non-leader thread's Tgid is the process pid, not its own tid.
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let h = std::thread::spawn(move || {
+            tid_tx.send(gettid()).unwrap();
+            done_rx.recv().ok(); // stay alive until the test has read /proc
+        });
+        let worker_tid = tid_rx.recv().unwrap();
+        let pid = std::process::id();
+        assert_ne!(worker_tid, pid, "worker tid must differ from pid");
+        assert_eq!(tgid_of(worker_tid), Some(pid));
+        done_tx.send(()).ok();
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn dup_fd_from_pid_handles_worker_thread_fd() {
+        use std::os::unix::io::AsRawFd;
+        // Open an fd in a non-leader worker thread, then duplicate it by that
+        // thread's tid. Exercises the tid->process pidfd resolution end to end
+        // (PIDFD_THREAD on >=6.9, the /proc Tgid fallback on older kernels).
+        let (info_tx, info_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let h = std::thread::spawn(move || {
+            let f = std::fs::File::open("/dev/null").unwrap();
+            info_tx.send((gettid(), f.as_raw_fd())).unwrap();
+            done_rx.recv().ok();
+            drop(f);
+        });
+        let (worker_tid, fd) = info_rx.recv().unwrap();
+        let dup = dup_fd_from_pid(worker_tid, fd);
+        done_tx.send(()).ok();
+        h.join().unwrap();
+        assert!(dup.is_ok(), "dup_fd_from_pid for a worker-thread fd failed: {:?}", dup.err());
+    }
 
     #[test]
     fn read_child_cstr_returns_none_for_null_addr_or_zero_max_len() {
