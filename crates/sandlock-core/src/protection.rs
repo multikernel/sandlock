@@ -10,6 +10,8 @@
 //! `ProtectionPolicy` (also in this module). The decision-vs-availability
 //! resolution happens in `landlock::confine_inner`.
 
+use std::collections::HashMap;
+
 /// A single Landlock-provided protection, ABI-gated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Protection {
@@ -79,6 +81,97 @@ mod tests {
         // No duplicates.
         for p in &collected {
             assert_eq!(collected.iter().filter(|&q| q == p).count(), 1);
+        }
+    }
+}
+
+/// What a `ProtectionPolicy` instructs sandlock to do with a given
+/// `Protection`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtectionState {
+    /// Enforce; if the host kernel cannot provide this protection,
+    /// `confine_inner` returns an error naming the protection and the
+    /// kernel's actual ABI version. This is the default for every
+    /// protection.
+    Strict,
+    /// Enforce where the host kernel supports it; skip silently when
+    /// it does not. The skip is observable via `Sandbox::active_protections()`
+    /// and `sandlock check`.
+    Degradable,
+    /// Never enforce, even on a host kernel that supports the protection.
+    /// Intended for workloads that genuinely need the capability the
+    /// protection blocks.
+    Disabled,
+}
+
+/// Per-`Protection` state collection. The default for any protection
+/// not explicitly named is `ProtectionState::Strict` — meaning a
+/// freshly-constructed `ProtectionPolicy` produces the same behaviour
+/// as the current hard `MIN_ABI = 6` floor.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProtectionPolicy {
+    states: HashMap<Protection, ProtectionState>,
+}
+
+impl ProtectionPolicy {
+    /// A policy with no overrides — every protection defaults to
+    /// `Strict`. Equivalent to the pre-Protection behaviour.
+    pub fn strict_all() -> Self {
+        Self::default()
+    }
+
+    /// Look up the state for a given protection. Returns `Strict`
+    /// for protections not explicitly named.
+    pub fn state(&self, protection: Protection) -> ProtectionState {
+        self.states.get(&protection).copied().unwrap_or(ProtectionState::Strict)
+    }
+
+    /// Set the state for a single protection. Internal API — public
+    /// builder methods (in the polarity-dependent layer landing later)
+    /// call this.
+    pub(crate) fn set(&mut self, protection: Protection, state: ProtectionState) {
+        self.states.insert(protection, state);
+    }
+
+    /// Iterator over every protection paired with its resolved state
+    /// (including the implicit `Strict` for unnamed ones).
+    pub fn iter(&self) -> impl Iterator<Item = (Protection, ProtectionState)> + '_ {
+        Protection::all().map(|p| (p, self.state(p)))
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    #[test]
+    fn strict_all_returns_strict_for_every_protection() {
+        let pol = ProtectionPolicy::strict_all();
+        for p in Protection::all() {
+            assert_eq!(pol.state(p), ProtectionState::Strict);
+        }
+    }
+
+    #[test]
+    fn unnamed_protections_default_to_strict_even_after_other_overrides() {
+        let mut pol = ProtectionPolicy::strict_all();
+        pol.set(Protection::SignalScope, ProtectionState::Degradable);
+        assert_eq!(pol.state(Protection::SignalScope), ProtectionState::Degradable);
+        assert_eq!(pol.state(Protection::FsTruncate), ProtectionState::Strict);
+        assert_eq!(pol.state(Protection::AbstractUnixScope), ProtectionState::Strict);
+    }
+
+    #[test]
+    fn iter_yields_every_protection_with_resolved_state() {
+        let mut pol = ProtectionPolicy::strict_all();
+        pol.set(Protection::FsIoctlDev, ProtectionState::Disabled);
+        let collected: Vec<_> = pol.iter().collect();
+        assert_eq!(collected.len(), 6);
+        assert!(collected.iter().any(|(p, s)| *p == Protection::FsIoctlDev && *s == ProtectionState::Disabled));
+        for (p, s) in &collected {
+            if *p != Protection::FsIoctlDev {
+                assert_eq!(*s, ProtectionState::Strict, "{:?} should default to Strict", p);
+            }
         }
     }
 }
