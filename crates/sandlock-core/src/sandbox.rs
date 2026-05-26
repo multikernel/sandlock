@@ -298,6 +298,14 @@ pub struct Sandbox {
     pub num_cpus: Option<u32>,
     pub port_remap: bool,
 
+    /// Skip the seccomp user-notification supervisor. The sandbox runs
+    /// with Landlock + a kernel-only deny filter, with none of the
+    /// supervisor-mediated features (IP allowlist, resource limits,
+    /// COW, chroot mediation, /proc virtualization, custom handlers).
+    /// Required when nesting inside another sandlock — the kernel only
+    /// allows one `SECCOMP_FILTER_FLAG_NEW_LISTENER` per task.
+    pub no_supervisor: bool,
+
     // User namespace
     pub uid: Option<u32>,
 
@@ -389,6 +397,7 @@ impl Clone for Sandbox {
             cpu_cores: self.cpu_cores.clone(),
             num_cpus: self.num_cpus,
             port_remap: self.port_remap,
+            no_supervisor: self.no_supervisor,
             uid: self.uid,
             policy_fn: self.policy_fn.clone(),
             name: self.name.clone(),
@@ -934,8 +943,6 @@ impl Sandbox {
             };
             let _ = crate::seccomp::bpf::install_deny_filter(&filter);
 
-            crate::process::CONFINED.store(true, std::sync::atomic::Ordering::Relaxed);
-
             init_fn();
 
             drop(pipe_read_ends);
@@ -1160,7 +1167,7 @@ impl Sandbox {
             .map(|s| CString::new(*s).map_err(|_| SandboxRuntimeError::Child("invalid command string".into())))
             .collect::<Result<Vec<_>, _>>()?;
 
-        let nested = crate::process::is_nested();
+        let no_supervisor = self.no_supervisor;
 
         let pipes = PipePair::new().map_err(SandboxRuntimeError::Io)?;
 
@@ -1209,7 +1216,7 @@ impl Sandbox {
         // workdir live in the upper dir, and Landlock checks EXECUTE on the
         // file's real path at execve time — so the upper dir must be granted
         // read+execute (READ_ACCESS) or `./created-binary` fails with EACCES.
-        let seccomp_cow_branch = if !nested && self.workdir.is_some() && self.fs_isolation == FsIsolation::None {
+        let seccomp_cow_branch = if !no_supervisor && self.workdir.is_some() && self.fs_isolation == FsIsolation::None {
             let workdir = self.workdir.as_ref().unwrap().clone();
             let storage = self.fs_storage.clone();
             let max_disk = self.max_disk.map(|b| b.0).unwrap_or(0);
@@ -1299,7 +1306,7 @@ impl Sandbox {
                 cmd: &c_cmd,
                 pipes: &pipes,
                 cow_config: cow_config.as_ref(),
-                nested,
+                no_supervisor,
                 keep_fds: &gather_keep_fds,
                 sandbox_name: Some(sandbox_name.as_str()),
                 extra_syscalls: &extra_syscalls,
@@ -1891,6 +1898,15 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "port-remap"))]
     pub port_remap: bool,
 
+    /// Skip the seccomp user-notification supervisor. The CLI exposes
+    /// its own `--no-supervisor` flag on `RunArgs` (which short-circuits
+    /// to a direct exec); this field is the API-level counterpart used
+    /// when the caller still wants the normal `Sandbox::run` lifecycle
+    /// but cannot install a listener (e.g. nested inside another
+    /// sandbox).
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub no_supervisor: bool,
+
     #[cfg_attr(feature = "cli", arg(long = "uid"))]
     pub uid: Option<u32>,
 
@@ -1967,6 +1983,7 @@ impl Clone for SandboxBuilder {
             cpu_cores: self.cpu_cores.clone(),
             num_cpus: self.num_cpus,
             port_remap: self.port_remap,
+            no_supervisor: self.no_supervisor,
             uid: self.uid,
             policy_fn: self.policy_fn.clone(),
             name: self.name.clone(),
@@ -2182,6 +2199,19 @@ impl SandboxBuilder {
         self
     }
 
+    /// Skip the seccomp user-notification supervisor. The sandbox keeps
+    /// Landlock and the kernel-level deny filter but loses every
+    /// supervisor-mediated feature (IP allowlist, resource limits, COW,
+    /// chroot mediation, /proc virtualization, custom handlers). The
+    /// kernel only permits one `SECCOMP_FILTER_FLAG_NEW_LISTENER` per
+    /// task, so set this when nesting `Sandbox::run` inside an already-
+    /// confined process; otherwise the inner seccomp install returns
+    /// `EBUSY`.
+    pub fn no_supervisor(mut self, v: bool) -> Self {
+        self.no_supervisor = v;
+        self
+    }
+
     pub fn policy_fn(
         mut self,
         f: impl Fn(crate::policy_fn::SyscallEvent, &mut crate::policy_fn::PolicyContext) -> crate::policy_fn::Verdict + Send + Sync + 'static,
@@ -2345,6 +2375,7 @@ impl SandboxBuilder {
             cpu_cores: self.cpu_cores,
             num_cpus: self.num_cpus,
             port_remap: self.port_remap,
+            no_supervisor: self.no_supervisor,
             uid: self.uid,
             policy_fn: self.policy_fn,
             name: self.name,

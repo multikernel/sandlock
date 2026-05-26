@@ -3,7 +3,6 @@ pub mod http;
 pub mod sandbox;     // formerly `policy`; contains Sandbox + SandboxBuilder + Confinement
 pub mod profile;
 pub mod result;
-pub mod process;     // runtime helpers (is_nested, CONFINED); SandboxProcess removed
 pub(crate) mod arch;
 pub(crate) mod sys;
 pub mod landlock;

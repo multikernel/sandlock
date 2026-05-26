@@ -177,6 +177,11 @@ async fn test_nested_sandbox() {
 }
 
 /// Test nested sandbox via CLI: outer runs inner sandlock binary.
+///
+/// The kernel only allows one `SECCOMP_FILTER_FLAG_NEW_LISTENER` per task,
+/// so cross-process nesting requires the **outer** to opt out of the
+/// supervisor via `--no-supervisor`. The outer then installs a deny-only
+/// filter that stacks under the inner's listener.
 #[tokio::test]
 async fn test_nested_sandbox_via_cli() {
     let sandlock_bin = std::env::current_dir().unwrap()
@@ -189,39 +194,72 @@ async fn test_nested_sandbox_via_cli() {
         }
     };
     let bin = sandlock_bin.to_str().unwrap();
+    let bin_dir = sandlock_bin.parent().unwrap().to_str().unwrap();
     let lib64_arg = if std::path::Path::new("/lib64").exists() {
         " -r /lib64"
     } else {
         ""
     };
 
-    // Outer allows /etc + sandlock binary; inner does not allow /etc
-    let outer = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
-        .fs_read("/etc").fs_read("/proc").fs_read("/dev")
-        .fs_read(sandlock_bin.parent().unwrap())
-        .fs_write("/tmp")
-        .build()
-        .unwrap();
+    let run_outer = |inner_cmd: &str| -> std::process::Output {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.args(["run", "--no-supervisor",
+                  "-r", "/usr", "-r", "/lib"]);
+        if std::path::Path::new("/lib64").exists() {
+            cmd.args(["-r", "/lib64"]);
+        }
+        cmd.args(["-r", "/bin", "-r", "/etc", "-r", "/proc", "-r", "/dev",
+                  "-r", bin_dir,
+                  "--", "sh", "-c", inner_cmd]);
+        cmd.output().expect("failed to spawn outer sandlock")
+    };
 
-    let inner_cmd = format!(
+    // Inner does not allow /etc — cat /etc/group should fail at the inner's
+    // Landlock layer even though the outer allows it.
+    let inner_block = format!(
         "{} run -r /usr -r /lib{} -r /bin -r /proc -- cat /etc/group",
-        bin, lib64_arg
+        bin, lib64_arg,
     );
-    let result = outer.clone().with_name("test")
-        .run(&["sh", "-c", &inner_cmd])
-        .await.unwrap();
-    assert!(!result.success(), "inner sandbox should block /etc");
+    let out = run_outer(&inner_block);
+    assert!(
+        !out.status.success(),
+        "inner sandbox should block /etc (status={:?}, stderr={})",
+        out.status, String::from_utf8_lossy(&out.stderr),
+    );
 
-    // Inner with /etc allowed — should succeed
-    let inner_cmd = format!(
+    // Inner with /etc allowed — should succeed.
+    let inner_ok = format!(
         "{} run -r /usr -r /lib{} -r /bin -r /etc -r /proc -- echo nested-ok",
-        bin, lib64_arg
+        bin, lib64_arg,
     );
-    let result = outer.clone().with_name("test")
-        .run(&["sh", "-c", &inner_cmd])
-        .await.unwrap();
-    assert!(result.success(), "nested sandbox with shared paths should work");
+    let out = run_outer(&inner_ok);
+    assert!(
+        out.status.success(),
+        "nested sandbox with shared paths should work (stderr={})",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("nested-ok"),
+        "stdout missing inner output: {}", String::from_utf8_lossy(&out.stdout),
+    );
+
+    // Negative: outer WITHOUT `--no-supervisor` keeps the listener slot;
+    // the inner's NEW_LISTENER install must hit EBUSY and the user must
+    // get a hint pointing at `--no-supervisor`.
+    let mut outer_with_supervisor = std::process::Command::new(bin);
+    outer_with_supervisor.args(["run", "-r", "/usr", "-r", "/lib"]);
+    if std::path::Path::new("/lib64").exists() {
+        outer_with_supervisor.args(["-r", "/lib64"]);
+    }
+    outer_with_supervisor.args(["-r", "/bin", "-r", "/etc", "-r", "/proc", "-r", "/dev",
+                                "-r", bin_dir,
+                                "--", "sh", "-c", &inner_ok]);
+    let out = outer_with_supervisor.output().expect("failed to spawn outer sandlock");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(),
+        "inner should fail when outer holds the listener (stderr={})", stderr);
+    assert!(stderr.contains("--no-supervisor"),
+        "EBUSY error must hint at --no-supervisor; got stderr: {}", stderr);
 }
 
 /// Test that fs_denied blocks hardlink, rename, and symlink bypass attempts.

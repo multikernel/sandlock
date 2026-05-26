@@ -727,7 +727,10 @@ pub(crate) struct ChildSpawnArgs<'a> {
     pub cmd: &'a [CString],
     pub pipes: &'a PipePair,
     pub cow_config: Option<&'a ChildMountConfig>,
-    pub nested: bool,
+    /// Skip the user-notification supervisor: child installs a kernel-only
+    /// deny filter, parent reads `notif_fd_num = 0` and never starts a
+    /// supervisor. Mirrors `Sandbox::no_supervisor`.
+    pub no_supervisor: bool,
     pub keep_fds: &'a [RawFd],
     /// Sandbox instance name. When set, it is also exposed as the
     /// sandbox's virtual hostname.
@@ -752,7 +755,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         cmd,
         pipes,
         cow_config,
-        nested,
+        no_supervisor,
         keep_fds,
         sandbox_name,
         extra_syscalls,
@@ -957,13 +960,19 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     }
 
     // 9. Assemble and install seccomp filter (IRREVERSIBLE)
-    let deny = blocklist_syscall_numbers(sandbox);
     let args = arg_filters(sandbox);
     let mut keep_fd: i32 = -1;
 
-    if nested {
-        // Nested sandbox: deny-only filter (no supervisor — parent handles it).
-        // BPF filters are ANDed by the kernel, so each level can only tighten.
+    if no_supervisor {
+        // No-supervisor mode: deny-only kernel filter, no NEW_LISTENER.
+        // BPF filters are ANDed by the kernel, so an outer filter (from a
+        // wrapping sandbox) keeps tightening this layer too.
+        //
+        // Uses the relaxed `no_supervisor_blocklist_syscall_numbers` deny
+        // list (which leaves `ptrace`, `unshare`, `process_vm_*`, etc.
+        // alone) so an inner full-supervisor sandlock nested under this
+        // one still has the syscalls its supervisor needs.
+        let deny = no_supervisor_blocklist_syscall_numbers(sandbox);
         let filter = match bpf::assemble_filter(&[], &deny, &args) {
             Ok(f) => f,
             Err(e) => fail!(format!("seccomp assemble: {}", e)),
@@ -971,11 +980,12 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         if let Err(e) = bpf::install_deny_filter(&filter) {
             fail!(format!("seccomp deny filter: {}", e));
         }
-        // Signal nested mode to parent (fd=0 means no supervisor needed)
+        // fd=0 tells the parent there's no supervisor to attach to.
         if let Err(e) = write_u32_fd(pipes.notif_w.as_raw_fd(), 0) {
-            fail!(format!("write nested signal: {}", e));
+            fail!(format!("write no-supervisor signal: {}", e));
         }
     } else {
+        let deny = blocklist_syscall_numbers(sandbox);
         // First-level sandbox: notif + deny filter with NEW_LISTENER.
         //
         // Caller-supplied handlers must have their syscalls registered in
@@ -1007,7 +1017,24 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         };
         let notif_fd = match bpf::install_filter(&filter) {
             Ok(fd) => fd,
-            Err(e) => fail!(format!("seccomp install: {}", e)),
+            Err(e) => {
+                // EBUSY here means another seccomp filter on this task already
+                // owns the SECCOMP_FILTER_FLAG_NEW_LISTENER slot. The kernel
+                // permits at most one listener per task — to nest, opt this
+                // sandbox out of the supervisor via `Sandbox::no_supervisor`
+                // (or the CLI's `--no-supervisor` flag).
+                if e.raw_os_error() == Some(libc::EBUSY) {
+                    let _ = write!(
+                        std::io::stderr(),
+                        "sandlock child: seccomp install: {} (an outer sandbox already owns the \
+                         seccomp listener; pass --no-supervisor or Sandbox::no_supervisor(true) \
+                         on this sandbox to nest)\n",
+                        e,
+                    );
+                    unsafe { libc::_exit(127) };
+                }
+                fail!(format!("seccomp install: {}", e));
+            }
         };
         keep_fd = notif_fd.as_raw_fd();
         if let Err(e) = write_u32_fd(pipes.notif_w.as_raw_fd(), keep_fd as u32) {
@@ -1015,9 +1042,6 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         }
         std::mem::forget(notif_fd);
     }
-
-    // Mark this process as confined for in-process nesting detection
-    crate::process::CONFINED.store(true, std::sync::atomic::Ordering::Relaxed);
 
     // 10. Wait for parent to signal ready
     match read_u32_fd(pipes.ready_r.as_raw_fd()) {
