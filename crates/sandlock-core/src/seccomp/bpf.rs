@@ -145,20 +145,50 @@ pub fn install_deny_filter(prog: &[SockFilter]) -> std::io::Result<()> {
 
 /// Install a cBPF seccomp filter on the calling thread with `NEW_LISTENER`.
 ///
+/// `WAIT_KILLABLE_RECV` (Linux 5.19+) is preferred for reliable notification
+/// delivery, but we fall back to `NEW_LISTENER`-only on older kernels that
+/// reject the bit with `EINVAL`. The fallback matches the pre-Rust Python
+/// implementation (`commit 50d5eb9`) and only trades a robustness flag —
+/// the security boundary (kept by `NEW_LISTENER`) is unaffected.
+///
 /// Returns the seccomp notification file descriptor.
 pub fn install_filter(prog: &[SockFilter]) -> std::io::Result<OwnedFd> {
     let fprog = SockFprog {
         len: prog.len() as u16,
         filter: prog.as_ptr(),
     };
-    let flags = SECCOMP_FILTER_FLAG_NEW_LISTENER | SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV;
-    let fd = seccomp(
-        SECCOMP_SET_MODE_FILTER,
-        flags,
-        &fprog as *const SockFprog as *const std::ffi::c_void,
+    let fd = install_with_einval_fallback(
+        SECCOMP_FILTER_FLAG_NEW_LISTENER | SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV,
+        SECCOMP_FILTER_FLAG_NEW_LISTENER,
+        |flags| {
+            seccomp(
+                SECCOMP_SET_MODE_FILTER,
+                flags,
+                &fprog as *const SockFprog as *const std::ffi::c_void,
+            )
+        },
     )?;
     // SAFETY: kernel returns a valid fd on success
     Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+}
+
+/// Call `install` with `preferred_flags`; on `EINVAL`, retry with `fallback_flags`.
+///
+/// Extracted as a generic helper so the EINVAL-retry control flow can be
+/// unit-tested without the real `seccomp(2)` syscall.
+pub(crate) fn install_with_einval_fallback<F>(
+    preferred_flags: u64,
+    fallback_flags: u64,
+    mut install: F,
+) -> std::io::Result<i64>
+where
+    F: FnMut(u64) -> std::io::Result<i64>,
+{
+    match install(preferred_flags) {
+        Ok(fd) => Ok(fd),
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => install(fallback_flags),
+        Err(e) => Err(e),
+    }
 }
 
 // ============================================================
@@ -271,5 +301,70 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    // --------------------------------------------------------
+    // install_with_einval_fallback — regression coverage for the
+    // SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV fallback on kernels < 5.19.
+    // --------------------------------------------------------
+
+    const PREFERRED: u64 =
+        SECCOMP_FILTER_FLAG_NEW_LISTENER | SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV;
+    const FALLBACK: u64 = SECCOMP_FILTER_FLAG_NEW_LISTENER;
+
+    #[test]
+    fn fallback_succeeds_first_try_returns_fd_no_retry() {
+        let mut calls = Vec::new();
+        let fd = install_with_einval_fallback(PREFERRED, FALLBACK, |flags| {
+            calls.push(flags);
+            Ok(42)
+        })
+        .expect("should succeed");
+        assert_eq!(fd, 42);
+        assert_eq!(calls, vec![PREFERRED], "must not retry on success");
+    }
+
+    #[test]
+    fn fallback_einval_retries_with_fallback_flags() {
+        let mut calls = Vec::new();
+        let fd = install_with_einval_fallback(PREFERRED, FALLBACK, |flags| {
+            calls.push(flags);
+            if flags & SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV != 0 {
+                Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+            } else {
+                Ok(99)
+            }
+        })
+        .expect("fallback must succeed");
+        assert_eq!(fd, 99);
+        assert_eq!(
+            calls,
+            vec![PREFERRED, FALLBACK],
+            "EINVAL on preferred must trigger fallback retry"
+        );
+    }
+
+    #[test]
+    fn fallback_non_einval_error_propagates_without_retry() {
+        let mut calls = 0;
+        let res = install_with_einval_fallback(PREFERRED, FALLBACK, |_| {
+            calls += 1;
+            Err(std::io::Error::from_raw_os_error(libc::EPERM))
+        });
+        let err = res.expect_err("EPERM should not retry");
+        assert_eq!(err.raw_os_error(), Some(libc::EPERM));
+        assert_eq!(calls, 1, "non-EINVAL error must not trigger retry");
+    }
+
+    #[test]
+    fn fallback_einval_on_both_returns_second_einval() {
+        let mut calls = 0;
+        let res = install_with_einval_fallback(PREFERRED, FALLBACK, |_| {
+            calls += 1;
+            Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+        });
+        let err = res.expect_err("both EINVAL should return error");
+        assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+        assert_eq!(calls, 2, "must attempt both flag sets exactly once");
     }
 }
