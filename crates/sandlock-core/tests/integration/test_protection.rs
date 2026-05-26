@@ -253,3 +253,70 @@ fn active_protections_reports_disabled_for_explicitly_off() {
     let signal = result.iter().find(|(p, _)| *p == Protection::SignalScope).unwrap();
     assert_eq!(signal.1, ProtectionStatus::Disabled);
 }
+
+// ----------------------------------------------------------------------
+// SandboxBuilder::allow_degraded / ::disable polarity-out methods
+// ----------------------------------------------------------------------
+
+#[test]
+fn builder_allow_degraded_sets_state_to_degradable() {
+    let sb = sandlock_core::Sandbox::builder()
+        .allow_degraded(Protection::SignalScope)
+        .build_unchecked()
+        .expect("build");
+    assert_eq!(
+        sb.protection_policy.state(Protection::SignalScope),
+        ProtectionState::Degradable
+    );
+}
+
+#[test]
+fn builder_disable_sets_state_to_disabled() {
+    let sb = sandlock_core::Sandbox::builder()
+        .disable(Protection::AbstractUnixScope)
+        .build_unchecked()
+        .expect("build");
+    assert_eq!(
+        sb.protection_policy.state(Protection::AbstractUnixScope),
+        ProtectionState::Disabled
+    );
+}
+
+#[test]
+fn builder_methods_are_idempotent_last_wins() {
+    let sb = sandlock_core::Sandbox::builder()
+        .allow_degraded(Protection::SignalScope)
+        .disable(Protection::SignalScope)
+        .build_unchecked()
+        .expect("build");
+    assert_eq!(
+        sb.protection_policy.state(Protection::SignalScope),
+        ProtectionState::Disabled
+    );
+}
+
+#[test]
+fn builder_methods_fluent_chain() {
+    let sb = sandlock_core::Sandbox::builder()
+        .allow_degraded(Protection::SignalScope)
+        .allow_degraded(Protection::AbstractUnixScope)
+        .disable(Protection::FsTruncate)
+        .build_unchecked()
+        .expect("build");
+    assert_eq!(
+        sb.protection_policy.state(Protection::SignalScope),
+        ProtectionState::Degradable
+    );
+    assert_eq!(
+        sb.protection_policy.state(Protection::AbstractUnixScope),
+        ProtectionState::Degradable
+    );
+    assert_eq!(
+        sb.protection_policy.state(Protection::FsTruncate),
+        ProtectionState::Disabled
+    );
+    assert_eq!(
+        sb.protection_policy.state(Protection::FsRefer),
+        ProtectionState::Strict
+    );
+}

@@ -11,7 +11,7 @@ use crate::context;
 use crate::error::SandboxError;
 pub use crate::http::{http_acl_check, normalize_path, prefix_or_exact_match, HttpRule};
 pub use crate::network::{NetAllow, Protocol};
-use crate::protection::{Protection, ProtectionPolicy, ProtectionStatus};
+use crate::protection::{Protection, ProtectionPolicy, ProtectionState, ProtectionStatus};
 
 /// A byte size value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1857,6 +1857,12 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "uid"))]
     pub uid: Option<u32>,
 
+    /// Per-protection state overrides. Defaults to `strict_all` — every
+    /// protection enforced, matching the historical `MIN_ABI = 6` floor.
+    /// Use the `allow_degraded` / `disable` builder methods to deviate.
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub protection_policy: ProtectionPolicy,
+
     // Internal callback — never a CLI flag.
     #[cfg_attr(feature = "cli", clap(skip))]
     pub policy_fn: Option<crate::policy_fn::PolicyCallback>,
@@ -1931,6 +1937,7 @@ impl Clone for SandboxBuilder {
             port_remap: self.port_remap,
             no_supervisor: self.no_supervisor,
             uid: self.uid,
+            protection_policy: self.protection_policy.clone(),
             policy_fn: self.policy_fn.clone(),
             name: self.name.clone(),
             // init_fn (FnOnce) cannot be cloned — drop to None.
@@ -1942,6 +1949,29 @@ impl Clone for SandboxBuilder {
 }
 
 impl SandboxBuilder {
+    /// Permit `protection` to be enforced when the host kernel
+    /// supports it, and silently skipped when it does not (fallback
+    /// for kernels below the protection's `min_abi()`).
+    ///
+    /// The default policy enforces every protection strictly; calling
+    /// `allow_degraded` lifts the strictness for the named protection
+    /// only. `sandlock check` and `Sandbox::active_protections()`
+    /// continue to report the degraded protection so the posture is
+    /// observable.
+    pub fn allow_degraded(mut self, protection: Protection) -> Self {
+        self.protection_policy.set(protection, ProtectionState::Degradable);
+        self
+    }
+
+    /// Never enforce `protection`, even on a host kernel that supports
+    /// it. Intended for workloads that legitimately need the capability
+    /// the protection blocks (e.g. signalling a sibling process when
+    /// `SignalScope` would normally prevent it).
+    pub fn disable(mut self, protection: Protection) -> Self {
+        self.protection_policy.set(protection, ProtectionState::Disabled);
+        self
+    }
+
     pub fn fs_write(mut self, path: impl Into<PathBuf>) -> Self {
         self.fs_writable.push(path.into());
         self
@@ -2255,7 +2285,7 @@ impl SandboxBuilder {
             fs_denied: self.fs_denied,
             extra_deny_syscalls: self.extra_deny_syscalls,
             extra_allow_syscalls: self.extra_allow_syscalls,
-            protection_policy: ProtectionPolicy::strict_all(),
+            protection_policy: self.protection_policy,
             net_allow,
             net_bind: self.net_bind,
             http_allow,
