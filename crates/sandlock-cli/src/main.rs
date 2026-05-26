@@ -188,11 +188,20 @@ struct RunTarget {
     cmd: Vec<String>,
 }
 
-/// Did the invocation use the `--` options terminator? When present, the
-/// trailing positionals are a host command (native mode) rather than a Docker
-/// `IMAGE [CMD...]` sequence.
-fn had_options_terminator() -> bool {
-    std::env::args().any(|a| a == "--")
+/// Did the invocation use a *leading* `--` options terminator — one that came
+/// before any positional argument? That selects native (host-command) mode.
+///
+/// clap strips this leading `--` and leaves the trailing positionals as exactly
+/// the argv tokens that followed it, so we detect it by checking whether the
+/// positionals equal the argv tail after the first `--`. A `--` that appears
+/// *after* the image (Docker's `IMAGE -- args`) is instead retained by clap
+/// inside the positionals, so it does not match here and stays in Docker mode.
+fn leading_terminator(positionals: &[String]) -> bool {
+    let argv: Vec<String> = std::env::args().collect();
+    match argv.iter().position(|a| a == "--") {
+        Some(t) => argv[t + 1..] == *positionals,
+        None => false,
+    }
 }
 
 /// Decide whether we are running a Docker image or a host command, and split
@@ -202,15 +211,18 @@ fn had_options_terminator() -> bool {
 /// * `... -- CMD`   → native mode; positionals are the host command, no image.
 /// * `IMG [CMD...]` → Docker mode; first positional is the image.
 fn resolve_run_target(args: &RunArgs) -> RunTarget {
-    split_run_target(args.image.as_deref(), &args.image_and_cmd, had_options_terminator())
+    split_run_target(args.image.as_deref(), &args.image_and_cmd, leading_terminator(&args.image_and_cmd))
 }
 
 /// Pure core of [`resolve_run_target`], split out for testing.
-fn split_run_target(image_flag: Option<&str>, positionals: &[String], had_terminator: bool) -> RunTarget {
+///
+/// `native_mode` is true when a leading `--` terminator selected host-command
+/// mode (see [`leading_terminator`]).
+fn split_run_target(image_flag: Option<&str>, positionals: &[String], native_mode: bool) -> RunTarget {
     if let Some(img) = image_flag {
         return RunTarget { image: Some(img.to_string()), cmd: positionals.to_vec() };
     }
-    if had_terminator {
+    if native_mode {
         return RunTarget { image: None, cmd: positionals.to_vec() };
     }
     match positionals.split_first() {
@@ -497,6 +509,8 @@ async fn run_command(args: RunArgs) -> Result<()> {
                 builder = builder.env_var(k, v);
             } else if let Ok(v) = std::env::var(spec) {
                 builder = builder.env_var(spec, v);
+            } else {
+                eprintln!("sandlock: warning: -e {}: not set in host environment, not forwarded", spec);
             }
         }
 
@@ -527,6 +541,19 @@ async fn run_command(args: RunArgs) -> Result<()> {
     } else {
         (None, None)
     };
+
+    // Capture the profile's program identity before `base` is consumed below.
+    // Image defaults sit *below* the profile in precedence, so we only let the
+    // image fill cwd/uid/env that the profile did not already set.
+    let profile_cwd: Option<String> = base_from_profile
+        .as_ref()
+        .and_then(|b| b.cwd.as_ref())
+        .map(|p| p.to_string_lossy().into_owned());
+    let profile_uid: Option<u32> = base_from_profile.as_ref().and_then(|b| b.uid);
+    let profile_env_keys: std::collections::HashSet<String> = base_from_profile
+        .as_ref()
+        .map(|b| b.env.iter().map(|(k, _)| k.clone()).collect())
+        .unwrap_or_default();
 
     // Start from profile or default
     let mut builder = if let Some(base) = base_from_profile {
@@ -671,14 +698,19 @@ async fn run_command(args: RunArgs) -> Result<()> {
     } else {
         None
     };
-    let mut effective_cwd: Option<String> = None;
-    let mut effective_uid: Option<u32> = None;
+    // Precedence (low → high): image defaults < profile < CLI flags. The profile
+    // values were already layered into the builder above, so the image only
+    // supplies cwd/uid/env that the profile left unset; CLI flags override both.
+    let mut effective_cwd: Option<String> = profile_cwd;
+    let mut effective_uid: Option<u32> = profile_uid;
     if let Some(ref cfg) = image_config {
         for kv in &cfg.env {
-            if let Some((k, v)) = kv.split_once('=') { builder = builder.env_var(k, v); }
+            if let Some((k, v)) = kv.split_once('=') {
+                if !profile_env_keys.contains(k) { builder = builder.env_var(k, v); }
+            }
         }
-        effective_cwd = cfg.workdir.clone();
-        effective_uid = cfg.user.as_deref().and_then(parse_user);
+        if effective_cwd.is_none() { effective_cwd = cfg.workdir.clone(); }
+        if effective_uid.is_none() { effective_uid = cfg.user.as_deref().and_then(parse_user); }
     }
 
     // ── Environment: --env-file, then -e/--env (later wins, like Docker) ──────
@@ -699,6 +731,10 @@ async fn run_command(args: RunArgs) -> Result<()> {
         } else if let Ok(v) = std::env::var(spec) {
             // Docker: `-e VAR` (no `=value`) forwards the host's value.
             builder = builder.env_var(spec, v);
+        } else {
+            // Docker leaves an unset `-e VAR` out of the child's environment;
+            // warn so it is not a silent no-op.
+            eprintln!("sandlock: warning: -e {}: not set in host environment, not forwarded", spec);
         }
     }
 
@@ -741,7 +777,13 @@ async fn run_command(args: RunArgs) -> Result<()> {
 
     // ── Docker --cpus → CPU count ─────────────────────────────────────────────
     if let Some(n) = args.cpus {
-        if n <= 0.0 { return Err(anyhow!("--cpus must be positive, got: {}", n)); }
+        if !n.is_finite() || n <= 0.0 {
+            return Err(anyhow!("--cpus must be a positive, finite number, got: {}", n));
+        }
+        // max_cpu takes a u8; reject values whose ceiling would not fit.
+        if n > 255.0 {
+            return Err(anyhow!("--cpus must be at most 255, got: {}", n));
+        }
         builder = builder.max_cpu(n.ceil() as u8);
     }
 
@@ -945,7 +987,7 @@ fn validate_no_supervisor(args: &RunArgs) -> Result<()> {
     if pb.chroot.is_some() { bad.push("--chroot"); }
     if args.image.is_some() { bad.push("--image"); }
     if pb.uid.is_some() { bad.push("--uid"); }
-    if pb.workdir.is_some() { bad.push("--workdir"); }
+    if pb.workdir.is_some() { bad.push("--fs-workdir"); }
     if pb.cwd.is_some() { bad.push("--cwd"); }
     if args.fs_isolation.is_some() { bad.push("--fs-isolation"); }
     if pb.fs_storage.is_some() { bad.push("--fs-storage"); }
@@ -1153,6 +1195,16 @@ mod docker_compat_tests {
         let t = split_run_target(None, &s(&["echo", "hi"]), true);
         assert_eq!(t.image, None);
         assert_eq!(t.cmd, s(&["echo", "hi"]));
+    }
+
+    #[test]
+    fn internal_terminator_after_image_stays_docker_mode() {
+        // `sandlock run alpine -- echo hi`: clap retains the `--` in the
+        // positionals (it follows the image), so leading_terminator() is false
+        // and alpine is still treated as the image, not a host command.
+        let t = split_run_target(None, &s(&["alpine", "--", "echo", "hi"]), false);
+        assert_eq!(t.image.as_deref(), Some("alpine"));
+        assert_eq!(t.cmd, s(&["--", "echo", "hi"]));
     }
 
     #[test]

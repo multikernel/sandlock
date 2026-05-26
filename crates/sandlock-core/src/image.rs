@@ -162,12 +162,12 @@ impl ImageConfig {
 /// Inspect a local Docker image's `Config`, returning the fields sandlock maps
 /// onto its sandbox (entrypoint, cmd, working dir, env, user).
 ///
-/// On any inspection failure this returns a default config so callers can fall
-/// back to running `/bin/sh`.
+/// Any inspection failure — `docker` not being executable, or a non-zero exit —
+/// yields a default config so callers can fall back to running `/bin/sh`.
 pub fn inspect_config(image: &str) -> Result<ImageConfig, SandlockError> {
     // One field per line keeps parsing simple and avoids delimiter clashes with
     // values that may themselves contain `|`.
-    let output = Command::new("docker")
+    let output = match Command::new("docker")
         .args([
             "inspect", "--format",
             "{{json .Config.Entrypoint}}\n{{json .Config.Cmd}}\n\
@@ -175,7 +175,11 @@ pub fn inspect_config(image: &str) -> Result<ImageConfig, SandlockError> {
             image,
         ])
         .output()
-        .map_err(|_| SandboxRuntimeError::Child("docker inspect failed".into()))?;
+    {
+        Ok(output) => output,
+        // `docker` not found / not executable: treat as "no config available".
+        Err(_) => return Ok(ImageConfig::default()),
+    };
 
     if !output.status.success() {
         return Ok(ImageConfig::default());
@@ -194,35 +198,17 @@ pub fn inspect_config(image: &str) -> Result<ImageConfig, SandlockError> {
 }
 
 /// Parse a JSON string literal like `"abc"` (or `null`) into its value.
+///
+/// Uses `serde_json` so all JSON escapes (`\n`, `\t`, `\uXXXX`, …) are decoded
+/// correctly; `null` and malformed input both yield `None`.
 fn parse_json_string(s: &str) -> Option<String> {
-    let s = s.trim();
-    if s == "null" || s.len() < 2 || !s.starts_with('"') || !s.ends_with('"') {
-        return None;
-    }
-    Some(s[1..s.len() - 1].replace("\\\"", "\"").replace("\\\\", "\\"))
+    serde_json::from_str::<Option<String>>(s.trim()).ok().flatten()
 }
 
-/// Parse a JSON string array like `["a","b"]` or return None for `null`.
+/// Parse a JSON string array like `["a","b"]`, or return `None` for `null` or
+/// malformed input. An empty array `[]` parses to `Some(vec![])`.
 fn parse_json_string_array(s: &str) -> Option<Vec<String>> {
-    let s = s.trim();
-    if s == "null" || s.is_empty() {
-        return None;
-    }
-    if !s.starts_with('[') || !s.ends_with(']') {
-        return None;
-    }
-    let inner = &s[1..s.len() - 1];
-    if inner.trim().is_empty() {
-        return Some(Vec::new());
-    }
-    let mut result = Vec::new();
-    for item in inner.split(',') {
-        let item = item.trim();
-        if item.starts_with('"') && item.ends_with('"') && item.len() >= 2 {
-            result.push(item[1..item.len() - 1].replace("\\\"", "\"").replace("\\\\", "\\"));
-        }
-    }
-    if result.is_empty() { None } else { Some(result) }
+    serde_json::from_str::<Option<Vec<String>>>(s.trim()).ok().flatten()
 }
 
 // ============================================================

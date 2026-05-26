@@ -1765,9 +1765,9 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(short = 'r', long = "fs-read", value_name = "PATH"))]
     pub fs_readable: Vec<PathBuf>,
 
-    // NOTE: `-w` is intentionally not a short alias here; the CLI reserves `-w`
-    // for Docker-compatible `--workdir`. Use the long `--fs-write` form.
-    #[cfg_attr(feature = "cli", arg(long = "fs-write", value_name = "PATH"))]
+    // NOTE: `-w` (lowercase) is reserved for Docker-compatible `--workdir`, so
+    // `--fs-write` takes the uppercase `-W` short flag instead.
+    #[cfg_attr(feature = "cli", arg(short = 'W', long = "fs-write", value_name = "PATH"))]
     pub fs_writable: Vec<PathBuf>,
 
     #[cfg_attr(feature = "cli", arg(long = "fs-deny", value_name = "PATH"))]

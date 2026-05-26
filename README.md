@@ -226,8 +226,8 @@ sandlock run --fs-write /tmp -r /usr -r /lib -- ./script.sh
 > Note: because the first positional is the image, the colliding short flags now
 > follow Docker (`-t` = tty, `-e` = env, `-p` = publish, `-w` = workdir). The
 > sandlock-native equivalents remain available as long options (`--timeout`,
-> `--exec-shell`, `--profile`, `--fs-write`), and the COW storage directory moved
-> from `--workdir` to `--fs-workdir`.
+> `--exec-shell`, `--profile`), `--fs-write` keeps a short flag as the uppercase
+> `-W`, and the COW storage directory moved from `--workdir` to `--fs-workdir`.
 
 ### Python API
 
