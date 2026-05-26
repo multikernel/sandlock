@@ -960,7 +960,6 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     }
 
     // 9. Assemble and install seccomp filter (IRREVERSIBLE)
-    let deny = blocklist_syscall_numbers(sandbox);
     let args = arg_filters(sandbox);
     let mut keep_fd: i32 = -1;
 
@@ -968,6 +967,12 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         // No-supervisor mode: deny-only kernel filter, no NEW_LISTENER.
         // BPF filters are ANDed by the kernel, so an outer filter (from a
         // wrapping sandbox) keeps tightening this layer too.
+        //
+        // Uses the relaxed `no_supervisor_blocklist_syscall_numbers` deny
+        // list (which leaves `ptrace`, `unshare`, `process_vm_*`, etc.
+        // alone) so an inner full-supervisor sandlock nested under this
+        // one still has the syscalls its supervisor needs.
+        let deny = no_supervisor_blocklist_syscall_numbers(sandbox);
         let filter = match bpf::assemble_filter(&[], &deny, &args) {
             Ok(f) => f,
             Err(e) => fail!(format!("seccomp assemble: {}", e)),
@@ -980,6 +985,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
             fail!(format!("write no-supervisor signal: {}", e));
         }
     } else {
+        let deny = blocklist_syscall_numbers(sandbox);
         // First-level sandbox: notif + deny filter with NEW_LISTENER.
         //
         // Caller-supplied handlers must have their syscalls registered in
