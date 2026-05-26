@@ -357,6 +357,27 @@ underlying Rust/C contract.
   was actually dispatched — the supervisor handles cleanup on all
   paths.
 
+## Protection opt-out
+
+The Python wrapper exposes the same opt-out mechanism as the Rust
+builder, via two keyword arguments on `Sandbox`:
+
+```python
+from sandlock import Sandbox, Protection
+
+sb = Sandbox(
+    fs_readable=["/data"],
+    fs_writable=["/tmp"],
+    allow_degraded=[Protection.SIGNAL_SCOPE, Protection.ABSTRACT_UNIX_SOCKET_SCOPE],
+)
+```
+
+`disable=[Protection.X, ...]` is the parallel kwarg for protections
+that should never be enforced even on capable kernels. See the
+"Protection opt-out" section of
+[`extension-handlers.md`](extension-handlers.md#protection-opt-out) for
+the full semantics.
+
 ## C ABI
 
 The Python wrapper sits on the C ABI declared in

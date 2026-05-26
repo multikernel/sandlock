@@ -824,6 +824,48 @@ both the sealed default and the `SANDLOCK_INJECT_WRITABLE` variant.
 See `crates/sandlock-ffi/tests/c/handler_smoke.c` for the canonical
 end-to-end example.
 
+## Protection opt-out
+
+By default sandlock enforces every Landlock protection the host kernel
+supports and refuses to start when a required protection is
+unavailable. Two builder methods on `SandboxBuilder` let callers opt
+out of the strict default on a per-protection basis:
+
+- `allow_degraded(Protection::P)` — enforce `P` where the host kernel
+  supports it, silently skip it where it does not. Use this when
+  deploying across a mixed fleet of kernels where some lack the
+  protection.
+- `disable(Protection::P)` — never enforce `P`, even on a kernel that
+  supports it. Use this when the workload legitimately needs the
+  capability the protection blocks (for example signalling a sibling
+  process when `SignalScope` would otherwise prevent it).
+
+Calling neither method leaves the protection in its default `Strict`
+state. The two methods are last-wins per protection: a later call for
+the same `Protection` value supersedes the earlier one.
+
+`sandlock check` reports each protection's availability against the
+host's Landlock ABI; `Sandbox::active_protections()` returns the
+per-protection resolved status (`Active`, `Degraded`, `Disabled`, or
+`Unavailable`) of a constructed `Sandbox`.
+
+Example:
+
+```rust
+use sandlock_core::{Protection, Sandbox};
+
+let sb = Sandbox::builder()
+    .fs_read("/data")
+    .fs_write("/tmp")
+    .allow_degraded(Protection::SignalScope)
+    .allow_degraded(Protection::AbstractUnixScope)
+    .build()?;
+```
+
+The two `allow_degraded` calls let the sandbox build on Linux kernels
+below 6.12, where the v6 IPC scopes are unavailable. On a kernel that
+does support them, the scopes remain enforced.
+
 ## Python wrapper
 
 See [`python-handlers.md`](python-handlers.md) — the dedicated page is the
