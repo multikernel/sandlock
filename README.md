@@ -6,7 +6,7 @@ and **seccomp user notification** (resource limits, IP enforcement, /proc
 virtualization). No root, no cgroups, no containers.
 
 ```
-sandlock run -w /tmp -r /usr -r /lib -m 512M -- python3 untrusted.py
+sandlock run --fs-write /tmp -r /usr -r /lib -m 512M -- python3 untrusted.py
 ```
 
 ## Why Sandlock?
@@ -92,13 +92,13 @@ cargo install --path crates/sandlock-cli
 
 ```bash
 # Basic confinement
-sandlock run -r /usr -r /lib -w /tmp -- ls /tmp
+sandlock run -r /usr -r /lib --fs-write /tmp -- ls /tmp
 
 # Interactive shell
-sandlock run -i -r /usr -r /lib -r /lib64 -r /bin -r /etc -w /tmp -- /bin/sh
+sandlock run -i -r /usr -r /lib -r /lib64 -r /bin -r /etc --fs-write /tmp -- /bin/sh
 
 # Resource limits + timeout
-sandlock run -m 512M -P 20 -t 30 -- ./compute.sh
+sandlock run -m 512M -P 20 --timeout 30 -- ./compute.sh
 
 # Outbound allowlist — restrict to one host on one port
 sandlock run --net-allow api.openai.com:443 -r /usr -r /lib -r /etc -- python3 agent.py
@@ -144,7 +144,7 @@ sandlock run --net-bind 8080 -r /usr -r /lib -r /etc -- python3 server.py
 
 # Clean environment
 sandlock run --clean-env --env CC=gcc \
-  -r /usr -r /lib -w /tmp -- make
+  -r /usr -r /lib --fs-write /tmp -- make
 
 # Deterministic execution (frozen time + seeded randomness)
 sandlock run --time-start "2000-01-01T00:00:00Z" --random-seed 42 -- ./build.sh
@@ -166,21 +166,68 @@ sandlock kill web.local
 sandlock run --chroot ./rootfs --fs-mount /work:/tmp/sandbox/work -- /bin/sh
 
 # COW filesystem (writes captured, committed on success)
-sandlock run --workdir /opt/project -r /usr -r /lib -- python3 task.py
+sandlock run --fs-workdir /opt/project -r /usr -r /lib -- python3 task.py
 
 # Dry-run (show what files would change, then discard)
-sandlock run --dry-run --workdir . -w . -r /usr -r /lib -r /bin -r /etc -- make build
+sandlock run --dry-run --fs-workdir . --fs-write . -r /usr -r /lib -r /bin -r /etc -- make build
 
 # Use a saved profile
-sandlock run -p build -- make -j4
+sandlock run --profile build -- make -j4
 
 # No-supervisor mode (Landlock + deny-only seccomp, no supervisor process)
-sandlock run --no-supervisor -r /usr -r /lib -r /lib64 -r /bin -w /tmp -- ./script.sh
+sandlock run --no-supervisor -r /usr -r /lib -r /lib64 -r /bin --fs-write /tmp -- ./script.sh
 
 # Nested sandboxing: confine sandlock's own supervisor
-sandlock run --no-supervisor -r /proc -r /usr -r /lib -r /lib64 -r /bin -r /etc -w /tmp -- \
-  sandlock run -r /usr -w /tmp -- untrusted-command
+sandlock run --no-supervisor -r /proc -r /usr -r /lib -r /lib64 -r /bin -r /etc --fs-write /tmp -- \
+  sandlock run -r /usr --fs-write /tmp -- untrusted-command
 ```
+
+### Docker-compatible CLI
+
+`sandlock run` is a drop-in for `docker run`: the first positional is the image,
+the rest is the command, and the common Docker flags are honoured. In most cases
+you can swap `docker run` for `sandlock run` unchanged — the container runs
+confined by Landlock + seccomp instead of namespaces, with **no root and no
+daemon**.
+
+```bash
+# Just replace `docker` with `sandlock`
+sandlock run alpine echo hello
+sandlock run -it ubuntu bash
+sandlock run -e FOO=bar -w /app -v "$PWD:/app" python:3.12-slim python app.py
+sandlock run --entrypoint /bin/sh alpine -c 'echo hi'
+sandlock run -p 8080 --network host nginx          # publish/allow a port
+```
+
+The image's baked-in `ENTRYPOINT`, `CMD`, `WorkingDir`, `Env`, and `User` are
+applied just like Docker. Images are pulled/extracted via the local Docker
+storage and cached under `~/.cache/sandlock/images`.
+
+> Writable layer: unlike Docker, the image rootfs is mounted **read-only** by
+> default (rootless sandboxing has no privileged overlay mount). Use `-v` to
+> bind writable host paths into the container, or — where privileges allow —
+> `--fs-isolation overlayfs --fs-workdir DIR` for a writable, discarded upper
+> layer.
+
+Supported Docker flags: `-i/--interactive`, `-t/--tty`, `-e/--env`,
+`--env-file`, `-v/--volume` (`HOST:CONTAINER[:ro|:rw]`), `-w/--workdir`,
+`-p/--publish`, `-u/--user`, `-m/--memory`, `--cpus`, `--name`, `--hostname`,
+`--entrypoint`, `--network none|host`, `--rm`. `--detach/-d`, `--privileged`,
+`--cap-add/--cap-drop`, and `--pull` are accepted for compatibility but do not
+apply to the sandbox model.
+
+To sandbox a **host** command (no image), put it after `--`; this is the native
+mode and keeps full access to the security flags below:
+
+```bash
+sandlock run --fs-write /tmp -r /usr -r /lib -- ./script.sh
+```
+
+> Note: because the first positional is the image, the colliding short flags now
+> follow Docker (`-t` = tty, `-e` = env, `-p` = publish, `-w` = workdir). The
+> sandlock-native equivalents remain available as long options (`--timeout`,
+> `--exec-shell`, `--profile`), `--fs-write` keeps a short flag as the uppercase
+> `-W`, and the COW storage directory moved from `--workdir` to `--fs-workdir`.
 
 ### Python API
 
@@ -425,8 +472,8 @@ extra_deny = []
 ```bash
 sandlock profile list
 sandlock profile show build
-sandlock run -p build        # uses [program].exec + args
-sandlock run -p build -- make test  # trailing command overrides [program]
+sandlock run --profile build        # uses [program].exec + args
+sandlock run --profile build -- make test  # trailing command overrides [program]
 ```
 
 ## How It Works

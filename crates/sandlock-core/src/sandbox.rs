@@ -1765,7 +1765,9 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(short = 'r', long = "fs-read", value_name = "PATH"))]
     pub fs_readable: Vec<PathBuf>,
 
-    #[cfg_attr(feature = "cli", arg(short = 'w', long = "fs-write", value_name = "PATH"))]
+    // NOTE: `-w` (lowercase) is reserved for Docker-compatible `--workdir`, so
+    // `--fs-write` takes the uppercase `-W` short flag instead.
+    #[cfg_attr(feature = "cli", arg(short = 'W', long = "fs-write", value_name = "PATH"))]
     pub fs_writable: Vec<PathBuf>,
 
     #[cfg_attr(feature = "cli", arg(long = "fs-deny", value_name = "PATH"))]
@@ -1843,7 +1845,9 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", clap(skip))]
     pub fs_isolation: Option<FsIsolation>,
 
-    #[cfg_attr(feature = "cli", arg(long = "workdir"))]
+    // `--workdir` is reserved for Docker-compatible working-directory (mapped to
+    // `cwd`); the COW/overlay storage directory uses `--fs-workdir`.
+    #[cfg_attr(feature = "cli", arg(long = "fs-workdir"))]
     pub workdir: Option<PathBuf>,
 
     #[cfg_attr(feature = "cli", arg(long = "cwd"))]

@@ -128,54 +128,87 @@ fn extract_container(container_id: &str, rootfs: &Path) -> Result<(), SandlockEr
 ///
 /// Returns the combined entrypoint and cmd, or `["/bin/sh"]` if none configured.
 pub fn inspect_cmd(image: &str) -> Result<Vec<String>, SandlockError> {
-    let output = Command::new("docker")
-        .args([
-            "inspect", "--format",
-            "{{json .Config.Entrypoint}}|{{json .Config.Cmd}}",
-            image,
-        ])
-        .output()
-        .map_err(|_| SandboxRuntimeError::Child("docker inspect failed".into()))?;
+    Ok(inspect_config(image)?.default_command())
+}
 
-    if !output.status.success() {
-        return Ok(vec!["/bin/sh".into()]);
-    }
+/// The subset of an image's `Config` that sandlock applies when running it,
+/// mirroring how `docker run` derives defaults from the image.
+#[derive(Debug, Default, Clone)]
+pub struct ImageConfig {
+    /// `Config.Entrypoint` — prepended to the command.
+    pub entrypoint: Option<Vec<String>>,
+    /// `Config.Cmd` — the default command (overridden by a CLI command).
+    pub cmd: Option<Vec<String>>,
+    /// `Config.WorkingDir` — the default working directory.
+    pub workdir: Option<String>,
+    /// `Config.Env` — baked-in environment as `KEY=VALUE` pairs.
+    pub env: Vec<String>,
+    /// `Config.User` — default user (name or uid[:gid]).
+    pub user: Option<String>,
+}
 
-    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let parts: Vec<&str> = raw.splitn(2, '|').collect();
-
-    let entrypoint = parts.first().and_then(|s| parse_json_string_array(s));
-    let cmd = parts.get(1).and_then(|s| parse_json_string_array(s));
-
-    match (entrypoint, cmd) {
-        (Some(ep), Some(c)) => Ok([ep, c].concat()),
-        (Some(ep), None) => Ok(ep),
-        (None, Some(c)) => Ok(c),
-        (None, None) => Ok(vec!["/bin/sh".into()]),
+impl ImageConfig {
+    /// Combined ENTRYPOINT + CMD, falling back to `/bin/sh` when neither is set.
+    pub fn default_command(&self) -> Vec<String> {
+        match (&self.entrypoint, &self.cmd) {
+            (Some(ep), Some(c)) => [ep.clone(), c.clone()].concat(),
+            (Some(ep), None) => ep.clone(),
+            (None, Some(c)) => c.clone(),
+            (None, None) => vec!["/bin/sh".into()],
+        }
     }
 }
 
-/// Parse a JSON string array like `["a","b"]` or return None for `null`.
+/// Inspect a local Docker image's `Config`, returning the fields sandlock maps
+/// onto its sandbox (entrypoint, cmd, working dir, env, user).
+///
+/// Any inspection failure — `docker` not being executable, or a non-zero exit —
+/// yields a default config so callers can fall back to running `/bin/sh`.
+pub fn inspect_config(image: &str) -> Result<ImageConfig, SandlockError> {
+    // One field per line keeps parsing simple and avoids delimiter clashes with
+    // values that may themselves contain `|`.
+    let output = match Command::new("docker")
+        .args([
+            "inspect", "--format",
+            "{{json .Config.Entrypoint}}\n{{json .Config.Cmd}}\n\
+             {{json .Config.WorkingDir}}\n{{json .Config.Env}}\n{{json .Config.User}}",
+            image,
+        ])
+        .output()
+    {
+        Ok(output) => output,
+        // `docker` not found / not executable: treat as "no config available".
+        Err(_) => return Ok(ImageConfig::default()),
+    };
+
+    if !output.status.success() {
+        return Ok(ImageConfig::default());
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let mut lines = raw.lines();
+
+    let entrypoint = lines.next().and_then(parse_json_string_array);
+    let cmd = lines.next().and_then(parse_json_string_array);
+    let workdir = lines.next().and_then(parse_json_string).filter(|s| !s.is_empty());
+    let env = lines.next().and_then(parse_json_string_array).unwrap_or_default();
+    let user = lines.next().and_then(parse_json_string).filter(|s| !s.is_empty());
+
+    Ok(ImageConfig { entrypoint, cmd, workdir, env, user })
+}
+
+/// Parse a JSON string literal like `"abc"` (or `null`) into its value.
+///
+/// Uses `serde_json` so all JSON escapes (`\n`, `\t`, `\uXXXX`, …) are decoded
+/// correctly; `null` and malformed input both yield `None`.
+fn parse_json_string(s: &str) -> Option<String> {
+    serde_json::from_str::<Option<String>>(s.trim()).ok().flatten()
+}
+
+/// Parse a JSON string array like `["a","b"]`, or return `None` for `null` or
+/// malformed input. An empty array `[]` parses to `Some(vec![])`.
 fn parse_json_string_array(s: &str) -> Option<Vec<String>> {
-    let s = s.trim();
-    if s == "null" || s.is_empty() {
-        return None;
-    }
-    if !s.starts_with('[') || !s.ends_with(']') {
-        return None;
-    }
-    let inner = &s[1..s.len() - 1];
-    if inner.trim().is_empty() {
-        return Some(Vec::new());
-    }
-    let mut result = Vec::new();
-    for item in inner.split(',') {
-        let item = item.trim();
-        if item.starts_with('"') && item.ends_with('"') && item.len() >= 2 {
-            result.push(item[1..item.len() - 1].replace("\\\"", "\"").replace("\\\\", "\\"));
-        }
-    }
-    if result.is_empty() { None } else { Some(result) }
+    serde_json::from_str::<Option<Vec<String>>>(s.trim()).ok().flatten()
 }
 
 // ============================================================
@@ -230,5 +263,29 @@ mod tests {
             parse_json_string_array(r#"["/bin/sh"]"#),
             Some(vec!["/bin/sh".into()])
         );
+    }
+
+    #[test]
+    fn test_parse_json_string() {
+        assert_eq!(parse_json_string(r#""/app""#), Some("/app".into()));
+        assert_eq!(parse_json_string("null"), None);
+        assert_eq!(parse_json_string(r#""""#), Some(String::new()));
+        assert_eq!(parse_json_string(r#""a\"b""#), Some("a\"b".into()));
+    }
+
+    #[test]
+    fn test_default_command_precedence() {
+        let cfg = ImageConfig {
+            entrypoint: Some(vec!["/entry".into()]),
+            cmd: Some(vec!["arg".into()]),
+            ..Default::default()
+        };
+        assert_eq!(cfg.default_command(), vec!["/entry".to_string(), "arg".into()]);
+
+        let cmd_only = ImageConfig { cmd: Some(vec!["bash".into()]), ..Default::default() };
+        assert_eq!(cmd_only.default_command(), vec!["bash".to_string()]);
+
+        let empty = ImageConfig::default();
+        assert_eq!(empty.default_command(), vec!["/bin/sh".to_string()]);
     }
 }
