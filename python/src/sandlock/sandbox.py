@@ -326,6 +326,24 @@ class Sandbox:
     on_error: BranchAction = BranchAction.ABORT
     """Branch action on sandbox error/exception."""
 
+    # Landlock protection opt-out — relax strict enforcement for the
+    # named protections. See ``sandlock.Protection`` (the IntEnum mirror
+    # of the C ABI ``sandlock_protection_t``).
+    allow_degraded: Sequence[int] = field(default_factory=list)
+    """Protections that may degrade silently on kernels that don't
+    support them. Each entry is a :class:`sandlock.Protection` value.
+    On a capable kernel the protection is still enforced strictly; on
+    an older kernel it is skipped instead of failing the build.
+    Idempotent / last-wins with :attr:`disable` (the later assignment
+    for a given protection wins)."""
+
+    disable: Sequence[int] = field(default_factory=list)
+    """Protections that are never enforced, even on a host kernel that
+    supports them. Each entry is a :class:`sandlock.Protection` value.
+    Use this for a deliberate opt-out (e.g. to allow a workload to use
+    a protection-incompatible feature). Idempotent / last-wins with
+    :attr:`allow_degraded`."""
+
     # Runtime kwargs — not part of policy serialization.
     name: str | None = field(default=None, repr=False, metadata={"runtime": True})
     """Sandbox name (also exposed as the virtual hostname inside the sandbox).
