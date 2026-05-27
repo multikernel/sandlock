@@ -4,6 +4,8 @@
 Uses a module-level import, constant, and helper on purpose: the patterns
 the old source-re-exec path could not handle.
 """
+from __future__ import annotations
+
 import os
 
 PREFIX = "fixture:"

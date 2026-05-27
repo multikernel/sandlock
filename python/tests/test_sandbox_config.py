@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for sandlock.sandbox."""
 
+from __future__ import annotations
+
 import pytest
 
 from sandlock.sandbox import (

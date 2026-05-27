@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Smoke tests for the sandlock Python handler wrapper."""
 
+from __future__ import annotations
+
 from sandlock.handler import ExceptionPolicy, Handler, NotifAction
 
 

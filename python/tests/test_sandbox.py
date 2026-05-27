@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for sandlock.Sandbox (ctypes FFI bindings)."""
 
+from __future__ import annotations
+
 import json
 import os
 import socket

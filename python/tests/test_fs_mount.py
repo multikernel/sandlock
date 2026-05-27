@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for fs_mount: mapping virtual paths inside a chroot to host directories."""
 
+from __future__ import annotations
+
 import os
 import shutil
 import tempfile

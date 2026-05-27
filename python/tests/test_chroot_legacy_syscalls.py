@@ -8,6 +8,8 @@ them. On ARM64 the helper uses equivalent raw *at syscalls, because
 Linux ARM64 does not expose the legacy non-*at path syscall ABI.
 """
 
+from __future__ import annotations
+
 import os
 import shutil
 from pathlib import Path

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for sandlock.Checkpoint (save_fn / restore_fn / persistence)."""
 
+from __future__ import annotations
+
 import json
 import sys
 
