@@ -7,6 +7,8 @@ should structure its tools.
 """
 
 
+from __future__ import annotations
+
 def _read_file_tool(path: str, *, workspace: str) -> str:
     import os
     with open(os.path.join(workspace, path)) as f:

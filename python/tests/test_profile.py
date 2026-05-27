@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for sandlock._profile (sectioned schema)."""
 
+from __future__ import annotations
+
 import textwrap
 
 import pytest

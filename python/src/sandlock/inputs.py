@@ -14,6 +14,8 @@ corresponding producer's stdout. Values are read lazily on
 first access and cached.
 """
 
+from __future__ import annotations
+
 import os
 
 

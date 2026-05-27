@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the Python Sandbox lifecycle methods: spawn, create, start, wait."""
 
+from __future__ import annotations
+
 import os
 import time
 

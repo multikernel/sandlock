@@ -6,6 +6,8 @@ concurrent sandboxes with separate fs_storage directories get isolated
 upper layers.  Parametrized across all COW backends (seccomp, overlayfs).
 """
 
+from __future__ import annotations
+
 import os
 import shutil
 import threading

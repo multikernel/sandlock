@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Integration tests for sandlock.mcp — per-tool sandboxed execution."""
 
+from __future__ import annotations
+
 import asyncio
 import json
 import os

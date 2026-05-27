@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the dynamic policy callback (policy_fn) feature."""
 
+from __future__ import annotations
+
 import os
 import sys
 import threading
