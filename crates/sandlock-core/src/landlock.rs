@@ -228,7 +228,38 @@ pub fn resolve(p: Protection, host_abi: u32, policy: &ProtectionPolicy) -> Resol
 
 /// Compute the `scoped` mask from the per-protection resolutions of
 /// the two scope protections.
+///
+/// # Precondition
+///
+/// The caller must have already rejected any `Protection` whose
+/// `resolve()` is `Resolved::StrictlyUnavailable` — otherwise this
+/// function silently produces a mask that omits the bit, which is the
+/// right answer for `Disabled` / `Degraded` but the *wrong* answer for
+/// `StrictlyUnavailable` (where the call should never have reached
+/// the mask-compute stage). `confine_inner` enforces this by walking
+/// `Protection::all()` and returning `ProtectionUnavailable` for any
+/// strict-unavailable protection before this function is called.
+///
+/// In test builds a `debug_assert!` pins the invariant so a future
+/// caller that forgets the upstream guard fails loudly.
 pub(crate) fn compute_scope_mask(abi: u32, pol: &ProtectionPolicy) -> u64 {
+    debug_assert!(
+        !matches!(
+            resolve(Protection::SignalScope, abi, pol),
+            Resolved::StrictlyUnavailable,
+        ),
+        "compute_scope_mask called with SignalScope StrictlyUnavailable; \
+         caller must filter via confine_inner's Protection::all() walk first"
+    );
+    debug_assert!(
+        !matches!(
+            resolve(Protection::AbstractUnixSocketScope, abi, pol),
+            Resolved::StrictlyUnavailable,
+        ),
+        "compute_scope_mask called with AbstractUnixSocketScope StrictlyUnavailable; \
+         caller must filter via confine_inner's Protection::all() walk first"
+    );
+
     let mut mask: u64 = 0;
     if resolve(Protection::AbstractUnixSocketScope, abi, pol) == Resolved::Active {
         mask |= LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET;
@@ -521,4 +552,212 @@ fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError
     })?;
 
     Ok(())
+}
+
+// ============================================================
+// Security-contract tests for the mask-compute helpers
+// ============================================================
+//
+// These tests check the *observable* output bits of
+// `compute_scope_mask` / `compute_fs_mask` / `compute_net_mask` against
+// the Landlock kernel constants, not just that the policy-state
+// HashMap was mutated. Each `ProtectionState` combined with each host
+// ABI produces a specific bit pattern — these tests are the contract
+// pin for the Landlock attrs that exit `confine_inner`. Drift here is
+// a security bug, not a refactor cleanup.
+
+#[cfg(test)]
+mod mask_contract_tests {
+    use super::*;
+    use crate::Sandbox;
+
+    // ---------- compute_scope_mask ----------
+
+    #[test]
+    fn scope_mask_strict_v6_sets_both_scope_bits() {
+        let pol = ProtectionPolicy::strict_all();
+        let mask = compute_scope_mask(6, &pol);
+        assert_eq!(
+            mask,
+            LANDLOCK_SCOPE_SIGNAL | LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET,
+            "strict_all on v6 host must request both v6 IPC scopes"
+        );
+    }
+
+    #[test]
+    fn scope_mask_disable_signal_clears_only_signal_bit() {
+        let mut pol = ProtectionPolicy::strict_all();
+        pol.set(Protection::SignalScope, ProtectionState::Disabled);
+        let mask = compute_scope_mask(6, &pol);
+        assert_eq!(mask & LANDLOCK_SCOPE_SIGNAL, 0, "SIGNAL must be cleared");
+        assert_eq!(
+            mask & LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET,
+            LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET,
+            "ABSTRACT_UNIX_SOCKET must remain set"
+        );
+    }
+
+    #[test]
+    fn scope_mask_disable_abstract_unix_clears_only_abstract_bit() {
+        let mut pol = ProtectionPolicy::strict_all();
+        pol.set(Protection::AbstractUnixSocketScope, ProtectionState::Disabled);
+        let mask = compute_scope_mask(6, &pol);
+        assert_eq!(
+            mask & LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET,
+            0,
+            "ABSTRACT_UNIX_SOCKET must be cleared",
+        );
+        assert_eq!(
+            mask & LANDLOCK_SCOPE_SIGNAL,
+            LANDLOCK_SCOPE_SIGNAL,
+            "SIGNAL must remain set",
+        );
+    }
+
+    #[test]
+    fn scope_mask_disable_both_returns_zero() {
+        let mut pol = ProtectionPolicy::strict_all();
+        pol.set(Protection::SignalScope, ProtectionState::Disabled);
+        pol.set(Protection::AbstractUnixSocketScope, ProtectionState::Disabled);
+        assert_eq!(
+            compute_scope_mask(6, &pol),
+            0,
+            "both scopes disabled on a capable host must produce mask=0"
+        );
+    }
+
+    #[test]
+    fn scope_mask_allow_degraded_on_v5_host_returns_zero() {
+        // v5 does not provide either v6 scope; Degradable must skip
+        // silently — observable as both bits absent.
+        let mut pol = ProtectionPolicy::strict_all();
+        pol.set(Protection::SignalScope, ProtectionState::Degradable);
+        pol.set(Protection::AbstractUnixSocketScope, ProtectionState::Degradable);
+        assert_eq!(
+            compute_scope_mask(5, &pol),
+            0,
+            "Degradable scopes on a v5 host must contribute no bits"
+        );
+    }
+
+    // ---------- compute_fs_mask ----------
+
+    #[test]
+    fn fs_mask_strict_v6_includes_all_fs_protection_bits() {
+        let pol = ProtectionPolicy::strict_all();
+        let mask = compute_fs_mask(6, &pol);
+        for (bit, name) in [
+            (LANDLOCK_ACCESS_FS_REFER, "REFER"),
+            (LANDLOCK_ACCESS_FS_TRUNCATE, "TRUNCATE"),
+            (LANDLOCK_ACCESS_FS_IOCTL_DEV, "IOCTL_DEV"),
+        ] {
+            assert_eq!(
+                mask & bit,
+                bit,
+                "{} bit must be set in the strict v6 fs mask",
+                name,
+            );
+        }
+    }
+
+    #[test]
+    fn fs_mask_disable_fs_refer_clears_only_refer_bit() {
+        let mut pol = ProtectionPolicy::strict_all();
+        pol.set(Protection::FsRefer, ProtectionState::Disabled);
+        let mask = compute_fs_mask(6, &pol);
+        assert_eq!(mask & LANDLOCK_ACCESS_FS_REFER, 0);
+        assert_eq!(mask & LANDLOCK_ACCESS_FS_TRUNCATE, LANDLOCK_ACCESS_FS_TRUNCATE);
+        assert_eq!(mask & LANDLOCK_ACCESS_FS_IOCTL_DEV, LANDLOCK_ACCESS_FS_IOCTL_DEV);
+    }
+
+    #[test]
+    fn fs_mask_disable_fs_truncate_clears_only_truncate_bit() {
+        let mut pol = ProtectionPolicy::strict_all();
+        pol.set(Protection::FsTruncate, ProtectionState::Disabled);
+        let mask = compute_fs_mask(6, &pol);
+        assert_eq!(mask & LANDLOCK_ACCESS_FS_TRUNCATE, 0);
+        assert_eq!(mask & LANDLOCK_ACCESS_FS_REFER, LANDLOCK_ACCESS_FS_REFER);
+        assert_eq!(mask & LANDLOCK_ACCESS_FS_IOCTL_DEV, LANDLOCK_ACCESS_FS_IOCTL_DEV);
+    }
+
+    #[test]
+    fn fs_mask_disable_fs_ioctl_dev_clears_only_ioctl_dev_bit() {
+        let mut pol = ProtectionPolicy::strict_all();
+        pol.set(Protection::FsIoctlDev, ProtectionState::Disabled);
+        let mask = compute_fs_mask(6, &pol);
+        assert_eq!(mask & LANDLOCK_ACCESS_FS_IOCTL_DEV, 0);
+        assert_eq!(mask & LANDLOCK_ACCESS_FS_REFER, LANDLOCK_ACCESS_FS_REFER);
+        assert_eq!(mask & LANDLOCK_ACCESS_FS_TRUNCATE, LANDLOCK_ACCESS_FS_TRUNCATE);
+    }
+
+    #[test]
+    fn fs_mask_degraded_protections_get_masked_off_on_low_abi_host() {
+        // FsIoctlDev requires v5; on a v4 host it is Degraded. The bit
+        // must NOT appear in the mask — declaring a bit the kernel
+        // doesn't know would fail landlock_create_ruleset with EINVAL.
+        // This is the bug class commit bf9490d fixed; pin it here.
+        let mut pol = ProtectionPolicy::strict_all();
+        pol.set(Protection::FsIoctlDev, ProtectionState::Degradable);
+        let mask = compute_fs_mask(4, &pol);
+        assert_eq!(
+            mask & LANDLOCK_ACCESS_FS_IOCTL_DEV,
+            0,
+            "Degraded FsIoctlDev on a v4 host must NOT contribute the IOCTL_DEV bit",
+        );
+    }
+
+    // ---------- compute_net_mask ----------
+
+    fn empty_sandbox() -> Sandbox {
+        Sandbox::builder()
+            .build_unchecked()
+            .expect("minimal builder must produce a sandbox in unit tests")
+    }
+
+    #[test]
+    fn net_mask_handle_net_false_returns_zero_no_wildcard() {
+        let pol = ProtectionPolicy::strict_all();
+        let sb = empty_sandbox();
+        let (mask, wildcard) = compute_net_mask(6, &pol, &sb, false);
+        assert_eq!(mask, 0, "handle_net=false → mask is zero");
+        assert!(!wildcard, "handle_net=false → wildcard is false");
+    }
+
+    #[test]
+    fn net_mask_strict_no_wildcard_sets_bind_and_connect_bits() {
+        let pol = ProtectionPolicy::strict_all();
+        let sb = empty_sandbox();
+        let (mask, wildcard) = compute_net_mask(6, &pol, &sb, true);
+        assert_eq!(
+            mask,
+            LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP,
+            "strict NetTcp with no wildcard rule → both BIND_TCP and CONNECT_TCP",
+        );
+        assert!(!wildcard);
+    }
+
+    #[test]
+    fn net_mask_disable_net_tcp_returns_zero() {
+        let mut pol = ProtectionPolicy::strict_all();
+        pol.set(Protection::NetTcp, ProtectionState::Disabled);
+        let sb = empty_sandbox();
+        let (mask, wildcard) = compute_net_mask(6, &pol, &sb, true);
+        assert_eq!(
+            mask, 0,
+            "disabled NetTcp must produce mask=0 regardless of handle_net",
+        );
+        assert!(!wildcard);
+    }
+
+    #[test]
+    fn net_mask_degraded_net_tcp_on_v3_host_returns_zero() {
+        // NetTcp requires v4. On a v3 host Degradable resolves to
+        // Degraded, contributing no bits.
+        let mut pol = ProtectionPolicy::strict_all();
+        pol.set(Protection::NetTcp, ProtectionState::Degradable);
+        let sb = empty_sandbox();
+        let (mask, wildcard) = compute_net_mask(3, &pol, &sb, true);
+        assert_eq!(mask, 0);
+        assert!(!wildcard);
+    }
 }
