@@ -26,7 +26,7 @@ pub enum Protection {
     /// `LANDLOCK_SCOPE_SIGNAL` — ABI v6+.
     SignalScope,
     /// `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` — ABI v6+.
-    AbstractUnixScope,
+    AbstractUnixSocketScope,
 }
 
 impl Protection {
@@ -39,7 +39,7 @@ impl Protection {
             Protection::NetTcp => 4,
             Protection::FsIoctlDev => 5,
             Protection::SignalScope => 6,
-            Protection::AbstractUnixScope => 6,
+            Protection::AbstractUnixSocketScope => 6,
         }
     }
 
@@ -51,7 +51,7 @@ impl Protection {
             Protection::NetTcp,
             Protection::FsIoctlDev,
             Protection::SignalScope,
-            Protection::AbstractUnixScope,
+            Protection::AbstractUnixSocketScope,
         ]
         .into_iter()
     }
@@ -71,7 +71,7 @@ mod tests {
         assert_eq!(Protection::NetTcp.min_abi(), 4);
         assert_eq!(Protection::FsIoctlDev.min_abi(), 5);
         assert_eq!(Protection::SignalScope.min_abi(), 6);
-        assert_eq!(Protection::AbstractUnixScope.min_abi(), 6);
+        assert_eq!(Protection::AbstractUnixSocketScope.min_abi(), 6);
     }
 
     #[test]
@@ -191,7 +191,7 @@ mod policy_tests {
         pol.set(Protection::SignalScope, ProtectionState::Degradable);
         assert_eq!(pol.state(Protection::SignalScope), ProtectionState::Degradable);
         assert_eq!(pol.state(Protection::FsTruncate), ProtectionState::Strict);
-        assert_eq!(pol.state(Protection::AbstractUnixScope), ProtectionState::Strict);
+        assert_eq!(pol.state(Protection::AbstractUnixSocketScope), ProtectionState::Strict);
     }
 
     #[test]

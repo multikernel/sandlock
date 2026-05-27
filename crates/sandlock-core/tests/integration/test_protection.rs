@@ -122,7 +122,7 @@ fn disabled_on_unavailable_host_resolves_to_disabled() {
 fn strict_all_on_v4_host_fails_only_for_v5_plus_protections() {
     // Host with ABI v4 supports FsRefer (v2), FsTruncate (v3), NetTcp
     // (v4); fails on FsIoctlDev (v5), SignalScope (v6),
-    // AbstractUnixScope (v6).
+    // AbstractUnixSocketScope (v6).
     let pol = ProtectionPolicy::strict_all();
     assert_eq!(resolve(Protection::FsRefer, 4, &pol), Resolved::Active);
     assert_eq!(resolve(Protection::FsTruncate, 4, &pol), Resolved::Active);
@@ -136,7 +136,7 @@ fn strict_all_on_v4_host_fails_only_for_v5_plus_protections() {
         Resolved::StrictlyUnavailable
     );
     assert_eq!(
-        resolve(Protection::AbstractUnixScope, 4, &pol),
+        resolve(Protection::AbstractUnixSocketScope, 4, &pol),
         Resolved::StrictlyUnavailable
     );
 }
@@ -273,11 +273,11 @@ fn builder_allow_degraded_sets_state_to_degradable() {
 #[test]
 fn builder_disable_sets_state_to_disabled() {
     let sb = sandlock_core::Sandbox::builder()
-        .disable(Protection::AbstractUnixScope)
+        .disable(Protection::AbstractUnixSocketScope)
         .build_unchecked()
         .expect("build");
     assert_eq!(
-        sb.protection_policy.state(Protection::AbstractUnixScope),
+        sb.protection_policy.state(Protection::AbstractUnixSocketScope),
         ProtectionState::Disabled
     );
 }
@@ -299,7 +299,7 @@ fn builder_methods_are_idempotent_last_wins() {
 fn builder_methods_fluent_chain() {
     let sb = sandlock_core::Sandbox::builder()
         .allow_degraded(Protection::SignalScope)
-        .allow_degraded(Protection::AbstractUnixScope)
+        .allow_degraded(Protection::AbstractUnixSocketScope)
         .disable(Protection::FsTruncate)
         .build_unchecked()
         .expect("build");
@@ -308,7 +308,7 @@ fn builder_methods_fluent_chain() {
         ProtectionState::Degradable
     );
     assert_eq!(
-        sb.protection_policy.state(Protection::AbstractUnixScope),
+        sb.protection_policy.state(Protection::AbstractUnixSocketScope),
         ProtectionState::Degradable
     );
     assert_eq!(

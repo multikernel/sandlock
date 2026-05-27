@@ -138,9 +138,11 @@ struct RunArgs {
 
 /// Parse a kebab-case protection name into a `Protection` value.
 ///
-/// Accepted strings (case-insensitive): `fs-refer`, `fs-truncate`, `net-tcp`,
-/// `fs-ioctl-dev`, `signal-scope`, `abstract-unix-scope-socket`
-/// (alias: `abstract-unix-socket-scope`).
+/// The canonical names match the Landlock kernel constants
+/// (`LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` → `abstract-unix-socket-scope`,
+/// etc.) and are case-insensitive. Accepted: `fs-refer`, `fs-truncate`,
+/// `net-tcp`, `fs-ioctl-dev`, `signal-scope`,
+/// `abstract-unix-socket-scope` (alias: `abstract-unix-scope-socket`).
 fn parse_protection(s: &str) -> Result<sandlock_core::Protection, String> {
     use sandlock_core::Protection;
     match s.to_ascii_lowercase().as_str() {
@@ -149,10 +151,13 @@ fn parse_protection(s: &str) -> Result<sandlock_core::Protection, String> {
         "net-tcp" => Ok(Protection::NetTcp),
         "fs-ioctl-dev" => Ok(Protection::FsIoctlDev),
         "signal-scope" => Ok(Protection::SignalScope),
-        "abstract-unix-scope-socket" | "abstract-unix-socket-scope" => {
-            Ok(Protection::AbstractUnixScope)
+        "abstract-unix-socket-scope" | "abstract-unix-scope-socket" => {
+            Ok(Protection::AbstractUnixSocketScope)
         }
-        other => Err(format!("unknown protection: {}", other)),
+        other => Err(format!(
+            "unknown protection: {} (valid: fs-refer, fs-truncate, net-tcp, fs-ioctl-dev, signal-scope, abstract-unix-socket-scope)",
+            other,
+        )),
     }
 }
 

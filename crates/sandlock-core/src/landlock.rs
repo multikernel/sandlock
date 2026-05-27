@@ -230,7 +230,7 @@ pub fn resolve(p: Protection, host_abi: u32, policy: &ProtectionPolicy) -> Resol
 /// the two scope protections.
 pub(crate) fn compute_scope_mask(abi: u32, pol: &ProtectionPolicy) -> u64 {
     let mut mask: u64 = 0;
-    if resolve(Protection::AbstractUnixScope, abi, pol) == Resolved::Active {
+    if resolve(Protection::AbstractUnixSocketScope, abi, pol) == Resolved::Active {
         mask |= LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET;
     }
     if resolve(Protection::SignalScope, abi, pol) == Resolved::Active {

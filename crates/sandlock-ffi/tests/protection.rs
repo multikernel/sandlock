@@ -54,7 +54,7 @@ fn protection_min_abi_returns_kernel_documented_floors() {
     assert_eq!(
         sandlock_protection_min_abi(PROT_ABSTRACT_UNIX_SOCKET_SCOPE),
         6,
-        "AbstractUnixScope requires Landlock ABI v6",
+        "AbstractUnixSocketScope requires Landlock ABI v6",
     );
 }
 
@@ -72,7 +72,7 @@ fn protection_discriminants_cover_rust_enum_in_order() {
     assert_eq!(rust_order[PROT_SIGNAL_SCOPE as usize], Protection::SignalScope);
     assert_eq!(
         rust_order[PROT_ABSTRACT_UNIX_SOCKET_SCOPE as usize],
-        Protection::AbstractUnixScope,
+        Protection::AbstractUnixSocketScope,
     );
 }
 
@@ -116,7 +116,7 @@ fn builder_disable_marks_protection_disabled() {
         sandlock_sandbox_builder_disable(b, PROT_ABSTRACT_UNIX_SOCKET_SCOPE)
     });
     assert_eq!(
-        sandbox.protection_policy.state(Protection::AbstractUnixScope),
+        sandbox.protection_policy.state(Protection::AbstractUnixSocketScope),
         ProtectionState::Disabled,
     );
     assert_eq!(

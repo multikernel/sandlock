@@ -625,7 +625,7 @@ fn try_protection_from_raw(raw: u32) -> Option<Protection> {
         PROT_NET_TCP => Some(Protection::NetTcp),
         PROT_FS_IOCTL_DEV => Some(Protection::FsIoctlDev),
         PROT_SIGNAL_SCOPE => Some(Protection::SignalScope),
-        PROT_ABSTRACT_UNIX_SOCKET_SCOPE => Some(Protection::AbstractUnixScope),
+        PROT_ABSTRACT_UNIX_SOCKET_SCOPE => Some(Protection::AbstractUnixSocketScope),
         _ => None,
     }
 }
