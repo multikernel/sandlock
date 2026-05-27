@@ -129,16 +129,35 @@ class Protection(IntEnum):
 
 
 _lib.sandlock_protection_min_abi.restype = ctypes.c_uint32
-_lib.sandlock_protection_min_abi.argtypes = [ctypes.c_int]
+_lib.sandlock_protection_min_abi.argtypes = [ctypes.c_uint32]
 
 # Move-semantics setters: each returns the (possibly relocated) builder
 # pointer, mirroring the convention of the other `_builder_fn` setters.
+# The C ABI accepts the protection as a `uint32_t` so an out-of-range
+# value is rejected at the FFI boundary (no `#[repr(C)]` enum cast).
 _b_allow_degraded = _builder_fn(
-    "sandlock_sandbox_builder_allow_degraded", ctypes.c_int
+    "sandlock_sandbox_builder_allow_degraded", ctypes.c_uint32
 )
 _b_disable = _builder_fn(
-    "sandlock_sandbox_builder_disable", ctypes.c_int
+    "sandlock_sandbox_builder_disable", ctypes.c_uint32
 )
+
+
+def _validate_protection(p: int, *, field: str) -> int:
+    """Coerce a caller-supplied protection value to a known discriminant
+    or raise :class:`ValueError`. Centralises the range check so the FFI
+    is never invoked with an unknown integer (the Rust setters silently
+    no-op on bad input, which is the wrong UX for the Python caller —
+    we want a loud failure at the SDK boundary instead).
+    """
+    try:
+        return int(Protection(int(p)))
+    except (ValueError, TypeError) as e:
+        valid = ", ".join(f"{m.name}={int(m)}" for m in Protection)
+        raise ValueError(
+            f"{field}: {p!r} is not a known Protection discriminant "
+            f"(valid: {valid})"
+        ) from e
 
 # Policy callback (policy_fn).
 # Path strings absent (issue #27 — path-based control belongs in Landlock).
@@ -1066,9 +1085,9 @@ class _NativePolicy:
         # same Protection appears in both lists, the later call wins
         # (matching the underlying `ProtectionPolicy::set` semantics).
         for p in (policy.allow_degraded or ()):
-            b = _b_allow_degraded(b, int(p))
+            b = _b_allow_degraded(b, _validate_protection(p, field="allow_degraded"))
         for p in (policy.disable or ()):
-            b = _b_disable(b, int(p))
+            b = _b_disable(b, _validate_protection(p, field="disable"))
 
         # Guard: warn if any dataclass field was set to a non-default value
         # but is not in _HANDLED_FIELDS (i.e. silently dropped).

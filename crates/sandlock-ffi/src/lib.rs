@@ -598,42 +598,51 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_deterministic_dirs(
 // Sandbox Builder — Landlock protections
 // ----------------------------------------------------------------
 
-/// Mirror of [`sandlock_core::Protection`] for the C ABI.
+/// C ABI discriminants mirroring [`sandlock_core::Protection`].
 ///
-/// Discriminant values are stable across releases; new protections are
-/// appended. The order matches the Rust `Protection` enum (and
-/// `Protection::all()`) so a discriminant can be converted to the Rust
-/// variant by index.
-#[repr(C)]
-#[allow(non_camel_case_types)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum sandlock_protection_t {
-    FsRefer = 0,
-    FsTruncate = 1,
-    NetTcp = 2,
-    FsIoctlDev = 3,
-    SignalScope = 4,
-    AbstractUnixScopeSocket = 5,
-}
+/// The Rust entry-points below accept the discriminant as a `u32`
+/// (rather than a `#[repr(C)]` enum) so that an out-of-range value
+/// from a C or Python caller is rejected at the boundary instead of
+/// reaching a Rust `match` over an enum and producing undefined
+/// behaviour.
+///
+/// New protections are appended at higher values; old discriminants
+/// are never reused.
+const PROT_FS_REFER: u32 = 0;
+const PROT_FS_TRUNCATE: u32 = 1;
+const PROT_NET_TCP: u32 = 2;
+const PROT_FS_IOCTL_DEV: u32 = 3;
+const PROT_SIGNAL_SCOPE: u32 = 4;
+const PROT_ABSTRACT_UNIX_SOCKET_SCOPE: u32 = 5;
 
-impl From<sandlock_protection_t> for Protection {
-    fn from(p: sandlock_protection_t) -> Self {
-        match p {
-            sandlock_protection_t::FsRefer => Protection::FsRefer,
-            sandlock_protection_t::FsTruncate => Protection::FsTruncate,
-            sandlock_protection_t::NetTcp => Protection::NetTcp,
-            sandlock_protection_t::FsIoctlDev => Protection::FsIoctlDev,
-            sandlock_protection_t::SignalScope => Protection::SignalScope,
-            sandlock_protection_t::AbstractUnixScopeSocket => Protection::AbstractUnixScope,
-        }
+/// Convert a raw discriminant into a `Protection`, returning `None`
+/// for values not in the known range. Centralises the validation that
+/// guards every C-ABI entry-point.
+fn try_protection_from_raw(raw: u32) -> Option<Protection> {
+    match raw {
+        PROT_FS_REFER => Some(Protection::FsRefer),
+        PROT_FS_TRUNCATE => Some(Protection::FsTruncate),
+        PROT_NET_TCP => Some(Protection::NetTcp),
+        PROT_FS_IOCTL_DEV => Some(Protection::FsIoctlDev),
+        PROT_SIGNAL_SCOPE => Some(Protection::SignalScope),
+        PROT_ABSTRACT_UNIX_SOCKET_SCOPE => Some(Protection::AbstractUnixScope),
+        _ => None,
     }
 }
 
 /// Per-protection minimum Landlock ABI version required by the host
 /// kernel for this protection to be available.
+///
+/// Returns `0` for any `protection` value that is not a known
+/// discriminant — `0` is below every real `min_abi()` (which start at
+/// `2`), so callers can use it as an "unknown protection" sentinel
+/// without colliding with a valid version number.
 #[no_mangle]
-pub extern "C" fn sandlock_protection_min_abi(protection: sandlock_protection_t) -> u32 {
-    Protection::from(protection).min_abi()
+pub extern "C" fn sandlock_protection_min_abi(protection: u32) -> u32 {
+    match try_protection_from_raw(protection) {
+        Some(p) => p.min_abi(),
+        None => 0,
+    }
 }
 
 /// Mark `protection` as degradable on the builder: enforced when the
@@ -642,7 +651,8 @@ pub extern "C" fn sandlock_protection_min_abi(protection: sandlock_protection_t)
 /// Returns the (possibly relocated) builder pointer, mirroring the
 /// move-semantics convention used by every other
 /// `sandlock_sandbox_builder_*` setter. A null `b` is returned
-/// unchanged.
+/// unchanged. An unknown `protection` discriminant is treated as a
+/// no-op: the builder is returned untouched.
 ///
 /// # Safety
 /// `b` must be a valid builder pointer returned by
@@ -651,11 +661,15 @@ pub extern "C" fn sandlock_protection_min_abi(protection: sandlock_protection_t)
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_allow_degraded(
     b: *mut SandboxBuilder,
-    protection: sandlock_protection_t,
+    protection: u32,
 ) -> *mut SandboxBuilder {
     if b.is_null() { return b; }
+    let p = match try_protection_from_raw(protection) {
+        Some(p) => p,
+        None => return b,
+    };
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.allow_degraded(protection.into())))
+    Box::into_raw(Box::new(builder.allow_degraded(p)))
 }
 
 /// Mark `protection` as disabled on the builder: never enforced, even
@@ -664,7 +678,8 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_allow_degraded(
 /// Returns the (possibly relocated) builder pointer, mirroring the
 /// move-semantics convention used by every other
 /// `sandlock_sandbox_builder_*` setter. A null `b` is returned
-/// unchanged.
+/// unchanged. An unknown `protection` discriminant is treated as a
+/// no-op: the builder is returned untouched.
 ///
 /// # Safety
 /// `b` must be a valid builder pointer returned by
@@ -673,11 +688,15 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_allow_degraded(
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_disable(
     b: *mut SandboxBuilder,
-    protection: sandlock_protection_t,
+    protection: u32,
 ) -> *mut SandboxBuilder {
     if b.is_null() { return b; }
+    let p = match try_protection_from_raw(protection) {
+        Some(p) => p,
+        None => return b,
+    };
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.disable(protection.into())))
+    Box::into_raw(Box::new(builder.disable(p)))
 }
 
 // ----------------------------------------------------------------

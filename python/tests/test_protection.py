@@ -106,3 +106,57 @@ def test_sandbox_build_with_idempotent_protection_kwargs():
     )
     native = _NativePolicy.from_dataclass(sb)
     assert native.ptr is not None and native.ptr != 0
+
+
+# --------------------------------------------------------------
+# Out-of-range protection int — the SDK must raise `ValueError`
+# before reaching the FFI. The Rust setters tolerate unknown
+# discriminants as a no-op, but the Python contract is loud failure
+# (silent no-op is the wrong UX when the caller typed a wrong int).
+# --------------------------------------------------------------
+
+
+def test_sandbox_build_rejects_out_of_range_protection_int():
+    """An integer outside the known `Protection` enum range raises
+    `ValueError` at build time — before reaching the FFI."""
+    import pytest
+
+    from sandlock._sdk import _NativePolicy
+
+    sb = Sandbox(fs_readable=["/usr"], allow_degraded=[99])
+    with pytest.raises(ValueError, match="allow_degraded"):
+        _NativePolicy.from_dataclass(sb)
+
+
+def test_sandbox_build_rejects_out_of_range_in_disable():
+    """Same guard applies to the `disable` kwarg."""
+    import pytest
+
+    from sandlock._sdk import _NativePolicy
+
+    sb = Sandbox(fs_readable=["/usr"], disable=[100, 200])
+    with pytest.raises(ValueError, match="disable"):
+        _NativePolicy.from_dataclass(sb)
+
+
+def test_sandbox_build_rejects_negative_protection_int():
+    """Negative ints are not valid Protection discriminants — must
+    raise rather than wrap to a large unsigned value at the FFI."""
+    import pytest
+
+    from sandlock._sdk import _NativePolicy
+
+    sb = Sandbox(fs_readable=["/usr"], allow_degraded=[-1])
+    with pytest.raises(ValueError):
+        _NativePolicy.from_dataclass(sb)
+
+
+def test_sandbox_build_accepts_plain_int_in_valid_range():
+    """Callers using plain `int` (not the `Protection` IntEnum) for
+    values in the valid range must still succeed — the validator
+    coerces through `Protection(int)`."""
+    from sandlock._sdk import _NativePolicy
+
+    sb = Sandbox(fs_readable=["/usr"], allow_degraded=[4])  # 4 == SIGNAL_SCOPE
+    native = _NativePolicy.from_dataclass(sb)
+    assert native.ptr is not None and native.ptr != 0
