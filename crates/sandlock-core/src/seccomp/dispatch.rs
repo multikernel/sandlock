@@ -487,10 +487,12 @@ pub(crate) fn build_dispatch_table(
     }
 
     // ------------------------------------------------------------------
-    // /etc/hosts virtualization (for concrete-host entries in net_allow)
+    // /etc/hosts virtualization: always on. The synthetic file contains
+    // the loopback base plus any concrete hostnames resolved from
+    // `net_allow`, so the host's on-disk `/etc/hosts` never leaks in.
     // ------------------------------------------------------------------
-    if let Some(ref etc_hosts) = policy.virtual_etc_hosts {
-        let etc_hosts_for_open = etc_hosts.clone();
+    {
+        let etc_hosts_for_open = policy.virtual_etc_hosts.clone();
         table.register(libc::SYS_openat, move |cx: &HandlerCtx| {
             let notif = cx.notif;
             let notif_fd = cx.notif_fd;
@@ -1019,7 +1021,7 @@ mod handler_tests {
                 deterministic_dirs: false,
                 virtual_hostname: None,
                 has_http_acl: false,
-                virtual_etc_hosts: None,
+                virtual_etc_hosts: String::new(),
             }),
             child_pidfd: None,
             notif_fd: -1,

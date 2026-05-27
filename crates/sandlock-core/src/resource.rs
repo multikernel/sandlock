@@ -653,7 +653,7 @@ mod tests {
             deterministic_dirs: false,
             virtual_hostname: None,
             has_http_acl: false,
-            virtual_etc_hosts: None,
+            virtual_etc_hosts: String::new(),
         }
     }
 

@@ -237,10 +237,11 @@ pub struct NotifPolicy {
     pub deterministic_dirs: bool,
     pub virtual_hostname: Option<String>,
     pub has_http_acl: bool,
-    /// Synthetic `/etc/hosts` content for `net_allow` host-rule virtualization.
-    /// When set, `openat("/etc/hosts")` returns a memfd with this content
-    /// so sandboxed processes can resolve allowed hostnames without DNS.
-    pub virtual_etc_hosts: Option<String>,
+    /// Synthetic `/etc/hosts` served to the sandbox. Always populated:
+    /// `openat("/etc/hosts")` returns a memfd with this content so the
+    /// host's on-disk `/etc/hosts` never leaks in. The content is the
+    /// loopback base plus any concrete hostnames resolved from `net_allow`.
+    pub virtual_etc_hosts: String,
 }
 
 // ============================================================

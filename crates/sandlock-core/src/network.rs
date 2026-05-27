@@ -1037,9 +1037,11 @@ pub struct ResolvedNetAllowSet {
     pub tcp: ResolvedNetAllow,
     pub udp: ResolvedNetAllow,
     pub icmp: ResolvedNetAllow,
-    /// Synthetic `/etc/hosts` content combining every concrete host
-    /// across all protocols. `None` when no concrete hostnames appear.
-    pub etc_hosts: Option<String>,
+    /// Synthetic `/etc/hosts` content. Always includes the loopback base
+    /// (`127.0.0.1 localhost` / `::1 localhost`) plus an entry per concrete
+    /// hostname appearing in any rule; the host's on-disk `/etc/hosts` never
+    /// leaks into the sandbox.
+    pub etc_hosts: String,
 }
 
 /// Resolve `--net-allow` rules into per-protocol runtime allowlists.
@@ -1053,10 +1055,11 @@ pub struct ResolvedNetAllowSet {
 pub async fn resolve_net_allow(
     rules: &[NetAllow],
 ) -> io::Result<ResolvedNetAllowSet> {
-    // Single shared etc_hosts for all protocols. Every concrete host
-    // (regardless of protocol) ends up resolvable in the sandbox.
+    // Single shared etc_hosts for all protocols. Always present so the
+    // sandbox sees a fixed loopback-only view independent of the host's
+    // on-disk `/etc/hosts`; concrete-hostname rules append their resolved
+    // entries on top.
     let mut etc_hosts = String::from("127.0.0.1 localhost\n::1 localhost\n");
-    let mut has_concrete_host = false;
 
     let per_proto = |target: Protocol| async move {
         let mut per_ip: HashMap<IpAddr, HashSet<u16>> = HashMap::new();
@@ -1064,7 +1067,6 @@ pub async fn resolve_net_allow(
         let mut any_ip_ports: HashSet<u16> = HashSet::new();
         let mut any_ip_all_ports = false;
         let mut local_etc_hosts = String::new();
-        let mut local_has_concrete = false;
 
         for rule in rules.iter().filter(|r| r.protocol == target) {
             match &rule.host {
@@ -1080,7 +1082,6 @@ pub async fn resolve_net_allow(
                     }
                 }
                 Some(host) => {
-                    local_has_concrete = true;
                     let addr = format!("{}:0", host);
                     let resolved = tokio::net::lookup_host(addr.as_str()).await.map_err(|e| {
                         io::Error::new(
@@ -1113,24 +1114,22 @@ pub async fn resolve_net_allow(
                 any_ip_all_ports,
             },
             local_etc_hosts,
-            local_has_concrete,
         ))
     };
 
-    let (tcp, tcp_eh, tcp_concrete) = per_proto(Protocol::Tcp).await?;
-    let (udp, udp_eh, udp_concrete) = per_proto(Protocol::Udp).await?;
-    let (icmp, icmp_eh, icmp_concrete) = per_proto(Protocol::Icmp).await?;
+    let (tcp, tcp_eh) = per_proto(Protocol::Tcp).await?;
+    let (udp, udp_eh) = per_proto(Protocol::Udp).await?;
+    let (icmp, icmp_eh) = per_proto(Protocol::Icmp).await?;
 
     for chunk in [tcp_eh, udp_eh, icmp_eh] {
         etc_hosts.push_str(&chunk);
     }
-    has_concrete_host |= tcp_concrete || udp_concrete || icmp_concrete;
 
     Ok(ResolvedNetAllowSet {
         tcp,
         udp,
         icmp,
-        etc_hosts: if has_concrete_host { Some(etc_hosts) } else { None },
+        etc_hosts,
     })
 }
 
@@ -1318,7 +1317,10 @@ mod tests {
         assert!(resolved.tcp.any_ip_ports.is_empty());
         assert!(resolved.udp.per_ip.is_empty());
         assert!(resolved.icmp.per_ip.is_empty());
-        assert!(resolved.etc_hosts.is_none());
+        // Loopback base is always emitted, even without rules, so the
+        // sandbox's `/etc/hosts` never falls through to the host's copy.
+        assert!(resolved.etc_hosts.contains("127.0.0.1 localhost"));
+        assert!(resolved.etc_hosts.contains("::1 localhost"));
     }
 
     #[tokio::test]
@@ -1339,7 +1341,8 @@ mod tests {
         }
         assert!(resolved.udp.per_ip.is_empty());
         assert!(resolved.icmp.per_ip.is_empty());
-        assert!(resolved.etc_hosts.as_deref().unwrap_or("").contains("localhost"));
+        // Concrete-host entry (`<ip> localhost`) appended on top of the base.
+        assert!(resolved.etc_hosts.contains("127.0.0.1 localhost"));
     }
 
     #[tokio::test]
@@ -1354,7 +1357,8 @@ mod tests {
         assert!(resolved.tcp.per_ip.is_empty());
         assert!(resolved.tcp.any_ip_ports.contains(&8080));
         assert!(!resolved.tcp.any_ip_all_ports);
-        assert!(resolved.etc_hosts.is_none());
+        // Even an any-IP rule still gets the loopback base content.
+        assert!(resolved.etc_hosts.contains("127.0.0.1 localhost"));
     }
 
     #[tokio::test]
@@ -1394,7 +1398,7 @@ mod tests {
         for ip in resolved.tcp.per_ip_all_ports.iter() {
             assert!(resolved.tcp.per_ip.contains_key(ip));
         }
-        assert!(resolved.etc_hosts.is_some());
+        assert!(resolved.etc_hosts.contains("localhost"));
     }
 
     #[tokio::test]
