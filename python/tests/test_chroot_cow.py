@@ -3,7 +3,8 @@
 
 Verifies that on_exit/on_error branch actions work correctly and that
 concurrent sandboxes with separate fs_storage directories get isolated
-upper layers.  Parametrized across all COW backends (seccomp, overlayfs).
+upper layers.  The seccomp-based COW (FsIsolation.NONE + workdir) is the
+only supported backend.
 """
 
 from __future__ import annotations
@@ -29,32 +30,7 @@ _FS_READABLE = ["/usr", "/usr/bin", "/bin", "/sbin", "/etc", "/proc", "/dev"]
 # Backend parametrization
 # ---------------------------------------------------------------------------
 
-def _overlayfs_available():
-    """Check if unprivileged overlayfs is usable (needs user+mount ns)."""
-    try:
-        p = Sandbox(
-            chroot=None,
-            workdir="/tmp",
-            cwd="/tmp",
-            fs_readable=["/"],
-            fs_writable=["/tmp"],
-            fs_isolation=FsIsolation.OVERLAYFS,
-            on_exit="abort",
-            clean_env=True,
-            env={"PATH": "/bin:/usr/bin"},
-        )
-        r = p.run(["true"])
-        return r.success
-    except Exception:
-        return False
-
-
-_BACKENDS = ["seccomp"]  # always available
-if _overlayfs_available():
-    _BACKENDS.append("overlayfs")
-
-
-@pytest.fixture(params=_BACKENDS)
+@pytest.fixture(params=["seccomp"])
 def backend(request):
     return request.param
 
@@ -95,9 +71,9 @@ def rootfs(tmp_path):
 
 def _cow_policy(rootfs, on_exit="abort", fs_storage=None, backend="seccomp"):
     """Build a COW policy for the given backend."""
-    # seccomp backend: fs_isolation left as NONE -- workdir triggers
-    # the seccomp COW path.  overlayfs: explicit.
-    fs_isolation = FsIsolation.OVERLAYFS if backend == "overlayfs" else FsIsolation.NONE
+    # seccomp backend: fs_isolation NONE + workdir triggers the seccomp COW path.
+    del backend  # only "seccomp" is supported
+    fs_isolation = FsIsolation.NONE
     return Sandbox(
         chroot=str(rootfs),
         workdir=str(rootfs),

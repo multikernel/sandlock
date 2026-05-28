@@ -83,7 +83,6 @@ class FsIsolation(Enum):
 
     NONE = "none"        # Direct host writes (default)
     BRANCHFS = "branchfs"  # BranchFS COW isolation
-    OVERLAYFS = "overlayfs"  # OverlayFS COW (kernel built-in, no dependencies)
 
 
 class BranchAction(Enum):
@@ -321,7 +320,8 @@ class Sandbox:
 
     # COW filesystem isolation
     fs_isolation: FsIsolation = FsIsolation.NONE
-    """Filesystem isolation mode.  Auto-set to OVERLAYFS when workdir is set."""
+    """Filesystem isolation mode.  ``NONE`` with ``workdir`` set engages the
+    seccomp-based COW (the default)."""
 
     fs_storage: str | None = None
     """Separate storage directory for BranchFS COW deltas.

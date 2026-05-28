@@ -482,15 +482,11 @@ full API, ordering semantics, and state patterns.
 
 ### COW Filesystem
 
-Two modes of copy-on-write filesystem isolation:
-
-**Seccomp COW** (default when `workdir` is set): Intercepts filesystem
-syscalls via seccomp notification. Writes go to an upper directory;
-reads resolve upper-then-lower. No mount namespace, no root. Committed
-on exit, aborted on error.
-
-**OverlayFS COW**: Uses kernel OverlayFS in a user namespace. Requires
-unprivileged user namespaces to be enabled.
+Copy-on-write filesystem isolation via seccomp notification: when
+`workdir` is set, sandlock intercepts filesystem syscalls and stages
+writes in an upper directory; reads resolve upper-then-lower. No mount
+namespace, no user namespace, no root. Committed on exit, aborted on
+error.
 
 **Dry-run mode**: `--dry-run` runs the command, inspects the COW layer
 for changes (added/modified/deleted files), prints a summary, then

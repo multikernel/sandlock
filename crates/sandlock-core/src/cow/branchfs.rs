@@ -69,11 +69,6 @@ impl CowBranch for BranchFsBranch {
         self.ctl_ioctl(FS_IOC_BRANCH_ABORT)
     }
 
-    fn cleanup(&self) -> Result<(), BranchError> {
-        // BranchFS cleanup happens via abort ioctl
-        self.abort()
-    }
-
     fn changes(&self) -> Result<Vec<crate::dry_run::Change>, BranchError> {
         Ok(Vec::new()) // BranchFS is kernel-managed; cannot inspect upper layer
     }

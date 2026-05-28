@@ -1,5 +1,5 @@
 use sandlock_core::{Sandbox};
-use sandlock_core::sandbox::{FsIsolation, BranchAction};
+use sandlock_core::sandbox::BranchAction;
 use std::fs;
 use std::path::PathBuf;
 
@@ -7,110 +7,6 @@ fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("sandlock-test-cow-{}-{}", name, std::process::id()));
     let _ = fs::create_dir_all(&dir);
     dir
-}
-
-/// Test that basic commands still work with OverlayFS enabled.
-#[tokio::test]
-async fn test_overlayfs_basic_commands() {
-    let workdir = temp_dir("basic");
-    let storage = temp_dir("basic-storage");
-    fs::write(workdir.join("hello.txt"), "original").unwrap();
-
-    let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
-        .fs_read("/proc")
-        .fs_write(&workdir)
-        .fs_isolation(FsIsolation::OverlayFs)
-        .workdir(&workdir)
-        .fs_storage(&storage)
-        .build()
-        .unwrap();
-
-    let result = policy.clone().with_name("test").run(&["cat", "hello.txt"]).await;
-    // May fail on systems without unprivileged overlayfs support
-    match result {
-        Ok(r) => assert!(r.success(), "cat should succeed"),
-        Err(e) => eprintln!("OverlayFS test skipped (not supported): {}", e),
-    }
-
-    let _ = fs::remove_dir_all(&workdir);
-    let _ = fs::remove_dir_all(&storage);
-}
-
-/// Test that writes in the sandbox don't affect the original directory (abort).
-#[tokio::test]
-async fn test_overlayfs_write_isolation() {
-    let workdir = temp_dir("isolation");
-    let storage = temp_dir("isolation-storage");
-    fs::write(workdir.join("data.txt"), "original").unwrap();
-
-    let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
-        .fs_read("/proc")
-        .fs_write(&workdir)
-        .fs_isolation(FsIsolation::OverlayFs)
-        .workdir(&workdir)
-        .fs_storage(&storage)
-        .on_exit(BranchAction::Abort)
-        .on_error(BranchAction::Abort)
-        .build()
-        .unwrap();
-
-    // Write to a file inside the sandbox
-    let result = policy.clone().with_name("test").run(&["sh", "-c", "echo modified > data.txt"]).await;
-    match result {
-        Ok(_r) => {
-            // Original file should still say "original" (COW aborted)
-            let content = fs::read_to_string(workdir.join("data.txt")).unwrap();
-            assert_eq!(content.trim(), "original", "Original should be unchanged after abort");
-        }
-        Err(e) => eprintln!("OverlayFS test skipped: {}", e),
-    }
-
-    let _ = fs::remove_dir_all(&workdir);
-    let _ = fs::remove_dir_all(&storage);
-}
-
-/// Test that COW commit merges writes back.
-#[tokio::test]
-async fn test_overlayfs_commit() {
-    let workdir = temp_dir("commit");
-    let storage = temp_dir("commit-storage");
-    fs::write(workdir.join("data.txt"), "original").unwrap();
-
-    let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
-        .fs_read("/proc")
-        .fs_write(&workdir)
-        .fs_isolation(FsIsolation::OverlayFs)
-        .workdir(&workdir)
-        .fs_storage(&storage)
-        .on_exit(BranchAction::Commit)
-        .build()
-        .unwrap();
-
-    let result = policy.clone().with_name("test").run(&["sh", "-c", "echo committed > data.txt"]).await;
-    match result {
-        Ok(r) => {
-            if r.success() {
-                let content = fs::read_to_string(workdir.join("data.txt")).unwrap();
-                assert_eq!(content.trim(), "committed", "File should be updated after commit");
-            }
-        }
-        Err(e) => eprintln!("OverlayFS test skipped: {}", e),
-    }
-
-    let _ = fs::remove_dir_all(&workdir);
-    let _ = fs::remove_dir_all(&storage);
-}
-
-/// Test that policy validation catches missing workdir.
-#[tokio::test]
-async fn test_cow_requires_workdir() {
-    let result = Sandbox::builder()
-        .fs_isolation(FsIsolation::OverlayFs)
-        .build();
-    assert!(result.is_err(), "Should fail without workdir");
 }
 
 // ============================================================

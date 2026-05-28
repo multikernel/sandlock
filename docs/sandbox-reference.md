@@ -90,7 +90,7 @@ no_huge_pages = true
 read      = ["/usr", "/lib"]
 write     = ["/tmp"]
 deny      = ["/proc/kcore"]
-isolation = "overlayfs"               # "none" | "overlayfs" | "branchfs"
+isolation = "branchfs"                # "none" | "branchfs"
 chroot    = "/opt/rootfs"
 mount     = ["/work:/host/sandbox/work"]
 on_exit   = "commit"                  # "commit" | "abort" | "keep"
@@ -175,7 +175,7 @@ filesystem isolation.
 | `fs_readable`  | `read`      | `Sequence[str]`     | `()`                    | Paths the sandbox may read (in addition to `fs_writable`).                                                                   |
 | `fs_writable`  | `write`     | `Sequence[str]`     | `()`                    | Paths the sandbox may read and write.                                                                                        |
 | `fs_denied`    | `deny`      | `Sequence[str]`     | `()`                    | Paths explicitly denied (neither read nor write), even if implied by a broader rule.                                         |
-| `fs_isolation` | `isolation` | `FsIsolation`       | `FsIsolation.NONE`      | Filesystem isolation mode. Auto-set to `FsIsolation.OVERLAYFS` when `workdir` is provided without an explicit value.         |
+| `fs_isolation` | `isolation` | `FsIsolation`       | `FsIsolation.NONE`      | Filesystem isolation mode. With `NONE` and a `workdir`, the seccomp-based COW path is used.                                  |
 | `chroot`       | `chroot`    | `str \| None`       | `None`                  | Path to `chroot` into before applying other confinement.                                                                     |
 | `fs_mount`     | `mount`     | `Mapping[str, str]` | `{}`                    | Map virtual paths inside the chroot to host directories. Python form: `{"/work": "/host/sandbox/work"}`. TOML form: list of `"VIRTUAL:HOST"` strings. |
 | `on_exit`      | `on_exit`   | `BranchAction`      | `BranchAction.COMMIT`   | Branch action on normal sandbox exit.                                                                                        |
@@ -282,9 +282,8 @@ and have no TOML counterpart.
 
 ```python
 class FsIsolation(Enum):
-    NONE      = "none"        # Direct host writes (default).
-    OVERLAYFS = "overlayfs"   # Kernel OverlayFS inside a user namespace.
-    BRANCHFS  = "branchfs"    # BranchFS COW isolation.
+    NONE      = "none"        # Direct host writes (default); seccomp COW engaged when `workdir` is set.
+    BRANCHFS  = "branchfs"    # BranchFS kernel-module COW isolation.
 ```
 
 ### `BranchAction`
@@ -331,10 +330,10 @@ parse_ports([80, "443", "8000-8005"])
    outbound traffic. Protocol gating is a function of rule presence:
    the seccomp layer denies UDP and ICMP socket creation when no rule
    of that protocol is configured.
-2. **Auto-switch of `fs_isolation`.** When `workdir` is set without an
-   explicit `fs_isolation`, the field defaults to
-   `FsIsolation.OVERLAYFS`. Pass `fs_isolation=FsIsolation.NONE`
-   explicitly to opt out.
+2. **Seccomp COW with `workdir`.** When `workdir` is set and
+   `fs_isolation=FsIsolation.NONE` (the default), the seccomp-based COW
+   path intercepts writes under `workdir` and stages them in an upper
+   layer, committed or aborted on exit per `on_exit` / `on_error`.
 3. **HTTP host auto-expansion.** HTTP rules referencing concrete hosts
    auto-add corresponding TCP entries on `http_ports` (and on `443`
    when `http_ca` is set). Wildcard hosts add the equivalent any-IP

@@ -229,7 +229,7 @@ Sandlock always applies its default syscall blocklist.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `fs_isolation` | `FsIsolation` | `NONE` | `NONE`, `BRANCHFS`, or `OVERLAYFS` |
+| `fs_isolation` | `FsIsolation` | `NONE` | `NONE` or `BRANCHFS` |
 | `fs_storage` | `str \| None` | `None` | Storage directory for BranchFS deltas |
 | `max_disk` | `str \| None` | `None` | Disk quota for BranchFS (e.g. `"1G"`) |
 | `on_exit` | `BranchAction` | `COMMIT` | `COMMIT`, `ABORT`, or `KEEP` |
@@ -587,9 +587,8 @@ from sandlock import SandlockError, SandboxError, SandboxRuntimeError
 
 #### `FsIsolation`
 
-- `FsIsolation.NONE` -- direct host writes (default)
-- `FsIsolation.BRANCHFS` -- BranchFS COW isolation
-- `FsIsolation.OVERLAYFS` -- OverlayFS COW
+- `FsIsolation.NONE` -- direct host writes (default); seccomp COW engaged when `workdir` is set
+- `FsIsolation.BRANCHFS` -- BranchFS kernel-module COW isolation
 
 #### `BranchAction`
 

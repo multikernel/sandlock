@@ -393,7 +393,6 @@ async fn run_command(args: RunArgs) -> Result<()> {
         use sandlock_core::sandbox::FsIsolation;
         let iso = match mode.as_str() {
             "none" => FsIsolation::None,
-            "overlayfs" => FsIsolation::OverlayFs,
             "branchfs" => FsIsolation::BranchFs,
             other => return Err(anyhow!("unknown --fs-isolation mode: {}", other)),
         };

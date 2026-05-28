@@ -214,7 +214,7 @@ def _coerce(
         except ValueError:
             raise PolicyError(
                 f"{source}: [{section}].{toml_key} must be "
-                f"'none', 'overlayfs', or 'branchfs', got {value!r}"
+                f"'none' or 'branchfs', got {value!r}"
             )
     if sandbox_key in ("on_exit", "on_error"):
         try:

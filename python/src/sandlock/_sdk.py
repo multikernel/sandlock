@@ -931,7 +931,6 @@ class _NativePolicy:
         from .sandbox import FsIsolation
         _iso_map = {
             FsIsolation.NONE: 0,
-            FsIsolation.OVERLAYFS: 1,
             FsIsolation.BRANCHFS: 2,
         }
         if policy.fs_isolation != FsIsolation.NONE:

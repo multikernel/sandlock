@@ -697,11 +697,8 @@ fn close_fds_above(min_fd: RawFd, keep: &[RawFd]) {
 }
 
 // ============================================================
-// COW filesystem config passed from parent to child
+// User-namespace uid/gid mapping helpers
 // ============================================================
-
-// Re-export ChildMountConfig so callers can use the old import path.
-pub(crate) use crate::cow::ChildMountConfig;
 
 /// Write uid/gid maps for an unprivileged user namespace.
 /// `real_uid`/`real_gid` must be captured *before* unshare(CLONE_NEWUSER),
@@ -711,14 +708,6 @@ fn write_id_maps(real_uid: u32, real_gid: u32, target_uid: u32, target_gid: u32)
     let _ = std::fs::write("/proc/self/uid_map", format!("{} {} 1\n", target_uid, real_uid));
     let _ = std::fs::write("/proc/self/setgroups", "deny\n");
     let _ = std::fs::write("/proc/self/gid_map", format!("{} {} 1\n", target_gid, real_gid));
-}
-
-/// Write uid/gid maps using the post-unshare overflow uid (65534).
-/// Used by the OverlayFS COW path which maps to root (UID 0) inside.
-fn write_id_maps_overflow() {
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
-    write_id_maps(uid, gid, 0, 0);
 }
 
 // ============================================================
@@ -736,7 +725,6 @@ pub(crate) struct ChildSpawnArgs<'a> {
     pub sandbox: &'a Sandbox,
     pub cmd: &'a [CString],
     pub pipes: &'a PipePair,
-    pub cow_config: Option<&'a ChildMountConfig>,
     /// Skip the user-notification supervisor: child installs a kernel-only
     /// deny filter, parent reads `notif_fd_num = 0` and never starts a
     /// supervisor. Mirrors `Sandbox::no_supervisor`.
@@ -764,7 +752,6 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         sandbox,
         cmd,
         pipes,
-        cow_config,
         no_supervisor,
         keep_fds,
         sandbox_name,
@@ -870,65 +857,12 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     let real_uid = unsafe { libc::getuid() };
     let real_gid = unsafe { libc::getgid() };
 
-    // 5b. User namespace for --uid mapping (when not using OverlayFS COW,
-    //     which sets up its own user namespace)
+    // 5b. User namespace for --uid mapping.
     if let Some(target_uid) = sandbox.uid {
-        if cow_config.is_none() {
-            if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
-                fail!("unshare(CLONE_NEWUSER)");
-            }
-            write_id_maps(real_uid, real_gid, target_uid, target_uid);
+        if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
+            fail!("unshare(CLONE_NEWUSER)");
         }
-    }
-
-    // 5c. User + mount namespace for OverlayFS COW (includes CLONE_NEWUSER)
-    if let Some(ref cow) = cow_config {
-        // unshare user + mount namespaces (unprivileged)
-        if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) } != 0 {
-            fail!("unshare(CLONE_NEWUSER | CLONE_NEWNS)");
-        }
-
-        // Write uid/gid maps using overflow uid (preserves existing COW behavior)
-        write_id_maps_overflow();
-
-        // Mount the overlay filesystem ON TOP of the workdir so the child
-        // sees the merged view at the original path.  The kernel resolves
-        // lowerdir before the covering mount takes effect, so using the
-        // same path as both lowerdir and mount-point is safe inside our
-        // private mount namespace.
-        let lowerdir = cow.lowers.iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(":");
-        let opts = format!(
-            "lowerdir={},upperdir={},workdir={}",
-            lowerdir,
-            cow.upper.display(),
-            cow.work.display(),
-        );
-
-        let mount_cstr = match CString::new(cow.mount_point.to_str().unwrap_or("")) {
-            Ok(c) => c,
-            Err(_) => fail!("invalid overlay mount point path"),
-        };
-        let overlay_cstr = CString::new("overlay").unwrap();
-        let opts_cstr = match CString::new(opts) {
-            Ok(c) => c,
-            Err(_) => fail!("invalid overlay opts"),
-        };
-
-        let ret = unsafe {
-            libc::mount(
-                overlay_cstr.as_ptr(),
-                mount_cstr.as_ptr(),
-                overlay_cstr.as_ptr(),
-                0,
-                opts_cstr.as_ptr() as *const libc::c_void,
-            )
-        };
-        if ret != 0 {
-            fail!("mount overlay");
-        }
+        write_id_maps(real_uid, real_gid, target_uid, target_uid);
     }
 
     // 6. Optional: change working directory

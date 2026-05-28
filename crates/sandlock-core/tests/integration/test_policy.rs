@@ -83,7 +83,7 @@ fn test_invalid_cpu_percent() {
 #[test]
 fn test_fs_isolation_requires_workdir() {
     assert!(Sandbox::builder()
-        .fs_isolation(FsIsolation::OverlayFs)
+        .fs_isolation(FsIsolation::BranchFs)
         .build()
         .is_err());
 }

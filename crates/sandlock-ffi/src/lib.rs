@@ -120,7 +120,8 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_fs_storage(
 }
 
 /// Set filesystem isolation mode.
-/// `mode`: 0 = None, 1 = OverlayFs, 2 = BranchFs.
+/// `mode`: 0 = None, 2 = BranchFs. (1, formerly OverlayFs, is no longer
+/// supported and falls back to None with a stderr warning.)
 ///
 /// # Safety
 /// `b` must be a valid builder pointer.
@@ -132,8 +133,11 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_fs_isolation(
     if b.is_null() { return b; }
     let builder = *Box::from_raw(b);
     let iso = match mode {
-        1 => FsIsolation::OverlayFs,
         2 => FsIsolation::BranchFs,
+        1 => {
+            eprintln!("sandlock: fs_isolation mode=1 (OverlayFs) is no longer supported; falling back to None");
+            FsIsolation::None
+        }
         _ => FsIsolation::None,
     };
     Box::into_raw(Box::new(builder.fs_isolation(iso)))

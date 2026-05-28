@@ -1,9 +1,9 @@
 use sandlock_core::sandbox::{FsIsolation, Sandbox};
 
 #[test]
-fn validate_overlayfs_without_workdir_fails() {
+fn validate_branchfs_without_workdir_fails() {
     let p = Sandbox::builder()
-        .fs_isolation(FsIsolation::OverlayFs)
+        .fs_isolation(FsIsolation::BranchFs)
         .build_unchecked()
         .unwrap();
     let err = p.validate().unwrap_err();

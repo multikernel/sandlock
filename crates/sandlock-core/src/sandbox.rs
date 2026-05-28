@@ -159,7 +159,6 @@ impl TryFrom<&Sandbox> for Confinement {
 pub enum FsIsolation {
     #[default]
     None,
-    OverlayFs,
     BranchFs,
 }
 
@@ -1144,7 +1143,7 @@ impl Sandbox {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use crate::error::SandboxRuntimeError;
         use crate::context::{PipePair, read_u32_fd};
-        use crate::cow::{CowBranch, overlayfs::OverlayBranch, branchfs::BranchFsBranch};
+        use crate::cow::{CowBranch, branchfs::BranchFsBranch};
         use crate::network;
         use crate::seccomp::ctx::SupervisorCtx;
         use crate::seccomp::notif::{self, NotifPolicy};
@@ -1196,18 +1195,6 @@ impl Sandbox {
         }
 
         let cow_branch: Option<Box<dyn CowBranch>> = match self.fs_isolation {
-            FsIsolation::OverlayFs => {
-                let workdir = self.workdir.as_ref()
-                    .ok_or_else(|| crate::error::SandlockError::Runtime(SandboxRuntimeError::Child("OverlayFs requires workdir".into())))?;
-                let storage = self.fs_storage.as_ref()
-                    .cloned()
-                    .unwrap_or_else(|| std::env::temp_dir().join("sandlock-overlay"));
-                std::fs::create_dir_all(&storage)
-                    .map_err(|e| crate::error::SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
-                let branch = OverlayBranch::create(workdir, &storage)
-                    .map_err(|e| crate::error::SandlockError::Runtime(SandboxRuntimeError::Branch(e)))?;
-                Some(Box::new(branch))
-            }
             FsIsolation::BranchFs => {
                 let workdir = self.workdir.as_ref()
                     .ok_or_else(|| crate::error::SandlockError::Runtime(SandboxRuntimeError::Child("BranchFs requires workdir".into())))?;
@@ -1217,8 +1204,6 @@ impl Sandbox {
             }
             FsIsolation::None => None,
         };
-
-        let cow_config = cow_branch.as_ref().and_then(|b| b.child_mount_config());
 
         // Seccomp COW: create the branch before fork so the child's Landlock
         // ruleset can include the upper layer. Binaries created inside the
@@ -1314,7 +1299,6 @@ impl Sandbox {
                 sandbox: self,
                 cmd: &c_cmd,
                 pipes: &pipes,
-                cow_config: cow_config.as_ref(),
                 no_supervisor,
                 keep_fds: &gather_keep_fds,
                 sandbox_name: Some(sandbox_name.as_str()),

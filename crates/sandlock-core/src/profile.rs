@@ -66,7 +66,7 @@ pub struct FilesystemSection {
     pub read: Vec<PathBuf>,
     pub write: Vec<PathBuf>,
     pub deny: Vec<PathBuf>,
-    /// One of `"none"`, `"overlayfs"`, `"branchfs"`. Maps to `Sandbox::fs_isolation`.
+    /// One of `"none"`, `"branchfs"`. Maps to `Sandbox::fs_isolation`.
     pub isolation: Option<String>,
     pub chroot: Option<PathBuf>,
     /// Each entry has the form `"VIRTUAL:HOST"`, matching `--fs-mount` syntax.
@@ -210,10 +210,9 @@ fn parse_fs_isolation(s: &str) -> Result<crate::sandbox::FsIsolation, SandlockEr
     use crate::sandbox::FsIsolation;
     Ok(match s {
         "none"      => FsIsolation::None,
-        "overlayfs" => FsIsolation::OverlayFs,
         "branchfs"  => FsIsolation::BranchFs,
         other       => return Err(SandlockError::Sandbox(SandboxError::Invalid(
-            format!("invalid fs isolation {other:?}; expected \"none\" | \"overlayfs\" | \"branchfs\""),
+            format!("invalid fs isolation {other:?}; expected \"none\" | \"branchfs\""),
         ))),
     })
 }
@@ -420,7 +419,7 @@ mod tests {
             read      = ["/usr", "/etc/redis"]
             write     = ["/var/lib/redis/state"]
             deny      = ["/proc/sys"]
-            isolation = "overlayfs"
+            isolation = "branchfs"
             chroot    = "/var/lib/redis-rootfs"
             mount     = ["/data:/srv/redis-data"]
             on_exit   = "commit"
@@ -509,12 +508,12 @@ mod tests {
     }
 
     #[test]
-    fn isolation_overlayfs_without_workdir_is_error() {
+    fn isolation_branchfs_without_workdir_is_error() {
         let toml = r#"
             [program]
             exec = "/bin/true"
             [filesystem]
-            isolation = "overlayfs"
+            isolation = "branchfs"
         "#;
         let err = parse_profile(toml).unwrap_err();
         let msg = format!("{err}");
@@ -536,14 +535,14 @@ mod tests {
     }
 
     #[test]
-    fn isolation_overlayfs_with_workdir_is_ok() {
+    fn isolation_branchfs_with_workdir_is_ok() {
         let toml = r#"
             [program]
             exec = "/bin/true"
             [config]
             workdir = "/tmp/wd"
             [filesystem]
-            isolation = "overlayfs"
+            isolation = "branchfs"
         "#;
         let (_p, _s) = parse_profile(toml).unwrap();
     }
