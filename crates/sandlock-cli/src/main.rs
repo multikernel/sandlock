@@ -105,8 +105,12 @@ struct RunArgs {
     #[arg(short = 'i', long)]
     interactive: bool,
 
-    /// Use a local Docker image as chroot rootfs
-    #[arg(long)]
+    /// Use a local Docker image as chroot rootfs, given by reference
+    /// (e.g. `python:3.12-slim`, a digest, or an image id). The image
+    /// must already be present in local Docker storage; sandlock never
+    /// pulls from a registry. Requires a running Docker daemon and an
+    /// accessible socket; the run fails early if neither is reachable.
+    #[arg(long, value_name = "IMAGE")]
     image: Option<String>,
 
     /// Dry-run: run the command, show filesystem changes, then discard
@@ -429,13 +433,13 @@ async fn run_command(args: RunArgs) -> Result<i32> {
     // the shared image cache directly.
     let image_cmd: Option<Vec<String>>;
     if let Some(ref img) = args.image {
-        let rootfs = sandlock_core::image::extract(img, None)?;
+        let rootfs = sandlock_core::image::extract(img, None).await?;
         builder = builder.chroot(&rootfs).fs_read("/");
         if pb.workdir.is_none() {
             builder = builder.workdir(&rootfs);
         }
         if args.cmd.is_empty() {
-            image_cmd = Some(sandlock_core::image::inspect_cmd(img)?);
+            image_cmd = Some(sandlock_core::image::inspect_cmd(img).await?);
         } else {
             image_cmd = None;
         }
