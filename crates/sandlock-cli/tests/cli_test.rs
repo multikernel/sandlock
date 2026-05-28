@@ -214,3 +214,46 @@ fn test_no_supervisor_exit_code() {
     assert_eq!(output.status.code(), Some(42));
 }
 
+/// Regression: `Sandbox::Drop` must run when the CLI exits.
+///
+/// When `--workdir` is set, seccomp COW stages writes in an upper layer
+/// and only copies them back to the workdir on commit, which runs in
+/// `Sandbox::Drop`. A previous version of the CLI called
+/// `std::process::exit(...)` from inside the function that owned the
+/// `Sandbox`, which skipped destructors entirely. Result: the file
+/// stayed orphaned in `/tmp/sandlock-cow-*/upper/` and never appeared
+/// in the workdir, even though the default `on_exit` is `commit`.
+#[test]
+fn test_cow_commit_runs_on_cli_exit() {
+    let workdir = tempfile::tempdir().expect("tempdir");
+    let sentinel = workdir.path().join("sentinel.txt");
+    assert!(!sentinel.exists(), "precondition: sentinel should not exist");
+
+    let cmd = format!("echo committed > {}", sentinel.display());
+    let output = sandlock_bin()
+        .args([
+            "run",
+            "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "-r", "/etc",
+            "-w", workdir.path().to_str().unwrap(),
+            "--workdir", workdir.path().to_str().unwrap(),
+            "--", "sh", "-c", &cmd,
+        ])
+        .output()
+        .expect("failed to run sandlock");
+    assert!(
+        output.status.success(),
+        "sandlock exit={:?}, stderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    assert!(
+        sentinel.exists(),
+        "COW commit did not run on CLI exit: {} missing. \
+         Was process::exit called instead of returning the exit code?",
+        sentinel.display(),
+    );
+    let contents = std::fs::read_to_string(&sentinel).unwrap_or_default();
+    assert_eq!(contents.trim(), "committed");
+}
+

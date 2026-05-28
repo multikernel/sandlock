@@ -136,7 +136,10 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Run(args) => run_command(args).await?,
+        Command::Run(args) => {
+            let code = run_command(args).await?;
+            std::process::exit(code);
+        }
 
         Command::List => {
             match network_registry::list() {
@@ -244,7 +247,10 @@ async fn main() -> Result<()> {
 }
 
 /// Implementation of `sandlock run`.
-async fn run_command(args: RunArgs) -> Result<()> {
+/// Returns the desired process exit code; the caller does
+/// `process::exit`. Calling `process::exit` here would bypass
+/// `Sandbox::Drop`, which is where COW commit/abort runs.
+async fn run_command(args: RunArgs) -> Result<i32> {
     let pb = &args.sandbox_builder;
 
     // `--no-supervisor` reaches the same `Sandbox::run` path as everything
@@ -480,13 +486,16 @@ async fn run_command(args: RunArgs) -> Result<()> {
             return Err(anyhow!("--dry-run requires --workdir"));
         }
         let dr = if let Some(secs) = args.timeout {
-            tokio::time::timeout(
+            match tokio::time::timeout(
                 std::time::Duration::from_secs(secs),
-                policy.dry_run_interactive(&cmd_strs)
-            ).await.unwrap_or_else(|_| {
-                eprintln!("sandlock: timeout after {}s", secs);
-                std::process::exit(124);
-            })?
+                policy.dry_run_interactive(&cmd_strs),
+            ).await {
+                Ok(r) => r?,
+                Err(_) => {
+                    eprintln!("sandlock: timeout after {}s", secs);
+                    return Ok(124);
+                }
+            }
         } else {
             policy.dry_run_interactive(&cmd_strs).await?
         };
@@ -529,13 +538,13 @@ async fn run_command(args: RunArgs) -> Result<()> {
         let result = if let Some(secs) = args.timeout {
             match tokio::time::timeout(
                 std::time::Duration::from_secs(secs),
-                policy.wait()
+                policy.wait(),
             ).await {
                 Ok(r) => r?,
                 Err(_) => {
                     let _ = network_registry::unregister(&sandbox_name);
                     eprintln!("sandlock: timeout after {}s", secs);
-                    std::process::exit(124);
+                    return Ok(124);
                 }
             }
         } else {
@@ -544,13 +553,16 @@ async fn run_command(args: RunArgs) -> Result<()> {
         let _ = network_registry::unregister(&sandbox_name);
         result
     } else if let Some(secs) = args.timeout {
-        tokio::time::timeout(
+        match tokio::time::timeout(
             std::time::Duration::from_secs(secs),
-            policy.run_interactive(&cmd_strs)
-        ).await.unwrap_or_else(|_| {
-            eprintln!("sandlock: timeout after {}s", secs);
-            std::process::exit(124);
-        })?
+            policy.run_interactive(&cmd_strs),
+        ).await {
+            Ok(r) => r?,
+            Err(_) => {
+                eprintln!("sandlock: timeout after {}s", secs);
+                return Ok(124);
+            }
+        }
     } else {
         policy.run_interactive(&cmd_strs).await?
     };
@@ -573,7 +585,7 @@ async fn run_command(args: RunArgs) -> Result<()> {
         }
     }
 
-    std::process::exit(result.code().unwrap_or(1));
+    Ok(result.code().unwrap_or(1))
 }
 
 /// Validate that no flags incompatible with --no-supervisor are set.
