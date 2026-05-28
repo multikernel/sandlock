@@ -63,6 +63,16 @@ struct RunArgs {
     #[arg(long = "fs-mount", value_name = "VIRTUAL:HOST")]
     fs_mount: Vec<String>,
 
+    /// COW branch action on normal sandbox exit: commit | abort | keep
+    /// (default: commit).
+    #[arg(long = "on-exit", value_name = "ACTION")]
+    on_exit: Option<String>,
+
+    /// COW branch action on sandbox error: commit | abort | keep
+    /// (default: abort).
+    #[arg(long = "on-error", value_name = "ACTION")]
+    on_error: Option<String>,
+
     #[arg(long = "env", value_name = "KEY=VALUE")]
     env_vars: Vec<String>,
 
@@ -405,6 +415,12 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         builder = builder.fs_isolation(iso);
     }
     if let Some(ref s) = args.max_disk { builder = builder.max_disk(ByteSize::parse(s)?); }
+    if let Some(ref s) = args.on_exit {
+        builder = builder.on_exit(parse_branch_action("--on-exit", s)?);
+    }
+    if let Some(ref s) = args.on_error {
+        builder = builder.on_error(parse_branch_action("--on-error", s)?);
+    }
     for spec in &args.fs_mount {
         let (virt, host) = spec.split_once(':')
             .ok_or_else(|| anyhow!("--fs-mount requires VIRTUAL:HOST, got: {}", spec))?;
@@ -721,4 +737,13 @@ fn parse_time_start(s: &str) -> Result<SystemTime> {
     let ts: jiff::Timestamp = s.parse()
         .map_err(|e| anyhow!("invalid --time-start '{}': {}", s, e))?;
     Ok(ts.into())
+}
+
+fn parse_branch_action(flag: &str, s: &str) -> Result<BranchAction> {
+    match s {
+        "commit" => Ok(BranchAction::Commit),
+        "abort"  => Ok(BranchAction::Abort),
+        "keep"   => Ok(BranchAction::Keep),
+        other    => Err(anyhow!("invalid {} value '{}': expected commit | abort | keep", flag, other)),
+    }
 }
