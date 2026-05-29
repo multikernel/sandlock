@@ -640,6 +640,81 @@ mod tests {
         assert_eq!(&gtod[48..52], &0x0000_8067u32.to_le_bytes(), "ret");
     }
 
+    /// Execute the generated `clock_gettime` offset stub as real machine code:
+    /// map it executable, call it through the `clock_gettime(clockid, *timespec)`
+    /// ABI, and confirm CLOCK_REALTIME comes back shifted by exactly the embedded
+    /// offset while CLOCK_MONOTONIC is left untouched. Unlike the layout tests
+    /// above, this proves the hand-assembled encoding (syscall, clockid branches,
+    /// PC-relative offset load, tv_sec add) actually runs correctly on hardware.
+    /// Needs no sandbox/Landlock, so it is runnable on any kernel.
+    #[test]
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+    fn offset_stub_clock_gettime_executes_and_shifts_realtime() {
+        use std::ptr;
+
+        const OFFSET: i64 = -86_400; // one day back
+        const PAGE: usize = 4096;
+        let stub = offset_stub_clock_gettime(OFFSET);
+        assert!(stub.len() <= PAGE);
+
+        // Map writable, copy the stub, then flip to read+exec (W^X friendly).
+        let page = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                PAGE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(page, libc::MAP_FAILED, "mmap exec page");
+        unsafe {
+            ptr::copy_nonoverlapping(stub.as_ptr(), page as *mut u8, stub.len());
+            assert_eq!(
+                libc::mprotect(page, PAGE, libc::PROT_READ | libc::PROT_EXEC),
+                0,
+                "mprotect r-x"
+            );
+        }
+        // On riscv64 instruction fetch is not coherent with the stores above
+        // until a FENCE.I retires on this hart (x86_64 caches are coherent).
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            std::arch::asm!("fence.i");
+        }
+
+        let stub_fn: extern "C" fn(libc::clockid_t, *mut libc::timespec) -> libc::c_int =
+            unsafe { std::mem::transmute(page) };
+
+        // CLOCK_REALTIME (0): stub time must equal real time + OFFSET.
+        let mut real = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        let mut stubbed = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        assert_eq!(unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut real) }, 0);
+        assert_eq!(stub_fn(libc::CLOCK_REALTIME, &mut stubbed), 0, "stub returns 0");
+        let shift = real.tv_sec - stubbed.tv_sec; // real - (real + OFFSET) = -OFFSET
+        assert!(
+            (shift - (-OFFSET)).abs() <= 2,
+            "CLOCK_REALTIME should be shifted by {OFFSET}s, observed real-stub={shift}s"
+        );
+
+        // CLOCK_MONOTONIC (1): not in {0,5}, so the stub must leave it unshifted.
+        let mut mono_stub = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        let mut mono_real = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        assert_eq!(stub_fn(libc::CLOCK_MONOTONIC, &mut mono_stub), 0);
+        assert_eq!(unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut mono_real) }, 0);
+        assert!(
+            (mono_real.tv_sec - mono_stub.tv_sec).abs() <= 2,
+            "CLOCK_MONOTONIC must be unshifted, stub={} real={}",
+            mono_stub.tv_sec,
+            mono_real.tv_sec
+        );
+
+        unsafe {
+            libc::munmap(page, PAGE);
+        }
+    }
+
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn test_offset_stub_contains_offset() {
