@@ -207,7 +207,9 @@ fn offset_stub_clock_gettime(offset_secs: i64) -> Vec<u8> {
 }
 
 /// Generate an offset stub for gettimeofday that forces a real syscall,
-/// then adds a time offset to tv_sec.
+/// then adds a time offset to tv_sec. For `gettimeofday(tv, tz)` the output
+/// `timeval*` is the FIRST arg (rdi); rsi is `timezone*`. (Contrast with
+/// clock_gettime, whose output `timespec*` is the second arg, rsi.)
 #[cfg(target_arch = "x86_64")]
 fn offset_stub_gettimeofday(offset_secs: i64) -> Vec<u8> {
     let mut stub = Vec::new();
@@ -215,9 +217,11 @@ fn offset_stub_gettimeofday(offset_secs: i64) -> Vec<u8> {
     stub.extend_from_slice(&[0xB8, 0x60, 0x00, 0x00, 0x00]); // mov eax, 96
     stub.extend_from_slice(&[0x0F, 0x05]); // syscall
     stub.extend_from_slice(&[0x5E, 0x5F]); // pop rsi, pop rdi
+    stub.extend_from_slice(&[0x48, 0x85, 0xFF]); // test rdi, rdi (timeval* == NULL?)
+    stub.extend_from_slice(&[0x74, 0x0D]); // je +13 -> ret (skip movabs(10)+add(3))
     stub.extend_from_slice(&[0x48, 0xB9]); // movabs rcx, imm64
     stub.extend_from_slice(&offset_secs.to_le_bytes());
-    stub.extend_from_slice(&[0x48, 0x01, 0x0E]); // add [rsi], rcx (tv_sec)
+    stub.extend_from_slice(&[0x48, 0x01, 0x0F]); // add [rdi], rcx (tv_sec)
     stub.push(0xC3); // ret
     stub
 }
@@ -640,28 +644,22 @@ mod tests {
         assert_eq!(&gtod[48..52], &0x0000_8067u32.to_le_bytes(), "ret");
     }
 
-    /// Execute the generated `clock_gettime` offset stub as real machine code:
-    /// map it executable, call it through the `clock_gettime(clockid, *timespec)`
-    /// ABI, and confirm CLOCK_REALTIME comes back shifted by exactly the embedded
-    /// offset while CLOCK_MONOTONIC is left untouched. Unlike the layout tests
-    /// above, this proves the hand-assembled encoding (syscall, clockid branches,
-    /// PC-relative offset load, tv_sec add) actually runs correctly on hardware.
-    /// Needs no sandbox/Landlock, so it is runnable on any kernel.
-    #[test]
     #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
-    fn offset_stub_clock_gettime_executes_and_shifts_realtime() {
+    const EXEC_PAGE: usize = 4096;
+
+    /// Map `code` into a fresh page, written then flipped to `PROT_READ|PROT_EXEC`
+    /// (W^X-friendly), and return the page pointer. On riscv64 a `fence.i` is issued
+    /// so the just-written instructions are fetchable on this hart (x86_64 caches
+    /// are coherent). Caller transmutes the pointer to the right fn type and frees
+    /// it with `libc::munmap(page, EXEC_PAGE)`.
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+    fn map_executable(code: &[u8]) -> *mut libc::c_void {
         use std::ptr;
-
-        const OFFSET: i64 = -86_400; // one day back
-        const PAGE: usize = 4096;
-        let stub = offset_stub_clock_gettime(OFFSET);
-        assert!(stub.len() <= PAGE);
-
-        // Map writable, copy the stub, then flip to read+exec (W^X friendly).
+        assert!(code.len() <= EXEC_PAGE);
         let page = unsafe {
             libc::mmap(
                 ptr::null_mut(),
-                PAGE,
+                EXEC_PAGE,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
                 -1,
@@ -670,20 +668,33 @@ mod tests {
         };
         assert_ne!(page, libc::MAP_FAILED, "mmap exec page");
         unsafe {
-            ptr::copy_nonoverlapping(stub.as_ptr(), page as *mut u8, stub.len());
+            ptr::copy_nonoverlapping(code.as_ptr(), page as *mut u8, code.len());
             assert_eq!(
-                libc::mprotect(page, PAGE, libc::PROT_READ | libc::PROT_EXEC),
+                libc::mprotect(page, EXEC_PAGE, libc::PROT_READ | libc::PROT_EXEC),
                 0,
                 "mprotect r-x"
             );
         }
-        // On riscv64 instruction fetch is not coherent with the stores above
-        // until a FENCE.I retires on this hart (x86_64 caches are coherent).
+        // riscv64 instruction fetch is not coherent with the stores above until a
+        // FENCE.I retires on this hart.
         #[cfg(target_arch = "riscv64")]
         unsafe {
             std::arch::asm!("fence.i");
         }
+        page
+    }
 
+    /// Execute the generated `clock_gettime` offset stub as real machine code and
+    /// confirm CLOCK_REALTIME comes back shifted by exactly the embedded offset
+    /// while CLOCK_MONOTONIC is left untouched. Unlike the layout tests above, this
+    /// proves the hand-assembled encoding (syscall, clockid branches, PC-relative
+    /// offset load, tv_sec add) actually runs correctly on hardware. Needs no
+    /// sandbox/Landlock, so it runs on any kernel.
+    #[test]
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+    fn offset_stub_clock_gettime_executes_and_shifts_realtime() {
+        const OFFSET: i64 = -86_400; // one day back
+        let page = map_executable(&offset_stub_clock_gettime(OFFSET));
         let stub_fn: extern "C" fn(libc::clockid_t, *mut libc::timespec) -> libc::c_int =
             unsafe { std::mem::transmute(page) };
 
@@ -711,7 +722,43 @@ mod tests {
         );
 
         unsafe {
-            libc::munmap(page, PAGE);
+            libc::munmap(page, EXEC_PAGE);
+        }
+    }
+
+    /// Execute the generated `gettimeofday` offset stub as real machine code:
+    /// confirm a non-NULL `timeval` comes back shifted by the embedded offset, and
+    /// that a NULL `timeval` takes the stub's NULL branch (returns 0, no store, no
+    /// fault). Runs on any kernel (no sandbox/Landlock).
+    #[test]
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+    fn offset_stub_gettimeofday_executes_and_shifts_tv_sec() {
+        const OFFSET: i64 = -86_400; // one day back
+        let page = map_executable(&offset_stub_gettimeofday(OFFSET));
+        let stub_fn: extern "C" fn(*mut libc::timeval, *mut libc::c_void) -> libc::c_int =
+            unsafe { std::mem::transmute(page) };
+
+        // Non-NULL timeval: tv_sec must be shifted by OFFSET.
+        let mut real = libc::timeval { tv_sec: 0, tv_usec: 0 };
+        let mut stubbed = libc::timeval { tv_sec: 0, tv_usec: 0 };
+        assert_eq!(unsafe { libc::gettimeofday(&mut real, std::ptr::null_mut()) }, 0);
+        assert_eq!(stub_fn(&mut stubbed, std::ptr::null_mut()), 0, "stub returns 0");
+        let shift = real.tv_sec - stubbed.tv_sec; // real - (real + OFFSET) = -OFFSET
+        assert!(
+            (shift - (-OFFSET)).abs() <= 2,
+            "gettimeofday tv_sec should be shifted by {OFFSET}s, observed real-stub={shift}s"
+        );
+
+        // NULL timeval: the stub must take its NULL branch — return 0 without
+        // dereferencing the pointer. A mis-encoded branch would SIGSEGV here.
+        assert_eq!(
+            stub_fn(std::ptr::null_mut(), std::ptr::null_mut()),
+            0,
+            "NULL timeval handled without fault"
+        );
+
+        unsafe {
+            libc::munmap(page, EXEC_PAGE);
         }
     }
 
