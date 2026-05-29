@@ -798,13 +798,19 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
-    unsafe fn caller_wait_then_raw_fork(flags: *mut i32) -> ! {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))]
+    unsafe fn caller_wait_then_fork(flags: *mut i32) -> ! {
         while ptr::read_volatile(flags.offset(GO)) == 0 {
             core::hint::spin_loop();
         }
 
+        // x86_64 has a real fork(2) syscall; generic-ABI arches (aarch64, riscv64)
+        // have none, so glibc fork() emulates it via clone(SIGCHLD). Either way the
+        // kernel reports a PTRACE_EVENT_{FORK,CLONE}, which is what we track.
+        #[cfg(target_arch = "x86_64")]
         let pid = libc::syscall(libc::SYS_fork) as i32;
+        #[cfg(not(target_arch = "x86_64"))]
+        let pid = libc::fork();
         if pid == 0 {
             ptr::write_volatile(flags.offset(CHILD_RAN), 1);
             while ptr::read_volatile(flags.offset(DONE)) == 0 {
@@ -822,7 +828,7 @@ mod tests {
         libc::_exit(1);
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))]
     #[test]
     fn process_creation_tracking_registers_child_before_user_code_runs() {
         let flags = SharedFlags::new();
@@ -831,7 +837,7 @@ mod tests {
         let caller = unsafe { libc::fork() };
         assert!(caller >= 0, "fork caller");
         if caller == 0 {
-            unsafe { caller_wait_then_raw_fork(flags.ptr) };
+            unsafe { caller_wait_then_fork(flags.ptr) };
         }
         let mut caller_guard = CallerGuard::new(caller, &flags);
 
@@ -869,7 +875,7 @@ mod tests {
         let created = rt
             .block_on(finish_process_creation_tracking(&ctx, trace))
             .expect("finish process-creation tracking");
-        assert!(created, "raw fork should produce a ptrace fork event");
+        assert!(created, "fork/clone should produce a ptrace process-creation event");
 
         let registered_pid = flags.read(REGISTERED_PID);
         assert!(registered_pid > 0, "child pid should be captured by hook");
@@ -887,7 +893,7 @@ mod tests {
         let mut status = 0;
         let waited = unsafe { libc::waitpid(caller, &mut status, 0) };
         assert_eq!(waited, caller, "wait caller");
-        assert_eq!(flags.read(FORK_FAILED), 0, "raw fork failed in caller");
+        assert_eq!(flags.read(FORK_FAILED), 0, "fork in caller failed");
         caller_guard.disarm();
     }
 }

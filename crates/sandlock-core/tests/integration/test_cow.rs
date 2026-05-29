@@ -252,7 +252,8 @@ async fn test_seccomp_cow_chdir_to_created_dir() {
 /// (dirfd=args[0], path=args[1], flags=args[2]), but open() uses
 /// (path=args[0], flags=args[1], mode=args[2]). This caused COW to miss
 /// all legacy open() calls on x86_64, falling through to the kernel. ARM64
-/// does not provide SYS_open, so it uses the equivalent raw openat ABI.
+/// and riscv64 do not provide SYS_open, so they use the equivalent raw
+/// openat ABI.
 #[tokio::test]
 async fn test_seccomp_cow_legacy_open_syscall() {
     let workdir = temp_dir("seccomp-legacy-open");
@@ -271,14 +272,14 @@ async fn test_seccomp_cow_legacy_open_syscall() {
         .unwrap();
 
     // Use raw syscall ABI to create a file, then verify it's visible during
-    // the run but discarded on abort. x86_64 uses legacy SYS_open; ARM64 uses
-    // the equivalent openat(AT_FDCWD, ...) ABI.
+    // the run but discarded on abort. x86_64 uses legacy SYS_open; ARM64 and
+    // riscv64 use the equivalent openat(AT_FDCWD, ...) ABI.
     let script = format!(concat!(
         "import ctypes, os, platform\n",
         "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
         "O_WRONLY = 1; O_CREAT = 64; O_TRUNC = 512\n",
         "path = b'{wd}/newfile.txt'\n",
-        "if platform.machine() == 'aarch64':\n",
+        "if platform.machine() in ('aarch64', 'riscv64'):\n",
         "    fd = libc.syscall(56, -100, path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)\n",
         "else:\n",
         "    fd = libc.syscall(2, path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)\n",
@@ -338,7 +339,7 @@ async fn test_seccomp_cow_excl_after_unlink() {
         "    open('{out}', 'w').write(f'UNLINK_FAILED:{{ctypes.get_errno()}}')\n",
         "    raise SystemExit(1)\n",
         "O_WRONLY = 1; O_CREAT = 64; O_EXCL = 128\n",
-        "if platform.machine() == 'aarch64':\n",
+        "if platform.machine() in ('aarch64', 'riscv64'):\n",
         "    fd = libc.syscall(56, -100, path, O_WRONLY | O_CREAT | O_EXCL, 0o644)\n",
         "else:\n",
         "    fd = libc.syscall(2, path, O_WRONLY | O_CREAT | O_EXCL, 0o644)\n",

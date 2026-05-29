@@ -137,7 +137,38 @@ fn ptrace_getregs(pid: i32) -> io::Result<Vec<u64>> {
         Ok(regs)
     }
 
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(target_arch = "riscv64")]
+    {
+        // Linux riscv64 exposes general-purpose registers through
+        // PTRACE_GETREGSET/NT_PRSTATUS. struct user_regs_struct is:
+        // pc, ra, sp, gp, tp, t0-t2, s0-s1, a0-a7, s2-s11, t3-t6
+        // (32 u64 values; x0 is hardwired zero and not stored).
+        const NT_PRSTATUS: libc::c_int = 1;
+        let mut regs = vec![0u64; 32];
+        let mut iov = libc::iovec {
+            iov_base: regs.as_mut_ptr() as *mut libc::c_void,
+            iov_len: regs.len() * std::mem::size_of::<u64>(),
+        };
+        let ret = unsafe {
+            libc::ptrace(
+                libc::PTRACE_GETREGSET,
+                pid,
+                NT_PRSTATUS as usize as *mut libc::c_void,
+                &mut iov as *mut libc::iovec as *mut libc::c_void,
+            )
+        };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        regs.truncate(iov.iov_len / std::mem::size_of::<u64>());
+        Ok(regs)
+    }
+
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )))]
     {
         let _ = pid;
         Err(io::Error::new(
@@ -615,5 +646,102 @@ impl Checkpoint {
             cow_snapshot: meta.cow_snapshot.map(PathBuf::from),
             app_state,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    /// `ptrace_getregs` captures a full register file with a plausible,
+    /// non-zero program counter from a live, seized child on the host
+    /// architecture. This exercises the architecture-specific register
+    /// capture path without requiring a full sandbox launch (no Landlock).
+    #[test]
+    fn ptrace_getregs_captures_program_counter() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep child");
+        let pid = child.id() as i32;
+
+        let result = (|| -> io::Result<Vec<u64>> {
+            ptrace_seize(pid)?;
+            let regs = ptrace_getregs(pid)?;
+            ptrace_detach(pid)?;
+            Ok(regs)
+        })();
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let regs = result.expect("register capture should succeed on this architecture");
+
+        // Architecture-specific register-file width.
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(regs.len(), 27, "x86_64 user_regs_struct is 27 u64");
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(regs.len(), 34, "aarch64 user_pt_regs is 34 u64");
+        #[cfg(target_arch = "riscv64")]
+        assert_eq!(regs.len(), 32, "riscv64 user_regs_struct is 32 u64");
+
+        // The program counter must be a non-zero userspace address; its index
+        // into the register file differs per architecture.
+        #[cfg(target_arch = "x86_64")]
+        let pc = regs[16]; // rip
+        #[cfg(target_arch = "aarch64")]
+        let pc = regs[32]; // pc, after x0-x30 and sp
+        #[cfg(target_arch = "riscv64")]
+        let pc = regs[0]; // pc is first in riscv user_regs_struct
+
+        #[cfg(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        ))]
+        assert!(pc != 0, "captured program counter should be non-zero, got {:#x}", pc);
+    }
+
+    /// Full capture -> save -> load roundtrip against a live child. `capture()`
+    /// only ptraces and reads `/proc`, so this exercises the architecture-specific
+    /// register arm plus the on-disk save/load format end to end WITHOUT a sandbox
+    /// launch (no Landlock) — the coverage the sandbox-launch integration test
+    /// cannot provide on kernels below the required Landlock ABI.
+    #[test]
+    fn capture_save_load_roundtrips() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep child");
+        let pid = child.id() as i32;
+
+        let policy = Sandbox::builder().build().expect("build policy");
+        let captured = capture(pid, &policy);
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let cp = captured.expect("capture should succeed on this architecture");
+        assert!(!cp.process_state.regs.is_empty(), "captured registers");
+        assert!(!cp.process_state.memory_maps.is_empty(), "captured memory maps");
+        assert!(!cp.fd_table.is_empty(), "captured fd table");
+
+        // Save to a temp dir, load it back, and confirm the round-trip is faithful.
+        let dir = std::env::temp_dir()
+            .join(format!("sandlock-cp-roundtrip-{}", std::process::id()));
+        cp.save(&dir).expect("save checkpoint");
+        let loaded = Checkpoint::load(&dir).expect("load checkpoint");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(loaded.process_state.regs, cp.process_state.regs, "regs roundtrip");
+        assert_eq!(
+            loaded.process_state.memory_data.len(),
+            cp.process_state.memory_data.len(),
+            "memory segment count roundtrip"
+        );
+        assert_eq!(loaded.fd_table.len(), cp.fd_table.len(), "fd count roundtrip");
+        assert_eq!(loaded.process_state.pid, cp.process_state.pid, "pid roundtrip");
+        assert!(!loaded.process_state.exe.is_empty(), "exe path captured");
     }
 }

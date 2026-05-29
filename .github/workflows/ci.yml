@@ -32,6 +32,32 @@ jobs:
       - name: Run integration tests
         run: cargo test --release --test integration -- --test-threads=1
 
+  rust-riscv64-cross:
+    name: Rust cross-build (riscv64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (riscv64 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: riscv64gc-unknown-linux-gnu
+
+      - name: Install riscv64 cross toolchain
+        run: sudo apt-get update && sudo apt-get install -y gcc-riscv64-linux-gnu
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      # Build-only: GitHub has no riscv64 runner, and seccomp/Landlock do not
+      # emulate faithfully under qemu-user, so the suite runs on a real riscv64
+      # host instead. This guards the port against compile regressions.
+      - name: Cross-build
+        env:
+          CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER: riscv64-linux-gnu-gcc
+          CC_riscv64gc_unknown_linux_gnu: riscv64-linux-gnu-gcc
+        run: cargo build --release --target riscv64gc-unknown-linux-gnu
+
   python:
     name: Python tests (${{ matrix.runner }}, py${{ matrix.python-version }})
     runs-on: ${{ matrix.runner }}

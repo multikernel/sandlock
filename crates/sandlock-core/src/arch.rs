@@ -84,6 +84,48 @@ mod imp {
     ];
 }
 
+#[cfg(target_arch = "riscv64")]
+mod imp {
+    // AUDIT_ARCH_RISCV64 = EM_RISCV(243) | __AUDIT_ARCH_64BIT | __AUDIT_ARCH_LE.
+    pub const AUDIT_ARCH: u32 = 0xC000_00F3;
+    pub const MAX_SYSCALL_NR: i64 = 463;
+    pub const SYS_SECCOMP: i64 = 277;
+    pub const SYS_MEMFD_CREATE: i64 = 279;
+    pub const SYS_PIDFD_OPEN: i64 = 434;
+    pub const SYS_PIDFD_GETFD: i64 = 438;
+    pub const SYS_OPENAT2: i64 = 437;
+
+    // riscv64 uses the generic syscall ABI: no legacy open/stat/fork/etc.
+    pub const SYS_OPEN: Option<i64> = None;
+    pub const SYS_STAT: Option<i64> = None;
+    pub const SYS_LSTAT: Option<i64> = None;
+    pub const SYS_ACCESS: Option<i64> = None;
+    pub const SYS_READLINK: Option<i64> = None;
+    pub const SYS_GETDENTS: Option<i64> = None;
+    pub const SYS_UNLINK: Option<i64> = None;
+    pub const SYS_RMDIR: Option<i64> = None;
+    pub const SYS_MKDIR: Option<i64> = None;
+    pub const SYS_RENAME: Option<i64> = None;
+    pub const SYS_SYMLINK: Option<i64> = None;
+    pub const SYS_LINK: Option<i64> = None;
+    pub const SYS_CHMOD: Option<i64> = None;
+    pub const SYS_CHOWN: Option<i64> = None;
+    pub const SYS_LCHOWN: Option<i64> = None;
+    pub const SYS_VFORK: Option<i64> = None;
+    pub const SYS_FUTIMESAT: Option<i64> = None;
+    pub const SYS_FORK: Option<i64> = None;
+    pub const SYS_IOPERM: Option<i64> = None;
+    pub const SYS_IOPL: Option<i64> = None;
+    pub const SYS_TIME: Option<i64> = None;
+
+    /// Every syscall the kernel will dispatch through `handle_fork`.
+    /// riscv64 has no `fork`/`vfork` (glibc emulates via `clone`).
+    pub const FORK_LIKE_SYSCALLS: &[i64] = &[
+        libc::SYS_clone,
+        libc::SYS_clone3,
+    ];
+}
+
 pub use imp::*;
 
 /// True if `nr` is plausibly a syscall number on the current architecture.
