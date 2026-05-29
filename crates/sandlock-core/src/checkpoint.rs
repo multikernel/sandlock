@@ -702,4 +702,46 @@ mod tests {
         ))]
         assert!(pc != 0, "captured program counter should be non-zero, got {:#x}", pc);
     }
+
+    /// Full capture -> save -> load roundtrip against a live child. `capture()`
+    /// only ptraces and reads `/proc`, so this exercises the architecture-specific
+    /// register arm plus the on-disk save/load format end to end WITHOUT a sandbox
+    /// launch (no Landlock) — the coverage the sandbox-launch integration test
+    /// cannot provide on kernels below the required Landlock ABI.
+    #[test]
+    fn capture_save_load_roundtrips() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep child");
+        let pid = child.id() as i32;
+
+        let policy = Sandbox::builder().build().expect("build policy");
+        let captured = capture(pid, &policy);
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let cp = captured.expect("capture should succeed on this architecture");
+        assert!(!cp.process_state.regs.is_empty(), "captured registers");
+        assert!(!cp.process_state.memory_maps.is_empty(), "captured memory maps");
+        assert!(!cp.fd_table.is_empty(), "captured fd table");
+
+        // Save to a temp dir, load it back, and confirm the round-trip is faithful.
+        let dir = std::env::temp_dir()
+            .join(format!("sandlock-cp-roundtrip-{}", std::process::id()));
+        cp.save(&dir).expect("save checkpoint");
+        let loaded = Checkpoint::load(&dir).expect("load checkpoint");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(loaded.process_state.regs, cp.process_state.regs, "regs roundtrip");
+        assert_eq!(
+            loaded.process_state.memory_data.len(),
+            cp.process_state.memory_data.len(),
+            "memory segment count roundtrip"
+        );
+        assert_eq!(loaded.fd_table.len(), cp.fd_table.len(), "fd count roundtrip");
+        assert_eq!(loaded.process_state.pid, cp.process_state.pid, "pid roundtrip");
+        assert!(!loaded.process_state.exe.is_empty(), "exe path captured");
+    }
 }
