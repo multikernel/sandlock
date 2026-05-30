@@ -11,7 +11,6 @@ from pathlib import Path
 import pytest
 
 from sandlock import Sandbox
-from sandlock.sandbox import FsIsolation
 
 
 _HELPER_BIN = Path(__file__).resolve().parent.parent.parent / "tests" / "rootfs-helper"
@@ -182,7 +181,6 @@ class TestFsMountCow:
             fs_storage=str(storage_dir),
             fs_writable=[str(work_dir)],
             fs_readable=list(_FS_READABLE),
-            fs_isolation=FsIsolation.NONE,
             on_exit=on_exit,
             on_error="abort",
             clean_env=True,

@@ -229,9 +229,8 @@ Sandlock always applies its default syscall blocklist.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `fs_isolation` | `FsIsolation` | `NONE` | `NONE` or `BRANCHFS` |
-| `fs_storage` | `str \| None` | `None` | Storage directory for BranchFS deltas |
-| `max_disk` | `str \| None` | `None` | Disk quota for BranchFS (e.g. `"1G"`) |
+| `fs_storage` | `str \| None` | `None` | Storage directory for the seccomp COW upper layer / deltas |
+| `max_disk` | `str \| None` | `None` | Disk quota for COW storage (e.g. `"1G"`) |
 | `on_exit` | `BranchAction` | `COMMIT` | `COMMIT`, `ABORT`, or `KEEP` |
 | `on_error` | `BranchAction` | `ABORT` | `COMMIT`, `ABORT`, or `KEEP` |
 
@@ -567,7 +566,7 @@ SandlockError (base)
   +-- SandboxRuntimeError  sandbox lifecycle errors
         +-- ForkError          fork failed
         +-- ChildError         child exited abnormally
-        +-- BranchError        BranchFS operation failed
+        +-- BranchError        COW branch operation failed
         |     +-- BranchConflictError   sibling branch committed (ESTALE)
         +-- ConfinementError   Landlock/seccomp setup failed
               +-- LandlockUnavailableError   no Landlock support
@@ -584,11 +583,6 @@ from sandlock import SandlockError, SandboxError, SandboxRuntimeError
 ```
 
 ### Enums
-
-#### `FsIsolation`
-
-- `FsIsolation.NONE` -- direct host writes (default); seccomp COW engaged when `workdir` is set
-- `FsIsolation.BRANCHFS` -- BranchFS kernel-module COW isolation
 
 #### `BranchAction`
 

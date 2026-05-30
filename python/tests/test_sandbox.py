@@ -534,33 +534,6 @@ class TestNewPolicyFields:
 
 
 
-class TestFsIsolation:
-    """Tests for fs_isolation FFI wiring."""
-
-    def test_fs_isolation_none_runs(self):
-        """Default FsIsolation.NONE should work normally."""
-        from sandlock.sandbox import FsIsolation
-        p = _policy()
-        assert p.fs_isolation == FsIsolation.NONE
-        result = p.run(["echo", "ok"])
-        assert result.success
-
-    def test_fs_isolation_value_roundtrips(self):
-        """Non-default values are accepted by the FFI builder without error."""
-        from sandlock.sandbox import FsIsolation
-        import warnings
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            p = _policy(fs_isolation=FsIsolation.BRANCHFS)
-            # Building the native policy should succeed (the mode itself
-            # may fail at sandbox.run time without branchfs, but FFI wiring
-            # should not warn or crash).
-            from sandlock._sdk import _NativePolicy
-            _NativePolicy._build_from_policy(p)
-        unwired = [x for x in w if "fs_isolation" in str(x.message)]
-        assert unwired == [], "fs_isolation should be wired, not warned about"
-
-
 class TestGpuDevices:
     """Tests for gpu_devices FFI wiring."""
 

@@ -74,7 +74,6 @@ _b_fs_read = _builder_fn("sandlock_sandbox_builder_fs_read", ctypes.c_char_p)
 _b_fs_write = _builder_fn("sandlock_sandbox_builder_fs_write", ctypes.c_char_p)
 _b_fs_deny = _builder_fn("sandlock_sandbox_builder_fs_deny", ctypes.c_char_p)
 _b_fs_storage = _builder_fn("sandlock_sandbox_builder_fs_storage", ctypes.c_char_p)
-_b_fs_isolation = _builder_fn("sandlock_sandbox_builder_fs_isolation", ctypes.c_uint8)
 _b_gpu_devices = _builder_fn("sandlock_sandbox_builder_gpu_devices", ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32)
 _b_workdir = _builder_fn("sandlock_sandbox_builder_workdir", ctypes.c_char_p)
 _b_cwd = _builder_fn("sandlock_sandbox_builder_cwd", ctypes.c_char_p)
@@ -892,7 +891,7 @@ class _NativePolicy:
     # managed outside it (policy_fn is wired in from_dataclass; notif_policy
     # is Python-side only; no_coredump is a Python convenience alias).
     _HANDLED_FIELDS: set[str] = {
-        "fs_writable", "fs_readable", "fs_denied", "fs_storage", "fs_isolation",
+        "fs_writable", "fs_readable", "fs_denied", "fs_storage",
         "workdir", "cwd", "chroot", "fs_mount", "on_exit", "on_error",
         "max_memory", "max_disk", "max_processes", "max_cpu", "num_cpus",
         "cpu_cores", "gpu_devices",
@@ -927,14 +926,6 @@ class _NativePolicy:
 
         if policy.fs_storage:
             b = _b_fs_storage(b, _encode(str(policy.fs_storage)))
-
-        from .sandbox import FsIsolation
-        _iso_map = {
-            FsIsolation.NONE: 0,
-            FsIsolation.BRANCHFS: 2,
-        }
-        if policy.fs_isolation != FsIsolation.NONE:
-            b = _b_fs_isolation(b, _iso_map[policy.fs_isolation])
 
         if policy.gpu_devices is not None:
             arr = (ctypes.c_uint32 * len(policy.gpu_devices))(*policy.gpu_devices)

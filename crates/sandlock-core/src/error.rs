@@ -22,9 +22,6 @@ pub enum SandboxError {
     #[error("invalid sandbox: {0}")]
     Invalid(String),
 
-    #[error("fs_isolation requires workdir to be set")]
-    FsIsolationRequiresWorkdir,
-
     #[error("max_cpu must be 1-100, got {0}")]
     InvalidCpuPercent(u8),
 

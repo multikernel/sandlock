@@ -78,15 +78,8 @@ def parse_ports(specs: Sequence[int | str]) -> list[int]:
     return sorted(ports)
 
 
-class FsIsolation(Enum):
-    """Filesystem mutation isolation mode."""
-
-    NONE = "none"        # Direct host writes (default)
-    BRANCHFS = "branchfs"  # BranchFS COW isolation
-
-
 class BranchAction(Enum):
-    """Action to take on a BranchFS branch when sandbox exits."""
+    """Action to take on the COW branch when sandbox exits."""
 
     COMMIT = "commit"    # Merge writes into parent branch
     ABORT = "abort"      # Discard all writes
@@ -319,18 +312,12 @@ class Sandbox:
     in this directory.  Independent of ``workdir`` (COW root)."""
 
     # COW filesystem isolation
-    fs_isolation: FsIsolation = FsIsolation.NONE
-    """Filesystem isolation mode.  ``NONE`` with ``workdir`` set engages the
-    seccomp-based COW (the default)."""
-
     fs_storage: str | None = None
-    """Separate storage directory for BranchFS COW deltas.
-    If set, passed as ``--storage`` to ``branchfs mount``."""
+    """Separate storage directory for the seccomp COW upper layer / deltas."""
 
     max_disk: str | None = None
-    """Disk quota for BranchFS storage (e.g. ``'1G'``).
-    Passed as ``--max-storage`` to ``branchfs mount``.
-    Enforced by BranchFS FUSE layer (returns ENOSPC)."""
+    """Disk quota for COW storage (e.g. ``'1G'``).
+    Enforced by the COW layer (returns ENOSPC)."""
 
     on_exit: BranchAction = BranchAction.COMMIT
     """Branch action on normal sandbox exit."""

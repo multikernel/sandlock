@@ -18,7 +18,7 @@ prefixes the dataclass uses), the field tables list both.
 ### Python
 
 ```python
-from sandlock import Sandbox, FsIsolation, BranchAction
+from sandlock import Sandbox, BranchAction
 
 sandbox = Sandbox(
     # [config]
@@ -35,7 +35,6 @@ sandbox = Sandbox(
 
     # [filesystem]
     fs_readable=(), fs_writable=(), fs_denied=(),
-    fs_isolation=FsIsolation.NONE,
     chroot=None, fs_mount={},
     on_exit=BranchAction.COMMIT, on_error=BranchAction.ABORT,
 
@@ -90,7 +89,6 @@ no_huge_pages = true
 read      = ["/usr", "/lib"]
 write     = ["/tmp"]
 deny      = ["/proc/kcore"]
-isolation = "branchfs"                # "none" | "branchfs"
 chroot    = "/opt/rootfs"
 mount     = ["/work:/host/sandbox/work"]
 on_exit   = "commit"                  # "commit" | "abort" | "keep"
@@ -129,7 +127,7 @@ Top-level configuration for the supervisor and COW workspace.
 | ------------ | ----------- | ------------- | ------- | ---------------------------------------------------------------------------------------- |
 | `http_ca`    | `http_ca`   | `str \| None` | `None`  | PEM CA certificate path for HTTPS MITM. When set, port `443` is added to `http_ports`.   |
 | `http_key`   | `http_key`  | `str \| None` | `None`  | PEM CA private key path. Required whenever `http_ca` is set.                             |
-| `fs_storage` | `fs_storage`| `str \| None` | `None`  | Separate storage directory for BranchFS COW deltas. Passed as `--storage` to `branchfs mount`. |
+| `fs_storage` | `fs_storage`| `str \| None` | `None`  | Separate storage directory for the seccomp COW upper layer / deltas. |
 | `workdir`    | `workdir`   | `str \| None` | `None`  | COW root directory. Controls which directory COW tracks; does **not** set the child's working directory. |
 
 HTTPS interception is opt-in: without `http_ca`, port 443 is not
@@ -175,7 +173,6 @@ filesystem isolation.
 | `fs_readable`  | `read`      | `Sequence[str]`     | `()`                    | Paths the sandbox may read (in addition to `fs_writable`).                                                                   |
 | `fs_writable`  | `write`     | `Sequence[str]`     | `()`                    | Paths the sandbox may read and write.                                                                                        |
 | `fs_denied`    | `deny`      | `Sequence[str]`     | `()`                    | Paths explicitly denied (neither read nor write), even if implied by a broader rule.                                         |
-| `fs_isolation` | `isolation` | `FsIsolation`       | `FsIsolation.NONE`      | Filesystem isolation mode. With `NONE` and a `workdir`, the seccomp-based COW path is used.                                  |
 | `chroot`       | `chroot`    | `str \| None`       | `None`                  | Path to `chroot` into before applying other confinement.                                                                     |
 | `fs_mount`     | `mount`     | `Mapping[str, str]` | `{}`                    | Map virtual paths inside the chroot to host directories. Python form: `{"/work": "/host/sandbox/work"}`. TOML form: list of `"VIRTUAL:HOST"` strings. |
 | `on_exit`      | `on_exit`   | `BranchAction`      | `BranchAction.COMMIT`   | Branch action on normal sandbox exit.                                                                                        |
@@ -252,7 +249,7 @@ prefix redundant; the GPU and CPU placement fields keep their names.
 | `max_processes`  | `processes`   | `int`                   | `64`    | Maximum **lifetime** fork count permitted in the sandbox (not concurrent). Also enables fork interception used by checkpoint freeze. |
 | `max_open_files` | `open_files`  | `int \| None`           | `None`  | Maximum number of open file descriptors. Enforced via `RLIMIT_NOFILE` (kernel, survives `exec`).                              |
 | `max_cpu`        | `cpu`         | `int \| None`           | `None`  | CPU throttle as a percentage of one core (1 to 100). Applied to the entire process group via `SIGSTOP`/`SIGCONT` cycling.    |
-| `max_disk`       | `disk`        | `str \| None`           | `None`  | BranchFS storage quota (e.g. `"1G"`). Returned as `ENOSPC` at the FUSE layer.                                                |
+| `max_disk`       | `disk`        | `str \| None`           | `None`  | COW storage quota (e.g. `"1G"`). Returned as `ENOSPC` when the upper layer exceeds it.                                       |
 | `gpu_devices`    | `gpu_devices` | `Sequence[int] \| None` | `None`  | GPU device indices to expose. `None` denies GPU access entirely; `[]` exposes every GPU; a list exposes only those devices. Adds Landlock rules for `/dev/nvidia*` and `/dev/dri/*` and sets `CUDA_VISIBLE_DEVICES` / `ROCR_VISIBLE_DEVICES`. |
 | `cpu_cores`      | `cpu_cores`   | `Sequence[int] \| None` | `None`  | CPU cores to pin the sandbox to via `sched_setaffinity` in the child.                                                        |
 | `num_cpus`       | `num_cpus`    | `int \| None`           | `None`  | Visible CPU count in `/proc/cpuinfo` (renumbered `0..N-1`). Also virtualizes `/proc/meminfo` when `max_memory` is set.        |
@@ -277,14 +274,6 @@ and have no TOML counterpart.
 | `notif_policy` | `NotifPolicy \| None` | `None`  | Seccomp user-notification policy for `/proc` and `/sys` virtualization. Usually configured implicitly by the other fields; advanced use only.     |
 
 ## Enumerations
-
-### `FsIsolation`
-
-```python
-class FsIsolation(Enum):
-    NONE      = "none"        # Direct host writes (default); seccomp COW engaged when `workdir` is set.
-    BRANCHFS  = "branchfs"    # BranchFS kernel-module COW isolation.
-```
 
 ### `BranchAction`
 
@@ -330,10 +319,10 @@ parse_ports([80, "443", "8000-8005"])
    outbound traffic. Protocol gating is a function of rule presence:
    the seccomp layer denies UDP and ICMP socket creation when no rule
    of that protocol is configured.
-2. **Seccomp COW with `workdir`.** When `workdir` is set and
-   `fs_isolation=FsIsolation.NONE` (the default), the seccomp-based COW
-   path intercepts writes under `workdir` and stages them in an upper
-   layer, committed or aborted on exit per `on_exit` / `on_error`.
+2. **Seccomp COW with `workdir`.** When `workdir` is set, the
+   seccomp-based COW path intercepts writes under `workdir` and stages
+   them in an upper layer, committed or aborted on exit per `on_exit` /
+   `on_error`.
 3. **HTTP host auto-expansion.** HTTP rules referencing concrete hosts
    auto-add corresponding TCP entries on `http_ports` (and on `443`
    when `http_ca` is set). Wildcard hosts add the equivalent any-IP

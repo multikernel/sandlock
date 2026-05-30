@@ -12,7 +12,7 @@ Rust CLI). Each section maps to a subset of ``Sandbox`` fields:
                     and are silently ignored — pass them to
                     ``sandbox.run(cmd)`` instead)
     [filesystem]  → fs_readable (read), fs_writable (write),
-                    fs_denied (deny), fs_isolation (isolation), chroot,
+                    fs_denied (deny), chroot,
                     fs_mount (mount), on_exit, on_error
     [network]     → net_bind (bind), net_allow (allow), port_remap
     [http]        → http_ports (ports), http_allow (allow),
@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any
 
 from .exceptions import PolicyError
-from .sandbox import BranchAction, FsIsolation, Sandbox
+from .sandbox import BranchAction, Sandbox
 
 
 _PROFILES_DIR = Path("~/.config/sandlock/profiles").expanduser()
@@ -75,7 +75,6 @@ _SECTIONS: dict[str, dict[str, tuple[str | None, type]]] = {
         "read":      ("fs_readable",  list),
         "write":     ("fs_writable",  list),
         "deny":      ("fs_denied",    list),
-        "isolation": ("fs_isolation", str),
         "chroot":    ("chroot",       str),
         "mount":     ("fs_mount",     list),
         "on_exit":   ("on_exit",      str),
@@ -208,14 +207,6 @@ def _coerce(
     section: str, toml_key: str, sandbox_key: str, value: Any, source: str
 ) -> Any:
     """Per-field value coercion (enums, mount-spec parsing, port lists)."""
-    if sandbox_key == "fs_isolation":
-        try:
-            return FsIsolation(value)
-        except ValueError:
-            raise PolicyError(
-                f"{source}: [{section}].{toml_key} must be "
-                f"'none' or 'branchfs', got {value!r}"
-            )
     if sandbox_key in ("on_exit", "on_error"):
         try:
             return BranchAction(value)

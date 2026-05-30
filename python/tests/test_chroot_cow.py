@@ -3,8 +3,8 @@
 
 Verifies that on_exit/on_error branch actions work correctly and that
 concurrent sandboxes with separate fs_storage directories get isolated
-upper layers.  The seccomp-based COW (FsIsolation.NONE + workdir) is the
-only supported backend.
+upper layers.  The seccomp-based COW (workdir set) is the only supported
+backend.
 """
 
 from __future__ import annotations
@@ -18,7 +18,6 @@ from pathlib import Path
 import pytest
 
 from sandlock import Sandbox
-from sandlock.sandbox import FsIsolation
 
 
 _HELPER_BIN = Path(__file__).resolve().parent.parent.parent / "tests" / "rootfs-helper"
@@ -71,9 +70,8 @@ def rootfs(tmp_path):
 
 def _cow_policy(rootfs, on_exit="abort", fs_storage=None, backend="seccomp"):
     """Build a COW policy for the given backend."""
-    # seccomp backend: fs_isolation NONE + workdir triggers the seccomp COW path.
+    # seccomp backend: setting workdir triggers the seccomp COW path.
     del backend  # only "seccomp" is supported
-    fs_isolation = FsIsolation.NONE
     return Sandbox(
         chroot=str(rootfs),
         workdir=str(rootfs),
@@ -82,7 +80,6 @@ def _cow_policy(rootfs, on_exit="abort", fs_storage=None, backend="seccomp"):
         fs_writable=["/tmp"],
         on_exit=on_exit,
         fs_storage=fs_storage,
-        fs_isolation=fs_isolation,
         clean_env=True,
         env={"PATH": "/usr/bin:/bin"},
     )

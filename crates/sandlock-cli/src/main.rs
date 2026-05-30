@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use sandlock_core::Sandbox;
-use sandlock_core::sandbox::{BranchAction, ByteSize, FsIsolation, SandboxBuilder};
+use sandlock_core::sandbox::{BranchAction, ByteSize, SandboxBuilder};
 use sandlock_core::profile;
 use anyhow::{Result, anyhow};
 use std::path::PathBuf;
@@ -52,9 +52,6 @@ struct RunArgs {
 
     #[arg(long = "max-disk")]
     max_disk: Option<String>,
-
-    #[arg(long = "fs-isolation", value_name = "MODE")]
-    fs_isolation: Option<String>,
 
     #[arg(long)]
     time_start: Option<String>,
@@ -345,9 +342,6 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         // Filesystem extras
         if let Some(ref path) = base.chroot { b = b.chroot(path); }
         if let Some(ref path) = base.fs_storage { b = b.fs_storage(path); }
-        if base.fs_isolation != sandlock_core::sandbox::FsIsolation::None {
-            b = b.fs_isolation(base.fs_isolation.clone());
-        }
         for (virt, host) in &base.fs_mount { b = b.fs_mount(virt, host); }
         b = b.on_exit(base.on_exit.clone());
         b = b.on_error(base.on_error.clone());
@@ -404,15 +398,6 @@ async fn run_command(args: RunArgs) -> Result<i32> {
     if let Some(ref ts) = args.time_start {
         let t = parse_time_start(ts)?;
         builder = builder.time_start(t);
-    }
-    if let Some(ref mode) = args.fs_isolation {
-        use sandlock_core::sandbox::FsIsolation;
-        let iso = match mode.as_str() {
-            "none" => FsIsolation::None,
-            "branchfs" => FsIsolation::BranchFs,
-            other => return Err(anyhow!("unknown --fs-isolation mode: {}", other)),
-        };
-        builder = builder.fs_isolation(iso);
     }
     if let Some(ref s) = args.max_disk { builder = builder.max_disk(ByteSize::parse(s)?); }
     if let Some(ref s) = args.on_exit {
@@ -637,7 +622,6 @@ fn validate_no_supervisor(args: &RunArgs) -> Result<()> {
     if pb.uid.is_some() { bad.push("--uid"); }
     if pb.workdir.is_some() { bad.push("--workdir"); }
     if pb.cwd.is_some() { bad.push("--cwd"); }
-    if args.fs_isolation.is_some() { bad.push("--fs-isolation"); }
     if pb.fs_storage.is_some() { bad.push("--fs-storage"); }
     if args.max_disk.is_some() { bad.push("--max-disk"); }
     if pb.port_remap { bad.push("--port-remap"); }
@@ -701,7 +685,6 @@ fn validate_no_supervisor_profile(profile: &Sandbox, source: &str) -> Result<()>
     if profile.no_randomize_memory { bad.push("[determinism].no_randomize_memory"); }
     if profile.no_huge_pages { bad.push("[program].no_huge_pages"); }
     if profile.no_coredump { bad.push("[program].no_coredump"); }
-    if profile.fs_isolation != FsIsolation::None { bad.push("[filesystem].isolation"); }
     if profile.workdir.is_some() { bad.push("[config].workdir"); }
     if profile.fs_storage.is_some() { bad.push("[config].fs_storage"); }
     if profile.cwd.is_some() { bad.push("[program].cwd"); }

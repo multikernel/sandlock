@@ -9,7 +9,7 @@ use std::ptr;
 use std::time::Duration;
 
 use sandlock_core::pipeline::Stage;
-use sandlock_core::sandbox::{BranchAction, ByteSize, FsIsolation, SandboxBuilder};
+use sandlock_core::sandbox::{BranchAction, ByteSize, SandboxBuilder};
 use sandlock_core::{Sandbox, RunResult};
 
 pub mod handler;
@@ -117,30 +117,6 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_fs_storage(
     let path = CStr::from_ptr(path).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.fs_storage(path)))
-}
-
-/// Set filesystem isolation mode.
-/// `mode`: 0 = None, 2 = BranchFs. (1, formerly OverlayFs, is no longer
-/// supported and falls back to None with a stderr warning.)
-///
-/// # Safety
-/// `b` must be a valid builder pointer.
-#[no_mangle]
-pub unsafe extern "C" fn sandlock_sandbox_builder_fs_isolation(
-    b: *mut SandboxBuilder,
-    mode: u8,
-) -> *mut SandboxBuilder {
-    if b.is_null() { return b; }
-    let builder = *Box::from_raw(b);
-    let iso = match mode {
-        2 => FsIsolation::BranchFs,
-        1 => {
-            eprintln!("sandlock: fs_isolation mode=1 (OverlayFs) is no longer supported; falling back to None");
-            FsIsolation::None
-        }
-        _ => FsIsolation::None,
-    };
-    Box::into_raw(Box::new(builder.fs_isolation(iso)))
 }
 
 /// # Safety

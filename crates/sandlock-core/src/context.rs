@@ -6,7 +6,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use crate::arch;
-use crate::sandbox::{FsIsolation, Sandbox};
+use crate::sandbox::Sandbox;
 use crate::seccomp::bpf::{self, stmt, jump};
 use crate::sys::structs::{
     AF_INET, AF_INET6,
@@ -347,7 +347,7 @@ pub fn notif_syscalls(policy: &Sandbox, sandbox_name: Option<&str>) -> Vec<u32> 
     }
 
     // COW filesystem interception (seccomp-based, unprivileged)
-    if policy.workdir.is_some() && policy.fs_isolation == FsIsolation::None {
+    if policy.workdir.is_some() {
         nrs.extend_from_slice(&[
             libc::SYS_openat as u32,
             libc::SYS_execve as u32,

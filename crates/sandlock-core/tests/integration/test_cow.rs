@@ -10,7 +10,7 @@ fn temp_dir(name: &str) -> PathBuf {
 }
 
 // ============================================================
-// Seccomp-based COW tests (FsIsolation::None + workdir)
+// Seccomp-based COW tests (workdir set)
 // ============================================================
 
 /// Test that seccomp COW creates files in upper, committed on exit.
@@ -23,7 +23,7 @@ async fn test_seccomp_cow_create_file() {
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc")
         .fs_write(&workdir)
-        .workdir(&workdir)  // FsIsolation::None is default → seccomp COW
+        .workdir(&workdir)  // workdir set → seccomp COW
         .on_exit(BranchAction::Commit)
         .build()
         .unwrap();

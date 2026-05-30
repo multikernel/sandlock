@@ -125,7 +125,6 @@ impl TryFrom<&Sandbox> for Confinement {
         if sandbox.no_huge_pages { unsupported.push("no_huge_pages"); }
         if sandbox.no_coredump { unsupported.push("no_coredump"); }
         if sandbox.deterministic_dirs { unsupported.push("deterministic_dirs"); }
-        if sandbox.fs_isolation != FsIsolation::None { unsupported.push("fs_isolation"); }
         if sandbox.workdir.is_some() { unsupported.push("workdir"); }
         if sandbox.cwd.is_some() { unsupported.push("cwd"); }
         if sandbox.fs_storage.is_some() { unsupported.push("fs_storage"); }
@@ -154,14 +153,6 @@ impl TryFrom<&Sandbox> for Confinement {
     }
 }
 
-/// Filesystem isolation mode.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum FsIsolation {
-    #[default]
-    None,
-    BranchFs,
-}
-
 /// Action to take on branch exit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum BranchAction {
@@ -187,7 +178,6 @@ struct Runtime {
     loadavg_handle: Option<JoinHandle<()>>,
     _stdout_read: Option<std::os::fd::OwnedFd>,
     _stderr_read: Option<std::os::fd::OwnedFd>,
-    cow_branch: Option<Box<dyn crate::cow::CowBranch>>,
     seccomp_cow: Option<crate::cow::seccomp::SeccompCowBranch>,
     supervisor_resource: Option<Arc<tokio::sync::Mutex<crate::seccomp::state::ResourceState>>>,
     supervisor_cow: Option<Arc<tokio::sync::Mutex<crate::seccomp::state::CowState>>>,
@@ -274,7 +264,6 @@ pub struct Sandbox {
     pub deterministic_dirs: bool,
 
     // Filesystem branch
-    pub fs_isolation: FsIsolation,
     pub workdir: Option<PathBuf>,
     pub cwd: Option<PathBuf>,
     pub fs_storage: Option<PathBuf>,
@@ -381,7 +370,6 @@ impl Clone for Sandbox {
             no_huge_pages: self.no_huge_pages,
             no_coredump: self.no_coredump,
             deterministic_dirs: self.deterministic_dirs,
-            fs_isolation: self.fs_isolation.clone(),
             workdir: self.workdir.clone(),
             cwd: self.cwd.clone(),
             fs_storage: self.fs_storage.clone(),
@@ -423,14 +411,9 @@ impl Sandbox {
 
     /// Validate cross-section invariants — checks that span multiple fields.
     ///
-    /// Currently:
-    /// - `fs_isolation != "none"` requires `workdir` to be set.
-    ///
-    /// Idempotent: calling repeatedly is safe.
+    /// Currently a no-op; retained as an extension point and for API
+    /// stability. Idempotent: calling repeatedly is safe.
     pub fn validate(&self) -> Result<(), SandboxError> {
-        if self.fs_isolation != FsIsolation::None && self.workdir.is_none() {
-            return Err(SandboxError::FsIsolationRequiresWorkdir);
-        }
         Ok(())
     }
 
@@ -716,30 +699,6 @@ impl Sandbox {
         self.do_create(cmd, false).await
     }
 
-    /// Commit COW writes to the original directory.
-    #[doc(hidden)]
-    pub async fn commit(&mut self) -> Result<(), crate::error::SandlockError> {
-        use crate::error::{SandboxRuntimeError, SandlockError};
-        if let Some(ref mut rt) = self.runtime {
-            if let Some(branch) = rt.cow_branch.take() {
-                branch.commit().map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Branch(e)))?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Discard COW writes.
-    #[doc(hidden)]
-    pub async fn abort_branch(&mut self) -> Result<(), crate::error::SandlockError> {
-        use crate::error::{SandboxRuntimeError, SandlockError};
-        if let Some(ref mut rt) = self.runtime {
-            if let Some(branch) = rt.cow_branch.take() {
-                branch.abort().map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Branch(e)))?;
-            }
-        }
-        Ok(())
-    }
-
     /// Freeze the sandbox: hold fork notifications + SIGSTOP the process group.
     pub(crate) async fn freeze(&self) -> Result<(), crate::error::SandlockError> {
         use crate::error::{SandboxRuntimeError, SandlockError};
@@ -1004,7 +963,6 @@ impl Sandbox {
                 loadavg_handle: None,
                 _stdout_read: None,
                 _stderr_read: None,
-                cow_branch: None,
                 seccomp_cow: None,
                 supervisor_resource: None,
                 supervisor_cow: None,
@@ -1089,7 +1047,6 @@ impl Sandbox {
             loadavg_handle: None,
             _stdout_read: None,
             _stderr_read: None,
-            cow_branch: None,
             seccomp_cow: None,
             supervisor_resource: None,
             supervisor_cow: None,
@@ -1112,9 +1069,6 @@ impl Sandbox {
 
     async fn collect_changes(&self) -> Vec<crate::dry_run::Change> {
         if let Some(ref rt) = self.runtime {
-            if let Some(ref branch) = rt.cow_branch {
-                return branch.changes().unwrap_or_default();
-            }
             if let Some(ref cow) = rt.seccomp_cow {
                 return cow.changes().unwrap_or_default();
             }
@@ -1124,9 +1078,6 @@ impl Sandbox {
 
     async fn do_abort(&mut self) {
         if let Some(ref mut rt) = self.runtime {
-            if let Some(branch) = rt.cow_branch.take() {
-                let _ = branch.abort();
-            }
             if let Some(ref mut cow) = rt.seccomp_cow {
                 let _ = cow.abort();
             }
@@ -1143,7 +1094,6 @@ impl Sandbox {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use crate::error::SandboxRuntimeError;
         use crate::context::{PipePair, read_u32_fd};
-        use crate::cow::{CowBranch, branchfs::BranchFsBranch};
         use crate::network;
         use crate::seccomp::ctx::SupervisorCtx;
         use crate::seccomp::notif::{self, NotifPolicy};
@@ -1194,23 +1144,12 @@ impl Sandbox {
             self.rt_mut().http_acl_handle = Some(handle);
         }
 
-        let cow_branch: Option<Box<dyn CowBranch>> = match self.fs_isolation {
-            FsIsolation::BranchFs => {
-                let workdir = self.workdir.as_ref()
-                    .ok_or_else(|| crate::error::SandlockError::Runtime(SandboxRuntimeError::Child("BranchFs requires workdir".into())))?;
-                let branch = BranchFsBranch::create(workdir)
-                    .map_err(|e| crate::error::SandlockError::Runtime(SandboxRuntimeError::Branch(e)))?;
-                Some(Box::new(branch))
-            }
-            FsIsolation::None => None,
-        };
-
         // Seccomp COW: create the branch before fork so the child's Landlock
         // ruleset can include the upper layer. Binaries created inside the
         // workdir live in the upper dir, and Landlock checks EXECUTE on the
         // file's real path at execve time — so the upper dir must be granted
         // read+execute (READ_ACCESS) or `./created-binary` fails with EACCES.
-        let seccomp_cow_branch = if !no_supervisor && self.workdir.is_some() && self.fs_isolation == FsIsolation::None {
+        let seccomp_cow_branch = if !no_supervisor && self.workdir.is_some() {
             let workdir = self.workdir.as_ref().unwrap().clone();
             let storage = self.fs_storage.clone();
             let max_disk = self.max_disk.map(|b| b.0).unwrap_or(0);
@@ -1308,8 +1247,6 @@ impl Sandbox {
         }
 
         // ===== PARENT PROCESS =====
-        self.rt_mut().cow_branch = cow_branch;
-
         drop(pipes.notif_w);
         drop(pipes.ready_r);
 
@@ -1375,7 +1312,7 @@ impl Sandbox {
                 time_offset: time_offset_val,
                 num_cpus: self.num_cpus,
                 port_remap: self.port_remap,
-                cow_enabled: self.workdir.is_some() && self.fs_isolation == FsIsolation::None,
+                cow_enabled: self.workdir.is_some(),
                 chroot_root: self.chroot.as_ref().and_then(|p| std::fs::canonicalize(p).ok()),
                 chroot_readable: self.fs_readable.clone(),
                 chroot_writable: self.fs_writable.clone(),
@@ -1605,14 +1542,6 @@ impl Drop for Sandbox {
             let action = if is_error { &self.on_error } else { &self.on_exit };
             let action = action.clone();
 
-            if let Some(ref branch) = rt.cow_branch {
-                match action {
-                    BranchAction::Commit => { let _ = branch.commit(); }
-                    BranchAction::Abort => { let _ = branch.abort(); }
-                    BranchAction::Keep => {}
-                }
-            }
-
             if let Some(ref mut cow) = rt.seccomp_cow {
                 match action {
                     BranchAction::Commit => { let _ = cow.commit(); }
@@ -1839,10 +1768,6 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "deterministic-dirs"))]
     pub deterministic_dirs: bool,
 
-    // fs_isolation requires string-to-enum parsing; not directly clap-friendly as FsIsolation.
-    #[cfg_attr(feature = "cli", clap(skip))]
-    pub fs_isolation: Option<FsIsolation>,
-
     #[cfg_attr(feature = "cli", arg(long = "workdir"))]
     pub workdir: Option<PathBuf>,
 
@@ -1961,7 +1886,6 @@ impl Clone for SandboxBuilder {
             no_huge_pages: self.no_huge_pages,
             no_coredump: self.no_coredump,
             deterministic_dirs: self.deterministic_dirs,
-            fs_isolation: self.fs_isolation.clone(),
             workdir: self.workdir.clone(),
             cwd: self.cwd.clone(),
             fs_storage: self.fs_storage.clone(),
@@ -2113,11 +2037,6 @@ impl SandboxBuilder {
 
     pub fn deterministic_dirs(mut self, v: bool) -> Self {
         self.deterministic_dirs = v;
-        self
-    }
-
-    pub fn fs_isolation(mut self, iso: FsIsolation) -> Self {
-        self.fs_isolation = Some(iso);
         self
     }
 
@@ -2329,7 +2248,6 @@ impl SandboxBuilder {
             }
         }
 
-        let fs_isolation = self.fs_isolation.unwrap_or_default();
         Ok(Sandbox {
             fs_writable: self.fs_writable,
             fs_readable: self.fs_readable,
@@ -2353,7 +2271,6 @@ impl SandboxBuilder {
             no_huge_pages: self.no_huge_pages,
             no_coredump: self.no_coredump,
             deterministic_dirs: self.deterministic_dirs,
-            fs_isolation,
             workdir: self.workdir,
             cwd: self.cwd,
             fs_storage: self.fs_storage,
