@@ -289,17 +289,12 @@ class OpenatHandler(_NamespaceHandler):
         except Exception as e:
             return NotifAction.errno(_errno_for(e))
 
-        fd = os.memfd_create(f"s3:{key}", os.MFD_CLOEXEC)
+        # inject_bytes builds the (sealed, read-only) memfd, rewinds it, and
+        # transfers fd ownership to the supervisor — no manual memfd dance.
         try:
-            os.write(fd, data)
-            os.lseek(fd, 0, os.SEEK_SET)  # ADDFD shares the offset, so rewind
+            return NotifAction.inject_bytes(data, cloexec=bool(flags & os.O_CLOEXEC))
         except OSError:
-            os.close(fd)
             return NotifAction.errno(errno.EIO)
-
-        # Ownership of fd transfers to the supervisor, so do NOT close it here.
-        newfd_flags = os.O_CLOEXEC if (flags & os.O_CLOEXEC) else 0
-        return NotifAction.inject_fd_send(fd, newfd_flags)
 
 
 class NewfstatatHandler(_NamespaceHandler):

@@ -256,6 +256,60 @@ fn handle<'a>(
 }
 ```
 
+### Injecting synthetic content (`inject_bytes`)
+
+When a handler hands the guest synthetic file content (a secret, a generated config, a fetched
+object) as the result of an `open`/`openat`, use
+[`NotifAction::inject_bytes`](../crates/sandlock-core/src/seccomp/notif.rs) instead of building a
+`memfd` by hand. It creates an in-memory file populated with the bytes, rewinds it, seals it
+read-only, and returns an `InjectFdSend` action carrying that fd:
+
+```rust
+use sandlock_core::seccomp::notif::NotifAction;
+
+// Inside a handler: serve the bytes as the openat result fd.
+return NotifAction::inject_bytes(b"INJECTED CONTENT\n");
+```
+
+`inject_bytes` owns the fd end to end: the supervisor creates, populates, seals, and (on dispatch)
+closes it, so the caller never touches a raw fd and there is no "when do I close this" question. On
+an allocation failure it collapses to `Errno(EIO)`, which is why it returns a `NotifAction`
+directly rather than a `Result`.
+
+The two defaults both suit the dominant case (synthetic, often sensitive, read-only content):
+
+- **Sealed read-only.** The fd carries `F_SEAL_SEAL | F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK`,
+  so the guest cannot modify or resize the content it is handed.
+- **`O_CLOEXEC` on the child-side fd**, so the content does not leak into programs the guest later
+  `execve`s (see the note below).
+
+When you are impersonating a real file and want byte-for-byte the semantics the guest asked for (a
+writable fd, or the guest's own `O_CLOEXEC` choice), drop to the lower-level primitive
+[`content_memfd(content, seal)`](../crates/sandlock-core/src/seccomp/notif.rs), which returns an
+`OwnedFd` you pass to `NotifAction::InjectFdSend { srcfd, newfd_flags }` yourself:
+
+```rust
+use sandlock_core::seccomp::notif::{content_memfd, NotifAction};
+
+// Writable injected fd, mirroring the guest's own O_CLOEXEC request.
+let fd = match content_memfd(&bytes, /* seal */ false) {
+    Ok(fd) => fd,
+    Err(_) => return NotifAction::Errno(libc::EIO),
+};
+let cloexec = (cx.notif.data.args[2] as i32 & libc::O_CLOEXEC) != 0; // openat flags
+NotifAction::InjectFdSend {
+    srcfd: fd,
+    newfd_flags: if cloexec { libc::O_CLOEXEC as u32 } else { 0 },
+}
+```
+
+> **Why `O_CLOEXEC` by default.** `newfd_flags` sets the close-on-exec bit on the *child-side* fd
+> (distinct from the supervisor's own `MFD_CLOEXEC` copy of the memfd). Without it, a subprocess
+> the guest `execve`s inherits an open fd to the injected content and can read it without ever
+> opening the file. For secret injection that is a silent leak, so `inject_bytes` closes the fd
+> across `exec`; handlers that virtualize a real file and need to honor the guest's request opt out
+> via `content_memfd` (or, over the C ABI, the documented flags).
+
 ### State patterns
 
 Common confusion: when a handler holds mutable state, what kind of synchronisation is needed?
@@ -379,6 +433,11 @@ The contract is exercised at two layers:
 | `Kill { sig, pgid }` | Send `sig` to the guest's process group. |
 | `Defer(Deferred)` | Run the carried future off the supervisor loop; its terminal action is sent later, keyed by `notif.id`. Non-`Continue`, so it ends the chain. See [Deferred handlers](#deferred-handlers). |
 
+`InjectFd`/`InjectFdSend`/`InjectFdSendTracked` carry a file descriptor. To synthesise *content*
+(rather than inject an fd you already hold), construct the action with
+[`NotifAction::inject_bytes`](#injecting-synthetic-content-inject_bytes); it builds the sealed
+`memfd` and produces an `InjectFdSend` for you.
+
 ### Continue-site safety
 
 Today's supervisor processes notifications sequentially in a single tokio task, so the response
@@ -485,8 +544,8 @@ User handlers can:
   syscall must have returned `Continue` for the user handler to see it.
 - Fake results (`ReturnValue`, `Errno`) — but only after the builtins for the same syscall
   returned `Continue`, so they cannot subvert confinement.
-- Inject fds (`InjectFd`/`InjectFdSendTracked`) — useful for materialising virtual file content
-  via `memfd` without ever touching the host filesystem.
+- Inject fds (`inject_bytes`, `InjectFd`, `InjectFdSendTracked`) to materialise virtual file
+  content via `memfd` without ever touching the host filesystem.
 
 ### BPF coverage
 
@@ -603,11 +662,17 @@ against the configured policy.
 
 ### Synthetic file content via `InjectFdSendTracked`
 
+For the common read-only case,
+[`NotifAction::inject_bytes`](#injecting-synthetic-content-inject_bytes) is the one-liner: it
+builds the sealed `memfd` and returns the inject action for you. Reach for `InjectFdSendTracked`
+only when you must know the exact fd number the kernel assigned in the child (for example to key
+per-fd bookkeeping); its `on_success` callback delivers that number without racing the guest.
+
 A read-only virtual file (e.g. `/etc/hostname`, an in-memory configuration generated per-call)
 can be exposed by intercepting `openat` and injecting a sealed `memfd` containing the content.
 The kernel returns the new fd slot to the guest, the handler's `on_success` callback runs
 synchronously to register the fd in the handler's bookkeeping, and the guest reads the content
-via the `memfd` — no host filesystem touched.
+via the `memfd` (no host filesystem touched).
 
 ### Deterministic audit trail for compliance
 
@@ -721,6 +786,36 @@ break. Consequently the caller MUST ensure their `ud` pointer is
 thread-safe: either immutable, or guarded by their own synchronization
 primitives (atomics, mutex, etc.). Rust offers no synchronization for
 an opaque `void*`; the responsibility is on the C side.
+
+### Injecting content (`sandlock_action_set_inject_bytes`)
+
+The C counterpart of
+[`NotifAction::inject_bytes`](#injecting-synthetic-content-inject_bytes) is:
+
+```c
+void sandlock_action_set_inject_bytes(sandlock_action_out_t *out,
+                                      const uint8_t *data, size_t len,
+                                      uint32_t flags);
+```
+
+The supervisor copies `data` during the call (so it need not outlive the
+call), builds the backing in-memory file, and owns the resulting fd.
+Unlike `sandlock_action_set_inject_fd_send`, the caller passes no fd and
+frees nothing. On an allocation failure the action becomes `Errno(EIO)`,
+so the one-setter callback contract still holds.
+
+`flags` is a bitmask whose zero value is the safe default (sealed
+read-only, child-side fd `O_CLOEXEC`), matching `inject_bytes`:
+
+| `flags` | effect |
+|---|---|
+| `0` | sealed read-only, `O_CLOEXEC` (recommended) |
+| `SANDLOCK_INJECT_WRITABLE` | leave the memfd writable (do not seal) |
+| `SANDLOCK_INJECT_NO_CLOEXEC` | clear `O_CLOEXEC` on the child-side fd |
+
+`data` may be `NULL` when `len == 0`, which injects an empty file. The
+pure-C check in `crates/sandlock-ffi/tests/c/handler_smoke.c` exercises
+both the sealed default and the `SANDLOCK_INJECT_WRITABLE` variant.
 
 ### Minimal example
 

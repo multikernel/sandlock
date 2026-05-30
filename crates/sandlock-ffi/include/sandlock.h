@@ -210,6 +210,24 @@ void sandlock_action_set_return_value(sandlock_action_out_t *out, int64_t value)
  *  setter per action. */
 void sandlock_action_set_inject_fd_send(sandlock_action_out_t *out,
                                         int32_t srcfd, uint32_t newfd_flags);
+
+/* Flags for sandlock_action_set_inject_bytes(). flags == 0 is the safe
+ * default: the injected file is sealed read-only and the child-side fd is
+ * O_CLOEXEC. */
+#define SANDLOCK_INJECT_WRITABLE   (1u << 0)  /* leave the memfd writable (do not seal) */
+#define SANDLOCK_INJECT_NO_CLOEXEC (1u << 1)  /* clear O_CLOEXEC on the child-side fd */
+
+/** Inject `len` bytes from `data` into the child as the syscall's returned
+ *  fd, backed by an in-memory file the supervisor creates. The bytes are
+ *  copied during the call, so `data` need not outlive it, and the caller
+ *  owns no fd (the supervisor creates, populates, and closes the memfd).
+ *  Use this instead of sandlock_action_set_inject_fd_send() when injecting
+ *  synthetic content (secrets, virtual files, fetched objects) rather than
+ *  an fd you already hold. On allocation failure the action becomes
+ *  Errno(EIO). `data` may be NULL when `len == 0` (injects an empty file). */
+void sandlock_action_set_inject_bytes(sandlock_action_out_t *out,
+                                      const uint8_t *data, size_t len,
+                                      uint32_t flags);
 /* NOTE: `SANDLOCK_ACTION_INJECT_FD_SEND_TRACKED` (= 5) and
  * `sandlock_action_inject_tracked_t` are reserved for a future
  * tracker-aware inject variant. No setter is exposed in this release;

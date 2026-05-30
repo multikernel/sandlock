@@ -32,7 +32,9 @@ sb.run_with_handlers(
   child-memory accessors.
 - `NotifAction` — frozen value-object. Construct via factory classmethods:
   `continue_()`, `errno(value)`, `returns(value)`, `hold()`,
-  `kill(sig, pgid)`, `inject_fd_send(srcfd, newfd_flags)`.
+  `kill(sig, pgid)`, `inject_fd_send(srcfd, newfd_flags)`,
+  `inject_bytes(data, *, seal=True, cloexec=True)` (see
+  [Inject synthetic content](#inject-synthetic-content)).
 - `ExceptionPolicy` — IntEnum: `KILL` (default), `DENY_EPERM`, `CONTINUE`,
   `DENY_EIO`.
 
@@ -186,6 +188,32 @@ class FakePid(Handler):
 sb.run_with_handlers(cmd, [("getpid", FakePid())])
 ```
 
+### Inject synthetic content
+
+`NotifAction.inject_bytes(data)` serves `data` to the guest as the fd returned
+by its `open`/`openat`, backed by an in-memory file. Use it instead of
+hand-rolling `os.memfd_create` + `os.write` + `os.lseek`: it builds the memfd,
+rewinds it, seals it read-only, and transfers fd ownership to the supervisor
+(the caller must NOT close it).
+
+```python
+from sandlock.handler import Handler, NotifAction, ExceptionPolicy
+
+class HostnameFile(Handler):
+    on_exception = ExceptionPolicy.KILL
+
+    def handle(self, ctx):
+        if ctx.read_path() == "/etc/hostname":
+            return NotifAction.inject_bytes(b"sandbox\n")
+        return NotifAction.continue_()
+```
+
+By default the fd is sealed read-only (the guest cannot modify or resize it)
+and `O_CLOEXEC` (the content does not leak into programs the guest later
+`exec`s). Pass `seal=False` for a writable fd, or `cloexec=False` to mirror a
+guest that opened the file without `O_CLOEXEC`. A rare allocation failure
+raises `OSError`, which the handler's `on_exception` policy then governs.
+
 ### Kill the child from a handler
 
 ```python
@@ -283,10 +311,9 @@ class FetchHandler(Handler):
         if key is None:
             return NotifAction.continue_()
         data = await self.backend.get(key)  # slow network GET, awaited off-loop
-        fd = os.memfd_create("obj", os.MFD_CLOEXEC)
-        os.write(fd, data)
-        os.lseek(fd, 0, os.SEEK_SET)
-        return NotifAction.inject_fd_send(fd)
+        # inject_bytes builds the sealed memfd and transfers fd ownership to
+        # the supervisor (see "Inject synthetic content" above).
+        return NotifAction.inject_bytes(data)
 ```
 
 Why it helps Python specifically: the coroutine runs on a worker thread,

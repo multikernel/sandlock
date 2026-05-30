@@ -49,6 +49,46 @@ def test_inject_fd_send_rejects_negative_srcfd():
         NotifAction.inject_fd_send(-1)
 
 
+def test_inject_bytes_returns_injectfdsend_with_readable_content():
+    import os
+    a = NotifAction.inject_bytes(b"hello-bytes")
+    assert a.kind == 4  # SANDLOCK_ACTION_INJECT_FD_SEND
+    assert a.newfd_flags == os.O_CLOEXEC
+    try:
+        assert os.pread(a.srcfd, 64, 0) == b"hello-bytes"
+    finally:
+        os.close(a.srcfd)  # not dispatched in this test, so we close it
+
+
+def test_inject_bytes_seals_read_only_by_default():
+    import os, fcntl
+    a = NotifAction.inject_bytes(b"x")
+    try:
+        seals = fcntl.fcntl(a.srcfd, fcntl.F_GET_SEALS)
+        assert seals & fcntl.F_SEAL_WRITE
+    finally:
+        os.close(a.srcfd)
+
+
+def test_inject_bytes_writable_skips_seal():
+    import os, fcntl
+    a = NotifAction.inject_bytes(b"x", seal=False)
+    try:
+        seals = fcntl.fcntl(a.srcfd, fcntl.F_GET_SEALS)
+        assert not (seals & fcntl.F_SEAL_WRITE)
+    finally:
+        os.close(a.srcfd)
+
+
+def test_inject_bytes_no_cloexec_clears_newfd_flags():
+    import os
+    a = NotifAction.inject_bytes(b"x", cloexec=False)
+    try:
+        assert a.newfd_flags == 0
+    finally:
+        os.close(a.srcfd)
+
+
 def test_notif_action_is_frozen():
     import dataclasses
     a = NotifAction.continue_()

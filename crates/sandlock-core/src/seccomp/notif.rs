@@ -134,6 +134,76 @@ impl NotifAction {
     pub fn defer<F: Future<Output = NotifAction> + Send + 'static>(fut: F) -> Self {
         NotifAction::Defer(Deferred::new(fut))
     }
+
+    /// Inject `content` into the child as the syscall's returned fd, backed by
+    /// a sealed (read-only, fixed-size), `O_CLOEXEC` in-memory file.
+    ///
+    /// The fd is created, populated, sealed, and owned end to end by sandlock;
+    /// the caller never sees or closes it. On allocation failure this collapses
+    /// to `Errno(EIO)`, so a handler can return it directly:
+    ///
+    /// ```ignore
+    /// return NotifAction::inject_bytes(&secret);
+    /// ```
+    ///
+    /// For a *writable* injected fd, build one with
+    /// [`content_memfd(content, false)`](content_memfd) and pass it to
+    /// [`NotifAction::InjectFdSend`] yourself.
+    pub fn inject_bytes(content: &[u8]) -> NotifAction {
+        match content_memfd(content, true) {
+            Ok(fd) => NotifAction::InjectFdSend {
+                srcfd: fd,
+                newfd_flags: libc::O_CLOEXEC as u32,
+            },
+            Err(_) => NotifAction::Errno(libc::EIO),
+        }
+    }
+}
+
+/// Create an anonymous in-memory file ("memfd") populated with `content` and
+/// rewound to offset 0, ready to inject as a syscall's returned fd via
+/// [`NotifAction::InjectFdSend`].
+///
+/// When `seal` is true the fd is sealed read-only and fixed-size
+/// (`F_SEAL_SEAL | F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK`) so the guest
+/// cannot modify or resize the content it is handed. Sealing is best-effort:
+/// on a kernel without sealing support the fd is still returned, bounded by
+/// the rest of the policy. Pass `false` only when the guest genuinely needs a
+/// writable injected fd.
+///
+/// Most callers want [`NotifAction::inject_bytes`], which wraps this in the
+/// common sealed + `O_CLOEXEC` configuration.
+pub fn content_memfd(content: &[u8], seal: bool) -> io::Result<OwnedFd> {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::unix::io::FromRawFd;
+
+    let flags = if seal {
+        (libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) as u32
+    } else {
+        libc::MFD_CLOEXEC as u32
+    };
+    let memfd = crate::sys::syscall::memfd_create("sandlock-content", flags)?;
+
+    // Write the content and rewind. Borrow the raw fd for File I/O without
+    // transferring ownership: `memfd` (the OwnedFd) keeps owning it.
+    {
+        let raw = memfd.as_raw_fd();
+        let mut file = unsafe { std::fs::File::from_raw_fd(raw) };
+        let res = file
+            .write_all(content)
+            .and_then(|()| file.seek(SeekFrom::Start(0)).map(|_| ()));
+        std::mem::forget(file); // don't close `raw`; `memfd` still owns it
+        res?;
+    }
+
+    if seal {
+        // Best-effort: ignore failure on kernels lacking sealing support.
+        let seals =
+            libc::F_SEAL_SEAL | libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK;
+        unsafe { libc::fcntl(memfd.as_raw_fd(), libc::F_ADD_SEALS, seals) };
+    }
+
+    Ok(memfd)
 }
 
 /// Collapse a deferred future's resolved action into a sendable terminal
@@ -1621,6 +1691,57 @@ mod tests {
             finalize_deferred(NotifAction::ReturnValue(3)),
             NotifAction::ReturnValue(3)
         ));
+    }
+
+    #[test]
+    fn content_memfd_roundtrips_content() {
+        use std::io::Read;
+        let fd = content_memfd(b"hello world", true).expect("content_memfd");
+        // The fd is rewound to offset 0, so a plain read returns the content.
+        let mut f = std::fs::File::from(fd);
+        let mut buf = String::new();
+        f.read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "hello world");
+    }
+
+    #[test]
+    fn content_memfd_sealed_applies_write_seal() {
+        let fd = content_memfd(b"data", true).expect("content_memfd");
+        let seals = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GET_SEALS) };
+        assert!(seals >= 0, "F_GET_SEALS failed");
+        assert!(
+            seals & libc::F_SEAL_WRITE != 0,
+            "expected F_SEAL_WRITE on a sealed memfd, got {seals:#x}"
+        );
+    }
+
+    #[test]
+    fn content_memfd_unsealed_has_no_write_seal() {
+        let fd = content_memfd(b"data", false).expect("content_memfd");
+        let seals = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GET_SEALS) };
+        assert!(seals >= 0, "F_GET_SEALS failed");
+        assert_eq!(
+            seals & libc::F_SEAL_WRITE,
+            0,
+            "unsealed memfd must not carry a write seal, got {seals:#x}"
+        );
+    }
+
+    #[test]
+    fn inject_bytes_produces_sealed_cloexec_injectfdsend() {
+        use std::io::Read;
+        match NotifAction::inject_bytes(b"payload") {
+            NotifAction::InjectFdSend { srcfd, newfd_flags } => {
+                assert_eq!(newfd_flags, libc::O_CLOEXEC as u32);
+                let seals = unsafe { libc::fcntl(srcfd.as_raw_fd(), libc::F_GET_SEALS) };
+                assert!(seals & libc::F_SEAL_WRITE != 0, "inject_bytes must seal");
+                let mut f = std::fs::File::from(srcfd);
+                let mut buf = String::new();
+                f.read_to_string(&mut buf).unwrap();
+                assert_eq!(buf, "payload");
+            }
+            other => panic!("expected InjectFdSend, got {other:?}"),
+        }
     }
 
     #[test]

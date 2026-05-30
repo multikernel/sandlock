@@ -2,10 +2,17 @@
 //! handler module. No Rust-side dispatch logic lives here — only the
 //! data layout and the thin `extern "C-unwind"` wrappers around it.
 
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{IntoRawFd, RawFd};
 use std::slice;
 
-use sandlock_core::seccomp::notif::{read_child_cstr, read_child_mem, write_child_mem};
+use sandlock_core::seccomp::notif::{content_memfd, read_child_cstr, read_child_mem, write_child_mem};
+
+/// `flags` bit for [`sandlock_action_set_inject_bytes`]: leave the injected
+/// memfd writable (do not seal). Default (bit clear) seals it read-only.
+pub const SANDLOCK_INJECT_WRITABLE: u32 = 1 << 0;
+/// `flags` bit for [`sandlock_action_set_inject_bytes`]: do not set
+/// `O_CLOEXEC` on the child-side fd. Default (bit clear) sets `O_CLOEXEC`.
+pub const SANDLOCK_INJECT_NO_CLOEXEC: u32 = 1 << 1;
 
 /// Opaque child-memory accessor handed to a C handler callback.
 ///
@@ -287,6 +294,61 @@ pub unsafe extern "C" fn sandlock_action_set_inject_fd_send(
     (*out).payload.inject_send = sandlock_action_inject_t { srcfd, newfd_flags };
 }
 
+/// Inject `len` bytes from `data` into the child as the syscall's returned
+/// fd, backed by an in-memory file created by the supervisor. The bytes are
+/// copied immediately, so `data` need not outlive the call.
+///
+/// `flags` is a bitmask of `SANDLOCK_INJECT_*`. With `flags == 0` the memfd is
+/// sealed read-only and the child-side fd is `O_CLOEXEC` — the safe default
+/// for synthetic file content (secrets, virtual files, fetched objects). On
+/// allocation failure the action is set to `Errno(EIO)`, so the callback's
+/// one-setter contract still holds and the child gets a definite response.
+///
+/// Unlike [`sandlock_action_set_inject_fd_send`], the caller owns no fd here:
+/// the supervisor creates, populates, and (on dispatch) closes the memfd.
+///
+/// # Safety
+/// `out` follows the same constraints as `sandlock_action_set_continue`.
+/// `data` must point to at least `len` readable bytes, or be null when
+/// `len == 0`.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_action_set_inject_bytes(
+    out: *mut sandlock_action_out_t,
+    data: *const u8,
+    len: usize,
+    flags: u32,
+) {
+    if out.is_null() { return; }
+
+    let seal = flags & SANDLOCK_INJECT_WRITABLE == 0;
+    let newfd_flags = if flags & SANDLOCK_INJECT_NO_CLOEXEC == 0 {
+        libc::O_CLOEXEC as u32
+    } else {
+        0
+    };
+
+    // Copy the caller's bytes now; `data` is only valid for this call.
+    let bytes: &[u8] = if data.is_null() || len == 0 {
+        &[]
+    } else {
+        slice::from_raw_parts(data, len)
+    };
+
+    match content_memfd(bytes, seal) {
+        Ok(fd) => {
+            (*out).kind = sandlock_action_kind_t::InjectFdSend as u32;
+            (*out).payload.inject_send = sandlock_action_inject_t {
+                srcfd: fd.into_raw_fd(),
+                newfd_flags,
+            };
+        }
+        Err(_) => {
+            (*out).kind = sandlock_action_kind_t::Errno as u32;
+            (*out).payload.errno_value = libc::EIO;
+        }
+    }
+}
+
 /// Hold the syscall pending until the supervisor explicitly releases it.
 ///
 /// # Safety
@@ -521,3 +583,70 @@ pub struct sandlock_handler_registration_t {
 // `Send` to allow the input array to be borrowed inside `unsafe`
 // contexts without per-call wrapper structs.
 unsafe impl Send for sandlock_handler_registration_t {}
+
+#[cfg(test)]
+mod inject_bytes_tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::unix::io::{FromRawFd, OwnedFd};
+
+    // Read an fd's full contents (from offset 0) and close it.
+    fn read_and_close(fd: RawFd) -> String {
+        let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mut s = String::new();
+        f.read_to_string(&mut s).unwrap();
+        s
+    }
+
+    #[test]
+    fn inject_bytes_default_is_sealed_cloexec_injectfdsend() {
+        let mut out = sandlock_action_out_t::zeroed();
+        let data = b"secret-token";
+        unsafe { sandlock_action_set_inject_bytes(&mut out, data.as_ptr(), data.len(), 0) };
+        assert_eq!(out.kind, sandlock_action_kind_t::InjectFdSend as u32);
+        let inject = unsafe { out.payload.inject_send };
+        assert_eq!(inject.newfd_flags, libc::O_CLOEXEC as u32);
+        let seals = unsafe { libc::fcntl(inject.srcfd, libc::F_GET_SEALS) };
+        assert!(seals & libc::F_SEAL_WRITE != 0, "default flags must seal");
+        assert_eq!(read_and_close(inject.srcfd), "secret-token");
+    }
+
+    #[test]
+    fn inject_bytes_writable_flag_skips_seal() {
+        let mut out = sandlock_action_out_t::zeroed();
+        let data = b"rw";
+        unsafe {
+            sandlock_action_set_inject_bytes(
+                &mut out, data.as_ptr(), data.len(), SANDLOCK_INJECT_WRITABLE,
+            )
+        };
+        assert_eq!(out.kind, sandlock_action_kind_t::InjectFdSend as u32);
+        let inject = unsafe { out.payload.inject_send };
+        let seals = unsafe { libc::fcntl(inject.srcfd, libc::F_GET_SEALS) };
+        assert_eq!(seals & libc::F_SEAL_WRITE, 0, "WRITABLE must not seal");
+        drop(unsafe { OwnedFd::from_raw_fd(inject.srcfd) });
+    }
+
+    #[test]
+    fn inject_bytes_no_cloexec_flag_clears_newfd_flags() {
+        let mut out = sandlock_action_out_t::zeroed();
+        let data = b"x";
+        unsafe {
+            sandlock_action_set_inject_bytes(
+                &mut out, data.as_ptr(), data.len(), SANDLOCK_INJECT_NO_CLOEXEC,
+            )
+        };
+        let inject = unsafe { out.payload.inject_send };
+        assert_eq!(inject.newfd_flags, 0);
+        drop(unsafe { OwnedFd::from_raw_fd(inject.srcfd) });
+    }
+
+    #[test]
+    fn inject_bytes_null_data_injects_empty_file() {
+        let mut out = sandlock_action_out_t::zeroed();
+        unsafe { sandlock_action_set_inject_bytes(&mut out, std::ptr::null(), 0, 0) };
+        assert_eq!(out.kind, sandlock_action_kind_t::InjectFdSend as u32);
+        let inject = unsafe { out.payload.inject_send };
+        assert_eq!(read_and_close(inject.srcfd), "");
+    }
+}
