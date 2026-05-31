@@ -13,11 +13,16 @@ jobs:
   # Build Rust binaries and shared library.
   # x86_64 is pinned to ubuntu-22.04 (glibc 2.35) so release binaries run on
   # older distros (Ubuntu 22.04+, Debian 12+, RHEL 9+). aarch64 builds on
-  # ubuntu-24.04-arm (glibc 2.39) — the runner matches the rest of CI; older
+  # ubuntu-24.04-arm (glibc 2.39): the runner matches the rest of CI; older
   # aarch64 distros can build from source until a 22.04-arm runner is wired in.
+  # riscv64 is cross-compiled on x86_64 (GitHub has no riscv64 runner). It is
+  # marked experimental: the binary is never run in CI (seccomp/Landlock do not
+  # emulate faithfully under qemu), so a cross-build break must not block the
+  # x86_64/aarch64 release or the crates.io/PyPI publish.
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.runs-on }}
+    continue-on-error: ${{ matrix.experimental || false }}
     strategy:
       fail-fast: false
       matrix:
@@ -26,6 +31,11 @@ jobs:
             runs-on: ubuntu-22.04
           - target: aarch64-unknown-linux-gnu
             runs-on: ubuntu-24.04-arm
+          - target: riscv64gc-unknown-linux-gnu
+            runs-on: ubuntu-latest
+            cross-cc: riscv64-linux-gnu-gcc
+            cross-pkg: gcc-riscv64-linux-gnu
+            experimental: true
     steps:
       - uses: actions/checkout@v4
 
@@ -33,6 +43,19 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      # Cross-targets need a C cross-toolchain and the matching linker/CC env
+      # vars (the names are derived from the target triple, per cargo and the
+      # cc crate conventions). Native targets skip this step.
+      - name: Set up cross toolchain
+        if: matrix.cross-cc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.cross-pkg }}
+          triple_upper=$(echo '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')
+          triple_lower=$(echo '${{ matrix.target }}' | tr '-' '_')
+          echo "CARGO_TARGET_${triple_upper}_LINKER=${{ matrix.cross-cc }}" >> "$GITHUB_ENV"
+          echo "CC_${triple_lower}=${{ matrix.cross-cc }}" >> "$GITHUB_ENV"
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
