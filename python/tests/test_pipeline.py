@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for Stage, Pipeline, and Sandbox.cmd()."""
 
+from __future__ import annotations
+
 import os
 import sys
 import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -273,10 +276,16 @@ class TestGather:
 
     def test_gather_with_python_inputs(self):
         """Consumer reads gather inputs via sandlock.inputs."""
+        from sandlock._sdk import _find_lib
         python_paths = [p for p in sys.path if p and os.path.isdir(p)]
+        # The sandbox-side python re-imports sandlock, which dlopens
+        # libsandlock_ffi.so, grant access to the directory holding
+        # the .so picked up by _find_lib() rather than assuming a
+        # fixed layout.
+        lib_dir = str(Path(_find_lib()).parent)
         policy = _policy(fs_readable=list(dict.fromkeys([
             "/usr", "/lib", "/lib64", "/etc", "/bin", "/sbin",
-            "/home", _PYTHON_PREFIX,
+            lib_dir, _PYTHON_PREFIX,
         ] + python_paths)))
 
         result = (

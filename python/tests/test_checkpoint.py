@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for sandlock.Checkpoint (save_fn / restore_fn / persistence)."""
 
+from __future__ import annotations
+
 import json
 import sys
 
@@ -28,13 +30,14 @@ def running_sandbox():
     sb = _policy()
     argv, argc = _make_argv(["sleep", "60"])
     native = sb._ensure_native()
-    sb._handle = _lib.sandlock_spawn(
+    sb._handle = _lib.sandlock_create(
         native.ptr,
         _encode(sb._resolve_name()),
         argv,
         argc,
     )
-    assert sb._handle, "spawn failed"
+    assert sb._handle, "create failed"
+    assert _lib.sandlock_start(sb._handle) == 0, "start failed"
     yield sb
     if sb._handle:
         _lib.sandlock_handle_free(sb._handle)

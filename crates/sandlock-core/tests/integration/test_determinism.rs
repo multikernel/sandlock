@@ -222,3 +222,42 @@ async fn test_hostname_virtualization() {
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     assert_eq!(stdout.trim(), "mybox", "Expected /etc/hostname 'mybox', got: {:?}", stdout.trim());
 }
+
+/// The /etc/hostname shim used to do a literal `path == "/etc/hostname"`
+/// match, so dirfd-relative and non-canonical spellings leaked the host's
+/// real hostname. Exercise each bypass shape and assert the virtual
+/// hostname comes back.
+#[tokio::test]
+async fn test_hostname_virtualization_resists_path_bypasses() {
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .build()
+        .unwrap();
+
+    let script = concat!(
+        "import os\n",
+        "results = {}\n",
+        "etcfd = os.open('/etc', os.O_DIRECTORY | os.O_RDONLY)\n",
+        "fd = os.open('hostname', os.O_RDONLY, dir_fd=etcfd)\n",
+        "results['dirfd']  = os.read(fd, 4096).decode().strip()\n",
+        "os.close(fd); os.close(etcfd)\n",
+        "results['dotdot'] = open('/etc/../etc/hostname').read().strip()\n",
+        "results['curdir'] = open('/etc/./hostname').read().strip()\n",
+        "results['slash2'] = open('//etc/hostname').read().strip()\n",
+        "print(results)\n",
+    );
+
+    let result = policy.clone().with_name("mybox").run(&["python3", "-c", script]).await.unwrap();
+    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
+    for label in ["dirfd", "dotdot", "curdir", "slash2"] {
+        let needle = format!("'{label}': 'mybox'");
+        assert!(
+            stdout.contains(&needle),
+            "{label}: host /etc/hostname leaked. stdout: {stdout}"
+        );
+    }
+}

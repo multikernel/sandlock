@@ -286,7 +286,8 @@ async fn test_spawn_and_kill() {
     let policy = base_policy().build().unwrap();
     let mut sb = policy.clone().with_name("test");
 
-    sb.spawn(&["sleep", "300"]).await.unwrap();
+    sb.create_interactive(&["sleep", "300"]).await.unwrap();
+    sb.start().unwrap();
     sb.kill().unwrap();
 
     let result = sb.wait().await.unwrap();
@@ -326,7 +327,8 @@ async fn test_pause_resume() {
     let policy = base_policy().build().unwrap();
     let mut sb = policy.clone().with_name("test");
 
-    sb.spawn(&["sleep", "300"]).await.unwrap();
+    sb.create_interactive(&["sleep", "300"]).await.unwrap();
+    sb.start().unwrap();
 
     sb.pause().expect("pause should succeed");
     sb.resume().expect("resume should succeed");

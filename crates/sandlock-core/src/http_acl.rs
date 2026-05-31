@@ -10,7 +10,7 @@ use hudsucker::{Body, HttpContext, HttpHandler, Proxy, RequestOrResponse};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
-use crate::sandbox::{http_acl_check, HttpRule};
+use crate::http::{http_acl_check, HttpRule};
 
 /// Shared map from proxy client address to the original destination IP
 /// that the sandboxed process tried to connect to. Written by the seccomp
@@ -228,10 +228,10 @@ pub async fn spawn_http_acl_proxy(
 
     let (key_pair, cert) = if let (Some(cert_path), Some(key_path)) = (ca_cert, ca_key) {
         let key_pem = std::fs::read_to_string(key_path).map_err(|e| {
-            std::io::Error::new(e.kind(), format!("failed to read --https-key {:?}: {e}", key_path))
+            std::io::Error::new(e.kind(), format!("failed to read --http-key {:?}: {e}", key_path))
         })?;
         let cert_pem = std::fs::read_to_string(cert_path).map_err(|e| {
-            std::io::Error::new(e.kind(), format!("failed to read --https-ca {:?}: {e}", cert_path))
+            std::io::Error::new(e.kind(), format!("failed to read --http-ca {:?}: {e}", cert_path))
         })?;
         let kp = KeyPair::from_pem(&key_pem).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, format!("invalid CA key: {e}"))

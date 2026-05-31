@@ -179,8 +179,9 @@ async fn run_pipeline(stages: Vec<Stage>) -> Result<RunResult, SandlockError> {
         };
 
         let cmd_refs: Vec<&str> = stage.args.iter().map(|s| s.as_str()).collect();
-        sb.spawn_with_io(&cmd_refs, stdin_fd, stdout_fd, stderr_fd)
+        sb.create_with_io(&cmd_refs, stdin_fd, stdout_fd, stderr_fd)
             .await?;
+        sb.start()?;
 
         sandboxes.push(sb);
     }
@@ -339,7 +340,8 @@ async fn run_gather(
         let mut sb = ns.stage.sandbox.clone().with_name(name);
         let stdout_fd = source_pipes[i].1.as_raw_fd();
         let cmd_refs: Vec<&str> = ns.stage.args.iter().map(|s| s.as_str()).collect();
-        sb.spawn_with_io(&cmd_refs, None, Some(stdout_fd), None).await?;
+        sb.create_with_io(&cmd_refs, None, Some(stdout_fd), None).await?;
+        sb.start()?;
         sandboxes.push(sb);
     }
 
@@ -366,13 +368,14 @@ async fn run_gather(
     }
 
     let cmd_refs: Vec<&str> = consumer.args.iter().map(|s| s.as_str()).collect();
-    consumer_sb.spawn_with_gather_io(
+    consumer_sb.create_with_gather_io(
         &cmd_refs,
         Some(stdin_fd),
         Some(cap_stdout_w.as_raw_fd()),
         Some(cap_stderr_w.as_raw_fd()),
         extra_fds,
     ).await?;
+    consumer_sb.start()?;
     sandboxes.push(consumer_sb);
 
     // Close pipe ends in parent

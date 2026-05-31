@@ -74,7 +74,6 @@ _b_fs_read = _builder_fn("sandlock_sandbox_builder_fs_read", ctypes.c_char_p)
 _b_fs_write = _builder_fn("sandlock_sandbox_builder_fs_write", ctypes.c_char_p)
 _b_fs_deny = _builder_fn("sandlock_sandbox_builder_fs_deny", ctypes.c_char_p)
 _b_fs_storage = _builder_fn("sandlock_sandbox_builder_fs_storage", ctypes.c_char_p)
-_b_fs_isolation = _builder_fn("sandlock_sandbox_builder_fs_isolation", ctypes.c_uint8)
 _b_gpu_devices = _builder_fn("sandlock_sandbox_builder_gpu_devices", ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32)
 _b_workdir = _builder_fn("sandlock_sandbox_builder_workdir", ctypes.c_char_p)
 _b_cwd = _builder_fn("sandlock_sandbox_builder_cwd", ctypes.c_char_p)
@@ -226,11 +225,17 @@ _lib.sandlock_run.argtypes = [_c_policy_p, ctypes.c_char_p, ctypes.POINTER(ctype
 _lib.sandlock_run_interactive.restype = ctypes.c_int
 _lib.sandlock_run_interactive.argtypes = [_c_policy_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
 
-# Spawn handle
+# Sandbox handle (create / start / wait)
 _c_handle_p = ctypes.c_void_p
 
-_lib.sandlock_spawn.restype = _c_handle_p
-_lib.sandlock_spawn.argtypes = [_c_policy_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
+_lib.sandlock_create.restype = _c_handle_p
+_lib.sandlock_create.argtypes = [_c_policy_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
+
+_lib.sandlock_create_for_run.restype = _c_handle_p
+_lib.sandlock_create_for_run.argtypes = [_c_policy_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
+
+_lib.sandlock_start.restype = ctypes.c_int
+_lib.sandlock_start.argtypes = [_c_handle_p]
 
 _lib.sandlock_handle_pid.restype = ctypes.c_int
 _lib.sandlock_handle_pid.argtypes = [_c_handle_p]
@@ -396,6 +401,153 @@ _lib.sandlock_checkpoint_free.argtypes = [_c_checkpoint_p]
 
 
 # ----------------------------------------------------------------
+# Handler ABI — extension handlers for seccomp-notif syscalls.
+#
+# Structures mirror the C ABI in crates/sandlock-ffi/include/sandlock.h;
+# the trampoline that drives these bindings lives in _handler_ffi.py.
+# ----------------------------------------------------------------
+
+# sandlock_notif_data_t — kernel seccomp-notification snapshot. The
+# `args` array is fixed at 6 entries (the syscall ABI maximum).
+class _SandlockNotifData(ctypes.Structure):
+    _fields_ = [
+        ("id", ctypes.c_uint64),
+        ("pid", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("syscall_nr", ctypes.c_int32),
+        ("arch", ctypes.c_uint32),
+        ("instruction_pointer", ctypes.c_uint64),
+        ("args", ctypes.c_uint64 * 6),
+    ]
+
+
+# sandlock_action_payload_t — the tagged union the setters fill in. The
+# trampoline never reads these fields directly (it only ever calls the
+# setters), but the layout must match so the struct is sized correctly.
+class _SandlockActionPayload(ctypes.Union):
+    _fields_ = [
+        ("none", ctypes.c_uint64),
+        ("errno_value", ctypes.c_int32),
+        ("return_value", ctypes.c_int64),
+        # inject_send: { int32 srcfd; uint32 newfd_flags; }
+        ("inject_send", ctypes.c_uint32 * 2),
+        # inject_send_tracked: { int32; uint32; uint64; } — reserved.
+        ("inject_send_tracked", ctypes.c_uint64 * 2),
+        # kill: { int32 sig; int32 pgid; }
+        ("kill", ctypes.c_int32 * 2),
+    ]
+
+
+# sandlock_action_out_t — the slot a handler writes its decision into.
+class _SandlockActionOut(ctypes.Structure):
+    _fields_ = [
+        ("kind", ctypes.c_uint32),
+        ("payload", _SandlockActionPayload),
+    ]
+
+
+# sandlock_handler_registration_t — one (syscall_nr, handler) pair.
+class _SandlockHandlerRegistration(ctypes.Structure):
+    _fields_ = [
+        ("syscall_nr", ctypes.c_int64),
+        ("handler", ctypes.c_void_p),
+    ]
+
+
+_c_mem_handle_p = ctypes.c_void_p
+
+# C handler signature:
+#   int (*)(void *ud, const sandlock_notif_data_t *notif,
+#           sandlock_mem_handle_t *mem, sandlock_action_out_t *out)
+_HANDLER_FN_TYPE = ctypes.CFUNCTYPE(
+    ctypes.c_int,
+    ctypes.c_void_p,                          # ud
+    ctypes.POINTER(_SandlockNotifData),       # notif
+    _c_mem_handle_p,                          # mem
+    ctypes.POINTER(_SandlockActionOut),       # out
+)
+
+# void (*)(void *ud)
+_UD_DROP_FN_TYPE = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
+
+_c_handler_p = ctypes.c_void_p
+
+_lib.sandlock_handler_new.restype = _c_handler_p
+_lib.sandlock_handler_new.argtypes = [
+    _HANDLER_FN_TYPE, ctypes.c_void_p, _UD_DROP_FN_TYPE, ctypes.c_uint32,
+]
+
+_lib.sandlock_handler_free.restype = None
+_lib.sandlock_handler_free.argtypes = [_c_handler_p]
+
+_lib.sandlock_run_with_handlers.restype = _c_result_p
+_lib.sandlock_run_with_handlers.argtypes = [
+    _c_policy_p, ctypes.c_char_p,
+    ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint,
+    ctypes.POINTER(_SandlockHandlerRegistration), ctypes.c_size_t,
+]
+
+_lib.sandlock_run_interactive_with_handlers.restype = _c_result_p
+_lib.sandlock_run_interactive_with_handlers.argtypes = [
+    _c_policy_p, ctypes.c_char_p,
+    ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint,
+    ctypes.POINTER(_SandlockHandlerRegistration), ctypes.c_size_t,
+]
+
+# Resolve a syscall name to its host-arch number; -1 on unknown/NULL.
+_lib.sandlock_syscall_nr.restype = ctypes.c_int64
+_lib.sandlock_syscall_nr.argtypes = [ctypes.c_char_p]
+
+# Action setters — exactly one per action, called from the trampoline.
+_lib.sandlock_action_set_continue.restype = None
+_lib.sandlock_action_set_continue.argtypes = [ctypes.POINTER(_SandlockActionOut)]
+
+_lib.sandlock_action_set_errno.restype = None
+_lib.sandlock_action_set_errno.argtypes = [
+    ctypes.POINTER(_SandlockActionOut), ctypes.c_int32,
+]
+
+_lib.sandlock_action_set_return_value.restype = None
+_lib.sandlock_action_set_return_value.argtypes = [
+    ctypes.POINTER(_SandlockActionOut), ctypes.c_int64,
+]
+
+_lib.sandlock_action_set_inject_fd_send.restype = None
+_lib.sandlock_action_set_inject_fd_send.argtypes = [
+    ctypes.POINTER(_SandlockActionOut), ctypes.c_int32, ctypes.c_uint32,
+]
+
+_lib.sandlock_action_set_hold.restype = None
+_lib.sandlock_action_set_hold.argtypes = [ctypes.POINTER(_SandlockActionOut)]
+
+_lib.sandlock_action_set_kill.restype = None
+_lib.sandlock_action_set_kill.argtypes = [
+    ctypes.POINTER(_SandlockActionOut), ctypes.c_int32, ctypes.c_int32,
+]
+
+# Child-memory accessors — valid only for the duration of a callback.
+_lib.sandlock_mem_read_cstr.restype = ctypes.c_int
+_lib.sandlock_mem_read_cstr.argtypes = [
+    _c_mem_handle_p, ctypes.c_uint64,
+    ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_size_t),
+]
+
+_lib.sandlock_mem_read.restype = ctypes.c_int
+_lib.sandlock_mem_read.argtypes = [
+    _c_mem_handle_p, ctypes.c_uint64,
+    ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_size_t),
+]
+
+_lib.sandlock_mem_write.restype = ctypes.c_int
+_lib.sandlock_mem_write.argtypes = [
+    _c_mem_handle_p, ctypes.c_uint64,
+    ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t,
+]
+
+
+# ----------------------------------------------------------------
 # SyscallEvent & PolicyContext (Python wrappers for policy_fn)
 # ----------------------------------------------------------------
 
@@ -525,7 +677,7 @@ class Checkpoint:
     Usage::
 
         sb = Sandbox(fs_readable=["/usr", "/lib"])
-        sb.start(["sleep", "60"])
+        sb.spawn(["sleep", "60"])
         cp = sb.checkpoint()
         cp.save("my-checkpoint")
 
@@ -739,7 +891,7 @@ class _NativePolicy:
     # managed outside it (policy_fn is wired in from_dataclass; notif_policy
     # is Python-side only; no_coredump is a Python convenience alias).
     _HANDLED_FIELDS: set[str] = {
-        "fs_writable", "fs_readable", "fs_denied", "fs_storage", "fs_isolation",
+        "fs_writable", "fs_readable", "fs_denied", "fs_storage",
         "workdir", "cwd", "chroot", "fs_mount", "on_exit", "on_error",
         "max_memory", "max_disk", "max_processes", "max_cpu", "num_cpus",
         "cpu_cores", "gpu_devices",
@@ -774,15 +926,6 @@ class _NativePolicy:
 
         if policy.fs_storage:
             b = _b_fs_storage(b, _encode(str(policy.fs_storage)))
-
-        from .sandbox import FsIsolation
-        _iso_map = {
-            FsIsolation.NONE: 0,
-            FsIsolation.OVERLAYFS: 1,
-            FsIsolation.BRANCHFS: 2,
-        }
-        if policy.fs_isolation != FsIsolation.NONE:
-            b = _b_fs_isolation(b, _iso_map[policy.fs_isolation])
 
         if policy.gpu_devices is not None:
             arr = (ctypes.c_uint32 * len(policy.gpu_devices))(*policy.gpu_devices)

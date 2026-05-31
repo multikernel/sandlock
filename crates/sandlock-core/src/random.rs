@@ -15,7 +15,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::RawFd;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 
-use crate::seccomp::notif::{read_child_cstr, write_child_mem, NotifAction};
+use crate::seccomp::notif::{write_child_mem, NotifAction};
 use crate::sys::structs::SeccompNotif;
 use crate::sys::syscall;
 
@@ -57,15 +57,12 @@ pub(crate) fn handle_random_open(
     rng: &mut ChaCha8Rng,
     notif_fd: RawFd,
 ) -> Option<NotifAction> {
-    // openat(dirfd, pathname, flags, mode): args[1] = pathname pointer
-    let path_ptr = notif.data.args[1];
-    if path_ptr == 0 {
-        return None;
-    }
-
-    let path = read_child_cstr(notif_fd, notif.id, notif.pid, path_ptr, 4096)?;
-
-    if path.as_str() != "/dev/urandom" && path.as_str() != "/dev/random" {
+    // Resolve the open path so dirfd-relative or non-canonical spellings
+    // (`/dev/../dev/urandom`, `openat(open("/dev"), "urandom", ...)`)
+    // can't sidestep the seed and read real kernel entropy.
+    let resolved = crate::procfs::resolve_open_target(notif, notif_fd)?;
+    let path = resolved.to_str()?;
+    if path != "/dev/urandom" && path != "/dev/random" {
         return None;
     }
 

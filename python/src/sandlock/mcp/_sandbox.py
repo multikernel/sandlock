@@ -19,13 +19,55 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 import sys
-import textwrap
-from types import SimpleNamespace
+from collections import namedtuple
 from typing import Any, Callable, Mapping
 
 from ..sandbox import Sandbox
 from ._policy import policy_for_tool, capabilities_from_mcp_tool
+
+
+_Entrypoint = namedtuple("_Entrypoint", "module qualname syspath")
+
+# Absolute path to the worker, run as a plain script (not ``-m``) so it
+# executes with only stdlib imports and never pulls the sandlock package
+# (and its FFI cdylib) into the jail.
+_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_worker.py")
+
+
+def _resolve_entrypoint(name: str, func: Callable) -> _Entrypoint:
+    """Derive an importable (module, qualname, syspath) for a tool function.
+
+    Rejects lambdas, methods, and nested/closure functions, which cannot
+    be imported by name in a fresh interpreter.
+    """
+    qualname = getattr(func, "__qualname__", getattr(func, "__name__", ""))
+    if qualname == "<lambda>":
+        raise ValueError(
+            f"cannot sandbox {name!r}: tool must be a top-level function, not a lambda"
+        )
+    if "<locals>" in qualname:
+        raise ValueError(
+            f"cannot sandbox {name!r}: nested function {qualname!r} is not importable; "
+            f"define the tool at module top level"
+        )
+    if "." in qualname:
+        raise ValueError(
+            f"cannot sandbox {name!r}: expected a top-level function "
+            f"(got qualname {qualname!r}); methods are not supported"
+        )
+    try:
+        file = inspect.getfile(func)
+    except TypeError as exc:
+        raise ValueError(
+            f"cannot sandbox {name!r}: source location unavailable ({exc})"
+        )
+    syspath = os.path.dirname(os.path.abspath(file))
+    module = func.__module__
+    if module == "__main__":
+        module = os.path.splitext(os.path.basename(file))[0]
+    return _Entrypoint(module=module, qualname=qualname, syspath=syspath)
 
 
 class _LocalTool:
@@ -61,6 +103,7 @@ class McpSandbox:
         self._timeout = timeout
         self._local_tools: dict[str, _LocalTool] = {}
         self._local_policies: dict[str, Sandbox] = {}
+        self._local_entrypoints: dict[str, _Entrypoint] = {}
         self._mcp_tools: dict[str, Any] = {}
         self._mcp_tool_session: dict[str, Any] = {}
         self._mcp_policies: dict[str, Sandbox] = {}
@@ -78,8 +121,16 @@ class McpSandbox:
     ) -> None:
         """Register a local tool.
 
-        The function runs in a per-call sandbox.  It must be
-        self-contained (imports inside the function body).
+        Each call runs in a fresh per-call sandbox.  The function must be
+        a top-level function in an import-safe module: the worker imports
+        that module by name, so module-level imports, helpers, constants,
+        and state are all fine, but lambdas, methods, and nested functions
+        are rejected, and any startup logic in the module must be guarded
+        under ``if __name__ == "__main__":``.
+
+        If the function declares a parameter named ``workspace``, the
+        sandbox's workspace path is injected for it at call time (hidden
+        from the tool schema and not overridable by the caller).
 
         Args:
             name: Tool name.
@@ -88,6 +139,7 @@ class McpSandbox:
             capabilities: Permission grants.  No capabilities = read-only.
             input_schema: JSON Schema for parameters.
         """
+        entry = _resolve_entrypoint(name, func)
         self._local_tools[name] = _LocalTool(
             name=name,
             func=func,
@@ -95,9 +147,11 @@ class McpSandbox:
             capabilities=capabilities or {},
             input_schema=input_schema or {"type": "object", "properties": {}},
         )
+        self._local_entrypoints[name] = entry
         self._local_policies[name] = policy_for_tool(
             workspace=self._workspace,
             capabilities=capabilities,
+            extra_readable=[entry.syspath],
         )
 
     # --- MCP server tools ---
@@ -177,34 +231,21 @@ class McpSandbox:
             raise KeyError(f"Unknown tool: {name!r}")
 
     async def _call_local(self, name: str, args: dict, timeout: float | None) -> str:
-        tool = self._local_tools[name]
         policy = self._local_policies[name]
+        entry = self._local_entrypoints[name]
 
-        try:
-            source = textwrap.dedent(inspect.getsource(tool.func))
-        except (OSError, TypeError):
-            raise RuntimeError(
-                f"Cannot sandbox {name!r}: function source not available"
-            )
-
-        args_json = json.dumps(args)
-        script = f"""\
-import json, sys
-
-{source}
-
-_args = json.loads({args_json!r})
-_result = {tool.func.__name__}(**_args)
-if _result is not None:
-    print(_result if isinstance(_result, str) else json.dumps(_result))
-"""
+        cmd = [
+            sys.executable, _WORKER,
+            "--syspath", entry.syspath,
+            "--workspace", self._workspace,
+            entry.module, entry.qualname,
+            json.dumps(args),
+        ]
 
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             None,
-            lambda: policy.run(
-                [sys.executable, "-c", script], timeout=timeout,
-            ),
+            lambda: policy.run(cmd, timeout=timeout),
         )
 
         if not result.success:

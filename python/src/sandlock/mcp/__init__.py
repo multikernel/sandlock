@@ -15,10 +15,6 @@ Deny by default.  Each tool declares capabilities explicitly.
 
 from ._policy import policy_for_tool, capabilities_from_mcp_tool
 from ._sandbox import McpSandbox
-try:
-    from .server import create_server
-except ImportError:
-    pass  # mcp not installed
 
 __all__ = [
     "McpSandbox",
@@ -26,3 +22,13 @@ __all__ = [
     "policy_for_tool",
     "capabilities_from_mcp_tool",
 ]
+
+
+def __getattr__(name):
+    # Import the server (and the heavy ``mcp`` framework) lazily, so that
+    # importing a built-in tool module in the per-call worker does not pull
+    # the whole MCP stack into the jail.  Requires the ``mcp`` extra.
+    if name == "create_server":
+        from .server import create_server
+        return create_server
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

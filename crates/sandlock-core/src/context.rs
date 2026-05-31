@@ -6,7 +6,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use crate::arch;
-use crate::sandbox::{FsIsolation, Sandbox};
+use crate::sandbox::Sandbox;
 use crate::seccomp::bpf::{self, stmt, jump};
 use crate::sys::structs::{
     AF_INET, AF_INET6,
@@ -308,8 +308,18 @@ pub fn notif_syscalls(policy: &Sandbox, sandbox_name: Option<&str>) -> Vec<u32> 
         nrs.push(libc::SYS_openat as u32);
     }
 
-    // /proc virtualization (always on: PID filtering, sensitive path blocking)
+    // /proc virtualization + /etc/hosts virtualization (always on).
+    //
+    // `openat` carries the simple `(AT_FDCWD, "/proc/...")` and
+    // `(AT_FDCWD, "/etc/hosts")` spellings; `openat2` is the same shape
+    // on newer libcs; legacy `open(path, ...)` is the same path without a
+    // dirfd. The handlers normalize all three into a single absolute path
+    // check, so we have to put every variant on the notif list — otherwise
+    // a caller that picks `open` or `openat2` slips past virtualization
+    // and reads the real on-disk file.
     nrs.push(libc::SYS_openat as u32);
+    nrs.push(arch::SYS_OPENAT2 as u32);
+    arch::push_optional_syscall(&mut nrs, arch::SYS_OPEN);
     nrs.push(libc::SYS_getdents64 as u32);
     arch::push_optional_syscall(&mut nrs, arch::SYS_GETDENTS);
 
@@ -337,9 +347,11 @@ pub fn notif_syscalls(policy: &Sandbox, sandbox_name: Option<&str>) -> Vec<u32> 
     }
 
     // COW filesystem interception (seccomp-based, unprivileged)
-    if policy.workdir.is_some() && policy.fs_isolation == FsIsolation::None {
+    if policy.workdir.is_some() {
         nrs.extend_from_slice(&[
             libc::SYS_openat as u32,
+            libc::SYS_execve as u32,
+            libc::SYS_execveat as u32,
             libc::SYS_unlinkat as u32,
             libc::SYS_mkdirat as u32,
             libc::SYS_renameat2 as u32,
@@ -685,11 +697,8 @@ fn close_fds_above(min_fd: RawFd, keep: &[RawFd]) {
 }
 
 // ============================================================
-// COW filesystem config passed from parent to child
+// User-namespace uid/gid mapping helpers
 // ============================================================
-
-// Re-export ChildMountConfig so callers can use the old import path.
-pub(crate) use crate::cow::ChildMountConfig;
 
 /// Write uid/gid maps for an unprivileged user namespace.
 /// `real_uid`/`real_gid` must be captured *before* unshare(CLONE_NEWUSER),
@@ -699,14 +708,6 @@ fn write_id_maps(real_uid: u32, real_gid: u32, target_uid: u32, target_gid: u32)
     let _ = std::fs::write("/proc/self/uid_map", format!("{} {} 1\n", target_uid, real_uid));
     let _ = std::fs::write("/proc/self/setgroups", "deny\n");
     let _ = std::fs::write("/proc/self/gid_map", format!("{} {} 1\n", target_gid, real_gid));
-}
-
-/// Write uid/gid maps using the post-unshare overflow uid (65534).
-/// Used by the OverlayFS COW path which maps to root (UID 0) inside.
-fn write_id_maps_overflow() {
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
-    write_id_maps(uid, gid, 0, 0);
 }
 
 // ============================================================
@@ -724,8 +725,10 @@ pub(crate) struct ChildSpawnArgs<'a> {
     pub sandbox: &'a Sandbox,
     pub cmd: &'a [CString],
     pub pipes: &'a PipePair,
-    pub cow_config: Option<&'a ChildMountConfig>,
-    pub nested: bool,
+    /// Skip the user-notification supervisor: child installs a kernel-only
+    /// deny filter, parent reads `notif_fd_num = 0` and never starts a
+    /// supervisor. Mirrors `Sandbox::no_supervisor`.
+    pub no_supervisor: bool,
     pub keep_fds: &'a [RawFd],
     /// Sandbox instance name. When set, it is also exposed as the
     /// sandbox's virtual hostname.
@@ -734,6 +737,10 @@ pub(crate) struct ChildSpawnArgs<'a> {
     /// Merged into the child's BPF notif list so the kernel actually
     /// raises USER_NOTIF for them.
     pub extra_syscalls: &'a [u32],
+    /// PID of the parent process captured before fork. Used to detect
+    /// parent death in the child without assuming PID 1 is always init
+    /// (incorrect in containers where the entrypoint runs as PID 1).
+    pub parent_pid: libc::pid_t,
 }
 
 /// Apply irreversible confinement (Landlock + seccomp) then exec the command.
@@ -745,11 +752,11 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         sandbox,
         cmd,
         pipes,
-        cow_config,
-        nested,
+        no_supervisor,
         keep_fds,
         sandbox_name,
         extra_syscalls,
+        parent_pid,
     } = args;
     // Helper: abort child on error. Includes the OS error automatically.
     macro_rules! fail {
@@ -784,8 +791,11 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         fail!("prctl(PR_SET_PDEATHSIG)");
     }
 
-    // 3. Check parent didn't die between fork and prctl
-    if unsafe { libc::getppid() } == 1 {
+    // 3. Check parent didn't die between fork and prctl.
+    // Compare against the actual parent PID captured before fork rather than
+    // hardcoding 1, since containers often run the entrypoint as PID 1 and a
+    // child forked from it legitimately has getppid() == 1.
+    if unsafe { libc::getppid() } != parent_pid {
         fail!("parent died before confinement");
     }
 
@@ -847,65 +857,12 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     let real_uid = unsafe { libc::getuid() };
     let real_gid = unsafe { libc::getgid() };
 
-    // 5b. User namespace for --uid mapping (when not using OverlayFS COW,
-    //     which sets up its own user namespace)
+    // 5b. User namespace for --uid mapping.
     if let Some(target_uid) = sandbox.uid {
-        if cow_config.is_none() {
-            if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
-                fail!("unshare(CLONE_NEWUSER)");
-            }
-            write_id_maps(real_uid, real_gid, target_uid, target_uid);
+        if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
+            fail!("unshare(CLONE_NEWUSER)");
         }
-    }
-
-    // 5c. User + mount namespace for OverlayFS COW (includes CLONE_NEWUSER)
-    if let Some(ref cow) = cow_config {
-        // unshare user + mount namespaces (unprivileged)
-        if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) } != 0 {
-            fail!("unshare(CLONE_NEWUSER | CLONE_NEWNS)");
-        }
-
-        // Write uid/gid maps using overflow uid (preserves existing COW behavior)
-        write_id_maps_overflow();
-
-        // Mount the overlay filesystem ON TOP of the workdir so the child
-        // sees the merged view at the original path.  The kernel resolves
-        // lowerdir before the covering mount takes effect, so using the
-        // same path as both lowerdir and mount-point is safe inside our
-        // private mount namespace.
-        let lowerdir = cow.lowers.iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(":");
-        let opts = format!(
-            "lowerdir={},upperdir={},workdir={}",
-            lowerdir,
-            cow.upper.display(),
-            cow.work.display(),
-        );
-
-        let mount_cstr = match CString::new(cow.mount_point.to_str().unwrap_or("")) {
-            Ok(c) => c,
-            Err(_) => fail!("invalid overlay mount point path"),
-        };
-        let overlay_cstr = CString::new("overlay").unwrap();
-        let opts_cstr = match CString::new(opts) {
-            Ok(c) => c,
-            Err(_) => fail!("invalid overlay opts"),
-        };
-
-        let ret = unsafe {
-            libc::mount(
-                overlay_cstr.as_ptr(),
-                mount_cstr.as_ptr(),
-                overlay_cstr.as_ptr(),
-                0,
-                opts_cstr.as_ptr() as *const libc::c_void,
-            )
-        };
-        if ret != 0 {
-            fail!("mount overlay");
-        }
+        write_id_maps(real_uid, real_gid, target_uid, target_uid);
     }
 
     // 6. Optional: change working directory
@@ -947,13 +904,19 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     }
 
     // 9. Assemble and install seccomp filter (IRREVERSIBLE)
-    let deny = blocklist_syscall_numbers(sandbox);
     let args = arg_filters(sandbox);
     let mut keep_fd: i32 = -1;
 
-    if nested {
-        // Nested sandbox: deny-only filter (no supervisor — parent handles it).
-        // BPF filters are ANDed by the kernel, so each level can only tighten.
+    if no_supervisor {
+        // No-supervisor mode: deny-only kernel filter, no NEW_LISTENER.
+        // BPF filters are ANDed by the kernel, so an outer filter (from a
+        // wrapping sandbox) keeps tightening this layer too.
+        //
+        // Uses the relaxed `no_supervisor_blocklist_syscall_numbers` deny
+        // list (which leaves `ptrace`, `unshare`, `process_vm_*`, etc.
+        // alone) so an inner full-supervisor sandlock nested under this
+        // one still has the syscalls its supervisor needs.
+        let deny = no_supervisor_blocklist_syscall_numbers(sandbox);
         let filter = match bpf::assemble_filter(&[], &deny, &args) {
             Ok(f) => f,
             Err(e) => fail!(format!("seccomp assemble: {}", e)),
@@ -961,14 +924,15 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         if let Err(e) = bpf::install_deny_filter(&filter) {
             fail!(format!("seccomp deny filter: {}", e));
         }
-        // Signal nested mode to parent (fd=0 means no supervisor needed)
+        // fd=0 tells the parent there's no supervisor to attach to.
         if let Err(e) = write_u32_fd(pipes.notif_w.as_raw_fd(), 0) {
-            fail!(format!("write nested signal: {}", e));
+            fail!(format!("write no-supervisor signal: {}", e));
         }
     } else {
+        let deny = blocklist_syscall_numbers(sandbox);
         // First-level sandbox: notif + deny filter with NEW_LISTENER.
         //
-        // Caller-supplied extra handlers must have their syscalls registered in
+        // Caller-supplied handlers must have their syscalls registered in
         // the BPF filter, otherwise the kernel never raises a notification for
         // them and the handler silently never fires.  We merge `extra_syscalls`
         // into the notif list and dedup so each syscall produces exactly one
@@ -978,7 +942,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
             notif.extend_from_slice(extra_syscalls);
         }
         // Argv-safety gate (companion to the policy_fn case in
-        // notif_syscalls): an extra handler bound to execve/execveat
+        // notif_syscalls): a handler bound to execve/execveat
         // can call `read_child_mem` to inspect argv, so the supervisor
         // must register newly forked children before they can run user
         // code — same invariant policy_fn relies on. Bare fork(2)
@@ -997,7 +961,24 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         };
         let notif_fd = match bpf::install_filter(&filter) {
             Ok(fd) => fd,
-            Err(e) => fail!(format!("seccomp install: {}", e)),
+            Err(e) => {
+                // EBUSY here means another seccomp filter on this task already
+                // owns the SECCOMP_FILTER_FLAG_NEW_LISTENER slot. The kernel
+                // permits at most one listener per task — to nest, opt this
+                // sandbox out of the supervisor via `Sandbox::no_supervisor`
+                // (or the CLI's `--no-supervisor` flag).
+                if e.raw_os_error() == Some(libc::EBUSY) {
+                    let _ = write!(
+                        std::io::stderr(),
+                        "sandlock child: seccomp install: {} (an outer sandbox already owns the \
+                         seccomp listener; pass --no-supervisor or Sandbox::no_supervisor(true) \
+                         on this sandbox to nest)\n",
+                        e,
+                    );
+                    unsafe { libc::_exit(127) };
+                }
+                fail!(format!("seccomp install: {}", e));
+            }
         };
         keep_fd = notif_fd.as_raw_fd();
         if let Err(e) = write_u32_fd(pipes.notif_w.as_raw_fd(), keep_fd as u32) {
@@ -1005,9 +986,6 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         }
         std::mem::forget(notif_fd);
     }
-
-    // Mark this process as confined for in-process nesting detection
-    crate::process::CONFINED.store(true, std::sync::atomic::Ordering::Relaxed);
 
     // 10. Wait for parent to signal ready
     match read_u32_fd(pipes.ready_r.as_raw_fd()) {
@@ -1387,9 +1365,9 @@ mod tests {
         // running architecture does not expose that syscall.
         let expected_unresolved: &[&str] = &[
             "nfsservctl",
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             "ioperm",
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             "iopl",
         ];
         let mut skipped = 0;

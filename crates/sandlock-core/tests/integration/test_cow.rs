@@ -1,5 +1,5 @@
 use sandlock_core::{Sandbox};
-use sandlock_core::sandbox::{FsIsolation, BranchAction};
+use sandlock_core::sandbox::BranchAction;
 use std::fs;
 use std::path::PathBuf;
 
@@ -9,112 +9,8 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
-/// Test that basic commands still work with OverlayFS enabled.
-#[tokio::test]
-async fn test_overlayfs_basic_commands() {
-    let workdir = temp_dir("basic");
-    let storage = temp_dir("basic-storage");
-    fs::write(workdir.join("hello.txt"), "original").unwrap();
-
-    let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
-        .fs_read("/proc")
-        .fs_write(&workdir)
-        .fs_isolation(FsIsolation::OverlayFs)
-        .workdir(&workdir)
-        .fs_storage(&storage)
-        .build()
-        .unwrap();
-
-    let result = policy.clone().with_name("test").run(&["cat", "hello.txt"]).await;
-    // May fail on systems without unprivileged overlayfs support
-    match result {
-        Ok(r) => assert!(r.success(), "cat should succeed"),
-        Err(e) => eprintln!("OverlayFS test skipped (not supported): {}", e),
-    }
-
-    let _ = fs::remove_dir_all(&workdir);
-    let _ = fs::remove_dir_all(&storage);
-}
-
-/// Test that writes in the sandbox don't affect the original directory (abort).
-#[tokio::test]
-async fn test_overlayfs_write_isolation() {
-    let workdir = temp_dir("isolation");
-    let storage = temp_dir("isolation-storage");
-    fs::write(workdir.join("data.txt"), "original").unwrap();
-
-    let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
-        .fs_read("/proc")
-        .fs_write(&workdir)
-        .fs_isolation(FsIsolation::OverlayFs)
-        .workdir(&workdir)
-        .fs_storage(&storage)
-        .on_exit(BranchAction::Abort)
-        .on_error(BranchAction::Abort)
-        .build()
-        .unwrap();
-
-    // Write to a file inside the sandbox
-    let result = policy.clone().with_name("test").run(&["sh", "-c", "echo modified > data.txt"]).await;
-    match result {
-        Ok(_r) => {
-            // Original file should still say "original" (COW aborted)
-            let content = fs::read_to_string(workdir.join("data.txt")).unwrap();
-            assert_eq!(content.trim(), "original", "Original should be unchanged after abort");
-        }
-        Err(e) => eprintln!("OverlayFS test skipped: {}", e),
-    }
-
-    let _ = fs::remove_dir_all(&workdir);
-    let _ = fs::remove_dir_all(&storage);
-}
-
-/// Test that COW commit merges writes back.
-#[tokio::test]
-async fn test_overlayfs_commit() {
-    let workdir = temp_dir("commit");
-    let storage = temp_dir("commit-storage");
-    fs::write(workdir.join("data.txt"), "original").unwrap();
-
-    let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
-        .fs_read("/proc")
-        .fs_write(&workdir)
-        .fs_isolation(FsIsolation::OverlayFs)
-        .workdir(&workdir)
-        .fs_storage(&storage)
-        .on_exit(BranchAction::Commit)
-        .build()
-        .unwrap();
-
-    let result = policy.clone().with_name("test").run(&["sh", "-c", "echo committed > data.txt"]).await;
-    match result {
-        Ok(r) => {
-            if r.success() {
-                let content = fs::read_to_string(workdir.join("data.txt")).unwrap();
-                assert_eq!(content.trim(), "committed", "File should be updated after commit");
-            }
-        }
-        Err(e) => eprintln!("OverlayFS test skipped: {}", e),
-    }
-
-    let _ = fs::remove_dir_all(&workdir);
-    let _ = fs::remove_dir_all(&storage);
-}
-
-/// Test that policy validation catches missing workdir.
-#[tokio::test]
-async fn test_cow_requires_workdir() {
-    let result = Sandbox::builder()
-        .fs_isolation(FsIsolation::OverlayFs)
-        .build();
-    assert!(result.is_err(), "Should fail without workdir");
-}
-
 // ============================================================
-// Seccomp-based COW tests (FsIsolation::None + workdir)
+// Seccomp-based COW tests (workdir set)
 // ============================================================
 
 /// Test that seccomp COW creates files in upper, committed on exit.
@@ -127,7 +23,7 @@ async fn test_seccomp_cow_create_file() {
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc")
         .fs_write(&workdir)
-        .workdir(&workdir)  // FsIsolation::None is default → seccomp COW
+        .workdir(&workdir)  // workdir set → seccomp COW
         .on_exit(BranchAction::Commit)
         .build()
         .unwrap();
@@ -356,7 +252,8 @@ async fn test_seccomp_cow_chdir_to_created_dir() {
 /// (dirfd=args[0], path=args[1], flags=args[2]), but open() uses
 /// (path=args[0], flags=args[1], mode=args[2]). This caused COW to miss
 /// all legacy open() calls on x86_64, falling through to the kernel. ARM64
-/// does not provide SYS_open, so it uses the equivalent raw openat ABI.
+/// and riscv64 do not provide SYS_open, so they use the equivalent raw
+/// openat ABI.
 #[tokio::test]
 async fn test_seccomp_cow_legacy_open_syscall() {
     let workdir = temp_dir("seccomp-legacy-open");
@@ -375,14 +272,14 @@ async fn test_seccomp_cow_legacy_open_syscall() {
         .unwrap();
 
     // Use raw syscall ABI to create a file, then verify it's visible during
-    // the run but discarded on abort. x86_64 uses legacy SYS_open; ARM64 uses
-    // the equivalent openat(AT_FDCWD, ...) ABI.
+    // the run but discarded on abort. x86_64 uses legacy SYS_open; ARM64 and
+    // riscv64 use the equivalent openat(AT_FDCWD, ...) ABI.
     let script = format!(concat!(
         "import ctypes, os, platform\n",
         "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
         "O_WRONLY = 1; O_CREAT = 64; O_TRUNC = 512\n",
         "path = b'{wd}/newfile.txt'\n",
-        "if platform.machine() == 'aarch64':\n",
+        "if platform.machine() in ('aarch64', 'riscv64'):\n",
         "    fd = libc.syscall(56, -100, path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)\n",
         "else:\n",
         "    fd = libc.syscall(2, path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)\n",
@@ -442,7 +339,7 @@ async fn test_seccomp_cow_excl_after_unlink() {
         "    open('{out}', 'w').write(f'UNLINK_FAILED:{{ctypes.get_errno()}}')\n",
         "    raise SystemExit(1)\n",
         "O_WRONLY = 1; O_CREAT = 64; O_EXCL = 128\n",
-        "if platform.machine() == 'aarch64':\n",
+        "if platform.machine() in ('aarch64', 'riscv64'):\n",
         "    fd = libc.syscall(56, -100, path, O_WRONLY | O_CREAT | O_EXCL, 0o644)\n",
         "else:\n",
         "    fd = libc.syscall(2, path, O_WRONLY | O_CREAT | O_EXCL, 0o644)\n",
@@ -497,6 +394,91 @@ async fn test_seccomp_cow_read_existing() {
         }
         Err(e) => eprintln!("Seccomp COW test skipped: {}", e),
     }
+
+    let _ = fs::remove_dir_all(&workdir);
+}
+
+/// Regression test: statx on a COW-created file must succeed.
+///
+/// statx is what `ls`, `stat`, and most modern coreutils use. The COW
+/// statx handler returned Continue when the file existed in the upper
+/// layer, so the kernel re-ran statx against the un-redirected lower path
+/// and returned ENOENT for files that live only in upper.
+#[tokio::test]
+async fn test_seccomp_cow_statx_created_file() {
+    let workdir = temp_dir("seccomp-statx");
+    let out_file = std::env::temp_dir().join(format!(
+        "sandlock-test-statx-{}", std::process::id()
+    ));
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc").fs_read("/dev")
+        .fs_write(&workdir).fs_write("/tmp")
+        .workdir(&workdir)
+        .cwd(&workdir)
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+
+    // Create a file that lives only in the COW upper layer, then statx it
+    // via the raw syscall (the path coreutils `stat`/`ls` take).
+    let script = format!(concat!(
+        "import ctypes, os, platform\n",
+        "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
+        "libc.syscall.restype = ctypes.c_long\n",
+        "open('created.txt', 'w').write('hi')\n",
+        "buf = ctypes.create_string_buffer(256)\n",
+        "AT_FDCWD = -100\n",
+        "STATX_BASIC_STATS = 0x7ff\n",
+        "nr = 291 if platform.machine() == 'aarch64' else 332\n",
+        "ret = libc.syscall(nr, AT_FDCWD, b'created.txt', 0, STATX_BASIC_STATS, buf)\n",
+        "err = ctypes.get_errno()\n",
+        "open('{out}', 'w').write('OK' if ret == 0 else f'FAIL:errno={{err}}')\n",
+    ), out = out_file.display());
+
+    let result = policy.clone().with_name("test").run(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "exit={:?}, stderr={}", result.code(), result.stderr_str().unwrap_or(""));
+    let content = fs::read_to_string(&out_file).unwrap_or_default();
+    assert_eq!(content, "OK", "statx on COW-created file should succeed, got: {}", content);
+
+    let _ = fs::remove_dir_all(&workdir);
+    let _ = fs::remove_file(&out_file);
+}
+
+/// Regression test: a binary created inside the COW workdir must
+/// be executable. execve had no COW redirect, so the kernel resolved the
+/// un-redirected lower path and returned ENOENT for binaries that live
+/// only in the upper layer.
+#[tokio::test]
+async fn test_seccomp_cow_exec_created_file() {
+    let workdir = temp_dir("seccomp-exec");
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc").fs_read("/dev")
+        .fs_write(&workdir)
+        .workdir(&workdir)
+        .cwd(&workdir)
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+
+    // Copy a real binary into the COW workdir (lands in upper), then exec it.
+    let result = policy.clone().with_name("test").run(&[
+        "sh", "-c", "cp /bin/echo m && ./m EXEC_OK",
+    ]).await.unwrap();
+
+    assert!(
+        result.success(),
+        "exec of COW-created binary should succeed, exit={:?}, stderr={}",
+        result.code(), result.stderr_str().unwrap_or("")
+    );
+    assert!(
+        result.stdout_str().unwrap_or("").contains("EXEC_OK"),
+        "exec'd binary should print EXEC_OK, stdout={:?}",
+        result.stdout_str()
+    );
 
     let _ = fs::remove_dir_all(&workdir);
 }

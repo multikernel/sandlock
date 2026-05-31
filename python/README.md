@@ -37,6 +37,31 @@ Returns -1 if Landlock is unavailable.
 
 Return the minimum Landlock ABI version required by sandlock (currently 6).
 
+### Confine
+
+Apply a `Sandbox`'s Landlock rules to the **current** process, in
+place. No fork, no exec.
+
+```python
+from sandlock import Sandbox, confine
+
+confine(Sandbox(
+    fs_readable=["/usr", "/lib"],
+    fs_writable=["/tmp"],
+))
+```
+
+#### `sandlock.confine(sandbox) -> None`
+
+Set `PR_SET_NO_NEW_PRIVS` and install the sandbox's Landlock ruleset
+on the live process. The confinement is **irreversible**.
+
+Only Landlock fields are honored (`fs_readable`, `fs_writable`,
+`fs_denied`); IPC and signal scoping are always applied. Sandbox
+config that requires a supervisor or a fresh child (seccomp, network,
+resource limits, COW, env, `policy_fn`, etc.) is rejected rather than
+silently ignored. Raises `ConfinementError` on failure.
+
 ### Sandbox
 
 ```python
@@ -45,7 +70,7 @@ sandlock.Sandbox(**kwargs)
 
 Sandbox configuration and runtime handle. Holds both the policy (filesystem,
 network, resource limits, etc.) and runtime state. Construct once, then call
-`run()`, `start()` + lifecycle methods, or use as a context manager.
+`run()` (blocking) or `spawn()` + lifecycle methods, or use as a context manager.
 
 All config fields are optional. Unset fields mean "no restriction" unless
 noted otherwise. Runtime kwargs (`name`, `policy_fn`, `init_fn`, `work_fn`)
@@ -204,9 +229,8 @@ Sandlock always applies its default syscall blocklist.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `fs_isolation` | `FsIsolation` | `NONE` | `NONE`, `BRANCHFS`, or `OVERLAYFS` |
-| `fs_storage` | `str \| None` | `None` | Storage directory for BranchFS deltas |
-| `max_disk` | `str \| None` | `None` | Disk quota for BranchFS (e.g. `"1G"`) |
+| `fs_storage` | `str \| None` | `None` | Storage directory for the seccomp COW upper layer / deltas |
+| `max_disk` | `str \| None` | `None` | Disk quota for COW storage (e.g. `"1G"`) |
 | `on_exit` | `BranchAction` | `COMMIT` | `COMMIT`, `ABORT`, or `KEEP` |
 | `on_error` | `BranchAction` | `ABORT` | `COMMIT`, `ABORT`, or `KEEP` |
 
@@ -221,12 +245,30 @@ Run a command, capturing stdout and stderr.
 result = sandbox.run(["python3", "-c", "print(42)"], timeout=10.0)
 ```
 
-#### `sandbox.start(cmd) -> None`
+#### `sandbox.spawn(cmd) -> None`
 
 Spawn `cmd` without waiting. Use `pid`, `pause()`, `resume()`, `kill()`,
 and `wait()` to manage the process lifecycle.
 
 Raises `RuntimeError` if a process is already running.
+
+Sugar for `create(cmd) + start()`; use those directly when you need the
+fork-park-exec split (e.g. starting several sandboxes in lockstep, or
+attaching external tracing to the parked PID before the child execs).
+
+#### `sandbox.create(cmd) -> None`
+
+Fork the sandboxed child and install policy. The child is parked between
+policy install and `execve`; call `start()` to release it. `pid` is
+available after this call but the child is not yet running user code.
+
+Raises `RuntimeError` if a process is already running.
+
+#### `sandbox.start() -> None`
+
+Release a previously `create()`d child to `execve`.
+
+Raises `RuntimeError` if no child has been created.
 
 #### `sandbox.wait() -> Result`
 
@@ -321,6 +363,80 @@ Create a lazy `Stage` bound to this sandbox.
 #### `pipeline.run(stdout=None, timeout=None) -> Result`
 
 Run the pipeline. Each stage's stdout feeds the next stage's stdin.
+
+### Gather
+
+Fan multiple producers into one consumer via named pipes. Each
+producer's stdout is delivered to the consumer under a label the
+consumer reads from a `sandlock.inputs` dict. This is the structural
+primitive behind the XOA pattern: producers and consumer are
+independent sandboxes, and the consumer never executes producer code
+inside its own LLM call.
+
+```python
+from sandlock import Sandbox
+
+planner  = Sandbox(...)   # writes code
+searcher = Sandbox(...)   # produces data
+executor = Sandbox(...)   # consumes both
+
+result = (
+    searcher.cmd(["python3", "-c", "..."]).as_("data")
+    + planner.cmd(["python3", "-c", "..."]).as_("code")
+    | executor.cmd(["python3", "consume.py"])
+).run()
+```
+
+Inside `consume.py`:
+
+```python
+from sandlock import inputs
+
+code = inputs["code"]
+data = inputs["data"]
+exec(compile(code, "<planner>", "exec"), {"data": data})
+```
+
+#### `stage.as_(name) -> NamedStage`
+
+Label a `Stage`'s stdout so the consumer can address it by name.
+
+#### `named_stage + named_stage_or_gather -> Gather`
+
+Combine two or more `NamedStage` values into a `Gather`. Repeated `+`
+extends the gather:
+
+```python
+g = a.as_("x") + b.as_("y") + c.as_("z")
+```
+
+#### `gather | consumer_stage -> GatherPipeline`
+
+Compose a `Gather` with a consumer `Stage` to form the runnable
+pipeline.
+
+#### `gather_pipeline.run(timeout=None) -> Result`
+
+Run all producers in parallel; each producer's stdout is wired to a
+pipe the consumer reads via `inputs[name]`. Returns the consumer's
+`Result`.
+
+#### `sandlock.inputs`
+
+Lazy dict-like accessor available inside the consumer process. Reads
+each producer's pipe on first access and caches the value.
+
+```python
+from sandlock import inputs
+
+inputs["code"]        # str: the producer's full stdout, decoded as utf-8
+"data" in inputs      # bool
+list(inputs.keys())   # ["data", "code"]
+```
+
+The pipe fds are passed via the `_SANDLOCK_GATHER` env var
+(`name:fd,name:fd,...`); the `inputs` object parses it on first
+access. Users do not interact with the env var directly.
 
 ### Dynamic policy
 
@@ -450,7 +566,7 @@ SandlockError (base)
   +-- SandboxRuntimeError  sandbox lifecycle errors
         +-- ForkError          fork failed
         +-- ChildError         child exited abnormally
-        +-- BranchError        BranchFS operation failed
+        +-- BranchError        COW branch operation failed
         |     +-- BranchConflictError   sibling branch committed (ESTALE)
         +-- ConfinementError   Landlock/seccomp setup failed
               +-- LandlockUnavailableError   no Landlock support
@@ -467,12 +583,6 @@ from sandlock import SandlockError, SandboxError, SandboxRuntimeError
 ```
 
 ### Enums
-
-#### `FsIsolation`
-
-- `FsIsolation.NONE` -- direct host writes (default)
-- `FsIsolation.BRANCHFS` -- BranchFS COW isolation
-- `FsIsolation.OVERLAYFS` -- OverlayFS COW
 
 #### `BranchAction`
 
@@ -502,19 +612,30 @@ mcp = McpSandbox(workspace="/tmp/agent", timeout=30.0)
 
 #### `mcp.add_tool(name, func, *, description="", capabilities=None, input_schema=None)`
 
-Register a local tool. The function must be self-contained (imports inside
-the body) -- it is serialized and executed in a fresh sandbox process.
+Register a local tool. `func` must be a top-level function in an import-safe
+module: the worker imports that module by name and calls the function in a
+fresh per-call sandbox. Module-level imports, helpers, constants, and state
+are all fine; lambdas, methods, and nested functions are rejected. Guard any
+module startup logic under `if __name__ == "__main__":`.
+
+A tool that declares a parameter named `workspace` receives the sandbox's
+workspace path automatically (injected at call time, hidden from the LLM
+schema, and not overridable by the model). No env wiring needed.
 
 ```python
-def read_file(path: str) -> str:
-    import os
-    workspace = os.environ["SANDLOCK_WORKSPACE"]
+# tools.py  (an importable module)
+import os
+
+def read_file(path: str, *, workspace: str) -> str:
     with open(os.path.join(workspace, path)) as f:
         return f.read()
+```
 
-mcp.add_tool("read_file", read_file,
+```python
+import tools
+
+mcp.add_tool("read_file", tools.read_file,
     description="Read a file from the workspace",
-    capabilities={"env": {"SANDLOCK_WORKSPACE": "/tmp/agent"}},
 )
 ```
 

@@ -214,3 +214,99 @@ fn test_no_supervisor_exit_code() {
     assert_eq!(output.status.code(), Some(42));
 }
 
+/// Regression: `Sandbox::Drop` must run when the CLI exits.
+///
+/// When `--workdir` is set, seccomp COW stages writes in an upper layer
+/// and only copies them back to the workdir on commit, which runs in
+/// `Sandbox::Drop`. A previous version of the CLI called
+/// `std::process::exit(...)` from inside the function that owned the
+/// `Sandbox`, which skipped destructors entirely. Result: the file
+/// stayed orphaned in `/tmp/sandlock-cow-*/upper/` and never appeared
+/// in the workdir, even though the default `on_exit` is `commit`.
+#[test]
+fn test_cow_commit_runs_on_cli_exit() {
+    let workdir = tempfile::tempdir().expect("tempdir");
+    let sentinel = workdir.path().join("sentinel.txt");
+    assert!(!sentinel.exists(), "precondition: sentinel should not exist");
+
+    let cmd = format!("echo committed > {}", sentinel.display());
+    let output = sandlock_bin()
+        .args([
+            "run",
+            "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "-r", "/etc",
+            "-w", workdir.path().to_str().unwrap(),
+            "--workdir", workdir.path().to_str().unwrap(),
+            "--", "sh", "-c", &cmd,
+        ])
+        .output()
+        .expect("failed to run sandlock");
+    assert!(
+        output.status.success(),
+        "sandlock exit={:?}, stderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    assert!(
+        sentinel.exists(),
+        "COW commit did not run on CLI exit: {} missing. \
+         Was process::exit called instead of returning the exit code?",
+        sentinel.display(),
+    );
+    let contents = std::fs::read_to_string(&sentinel).unwrap_or_default();
+    assert_eq!(contents.trim(), "committed");
+}
+
+/// Regression: `--uid N` maps the sandbox to UID `N` via an unprivileged
+/// user namespace, even when the host UID is non-zero. This is the only
+/// remaining `CLONE_NEWUSER` site after the overlayfs backend removal;
+/// the test guards against accidentally tearing it out.
+#[test]
+fn test_uid_mapping_fakes_root() {
+    // `id -u` reports the in-namespace UID. Passing --uid 0 should make
+    // the child see UID 0 (fake root) regardless of the host UID.
+    let output = sandlock_bin()
+        .args([
+            "run",
+            "--uid", "0",
+            "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "-r", "/etc",
+            "--", "id", "-u",
+        ])
+        .output()
+        .expect("failed to run sandlock");
+    assert!(
+        output.status.success(),
+        "sandlock --uid 0 failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "0",
+        "expected UID 0 inside sandbox; got stdout={:?}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+}
+
+#[test]
+fn test_uid_mapping_arbitrary_uid() {
+    // Arbitrary --uid value should also map cleanly (not just 0).
+    let output = sandlock_bin()
+        .args([
+            "run",
+            "--uid", "1234",
+            "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "-r", "/etc",
+            "--", "id", "-u",
+        ])
+        .output()
+        .expect("failed to run sandlock");
+    assert!(
+        output.status.success(),
+        "sandlock --uid 1234 failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "1234",
+    );
+}
+

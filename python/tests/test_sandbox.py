@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for sandlock.Sandbox (ctypes FFI bindings)."""
 
+from __future__ import annotations
+
 import json
 import os
 import socket
@@ -23,6 +25,17 @@ def _policy(**overrides):
     defaults = {"fs_readable": _PYTHON_READABLE}
     defaults.update(overrides)
     return Sandbox(**defaults)
+
+
+def _join_threads_or_fail(threads, timeout: float):
+    deadline = time.monotonic() + timeout
+    for thread in threads:
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+
+    alive = [thread.name for thread in threads if thread.is_alive()]
+    assert not alive, (
+        f"threads did not finish within {timeout:g}s: {', '.join(alive)}"
+    )
 
 
 class TestSandboxRun:
@@ -74,6 +87,126 @@ class TestSandboxRun:
         result = policy.run(["cat", str(secret)])
 
         assert not result.success
+
+
+class TestSandlockRunCAbiMultiThreaded:
+    """Regression for issue #47 covering only the C ABI ``sandlock_run`` path.
+
+    Tests here invoke ``_lib.sandlock_run`` directly through ctypes from
+    multiple threads, then assert all calls succeed and produce the
+    expected output. The Python ``Sandbox.run()`` user-facing path is
+    covered by :class:`TestSandboxRunMultiThreaded` below; it uses
+    ``sandlock_create_for_run`` so the parked handle still exposes
+    PID/pause/resume during ``run()``.
+
+    Note: these tests assert "concurrent multi-threaded callers do not
+    deadlock or corrupt each other"; they are not red-on-pristine
+    against a regression that re-introduces the eager multi-thread
+    worker-spawn pattern, because glibc transparently falls back from
+    ``clone3`` to ``clone(2)`` on an unrestricted dev box. The original
+    failure mode requires a host with ``clone3`` blocked by seccomp
+    (Kubernetes ``RuntimeDefault``).
+    """
+
+    @staticmethod
+    def _run_via_c_abi(name: str, cmd):
+        """Invoke ``sandlock_run`` directly, bypassing Python ``Sandbox.run``."""
+        import ctypes
+        from sandlock._sdk import _lib, _make_argv, _read_result_bytes, Result
+
+        sb = Sandbox(name=name, fs_readable=_PYTHON_READABLE)
+        native = sb._ensure_native()
+        argv, argc = _make_argv(list(cmd))
+        name_b = name.encode("utf-8") + b"\x00"
+
+        result_p = _lib.sandlock_run(
+            native.ptr, ctypes.c_char_p(name_b), argv, argc,
+        )
+        if not result_p:
+            return Result(success=False, exit_code=-1, error="sandlock_run returned NULL")
+
+        exit_code = _lib.sandlock_result_exit_code(result_p)
+        success = _lib.sandlock_result_success(result_p)
+        stdout = _read_result_bytes(result_p, _lib.sandlock_result_stdout_bytes)
+        stderr = _read_result_bytes(result_p, _lib.sandlock_result_stderr_bytes)
+        _lib.sandlock_result_free(result_p)
+        return Result(
+            success=bool(success), exit_code=exit_code,
+            stdout=stdout, stderr=stderr,
+        )
+
+    def test_concurrent_sandlock_run_from_many_threads(self):
+        N = 8
+        results = [None] * N
+        errors = [None] * N
+
+        def worker(i: int):
+            try:
+                results[i] = self._run_via_c_abi(
+                    f"issue47-cabi-{i}", ["echo", f"hello from thread {i}"],
+                )
+            except Exception as e:
+                errors[i] = e
+
+        threads = [
+            threading.Thread(
+                target=worker,
+                args=(i,),
+                name=f"issue47-cabi-{i}",
+                daemon=True,
+            )
+            for i in range(N)
+        ]
+        for t in threads:
+            t.start()
+        _join_threads_or_fail(threads, timeout=30)
+
+        for i in range(N):
+            assert errors[i] is None, f"thread {i} raised: {errors[i]}"
+            assert results[i] is not None, f"thread {i} produced no result"
+            assert results[i].success, (
+                f"thread {i}: success=False exit={results[i].exit_code} "
+                f"error={results[i].error!r}"
+            )
+            assert f"hello from thread {i}".encode() in results[i].stdout
+
+
+class TestSandboxRunMultiThreaded:
+    """Regression for issue #47 on the Python user-facing ``Sandbox.run`` path."""
+
+    def test_concurrent_run_from_many_threads(self):
+        N = 8
+        results = [None] * N
+        errors = [None] * N
+
+        def worker(i: int):
+            try:
+                sb = Sandbox(name=f"issue47-python-{i}", fs_readable=_PYTHON_READABLE)
+                results[i] = sb.run(["echo", f"hello from thread {i}"])
+            except Exception as e:
+                errors[i] = e
+
+        threads = [
+            threading.Thread(
+                target=worker,
+                args=(i,),
+                name=f"issue47-python-{i}",
+                daemon=True,
+            )
+            for i in range(N)
+        ]
+        for t in threads:
+            t.start()
+        _join_threads_or_fail(threads, timeout=30)
+
+        for i in range(N):
+            assert errors[i] is None, f"thread {i} raised: {errors[i]}"
+            assert results[i] is not None, f"thread {i} produced no result"
+            assert results[i].success, (
+                f"thread {i}: success=False exit={results[i].exit_code} "
+                f"error={results[i].error!r}"
+            )
+            assert f"hello from thread {i}".encode() in results[i].stdout
 
 
 class TestPortRemap:
@@ -267,46 +400,29 @@ class TestCpuThrottle:
 
 
 class TestPauseResume:
-    def test_pause_resume_from_thread(self):
+    def test_pause_resume(self):
         sb = _policy()
-
-        def run_in_thread():
-            return sb.run(["python3", "-c",
-                "import time\n"
-                "for i in range(5):\n"
-                "    print(i, flush=True)\n"
-                "    time.sleep(0.1)\n"
-            ])
-
-        t = threading.Thread(target=run_in_thread)
-        t.start()
-        time.sleep(0.15)  # let it start
+        sb.spawn(["python3", "-c",
+            "import time\n"
+            "for i in range(5):\n"
+            "    print(i, flush=True)\n"
+            "    time.sleep(0.1)\n"
+        ])
 
         sb.pause()
-        time.sleep(0.3)  # paused — should not progress
+        time.sleep(0.3)  # paused, should not progress
         sb.resume()
-
-        t.join(timeout=10)
-        # Process should have completed after resume
+        sb.wait()
 
     def test_pid_available_during_run(self):
         sb = _policy()
-        pid_seen = []
-
-        def run_in_thread():
-            sb.run(["sleep", "1"])
-
-        t = threading.Thread(target=run_in_thread)
-        t.start()
-        time.sleep(0.1)
+        sb.spawn(["sleep", "1"])
 
         pid = sb.pid
         assert pid is not None
         assert pid > 0
-        pid_seen.append(pid)
 
-        # After run completes, pid should be None
-        t.join(timeout=10)
+        sb.wait()
         assert sb.pid is None
 
     def test_pause_not_running_raises(self):
@@ -416,33 +532,6 @@ class TestNewPolicyFields:
         result = p.run(["echo", "ok"])
         assert result.success
 
-
-
-class TestFsIsolation:
-    """Tests for fs_isolation FFI wiring."""
-
-    def test_fs_isolation_none_runs(self):
-        """Default FsIsolation.NONE should work normally."""
-        from sandlock.sandbox import FsIsolation
-        p = _policy()
-        assert p.fs_isolation == FsIsolation.NONE
-        result = p.run(["echo", "ok"])
-        assert result.success
-
-    def test_fs_isolation_value_roundtrips(self):
-        """Non-default values are accepted by the FFI builder without error."""
-        from sandlock.sandbox import FsIsolation
-        import warnings
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            p = _policy(fs_isolation=FsIsolation.BRANCHFS)
-            # Building the native policy should succeed (the mode itself
-            # may fail at sandbox.run time without branchfs, but FFI wiring
-            # should not warn or crash).
-            from sandlock._sdk import _NativePolicy
-            _NativePolicy._build_from_policy(p)
-        unwired = [x for x in w if "fs_isolation" in str(x.message)]
-        assert unwired == [], "fs_isolation should be wired, not warned about"
 
 
 class TestGpuDevices:

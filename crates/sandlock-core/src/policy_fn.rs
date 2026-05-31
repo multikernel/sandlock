@@ -75,7 +75,7 @@ pub enum SyscallCategory {
 /// sees the same memory the supervisor inspected. Siblings are killed
 /// by the kernel during execve's `de_thread` step; peer threads are
 /// detached after `NOTIF_SEND` and resume normally. See
-/// `crate::sandbox_freeze`.
+/// `crate::freeze`.
 ///
 /// Network fields (`host`, `port`) are TOCTOU-safe because the
 /// supervisor performs `connect`/`sendto`/`bind` on-behalf via

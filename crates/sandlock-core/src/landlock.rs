@@ -24,6 +24,16 @@ use crate::sys::syscall;
 const READ_ACCESS: u64 =
     LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
 
+/// Access rights that apply to non-directory files. The kernel rejects a
+/// path-beneath rule on a non-directory whose `allowed_access` carries any
+/// directory-only right (READ_DIR, MAKE_*, REMOVE_*, REFER) with EINVAL, so the
+/// requested access is masked down to this set for files and device nodes.
+const ACCESS_FILE: u64 = LANDLOCK_ACCESS_FS_EXECUTE
+    | LANDLOCK_ACCESS_FS_WRITE_FILE
+    | LANDLOCK_ACCESS_FS_READ_FILE
+    | LANDLOCK_ACCESS_FS_TRUNCATE
+    | LANDLOCK_ACCESS_FS_IOCTL_DEV;
+
 /// Build the full FS access bitmask for the given ABI version.
 fn base_fs_access(abi: u32) -> u64 {
     // ABI v1 base: bits 0-12 (EXECUTE through MAKE_SYM)
@@ -121,16 +131,31 @@ pub fn abi_version() -> Result<u32, ConfinementError> {
 
 /// Open `path` and add a Landlock path-beneath rule to `ruleset_fd`.
 fn add_path_rule(ruleset_fd: &OwnedFd, path: &Path, access: u64) -> Result<(), ConfinementError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // Reference the path with O_PATH rather than opening it for I/O: O_PATH does
+    // not block on FIFOs and needs no read permission on the target, so a rule
+    // on a FIFO or a write-only/no-read path neither hangs nor fails here. An
+    // O_PATH fd still supports fstat (the file-type check below) and serves as a
+    // valid parent_fd for landlock_add_rule.
     let file = std::fs::OpenOptions::new()
         .read(true)
+        .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
         .open(path)
         .map_err(|e| {
             ConfinementError::Landlock(format!("open path {:?} failed: {}", path, e))
         })?;
 
+    // Directory-only access rights (READ_DIR, MAKE_*, REMOVE_*, REFER) make
+    // landlock_add_rule fail with EINVAL on a non-directory path. Mask the
+    // requested access down to the file-applicable set for files and devices.
+    let allowed_access = match file.metadata() {
+        Ok(m) if m.is_dir() => access,
+        _ => access & ACCESS_FILE,
+    };
+
     use std::os::unix::io::AsRawFd;
     let attr = LandlockPathBeneathAttr {
-        allowed_access: access,
+        allowed_access,
         parent_fd: file.as_raw_fd(),
     };
 

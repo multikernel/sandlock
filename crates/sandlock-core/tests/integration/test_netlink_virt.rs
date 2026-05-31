@@ -66,15 +66,25 @@ async fn loopback_bind_succeeds() {
 /// Exercises `RTM_GETADDR` via glibc's `__check_pf`.  With `AI_ADDRCONFIG`,
 /// glibc opens a NETLINK_ROUTE socket and dumps addresses to decide which
 /// families (v4/v6) the host supports.  Our synthesized dump advertises
-/// both 127.0.0.1 and ::1, so getaddrinfo must return entries for both
-/// families for `localhost`.
+/// both 127.0.0.1 and ::1, so AI_ADDRCONFIG must accept both families.
+///
+/// We use `getaddrinfo(None, port, AI_PASSIVE | AI_ADDRCONFIG)` instead of
+/// looking up "localhost". glibc fast-paths "localhost" through a
+/// hard-coded check that uses `__check_pf` directly and filters out v6
+/// when no non-loopback IPv6 address is configured (loopback-only is
+/// exactly what our sandbox shows), so a localhost lookup never returns
+/// v6 inside the sandbox regardless of `/etc/hosts`. AI_PASSIVE with a
+/// null node name returns the wildcard address for every family that
+/// `__check_pf` says is configured, so it exercises the netlink dump
+/// path directly.
 #[tokio::test]
 async fn getaddrinfo_ai_addrconfig_returns_v4_and_v6() {
     let out = temp_out("getaddrinfo");
     let script = format!(concat!(
         "import socket\n",
         "fams = sorted({{i[0].name for i in socket.getaddrinfo(",
-        "'localhost', 443, type=socket.SOCK_STREAM, flags=socket.AI_ADDRCONFIG)}})\n",
+        "None, 443, type=socket.SOCK_STREAM, ",
+        "flags=socket.AI_PASSIVE | socket.AI_ADDRCONFIG)}})\n",
         "open('{out}', 'w').write(','.join(fams))\n",
     ), out = out.display());
 
@@ -87,7 +97,7 @@ async fn getaddrinfo_ai_addrconfig_returns_v4_and_v6() {
     assert_eq!(
         contents.trim(),
         "AF_INET,AF_INET6",
-        "AI_ADDRCONFIG should return both families for localhost, got: {}",
+        "AI_ADDRCONFIG should consider both families configured, got: {}",
         contents
     );
     assert!(result.success());
@@ -327,5 +337,76 @@ async fn non_route_netlink_still_blocked() {
         contents.starts_with("BLOCKED:"),
         "NETLINK_AUDIT should be blocked, got: {}", contents
     );
+    assert!(result.success());
+}
+
+/// `/etc/hosts` is always virtualized, independent of whatever the host's
+/// on-disk file says: the sandbox sees a fixed loopback-only view. The
+/// loopback base (`127.0.0.1 localhost` / `::1 localhost`) is always
+/// present, and concrete-host entries from `net_allow` get appended to
+/// the same synthetic file.
+#[tokio::test]
+async fn etc_hosts_virtualized_with_loopback_base() {
+    let out = temp_out("etc-hosts");
+    let script = format!(
+        "open('{out}', 'w').write(open('/etc/hosts').read())\n",
+        out = out.display(),
+    );
+
+    let policy = base_policy().build().unwrap();
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+        .await.unwrap();
+
+    let contents = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    // With no `net_allow` rules the sandbox sees exactly the loopback
+    // base; any deviation means the on-disk `/etc/hosts` leaked through.
+    assert_eq!(
+        contents,
+        "127.0.0.1 localhost\n::1 localhost\n",
+        "virtual /etc/hosts content mismatch"
+    );
+    assert!(result.success());
+}
+
+/// The literal-path match used to be the only check, so any spelling
+/// other than `"/etc/hosts"` reached the host's on-disk file. Hit each
+/// known bypass and assert we see the synthetic content instead.
+#[tokio::test]
+async fn etc_hosts_virtualization_resists_path_bypasses() {
+    let out = temp_out("etc-hosts-bypass");
+    // Python's builtin `open` goes through libc → `openat(AT_FDCWD, ...)`,
+    // so we cover the dirfd-relative case via os.open + os.openat-style
+    // file-descriptor reuse, and the non-canonical case directly.
+    let script = format!(concat!(
+        "import os\n",
+        "results = {{}}\n",
+        // 1. Dirfd-relative: open /etc, then read 'hosts' relative to it.
+        "etcfd = os.open('/etc', os.O_DIRECTORY | os.O_RDONLY)\n",
+        "fd = os.open('hosts', os.O_RDONLY, dir_fd=etcfd)\n",
+        "results['dirfd_relative'] = os.read(fd, 4096).decode()\n",
+        "os.close(fd); os.close(etcfd)\n",
+        // 2. Non-canonical absolute via redundant components.
+        "results['dotdot']  = open('/etc/../etc/hosts').read()\n",
+        "results['slash2']  = open('//etc/hosts').read()\n",
+        "results['curdir']  = open('/etc/./hosts').read()\n",
+        "open('{out}', 'w').write(repr(results))\n",
+    ), out = out.display());
+
+    let policy = base_policy().build().unwrap();
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+        .await.unwrap();
+
+    let contents = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    // Every spelling must hit the synthetic memfd, not the host file.
+    let expected = "127.0.0.1 localhost\\n::1 localhost\\n";
+    for label in ["dirfd_relative", "dotdot", "slash2", "curdir"] {
+        let needle = format!("'{label}': '{expected}'");
+        assert!(
+            contents.contains(&needle),
+            "{label}: host /etc/hosts leaked. got: {contents}"
+        );
+    }
     assert!(result.success());
 }

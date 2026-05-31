@@ -47,7 +47,7 @@ impl Handler for OpenAudit {
 }
 
 let policy = Policy::builder().fs_read("/usr").fs_write("/tmp").build()?;
-Sandbox::run_with_extra_handlers(
+Sandbox::run_with_handlers(
     &policy,
     None,
     &["python3", "-c", "print(42)"],
@@ -70,7 +70,7 @@ let audit = |cx: &HandlerCtx| async move {
     NotifAction::Continue
 };
 
-Sandbox::run_with_extra_handlers(&policy, None, &cmd, [(libc::SYS_openat, audit)]).await?;
+Sandbox::run_with_handlers(&policy, None, &cmd, [(libc::SYS_openat, audit)]).await?;
 ```
 
 Use closures for prototyping or trivial state; switch to a struct as soon as the handler grows
@@ -88,11 +88,11 @@ assert!(matches!(Syscall::checked(-5), Err(SyscallError::Negative(-5))));
 assert!(matches!(Syscall::checked(99_999), Err(SyscallError::UnknownForArch(99_999))));
 ```
 
-`run_with_extra_handlers` accepts an `IntoIterator<Item = (S, H)>` where `S: TryInto<Syscall, Error = SyscallError>`,
+`run_with_handlers` accepts an `IntoIterator<Item = (S, H)>` where `S: TryInto<Syscall, Error = SyscallError>`,
 so callers can pass raw `i64`/`u32` syscall numbers and they are validated up-front:
 
 ```rust
-Sandbox::run_with_extra_handlers(&policy, None, &cmd, [(libc::SYS_openat, openat_h)]).await?;
+Sandbox::run_with_handlers(&policy, None, &cmd, [(libc::SYS_openat, openat_h)]).await?;
 ```
 
 Without `Syscall::checked`, passing `-5` as a syscall number would compile but never fire — the
@@ -104,8 +104,8 @@ There are two entry points; both spawn the sandbox, wait for it to exit, and ret
 
 | name | stdio |
 | --- | --- |
-| `Sandbox::run_with_extra_handlers(policy, name, cmd, handlers)` | captured (returned in `RunResult`) |
-| `Sandbox::run_interactive_with_extra_handlers(policy, name, cmd, handlers)` | inherited from the parent |
+| `Sandbox::run_with_handlers(policy, name, cmd, handlers)` | captured (returned in `RunResult`) |
+| `Sandbox::run_interactive_with_handlers(policy, name, cmd, handlers)` | inherited from the parent |
 
 `name: Option<&str>` is the sandbox instance name (also exposed as the virtual hostname when set);
 pass `None` when no name is needed.
@@ -113,11 +113,11 @@ pass `None` when no name is needed.
 Both have the same generic shape:
 
 ```rust
-pub async fn run_with_extra_handlers<I, S, H>(
+pub async fn run_with_handlers<I, S, H>(
     policy: &Policy,
     name: Option<&str>,
     cmd: &[&str],
-    extra_handlers: I,
+    handlers: I,
 ) -> Result<RunResult, SandlockError>
 where
     I: IntoIterator<Item = (S, H)>,
@@ -128,7 +128,7 @@ where
 Multiple handlers — passed in one array literal:
 
 ```rust
-Sandbox::run_with_extra_handlers(
+Sandbox::run_with_handlers(
     &policy,
     None,
     &cmd,
@@ -149,7 +149,7 @@ implement `Handler` themselves, so `H` resolves to a single type:
 let openat_h: Box<dyn Handler> = Box::new(my_openat_handler);
 let close_h:  Box<dyn Handler> = Box::new(MyCloseStruct { ... });
 
-Sandbox::run_with_extra_handlers(
+Sandbox::run_with_handlers(
     &policy,
     None,
     &cmd,
@@ -163,16 +163,16 @@ Errors at registration time, before fork:
 - `SyscallError::Negative` / `SyscallError::UnknownForArch` from `Syscall::checked` (wrapped in
   `HandlerError::InvalidSyscall`, then in `SandlockError::Handler`).
 - `HandlerError::OnDenySyscall` if any registered syscall is in Sandlock's default syscall
-  blocklist or the policy's extra `block_syscalls` list (see [Security boundary](#security-boundary)).
+  blocklist or the policy's `extra_deny_syscalls` list (see [Security boundary](#security-boundary)).
 
 ### Interactive mode
 
 For REPL-like workflows (a sandboxed shell, a long-running supervised process whose stdin/stdout
-should be inherited from the host), use `run_interactive_with_extra_handlers`. The handler API
+should be inherited from the host), use `run_interactive_with_handlers`. The handler API
 is identical:
 
 ```rust
-Sandbox::run_interactive_with_extra_handlers(
+Sandbox::run_interactive_with_handlers(
     &policy,
     None,
     &["bash"],
@@ -181,7 +181,7 @@ Sandbox::run_interactive_with_extra_handlers(
 .await?;  // host stdin/stdout inherited
 ```
 
-`run_interactive_with_extra_handlers` does not capture stdout/stderr — the child sees the parent's
+`run_interactive_with_handlers` does not capture stdout/stderr — the child sees the parent's
 terminal directly.
 
 ### Reading syscall arguments
@@ -321,7 +321,7 @@ let stats = std::sync::Arc::new(CallStats {
     close:  AtomicU64::new(0),
 });
 
-Sandbox::run_with_extra_handlers(
+Sandbox::run_with_handlers(
     &policy,
     None,
     &cmd,
@@ -346,7 +346,7 @@ For each intercepted syscall:
 1. Builtin handlers registered inside
    [`build_dispatch_table`](../crates/sandlock-core/src/seccomp/dispatch.rs)
    run first, in their internal registration order.
-2. Handlers passed to `run_with_extra_handlers` run afterwards, in iterator order.
+2. Handlers passed to `run_with_handlers` run afterwards, in iterator order.
 3. Multiple iterator entries on the same syscall run in insertion order.
 
 The chain stops as soon as a handler returns a non-`NotifAction::Continue` result; subsequent
@@ -356,14 +356,14 @@ handlers, and the chain evaluator short-circuits on the first non-`Continue`.
 
 The contract is exercised at two layers:
 
-- Unit, in [`seccomp::dispatch::extra_handler_tests`](../crates/sandlock-core/src/seccomp/dispatch.rs):
+- Unit, in [`seccomp::dispatch::handler_tests`](../crates/sandlock-core/src/seccomp/dispatch.rs):
   `dispatch_walks_chain_in_registration_order`,
   `dispatch_runs_builtin_before_extra`,
   `dispatch_stops_at_first_non_continue` drive `dispatch()` walker against a minimal `SupervisorCtx`.
-- End-to-end, in [`tests/integration/test_extra_handlers.rs`](../crates/sandlock-core/tests/integration/test_extra_handlers.rs):
-  `run_with_extra_handlers_preserves_insertion_order_in_sandbox_chain`,
+- End-to-end, in [`tests/integration/test_handlers.rs`](../crates/sandlock-core/tests/integration/test_handlers.rs):
+  `run_with_handlers_preserves_insertion_order_in_sandbox_chain`,
   `builtin_non_continue_blocks_extra`,
-  `extra_handler_runs_after_builtin_returns_continue` drive a live Landlock+seccomp sandbox.
+  `handler_runs_after_builtin_returns_continue` drive a live Landlock+seccomp sandbox.
 
 ### Return values
 
@@ -380,15 +380,18 @@ The contract is exercised at two layers:
 
 ### Continue-site safety
 
-The supervisor processes notifications sequentially in a single tokio task, so the response sent
-for one notification gates the kernel resumption of the trapped syscall.  Sandlock-internal
-locks (`tokio::sync::Mutex`/`RwLock`) live on the supervisor; user handlers do not have access
-to them through `HandlerCtx`, so the contract here is local to handler-owned state on `&self`:
-a `tokio::sync::Mutex<T>` or `RwLock<T>` field on your handler must not be held across an
-`.await` point.  If the guard is alive when control returns to the supervisor loop, the next
-notification that needs the same lock parks, the response for the current notification is not
-sent, and the child stays trapped in the syscall.  Acquire, mutate, drop — `await` only after
-the guard is out of scope.
+Today's supervisor processes notifications sequentially in a single tokio task, so the response
+sent for one notification gates the kernel resumption of the trapped syscall. Treat this as an
+implementation detail, not a contract — the public API makes no promise that a future
+dispatcher will not parallelise. The `Handler` trait already requires `Send + Sync`, and the C
+ABI requires `ud` to be thread-safe (see [C ABI → Thread safety](#thread-safety)) for exactly
+this reason. Sandlock-internal locks (`tokio::sync::Mutex`/`RwLock`) live on the supervisor;
+user handlers do not have access to them through `HandlerCtx`, so the contract here is local to
+handler-owned state on `&self`: a `tokio::sync::Mutex<T>` or `RwLock<T>` field on your handler
+must not be held across an `.await` point. If the guard is alive when control returns to the
+supervisor loop, the next notification that needs the same lock parks, the response for the
+current notification is not sent, and the child stays trapped in the syscall. Acquire, mutate,
+drop — `await` only after the guard is out of scope.
 
 See [issue #27][i27] for the underlying supervisor-loop contract that this convention extends to
 user handlers.
@@ -418,13 +421,13 @@ User handlers can:
 
 ### BPF coverage
 
-`run_with_extra_handlers` collects the syscall numbers declared by the user-supplied handlers and merges them
+`run_with_handlers` collects the syscall numbers declared by the user-supplied handlers and merges them
 into the cBPF notification list installed in the child before `execve`. Without this step the
 kernel never raises `SECCOMP_RET_USER_NOTIF` for a syscall that no builtin intercepts, and the
 user handler silently never fires. The merge is dedup-aware: an `openat` registered both by a
 builtin and a user handler produces a single JEQ in the assembled program.
 
-Validation runs at registration time (before fork). If `Syscall::checked` fails, `run_with_extra_handlers`
+Validation runs at registration time (before fork). If `Syscall::checked` fails, `run_with_handlers`
 returns the error without enqueueing the handler.
 
 ### Blocklist Bypass Guard
@@ -432,21 +435,21 @@ returns the error without enqueueing the handler.
 The cBPF program emits notif JEQs *before* deny JEQs, so a syscall present in both lists
 hits `SECCOMP_RET_USER_NOTIF` first. A handler registered on a syscall in
 [`DEFAULT_BLOCKLIST_SYSCALLS`](../crates/sandlock-core/src/sys/structs.rs) — or in the policy's
-extra `block_syscalls` list — would convert a kernel-deny into a user-supervised
+`extra_deny_syscalls` list — would convert a kernel-deny into a user-supervised
 path; a handler returning `NotifAction::Continue` would become
 `SECCOMP_USER_NOTIF_FLAG_CONTINUE` and the kernel would actually run the syscall, silently
 bypassing deny.
 
-`run_with_extra_handlers` rejects this configuration at registration time and returns
+`run_with_handlers` rejects this configuration at registration time and returns
 `HandlerError::OnDenySyscall { syscall_nr }`. The check is implemented in
 [`validate_handler_syscalls_against_policy`](../crates/sandlock-core/src/seccomp/dispatch.rs)
 and covers both the default blocklist (`DEFAULT_BLOCKLIST_SYSCALLS`) and the
-user-specified extras (`block_syscalls`); both branches are tested
+user-specified extras (`extra_deny_syscalls`); both branches are tested
 (`validate_extras_rejects_user_specified_blocklist`,
-`extra_handler_on_default_blocklist_syscall_is_rejected`,
-`run_with_extra_handlers_rejects_handler_on_default_blocklist_syscall`,
-`run_with_extra_handlers_rejects_negative_syscall`,
-`run_with_extra_handlers_rejects_arch_unknown_syscall`).
+`handler_on_default_blocklist_syscall_is_rejected`,
+`run_with_handlers_rejects_handler_on_default_blocklist_syscall`,
+`run_with_handlers_rejects_negative_syscall`,
+`run_with_handlers_rejects_arch_unknown_syscall`).
 
 Sandlock always installs its default syscall blocklist, so this guard is always active.
 
@@ -482,7 +485,7 @@ impl<H: Handler> Handler for PanicSafe<H> {
     }
 }
 
-Sandbox::run_with_extra_handlers(
+Sandbox::run_with_handlers(
     &policy,
     None,
     &cmd,
@@ -507,7 +510,7 @@ Wrap each handler in `Box<dyn Handler>` so the iterator's `H` parameter is unifo
 heterogeneous handler types:
 
 ```rust
-Sandbox::run_with_extra_handlers(
+Sandbox::run_with_handlers(
     &policy,
     None,
     &cmd,
@@ -587,7 +590,7 @@ The host binary instantiates the handlers and passes them as one
 iterator's `H` parameter stays homogeneous:
 
 ```rust
-Sandbox::run_with_extra_handlers(
+Sandbox::run_with_handlers(
     &policy,
     None,
     &cmd,
@@ -604,3 +607,53 @@ For a single concrete handler type the bare struct works without the `Box::new` 
 
 The crate links against `sandlock-core` as an ordinary dependency — no fork, no
 `[patch.crates-io]`, no duplication of `notif::supervisor`.
+
+## C ABI
+
+The same handler model is available to non-Rust callers via the
+`sandlock-ffi` cdylib (header: `crates/sandlock-ffi/include/sandlock.h`).
+
+### Lifetimes
+
+| Object                         | Allocated by                           | Freed by                                    |
+|--------------------------------|----------------------------------------|---------------------------------------------|
+| `sandlock_handler_t*`          | `sandlock_handler_new`                 | `sandlock_handler_free` (if never registered) <br>or the supervisor (after a successful `sandlock_run_with_handlers`) |
+| `sandlock_action_out_t`        | Rust adapter (stack), pointer to C     | Adapter (stack-scoped to one callback)      |
+| `sandlock_mem_handle_t*`       | Rust adapter (stack)                   | Adapter (do not retain past callback return) |
+| `sandlock_notif_data_t`        | Rust adapter (stack), pointer to C     | Adapter (do not retain past callback return) |
+
+### Callback contract
+
+A C handler must:
+
+1. Return `0` exactly when it has called one — and only one — of the
+   `sandlock_action_set_*` setters on `out`.
+2. Return non-zero on any internal error. The supervisor then applies
+   the handler's `on_exception` policy (default: `SANDLOCK_EXCEPTION_KILL`).
+3. Not retain `notif`, `mem`, or `out` past the return statement.
+4. May panic from inside a Rust-side handler exposed through the
+   C ABI — the supervisor catches the unwind via `catch_unwind` and
+   applies the configured exception policy. Pure-C callers cannot
+   panic (C has no unwinding); this clause is for Rust handlers
+   plugged into the C ABI surface.
+
+### Thread safety
+
+The supervisor MAY invoke a C handler callback from multiple worker
+threads concurrently across different notifications. Today's dispatch
+loop is largely serial, but the public C ABI makes no concurrency
+guarantee — a future dispatcher could parallelise without an ABI
+break. Consequently the caller MUST ensure their `ud` pointer is
+thread-safe: either immutable, or guarded by their own synchronization
+primitives (atomics, mutex, etc.). Rust offers no synchronization for
+an opaque `void*`; the responsibility is on the C side.
+
+### Minimal example
+
+See `crates/sandlock-ffi/tests/c/handler_smoke.c` for the canonical
+end-to-end example.
+
+## Python wrapper
+
+See [`python-handlers.md`](python-handlers.md) — the dedicated page is the
+single source of truth for the Python wrapper.

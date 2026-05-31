@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::IpAddr;
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 use crate::error::NotifError;
@@ -177,25 +177,29 @@ fn is_denied_with_symlink_resolve(
     false
 }
 
+/// Read the thread-group leader (Tgid) of a thread from `/proc/<tid>/status`.
+fn tgid_of(tid: u32) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{}/status", tid)).ok()?;
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Tgid:").and_then(|r| r.trim().parse().ok()))
+}
+
 /// Duplicate a file descriptor from an arbitrary process (by PID/TID) into the supervisor.
-/// Uses PIDFD_THREAD so pidfd_open works for any thread, not just the group leader.
-pub(crate) fn dup_fd_from_pid(pid: u32, target_fd: i32) -> Result<OwnedFd, io::Error> {
-    const SYS_PIDFD_OPEN: i64 = 434;
-    const SYS_PIDFD_GETFD: i64 = 438;
-    const PIDFD_THREAD: i64 = libc::O_EXCL as i64; // Linux 6.9+
-    let pidfd = unsafe { libc::syscall(SYS_PIDFD_OPEN, pid as i64, PIDFD_THREAD) };
-    if pidfd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let pidfd_owned = unsafe { OwnedFd::from_raw_fd(pidfd as i32) };
-    let ret = unsafe {
-        libc::syscall(SYS_PIDFD_GETFD, pidfd_owned.as_raw_fd() as i64, target_fd as i64, 0i64)
-    };
-    if ret < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(unsafe { OwnedFd::from_raw_fd(ret as i32) })
-    }
+///
+/// `pidfd_getfd` (Linux 5.6+) needs a pidfd for the owning *process*. All threads
+/// of a process share one fd table, so the process's pidfd dups any thread's fd:
+/// `pidfd_open(pid, 0)` gives it directly when `pid` is a thread-group leader,
+/// otherwise we resolve the leader via `Tgid` in `/proc/<pid>/status` and open
+/// that. The triggering thread is frozen on the seccomp notification, so its
+/// Tgid cannot race with pid reuse. Works on any kernel with `pidfd_getfd`.
+pub(crate) fn dup_fd_from_pid(pid: u32, target_fd: i32) -> io::Result<OwnedFd> {
+    use crate::sys::syscall::{pidfd_getfd, pidfd_open};
+    let pidfd = pidfd_open(pid, 0).or_else(|e| match tgid_of(pid) {
+        Some(tgid) if tgid != pid => pidfd_open(tgid, 0),
+        _ => Err(e),
+    })?;
+    pidfd_getfd(&pidfd, target_fd, 0)
 }
 
 // ============================================================
@@ -212,7 +216,7 @@ pub struct NotifPolicy {
     pub has_time_start: bool,
     /// Argv-safety gate: the supervisor must freeze every task that
     /// could mutate argv before any consumer reads it. True when
-    /// `policy_fn` is active or when an extra handler is bound to
+    /// `policy_fn` is active or when a handler is bound to
     /// execve/execveat (such handlers can call `read_child_mem`).
     /// Also gates ptrace fork-event tracking so `ProcessIndex` is
     /// complete when the freeze enumerates it.
@@ -233,10 +237,11 @@ pub struct NotifPolicy {
     pub deterministic_dirs: bool,
     pub virtual_hostname: Option<String>,
     pub has_http_acl: bool,
-    /// Synthetic `/etc/hosts` content for `net_allow_hosts` virtualization.
-    /// When set, `openat("/etc/hosts")` returns a memfd with this content
-    /// so sandboxed processes can resolve allowed hostnames without DNS.
-    pub virtual_etc_hosts: Option<String>,
+    /// Synthetic `/etc/hosts` served to the sandbox. Always populated:
+    /// `openat("/etc/hosts")` returns a memfd with this content so the
+    /// host's on-disk `/etc/hosts` never leaks in. The content is the
+    /// loopback base plus any concrete hostnames resolved from `net_allow`.
+    pub virtual_etc_hosts: String,
 }
 
 // ============================================================
@@ -255,6 +260,47 @@ fn recv_notif(fd: RawFd) -> io::Result<SeccompNotif> {
     } else {
         Ok(notif)
     }
+}
+
+/// Result of a non-blocking probe on the seccomp notif fd.
+enum NotifFdState {
+    /// At least one INIT-state notification is queued. `recv_notif`
+    /// will return without blocking.
+    Pending,
+    /// No notifications and no terminal flags. Wait for the next
+    /// epoll edge before probing again.
+    Empty,
+    /// `POLLHUP`/`POLLERR`/`POLLNVAL` set, or `poll(2)` itself failed:
+    /// filter has been released or the fd is invalid. The supervisor
+    /// should exit; subsequent waits would busy-spin because epoll
+    /// keeps reporting the fd ready.
+    Terminal,
+}
+
+/// Non-blocking probe of the seccomp notif fd.
+///
+/// `SECCOMP_IOCTL_NOTIF_RECV` ignores `O_NONBLOCK` and calls
+/// `wait_event_interruptible` unconditionally (kernel/seccomp.c
+/// `seccomp_notify_recv`). So `recv_notif` cannot be invoked
+/// speculatively to detect an empty queue. This helper uses
+/// `poll(timeout=0)` as a non-blocking predictor: if POLLIN is set
+/// the kernel will hand us a notification without blocking; if a
+/// terminal flag is set the fd will keep waking AsyncFd until the
+/// supervisor exits.
+fn probe_notif_fd(fd: RawFd) -> NotifFdState {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let r = unsafe { libc::poll(&mut pfd, 1, 0) };
+    if r > 0 && (pfd.revents & libc::POLLIN) != 0 {
+        return NotifFdState::Pending;
+    }
+    if r < 0 || (pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0 {
+        return NotifFdState::Terminal;
+    }
+    NotifFdState::Empty
 }
 
 /// Send a response with SECCOMP_USER_NOTIF_FLAG_CONTINUE.
@@ -996,9 +1042,9 @@ async fn handle_notification(
     let mut exec_freeze = None;
     if matches!(action, NotifAction::Continue)
         && policy.argv_safety_required
-        && crate::sandbox_freeze::requires_freeze_on_continue(nr)
+        && crate::freeze::requires_freeze_on_continue(nr)
     {
-        match crate::sandbox_freeze::freeze_sandbox_for_execve(
+        match crate::freeze::freeze_sandbox_for_execve(
             &ctx.processes,
             notif.pid as i32,
         ) {
@@ -1086,9 +1132,9 @@ async fn handle_notification(
 
     if let Some(freeze) = exec_freeze {
         if exec_continued && send_result.is_ok() {
-            crate::sandbox_freeze::detach_peers(&freeze.peer_tids);
+            crate::freeze::detach_peers(&freeze.peer_tids);
         } else {
-            crate::sandbox_freeze::detach_all(&freeze);
+            crate::freeze::detach_all(&freeze);
         }
     }
 }
@@ -1108,8 +1154,21 @@ pub async fn supervisor(
     notif_fd: OwnedFd,
     ctx: Arc<super::ctx::SupervisorCtx>,
     pending_handlers: Vec<(i64, std::sync::Arc<dyn super::dispatch::Handler>)>,
+    startup: tokio::sync::oneshot::Sender<io::Result<()>>,
 ) {
-    let fd = notif_fd.as_raw_fd();
+    // Register the notif fd with the Tokio IO driver so we can wait for
+    // readiness via epoll instead of a dedicated blocking thread.
+    let async_fd = match tokio::io::unix::AsyncFd::with_interest(
+        notif_fd,
+        tokio::io::Interest::READABLE,
+    ) {
+        Ok(fd) => fd,
+        Err(err) => {
+            let _ = startup.send(Err(err));
+            return;
+        }
+    };
+    let fd = async_fd.get_ref().as_raw_fd();
 
     // Build the dispatch table once at startup.
     let dispatch_table = Arc::new(super::dispatch::build_dispatch_table(
@@ -1122,28 +1181,10 @@ pub async fn supervisor(
     // Try to enable sync wakeup (Linux 6.7+, ignore error on older kernels).
     try_set_sync_wakeup(fd);
 
-    // SECCOMP_IOCTL_NOTIF_RECV blocks regardless of O_NONBLOCK, so we
-    // receive notifications in a blocking thread and send them to the
-    // async handler via a channel.  This guarantees we never miss a
-    // notification — the thread is always blocked in recv_notif ready
-    // for the next one.
-    //
-    // Notifications are processed sequentially (not spawned) to avoid
-    // mutex contention between concurrent handlers.
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SeccompNotif>();
-
-    std::thread::spawn(move || {
-        loop {
-            match recv_notif(fd) {
-                Ok(notif) => {
-                    if tx.send(notif).is_err() {
-                        break; // receiver dropped — supervisor shutting down
-                    }
-                }
-                Err(_) => break, // fd closed — child exited
-            }
-        }
-    });
+    // The IO driver has the fd registered; subsequent block_on cycles
+    // can resume this task and pick up readiness events. Tell the
+    // caller it is safe to release the child.
+    let _ = startup.send(Ok(()));
 
     // Periodic sweep as a defensive backstop in case pidfd-based
     // lifecycle cleanup misses an entry (e.g. pidfd_open failed for a
@@ -1152,8 +1193,37 @@ pub async fn supervisor(
     // still per-child pidfd readiness in `spawn_pid_watcher`.
     let gc = tokio::spawn(process_index_gc(Arc::clone(&ctx.processes)));
 
-    while let Some(notif) = rx.recv().await {
-        handle_notification(notif, &ctx, &dispatch_table, fd).await;
+    // Edge-triggered drain: each `readable().await` returns once per
+    // epoll edge, then we drain the kernel queue via `probe_notif_fd`
+    // until empty. The drain is necessary because tokio's AsyncFd is
+    // edge-triggered and `recv_notif` does not signal "would block",
+    // so a burst of arrivals between two `readable().await` calls
+    // would coalesce into a single wake event.
+    //
+    // Notifications are processed sequentially (not spawned) to avoid
+    // mutex contention between concurrent handlers.
+    'outer: loop {
+        let mut ready = match async_fd.readable().await {
+            Ok(r) => r,
+            Err(_) => break 'outer,
+        };
+        ready.clear_ready();
+        drop(ready);
+
+        loop {
+            match probe_notif_fd(fd) {
+                NotifFdState::Pending => {
+                    let notif = match recv_notif(fd) {
+                        Ok(n) => n,
+                        Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                        Err(_) => break 'outer,
+                    };
+                    handle_notification(notif, &ctx, &dispatch_table, fd).await;
+                }
+                NotifFdState::Empty => break,
+                NotifFdState::Terminal => break 'outer,
+            }
+        }
     }
 
     gc.abort();
@@ -1227,6 +1297,55 @@ pub(crate) async fn cleanup_pid(ctx: &super::ctx::SupervisorCtx, key: super::sta
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::io::FromRawFd;
+
+    fn gettid() -> u32 {
+        (unsafe { libc::syscall(libc::SYS_gettid) }) as u32
+    }
+
+    #[test]
+    fn tgid_of_main_thread_is_own_pid() {
+        // The main thread's tid equals the process pid, and its Tgid is the pid.
+        assert_eq!(tgid_of(gettid()), Some(std::process::id()));
+    }
+
+    #[test]
+    fn tgid_of_worker_thread_resolves_to_process() {
+        // A non-leader thread's Tgid is the process pid, not its own tid.
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let h = std::thread::spawn(move || {
+            tid_tx.send(gettid()).unwrap();
+            done_rx.recv().ok(); // stay alive until the test has read /proc
+        });
+        let worker_tid = tid_rx.recv().unwrap();
+        let pid = std::process::id();
+        assert_ne!(worker_tid, pid, "worker tid must differ from pid");
+        assert_eq!(tgid_of(worker_tid), Some(pid));
+        done_tx.send(()).ok();
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn dup_fd_from_pid_handles_worker_thread_fd() {
+        use std::os::unix::io::AsRawFd;
+        // Open an fd in a non-leader worker thread, then duplicate it by that
+        // thread's tid. Exercises the tid->process pidfd resolution end to end
+        // (PIDFD_THREAD on >=6.9, the /proc Tgid fallback on older kernels).
+        let (info_tx, info_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let h = std::thread::spawn(move || {
+            let f = std::fs::File::open("/dev/null").unwrap();
+            info_tx.send((gettid(), f.as_raw_fd())).unwrap();
+            done_rx.recv().ok();
+            drop(f);
+        });
+        let (worker_tid, fd) = info_rx.recv().unwrap();
+        let dup = dup_fd_from_pid(worker_tid, fd);
+        done_tx.send(()).ok();
+        h.join().unwrap();
+        assert!(dup.is_ok(), "dup_fd_from_pid for a worker-thread fd failed: {:?}", dup.err());
+    }
 
     #[test]
     fn read_child_cstr_returns_none_for_null_addr_or_zero_max_len() {

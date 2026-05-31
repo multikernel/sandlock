@@ -68,7 +68,7 @@ fn parse_vdso_symbols(vdso_bytes: &[u8]) -> HashMap<String, u64> {
     symbols
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 fn push_insn(stub: &mut Vec<u8>, insn: u32) {
     stub.extend_from_slice(&insn.to_le_bytes());
 }
@@ -96,7 +96,7 @@ fn arm64_b_insn(from: u64, to: u64) -> Result<u32, SandlockError> {
 
 /// Compute the offset within the vDSO mapping where the trampoline area starts —
 /// just past the last symbol, rounded up to a 16-byte boundary.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 fn vdso_tramp_start(vdso_bytes: &[u8]) -> Option<u64> {
     let elf = goblin::elf::Elf::parse(vdso_bytes).ok()?;
     let highest_end = elf
@@ -207,7 +207,9 @@ fn offset_stub_clock_gettime(offset_secs: i64) -> Vec<u8> {
 }
 
 /// Generate an offset stub for gettimeofday that forces a real syscall,
-/// then adds a time offset to tv_sec.
+/// then adds a time offset to tv_sec. For `gettimeofday(tv, tz)` the output
+/// `timeval*` is the FIRST arg (rdi); rsi is `timezone*`. (Contrast with
+/// clock_gettime, whose output `timespec*` is the second arg, rsi.)
 #[cfg(target_arch = "x86_64")]
 fn offset_stub_gettimeofday(offset_secs: i64) -> Vec<u8> {
     let mut stub = Vec::new();
@@ -215,9 +217,11 @@ fn offset_stub_gettimeofday(offset_secs: i64) -> Vec<u8> {
     stub.extend_from_slice(&[0xB8, 0x60, 0x00, 0x00, 0x00]); // mov eax, 96
     stub.extend_from_slice(&[0x0F, 0x05]); // syscall
     stub.extend_from_slice(&[0x5E, 0x5F]); // pop rsi, pop rdi
+    stub.extend_from_slice(&[0x48, 0x85, 0xFF]); // test rdi, rdi (timeval* == NULL?)
+    stub.extend_from_slice(&[0x74, 0x0D]); // je +13 -> ret (skip movabs(10)+add(3))
     stub.extend_from_slice(&[0x48, 0xB9]); // movabs rcx, imm64
     stub.extend_from_slice(&offset_secs.to_le_bytes());
-    stub.extend_from_slice(&[0x48, 0x01, 0x0E]); // add [rsi], rcx (tv_sec)
+    stub.extend_from_slice(&[0x48, 0x01, 0x0F]); // add [rdi], rcx (tv_sec)
     stub.push(0xC3); // ret
     stub
 }
@@ -254,6 +258,216 @@ fn vdso_targets() -> Vec<(&'static str, &'static str, u32)> {
     ]
 }
 
+// ============================================================
+// riscv64 vDSO codegen
+//
+// Like aarch64, riscv64 places a full stub in the slack space at the tail of
+// the vDSO mapping and patches each function entry with a single 4-byte `j`
+// (jal x0) that jumps to its stub. The offset stubs run the real syscall, then
+// add the time offset to the returned tv_sec (mirroring x86_64/aarch64). The
+// 64-bit offset is stored as data at the tail of each stub and loaded
+// PC-relative via `auipc`, so the stub is position-independent. It is read with
+// two naturally-aligned 4-byte loads (lwu/lw) to avoid a misaligned 8-byte load.
+// ============================================================
+
+/// Emit `li a7, value` (load syscall number into a7/x17). Uses a single `addi`
+/// for the 12-bit case (all syscall numbers sandlock patches fit), falling back
+/// to `lui`+`addiw` for larger 32-bit values.
+#[cfg(target_arch = "riscv64")]
+fn riscv_li_a7(stub: &mut Vec<u8>, value: u32) {
+    const A7: u32 = 17;
+    if value < 2048 {
+        // addi a7, x0, value
+        push_insn(stub, (value << 20) | (A7 << 7) | 0x13);
+    } else {
+        let lo12 = value & 0xfff;
+        // sign-extend lo12: if bit 11 is set, addiw subtracts, so bump hi20.
+        let hi20 = if lo12 & 0x800 != 0 {
+            (value >> 12).wrapping_add(1) & 0xf_ffff
+        } else {
+            (value >> 12) & 0xf_ffff
+        };
+        push_insn(stub, (hi20 << 12) | (A7 << 7) | 0x37); // lui a7, hi20
+        push_insn(stub, ((lo12 & 0xfff) << 20) | (A7 << 15) | (A7 << 7) | 0x1b); // addiw a7, a7, lo12
+    }
+}
+
+/// Encode a riscv64 unconditional `j target` (jal x0, offset) located at `from`.
+/// The JAL immediate is signed and scaled by 2, so the reachable range is ±1 MiB.
+#[cfg(target_arch = "riscv64")]
+fn riscv_j_insn(from: u64, to: u64) -> Result<u32, SandlockError> {
+    let delta = to as i64 - from as i64;
+    if delta % 2 != 0 {
+        return Err(SandlockError::MemoryProtect(format!(
+            "riscv64 J target {:#x} not 2-byte aligned from {:#x}",
+            to, from
+        )));
+    }
+    if !(-(1i64 << 20)..(1i64 << 20)).contains(&delta) {
+        return Err(SandlockError::MemoryProtect(format!(
+            "riscv64 J {:#x}->{:#x} out of ±1 MiB range",
+            from, to
+        )));
+    }
+    let imm = delta as u32;
+    let b20 = (imm >> 20) & 0x1;
+    let b10_1 = (imm >> 1) & 0x3ff;
+    let b11 = (imm >> 11) & 0x1;
+    let b19_12 = (imm >> 12) & 0xff;
+    // jal x0, offset (rd = x0)
+    Ok((b20 << 31) | (b10_1 << 21) | (b11 << 20) | (b19_12 << 12) | 0x6f)
+}
+
+/// Minimal RV64I instruction encoders for the time-offset stubs. Registers are
+/// ABI numbers; the stubs touch only caller-saved temporaries (t0-t6) and the
+/// syscall registers (a0/a1/a7), so they need no prologue/epilogue.
+#[cfg(target_arch = "riscv64")]
+mod rv {
+    pub const X0: u32 = 0;
+    pub const T0: u32 = 5;
+    pub const T1: u32 = 6;
+    pub const T2: u32 = 7;
+    pub const A0: u32 = 10;
+    pub const A1: u32 = 11;
+    pub const A7: u32 = 17;
+    pub const T3: u32 = 28;
+    pub const T4: u32 = 29;
+    pub const T5: u32 = 30;
+    pub const T6: u32 = 31;
+    pub const ECALL: u32 = 0x0000_0073;
+    pub const RET: u32 = 0x0000_8067; // jalr x0, 0(ra)
+
+    pub fn addi(rd: u32, rs1: u32, imm: i32) -> u32 {
+        ((imm as u32 & 0xfff) << 20) | (rs1 << 15) | (rd << 7) | 0x13
+    }
+    /// `mv rd, rs` == `addi rd, rs, 0`
+    pub fn mv(rd: u32, rs: u32) -> u32 {
+        addi(rd, rs, 0)
+    }
+    pub fn auipc(rd: u32, imm20: u32) -> u32 {
+        (imm20 << 12) | (rd << 7) | 0x17
+    }
+    pub fn lwu(rd: u32, rs1: u32, imm: i32) -> u32 {
+        ((imm as u32 & 0xfff) << 20) | (rs1 << 15) | (6 << 12) | (rd << 7) | 0x03
+    }
+    pub fn lw(rd: u32, rs1: u32, imm: i32) -> u32 {
+        ((imm as u32 & 0xfff) << 20) | (rs1 << 15) | (2 << 12) | (rd << 7) | 0x03
+    }
+    pub fn ld(rd: u32, rs1: u32, imm: i32) -> u32 {
+        ((imm as u32 & 0xfff) << 20) | (rs1 << 15) | (3 << 12) | (rd << 7) | 0x03
+    }
+    pub fn sd(rs2: u32, rs1: u32, imm: i32) -> u32 {
+        let i = imm as u32;
+        ((i >> 5 & 0x7f) << 25) | (rs2 << 20) | (rs1 << 15) | (3 << 12) | ((i & 0x1f) << 7) | 0x23
+    }
+    pub fn slli(rd: u32, rs1: u32, shamt: u32) -> u32 {
+        ((shamt & 0x3f) << 20) | (rs1 << 15) | (1 << 12) | (rd << 7) | 0x13
+    }
+    pub fn or(rd: u32, rs1: u32, rs2: u32) -> u32 {
+        (rs2 << 20) | (rs1 << 15) | (6 << 12) | (rd << 7) | 0x33
+    }
+    pub fn add(rd: u32, rs1: u32, rs2: u32) -> u32 {
+        (rs2 << 20) | (rs1 << 15) | (rd << 7) | 0x33
+    }
+    pub fn beq(rs1: u32, rs2: u32, imm: i32) -> u32 {
+        branch(0, rs1, rs2, imm)
+    }
+    pub fn bne(rs1: u32, rs2: u32, imm: i32) -> u32 {
+        branch(1, rs1, rs2, imm)
+    }
+    fn branch(funct3: u32, rs1: u32, rs2: u32, imm: i32) -> u32 {
+        let i = imm as u32;
+        ((i >> 12 & 1) << 31)
+            | ((i >> 5 & 0x3f) << 25)
+            | (rs2 << 20)
+            | (rs1 << 15)
+            | (funct3 << 12)
+            | ((i >> 1 & 0xf) << 8)
+            | ((i >> 11 & 1) << 7)
+            | 0x63
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+fn simple_stub(syscall_nr: u32) -> Vec<u8> {
+    let mut stub = Vec::new();
+    riscv_li_a7(&mut stub, syscall_nr);
+    push_insn(&mut stub, 0x0000_0073); // ecall
+    push_insn(&mut stub, 0x0000_8067); // ret (jalr x0, 0(ra))
+    stub
+}
+
+/// clock_gettime(clockid=a0, timespec*=a1): run the real syscall, then add the
+/// time offset to tv_sec for CLOCK_REALTIME (0) and CLOCK_REALTIME_COARSE (5).
+#[cfg(target_arch = "riscv64")]
+fn offset_stub_clock_gettime(offset_secs: i64) -> Vec<u8> {
+    use rv::*;
+    const DOFF: i32 = 36; // bytes from the `auipc` to the embedded offset data
+    let nr = libc::SYS_clock_gettime as i32;
+    let insns: [u32; 16] = [
+        mv(T0, A0),           // save clockid (a0 is overwritten by the return)
+        mv(T4, A1),           // save timespec*
+        addi(A7, X0, nr),     // li a7, SYS_clock_gettime
+        ECALL,                // a0 = kernel return value (preserved to the caller)
+        beq(T0, X0, 12),      // clockid == CLOCK_REALTIME -> apply
+        addi(T1, X0, 5),      // li t1, CLOCK_REALTIME_COARSE
+        bne(T0, T1, 36),      // clockid != COARSE -> end (skip offset)
+        auipc(T2, 0),         // apply: t2 = &this instruction
+        lwu(T5, T2, DOFF),    // t5 = low 32 bits of offset (zero-extended)
+        lw(T6, T2, DOFF + 4), // t6 = high 32 bits (sign-extended)
+        slli(T6, T6, 32),
+        or(T2, T5, T6),       // t2 = full 64-bit offset
+        ld(T3, T4, 0),        // t3 = tv_sec
+        add(T3, T3, T2),      // t3 += offset
+        sd(T3, T4, 0),        // tv_sec = t3
+        RET,                  // end
+    ];
+    let mut stub = Vec::with_capacity(insns.len() * 4 + 8);
+    for insn in insns {
+        push_insn(&mut stub, insn);
+    }
+    stub.extend_from_slice(&offset_secs.to_le_bytes());
+    stub
+}
+
+/// gettimeofday(timeval*=a0): run the real syscall, then add the time offset to
+/// tv_sec, unless the timeval pointer is NULL.
+#[cfg(target_arch = "riscv64")]
+fn offset_stub_gettimeofday(offset_secs: i64) -> Vec<u8> {
+    use rv::*;
+    const DOFF: i32 = 36;
+    let nr = libc::SYS_gettimeofday as i32;
+    let insns: [u32; 13] = [
+        mv(T4, A0),           // save timeval*
+        addi(A7, X0, nr),     // li a7, SYS_gettimeofday
+        ECALL,
+        beq(T4, X0, 36),      // timeval == NULL -> end
+        auipc(T2, 0),
+        lwu(T5, T2, DOFF),
+        lw(T6, T2, DOFF + 4),
+        slli(T6, T6, 32),
+        or(T2, T5, T6),
+        ld(T3, T4, 0),        // t3 = tv_sec
+        add(T3, T3, T2),
+        sd(T3, T4, 0),
+        RET,                  // end
+    ];
+    let mut stub = Vec::with_capacity(insns.len() * 4 + 8);
+    for insn in insns {
+        push_insn(&mut stub, insn);
+    }
+    stub.extend_from_slice(&offset_secs.to_le_bytes());
+    stub
+}
+
+#[cfg(target_arch = "riscv64")]
+fn vdso_targets() -> Vec<(&'static str, &'static str, u32)> {
+    vec![
+        ("clock_gettime", "__vdso_clock_gettime", libc::SYS_clock_gettime as u32),
+        ("gettimeofday", "__vdso_gettimeofday", libc::SYS_gettimeofday as u32),
+    ]
+}
+
 /// Patch the vDSO of a target process to force real syscalls (interceptable by seccomp).
 /// If `time_offset_secs` is provided, clock_gettime and gettimeofday stubs will add
 /// the offset to the returned time.
@@ -280,10 +494,10 @@ pub(crate) fn patch(
             SandlockError::MemoryProtect(format!("failed to open /proc/{}/mem: {}", pid, e))
         })?;
 
-    // arm64: place full stubs in slack space at the tail of the vDSO mapping and
-    // patch each function entry with a single 4-byte B that jumps to its stub.
+    // arm64/riscv64: place full stubs in slack space at the tail of the vDSO
+    // mapping and patch each function entry with a single 4-byte jump to its stub.
     // x86_64: stubs are short and inter-symbol gaps are wide; patch inline.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     let mut tramp_offset = vdso_tramp_start(&vdso_bytes).unwrap_or(0);
 
     for (name, alt_name, syscall_nr) in vdso_targets() {
@@ -311,7 +525,7 @@ pub(crate) fn patch(
                 })?;
             }
 
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             {
                 if tramp_offset + stub.len() as u64 > mapping_size {
                     return Err(SandlockError::MemoryProtect(format!(
@@ -334,7 +548,10 @@ pub(crate) fn patch(
                     ))
                 })?;
 
+                #[cfg(target_arch = "aarch64")]
                 let b_insn = arm64_b_insn(entry_addr, tramp_addr)?;
+                #[cfg(target_arch = "riscv64")]
+                let b_insn = riscv_j_insn(entry_addr, tramp_addr)?;
                 mem.seek(SeekFrom::Start(entry_addr)).map_err(|e| {
                     SandlockError::MemoryProtect(format!(
                         "failed to seek to {} entry at {:#x}: {}",
@@ -396,6 +613,153 @@ mod tests {
         let stub = simple_stub(228);
         // movz x8, #228 / svc #0 / ret — three 4-byte instructions.
         assert_eq!(stub.len(), 12);
+    }
+
+    #[test]
+    #[cfg(target_arch = "riscv64")]
+    fn test_simple_stub_size() {
+        let stub = simple_stub(228);
+        // addi a7, x0, 228 / ecall / ret — three 4-byte instructions.
+        assert_eq!(stub.len(), 12);
+        // ecall and ret are fixed encodings.
+        assert_eq!(&stub[4..8], &0x0000_0073u32.to_le_bytes());
+        assert_eq!(&stub[8..12], &0x0000_8067u32.to_le_bytes());
+    }
+
+    #[test]
+    #[cfg(target_arch = "riscv64")]
+    fn test_offset_stub_riscv_layout() {
+        let off: i64 = -86400; // one day back
+        let cg = offset_stub_clock_gettime(off);
+        // 16 instructions (64 bytes) + 8-byte embedded offset.
+        assert_eq!(cg.len(), 72);
+        assert_eq!(&cg[64..72], &off.to_le_bytes(), "offset stored at tail");
+        assert_eq!(&cg[12..16], &0x0000_0073u32.to_le_bytes(), "ecall");
+        assert_eq!(&cg[60..64], &0x0000_8067u32.to_le_bytes(), "ret");
+
+        let gtod = offset_stub_gettimeofday(off);
+        // 13 instructions (52 bytes) + 8-byte embedded offset.
+        assert_eq!(gtod.len(), 60);
+        assert_eq!(&gtod[52..60], &off.to_le_bytes(), "offset stored at tail");
+        assert_eq!(&gtod[48..52], &0x0000_8067u32.to_le_bytes(), "ret");
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+    const EXEC_PAGE: usize = 4096;
+
+    /// Map `code` into a fresh page, written then flipped to `PROT_READ|PROT_EXEC`
+    /// (W^X-friendly), and return the page pointer. On riscv64 a `fence.i` is issued
+    /// so the just-written instructions are fetchable on this hart (x86_64 caches
+    /// are coherent). Caller transmutes the pointer to the right fn type and frees
+    /// it with `libc::munmap(page, EXEC_PAGE)`.
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+    fn map_executable(code: &[u8]) -> *mut libc::c_void {
+        use std::ptr;
+        assert!(code.len() <= EXEC_PAGE);
+        let page = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                EXEC_PAGE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(page, libc::MAP_FAILED, "mmap exec page");
+        unsafe {
+            ptr::copy_nonoverlapping(code.as_ptr(), page as *mut u8, code.len());
+            assert_eq!(
+                libc::mprotect(page, EXEC_PAGE, libc::PROT_READ | libc::PROT_EXEC),
+                0,
+                "mprotect r-x"
+            );
+        }
+        // riscv64 instruction fetch is not coherent with the stores above until a
+        // FENCE.I retires on this hart.
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            std::arch::asm!("fence.i");
+        }
+        page
+    }
+
+    /// Execute the generated `clock_gettime` offset stub as real machine code and
+    /// confirm CLOCK_REALTIME comes back shifted by exactly the embedded offset
+    /// while CLOCK_MONOTONIC is left untouched. Unlike the layout tests above, this
+    /// proves the hand-assembled encoding (syscall, clockid branches, PC-relative
+    /// offset load, tv_sec add) actually runs correctly on hardware. Needs no
+    /// sandbox/Landlock, so it runs on any kernel.
+    #[test]
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+    fn offset_stub_clock_gettime_executes_and_shifts_realtime() {
+        const OFFSET: i64 = -86_400; // one day back
+        let page = map_executable(&offset_stub_clock_gettime(OFFSET));
+        let stub_fn: extern "C" fn(libc::clockid_t, *mut libc::timespec) -> libc::c_int =
+            unsafe { std::mem::transmute(page) };
+
+        // CLOCK_REALTIME (0): stub time must equal real time + OFFSET.
+        let mut real = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        let mut stubbed = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        assert_eq!(unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut real) }, 0);
+        assert_eq!(stub_fn(libc::CLOCK_REALTIME, &mut stubbed), 0, "stub returns 0");
+        let shift = real.tv_sec - stubbed.tv_sec; // real - (real + OFFSET) = -OFFSET
+        assert!(
+            (shift - (-OFFSET)).abs() <= 2,
+            "CLOCK_REALTIME should be shifted by {OFFSET}s, observed real-stub={shift}s"
+        );
+
+        // CLOCK_MONOTONIC (1): not in {0,5}, so the stub must leave it unshifted.
+        let mut mono_stub = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        let mut mono_real = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        assert_eq!(stub_fn(libc::CLOCK_MONOTONIC, &mut mono_stub), 0);
+        assert_eq!(unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut mono_real) }, 0);
+        assert!(
+            (mono_real.tv_sec - mono_stub.tv_sec).abs() <= 2,
+            "CLOCK_MONOTONIC must be unshifted, stub={} real={}",
+            mono_stub.tv_sec,
+            mono_real.tv_sec
+        );
+
+        unsafe {
+            libc::munmap(page, EXEC_PAGE);
+        }
+    }
+
+    /// Execute the generated `gettimeofday` offset stub as real machine code:
+    /// confirm a non-NULL `timeval` comes back shifted by the embedded offset, and
+    /// that a NULL `timeval` takes the stub's NULL branch (returns 0, no store, no
+    /// fault). Runs on any kernel (no sandbox/Landlock).
+    #[test]
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+    fn offset_stub_gettimeofday_executes_and_shifts_tv_sec() {
+        const OFFSET: i64 = -86_400; // one day back
+        let page = map_executable(&offset_stub_gettimeofday(OFFSET));
+        let stub_fn: extern "C" fn(*mut libc::timeval, *mut libc::c_void) -> libc::c_int =
+            unsafe { std::mem::transmute(page) };
+
+        // Non-NULL timeval: tv_sec must be shifted by OFFSET.
+        let mut real = libc::timeval { tv_sec: 0, tv_usec: 0 };
+        let mut stubbed = libc::timeval { tv_sec: 0, tv_usec: 0 };
+        assert_eq!(unsafe { libc::gettimeofday(&mut real, std::ptr::null_mut()) }, 0);
+        assert_eq!(stub_fn(&mut stubbed, std::ptr::null_mut()), 0, "stub returns 0");
+        let shift = real.tv_sec - stubbed.tv_sec; // real - (real + OFFSET) = -OFFSET
+        assert!(
+            (shift - (-OFFSET)).abs() <= 2,
+            "gettimeofday tv_sec should be shifted by {OFFSET}s, observed real-stub={shift}s"
+        );
+
+        // NULL timeval: the stub must take its NULL branch — return 0 without
+        // dereferencing the pointer. A mis-encoded branch would SIGSEGV here.
+        assert_eq!(
+            stub_fn(std::ptr::null_mut(), std::ptr::null_mut()),
+            0,
+            "NULL timeval handled without fault"
+        );
+
+        unsafe {
+            libc::munmap(page, EXEC_PAGE);
+        }
     }
 
     #[test]

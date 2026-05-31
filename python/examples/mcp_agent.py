@@ -43,60 +43,9 @@ import tempfile
 from openai import OpenAI
 from sandlock.mcp import McpSandbox
 
-
-# ---------------------------------------------------------------------------
-# Tool implementations — plain Python functions
-# ---------------------------------------------------------------------------
-
-def read_file(path: str) -> str:
-    """Read a file from the workspace."""
-    import os
-    workspace = os.environ["SANDLOCK_WORKSPACE"]
-    full = os.path.join(workspace, path)
-    with open(full) as f:
-        return f.read()
-
-
-def write_file(path: str, content: str) -> str:
-    """Write content to a file in the workspace."""
-    import os
-    workspace = os.environ["SANDLOCK_WORKSPACE"]
-    full = os.path.join(workspace, path)
-    parent = os.path.dirname(full)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    with open(full, "w") as f:
-        f.write(content)
-    return f"Wrote {len(content)} bytes to {path}"
-
-
-def run_python(code: str) -> str:
-    """Execute Python code and return stdout."""
-    import io
-    import contextlib
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        exec(code)
-    return buf.getvalue()
-
-
-def list_files() -> str:
-    """List files in the workspace."""
-    import os
-    workspace = os.environ["SANDLOCK_WORKSPACE"]
-    entries = sorted(os.listdir(workspace))
-    lines = []
-    for e in entries:
-        kind = "dir" if os.path.isdir(os.path.join(workspace, e)) else "file"
-        lines.append(f"{kind}  {e}")
-    return "\n".join(lines) if lines else "(empty)"
-
-
-def web_fetch(url: str) -> str:
-    """Fetch a URL and return the response body (first 4KB)."""
-    from urllib.request import urlopen
-    resp = urlopen(url, timeout=10)
-    return resp.read(4096).decode("utf-8", errors="replace")
+# Tools live in a stdlib-only module so McpSandbox can import them inside
+# each per-call jail without pulling in openai or sandlock.  See agent_tools.py.
+from agent_tools import read_file, write_file, run_python, list_files, web_fetch
 
 
 # ---------------------------------------------------------------------------
@@ -110,13 +59,11 @@ async def run_agent(user_prompt: str, workspace: str):
     mcp = McpSandbox(workspace=workspace)
 
     # Deny by default: clean env, no writes, no network.
-    # Each tool gets only the env vars and permissions it needs.
-    ws_env = {"SANDLOCK_WORKSPACE": workspace}
-
+    # Each tool gets only the permissions it needs; the workspace path is
+    # injected automatically into any tool that declares a `workspace` param.
     mcp.add_tool(
         "read_file", read_file,
         description="Read a file from the workspace. Path is relative to workspace root.",
-        capabilities={"env": ws_env},
         input_schema={
             "type": "object",
             "properties": {"path": {"type": "string", "description": "Relative file path"}},
@@ -126,7 +73,7 @@ async def run_agent(user_prompt: str, workspace: str):
     mcp.add_tool(
         "write_file", write_file,
         description="Write content to a file in the workspace. Creates parent directories.",
-        capabilities={"fs_writable": [workspace], "env": ws_env},
+        capabilities={"fs_writable": [workspace]},
         input_schema={
             "type": "object",
             "properties": {
@@ -149,7 +96,6 @@ async def run_agent(user_prompt: str, workspace: str):
     mcp.add_tool(
         "list_files", list_files,
         description="List files in the workspace directory.",
-        capabilities={"env": ws_env},
         input_schema={"type": "object", "properties": {}},
     )
     mcp.add_tool(

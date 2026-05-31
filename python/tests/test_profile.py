@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for sandlock._profile (sectioned schema)."""
 
+from __future__ import annotations
+
 import textwrap
 
 import pytest
@@ -13,7 +15,7 @@ from sandlock._profile import (
     profiles_dir,
 )
 from sandlock.exceptions import PolicyError
-from sandlock.sandbox import BranchAction, FsIsolation, Sandbox
+from sandlock.sandbox import BranchAction, Sandbox
 
 
 class TestPolicyFromDict:
@@ -140,11 +142,9 @@ class TestPolicyFromDict:
         assert p.deterministic_dirs is True
         assert p.no_randomize_memory is True
 
-    def test_filesystem_isolation_enum(self):
-        p = policy_from_dict({
-            "filesystem": {"isolation": "branchfs"},
-        })
-        assert p.fs_isolation == FsIsolation.BRANCHFS
+    def test_filesystem_isolation_key_rejected(self):
+        with pytest.raises(PolicyError, match=r"unknown field\(s\) in \[filesystem\]"):
+            policy_from_dict({"filesystem": {"isolation": "none"}})
 
     def test_filesystem_branch_actions(self):
         p = policy_from_dict({
@@ -174,10 +174,6 @@ class TestPolicyFromDict:
     def test_type_mismatch_raises(self):
         with pytest.raises(PolicyError, match=r"\[program\]\.clean_env expected bool"):
             policy_from_dict({"program": {"clean_env": "yes"}})
-
-    def test_invalid_fs_isolation_raises(self):
-        with pytest.raises(PolicyError, match=r"\[filesystem\]\.isolation must be"):
-            policy_from_dict({"filesystem": {"isolation": "invalid"}})
 
     def test_invalid_branch_action_raises(self):
         with pytest.raises(PolicyError, match=r"\[filesystem\]\.on_exit must be"):

@@ -1,4 +1,4 @@
-// Network control handlers — IP allowlist enforcement via seccomp notification.
+// Network policy and control handlers — IP allowlist enforcement via seccomp notification.
 //
 // Intercepts connect/sendto/sendmsg syscalls, extracts the destination IP from
 // the child's memory, and checks it against an allowlist of resolved IPs.
@@ -9,6 +9,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
+use crate::error::SandboxError;
 use crate::seccomp::ctx::SupervisorCtx;
 use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction};
 use crate::sys::structs::{SeccompNotif, AF_INET, AF_INET6, ECONNREFUSED};
@@ -16,6 +19,182 @@ use crate::sys::structs::{SeccompNotif, AF_INET, AF_INET6, ECONNREFUSED};
 /// Maximum buffer size for sendto/sendmsg on-behalf operations (64 MiB).
 /// Prevents a sandboxed process from triggering OOM in the supervisor.
 const MAX_SEND_BUF: usize = 64 << 20;
+
+/// L4 protocol that a `NetAllow` rule applies to.
+///
+/// `Tcp` is the default if a rule has no scheme (the bare `host:port`
+/// form). `Udp` and `Icmp` require an explicit scheme.
+///
+/// `Icmp` is the kernel's unprivileged ping socket
+/// (`SOCK_DGRAM + IPPROTO_ICMP{,V6}`), gated by `ping_group_range` —
+/// destinations are filterable per host. Sandlock does not expose raw
+/// ICMP (`SOCK_RAW + IPPROTO_ICMP`): destination filtering at `sendto`
+/// would lie because raw sockets let the agent craft the IP header,
+/// and packet-crafting capabilities aren't part of the XOA threat
+/// model. Workloads that genuinely need raw ICMP should run outside
+/// sandlock or rely on the host's `ping_group_range` for the dgram
+/// path instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+    Tcp,
+    Udp,
+    Icmp,
+}
+
+impl Protocol {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "tcp" => Some(Protocol::Tcp),
+            "udp" => Some(Protocol::Udp),
+            "icmp" => Some(Protocol::Icmp),
+            _ => None,
+        }
+    }
+}
+
+/// A network endpoint allow rule.
+///
+/// Each rule permits one protocol's traffic to one host (or any IP, for
+/// the `:port` form) on a specific set of ports. Multiple rules are
+/// OR'd: traffic is permitted if any rule matches the protocol, the
+/// destination IP, and the destination port.
+///
+/// ICMP rules carry no port (ICMP has none); their `ports` is empty
+/// and `all_ports` is false.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct NetAllow {
+    /// L4 protocol this rule applies to.
+    #[serde(default = "default_protocol_tcp")]
+    pub protocol: Protocol,
+    /// Hostname; `None` means "any IP" (the `:port` form, or `icmp://*`).
+    pub host: Option<String>,
+    /// Permitted ports. Must be non-empty unless `all_ports` is true,
+    /// in which case it must be empty. Always empty for `Protocol::Icmp`.
+    pub ports: Vec<u16>,
+    /// "Any port" wildcard from the `*` token in port position. When
+    /// true, `ports` is empty; the rule permits every TCP/UDP port to
+    /// the host (or to any IP, when `host` is `None`).
+    #[serde(default)]
+    pub all_ports: bool,
+}
+
+fn default_protocol_tcp() -> Protocol {
+    Protocol::Tcp
+}
+
+impl NetAllow {
+    /// Parse a rule spec. Forms:
+    ///
+    /// - `host:port[,port,...]`, `:port`, `*:port`, `host:*`, `:*`, `*:*`
+    ///   — TCP (the default scheme).
+    /// - `tcp://...` — explicit TCP, same suffix grammar as the bare form.
+    /// - `udp://...` — UDP, same suffix grammar as the bare form.
+    /// - `icmp://host` or `icmp://*` — ICMP echo (kernel ping socket).
+    ///   No port field; `icmp://host:80` is rejected.
+    ///
+    /// `*` in port position means "any port" (the all-ports wildcard).
+    /// Mixing `*` with concrete ports (e.g. `host:80,*`) is rejected.
+    pub fn parse(s: &str) -> Result<Self, SandboxError> {
+        // Split off the optional scheme prefix `<proto>://`. If absent,
+        // default to TCP and the rest of the parser is unchanged.
+        let (protocol, rest) = match s.split_once("://") {
+            Some((scheme, body)) => {
+                let proto = Protocol::parse(scheme).ok_or_else(|| {
+                    SandboxError::Invalid(format!(
+                        "--net-allow: unknown scheme `{}://` in `{}` (expected tcp, udp, icmp)",
+                        scheme, s
+                    ))
+                })?;
+                (proto, body)
+            }
+            None => (Protocol::Tcp, s),
+        };
+
+        if protocol == Protocol::Icmp {
+            return Self::parse_icmp(rest, s);
+        }
+
+        let (host_part, port_part) = rest.rsplit_once(':').ok_or_else(|| {
+            SandboxError::Invalid(format!(
+                "--net-allow: expected `host:port` or `:port`, got `{}`",
+                s
+            ))
+        })?;
+        let host = match host_part {
+            "" | "*" => None,
+            h => Some(h.to_string()),
+        };
+
+        // Detect the wildcard token. We split on ',' first so a
+        // single `*` is a clean match — `*,80` is rejected explicitly
+        // below rather than letting `*` parse as port 0.
+        let mut ports = Vec::new();
+        let mut saw_wildcard = false;
+        for p in port_part.split(',') {
+            let p = p.trim();
+            if p == "*" {
+                saw_wildcard = true;
+                continue;
+            }
+            let n: u16 = p.parse().map_err(|_| {
+                SandboxError::Invalid(format!("--net-allow: invalid port `{}` in `{}`", p, s))
+            })?;
+            if n == 0 {
+                return Err(SandboxError::Invalid(format!(
+                    "--net-allow: port 0 is not valid in `{}`",
+                    s
+                )));
+            }
+            ports.push(n);
+        }
+        if saw_wildcard && !ports.is_empty() {
+            return Err(SandboxError::Invalid(format!(
+                "--net-allow: cannot mix `*` with concrete ports in `{}`",
+                s
+            )));
+        }
+        if !saw_wildcard && ports.is_empty() {
+            return Err(SandboxError::Invalid(format!(
+                "--net-allow: at least one port required in `{}`",
+                s
+            )));
+        }
+        Ok(NetAllow {
+            protocol,
+            host,
+            ports,
+            all_ports: saw_wildcard,
+        })
+    }
+
+    /// Parse the body of an `icmp://` rule. Accepts a host or `*` —
+    /// ICMP has no ports, so any `:` separator is rejected.
+    fn parse_icmp(body: &str, full: &str) -> Result<Self, SandboxError> {
+        if body.contains(':') {
+            return Err(SandboxError::Invalid(format!(
+                "--net-allow: icmp rules take no port, got `{}`",
+                full
+            )));
+        }
+        if body.is_empty() {
+            return Err(SandboxError::Invalid(format!(
+                "--net-allow: icmp rule needs a host or `*`, got `{}`",
+                full
+            )));
+        }
+        let host = match body {
+            "*" => None,
+            h => Some(h.to_string()),
+        };
+        Ok(NetAllow {
+            protocol: Protocol::Icmp,
+            host,
+            ports: Vec::new(),
+            all_ports: false,
+        })
+    }
+}
 
 // ============================================================
 // parse_ip_from_sockaddr — parse IP from a sockaddr byte buffer
@@ -68,6 +247,14 @@ fn parse_port_from_sockaddr(bytes: &[u8]) -> Option<u16> {
     }
 }
 
+fn set_port_in_sockaddr(bytes: &mut [u8], port: u16) {
+    if bytes.len() >= 4 {
+        let port_bytes = port.to_be_bytes();
+        bytes[2] = port_bytes[0];
+        bytes[3] = port_bytes[1];
+    }
+}
+
 // ============================================================
 // query_socket_protocol — derive the rule Protocol from a fd via getsockopt
 // ============================================================
@@ -78,8 +265,7 @@ fn parse_port_from_sockaddr(bytes: &[u8]) -> Option<u16> {
 /// Returns `None` for protocols sandlock does not gate via `net_allow`
 /// (raw, SCTP, etc.) — the handler treats those as "no rule applies"
 /// which collapses to the default-deny path.
-fn query_socket_protocol(fd: RawFd) -> Option<crate::sandbox::Protocol> {
-    use crate::sandbox::Protocol;
+fn query_socket_protocol(fd: RawFd) -> Option<Protocol> {
     let mut proto: libc::c_int = 0;
     let mut len: libc::socklen_t = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
     let rc = unsafe {
@@ -144,7 +330,7 @@ async fn connect_on_behalf(
         let dest_port = parse_port_from_sockaddr(&addr_bytes);
         let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
             Ok(fd) => fd,
-            Err(_) => return NotifAction::Errno(libc::ENOSYS),
+            Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
         };
         let protocol = match query_socket_protocol(dup_fd.as_raw_fd()) {
             Some(p) => p,
@@ -179,6 +365,11 @@ async fn connect_on_behalf(
         let http_acl_addr = ns.http_acl_addr;
         let http_acl_intercept = dest_port.map_or(false, |p| ns.http_acl_ports.contains(&p));
         let http_acl_orig_dest = ns.http_acl_orig_dest.clone();
+        let remapped_loopback_port = if ctx.policy.port_remap && ip.is_loopback() {
+            dest_port.and_then(|p| ns.port_map.get_real(p))
+        } else {
+            None
+        };
 
         drop(ns);
 
@@ -186,7 +377,7 @@ async fn connect_on_behalf(
         let mut redirected = false;
         let is_ipv6 = parse_ip_from_sockaddr(&addr_bytes)
             .map_or(false, |ip| ip.is_ipv6());
-        let (connect_addr, connect_len) = if let Some(proxy_addr) = http_acl_addr {
+        let (mut connect_addr, connect_len) = if let Some(proxy_addr) = http_acl_addr {
             if http_acl_intercept {
                 redirected = true;
                 if is_ipv6 {
@@ -240,6 +431,13 @@ async fn connect_on_behalf(
         } else {
             (addr_bytes.clone(), addr_len)
         };
+        if !redirected {
+            if let Some(real_port) = remapped_loopback_port {
+                // The child sees virtual ports via getsockname(); connect
+                // still has to target the real bound loopback port.
+                set_port_in_sockaddr(&mut connect_addr, real_port);
+            }
+        }
 
         // (The supervisor-side dup is the same fd we already created
         // for the SO_PROTOCOL probe above — reuse it rather than
@@ -396,7 +594,7 @@ async fn sendto_on_behalf(
         let dest_port = parse_port_from_sockaddr(&addr_bytes);
         let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
             Ok(fd) => fd,
-            Err(_) => return NotifAction::Errno(libc::ENOSYS),
+            Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
         };
         let protocol = match query_socket_protocol(dup_fd.as_raw_fd()) {
             Some(p) => p,
@@ -484,7 +682,7 @@ async fn sendmsg_on_behalf(
 
     let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
         Ok(fd) => fd,
-        Err(_) => return NotifAction::Errno(libc::ENOSYS),
+        Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
     };
     let protocol = match query_socket_protocol(dup_fd.as_raw_fd()) {
         Some(p) => p,
@@ -562,7 +760,7 @@ async fn send_msghdr_on_behalf(
     ctx: &Arc<SupervisorCtx>,
     notif_fd: RawFd,
     dup_fd: &std::os::unix::io::OwnedFd,
-    protocol: crate::sandbox::Protocol,
+    protocol: Protocol,
     msghdr_ptr: u64,
     flags: i32,
 ) -> Result<isize, i32> {
@@ -721,7 +919,7 @@ async fn sendmmsg_on_behalf(
 
     let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
         Ok(fd) => fd,
-        Err(_) => return NotifAction::Errno(libc::ENOSYS),
+        Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
     };
     let protocol = match query_socket_protocol(dup_fd.as_raw_fd()) {
         Some(p) => p,
@@ -839,9 +1037,12 @@ pub struct ResolvedNetAllowSet {
     pub tcp: ResolvedNetAllow,
     pub udp: ResolvedNetAllow,
     pub icmp: ResolvedNetAllow,
-    /// Synthetic `/etc/hosts` content combining every concrete host
-    /// across all protocols. `None` when no concrete hostnames appear.
-    pub etc_hosts: Option<String>,
+    /// `<ip> <hostname>\n` lines from every concrete-host rule across
+    /// every protocol, in resolution order. Empty when no concrete-host
+    /// rules are present. Combined with the loopback base (or, in chroot
+    /// mode, the image's `/etc/hosts`) by [`compose_virtual_etc_hosts`]
+    /// to build the synthetic file served to the sandbox.
+    pub concrete_host_entries: String,
 }
 
 /// Resolve `--net-allow` rules into per-protocol runtime allowlists.
@@ -853,22 +1054,14 @@ pub struct ResolvedNetAllowSet {
 /// (PortAllow::Any). A `*` host on ICMP becomes `any_ip_all_ports`,
 /// which the handler reads as "no destination check."
 pub async fn resolve_net_allow(
-    rules: &[crate::sandbox::NetAllow],
+    rules: &[NetAllow],
 ) -> io::Result<ResolvedNetAllowSet> {
-    use crate::sandbox::Protocol;
-
-    // Single shared etc_hosts for all protocols. Every concrete host
-    // (regardless of protocol) ends up resolvable in the sandbox.
-    let mut etc_hosts = String::from("127.0.0.1 localhost\n::1 localhost\n");
-    let mut has_concrete_host = false;
-
     let per_proto = |target: Protocol| async move {
         let mut per_ip: HashMap<IpAddr, HashSet<u16>> = HashMap::new();
         let mut per_ip_all_ports: HashSet<IpAddr> = HashSet::new();
         let mut any_ip_ports: HashSet<u16> = HashSet::new();
         let mut any_ip_all_ports = false;
         let mut local_etc_hosts = String::new();
-        let mut local_has_concrete = false;
 
         for rule in rules.iter().filter(|r| r.protocol == target) {
             match &rule.host {
@@ -884,7 +1077,6 @@ pub async fn resolve_net_allow(
                     }
                 }
                 Some(host) => {
-                    local_has_concrete = true;
                     let addr = format!("{}:0", host);
                     let resolved = tokio::net::lookup_host(addr.as_str()).await.map_err(|e| {
                         io::Error::new(
@@ -917,25 +1109,83 @@ pub async fn resolve_net_allow(
                 any_ip_all_ports,
             },
             local_etc_hosts,
-            local_has_concrete,
         ))
     };
 
-    let (tcp, tcp_eh, tcp_concrete) = per_proto(Protocol::Tcp).await?;
-    let (udp, udp_eh, udp_concrete) = per_proto(Protocol::Udp).await?;
-    let (icmp, icmp_eh, icmp_concrete) = per_proto(Protocol::Icmp).await?;
+    let (tcp, tcp_eh) = per_proto(Protocol::Tcp).await?;
+    let (udp, udp_eh) = per_proto(Protocol::Udp).await?;
+    let (icmp, icmp_eh) = per_proto(Protocol::Icmp).await?;
 
+    let mut concrete_host_entries = String::new();
     for chunk in [tcp_eh, udp_eh, icmp_eh] {
-        etc_hosts.push_str(&chunk);
+        concrete_host_entries.push_str(&chunk);
     }
-    has_concrete_host |= tcp_concrete || udp_concrete || icmp_concrete;
 
     Ok(ResolvedNetAllowSet {
         tcp,
         udp,
         icmp,
-        etc_hosts: if has_concrete_host { Some(etc_hosts) } else { None },
+        concrete_host_entries,
     })
+}
+
+/// Compose the synthetic `/etc/hosts` served to the sandbox.
+///
+/// - **No chroot**: emit the fixed loopback base
+///   (`127.0.0.1 localhost\n::1 localhost\n`) followed by the
+///   concrete-host entries from [`resolve_net_allow`]. The sandbox sees
+///   the same baseline regardless of what the host's on-disk file says.
+/// - **With chroot**: read `<chroot>/etc/hosts` and use it as the base
+///   (an image that bakes in private-registry entries or similar keeps
+///   them). Inject loopback entries only for any localhost family the
+///   image doesn't already cover — never both, so we don't duplicate
+///   what the image already has. Concrete-host entries are still
+///   appended on top.
+///
+/// If a chroot is set but `<chroot>/etc/hosts` is unreadable (absent,
+/// permission denied, etc.), fall back to the bare loopback base — the
+/// sandbox always sees a usable hosts file.
+pub fn compose_virtual_etc_hosts(
+    chroot_root: Option<&std::path::Path>,
+    concrete_host_entries: &str,
+) -> String {
+    let mut out = String::new();
+    let mut has_v4_localhost = false;
+    let mut has_v6_localhost = false;
+
+    if let Some(root) = chroot_root {
+        if let Ok(image) = std::fs::read_to_string(root.join("etc").join("hosts")) {
+            for line in image.lines() {
+                // Strip an inline `#` comment before tokenizing — the
+                // hosts(5) format treats everything after `#` as a comment.
+                let stripped = line.split('#').next().unwrap_or("");
+                let mut parts = stripped.split_whitespace();
+                let Some(ip) = parts.next() else { continue };
+                for name in parts {
+                    if name == "localhost" {
+                        if ip == "127.0.0.1" {
+                            has_v4_localhost = true;
+                        } else if ip == "::1" {
+                            has_v6_localhost = true;
+                        }
+                    }
+                }
+            }
+            out.push_str(&image);
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+    }
+
+    if !has_v4_localhost {
+        out.push_str("127.0.0.1 localhost\n");
+    }
+    if !has_v6_localhost {
+        out.push_str("::1 localhost\n");
+    }
+    out.push_str(concrete_host_entries);
+    out
 }
 
 // ============================================================
@@ -945,7 +1195,175 @@ pub async fn resolve_net_allow(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sandbox::NetAllow;
+
+    // --- NetAllow::parse tests ---
+
+    #[test]
+    fn netallow_parse_concrete_host_port() {
+        let r = NetAllow::parse("example.com:443").unwrap();
+        assert_eq!(r.host.as_deref(), Some("example.com"));
+        assert_eq!(r.ports, vec![443]);
+        assert!(!r.all_ports);
+    }
+
+    #[test]
+    fn netallow_parse_any_host_port() {
+        let r = NetAllow::parse(":8080").unwrap();
+        assert_eq!(r.host, None);
+        assert_eq!(r.ports, vec![8080]);
+        assert!(!r.all_ports);
+
+        let r = NetAllow::parse("*:8080").unwrap();
+        assert_eq!(r.host, None);
+        assert_eq!(r.ports, vec![8080]);
+        assert!(!r.all_ports);
+    }
+
+    #[test]
+    fn netallow_parse_multiple_ports() {
+        let r = NetAllow::parse("github.com:22,80,443").unwrap();
+        assert_eq!(r.host.as_deref(), Some("github.com"));
+        assert_eq!(r.ports, vec![22, 80, 443]);
+        assert!(!r.all_ports);
+    }
+
+    #[test]
+    fn netallow_parse_wildcard_any_host_any_port_colon() {
+        let r = NetAllow::parse(":*").unwrap();
+        assert_eq!(r.host, None);
+        assert!(r.ports.is_empty());
+        assert!(r.all_ports);
+    }
+
+    #[test]
+    fn netallow_parse_wildcard_any_host_any_port_star() {
+        let r = NetAllow::parse("*:*").unwrap();
+        assert_eq!(r.host, None);
+        assert!(r.ports.is_empty());
+        assert!(r.all_ports);
+    }
+
+    #[test]
+    fn netallow_parse_wildcard_concrete_host_any_port() {
+        let r = NetAllow::parse("example.com:*").unwrap();
+        assert_eq!(r.host.as_deref(), Some("example.com"));
+        assert!(r.ports.is_empty());
+        assert!(r.all_ports);
+    }
+
+    #[test]
+    fn netallow_parse_rejects_mixed_wildcard_and_concrete() {
+        // `host:80,*` and `host:*,80` are both ambiguous: the user
+        // either meant "any port" (wildcard wins) or "ports 80 plus
+        // some weird placeholder". Refuse and force a clean spec.
+        let err = NetAllow::parse("example.com:80,*").unwrap_err();
+        assert!(format!("{}", err).contains("cannot mix"));
+        let err = NetAllow::parse("example.com:*,80").unwrap_err();
+        assert!(format!("{}", err).contains("cannot mix"));
+    }
+
+    #[test]
+    fn netallow_parse_rejects_port_zero() {
+        let err = NetAllow::parse("example.com:0").unwrap_err();
+        assert!(format!("{}", err).contains("port 0"));
+    }
+
+    #[test]
+    fn netallow_parse_rejects_empty_port() {
+        let err = NetAllow::parse("example.com:").unwrap_err();
+        assert!(format!("{}", err).contains("invalid port"));
+    }
+
+    #[test]
+    fn netallow_parse_rejects_no_colon() {
+        let err = NetAllow::parse("example.com").unwrap_err();
+        assert!(format!("{}", err).contains("expected"));
+    }
+
+    #[test]
+    fn netallow_parse_repeated_wildcard_is_idempotent() {
+        // `*,*` collapses to a single wildcard — neither token contributes
+        // a concrete port, so the rule remains "any port".
+        let r = NetAllow::parse(":*,*").unwrap();
+        assert!(r.all_ports);
+        assert!(r.ports.is_empty());
+    }
+
+    // --- Protocol scheme prefix tests ---
+
+    #[test]
+    fn netallow_bare_form_defaults_to_tcp() {
+        let r = NetAllow::parse("example.com:443").unwrap();
+        assert_eq!(r.protocol, Protocol::Tcp);
+    }
+
+    #[test]
+    fn netallow_explicit_tcp_scheme() {
+        let r = NetAllow::parse("tcp://example.com:443").unwrap();
+        assert_eq!(r.protocol, Protocol::Tcp);
+        assert_eq!(r.host.as_deref(), Some("example.com"));
+        assert_eq!(r.ports, vec![443]);
+    }
+
+    #[test]
+    fn netallow_udp_scheme_with_host_port() {
+        let r = NetAllow::parse("udp://1.1.1.1:53").unwrap();
+        assert_eq!(r.protocol, Protocol::Udp);
+        assert_eq!(r.host.as_deref(), Some("1.1.1.1"));
+        assert_eq!(r.ports, vec![53]);
+    }
+
+    #[test]
+    fn netallow_udp_wildcard_any_anywhere() {
+        // The "any UDP" gate, equivalent to the old `allow_udp = true`.
+        let r = NetAllow::parse("udp://*:*").unwrap();
+        assert_eq!(r.protocol, Protocol::Udp);
+        assert_eq!(r.host, None);
+        assert!(r.all_ports);
+    }
+
+    #[test]
+    fn netallow_icmp_scheme_with_host() {
+        let r = NetAllow::parse("icmp://github.com").unwrap();
+        assert_eq!(r.protocol, Protocol::Icmp);
+        assert_eq!(r.host.as_deref(), Some("github.com"));
+        assert!(r.ports.is_empty());
+        assert!(!r.all_ports);
+    }
+
+    #[test]
+    fn netallow_icmp_wildcard() {
+        // The "any ICMP echo" gate, equivalent to the old
+        // `allow_icmp = true` for the SOCK_DGRAM path.
+        let r = NetAllow::parse("icmp://*").unwrap();
+        assert_eq!(r.protocol, Protocol::Icmp);
+        assert_eq!(r.host, None);
+    }
+
+    #[test]
+    fn netallow_icmp_rejects_port() {
+        // ICMP has no port — `:port` is meaningless and refused
+        // explicitly so users can't write a rule that doesn't do what
+        // they think.
+        let err = NetAllow::parse("icmp://github.com:80").unwrap_err();
+        assert!(format!("{}", err).contains("icmp rules take no port"));
+    }
+
+    #[test]
+    fn netallow_icmp_rejects_empty_body() {
+        let err = NetAllow::parse("icmp://").unwrap_err();
+        assert!(format!("{}", err).contains("needs a host or `*`"));
+    }
+
+    #[test]
+    fn netallow_unknown_scheme_rejected() {
+        // Including `icmp-raw` — sandlock does not expose raw ICMP, so
+        // the scheme is unknown rather than a special-case error.
+        for spec in ["sctp://host:1234", "icmp-raw://*"] {
+            let err = NetAllow::parse(spec).unwrap_err();
+            assert!(format!("{}", err).contains("unknown scheme"), "spec: {}", spec);
+        }
+    }
 
     #[tokio::test]
     async fn test_resolve_net_allow_empty() {
@@ -954,13 +1372,14 @@ mod tests {
         assert!(resolved.tcp.any_ip_ports.is_empty());
         assert!(resolved.udp.per_ip.is_empty());
         assert!(resolved.icmp.per_ip.is_empty());
-        assert!(resolved.etc_hosts.is_none());
+        // No concrete-host rules → no resolved-entry lines.
+        assert!(resolved.concrete_host_entries.is_empty());
     }
 
     #[tokio::test]
     async fn test_resolve_net_allow_concrete_host() {
         let rules = vec![NetAllow {
-            protocol: crate::sandbox::Protocol::Tcp,
+            protocol: Protocol::Tcp,
             host: Some("localhost".to_string()),
             ports: vec![80, 443],
             all_ports: false,
@@ -975,23 +1394,35 @@ mod tests {
         }
         assert!(resolved.udp.per_ip.is_empty());
         assert!(resolved.icmp.per_ip.is_empty());
-        assert!(resolved.etc_hosts.as_deref().unwrap_or("").contains("localhost"));
+        // The resolved entry (`<ip> localhost`) surfaces in concrete_host_entries.
+        assert!(resolved.concrete_host_entries.contains("127.0.0.1 localhost"));
     }
 
     #[tokio::test]
     async fn test_resolve_net_allow_any_ip() {
-        let rules = vec![NetAllow { protocol: crate::sandbox::Protocol::Tcp, host: None, ports: vec![8080], all_ports: false }];
+        let rules = vec![NetAllow {
+            protocol: Protocol::Tcp,
+            host: None,
+            ports: vec![8080],
+            all_ports: false,
+        }];
         let resolved = resolve_net_allow(&rules).await.unwrap();
         assert!(resolved.tcp.per_ip.is_empty());
         assert!(resolved.tcp.any_ip_ports.contains(&8080));
         assert!(!resolved.tcp.any_ip_all_ports);
-        assert!(resolved.etc_hosts.is_none());
+        // Any-IP rule has no concrete host, so no resolved-entry line.
+        assert!(resolved.concrete_host_entries.is_empty());
     }
 
     #[tokio::test]
     async fn test_resolve_net_allow_any_ip_all_ports() {
         // `:*` — fully unrestricted egress, TCP-only.
-        let rules = vec![NetAllow { protocol: crate::sandbox::Protocol::Tcp, host: None, ports: vec![], all_ports: true }];
+        let rules = vec![NetAllow {
+            protocol: Protocol::Tcp,
+            host: None,
+            ports: vec![],
+            all_ports: true,
+        }];
         let resolved = resolve_net_allow(&rules).await.unwrap();
         assert!(resolved.tcp.any_ip_all_ports);
         assert!(resolved.tcp.per_ip.is_empty());
@@ -1006,19 +1437,21 @@ mod tests {
     async fn test_resolve_net_allow_concrete_host_all_ports() {
         // `localhost:*` — every port to localhost only, TCP.
         let rules = vec![NetAllow {
-            protocol: crate::sandbox::Protocol::Tcp,
+            protocol: Protocol::Tcp,
             host: Some("localhost".to_string()),
             ports: vec![],
             all_ports: true,
         }];
         let resolved = resolve_net_allow(&rules).await.unwrap();
         assert!(!resolved.tcp.any_ip_all_ports);
-        assert!(!resolved.tcp.per_ip_all_ports.is_empty(),
-            "localhost should resolve to at least one IP marked as any-port");
+        assert!(
+            !resolved.tcp.per_ip_all_ports.is_empty(),
+            "localhost should resolve to at least one IP marked as any-port"
+        );
         for ip in resolved.tcp.per_ip_all_ports.iter() {
             assert!(resolved.tcp.per_ip.contains_key(ip));
         }
-        assert!(resolved.etc_hosts.is_some());
+        assert!(resolved.concrete_host_entries.contains("localhost"));
     }
 
     #[tokio::test]
@@ -1028,9 +1461,14 @@ mod tests {
         // into per_ip (the runtime layer chooses Unrestricted, ignoring
         // the concrete entries).
         let rules = vec![
-            NetAllow { protocol: crate::sandbox::Protocol::Tcp, host: None, ports: vec![], all_ports: true },
             NetAllow {
-                protocol: crate::sandbox::Protocol::Tcp,
+                protocol: Protocol::Tcp,
+                host: None,
+                ports: vec![],
+                all_ports: true,
+            },
+            NetAllow {
+                protocol: Protocol::Tcp,
                 host: Some("localhost".to_string()),
                 ports: vec![22],
                 all_ports: false,
@@ -1051,21 +1489,27 @@ mod tests {
         // This is the property Phase 2 relies on for protocol routing.
         let rules = vec![
             NetAllow {
-                protocol: crate::sandbox::Protocol::Tcp,
+                protocol: Protocol::Tcp,
                 host: Some("localhost".to_string()),
                 ports: vec![443],
                 all_ports: false,
             },
             NetAllow {
-                protocol: crate::sandbox::Protocol::Udp,
+                protocol: Protocol::Udp,
                 host: None,
                 ports: vec![53],
                 all_ports: false,
             },
         ];
         let resolved = resolve_net_allow(&rules).await.unwrap();
-        assert!(!resolved.tcp.per_ip.is_empty(), "TCP rule should populate tcp set");
-        assert!(resolved.udp.any_ip_ports.contains(&53), "UDP rule should populate udp set");
+        assert!(
+            !resolved.tcp.per_ip.is_empty(),
+            "TCP rule should populate tcp set"
+        );
+        assert!(
+            resolved.udp.any_ip_ports.contains(&53),
+            "UDP rule should populate udp set"
+        );
         // Cross-contamination check: TCP per_ip ports must not contain 53;
         // UDP must not contain 443.
         for ports in resolved.tcp.per_ip.values() {
@@ -1079,15 +1523,20 @@ mod tests {
         // ICMP rules carry no ports; concrete hosts go into per_ip with
         // PortAllow::Any-style empty port set, plus per_ip_all_ports.
         let rules = vec![NetAllow {
-            protocol: crate::sandbox::Protocol::Icmp,
+            protocol: Protocol::Icmp,
             host: Some("localhost".to_string()),
             ports: vec![],
             all_ports: false,
         }];
         let resolved = resolve_net_allow(&rules).await.unwrap();
-        assert!(!resolved.icmp.per_ip.is_empty(), "icmp host should populate per_ip");
-        assert!(!resolved.icmp.per_ip_all_ports.is_empty(),
-            "icmp host should mark per_ip_all_ports (no port check)");
+        assert!(
+            !resolved.icmp.per_ip.is_empty(),
+            "icmp host should populate per_ip"
+        );
+        assert!(
+            !resolved.icmp.per_ip_all_ports.is_empty(),
+            "icmp host should mark per_ip_all_ports (no port check)"
+        );
         assert!(resolved.icmp.any_ip_ports.is_empty());
         // TCP/UDP unaffected.
         assert!(resolved.tcp.per_ip.is_empty());
@@ -1098,7 +1547,7 @@ mod tests {
     async fn test_resolve_icmp_wildcard() {
         // `icmp://*` — any ICMP destination.
         let rules = vec![NetAllow {
-            protocol: crate::sandbox::Protocol::Icmp,
+            protocol: Protocol::Icmp,
             host: None,
             ports: vec![],
             all_ports: false,
@@ -1106,5 +1555,109 @@ mod tests {
         let resolved = resolve_net_allow(&rules).await.unwrap();
         assert!(resolved.icmp.any_ip_all_ports);
         assert!(!resolved.tcp.any_ip_all_ports);
+    }
+
+    // ============================================================
+    // compose_virtual_etc_hosts — synthetic /etc/hosts assembly
+    // ============================================================
+
+    use std::io::Write;
+
+    fn temp_rootfs_with_hosts(name: &str, hosts_content: Option<&str>) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sandlock-test-compose-hosts-{}-{}",
+            name, std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(dir.join("etc"));
+        if let Some(content) = hosts_content {
+            let mut f = std::fs::File::create(dir.join("etc").join("hosts")).unwrap();
+            f.write_all(content.as_bytes()).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn compose_no_chroot_emits_loopback_base() {
+        // Default path — no chroot, no concrete-host rules → the same
+        // fixed loopback view we promise every sandbox.
+        let out = compose_virtual_etc_hosts(None, "");
+        assert_eq!(out, "127.0.0.1 localhost\n::1 localhost\n");
+    }
+
+    #[test]
+    fn compose_no_chroot_appends_concrete_entries() {
+        let out = compose_virtual_etc_hosts(None, "10.0.0.1 api\n");
+        assert_eq!(out, "127.0.0.1 localhost\n::1 localhost\n10.0.0.1 api\n");
+    }
+
+    #[test]
+    fn compose_chroot_seeds_from_image_and_injects_missing_loopback() {
+        // Image ships an entry of its own but no localhost mapping; the
+        // shim must keep the image's content and inject both loopback
+        // entries on top so the always-on guarantee still holds.
+        let rootfs = temp_rootfs_with_hosts(
+            "no-localhost",
+            Some("10.0.0.5 myimage.local\n"),
+        );
+        let out = compose_virtual_etc_hosts(Some(&rootfs), "");
+        assert!(out.contains("10.0.0.5 myimage.local"), "image entry missing: {out}");
+        assert!(out.contains("127.0.0.1 localhost"), "v4 loopback missing: {out}");
+        assert!(out.contains("::1 localhost"), "v6 loopback missing: {out}");
+        let _ = std::fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
+    fn compose_chroot_does_not_duplicate_existing_loopback() {
+        // Image already has both loopback entries — don't append duplicates.
+        let rootfs = temp_rootfs_with_hosts(
+            "both-localhost",
+            Some("127.0.0.1 localhost\n::1 localhost\n10.0.0.5 myimage.local\n"),
+        );
+        let out = compose_virtual_etc_hosts(Some(&rootfs), "");
+        assert_eq!(out.matches("127.0.0.1 localhost").count(), 1, "v4 dup'd: {out}");
+        assert_eq!(out.matches("::1 localhost").count(), 1, "v6 dup'd: {out}");
+        assert!(out.contains("10.0.0.5 myimage.local"));
+        let _ = std::fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
+    fn compose_chroot_injects_only_missing_family() {
+        // Image has v4 but no v6 localhost — inject only v6, leave v4 alone.
+        let rootfs = temp_rootfs_with_hosts(
+            "only-v4-localhost",
+            Some("127.0.0.1 localhost myimage\n"),
+        );
+        let out = compose_virtual_etc_hosts(Some(&rootfs), "");
+        assert_eq!(out.matches("127.0.0.1 localhost").count(), 1);
+        assert!(out.contains("::1 localhost"), "v6 loopback should be injected: {out}");
+        let _ = std::fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
+    fn compose_chroot_missing_file_falls_back_to_loopback() {
+        // Chroot exists but has no /etc/hosts — fall back to the bare
+        // loopback base so the sandbox always sees a usable file.
+        let rootfs = temp_rootfs_with_hosts("no-file", None);
+        let out = compose_virtual_etc_hosts(Some(&rootfs), "10.0.0.1 api\n");
+        assert_eq!(out, "127.0.0.1 localhost\n::1 localhost\n10.0.0.1 api\n");
+        let _ = std::fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
+    fn compose_chroot_strips_inline_comments_when_detecting_loopback() {
+        // hosts(5) treats `#` as a comment-start; the loopback-presence
+        // check must respect it (otherwise an image line like
+        // `127.0.0.1 # localhost` would be falsely treated as covering v4).
+        let rootfs = temp_rootfs_with_hosts(
+            "with-comments",
+            Some("127.0.0.1 # localhost is a comment here\n"),
+        );
+        let out = compose_virtual_etc_hosts(Some(&rootfs), "");
+        // Real `127.0.0.1 localhost` line must still be injected.
+        assert!(
+            out.lines().any(|l| l.trim() == "127.0.0.1 localhost"),
+            "v4 loopback should still be injected: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&rootfs);
     }
 }

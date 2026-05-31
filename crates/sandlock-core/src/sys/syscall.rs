@@ -37,6 +37,15 @@ pub unsafe fn syscall3(nr: i64, a1: u64, a2: u64, a3: u64) -> io::Result<i64> {
         in("x2") a3,
         options(nostack),
     );
+    #[cfg(target_arch = "riscv64")]
+    std::arch::asm!(
+        "ecall",
+        inlateout("a7") nr => _,
+        inlateout("a0") a1 as i64 => ret,
+        in("a1") a2,
+        in("a2") a3,
+        options(nostack),
+    );
     if ret < 0 && ret >= -4095 {
         Err(io::Error::from_raw_os_error(-ret as i32))
     } else {
@@ -70,6 +79,16 @@ pub unsafe fn syscall4(nr: i64, a1: u64, a2: u64, a3: u64, a4: u64) -> io::Resul
         in("x1") a2,
         in("x2") a3,
         in("x3") a4,
+        options(nostack),
+    );
+    #[cfg(target_arch = "riscv64")]
+    std::arch::asm!(
+        "ecall",
+        inlateout("a7") nr => _,
+        inlateout("a0") a1 as i64 => ret,
+        in("a1") a2,
+        in("a2") a3,
+        in("a3") a4,
         options(nostack),
     );
     if ret < 0 && ret >= -4095 {

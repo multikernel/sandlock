@@ -411,16 +411,21 @@ pub(crate) async fn handle_proc_open(
     policy: &NotifPolicy,
     notif_fd: RawFd,
 ) -> NotifAction {
-    // openat(dirfd, pathname, flags, mode)
-    // args[0] = dirfd, args[1] = pathname pointer
-    let path_ptr = notif.data.args[1];
-    let path = match read_path(notif, path_ptr, notif_fd) {
+    // Resolve open/openat/openat2 to a normalized absolute path so the
+    // sensitive-path deny, the per-PID filter, and the virtualization
+    // string-matches below all see the same canonical form regardless of
+    // how the caller spelled it (dirfd-relative, `..`-laden, etc.).
+    let resolved = match resolve_open_target(notif, notif_fd) {
+        Some(p) => p,
+        None => return NotifAction::Continue,
+    };
+    let path = match resolved.to_str() {
         Some(p) => p,
         None => return NotifAction::Continue,
     };
 
     // Block sensitive paths.
-    if is_sensitive_proc(&path) {
+    if is_sensitive_proc(path) {
         return NotifAction::Errno(EACCES);
     }
 
@@ -428,7 +433,7 @@ pub(crate) async fn handle_proc_open(
     // This complements the getdents64 PID filtering — directory listings
     // already hide non-sandbox PIDs, but without this check a process
     // could still open /proc/{ppid}/cmdline (or any guessed PID) directly.
-    if let Some(pid) = extract_proc_pid(&path) {
+    if let Some(pid) = extract_proc_pid(path) {
         if !processes.contains(pid) {
             return NotifAction::Errno(EACCES);
         }
@@ -586,41 +591,125 @@ pub(crate) fn handle_uname(
     }
 }
 
-/// Handle openat targeting /etc/hostname — return a memfd with the virtual hostname.
+/// Handle open/openat/openat2 targeting /etc/hostname — return a memfd
+/// with the virtual hostname. Path is resolved and lexically normalized
+/// via [`resolve_open_target`] so dirfd-relative and non-canonical
+/// spellings all hit the shim.
 pub(crate) fn handle_hostname_open(
     notif: &SeccompNotif,
     hostname: &str,
     notif_fd: RawFd,
 ) -> Option<NotifAction> {
-    let path_ptr = notif.data.args[1];
-    let path = read_path(notif, path_ptr, notif_fd)?;
-
-    if path != "/etc/hostname" {
+    let resolved = resolve_open_target(notif, notif_fd)?;
+    if resolved != std::path::Path::new("/etc/hostname") {
         return None;
     }
-
     let content = format!("{}\n", hostname);
     Some(inject_memfd(content.as_bytes()))
 }
 
-/// Intercept `openat("/etc/hosts")` and return a memfd with virtual content.
+/// Intercept any `open`/`openat`/`openat2` of `/etc/hosts` and return a memfd
+/// with virtual content.
 ///
-/// When `net_allow_hosts` is set, the supervisor pre-resolves allowed domains
-/// and builds a synthetic `/etc/hosts`.  This lets sandboxed processes resolve
-/// hostnames via glibc's `files` NSS backend without contacting a DNS server.
+/// Every sandbox gets a fixed loopback view (`127.0.0.1 localhost` /
+/// `::1 localhost`) plus any concrete hostnames pre-resolved from
+/// `net_allow`, so the host's on-disk `/etc/hosts` never leaks in and
+/// glibc's `files` NSS backend resolves allowed hostnames without DNS.
 pub(crate) fn handle_etc_hosts_open(
     notif: &SeccompNotif,
     etc_hosts_content: &str,
     notif_fd: RawFd,
 ) -> Option<NotifAction> {
-    let path_ptr = notif.data.args[1];
-    let path = read_path(notif, path_ptr, notif_fd)?;
-
-    if path != "/etc/hosts" {
+    let resolved = resolve_open_target(notif, notif_fd)?;
+    if resolved != std::path::Path::new("/etc/hosts") {
         return None;
     }
-
     Some(inject_memfd(etc_hosts_content.as_bytes()))
+}
+
+/// Resolve the path argument of an open-family syscall (`open`, `openat`,
+/// or `openat2`) to a lexically-normalized absolute host-side path.
+///
+/// Used by every `openat`-shaped handler so the security and
+/// virtualization checks operate on the same canonical form regardless
+/// of how the caller spelled the path. The literal-string compare used
+/// before this helper missed four bypass shapes: legacy `open`,
+/// `openat2`, dirfd-relative spellings like `openat(open("/etc"),
+/// "hosts", ...)`, and non-canonical absolutes like `/etc/../etc/hosts`
+/// or `//etc/hosts`.
+///
+/// Returns `None` if the notif isn't an open variant, the path can't be
+/// read from child memory, the dirfd can't be resolved, or the path
+/// walks above `/`. Callers treat `None` as "fall through to the kernel"
+/// (`NotifAction::Continue`).
+pub(crate) fn resolve_open_target(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+) -> Option<std::path::PathBuf> {
+    let nr = notif.data.nr as i64;
+    let (dirfd, path_ptr): (i64, u64) = if Some(nr) == crate::arch::SYS_OPEN {
+        // open(path, flags, mode) — no dirfd, behaves as AT_FDCWD.
+        (libc::AT_FDCWD as i64, notif.data.args[0])
+    } else if nr == libc::SYS_openat || nr == crate::arch::SYS_OPENAT2 {
+        // openat(dirfd, path, ...) and openat2(dirfd, path, ...) share
+        // the same first two argument slots.
+        (notif.data.args[0] as i64, notif.data.args[1])
+    } else {
+        return None;
+    };
+    let path = read_path(notif, path_ptr, notif_fd)?;
+    resolve_to_normalized_absolute(notif.pid, dirfd, &path)
+}
+
+/// Lexical normalization of `(pid, dirfd, path)`:
+///
+/// - Absolute `path`: used as-is.
+/// - Relative `path` with `dirfd == AT_FDCWD`: prefixed with the child's
+///   cwd from `/proc/<pid>/cwd`.
+/// - Relative `path` with explicit `dirfd`: prefixed with the symlink
+///   target of `/proc/<pid>/fd/<dirfd>` (the host kernel's view of the
+///   directory the dirfd points to).
+///
+/// Then collapses `.`, `..`, and redundant `/` components. Returns
+/// `None` if the dirfd cannot be resolved or the path walks above `/`.
+fn resolve_to_normalized_absolute(
+    pid: u32,
+    dirfd: i64,
+    path: &str,
+) -> Option<std::path::PathBuf> {
+    use std::path::{Component, Path, PathBuf};
+
+    let joined: PathBuf = if Path::new(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        let base = if dirfd as i32 == libc::AT_FDCWD {
+            std::fs::read_link(format!("/proc/{}/cwd", pid)).ok()?
+        } else {
+            std::fs::read_link(format!("/proc/{}/fd/{}", pid, dirfd as i32)).ok()?
+        };
+        base.join(path)
+    };
+
+    let mut out = PathBuf::new();
+    for comp in joined.components() {
+        match comp {
+            Component::Prefix(p) => out.push(p.as_os_str()),
+            Component::RootDir => out.push("/"),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // pop the last regular component; refuse to walk above
+                // the root (out becomes empty after popping "/").
+                if !out.pop() {
+                    return None;
+                }
+                if out.as_os_str().is_empty() {
+                    return None;
+                }
+            }
+            Component::Normal(c) => out.push(c),
+        }
+    }
+    Some(out)
 }
 
 // ============================================================

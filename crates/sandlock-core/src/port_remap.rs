@@ -8,17 +8,12 @@
 //   - handle_bind performs the bind on-behalf via pidfd_getfd (kernel
 //     object, not racy user-memory string) and returns ReturnValue/Errno.
 //     No security decision returns Continue.
-//   - handle_getsockname returns Continue at the end so the kernel
-//     performs the real getsockname; the supervisor only translates the
-//     port number afterwards. The remaining Continues guard early-exit
-//     conditions (NULL pointers, undersized addrlen, read failures).
-//     None of these involve approving access based on user-memory
-//     contents — port-remap is naming, not authorization. Network
-//     allowlisting lives in network.rs and is on-behalf there.
+//   - handle_getsockname performs the getsockname on-behalf and writes
+//     the translated sockaddr back to the child, so remapped real ports
+//     never leak through the virtual interface.
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -80,28 +75,6 @@ impl PortMap {
     pub fn get_virtual(&self, real_port: u16) -> Option<u16> {
         self.real_to_virtual.get(&real_port).copied()
     }
-
-    /// Return a real port for `virtual_port`, allocating one if needed.
-    ///
-    /// Fast path: try to use the virtual port itself. If that port is already
-    /// taken on the host, fall back to asking the kernel for any free ephemeral
-    /// port. Once a mapping is established it is cached and returned unchanged
-    /// on subsequent calls.
-    pub fn allocate_or_reserve(&mut self, virtual_port: u16, family: u32) -> Option<u16> {
-        // Already mapped?
-        if let Some(real) = self.virtual_to_real.get(&virtual_port) {
-            return Some(*real);
-        }
-        // Fast path: try the virtual port itself
-        if let Some(port) = try_reserve_port(virtual_port, family) {
-            self.record_bind(virtual_port, port);
-            return Some(port);
-        }
-        // Slow path: allocate different port
-        let real = allocate_real_port(family)?;
-        self.record_bind(virtual_port, real);
-        Some(real)
-    }
 }
 
 // ============================================================
@@ -134,42 +107,24 @@ fn set_port_in_sockaddr(bytes: &mut [u8], port: u16) {
 }
 
 // ============================================================
-// Port allocation helpers
-// ============================================================
-
-/// Check if a port is available by probe-and-close.
-fn try_reserve_port(port: u16, family: u32) -> Option<u16> {
-    if port == 0 {
-        return None;
-    }
-    let addr: SocketAddr = if family == AF_INET6 {
-        SocketAddr::new(Ipv6Addr::LOCALHOST.into(), port)
-    } else {
-        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)
-    };
-    TcpListener::bind(addr).ok().map(|_| port)
-}
-
-/// Allocate a free ephemeral port from the kernel via bind(0).
-fn allocate_real_port(family: u32) -> Option<u16> {
-    let addr: SocketAddr = if family == AF_INET6 {
-        SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 0)
-    } else {
-        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)
-    };
-    let listener = TcpListener::bind(addr).ok()?;
-    Some(listener.local_addr().ok()?.port())
-}
-
-// ============================================================
 // handle_bind — intercept bind to track/remap ports
 // ============================================================
 
 /// Handle bind syscalls on behalf of the child process (TOCTOU-safe).
 ///
 /// Performs bind() in the supervisor using a duplicated copy of the child's
-/// socket fd (via pidfd_getfd). This avoids TOCTOU races and allows port
-/// remapping to be applied transparently.
+/// socket fd (via pidfd_getfd). For AF_INET/AF_INET6 with a non-zero port:
+///
+///   1. Pick a first-attempt port: the cached real port if `port_map` has
+///      one for this virtual port, else the virtual port itself.
+///   2. Bind the child's socket to that port. On `EADDRINUSE`, retry with
+///      port 0 so the kernel picks a fresh real port. The retry covers
+///      both the first-time host conflict and the stale-cache case where
+///      our previously-allocated real port was reclaimed by another
+///      process after the prior socket was closed.
+///   3. `record_bind` runs only after the bind succeeds, and only when
+///      the mapping actually changed — failed binds leave no stale
+///      forward-map entry.
 ///
 /// bind(sockfd, addr, addrlen): args[0]=fd, args[1]=addr_ptr, args[2]=addrlen
 pub(crate) async fn handle_bind(
@@ -191,65 +146,109 @@ pub(crate) async fn handle_bind(
         Err(_) => return NotifAction::Errno(libc::EIO),
     };
 
-    let family = u16::from_ne_bytes([bytes[0], bytes[1]]) as u32;
+    let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
+        Ok(fd) => fd,
+        Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
+    };
 
-    if let Some(virtual_port) = extract_port(&bytes) {
-        if virtual_port == 0 {
-            // Ephemeral port — still do on-behalf for TOCTOU safety
-            let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
-                Ok(fd) => fd,
-                Err(_) => return NotifAction::Errno(libc::ENOSYS),
-            };
-            let ret = unsafe {
-                libc::bind(dup_fd.as_raw_fd(), bytes.as_ptr() as *const libc::sockaddr, addr_len as libc::socklen_t)
-            };
-            return if ret == 0 {
-                NotifAction::ReturnValue(0)
-            } else {
-                NotifAction::Errno(unsafe { *libc::__errno_location() })
-            };
+    // Non-IP family or ephemeral (port == 0): bind verbatim — nothing to
+    // track or remap. extract_port returns None for non-IP families and
+    // for truncated buffers; in both cases the kernel will validate.
+    let virtual_port = match extract_port(&bytes) {
+        Some(p) if p != 0 => p,
+        _ => return bind_verbatim(&dup_fd, &bytes, addr_len),
+    };
+
+    // Pick a first-attempt port: cached real port if known, else the
+    // virtual port itself. The cached real port keeps repeat binds of
+    // the same virtual port consistent across the sandbox; the virtual
+    // port itself is the natural identity-bind target.
+    let cached_real = {
+        let ns = network.lock().await;
+        ns.port_map.get_real(virtual_port)
+    };
+    let attempt_port = cached_real.unwrap_or(virtual_port);
+    set_port_in_sockaddr(&mut bytes, attempt_port);
+
+    let ret = unsafe {
+        libc::bind(
+            dup_fd.as_raw_fd(),
+            bytes.as_ptr() as *const libc::sockaddr,
+            addr_len as libc::socklen_t,
+        )
+    };
+    if ret == 0 {
+        // The cached mapping (if any) is already correct. Record only
+        // when this is a first-time identity bind.
+        if cached_real.is_none() {
+            network.lock().await.port_map.record_bind(virtual_port, virtual_port);
         }
-
-        let mut ns = network.lock().await;
-        // Apply port remapping on our copy
-        if let Some(real_port) = ns.port_map.allocate_or_reserve(virtual_port, family) {
-            if real_port != virtual_port {
-                set_port_in_sockaddr(&mut bytes, real_port);
-            }
-        }
-
-        drop(ns);
-
-        // Duplicate child's socket and bind in supervisor
-        let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
-            Ok(fd) => fd,
-            Err(_) => return NotifAction::Errno(libc::ENOSYS),
-        };
-
-        let ret = unsafe {
-            libc::bind(dup_fd.as_raw_fd(), bytes.as_ptr() as *const libc::sockaddr, addr_len as libc::socklen_t)
-        };
-
-        if ret == 0 {
-            NotifAction::ReturnValue(0)
-        } else {
-            NotifAction::Errno(unsafe { *libc::__errno_location() })
-        }
-    } else {
-        // Non-IP family — still do on-behalf for consistency
-        let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
-            Ok(fd) => fd,
-            Err(_) => return NotifAction::Errno(libc::ENOSYS),
-        };
-        let ret = unsafe {
-            libc::bind(dup_fd.as_raw_fd(), bytes.as_ptr() as *const libc::sockaddr, addr_len as libc::socklen_t)
-        };
-        if ret == 0 {
-            NotifAction::ReturnValue(0)
-        } else {
-            NotifAction::Errno(unsafe { *libc::__errno_location() })
-        }
+        return NotifAction::ReturnValue(0);
     }
+    let err = unsafe { *libc::__errno_location() };
+    if err != libc::EADDRINUSE {
+        return NotifAction::Errno(err);
+    }
+
+    // EADDRINUSE on the chosen real port. Two cases:
+    //   - First-time bind: another process owns the virtual port on the
+    //     host.
+    //   - Cached bind: our previously-allocated real port was reclaimed
+    //     while the sandbox's earlier socket was closed.
+    // In both cases let the kernel pick a fresh real port via bind(0).
+    set_port_in_sockaddr(&mut bytes, 0);
+    let ret = unsafe {
+        libc::bind(
+            dup_fd.as_raw_fd(),
+            bytes.as_ptr() as *const libc::sockaddr,
+            addr_len as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        return NotifAction::Errno(unsafe { *libc::__errno_location() });
+    }
+    let real_port = match query_local_port(&dup_fd) {
+        Some(p) => p,
+        None => return NotifAction::Errno(libc::EIO),
+    };
+    network.lock().await.port_map.record_bind(virtual_port, real_port);
+    NotifAction::ReturnValue(0)
+}
+
+/// Run `bind(2)` on a duplicated child fd, propagating success or errno.
+fn bind_verbatim(fd: &OwnedFd, addr: &[u8], len: usize) -> NotifAction {
+    let ret = unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            addr.as_ptr() as *const libc::sockaddr,
+            len as libc::socklen_t,
+        )
+    };
+    if ret == 0 {
+        NotifAction::ReturnValue(0)
+    } else {
+        NotifAction::Errno(unsafe { *libc::__errno_location() })
+    }
+}
+
+/// Read the local port from a bound socket via `getsockname(2)`.
+fn query_local_port(fd: &OwnedFd) -> Option<u16> {
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockname(
+            fd.as_raw_fd(),
+            &mut storage as *mut _ as *mut libc::sockaddr,
+            &mut len,
+        )
+    };
+    if ret != 0 {
+        return None;
+    }
+    let bytes = unsafe {
+        std::slice::from_raw_parts(&storage as *const _ as *const u8, len as usize)
+    };
+    extract_port(bytes)
 }
 
 // ============================================================
@@ -258,12 +257,9 @@ pub(crate) async fn handle_bind(
 
 /// Handle getsockname to translate real ports back to virtual ports.
 ///
-/// After getsockname executes, reads the returned sockaddr and replaces
-/// the real port with the virtual port if a mapping exists.
-///
-/// For Phase 5, this is a framework — since we only do identity mappings
-/// in handle_bind, getsockname will always see the correct port. When
-/// actual remapping is added, this will rewrite the port in the result.
+/// Performs getsockname() in the supervisor using a duplicated copy of the
+/// child's socket fd, rewrites the returned real port to the virtual port
+/// when a mapping exists, and copies the result back to child memory.
 ///
 /// getsockname(sockfd, addr, addrlen): args[0]=fd, args[1]=addr_ptr, args[2]=addrlen_ptr
 pub(crate) async fn handle_getsockname(
@@ -271,42 +267,73 @@ pub(crate) async fn handle_getsockname(
     network: &Arc<Mutex<NetworkState>>,
     notif_fd: RawFd,
 ) -> NotifAction {
+    let sockfd = notif.data.args[0] as i32;
     let addr_ptr = notif.data.args[1];
     let addrlen_ptr = notif.data.args[2];
 
     if addr_ptr == 0 || addrlen_ptr == 0 {
-        return NotifAction::Continue;
+        return NotifAction::Errno(libc::EFAULT);
     }
 
-    // Read the addrlen value to know how many bytes to read.
+    // Read the caller-provided buffer length.
     let addrlen_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, addrlen_ptr, 4) {
         Ok(b) if b.len() >= 4 => b,
-        _ => return NotifAction::Continue,
+        _ => return NotifAction::Errno(libc::EFAULT),
     };
     let addr_len = u32::from_ne_bytes(addrlen_bytes[..4].try_into().unwrap()) as usize;
 
-    if addr_len < 4 {
-        return NotifAction::Continue;
+    let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
+        Ok(fd) => fd,
+        Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
+    };
+
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let storage_len = std::mem::size_of::<libc::sockaddr_storage>();
+    let mut actual_len = addr_len.min(storage_len) as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockname(
+            dup_fd.as_raw_fd(),
+            &mut storage as *mut _ as *mut libc::sockaddr,
+            &mut actual_len,
+        )
+    };
+    if ret != 0 {
+        return NotifAction::Errno(unsafe { *libc::__errno_location() });
     }
 
-    let read_len = addr_len.min(128);
-    let mut bytes = match read_child_mem(notif_fd, notif.id, notif.pid, addr_ptr, read_len) {
-        Ok(b) => b,
-        Err(_) => return NotifAction::Continue,
+    let actual_len_usize = actual_len as usize;
+    let to_write = addr_len.min(actual_len_usize).min(storage_len);
+    let mut bytes = if to_write == 0 {
+        Vec::new()
+    } else {
+        let storage_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &storage as *const _ as *const u8,
+                storage_len,
+            )
+        };
+        storage_bytes[..to_write].to_vec()
     };
 
     if let Some(real_port) = extract_port(&bytes) {
         let ns = network.lock().await;
         if let Some(virtual_port) = ns.port_map.get_virtual(real_port) {
-            // Rewrite the port in the sockaddr buffer.
             set_port_in_sockaddr(&mut bytes, virtual_port);
-            drop(ns);
-            // Write the modified sockaddr back to child memory.
-            let _ = write_child_mem(notif_fd, notif.id, notif.pid, addr_ptr, &bytes);
         }
     }
 
-    NotifAction::Continue
+    if !bytes.is_empty()
+        && write_child_mem(notif_fd, notif.id, notif.pid, addr_ptr, &bytes).is_err()
+    {
+        return NotifAction::Errno(libc::EFAULT);
+    }
+
+    let actual = (actual_len as u32).to_ne_bytes();
+    if write_child_mem(notif_fd, notif.id, notif.pid, addrlen_ptr, &actual).is_err() {
+        return NotifAction::Errno(libc::EFAULT);
+    }
+
+    NotifAction::ReturnValue(0)
 }
 
 // ============================================================
@@ -379,32 +406,4 @@ mod tests {
         assert_eq!(buf[3], 0xBB);
     }
 
-    #[test]
-    fn test_try_reserve_port_zero() {
-        assert!(try_reserve_port(0, AF_INET).is_none());
-    }
-
-    #[test]
-    fn test_allocate_real_port() {
-        let port = allocate_real_port(AF_INET);
-        assert!(port.is_some());
-        assert!(port.unwrap() > 0);
-    }
-
-    #[test]
-    fn test_port_map_allocate_or_reserve() {
-        let mut pm = PortMap::new();
-        let real = pm.allocate_or_reserve(18080, AF_INET); // use high port unlikely to conflict
-        assert!(real.is_some());
-        let real = real.unwrap();
-        assert!(pm.bound_ports.contains(&real));
-    }
-
-    #[test]
-    fn test_port_map_allocate_or_reserve_cached() {
-        let mut pm = PortMap::new();
-        let first = pm.allocate_or_reserve(18081, AF_INET).unwrap();
-        let second = pm.allocate_or_reserve(18081, AF_INET).unwrap();
-        assert_eq!(first, second); // should return cached mapping
-    }
 }

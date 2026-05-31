@@ -72,6 +72,101 @@ async fn test_sensitive_proc_blocked() {
     assert!(!result.success(), "/proc/kcore should be denied");
 }
 
+/// The sensitive-path deny used to do a literal `path == "/proc/kcore"`
+/// (and `starts_with("/proc/kcore/")`) match, which any non-canonical or
+/// dirfd-relative spelling sidestepped. Exercise each known bypass shape
+/// and assert the deny still fires.
+#[tokio::test]
+async fn test_sensitive_proc_resists_bypasses() {
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .num_cpus(1)
+        .build()
+        .unwrap();
+
+    // EACCES (errno 13) is what the handler returns for sensitive paths.
+    // Each branch prints OK if the open was denied, FAIL otherwise.
+    let script = concat!(
+        "import os, errno\n",
+        "results = []\n",
+        "def must_deny(label, fn):\n",
+        "  try:\n",
+        "    fd = fn()\n",
+        "    os.close(fd)\n",
+        "    results.append(f'{label}:LEAKED')\n",
+        "  except OSError as e:\n",
+        "    results.append(f'{label}:DENIED' if e.errno == errno.EACCES else f'{label}:errno={e.errno}')\n",
+        // 1. dirfd-relative: open(/proc), then open 'kcore' relative to it
+        "procfd = os.open('/proc', os.O_DIRECTORY | os.O_RDONLY)\n",
+        "must_deny('dirfd', lambda: os.open('kcore', os.O_RDONLY, dir_fd=procfd))\n",
+        "os.close(procfd)\n",
+        // 2. non-canonical absolutes
+        "must_deny('dotdot', lambda: os.open('/proc/../proc/kcore', os.O_RDONLY))\n",
+        "must_deny('curdir', lambda: os.open('/proc/./kcore', os.O_RDONLY))\n",
+        "must_deny('slash2', lambda: os.open('//proc/kcore', os.O_RDONLY))\n",
+        "print('|'.join(results))\n",
+    );
+
+    let result = policy.clone().with_name("test").run(&["python3", "-c", script]).await.unwrap();
+    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
+    for label in ["dirfd", "dotdot", "curdir", "slash2"] {
+        let needle = format!("{label}:DENIED");
+        assert!(
+            stdout.contains(&needle),
+            "{label}: /proc/kcore leaked via this spelling. stdout: {stdout}"
+        );
+    }
+}
+
+/// The /proc/cpuinfo virtualization used to do a literal
+/// `path == "/proc/cpuinfo"` match, so non-canonical and dirfd-relative
+/// spellings fell through to the host's real cpuinfo and leaked the host's
+/// real CPU count.
+#[tokio::test]
+async fn test_proc_virt_resists_bypasses() {
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .num_cpus(2)
+        .build()
+        .unwrap();
+
+    // Every spelling must see exactly 2 `^processor` lines, matching the
+    // synthetic cpuinfo. A leak to the host file would show this host's
+    // real CPU count (almost certainly != 2).
+    let script = concat!(
+        "import os\n",
+        "results = {}\n",
+        "procfd = os.open('/proc', os.O_DIRECTORY | os.O_RDONLY)\n",
+        "fd = os.open('cpuinfo', os.O_RDONLY, dir_fd=procfd)\n",
+        "results['dirfd']  = os.read(fd, 4096).decode().count('processor\\t')\n",
+        "os.close(fd); os.close(procfd)\n",
+        "results['dotdot'] = open('/proc/../proc/cpuinfo').read().count('processor\\t')\n",
+        "results['curdir'] = open('/proc/./cpuinfo').read().count('processor\\t')\n",
+        "results['slash2'] = open('//proc/cpuinfo').read().count('processor\\t')\n",
+        "print(results)\n",
+    );
+
+    let result = policy.clone().with_name("test").run(&["python3", "-c", script]).await.unwrap();
+    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
+    for label in ["dirfd", "dotdot", "curdir", "slash2"] {
+        let needle = format!("'{label}': 2");
+        assert!(
+            stdout.contains(&needle),
+            "{label}: host cpuinfo leaked (expected 2 processors, virtualized). stdout: {stdout}"
+        );
+    }
+}
+
 /// Test basic sandbox still works without /proc virtualization.
 #[tokio::test]
 async fn test_no_proc_virt_still_works() {

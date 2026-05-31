@@ -1,8 +1,8 @@
 //! Extract local Docker/OCI images into rootfs directories for sandboxing.
 //!
-//! Uses `docker create` + `docker export` to extract a locally available
-//! image. No registry pulling — the image must already be present in
-//! local Docker storage.
+//! Uses `docker create` + `docker export` to extract the image. If the
+//! image is present in local Docker storage it is used as-is; otherwise
+//! `docker create` pulls it from the configured registry first.
 //!
 //! ```ignore
 //! let rootfs = image::extract("python:3.12-slim", None)?;
@@ -35,7 +35,8 @@ fn cache_key(image: &str) -> String {
 /// Creates a temporary container, exports its filesystem, and extracts
 /// it. Returns the cached path on subsequent calls.
 ///
-/// The image must already be pulled locally (`docker pull` beforehand).
+/// If the image is not in local Docker storage, `docker create` pulls it
+/// from the registry first.
 pub fn extract(image: &str, cache_dir: Option<&Path>) -> Result<PathBuf, SandlockError> {
     let cache = cache_dir
         .map(PathBuf::from)

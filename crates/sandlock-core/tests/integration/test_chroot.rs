@@ -537,3 +537,92 @@ async fn test_fs_mount_read_write() {
     let _ = fs::remove_dir_all(&rootfs);
     let _ = fs::remove_dir_all(&work_dir);
 }
+
+/// When the chroot image ships its own `/etc/hosts`, the synthetic file
+/// the sandbox sees should be seeded from the image's content (so any
+/// private-registry / internal-service entries the image baked in
+/// survive virtualization) — with loopback entries added only if the
+/// image didn't already provide them.
+#[tokio::test]
+async fn test_chroot_etc_hosts_seeded_from_image() {
+    let rootfs = build_test_rootfs("etc-hosts-image-seed");
+    // Put a hosts file in the image that has its own entry but is
+    // missing both loopback families on purpose.
+    fs::write(
+        rootfs.join("etc/hosts"),
+        "10.0.0.5 internal.registry.local\n",
+    )
+    .unwrap();
+
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_read("/etc")
+        .build()
+        .unwrap();
+
+    let result = policy.clone().with_name("test").run(&["rootfs-helper", "cat", "/etc/hosts"]).await;
+    match result {
+        Ok(r) => {
+            assert!(
+                r.success(),
+                "cat /etc/hosts should succeed inside chroot, stderr: {}",
+                r.stderr_str().unwrap_or("")
+            );
+            let stdout = r.stdout_str().unwrap_or("").to_string();
+            assert!(
+                stdout.contains("10.0.0.5 internal.registry.local"),
+                "image's /etc/hosts entry missing: {stdout}"
+            );
+            assert!(
+                stdout.contains("127.0.0.1 localhost"),
+                "v4 loopback should be injected for the image: {stdout}"
+            );
+            assert!(
+                stdout.contains("::1 localhost"),
+                "v6 loopback should be injected for the image: {stdout}"
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// When the image already ships loopback entries, the synthesizer must
+/// not duplicate them — the sandbox should see exactly the image's view
+/// of localhost, not two copies of it.
+#[tokio::test]
+async fn test_chroot_etc_hosts_no_duplicate_loopback() {
+    let rootfs = build_test_rootfs("etc-hosts-no-dup");
+    fs::write(
+        rootfs.join("etc/hosts"),
+        "127.0.0.1 localhost\n::1 localhost\n10.0.0.5 svc.local\n",
+    )
+    .unwrap();
+
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_read("/etc")
+        .build()
+        .unwrap();
+
+    let result = policy.clone().with_name("test").run(&["rootfs-helper", "cat", "/etc/hosts"]).await;
+    match result {
+        Ok(r) => {
+            assert!(r.success(), "cat /etc/hosts should succeed");
+            let stdout = r.stdout_str().unwrap_or("").to_string();
+            assert_eq!(
+                stdout.matches("127.0.0.1 localhost").count(),
+                1,
+                "v4 loopback duplicated: {stdout}"
+            );
+            assert_eq!(
+                stdout.matches("::1 localhost").count(),
+                1,
+                "v6 loopback duplicated: {stdout}"
+            );
+            assert!(stdout.contains("10.0.0.5 svc.local"), "image entry missing: {stdout}");
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}

@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use sandlock_core::Sandbox;
-use sandlock_core::sandbox::{BranchAction, ByteSize, FsIsolation, SandboxBuilder};
+use sandlock_core::sandbox::{BranchAction, ByteSize, SandboxBuilder};
 use sandlock_core::profile;
 use anyhow::{Result, anyhow};
 use std::path::PathBuf;
@@ -53,15 +53,22 @@ struct RunArgs {
     #[arg(long = "max-disk")]
     max_disk: Option<String>,
 
-    #[arg(long = "fs-isolation", value_name = "MODE")]
-    fs_isolation: Option<String>,
-
     #[arg(long)]
     time_start: Option<String>,
 
     /// Mount a host path inside the sandbox (e.g. --fs-mount /work:/host/path)
     #[arg(long = "fs-mount", value_name = "VIRTUAL:HOST")]
     fs_mount: Vec<String>,
+
+    /// COW branch action on normal sandbox exit: commit | abort | keep
+    /// (default: commit).
+    #[arg(long = "on-exit", value_name = "ACTION")]
+    on_exit: Option<String>,
+
+    /// COW branch action on sandbox error: commit | abort | keep
+    /// (default: abort).
+    #[arg(long = "on-error", value_name = "ACTION")]
+    on_error: Option<String>,
 
     #[arg(long = "env", value_name = "KEY=VALUE")]
     env_vars: Vec<String>,
@@ -136,7 +143,10 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Run(args) => run_command(args).await?,
+        Command::Run(args) => {
+            let code = run_command(args).await?;
+            std::process::exit(code);
+        }
 
         Command::List => {
             match network_registry::list() {
@@ -244,90 +254,18 @@ async fn main() -> Result<()> {
 }
 
 /// Implementation of `sandlock run`.
-async fn run_command(args: RunArgs) -> Result<()> {
+/// Returns the desired process exit code; the caller does
+/// `process::exit`. Calling `process::exit` here would bypass
+/// `Sandbox::Drop`, which is where COW commit/abort runs.
+async fn run_command(args: RunArgs) -> Result<i32> {
     let pb = &args.sandbox_builder;
 
+    // `--no-supervisor` reaches the same `Sandbox::run` path as everything
+    // else; the deny-only filter and skipped supervisor are gated on the
+    // sandbox's `no_supervisor` field. Validate flag/profile combinations
+    // upfront so users hit the error before any setup happens.
     if args.no_supervisor {
         validate_no_supervisor(&args)?;
-
-        // Load profile once (if any) and split into policy base + program spec.
-        let (ns_profile_base, ns_profile_spec) = if let Some(ref name) = args.profile {
-            let (base, spec) = sandlock_core::profile::load_profile(name)?;
-            (Some(base), Some(spec))
-        } else if let Some(ref path) = args.profile_file {
-            let content = std::fs::read_to_string(path)
-                .map_err(|e| anyhow!("failed to read profile file {}: {}", path.display(), e))?;
-            let (base, spec) = sandlock_core::profile::parse_profile(&content)?;
-            (Some(base), Some(spec))
-        } else {
-            (None, None)
-        };
-
-        // Build a minimal policy with only fs rules
-        let mut builder = if let Some(ref base) = ns_profile_base {
-            validate_no_supervisor_profile(base, &profile_source(&args))?;
-            let mut b = Sandbox::builder();
-            for p in &base.fs_readable { b = b.fs_read(p); }
-            for p in &base.fs_writable { b = b.fs_write(p); }
-            if !base.extra_allow_syscalls.is_empty() {
-                b = b.extra_allow_syscalls(base.extra_allow_syscalls.clone());
-            }
-            if !base.extra_deny_syscalls.is_empty() {
-                b = b.extra_deny_syscalls(base.extra_deny_syscalls.clone());
-            }
-            b = b.clean_env(base.clean_env);
-            for (k, v) in &base.env { b = b.env_var(k, v); }
-            b
-        } else {
-            Sandbox::builder()
-        };
-
-        // Derive the effective command: profile's [program] section supplies the
-        // default; a trailing positional command on the CLI overrides it.
-        let effective_cmd: Vec<String> = if !args.cmd.is_empty() || args.exec_shell.is_some() {
-            args.cmd.clone()
-        } else if let Some(spec) = ns_profile_spec {
-            if let Some(exec) = spec.exec {
-                let exec_str = exec.into_os_string().into_string()
-                    .map_err(|_| anyhow!("non-UTF-8 exec path in profile"))?;
-                let mut v = vec![exec_str];
-                v.extend(spec.args);
-                v
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-
-        // Apply CLI fs/syscall/env flags on top of the profile base.
-        for p in &pb.fs_readable { builder = builder.fs_read(p); }
-        for p in &pb.fs_writable { builder = builder.fs_write(p); }
-        for p in &pb.fs_denied { builder = builder.fs_deny(p); }
-        if !pb.extra_allow_syscalls.is_empty() { builder = builder.extra_allow_syscalls(pb.extra_allow_syscalls.clone()); }
-        if !pb.extra_deny_syscalls.is_empty() { builder = builder.extra_deny_syscalls(pb.extra_deny_syscalls.clone()); }
-        if pb.clean_env { builder = builder.clean_env(true); }
-        for spec in &args.env_vars {
-            if let Some((k, v)) = spec.split_once('=') {
-                builder = builder.env_var(k, v);
-            } else {
-                return Err(anyhow!("--env requires KEY=VALUE, got: {}", spec));
-            }
-        }
-
-        let policy = builder.build()?;
-
-        if args.exec_shell.is_none() && effective_cmd.is_empty() {
-            return Err(anyhow!("no command specified (no trailing command and no [program].exec in profile)"));
-        }
-
-        let cmd_strs: Vec<&str> = if let Some(ref shell_cmd) = args.exec_shell {
-            vec!["/bin/sh", "-c", shell_cmd.as_str()]
-        } else {
-            effective_cmd.iter().map(|s| s.as_str()).collect()
-        };
-
-        return no_supervisor_exec(&policy, &cmd_strs);
     }
 
     // Hoist the profile load so we don't read+parse twice.
@@ -342,6 +280,12 @@ async fn run_command(args: RunArgs) -> Result<()> {
     } else {
         (None, None)
     };
+
+    if args.no_supervisor {
+        if let Some(ref base) = base_from_profile {
+            validate_no_supervisor_profile(base, &profile_source(&args))?;
+        }
+    }
 
     // Start from profile or default
     let mut builder = if let Some(base) = base_from_profile {
@@ -398,9 +342,6 @@ async fn run_command(args: RunArgs) -> Result<()> {
         // Filesystem extras
         if let Some(ref path) = base.chroot { b = b.chroot(path); }
         if let Some(ref path) = base.fs_storage { b = b.fs_storage(path); }
-        if base.fs_isolation != sandlock_core::sandbox::FsIsolation::None {
-            b = b.fs_isolation(base.fs_isolation.clone());
-        }
         for (virt, host) in &base.fs_mount { b = b.fs_mount(virt, host); }
         b = b.on_exit(base.on_exit.clone());
         b = b.on_error(base.on_error.clone());
@@ -458,17 +399,13 @@ async fn run_command(args: RunArgs) -> Result<()> {
         let t = parse_time_start(ts)?;
         builder = builder.time_start(t);
     }
-    if let Some(ref mode) = args.fs_isolation {
-        use sandlock_core::sandbox::FsIsolation;
-        let iso = match mode.as_str() {
-            "none" => FsIsolation::None,
-            "overlayfs" => FsIsolation::OverlayFs,
-            "branchfs" => FsIsolation::BranchFs,
-            other => return Err(anyhow!("unknown --fs-isolation mode: {}", other)),
-        };
-        builder = builder.fs_isolation(iso);
-    }
     if let Some(ref s) = args.max_disk { builder = builder.max_disk(ByteSize::parse(s)?); }
+    if let Some(ref s) = args.on_exit {
+        builder = builder.on_exit(parse_branch_action("--on-exit", s)?);
+    }
+    if let Some(ref s) = args.on_error {
+        builder = builder.on_error(parse_branch_action("--on-error", s)?);
+    }
     for spec in &args.fs_mount {
         let (virt, host) = spec.split_once(':')
             .ok_or_else(|| anyhow!("--fs-mount requires VIRTUAL:HOST, got: {}", spec))?;
@@ -486,15 +423,17 @@ async fn run_command(args: RunArgs) -> Result<()> {
 
     let sandbox_name = args.name.clone().unwrap_or_else(|| network_registry::next_name());
 
-    // Handle --image: extract rootfs, set chroot, get default cmd
+    // Handle --image: extract rootfs, set chroot, get default cmd.
+    // Auto-set workdir to the rootfs path when the user hasn't passed one,
+    // so seccomp COW stages writes in an upper layer instead of mutating
+    // the shared image cache directly.
     let image_cmd: Option<Vec<String>>;
     if let Some(ref img) = args.image {
         let rootfs = sandlock_core::image::extract(img, None)?;
-        builder = builder.chroot(rootfs);
-        // Add standard paths inside the chroot
-        builder = builder.fs_read("/usr").fs_read("/lib").fs_read("/lib64")
-            .fs_read("/bin").fs_read("/sbin").fs_read("/etc")
-            .fs_read("/proc").fs_read("/dev");
+        builder = builder.chroot(&rootfs).fs_read("/");
+        if pb.workdir.is_none() {
+            builder = builder.workdir(&rootfs);
+        }
         if args.cmd.is_empty() {
             image_cmd = Some(sandlock_core::image::inspect_cmd(img)?);
         } else {
@@ -528,6 +467,10 @@ async fn run_command(args: RunArgs) -> Result<()> {
         return Err(anyhow!("no command specified (no trailing command and no [program].exec in profile)"));
     }
 
+    if args.no_supervisor {
+        builder = builder.no_supervisor(true);
+    }
+
     let policy = builder.build()?;
     let cmd_strs: Vec<&str> = if let Some(ref shell_cmd) = args.exec_shell {
         vec!["/bin/sh", "-c", shell_cmd.as_str()]
@@ -550,13 +493,16 @@ async fn run_command(args: RunArgs) -> Result<()> {
             return Err(anyhow!("--dry-run requires --workdir"));
         }
         let dr = if let Some(secs) = args.timeout {
-            tokio::time::timeout(
+            match tokio::time::timeout(
                 std::time::Duration::from_secs(secs),
-                policy.dry_run_interactive(&cmd_strs)
-            ).await.unwrap_or_else(|_| {
-                eprintln!("sandlock: timeout after {}s", secs);
-                std::process::exit(124);
-            })?
+                policy.dry_run_interactive(&cmd_strs),
+            ).await {
+                Ok(r) => r?,
+                Err(_) => {
+                    eprintln!("sandlock: timeout after {}s", secs);
+                    return Ok(124);
+                }
+            }
         } else {
             policy.dry_run_interactive(&cmd_strs).await?
         };
@@ -579,7 +525,8 @@ async fn run_command(args: RunArgs) -> Result<()> {
             let _ = network_registry::update_ports(&reg_name, ports.clone());
         });
 
-        policy.spawn(&cmd_strs).await?;
+        policy.create_interactive(&cmd_strs).await?;
+        policy.start()?;
 
         let pid = policy.pid().unwrap_or(0);
         let registered_hosts: Vec<String> = policy
@@ -598,13 +545,13 @@ async fn run_command(args: RunArgs) -> Result<()> {
         let result = if let Some(secs) = args.timeout {
             match tokio::time::timeout(
                 std::time::Duration::from_secs(secs),
-                policy.wait()
+                policy.wait(),
             ).await {
                 Ok(r) => r?,
                 Err(_) => {
                     let _ = network_registry::unregister(&sandbox_name);
                     eprintln!("sandlock: timeout after {}s", secs);
-                    std::process::exit(124);
+                    return Ok(124);
                 }
             }
         } else {
@@ -613,13 +560,16 @@ async fn run_command(args: RunArgs) -> Result<()> {
         let _ = network_registry::unregister(&sandbox_name);
         result
     } else if let Some(secs) = args.timeout {
-        tokio::time::timeout(
+        match tokio::time::timeout(
             std::time::Duration::from_secs(secs),
-            policy.run_interactive(&cmd_strs)
-        ).await.unwrap_or_else(|_| {
-            eprintln!("sandlock: timeout after {}s", secs);
-            std::process::exit(124);
-        })?
+            policy.run_interactive(&cmd_strs),
+        ).await {
+            Ok(r) => r?,
+            Err(_) => {
+                eprintln!("sandlock: timeout after {}s", secs);
+                return Ok(124);
+            }
+        }
     } else {
         policy.run_interactive(&cmd_strs).await?
     };
@@ -642,7 +592,7 @@ async fn run_command(args: RunArgs) -> Result<()> {
         }
     }
 
-    std::process::exit(result.code().unwrap_or(1));
+    Ok(result.code().unwrap_or(1))
 }
 
 /// Validate that no flags incompatible with --no-supervisor are set.
@@ -672,7 +622,6 @@ fn validate_no_supervisor(args: &RunArgs) -> Result<()> {
     if pb.uid.is_some() { bad.push("--uid"); }
     if pb.workdir.is_some() { bad.push("--workdir"); }
     if pb.cwd.is_some() { bad.push("--cwd"); }
-    if args.fs_isolation.is_some() { bad.push("--fs-isolation"); }
     if pb.fs_storage.is_some() { bad.push("--fs-storage"); }
     if args.max_disk.is_some() { bad.push("--max-disk"); }
     if pb.port_remap { bad.push("--port-remap"); }
@@ -736,7 +685,6 @@ fn validate_no_supervisor_profile(profile: &Sandbox, source: &str) -> Result<()>
     if profile.no_randomize_memory { bad.push("[determinism].no_randomize_memory"); }
     if profile.no_huge_pages { bad.push("[program].no_huge_pages"); }
     if profile.no_coredump { bad.push("[program].no_coredump"); }
-    if profile.fs_isolation != FsIsolation::None { bad.push("[filesystem].isolation"); }
     if profile.workdir.is_some() { bad.push("[config].workdir"); }
     if profile.fs_storage.is_some() { bad.push("[config].fs_storage"); }
     if profile.cwd.is_some() { bad.push("[program].cwd"); }
@@ -757,73 +705,6 @@ fn validate_no_supervisor_profile(profile: &Sandbox, source: &str) -> Result<()>
     Ok(())
 }
 
-/// Execute a command with no-supervisor confinement.
-/// Applies Landlock + deny-only seccomp filter, handles env, then execs.
-fn no_supervisor_exec(policy: &Sandbox, cmd: &[&str]) -> Result<()> {
-    use std::ffi::CString;
-
-    // 1. Apply Landlock confinement (sets NO_NEW_PRIVS + Landlock rules)
-    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-        return Err(anyhow!(
-            "prctl(PR_SET_NO_NEW_PRIVS) failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    sandlock_core::landlock::confine(policy)
-        .map_err(|e| anyhow!("Landlock confinement failed: {}", e))?;
-
-    // 2. Install deny-only seccomp filter (blocks dangerous syscalls without supervisor)
-    let deny_nrs = sandlock_core::context::no_supervisor_blocklist_syscall_numbers(policy);
-    let filter = sandlock_core::seccomp::bpf::assemble_filter(&[], &deny_nrs, &[])
-        .map_err(|e| anyhow!("seccomp assemble failed: {}", e))?;
-    sandlock_core::seccomp::bpf::install_deny_filter(&filter)
-        .map_err(|e| anyhow!("seccomp deny filter failed: {}", e))?;
-
-    // 3. Apply environment settings
-    if policy.clean_env {
-        // Preserve only essential vars, clear the rest
-        let keep: Vec<(String, String)> = ["PATH", "HOME", "USER", "TERM", "LANG"]
-            .iter()
-            .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
-            .collect();
-        // Clear all env vars
-        for (k, _) in std::env::vars() {
-            std::env::remove_var(&k);
-        }
-        // Restore kept ones
-        for (k, v) in &keep {
-            std::env::set_var(k, v);
-        }
-    }
-    for (k, v) in &policy.env {
-        std::env::set_var(k, v);
-    }
-
-    // 4. exec the command
-    let c_prog = CString::new(cmd[0])
-        .map_err(|_| anyhow!("invalid command name: {}", cmd[0]))?;
-    let c_args: Vec<CString> = cmd
-        .iter()
-        .map(|a| CString::new(*a).map_err(|_| anyhow!("invalid argument: {}", a)))
-        .collect::<Result<Vec<_>>>()?;
-    let c_arg_ptrs: Vec<*const libc::c_char> = c_args
-        .iter()
-        .map(|a| a.as_ptr())
-        .chain(std::iter::once(std::ptr::null()))
-        .collect();
-
-    unsafe {
-        libc::execvp(c_prog.as_ptr(), c_arg_ptrs.as_ptr());
-    }
-
-    // If we get here, execvp failed
-    Err(anyhow!(
-        "execvp({}) failed: {}",
-        cmd[0],
-        std::io::Error::last_os_error()
-    ))
-}
-
 /// Parse an ISO 8601 timestamp (e.g. "2000-01-01T00:00:00Z") into a SystemTime.
 /// Render a port list back into the `--net-allow` port-suffix form:
 /// concrete ports become `80,443`; the all-ports wildcard becomes `*`.
@@ -839,4 +720,13 @@ fn parse_time_start(s: &str) -> Result<SystemTime> {
     let ts: jiff::Timestamp = s.parse()
         .map_err(|e| anyhow!("invalid --time-start '{}': {}", s, e))?;
     Ok(ts.into())
+}
+
+fn parse_branch_action(flag: &str, s: &str) -> Result<BranchAction> {
+    match s {
+        "commit" => Ok(BranchAction::Commit),
+        "abort"  => Ok(BranchAction::Abort),
+        "keep"   => Ok(BranchAction::Keep),
+        other    => Err(anyhow!("invalid {} value '{}': expected commit | abort | keep", flag, other)),
+    }
 }

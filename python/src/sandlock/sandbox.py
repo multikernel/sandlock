@@ -78,16 +78,8 @@ def parse_ports(specs: Sequence[int | str]) -> list[int]:
     return sorted(ports)
 
 
-class FsIsolation(Enum):
-    """Filesystem mutation isolation mode."""
-
-    NONE = "none"        # Direct host writes (default)
-    BRANCHFS = "branchfs"  # BranchFS COW isolation
-    OVERLAYFS = "overlayfs"  # OverlayFS COW (kernel built-in, no dependencies)
-
-
 class BranchAction(Enum):
-    """Action to take on a BranchFS branch when sandbox exits."""
+    """Action to take on the COW branch when sandbox exits."""
 
     COMMIT = "commit"    # Merge writes into parent branch
     ABORT = "abort"      # Discard all writes
@@ -320,17 +312,12 @@ class Sandbox:
     in this directory.  Independent of ``workdir`` (COW root)."""
 
     # COW filesystem isolation
-    fs_isolation: FsIsolation = FsIsolation.NONE
-    """Filesystem isolation mode.  Auto-set to OVERLAYFS when workdir is set."""
-
     fs_storage: str | None = None
-    """Separate storage directory for BranchFS COW deltas.
-    If set, passed as ``--storage`` to ``branchfs mount``."""
+    """Separate storage directory for the seccomp COW upper layer / deltas."""
 
     max_disk: str | None = None
-    """Disk quota for BranchFS storage (e.g. ``'1G'``).
-    Passed as ``--max-storage`` to ``branchfs mount``.
-    Enforced by BranchFS FUSE layer (returns ENOSPC)."""
+    """Disk quota for COW storage (e.g. ``'1G'``).
+    Enforced by the COW layer (returns ENOSPC)."""
 
     on_exit: BranchAction = BranchAction.COMMIT
     """Branch action on normal sandbox exit."""
@@ -484,12 +471,19 @@ class Sandbox:
         argv, argc = _make_argv(list(cmd))
         resolved_name = self._resolve_name()
 
-        # Spawn (non-blocking) so PID is available for pause/resume
-        self._handle = _lib.sandlock_spawn(
+        # Create (parked) so PID is available for pause/resume, then start.
+        # The one-shot run path immediately drives wait on this same Python
+        # thread, so it can use the FFI current-thread runtime and avoid
+        # eager Tokio worker-thread creation.
+        self._handle = _lib.sandlock_create_for_run(
             native.ptr, _encode(resolved_name), argv, argc,
         )
         if not self._handle:
-            return Result(success=False, exit_code=-1, error="sandlock_spawn failed")
+            return Result(success=False, exit_code=-1, error="sandlock_create failed")
+        if _lib.sandlock_start(self._handle) != 0:
+            _lib.sandlock_handle_free(self._handle)
+            self._handle = None
+            return Result(success=False, exit_code=-1, error="sandlock_start failed")
 
         try:
             timeout_ms = int(timeout * 1000) if timeout else 0
@@ -514,11 +508,191 @@ class Sandbox:
             stderr=stderr,
         )
 
-    def start(self, cmd: Sequence[str]) -> None:
-        """Spawn ``cmd`` in the sandbox without waiting for it to finish.
+    def run_with_handlers(
+        self,
+        cmd: Sequence[str],
+        handlers: Sequence,
+        name: str | None = None,
+    ):
+        """Run ``cmd`` under this sandbox with extra seccomp-notif handlers.
 
-        After calling ``start()``, use ``pid``, ``pause()``, ``resume()``,
-        ``kill()``, and ``wait()`` to manage the process lifecycle.
+        ``handlers`` is a sequence of ``(syscall, Handler)`` pairs.
+        ``syscall`` is either a syscall name (``str``, e.g. ``"openat"``)
+        resolved for the host architecture, or a raw kernel syscall
+        number (``int``). Prefer the name — raw numbers are
+        architecture-specific. A name sandlock cannot resolve raises
+        ``ValueError``; syscalls sandlock does not filter (e.g.
+        ``getpid``) are not name-resolvable and must be passed as an
+        ``int``. ``Handler`` is an instance of
+        :class:`sandlock.handler.Handler`; see that class for handler
+        semantics.
+
+        Ownership of every ``Handler`` is held by the sandlock supervisor
+        for the duration of the run; the Python-side reference is held in
+        an internal registry and released when the run completes (success
+        or failure).
+
+        The underlying C ABI builds and drives its own runtime for each
+        call. Do not invoke this method from a thread that already runs a
+        Tokio runtime — the FFI panics in that case, and the panic
+        propagates as a Python exception via ``extern "C-unwind"``.
+
+        Args:
+            cmd: Command and arguments to execute.
+            handlers: Sequence of ``(syscall, Handler)`` pairs, where
+                ``syscall`` is a name (``str``) or raw number (``int``).
+            name: Optional sandbox name. ``None`` resolves to the same
+                auto-generated name as :meth:`run`.
+
+        Returns:
+            A :class:`Result` describing the run.
+        """
+        import ctypes
+
+        from . import _handler_ffi
+        from ._sdk import (
+            _SandlockHandlerRegistration,
+            _encode,
+            _lib,
+            _make_argv,
+            _read_result_bytes,
+            Result,
+        )
+
+        if self._handle is not None:
+            raise RuntimeError("sandbox is already running")
+
+        # Resolve syscall keys (str name -> host-arch number, int as is)
+        # up front: an unknown name fails loudly here, before any native
+        # policy is built or any handler container is allocated.
+        handlers = [(_resolve_syscall(key), h) for key, h in list(handlers)]
+        native = self._ensure_native()
+        argv, argc = _make_argv(list(cmd))
+        resolved_name = name if name is not None else self._resolve_name()
+
+        trampoline = _handler_ffi._make_trampoline()
+        ud_drop = _handler_ffi._make_ud_drop()
+
+        # Build the registration array. Handler containers allocated here
+        # are consumed by sandlock_run_with_handlers — on a successful or
+        # failed call the supervisor frees them (and fires ud_drop). We
+        # must NOT call sandlock_handler_free on any container handed in.
+        regs = (_SandlockHandlerRegistration * len(handlers))()
+        registered_ids: list[int] = []
+        # ``i`` is referenced in the rollback path; keep it bound even if
+        # ``handlers`` is empty and the loop never runs.
+        i = 0
+        # A container produced by sandlock_handler_new but not yet stored
+        # into ``regs`` is owned by neither the regs array nor the
+        # supervisor. Track it here so the rollback path can free it;
+        # clear it back to None the instant ownership moves into regs.
+        container = None
+        try:
+            for i, (syscall_nr, handler) in enumerate(handlers):
+                hid = _handler_ffi._register_handler(handler)
+                registered_ids.append(hid)
+                container = _lib.sandlock_handler_new(
+                    trampoline,
+                    ctypes.c_void_p(hid),
+                    ud_drop,
+                    int(handler.on_exception),
+                )
+                if not container:
+                    raise RuntimeError(
+                        "sandlock_handler_new returned NULL for syscall "
+                        f"{syscall_nr}"
+                    )
+                regs[i].syscall_nr = int(syscall_nr)
+                regs[i].handler = container
+                # Ownership now lives in regs[i]; clear the pending ref so
+                # the rollback path does not double-free it (regs[i] is
+                # already covered by the range(i) loop below).
+                container = None
+        except BaseException:
+            # Roll back: free every handler container already allocated
+            # in this loop. sandlock_handler_free fires the container's
+            # ud_drop, which removes that handler from the registry — so
+            # we must NOT also call _unregister_handler for those.
+            #
+            # BaseException (not Exception) so a KeyboardInterrupt or
+            # SystemExit raised mid-loop still triggers cleanup before it
+            # propagates.
+            for j in range(i):
+                if regs[j].handler:
+                    _lib.sandlock_handler_free(regs[j].handler)
+            # A container created by sandlock_handler_new in the failing
+            # iteration but not yet stored into regs[i]. With syscall
+            # numbers resolved up front, no step currently sits between
+            # the alloc and the store that can raise — but this stays as
+            # forward defense (a future fallible step there would leak
+            # the container otherwise). It is owned by nothing else, so
+            # free it here. After a successful store ``container`` is
+            # None, so this branch never double-frees a container
+            # already covered above.
+            if container:
+                _lib.sandlock_handler_free(container)
+            # The current slot `i` registered a handler id but its
+            # container's ud_drop will never fire (either no container
+            # was created, or the one created above is freed by hand and
+            # its ud_drop only clears that same id) — drop it by hand.
+            if i < len(registered_ids):
+                _handler_ffi._unregister_handler(registered_ids[i])
+            raise
+
+        name_b = _encode(resolved_name)
+        try:
+            result_p = _lib.sandlock_run_with_handlers(
+                native.ptr,
+                name_b,
+                argv,
+                argc,
+                regs,
+                len(handlers),
+            )
+        finally:
+            # The registry exists only to route dispatch DURING the run;
+            # once sandlock_run_with_handlers returns, no handler can be
+            # invoked again. On the normal and early-return paths the
+            # supervisor has already fired every ud_drop, emptying these
+            # slots. On a panic — the entry point is extern "C-unwind",
+            # so a panic (e.g. called from within an existing Tokio
+            # runtime) propagates here as a Python exception — it may
+            # not have. Sweep unconditionally so a panic cannot orphan
+            # entries in the process-global registry;
+            # _unregister_handler is idempotent (pop(.., None)), so this
+            # is a no-op on the paths where ud_drop already ran.
+            for hid in registered_ids:
+                _handler_ffi._unregister_handler(hid)
+        # Ownership of every container has transferred to the supervisor.
+
+        if not result_p:
+            return Result(
+                success=False,
+                exit_code=-1,
+                error="sandlock_run_with_handlers failed",
+            )
+
+        exit_code = _lib.sandlock_result_exit_code(result_p)
+        success = _lib.sandlock_result_success(result_p)
+        stdout = _read_result_bytes(result_p, _lib.sandlock_result_stdout_bytes)
+        stderr = _read_result_bytes(result_p, _lib.sandlock_result_stderr_bytes)
+        _lib.sandlock_result_free(result_p)
+
+        return Result(
+            success=bool(success),
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+    def create(self, cmd: Sequence[str]) -> None:
+        """Fork the sandboxed child and install policy. The child is
+        parked between policy install and ``execve``; call ``start()``
+        to release it.
+
+        ``pid`` is available after this call. The child is not running
+        user code yet -- it is blocked inside the sandlock supervisor
+        waiting for ``start()``.
 
         Raises:
             RuntimeError: If a process is already running.
@@ -532,11 +706,40 @@ class Sandbox:
         argv, argc = _make_argv(list(cmd))
         resolved_name = self._resolve_name()
 
-        self._handle = _lib.sandlock_spawn(
+        self._handle = _lib.sandlock_create(
             native.ptr, _encode(resolved_name), argv, argc,
         )
         if not self._handle:
-            raise RuntimeError("sandlock_spawn failed")
+            raise RuntimeError("sandlock_create failed")
+
+    def start(self) -> None:
+        """Release a previously ``create()``d child to ``execve`` the
+        configured command.
+
+        Raises:
+            RuntimeError: If no child has been created.
+        """
+        from ._sdk import _lib
+
+        if self._handle is None:
+            raise RuntimeError("sandbox has not been created")
+        if _lib.sandlock_start(self._handle) != 0:
+            _lib.sandlock_handle_free(self._handle)
+            self._handle = None
+            raise RuntimeError("sandlock_start failed")
+
+    def spawn(self, cmd: Sequence[str]) -> None:
+        """Spawn ``cmd`` in the sandbox without waiting for it to finish.
+
+        Sugar for ``create(cmd) + start()``. After calling ``spawn()``,
+        use ``pid``, ``pause()``, ``resume()``, ``kill()``, and ``wait()``
+        to manage the process lifecycle.
+
+        Raises:
+            RuntimeError: If a process is already running.
+        """
+        self.create(cmd)
+        self.start()
 
     def wait(self):
         """Wait for the running process to finish and return its Result.
@@ -832,3 +1035,45 @@ def _encode(s: str) -> bytes:
     if b'\x00' in result:
         raise ValueError(f"NUL byte in string argument: {result!r}")
     return result
+
+
+def _resolve_syscall(key) -> int:
+    """Resolve a handler-registration key to a kernel syscall number.
+
+    ``key`` is either:
+
+    * an ``int`` — a raw kernel syscall number, used as is; or
+    * a ``str`` — a syscall name (e.g. ``"openat"``), resolved for the
+      host architecture so callers need not hard-code arch-specific
+      numbers.
+
+    A numeric string (e.g. ``"257"``) is treated as a name, not a
+    number — it will not resolve; pass an ``int`` for a raw number.
+
+    Raises ``ValueError`` for a name sandlock cannot resolve (syscalls
+    sandlock does not filter, e.g. ``getpid``, are not name-resolvable
+    and must be passed as an ``int``), and ``TypeError`` for any other
+    key type.
+    """
+    # bool is an int subclass: True/False would otherwise slip through
+    # the int branch and resolve to syscalls 1/0 (write/read) — a silent
+    # wrong registration. Reject before the int check.
+    if isinstance(key, bool):
+        raise TypeError(
+            "syscall key must be a name (str) or number (int), not bool"
+        )
+    if isinstance(key, str):
+        from ._sdk import _lib
+        nr = _lib.sandlock_syscall_nr(_encode(key))
+        if nr < 0:
+            raise ValueError(
+                f"unknown syscall name {key!r}: sandlock cannot resolve it "
+                f"— pass the raw kernel syscall number as an int instead"
+            )
+        return nr
+    if isinstance(key, int):
+        return key
+    raise TypeError(
+        f"syscall key must be a name (str) or number (int), "
+        f"got {type(key).__name__}"
+    )

@@ -9,6 +9,8 @@ use tokio::task::JoinHandle;
 
 use crate::context;
 use crate::error::SandboxError;
+pub use crate::http::{http_acl_check, normalize_path, prefix_or_exact_match, HttpRule};
+pub use crate::network::{NetAllow, Protocol};
 
 /// A byte size value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,7 +125,6 @@ impl TryFrom<&Sandbox> for Confinement {
         if sandbox.no_huge_pages { unsupported.push("no_huge_pages"); }
         if sandbox.no_coredump { unsupported.push("no_coredump"); }
         if sandbox.deterministic_dirs { unsupported.push("deterministic_dirs"); }
-        if sandbox.fs_isolation != FsIsolation::None { unsupported.push("fs_isolation"); }
         if sandbox.workdir.is_some() { unsupported.push("workdir"); }
         if sandbox.cwd.is_some() { unsupported.push("cwd"); }
         if sandbox.fs_storage.is_some() { unsupported.push("fs_storage"); }
@@ -152,15 +153,6 @@ impl TryFrom<&Sandbox> for Confinement {
     }
 }
 
-/// Filesystem isolation mode.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum FsIsolation {
-    #[default]
-    None,
-    OverlayFs,
-    BranchFs,
-}
-
 /// Action to take on branch exit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum BranchAction {
@@ -168,345 +160,6 @@ pub enum BranchAction {
     Commit,
     Abort,
     Keep,
-}
-
-/// L4 protocol that a `NetAllow` rule applies to.
-///
-/// `Tcp` is the default if a rule has no scheme (the bare `host:port`
-/// form). `Udp` and `Icmp` require an explicit scheme.
-///
-/// `Icmp` is the kernel's unprivileged ping socket
-/// (`SOCK_DGRAM + IPPROTO_ICMP{,V6}`), gated by `ping_group_range` —
-/// destinations are filterable per host. Sandlock does not expose raw
-/// ICMP (`SOCK_RAW + IPPROTO_ICMP`): destination filtering at `sendto`
-/// would lie because raw sockets let the agent craft the IP header,
-/// and packet-crafting capabilities aren't part of the XOA threat
-/// model. Workloads that genuinely need raw ICMP should run outside
-/// sandlock or rely on the host's `ping_group_range` for the dgram
-/// path instead.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Protocol {
-    Tcp,
-    Udp,
-    Icmp,
-}
-
-impl Protocol {
-    fn parse(s: &str) -> Option<Self> {
-        match s {
-            "tcp" => Some(Protocol::Tcp),
-            "udp" => Some(Protocol::Udp),
-            "icmp" => Some(Protocol::Icmp),
-            _ => None,
-        }
-    }
-}
-
-/// A network endpoint allow rule.
-///
-/// Each rule permits one protocol's traffic to one host (or any IP, for
-/// the `:port` form) on a specific set of ports. Multiple rules are
-/// OR'd: traffic is permitted if any rule matches the protocol, the
-/// destination IP, and the destination port.
-///
-/// ICMP rules carry no port (ICMP has none); their `ports` is empty
-/// and `all_ports` is false.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct NetAllow {
-    /// L4 protocol this rule applies to.
-    #[serde(default = "default_protocol_tcp")]
-    pub protocol: Protocol,
-    /// Hostname; `None` means "any IP" (the `:port` form, or `icmp://*`).
-    pub host: Option<String>,
-    /// Permitted ports. Must be non-empty unless `all_ports` is true,
-    /// in which case it must be empty. Always empty for `Protocol::Icmp`.
-    pub ports: Vec<u16>,
-    /// "Any port" wildcard from the `*` token in port position. When
-    /// true, `ports` is empty; the rule permits every TCP/UDP port to
-    /// the host (or to any IP, when `host` is `None`).
-    #[serde(default)]
-    pub all_ports: bool,
-}
-
-fn default_protocol_tcp() -> Protocol { Protocol::Tcp }
-
-impl NetAllow {
-    /// Parse a rule spec. Forms:
-    ///
-    /// - `host:port[,port,...]`, `:port`, `*:port`, `host:*`, `:*`, `*:*`
-    ///   — TCP (the default scheme).
-    /// - `tcp://...` — explicit TCP, same suffix grammar as the bare form.
-    /// - `udp://...` — UDP, same suffix grammar as the bare form.
-    /// - `icmp://host` or `icmp://*` — ICMP echo (kernel ping socket).
-    ///   No port field; `icmp://host:80` is rejected.
-    ///
-    /// `*` in port position means "any port" (the all-ports wildcard).
-    /// Mixing `*` with concrete ports (e.g. `host:80,*`) is rejected.
-    pub fn parse(s: &str) -> Result<Self, SandboxError> {
-        // Split off the optional scheme prefix `<proto>://`. If absent,
-        // default to TCP and the rest of the parser is unchanged.
-        let (protocol, rest) = match s.split_once("://") {
-            Some((scheme, body)) => {
-                let proto = Protocol::parse(scheme).ok_or_else(|| {
-                    SandboxError::Invalid(format!(
-                        "--net-allow: unknown scheme `{}://` in `{}` (expected tcp, udp, icmp)",
-                        scheme, s
-                    ))
-                })?;
-                (proto, body)
-            }
-            None => (Protocol::Tcp, s),
-        };
-
-        if protocol == Protocol::Icmp {
-            return Self::parse_icmp(rest, s);
-        }
-
-        let (host_part, port_part) = rest.rsplit_once(':').ok_or_else(|| {
-            SandboxError::Invalid(format!(
-                "--net-allow: expected `host:port` or `:port`, got `{}`",
-                s
-            ))
-        })?;
-        let host = match host_part {
-            "" | "*" => None,
-            h => Some(h.to_string()),
-        };
-
-        // Detect the wildcard token. We split on ',' first so a
-        // single `*` is a clean match — `*,80` is rejected explicitly
-        // below rather than letting `*` parse as port 0.
-        let mut ports = Vec::new();
-        let mut saw_wildcard = false;
-        for p in port_part.split(',') {
-            let p = p.trim();
-            if p == "*" {
-                saw_wildcard = true;
-                continue;
-            }
-            let n: u16 = p.parse().map_err(|_| {
-                SandboxError::Invalid(format!("--net-allow: invalid port `{}` in `{}`", p, s))
-            })?;
-            if n == 0 {
-                return Err(SandboxError::Invalid(format!(
-                    "--net-allow: port 0 is not valid in `{}`",
-                    s
-                )));
-            }
-            ports.push(n);
-        }
-        if saw_wildcard && !ports.is_empty() {
-            return Err(SandboxError::Invalid(format!(
-                "--net-allow: cannot mix `*` with concrete ports in `{}`",
-                s
-            )));
-        }
-        if !saw_wildcard && ports.is_empty() {
-            return Err(SandboxError::Invalid(format!(
-                "--net-allow: at least one port required in `{}`",
-                s
-            )));
-        }
-        Ok(NetAllow { protocol, host, ports, all_ports: saw_wildcard })
-    }
-
-    /// Parse the body of an `icmp://` rule. Accepts a host or `*` —
-    /// ICMP has no ports, so any `:` separator is rejected.
-    fn parse_icmp(body: &str, full: &str) -> Result<Self, SandboxError> {
-        if body.contains(':') {
-            return Err(SandboxError::Invalid(format!(
-                "--net-allow: icmp rules take no port, got `{}`",
-                full
-            )));
-        }
-        if body.is_empty() {
-            return Err(SandboxError::Invalid(format!(
-                "--net-allow: icmp rule needs a host or `*`, got `{}`",
-                full
-            )));
-        }
-        let host = match body {
-            "*" => None,
-            h => Some(h.to_string()),
-        };
-        Ok(NetAllow {
-            protocol: Protocol::Icmp,
-            host,
-            ports: Vec::new(),
-            all_ports: false,
-        })
-    }
-}
-
-/// An HTTP access control rule.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct HttpRule {
-    pub method: String,
-    pub host: String,
-    pub path: String,
-}
-
-impl HttpRule {
-    /// Parse a rule from "METHOD host/path" format.
-    ///
-    /// Examples:
-    /// - `"GET api.example.com/v1/*"` → method="GET", host="api.example.com", path="/v1/*"
-    /// - `"* */admin/*"` → method="*", host="*", path="/admin/*"
-    /// - `"GET example.com"` → method="GET", host="example.com", path="/*"
-    pub fn parse(s: &str) -> Result<Self, SandboxError> {
-        let s = s.trim();
-        let (method, rest) = s
-            .split_once(char::is_whitespace)
-            .ok_or_else(|| SandboxError::Invalid(format!("invalid http rule: {}", s)))?;
-        let rest = rest.trim();
-        if rest.is_empty() {
-            return Err(SandboxError::Invalid(format!("invalid http rule: {}", s)));
-        }
-
-        let (host, path) = if let Some(pos) = rest.find('/') {
-            let (h, p) = rest.split_at(pos);
-            // Normalize the rule path, but preserve trailing * for glob matching.
-            let has_wildcard = p.ends_with('*');
-            let mut normalized = normalize_path(p);
-            if has_wildcard && !normalized.ends_with('*') {
-                normalized.push('*');
-            }
-            (h.to_string(), normalized)
-        } else {
-            (rest.to_string(), "/*".to_string())
-        };
-
-        Ok(HttpRule {
-            method: method.to_uppercase(),
-            host,
-            path,
-        })
-    }
-
-    /// Check whether this rule matches the given request parameters.
-    /// The request path is normalized before matching to prevent bypasses
-    /// via `//`, `/../`, `/.`, or percent-encoding.
-    pub fn matches(&self, method: &str, host: &str, path: &str) -> bool {
-        // Method match
-        if self.method != "*" && !self.method.eq_ignore_ascii_case(method) {
-            return false;
-        }
-        // Host match
-        if self.host != "*" && !self.host.eq_ignore_ascii_case(host) {
-            return false;
-        }
-        // Path match — normalize to prevent encoding/traversal bypasses
-        let normalized = normalize_path(path);
-        prefix_or_exact_match(&self.path, &normalized)
-    }
-}
-
-/// Normalize an HTTP path to prevent ACL bypasses via encoding tricks.
-///
-/// - Decodes percent-encoded characters (e.g. `%2F` → `/`, `%61` → `a`)
-/// - Collapses duplicate slashes (`//` → `/`)
-/// - Resolves `.` and `..` segments
-/// - Ensures the path starts with `/`
-pub fn normalize_path(path: &str) -> String {
-    // 1. Percent-decode
-    let mut decoded = String::with_capacity(path.len());
-    let mut chars = path.bytes();
-    while let Some(b) = chars.next() {
-        if b == b'%' {
-            let hi = chars.next();
-            let lo = chars.next();
-            if let (Some(h), Some(l)) = (hi, lo) {
-                let hex = [h, l];
-                if let Ok(s) = std::str::from_utf8(&hex) {
-                    if let Ok(val) = u8::from_str_radix(s, 16) {
-                        decoded.push(val as char);
-                        continue;
-                    }
-                }
-                // Malformed percent encoding — keep as-is
-                decoded.push(b as char);
-                decoded.push(h as char);
-                decoded.push(l as char);
-            } else {
-                decoded.push(b as char);
-            }
-        } else {
-            decoded.push(b as char);
-        }
-    }
-
-    // 2. Split into segments, resolve . and .., skip empty segments (collapses //)
-    let mut segments: Vec<&str> = Vec::new();
-    for seg in decoded.split('/') {
-        match seg {
-            "" | "." => {}
-            ".." => {
-                segments.pop();
-            }
-            s => segments.push(s),
-        }
-    }
-
-    // 3. Reconstruct with leading /
-    let mut result = String::with_capacity(decoded.len());
-    result.push('/');
-    result.push_str(&segments.join("/"));
-    result
-}
-
-/// Simple prefix or exact matching for paths. Supports trailing `*` as a prefix match.
-///
-/// Only supports:
-/// - `"/*"` or `"*"` matches everything
-/// - `"/v1/*"` matches "/v1/foo", "/v1/foo/bar" (prefix match)
-/// - `"/v1/models"` matches exactly "/v1/models" (exact match)
-///
-/// Does NOT support mid-pattern wildcards (e.g., "/v1/*/models").
-pub fn prefix_or_exact_match(pattern: &str, value: &str) -> bool {
-    if pattern == "/*" || pattern == "*" {
-        return true;
-    }
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        value.starts_with(prefix)
-    } else {
-        pattern == value
-    }
-}
-
-/// Evaluate HTTP ACL rules against a request.
-///
-/// - Block rules are checked first; if any match, return false.
-/// - Allow rules are checked next; if any match, return true.
-/// - If allow rules exist but none matched, return false (deny-by-default).
-/// - If no rules at all, return true (unrestricted).
-pub fn http_acl_check(
-    allow: &[HttpRule],
-    deny: &[HttpRule],
-    method: &str,
-    host: &str,
-    path: &str,
-) -> bool {
-    // Block rules checked first
-    for rule in deny {
-        if rule.matches(method, host, path) {
-            return false;
-        }
-    }
-    // Allow rules checked next
-    if allow.is_empty() && deny.is_empty() {
-        return true; // unrestricted
-    }
-    if allow.is_empty() {
-        // Only block rules exist; anything not denied is allowed
-        return true;
-    }
-    for rule in allow {
-        if rule.matches(method, host, path) {
-            return true;
-        }
-    }
-    false // allow rules exist but none matched
 }
 
 // ============================================================
@@ -525,7 +178,6 @@ struct Runtime {
     loadavg_handle: Option<JoinHandle<()>>,
     _stdout_read: Option<std::os::fd::OwnedFd>,
     _stderr_read: Option<std::os::fd::OwnedFd>,
-    cow_branch: Option<Box<dyn crate::cow::CowBranch>>,
     seccomp_cow: Option<crate::cow::seccomp::SeccompCowBranch>,
     supervisor_resource: Option<Arc<tokio::sync::Mutex<crate::seccomp::state::ResourceState>>>,
     supervisor_cow: Option<Arc<tokio::sync::Mutex<crate::seccomp::state::CowState>>>,
@@ -537,7 +189,8 @@ struct Runtime {
     http_acl_handle: Option<crate::http_acl::HttpAclProxyHandle>,
     #[allow(clippy::type_complexity)]
     on_bind: Option<Box<dyn Fn(&HashMap<u16, u16>) + Send + Sync>>,
-    extra_handlers: Vec<(i64, Arc<dyn crate::seccomp::dispatch::Handler>)>,
+    handlers: Vec<(i64, Arc<dyn crate::seccomp::dispatch::Handler>)>,
+    ready_w: Option<std::os::fd::OwnedFd>,
 }
 
 /// Lifecycle state for the runtime.
@@ -596,8 +249,6 @@ pub struct Sandbox {
     /// PEM CA key for HTTPS MITM. Required when http_ca is set.
     pub http_key: Option<PathBuf>,
 
-    // Namespace isolation — always enabled, not user-configurable.
-
     // Resource limits
     pub max_memory: Option<ByteSize>,
     pub max_processes: u32,
@@ -613,7 +264,6 @@ pub struct Sandbox {
     pub deterministic_dirs: bool,
 
     // Filesystem branch
-    pub fs_isolation: FsIsolation,
     pub workdir: Option<PathBuf>,
     pub cwd: Option<PathBuf>,
     pub fs_storage: Option<PathBuf>,
@@ -635,6 +285,14 @@ pub struct Sandbox {
     pub cpu_cores: Option<Vec<u32>>,
     pub num_cpus: Option<u32>,
     pub port_remap: bool,
+
+    /// Skip the seccomp user-notification supervisor. The sandbox runs
+    /// with Landlock + a kernel-only deny filter, with none of the
+    /// supervisor-mediated features (IP allowlist, resource limits,
+    /// COW, chroot mediation, /proc virtualization, custom handlers).
+    /// Required when nesting inside another sandlock — the kernel only
+    /// allows one `SECCOMP_FILTER_FLAG_NEW_LISTENER` per task.
+    pub no_supervisor: bool,
 
     // User namespace
     pub uid: Option<u32>,
@@ -712,7 +370,6 @@ impl Clone for Sandbox {
             no_huge_pages: self.no_huge_pages,
             no_coredump: self.no_coredump,
             deterministic_dirs: self.deterministic_dirs,
-            fs_isolation: self.fs_isolation.clone(),
             workdir: self.workdir.clone(),
             cwd: self.cwd.clone(),
             fs_storage: self.fs_storage.clone(),
@@ -727,6 +384,7 @@ impl Clone for Sandbox {
             cpu_cores: self.cpu_cores.clone(),
             num_cpus: self.num_cpus,
             port_remap: self.port_remap,
+            no_supervisor: self.no_supervisor,
             uid: self.uid,
             policy_fn: self.policy_fn.clone(),
             name: self.name.clone(),
@@ -753,14 +411,9 @@ impl Sandbox {
 
     /// Validate cross-section invariants — checks that span multiple fields.
     ///
-    /// Currently:
-    /// - `fs_isolation != "none"` requires `workdir` to be set.
-    ///
-    /// Idempotent: calling repeatedly is safe.
+    /// Currently a no-op; retained as an extension point and for API
+    /// stability. Idempotent: calling repeatedly is safe.
     pub fn validate(&self) -> Result<(), SandboxError> {
-        if self.fs_isolation != FsIsolation::None && self.workdir.is_none() {
-            return Err(SandboxError::FsIsolationRequiresWorkdir);
-        }
         Ok(())
     }
 
@@ -949,22 +602,76 @@ impl Sandbox {
         Ok(RunResult { exit_status, stdout, stderr })
     }
 
-    /// Spawn a sandboxed process without waiting for it to exit.
-    /// Use `wait()` to collect the exit status when done.
-    #[doc(hidden)]
+    /// Fork the sandboxed child and install policy (seccomp + notif
+    /// supervisor + rlimits + landlock + COW + network/HTTP proxies).
+    /// The child is parked between policy install and `execve`; call
+    /// `start()` to release it. Stdout/stderr are captured for later
+    /// retrieval via `wait()`.
+    pub async fn create(&mut self, cmd: &[&str]) -> Result<(), crate::error::SandlockError> {
+        self.do_create(cmd, true).await
+    }
+
+    /// Like `create` but inherits stdio (no capture).
+    pub async fn create_interactive(&mut self, cmd: &[&str]) -> Result<(), crate::error::SandlockError> {
+        self.do_create(cmd, false).await
+    }
+
+    /// Release a previously `create()`d child to `execve` the configured
+    /// command. Returns immediately; use `wait()` to collect the exit
+    /// status when the child finishes.
+    pub fn start(&mut self) -> Result<(), crate::error::SandlockError> {
+        self.do_start()
+    }
+
+    /// Sugar for `create()` + `start()` that also blocks until the child
+    /// has completed `execve()` and is executing user code. After this
+    /// returns, operations that read user-code state (e.g. `checkpoint()`,
+    /// `/proc/<pid>/exe`) observe the requested binary rather than the
+    /// supervisor.
     pub async fn spawn(&mut self, cmd: &[&str]) -> Result<(), crate::error::SandlockError> {
-        self.do_spawn(cmd, false).await
+        self.create(cmd).await?;
+        self.start()?;
+        self.wait_until_exec().await
     }
 
-    /// Like `spawn` but captures stdout and stderr (available via `wait()`).
-    #[doc(hidden)]
-    pub async fn spawn_captured(&mut self, cmd: &[&str]) -> Result<(), crate::error::SandlockError> {
-        self.do_spawn(cmd, true).await
+    /// Like `spawn` but inherits stdio (no capture).
+    pub async fn spawn_interactive(&mut self, cmd: &[&str]) -> Result<(), crate::error::SandlockError> {
+        self.create_interactive(cmd).await?;
+        self.start()?;
+        self.wait_until_exec().await
     }
 
-    /// Spawn with explicit stdin/stdout/stderr fd redirection.
+    /// Wait for the child to finish `execve`. Detected by `/proc/<pid>/exe`
+    /// no longer matching `/proc/self/exe` (before execve the child still
+    /// shares the supervisor's binary). The kernel offers no direct event
+    /// for execve completion, so this polls every 1ms with a 5s ceiling.
+    async fn wait_until_exec(&self) -> Result<(), crate::error::SandlockError> {
+        use crate::error::SandboxRuntimeError;
+        let pid = self.pid().ok_or(SandboxRuntimeError::NotRunning)?;
+        let Some(our_exe) = std::fs::read_link("/proc/self/exe").ok() else {
+            return Ok(());
+        };
+        let child_link = format!("/proc/{}/exe", pid);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Ok(child_exe) = std::fs::read_link(&child_link) {
+                if child_exe != our_exe {
+                    return Ok(());
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(SandboxRuntimeError::Child(
+                    "child did not exec() within 5s".into(),
+                ).into());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+
+    /// Create with explicit stdin/stdout/stderr fd redirection. Child is
+    /// parked after policy install; call `start()` to release.
     #[doc(hidden)]
-    pub async fn spawn_with_io(
+    pub async fn create_with_io(
         &mut self,
         cmd: &[&str],
         stdin_fd: Option<std::os::unix::io::RawFd>,
@@ -973,12 +680,12 @@ impl Sandbox {
     ) -> Result<(), crate::error::SandlockError> {
         self.ensure_runtime()?;
         self.rt_mut().io_overrides = Some((stdin_fd, stdout_fd, stderr_fd));
-        self.do_spawn(cmd, false).await
+        self.do_create(cmd, false).await
     }
 
-    /// Like `spawn_with_io` but also maps extra fds into the child.
+    /// Like `create_with_io` but also maps extra fds into the child.
     #[doc(hidden)]
-    pub async fn spawn_with_gather_io(
+    pub async fn create_with_gather_io(
         &mut self,
         cmd: &[&str],
         stdin_fd: Option<std::os::unix::io::RawFd>,
@@ -989,31 +696,7 @@ impl Sandbox {
         self.ensure_runtime()?;
         self.rt_mut().io_overrides = Some((stdin_fd, stdout_fd, stderr_fd));
         self.rt_mut().extra_fds = extra_fds;
-        self.do_spawn(cmd, false).await
-    }
-
-    /// Commit COW writes to the original directory.
-    #[doc(hidden)]
-    pub async fn commit(&mut self) -> Result<(), crate::error::SandlockError> {
-        use crate::error::{SandboxRuntimeError, SandlockError};
-        if let Some(ref mut rt) = self.runtime {
-            if let Some(branch) = rt.cow_branch.take() {
-                branch.commit().map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Branch(e)))?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Discard COW writes.
-    #[doc(hidden)]
-    pub async fn abort_branch(&mut self) -> Result<(), crate::error::SandlockError> {
-        use crate::error::{SandboxRuntimeError, SandlockError};
-        if let Some(ref mut rt) = self.runtime {
-            if let Some(branch) = rt.cow_branch.take() {
-                branch.abort().map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Branch(e)))?;
-            }
-        }
-        Ok(())
+        self.do_create(cmd, false).await
     }
 
     /// Freeze the sandbox: hold fork notifications + SIGSTOP the process group.
@@ -1073,7 +756,8 @@ impl Sandbox {
         &mut self,
         cmd: &[&str],
     ) -> Result<crate::result::RunResult, crate::error::SandlockError> {
-        self.do_spawn(cmd, true).await?;
+        self.do_create(cmd, true).await?;
+        self.do_start()?;
         self.wait().await
     }
 
@@ -1082,54 +766,58 @@ impl Sandbox {
         &mut self,
         cmd: &[&str],
     ) -> Result<crate::result::RunResult, crate::error::SandlockError> {
-        self.do_spawn(cmd, false).await?;
+        self.do_create(cmd, false).await?;
+        self.do_start()?;
         self.wait().await
     }
 
     /// One-shot run with user-supplied syscall handlers.
-    pub async fn run_with_extra_handlers<I, S, H>(
+    pub async fn run_with_handlers<I, S, H>(
         &mut self,
         cmd: &[&str],
-        extra_handlers: I,
+        handlers: I,
     ) -> Result<crate::result::RunResult, crate::error::SandlockError>
     where
         I: IntoIterator<Item = (S, H)>,
         S: TryInto<crate::seccomp::syscall::Syscall, Error = crate::seccomp::syscall::SyscallError>,
         H: crate::seccomp::dispatch::Handler,
     {
-        let pending = sandbox_collect_extra_handlers(extra_handlers, self)?;
+        let pending = sandbox_collect_handlers(handlers, self)?;
         self.ensure_runtime()?;
-        self.rt_mut().extra_handlers = pending;
-        self.do_spawn(cmd, true).await?;
+        self.rt_mut().handlers = pending;
+        self.do_create(cmd, true).await?;
+        self.do_start()?;
         self.wait().await
     }
 
-    /// Interactive-stdio counterpart of `run_with_extra_handlers`.
-    pub async fn run_interactive_with_extra_handlers<I, S, H>(
+    /// Interactive-stdio counterpart of `run_with_handlers`.
+    pub async fn run_interactive_with_handlers<I, S, H>(
         &mut self,
         cmd: &[&str],
-        extra_handlers: I,
+        handlers: I,
     ) -> Result<crate::result::RunResult, crate::error::SandlockError>
     where
         I: IntoIterator<Item = (S, H)>,
         S: TryInto<crate::seccomp::syscall::Syscall, Error = crate::seccomp::syscall::SyscallError>,
         H: crate::seccomp::dispatch::Handler,
     {
-        let pending = sandbox_collect_extra_handlers(extra_handlers, self)?;
+        let pending = sandbox_collect_handlers(handlers, self)?;
         self.ensure_runtime()?;
-        self.rt_mut().extra_handlers = pending;
-        self.do_spawn(cmd, false).await?;
+        self.rt_mut().handlers = pending;
+        self.do_create(cmd, false).await?;
+        self.do_start()?;
         self.wait().await
     }
 
-    /// Dry-run: spawn, wait, collect filesystem changes, then abort.
+    /// Dry-run: create, start, wait, collect filesystem changes, then abort.
     pub async fn dry_run(
         &mut self,
         cmd: &[&str],
     ) -> Result<crate::dry_run::DryRunResult, crate::error::SandlockError> {
         self.on_exit = BranchAction::Keep;
         self.on_error = BranchAction::Keep;
-        self.do_spawn(cmd, true).await?;
+        self.do_create(cmd, true).await?;
+        self.do_start()?;
         let run_result = self.wait().await?;
         let changes = self.collect_changes().await;
         self.do_abort().await;
@@ -1143,7 +831,8 @@ impl Sandbox {
     ) -> Result<crate::dry_run::DryRunResult, crate::error::SandlockError> {
         self.on_exit = BranchAction::Keep;
         self.on_error = BranchAction::Keep;
-        self.do_spawn(cmd, false).await?;
+        self.do_create(cmd, false).await?;
+        self.do_start()?;
         let run_result = self.wait().await?;
         let changes = self.collect_changes().await;
         self.do_abort().await;
@@ -1212,8 +901,6 @@ impl Sandbox {
             };
             let _ = crate::seccomp::bpf::install_deny_filter(&filter);
 
-            crate::process::CONFINED.store(true, std::sync::atomic::Ordering::Relaxed);
-
             init_fn();
 
             drop(pipe_read_ends);
@@ -1276,7 +963,6 @@ impl Sandbox {
                 loadavg_handle: None,
                 _stdout_read: None,
                 _stderr_read: None,
-                cow_branch: None,
                 seccomp_cow: None,
                 supervisor_resource: None,
                 supervisor_cow: None,
@@ -1287,7 +973,8 @@ impl Sandbox {
                 extra_fds: Vec::new(),
                 http_acl_handle: None,
                 on_bind: None,
-                extra_handlers: Vec::new(),
+                handlers: Vec::new(),
+                ready_w: None,
             }));
             clones.push(clone_sb);
         }
@@ -1332,7 +1019,8 @@ impl Sandbox {
         let mut reducer = self.clone().with_name(reducer_name);
         reducer.ensure_runtime()?;
         reducer.rt_mut().io_overrides = Some((Some(stdin_fds[0]), None, None));
-        reducer.do_spawn(cmd, true).await?;
+        reducer.do_create(cmd, true).await?;
+        reducer.do_start()?;
         unsafe { libc::close(stdin_fds[0]) };
 
         let _ = write_handle.await;
@@ -1359,7 +1047,6 @@ impl Sandbox {
             loadavg_handle: None,
             _stdout_read: None,
             _stderr_read: None,
-            cow_branch: None,
             seccomp_cow: None,
             supervisor_resource: None,
             supervisor_cow: None,
@@ -1370,7 +1057,8 @@ impl Sandbox {
             extra_fds: Vec::new(),
             http_acl_handle: None,
             on_bind: None,
-            extra_handlers: Vec::new(),
+            handlers: Vec::new(),
+            ready_w: None,
         }));
         Ok(())
     }
@@ -1381,9 +1069,6 @@ impl Sandbox {
 
     async fn collect_changes(&self) -> Vec<crate::dry_run::Change> {
         if let Some(ref rt) = self.runtime {
-            if let Some(ref branch) = rt.cow_branch {
-                return branch.changes().unwrap_or_default();
-            }
             if let Some(ref cow) = rt.seccomp_cow {
                 return cow.changes().unwrap_or_default();
             }
@@ -1393,9 +1078,6 @@ impl Sandbox {
 
     async fn do_abort(&mut self) {
         if let Some(ref mut rt) = self.runtime {
-            if let Some(branch) = rt.cow_branch.take() {
-                let _ = branch.abort();
-            }
             if let Some(ref mut cow) = rt.seccomp_cow {
                 let _ = cow.abort();
             }
@@ -1403,15 +1085,15 @@ impl Sandbox {
     }
 
     // ================================================================
-    // Internal: do_spawn (the main fork/confinement entry point)
+    // Internal: do_create (fork + policy install; child parks at the
+    // ready_r read, awaiting do_start to release it to execve).
     // ================================================================
 
-    async fn do_spawn(&mut self, cmd: &[&str], capture: bool) -> Result<(), crate::error::SandlockError> {
+    async fn do_create(&mut self, cmd: &[&str], capture: bool) -> Result<(), crate::error::SandlockError> {
         use std::ffi::CString;
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use crate::error::SandboxRuntimeError;
-        use crate::context::{PipePair, read_u32_fd, write_u32_fd};
-        use crate::cow::{CowBranch, overlayfs::OverlayBranch, branchfs::BranchFsBranch};
+        use crate::context::{PipePair, read_u32_fd};
         use crate::network;
         use crate::seccomp::ctx::SupervisorCtx;
         use crate::seccomp::notif::{self, NotifPolicy};
@@ -1434,14 +1116,23 @@ impl Sandbox {
             .map(|s| CString::new(*s).map_err(|_| SandboxRuntimeError::Child("invalid command string".into())))
             .collect::<Result<Vec<_>, _>>()?;
 
-        let nested = crate::process::is_nested();
+        let no_supervisor = self.no_supervisor;
 
         let pipes = PipePair::new().map_err(SandboxRuntimeError::Io)?;
 
         let resolved_net_allow = network::resolve_net_allow(&self.net_allow)
             .await
             .map_err(SandboxRuntimeError::Io)?;
-        let virtual_etc_hosts = resolved_net_allow.etc_hosts.clone();
+        // In chroot/image mode, seed the synthetic /etc/hosts from the
+        // rootfs's own file so entries baked into the image (private
+        // registries, internal hostnames, etc.) survive virtualization.
+        // Without a chroot, the helper returns the fixed loopback base.
+        // Either way, concrete-host rules from `net_allow` are appended
+        // on top.
+        let virtual_etc_hosts = network::compose_virtual_etc_hosts(
+            self.chroot.as_deref(),
+            &resolved_net_allow.concrete_host_entries,
+        );
 
         if !self.http_allow.is_empty() || !self.http_deny.is_empty() {
             let handle = crate::http_acl::spawn_http_acl_proxy(
@@ -1453,30 +1144,28 @@ impl Sandbox {
             self.rt_mut().http_acl_handle = Some(handle);
         }
 
-        let cow_branch: Option<Box<dyn CowBranch>> = match self.fs_isolation {
-            FsIsolation::OverlayFs => {
-                let workdir = self.workdir.as_ref()
-                    .ok_or_else(|| crate::error::SandlockError::Runtime(SandboxRuntimeError::Child("OverlayFs requires workdir".into())))?;
-                let storage = self.fs_storage.as_ref()
-                    .cloned()
-                    .unwrap_or_else(|| std::env::temp_dir().join("sandlock-overlay"));
-                std::fs::create_dir_all(&storage)
-                    .map_err(|e| crate::error::SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
-                let branch = OverlayBranch::create(workdir, &storage)
-                    .map_err(|e| crate::error::SandlockError::Runtime(SandboxRuntimeError::Branch(e)))?;
-                Some(Box::new(branch))
+        // Seccomp COW: create the branch before fork so the child's Landlock
+        // ruleset can include the upper layer. Binaries created inside the
+        // workdir live in the upper dir, and Landlock checks EXECUTE on the
+        // file's real path at execve time — so the upper dir must be granted
+        // read+execute (READ_ACCESS) or `./created-binary` fails with EACCES.
+        let seccomp_cow_branch = if !no_supervisor && self.workdir.is_some() {
+            let workdir = self.workdir.as_ref().unwrap().clone();
+            let storage = self.fs_storage.clone();
+            let max_disk = self.max_disk.map(|b| b.0).unwrap_or(0);
+            match crate::cow::seccomp::SeccompCowBranch::create(&workdir, storage.as_deref(), max_disk) {
+                Ok(branch) => {
+                    self.fs_readable.push(branch.upper_dir().to_path_buf());
+                    Some(branch)
+                }
+                Err(e) => {
+                    eprintln!("sandlock: seccomp COW branch creation failed: {}", e);
+                    None
+                }
             }
-            FsIsolation::BranchFs => {
-                let workdir = self.workdir.as_ref()
-                    .ok_or_else(|| crate::error::SandlockError::Runtime(SandboxRuntimeError::Child("BranchFs requires workdir".into())))?;
-                let branch = BranchFsBranch::create(workdir)
-                    .map_err(|e| crate::error::SandlockError::Runtime(SandboxRuntimeError::Branch(e)))?;
-                Some(Box::new(branch))
-            }
-            FsIsolation::None => None,
+        } else {
+            None
         };
-
-        let cow_config = cow_branch.as_ref().and_then(|b| b.child_mount_config());
 
         let (stdout_r, stderr_r) = if capture {
             let mut stdout_fds = [0i32; 2];
@@ -1504,6 +1193,10 @@ impl Sandbox {
         } else {
             (None, None)
         };
+
+        // Capture our PID before fork so the child can detect parent death
+        // without assuming PID 1 is always init (wrong in containers).
+        let parent_pid = unsafe { libc::getpid() };
 
         let pid = unsafe { libc::fork() };
         if pid < 0 {
@@ -1535,7 +1228,7 @@ impl Sandbox {
 
             let gather_keep_fds: Vec<i32> = extra_fds_copy.iter().map(|&(target, _)| target).collect();
 
-            let extra_syscalls: Vec<u32> = self.rt().extra_handlers
+            let extra_syscalls: Vec<u32> = self.rt().handlers
                 .iter()
                 .map(|h| h.0 as u32)
                 .collect();
@@ -1545,17 +1238,15 @@ impl Sandbox {
                 sandbox: self,
                 cmd: &c_cmd,
                 pipes: &pipes,
-                cow_config: cow_config.as_ref(),
-                nested,
+                no_supervisor,
                 keep_fds: &gather_keep_fds,
                 sandbox_name: Some(sandbox_name.as_str()),
                 extra_syscalls: &extra_syscalls,
+                parent_pid,
             });
         }
 
         // ===== PARENT PROCESS =====
-        self.rt_mut().cow_branch = cow_branch;
-
         drop(pipes.notif_w);
         drop(pipes.ready_r);
 
@@ -1563,7 +1254,8 @@ impl Sandbox {
         self.rt_mut()._stderr_read = stderr_r.map(|(r, _w)| r);
 
         self.rt_mut().child_pid = Some(pid);
-        self.rt_mut().state = RuntimeState::Running;
+        // State remains `Created` until `do_start` writes ready_w to release
+        // the child to execve.
 
         let pidfd = match syscall::pidfd_open(pid as u32, 0) {
             Ok(fd) => Some(fd),
@@ -1614,13 +1306,13 @@ impl Sandbox {
                 has_random_seed: self.random_seed.is_some(),
                 has_time_start: self.time_start.is_some(),
                 argv_safety_required: self.policy_fn.is_some()
-                    || self.rt().extra_handlers.iter().any(|h| {
+                    || self.rt().handlers.iter().any(|h| {
                         h.0 == libc::SYS_execve || h.0 == libc::SYS_execveat
                     }),
                 time_offset: time_offset_val,
                 num_cpus: self.num_cpus,
                 port_remap: self.port_remap,
-                cow_enabled: self.workdir.is_some() && self.fs_isolation == FsIsolation::None,
+                cow_enabled: self.workdir.is_some(),
                 chroot_root: self.chroot.as_ref().and_then(|p| std::fs::canonicalize(p).ok()),
                 chroot_readable: self.fs_readable.clone(),
                 chroot_writable: self.fs_writable.clone(),
@@ -1686,15 +1378,7 @@ impl Sandbox {
             res_state.proc_count = 1;
 
             let mut cow_state = CowState::new();
-            if self.workdir.is_some() && self.fs_isolation == FsIsolation::None {
-                let workdir = self.workdir.as_ref().unwrap();
-                let storage = self.fs_storage.as_deref();
-                let max_disk = self.max_disk.map(|b| b.0).unwrap_or(0);
-                match crate::cow::seccomp::SeccompCowBranch::create(workdir, storage, max_disk) {
-                    Ok(branch) => { cow_state.branch = Some(branch); }
-                    Err(e) => { eprintln!("sandlock: seccomp COW branch creation failed: {}", e); }
-                }
-            }
+            cow_state.branch = seccomp_cow_branch;
 
             let mut policy_fn_state = PolicyFnState::new();
 
@@ -1763,10 +1447,26 @@ impl Sandbox {
                 notif_fd: notif_raw_fd,
             });
 
-            let extra_handlers = std::mem::take(&mut self.rt_mut().extra_handlers);
+            let handlers = std::mem::take(&mut self.rt_mut().handlers);
+            let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
             self.rt_mut().notif_handle = Some(tokio::spawn(
-                notif::supervisor(notif_fd, ctx, extra_handlers),
+                notif::supervisor(notif_fd, ctx, handlers, startup_tx),
             ));
+            // Wait for the supervisor to register the notif fd with the IO
+            // driver before we release the child to execve. Otherwise an
+            // early traced syscall would queue a notification on a fd no
+            // one is polling, and the child would block until the next
+            // `block_on` re-enters the runtime. Critical for current-thread
+            // runtimes, harmless overhead for multi-thread.
+            match startup_rx.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(SandboxRuntimeError::Io(e).into()),
+                Err(_) => {
+                    return Err(SandboxRuntimeError::Child(
+                        "seccomp supervisor exited during startup".into(),
+                    ).into());
+                }
+            }
 
             let la_resource = Arc::clone(&res_state);
             self.rt_mut().loadavg_handle = Some(tokio::spawn(async move {
@@ -1788,11 +1488,30 @@ impl Sandbox {
             }
         }
 
-        write_u32_fd(pipes.ready_w.as_raw_fd(), 1)
-            .map_err(|e| SandboxRuntimeError::Child(format!("write ready signal: {}", e)))?;
-
         self.rt_mut().pidfd = pidfd;
+        self.rt_mut().ready_w = Some(pipes.ready_w);
 
+        Ok(())
+    }
+
+    // ================================================================
+    // Internal: do_start (release the parked child to execve)
+    // ================================================================
+
+    fn do_start(&mut self) -> Result<(), crate::error::SandlockError> {
+        use std::os::fd::AsRawFd;
+        use crate::context::write_u32_fd;
+        use crate::error::SandboxRuntimeError;
+
+        if !matches!(self.rt().state, RuntimeState::Created) {
+            return Err(SandboxRuntimeError::Child("start() requires a created sandbox".into()).into());
+        }
+        let ready_w = self.rt_mut().ready_w.take()
+            .ok_or_else(|| SandboxRuntimeError::Child("start() called without a prior create()".into()))?;
+        write_u32_fd(ready_w.as_raw_fd(), 1)
+            .map_err(|e| SandboxRuntimeError::Child(format!("write ready signal: {}", e)))?;
+        drop(ready_w);
+        self.rt_mut().state = RuntimeState::Running;
         Ok(())
     }
 }
@@ -1805,7 +1524,7 @@ impl Drop for Sandbox {
     fn drop(&mut self) {
         if let Some(ref mut rt) = self.runtime {
             if let Some(pid) = rt.child_pid {
-                if matches!(rt.state, RuntimeState::Running | RuntimeState::Paused) {
+                if matches!(rt.state, RuntimeState::Created | RuntimeState::Running | RuntimeState::Paused) {
                     unsafe { libc::killpg(pid, libc::SIGKILL) };
                     let mut status: i32 = 0;
                     unsafe { libc::waitpid(pid, &mut status, 0) };
@@ -1822,14 +1541,6 @@ impl Drop for Sandbox {
             );
             let action = if is_error { &self.on_error } else { &self.on_exit };
             let action = action.clone();
-
-            if let Some(ref branch) = rt.cow_branch {
-                match action {
-                    BranchAction::Commit => { let _ = branch.commit(); }
-                    BranchAction::Abort => { let _ = branch.abort(); }
-                    BranchAction::Keep => {}
-                }
-            }
 
             if let Some(ref mut cow) = rt.seccomp_cow {
                 match action {
@@ -1929,8 +1640,8 @@ fn sandbox_wait_status_to_exit(status: i32) -> crate::result::ExitStatus {
     }
 }
 
-fn sandbox_collect_extra_handlers<I, S, H>(
-    extra_handlers: I,
+fn sandbox_collect_handlers<I, S, H>(
+    handlers: I,
     sandbox: &Sandbox,
 ) -> Result<Vec<(i64, Arc<dyn crate::seccomp::dispatch::Handler>)>, crate::error::SandlockError>
 where
@@ -1940,7 +1651,7 @@ where
 {
     use crate::seccomp::dispatch::{Handler, HandlerError};
 
-    let pending: Vec<(i64, Arc<dyn Handler>)> = extra_handlers
+    let pending: Vec<(i64, Arc<dyn Handler>)> = handlers
         .into_iter()
         .map(|(syscall, handler)| {
             let nr = syscall.try_into().map_err(HandlerError::from)?.raw();
@@ -2057,10 +1768,6 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "deterministic-dirs"))]
     pub deterministic_dirs: bool,
 
-    // fs_isolation requires string-to-enum parsing; not directly clap-friendly as FsIsolation.
-    #[cfg_attr(feature = "cli", clap(skip))]
-    pub fs_isolation: Option<FsIsolation>,
-
     #[cfg_attr(feature = "cli", arg(long = "workdir"))]
     pub workdir: Option<PathBuf>,
 
@@ -2108,6 +1815,15 @@ pub struct SandboxBuilder {
 
     #[cfg_attr(feature = "cli", arg(long = "port-remap"))]
     pub port_remap: bool,
+
+    /// Skip the seccomp user-notification supervisor. The CLI exposes
+    /// its own `--no-supervisor` flag on `RunArgs` (which short-circuits
+    /// to a direct exec); this field is the API-level counterpart used
+    /// when the caller still wants the normal `Sandbox::run` lifecycle
+    /// but cannot install a listener (e.g. nested inside another
+    /// sandbox).
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub no_supervisor: bool,
 
     #[cfg_attr(feature = "cli", arg(long = "uid"))]
     pub uid: Option<u32>,
@@ -2170,7 +1886,6 @@ impl Clone for SandboxBuilder {
             no_huge_pages: self.no_huge_pages,
             no_coredump: self.no_coredump,
             deterministic_dirs: self.deterministic_dirs,
-            fs_isolation: self.fs_isolation.clone(),
             workdir: self.workdir.clone(),
             cwd: self.cwd.clone(),
             fs_storage: self.fs_storage.clone(),
@@ -2185,6 +1900,7 @@ impl Clone for SandboxBuilder {
             cpu_cores: self.cpu_cores.clone(),
             num_cpus: self.num_cpus,
             port_remap: self.port_remap,
+            no_supervisor: self.no_supervisor,
             uid: self.uid,
             policy_fn: self.policy_fn.clone(),
             name: self.name.clone(),
@@ -2324,11 +2040,6 @@ impl SandboxBuilder {
         self
     }
 
-    pub fn fs_isolation(mut self, iso: FsIsolation) -> Self {
-        self.fs_isolation = Some(iso);
-        self
-    }
-
     pub fn workdir(mut self, path: impl Into<PathBuf>) -> Self {
         self.workdir = Some(path.into());
         self
@@ -2397,6 +2108,19 @@ impl SandboxBuilder {
 
     pub fn port_remap(mut self, v: bool) -> Self {
         self.port_remap = v;
+        self
+    }
+
+    /// Skip the seccomp user-notification supervisor. The sandbox keeps
+    /// Landlock and the kernel-level deny filter but loses every
+    /// supervisor-mediated feature (IP allowlist, resource limits, COW,
+    /// chroot mediation, /proc virtualization, custom handlers). The
+    /// kernel only permits one `SECCOMP_FILTER_FLAG_NEW_LISTENER` per
+    /// task, so set this when nesting `Sandbox::run` inside an already-
+    /// confined process; otherwise the inner seccomp install returns
+    /// `EBUSY`.
+    pub fn no_supervisor(mut self, v: bool) -> Self {
+        self.no_supervisor = v;
         self
     }
 
@@ -2524,7 +2248,6 @@ impl SandboxBuilder {
             }
         }
 
-        let fs_isolation = self.fs_isolation.unwrap_or_default();
         Ok(Sandbox {
             fs_writable: self.fs_writable,
             fs_readable: self.fs_readable,
@@ -2548,7 +2271,6 @@ impl SandboxBuilder {
             no_huge_pages: self.no_huge_pages,
             no_coredump: self.no_coredump,
             deterministic_dirs: self.deterministic_dirs,
-            fs_isolation,
             workdir: self.workdir,
             cwd: self.cwd,
             fs_storage: self.fs_storage,
@@ -2563,6 +2285,7 @@ impl SandboxBuilder {
             cpu_cores: self.cpu_cores,
             num_cpus: self.num_cpus,
             port_remap: self.port_remap,
+            no_supervisor: self.no_supervisor,
             uid: self.uid,
             policy_fn: self.policy_fn,
             name: self.name,
@@ -2582,156 +2305,8 @@ impl SandboxBuilder {
 }
 
 #[cfg(test)]
-mod http_rule_tests {
+mod tests {
     use super::*;
-
-    // --- HttpRule::parse tests ---
-
-    #[test]
-    fn parse_basic_get() {
-        let rule = HttpRule::parse("GET api.example.com/v1/*").unwrap();
-        assert_eq!(rule.method, "GET");
-        assert_eq!(rule.host, "api.example.com");
-        assert_eq!(rule.path, "/v1/*");
-    }
-
-    #[test]
-    fn parse_wildcard_method_and_host() {
-        let rule = HttpRule::parse("* */admin/*").unwrap();
-        assert_eq!(rule.method, "*");
-        assert_eq!(rule.host, "*");
-        assert_eq!(rule.path, "/admin/*");
-    }
-
-    #[test]
-    fn parse_post_with_exact_path() {
-        let rule = HttpRule::parse("POST example.com/upload").unwrap();
-        assert_eq!(rule.method, "POST");
-        assert_eq!(rule.host, "example.com");
-        assert_eq!(rule.path, "/upload");
-    }
-
-    #[test]
-    fn parse_no_path_defaults_to_wildcard() {
-        let rule = HttpRule::parse("GET example.com").unwrap();
-        assert_eq!(rule.method, "GET");
-        assert_eq!(rule.host, "example.com");
-        assert_eq!(rule.path, "/*");
-    }
-
-    #[test]
-    fn parse_method_uppercased() {
-        let rule = HttpRule::parse("get example.com/foo").unwrap();
-        assert_eq!(rule.method, "GET");
-    }
-
-    #[test]
-    fn parse_error_no_space() {
-        assert!(HttpRule::parse("GETexample.com").is_err());
-    }
-
-    #[test]
-    fn parse_error_empty_host() {
-        assert!(HttpRule::parse("GET  ").is_err());
-    }
-
-    // --- prefix_or_exact_match tests ---
-
-    #[test]
-    fn prefix_or_exact_match_wildcard_all() {
-        assert!(prefix_or_exact_match("/*", "/anything"));
-        assert!(prefix_or_exact_match("*", "/anything"));
-        assert!(prefix_or_exact_match("/*", "/"));
-    }
-
-    #[test]
-    fn prefix_or_exact_match_prefix() {
-        assert!(prefix_or_exact_match("/v1/*", "/v1/foo"));
-        assert!(prefix_or_exact_match("/v1/*", "/v1/foo/bar"));
-        assert!(prefix_or_exact_match("/v1/*", "/v1/"));
-        assert!(!prefix_or_exact_match("/v1/*", "/v2/foo"));
-    }
-
-    #[test]
-    fn prefix_or_exact_match_exact() {
-        assert!(prefix_or_exact_match("/v1/models", "/v1/models"));
-        assert!(!prefix_or_exact_match("/v1/models", "/v1/models/extra"));
-        assert!(!prefix_or_exact_match("/v1/models", "/v1/model"));
-    }
-
-    // --- HttpRule::matches tests ---
-
-    #[test]
-    fn matches_exact() {
-        let rule = HttpRule::parse("GET api.example.com/v1/models").unwrap();
-        assert!(rule.matches("GET", "api.example.com", "/v1/models"));
-        assert!(!rule.matches("POST", "api.example.com", "/v1/models"));
-        assert!(!rule.matches("GET", "other.com", "/v1/models"));
-        assert!(!rule.matches("GET", "api.example.com", "/v1/other"));
-    }
-
-    #[test]
-    fn matches_wildcard_method() {
-        let rule = HttpRule::parse("* api.example.com/v1/*").unwrap();
-        assert!(rule.matches("GET", "api.example.com", "/v1/foo"));
-        assert!(rule.matches("POST", "api.example.com", "/v1/bar"));
-    }
-
-    #[test]
-    fn matches_wildcard_host() {
-        let rule = HttpRule::parse("GET */v1/*").unwrap();
-        assert!(rule.matches("GET", "any.host.com", "/v1/foo"));
-    }
-
-    #[test]
-    fn matches_case_insensitive_method() {
-        let rule = HttpRule::parse("GET example.com/foo").unwrap();
-        assert!(rule.matches("get", "example.com", "/foo"));
-        assert!(rule.matches("Get", "example.com", "/foo"));
-    }
-
-    #[test]
-    fn matches_case_insensitive_host() {
-        let rule = HttpRule::parse("GET Example.COM/foo").unwrap();
-        assert!(rule.matches("GET", "example.com", "/foo"));
-    }
-
-    // --- http_acl_check tests ---
-
-    #[test]
-    fn acl_no_rules_allows_all() {
-        assert!(http_acl_check(&[], &[], "GET", "example.com", "/foo"));
-    }
-
-    #[test]
-    fn acl_allow_only_permits_matching() {
-        let allow = vec![HttpRule::parse("GET api.example.com/v1/*").unwrap()];
-        assert!(http_acl_check(&allow, &[], "GET", "api.example.com", "/v1/foo"));
-        assert!(!http_acl_check(&allow, &[], "POST", "api.example.com", "/v1/foo"));
-        assert!(!http_acl_check(&allow, &[], "GET", "other.com", "/v1/foo"));
-    }
-
-    #[test]
-    fn acl_deny_only_blocks_matching() {
-        let deny = vec![HttpRule::parse("* */admin/*").unwrap()];
-        assert!(!http_acl_check(&[], &deny, "GET", "example.com", "/admin/settings"));
-        assert!(http_acl_check(&[], &deny, "GET", "example.com", "/public/page"));
-    }
-
-    #[test]
-    fn acl_deny_takes_precedence_over_allow() {
-        let allow = vec![HttpRule::parse("* example.com/*").unwrap()];
-        let deny = vec![HttpRule::parse("* example.com/admin/*").unwrap()];
-        assert!(http_acl_check(&allow, &deny, "GET", "example.com", "/public"));
-        assert!(!http_acl_check(&allow, &deny, "GET", "example.com", "/admin/settings"));
-    }
-
-    #[test]
-    fn acl_allow_deny_by_default_when_no_match() {
-        let allow = vec![HttpRule::parse("GET api.example.com/v1/*").unwrap()];
-        // Different host, not matched by allow -> denied
-        assert!(!http_acl_check(&allow, &[], "GET", "evil.com", "/v1/foo"));
-    }
 
     // --- SandboxBuilder integration ---
 
@@ -2809,260 +2384,4 @@ mod http_rule_tests {
         assert!(!p3.allows_sysv_ipc());
     }
 
-    // --- normalize_path tests ---
-
-    #[test]
-    fn normalize_path_basic() {
-        assert_eq!(normalize_path("/foo/bar"), "/foo/bar");
-        assert_eq!(normalize_path("/"), "/");
-    }
-
-    #[test]
-    fn normalize_path_double_slashes() {
-        assert_eq!(normalize_path("/foo//bar"), "/foo/bar");
-        assert_eq!(normalize_path("//foo///bar//"), "/foo/bar");
-    }
-
-    #[test]
-    fn normalize_path_dot_segments() {
-        assert_eq!(normalize_path("/foo/./bar"), "/foo/bar");
-        assert_eq!(normalize_path("/foo/../bar"), "/bar");
-        assert_eq!(normalize_path("/foo/bar/../../baz"), "/baz");
-    }
-
-    #[test]
-    fn normalize_path_dotdot_at_root() {
-        assert_eq!(normalize_path("/../foo"), "/foo");
-        assert_eq!(normalize_path("/../../foo"), "/foo");
-    }
-
-    #[test]
-    fn normalize_path_percent_encoding() {
-        // %2F = /, %61 = a
-        assert_eq!(normalize_path("/foo%2Fbar"), "/foo/bar");
-        assert_eq!(normalize_path("/%61dmin/settings"), "/admin/settings");
-    }
-
-    #[test]
-    fn normalize_path_mixed_bypass_attempts() {
-        // Double-encoded traversal
-        assert_eq!(normalize_path("/v1/./admin/settings"), "/v1/admin/settings");
-        assert_eq!(normalize_path("/v1/../admin/settings"), "/admin/settings");
-        assert_eq!(normalize_path("/v1//admin/settings"), "/v1/admin/settings");
-        assert_eq!(normalize_path("/v1/%2e%2e/admin"), "/admin");
-    }
-
-    // --- ACL bypass prevention tests ---
-
-    #[test]
-    fn acl_deny_prevents_double_slash_bypass() {
-        let deny = vec![HttpRule::parse("* */admin/*").unwrap()];
-        // These should all be caught by the deny rule
-        assert!(!http_acl_check(&[], &deny, "GET", "example.com", "/admin/settings"));
-        assert!(!http_acl_check(&[], &deny, "GET", "example.com", "//admin/settings"));
-        assert!(!http_acl_check(&[], &deny, "GET", "example.com", "/admin//settings"));
-    }
-
-    #[test]
-    fn acl_deny_prevents_dot_segment_bypass() {
-        let deny = vec![HttpRule::parse("* */admin/*").unwrap()];
-        assert!(!http_acl_check(&[], &deny, "GET", "example.com", "/./admin/settings"));
-        assert!(!http_acl_check(&[], &deny, "GET", "example.com", "/public/../admin/settings"));
-    }
-
-    #[test]
-    fn acl_deny_prevents_percent_encoding_bypass() {
-        let deny = vec![HttpRule::parse("* */admin/*").unwrap()];
-        // %61dmin = admin
-        assert!(!http_acl_check(&[], &deny, "GET", "example.com", "/%61dmin/settings"));
-    }
-
-    #[test]
-    fn acl_allow_normalized_path_still_works() {
-        let allow = vec![HttpRule::parse("GET example.com/v1/models").unwrap()];
-        assert!(http_acl_check(&allow, &[], "GET", "example.com", "/v1/models"));
-        assert!(http_acl_check(&allow, &[], "GET", "example.com", "/v1/./models"));
-        assert!(http_acl_check(&allow, &[], "GET", "example.com", "/v1//models"));
-        // These resolve to different paths and should be denied
-        assert!(!http_acl_check(&allow, &[], "GET", "example.com", "/v1/models/extra"));
-        assert!(!http_acl_check(&allow, &[], "GET", "example.com", "/v2/models"));
-    }
-
-    #[test]
-    fn parse_normalizes_rule_path() {
-        let rule = HttpRule::parse("GET example.com/v1/./models/*").unwrap();
-        assert_eq!(rule.path, "/v1/models/*");
-
-        let rule = HttpRule::parse("GET example.com/v1//models").unwrap();
-        assert_eq!(rule.path, "/v1/models");
-    }
-
-    // --- NetAllow::parse tests ---
-
-    #[test]
-    fn netallow_parse_concrete_host_port() {
-        let r = NetAllow::parse("example.com:443").unwrap();
-        assert_eq!(r.host.as_deref(), Some("example.com"));
-        assert_eq!(r.ports, vec![443]);
-        assert!(!r.all_ports);
-    }
-
-    #[test]
-    fn netallow_parse_any_host_port() {
-        let r = NetAllow::parse(":8080").unwrap();
-        assert_eq!(r.host, None);
-        assert_eq!(r.ports, vec![8080]);
-        assert!(!r.all_ports);
-
-        let r = NetAllow::parse("*:8080").unwrap();
-        assert_eq!(r.host, None);
-        assert_eq!(r.ports, vec![8080]);
-        assert!(!r.all_ports);
-    }
-
-    #[test]
-    fn netallow_parse_multiple_ports() {
-        let r = NetAllow::parse("github.com:22,80,443").unwrap();
-        assert_eq!(r.host.as_deref(), Some("github.com"));
-        assert_eq!(r.ports, vec![22, 80, 443]);
-        assert!(!r.all_ports);
-    }
-
-    #[test]
-    fn netallow_parse_wildcard_any_host_any_port_colon() {
-        let r = NetAllow::parse(":*").unwrap();
-        assert_eq!(r.host, None);
-        assert!(r.ports.is_empty());
-        assert!(r.all_ports);
-    }
-
-    #[test]
-    fn netallow_parse_wildcard_any_host_any_port_star() {
-        let r = NetAllow::parse("*:*").unwrap();
-        assert_eq!(r.host, None);
-        assert!(r.ports.is_empty());
-        assert!(r.all_ports);
-    }
-
-    #[test]
-    fn netallow_parse_wildcard_concrete_host_any_port() {
-        let r = NetAllow::parse("example.com:*").unwrap();
-        assert_eq!(r.host.as_deref(), Some("example.com"));
-        assert!(r.ports.is_empty());
-        assert!(r.all_ports);
-    }
-
-    #[test]
-    fn netallow_parse_rejects_mixed_wildcard_and_concrete() {
-        // `host:80,*` and `host:*,80` are both ambiguous: the user
-        // either meant "any port" (wildcard wins) or "ports 80 plus
-        // some weird placeholder". Refuse and force a clean spec.
-        let err = NetAllow::parse("example.com:80,*").unwrap_err();
-        assert!(format!("{}", err).contains("cannot mix"));
-        let err = NetAllow::parse("example.com:*,80").unwrap_err();
-        assert!(format!("{}", err).contains("cannot mix"));
-    }
-
-    #[test]
-    fn netallow_parse_rejects_port_zero() {
-        let err = NetAllow::parse("example.com:0").unwrap_err();
-        assert!(format!("{}", err).contains("port 0"));
-    }
-
-    #[test]
-    fn netallow_parse_rejects_empty_port() {
-        let err = NetAllow::parse("example.com:").unwrap_err();
-        assert!(format!("{}", err).contains("invalid port"));
-    }
-
-    #[test]
-    fn netallow_parse_rejects_no_colon() {
-        let err = NetAllow::parse("example.com").unwrap_err();
-        assert!(format!("{}", err).contains("expected"));
-    }
-
-    #[test]
-    fn netallow_parse_repeated_wildcard_is_idempotent() {
-        // `*,*` collapses to a single wildcard — neither token contributes
-        // a concrete port, so the rule remains "any port".
-        let r = NetAllow::parse(":*,*").unwrap();
-        assert!(r.all_ports);
-        assert!(r.ports.is_empty());
-    }
-
-    // --- Protocol scheme prefix tests ---
-
-    #[test]
-    fn netallow_bare_form_defaults_to_tcp() {
-        let r = NetAllow::parse("example.com:443").unwrap();
-        assert_eq!(r.protocol, Protocol::Tcp);
-    }
-
-    #[test]
-    fn netallow_explicit_tcp_scheme() {
-        let r = NetAllow::parse("tcp://example.com:443").unwrap();
-        assert_eq!(r.protocol, Protocol::Tcp);
-        assert_eq!(r.host.as_deref(), Some("example.com"));
-        assert_eq!(r.ports, vec![443]);
-    }
-
-    #[test]
-    fn netallow_udp_scheme_with_host_port() {
-        let r = NetAllow::parse("udp://1.1.1.1:53").unwrap();
-        assert_eq!(r.protocol, Protocol::Udp);
-        assert_eq!(r.host.as_deref(), Some("1.1.1.1"));
-        assert_eq!(r.ports, vec![53]);
-    }
-
-    #[test]
-    fn netallow_udp_wildcard_any_anywhere() {
-        // The "any UDP" gate, equivalent to the old `allow_udp = true`.
-        let r = NetAllow::parse("udp://*:*").unwrap();
-        assert_eq!(r.protocol, Protocol::Udp);
-        assert_eq!(r.host, None);
-        assert!(r.all_ports);
-    }
-
-    #[test]
-    fn netallow_icmp_scheme_with_host() {
-        let r = NetAllow::parse("icmp://github.com").unwrap();
-        assert_eq!(r.protocol, Protocol::Icmp);
-        assert_eq!(r.host.as_deref(), Some("github.com"));
-        assert!(r.ports.is_empty());
-        assert!(!r.all_ports);
-    }
-
-    #[test]
-    fn netallow_icmp_wildcard() {
-        // The "any ICMP echo" gate, equivalent to the old
-        // `allow_icmp = true` for the SOCK_DGRAM path.
-        let r = NetAllow::parse("icmp://*").unwrap();
-        assert_eq!(r.protocol, Protocol::Icmp);
-        assert_eq!(r.host, None);
-    }
-
-    #[test]
-    fn netallow_icmp_rejects_port() {
-        // ICMP has no port — `:port` is meaningless and refused
-        // explicitly so users can't write a rule that doesn't do what
-        // they think.
-        let err = NetAllow::parse("icmp://github.com:80").unwrap_err();
-        assert!(format!("{}", err).contains("icmp rules take no port"));
-    }
-
-    #[test]
-    fn netallow_icmp_rejects_empty_body() {
-        let err = NetAllow::parse("icmp://").unwrap_err();
-        assert!(format!("{}", err).contains("needs a host or `*`"));
-    }
-
-    #[test]
-    fn netallow_unknown_scheme_rejected() {
-        // Including `icmp-raw` — sandlock does not expose raw ICMP, so
-        // the scheme is unknown rather than a special-case error.
-        for spec in ["sctp://host:1234", "icmp-raw://*"] {
-            let err = NetAllow::parse(spec).unwrap_err();
-            assert!(format!("{}", err).contains("unknown scheme"), "spec: {}", spec);
-        }
-    }
 }

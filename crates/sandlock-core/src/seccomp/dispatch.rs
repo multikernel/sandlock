@@ -41,8 +41,8 @@ use tokio::sync::Mutex;
 /// Public extension trait for sandlock seccomp-notif handlers.
 ///
 /// Each implementor is registered against a [`crate::seccomp::syscall::Syscall`]
-/// through [`crate::Sandbox::run_with_extra_handlers`] /
-/// [`crate::Sandbox::run_interactive_with_extra_handlers`].  Receives
+/// through [`crate::Sandbox::run_with_handlers`] /
+/// [`crate::Sandbox::run_interactive_with_handlers`].  Receives
 /// `&HandlerCtx` borrowed for the call; cannot outlive the dispatch
 /// invocation.
 ///
@@ -99,7 +99,7 @@ where
 // Concrete impls for `Box<dyn Handler>` and `Arc<dyn Handler>` so callers
 // can erase concrete handler types behind a smart pointer when mixing
 // different handler shapes in one `IntoIterator` passed to
-// `run_with_extra_handlers` — e.g. `Vec<(i64, Box<dyn Handler>)>` lets a
+// `run_with_handlers` — e.g. `Vec<(i64, Box<dyn Handler>)>` lets a
 // downstream register handlers of different concrete types without
 // writing a per-crate wrapper enum.
 //
@@ -126,7 +126,7 @@ impl Handler for std::sync::Arc<dyn Handler> {
 }
 
 /// Errors raised when registering user handlers via
-/// [`crate::Sandbox::run_with_extra_handlers`].
+/// [`crate::Sandbox::run_with_handlers`].
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum HandlerError {
     #[error("invalid syscall in handler registration: {0}")]
@@ -152,8 +152,22 @@ pub enum HandlerError {
 /// The blocklist is whatever [`crate::context::blocklist_syscall_numbers`]
 /// resolves from Sandlock's default syscall blocklist plus policy extras.
 ///
+/// Every open-family syscall a path-keyed handler must intercept to be
+/// leak-proof: `open` (legacy), `openat`, and `openat2`. A handler that
+/// only registers `openat` is bypassed by any libc that picks one of
+/// the others. The corresponding BPF notif list (in `context::notif_syscalls`)
+/// must register the same set so the kernel actually produces a
+/// notification — otherwise `RET_ALLOW` makes the handler unreachable.
+fn open_family_syscalls() -> Vec<i64> {
+    let mut v = vec![libc::SYS_openat, arch::SYS_OPENAT2];
+    if let Some(legacy_open) = arch::SYS_OPEN {
+        v.push(legacy_open);
+    }
+    v
+}
+
 /// Takes only the syscall numbers because that's all it needs to check.
-/// Called from the `run_with_extra_handlers` entry points before any
+/// Called from the `run_with_handlers` entry points before any
 /// handler is registered against the dispatch table.
 ///
 /// Returns the offending syscall number on rejection so the caller can
@@ -203,7 +217,7 @@ impl DispatchTable {
     /// Register a pre-`Arc`'d handler.  Used both by builtin chunks
     /// that share state via `Arc::clone` (one `ForkHandler` instance
     /// registers against `SYS_clone`/`SYS_clone3`/`SYS_vfork`) and by
-    /// `run_with_extra_handlers` when each item already arrives as
+    /// `run_with_handlers` when each item already arrives as
     /// `Arc<dyn Handler>`.
     pub(crate) fn register_arc(
         &mut self,
@@ -352,24 +366,29 @@ pub(crate) fn build_dispatch_table(
     }
 
     // ------------------------------------------------------------------
-    // Deterministic random — /dev/urandom opens (openat)
+    // Deterministic random — /dev/urandom and /dev/random opens.
+    // Registered for every open-family syscall so dirfd-relative and
+    // legacy `open` spellings can't slip past the seed and read the
+    // kernel's real entropy.
     // ------------------------------------------------------------------
     if policy.has_random_seed {
-        let __sup = Arc::clone(ctx);
-        table.register(libc::SYS_openat, move |cx: &HandlerCtx| {
-            let notif = cx.notif;
-            let sup = Arc::clone(&__sup);
-            let notif_fd = cx.notif_fd;
-            async move {
-                let mut tr = sup.time_random.lock().await;
-                if let Some(ref mut rng) = tr.random_state {
-                    if let Some(action) = crate::random::handle_random_open(&notif, rng, notif_fd) {
-                        return action;
+        for nr in open_family_syscalls() {
+            let __sup = Arc::clone(ctx);
+            table.register(nr, move |cx: &HandlerCtx| {
+                let notif = cx.notif;
+                let sup = Arc::clone(&__sup);
+                let notif_fd = cx.notif_fd;
+                async move {
+                    let mut tr = sup.time_random.lock().await;
+                    if let Some(ref mut rng) = tr.random_state {
+                        if let Some(action) = crate::random::handle_random_open(&notif, rng, notif_fd) {
+                            return action;
+                        }
                     }
+                    NotifAction::Continue
                 }
-                NotifAction::Continue
-            }
-        });
+            });
+        }
     }
 
     // ------------------------------------------------------------------
@@ -393,6 +412,38 @@ pub(crate) fn build_dispatch_table(
     }
 
     // ------------------------------------------------------------------
+    // /etc/hosts virtualization: always on. The synthetic file contains
+    // the loopback base (or, in chroot/image mode, the image's own
+    // `/etc/hosts` merged with a loopback fallback) plus any concrete
+    // hostnames resolved from `net_allow`, so the host's on-disk
+    // `/etc/hosts` never leaks in and image-baked entries are preserved.
+    //
+    // Registered for every open-family syscall (see `open_family_syscalls`).
+    // Must run *before* the chroot handler so that in chroot mode the
+    // synthetic memfd wins over a direct open of `<chroot>/etc/hosts` —
+    // the chroot handler always intercepts opens within the chroot and
+    // would otherwise serve the raw image file, defeating the merge.
+    // ------------------------------------------------------------------
+    {
+        let etc_hosts = policy.virtual_etc_hosts.clone();
+        for nr in open_family_syscalls() {
+            let etc_hosts = etc_hosts.clone();
+            table.register(nr, move |cx: &HandlerCtx| {
+                let notif = cx.notif;
+                let notif_fd = cx.notif_fd;
+                let etc_hosts = etc_hosts.clone();
+                async move {
+                    if let Some(action) = crate::procfs::handle_etc_hosts_open(&notif, &etc_hosts, notif_fd) {
+                        action
+                    } else {
+                        NotifAction::Continue
+                    }
+                }
+            });
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Chroot path interception (before COW)
     // ------------------------------------------------------------------
     if policy.chroot_root.is_some() {
@@ -407,13 +458,15 @@ pub(crate) fn build_dispatch_table(
     }
 
     // ------------------------------------------------------------------
-    // /proc virtualization (always on)
+    // /proc virtualization (always on). The handler does both
+    // sensitive-path blocking and per-PID filtering, both of which are
+    // security boundaries, so it has to catch every open-family spelling.
     // ------------------------------------------------------------------
-    {
+    for nr in open_family_syscalls() {
         let policy_for_proc_open = Arc::clone(policy);
         let resource_for_proc_open = Arc::clone(resource);
         let __sup = Arc::clone(ctx);
-        table.register(libc::SYS_openat, move |cx: &HandlerCtx| {
+        table.register(nr, move |cx: &HandlerCtx| {
             let notif = cx.notif;
             let sup = Arc::clone(&__sup);
             let notif_fd = cx.notif_fd;
@@ -459,7 +512,9 @@ pub(crate) fn build_dispatch_table(
     }
 
     // ------------------------------------------------------------------
-    // Hostname virtualization
+    // Hostname virtualization. The `/etc/hostname` shim is registered
+    // for every open-family syscall so dirfd-relative and legacy `open`
+    // spellings can't leak the host's real hostname.
     // ------------------------------------------------------------------
     if let Some(ref hostname) = policy.virtual_hostname {
         let hostname_for_uname = hostname.clone();
@@ -472,38 +527,24 @@ pub(crate) fn build_dispatch_table(
                 crate::procfs::handle_uname(&notif, &hostname, notif_fd)
             }
         });
-        table.register(libc::SYS_openat, move |cx: &HandlerCtx| {
-            let notif = cx.notif;
-            let notif_fd = cx.notif_fd;
+        for nr in open_family_syscalls() {
             let hostname = hostname_for_open.clone();
-            async move {
-                if let Some(action) = crate::procfs::handle_hostname_open(&notif, &hostname, notif_fd) {
-                    action
-                } else {
-                    NotifAction::Continue
+            table.register(nr, move |cx: &HandlerCtx| {
+                let notif = cx.notif;
+                let notif_fd = cx.notif_fd;
+                let hostname = hostname.clone();
+                async move {
+                    if let Some(action) = crate::procfs::handle_hostname_open(&notif, &hostname, notif_fd) {
+                        action
+                    } else {
+                        NotifAction::Continue
+                    }
                 }
-            }
-        });
+            });
+        }
     }
 
-    // ------------------------------------------------------------------
-    // /etc/hosts virtualization (for net_allow_hosts)
-    // ------------------------------------------------------------------
-    if let Some(ref etc_hosts) = policy.virtual_etc_hosts {
-        let etc_hosts_for_open = etc_hosts.clone();
-        table.register(libc::SYS_openat, move |cx: &HandlerCtx| {
-            let notif = cx.notif;
-            let notif_fd = cx.notif_fd;
-            let etc_hosts = etc_hosts_for_open.clone();
-            async move {
-                if let Some(action) = crate::procfs::handle_etc_hosts_open(&notif, &etc_hosts, notif_fd) {
-                    action
-                } else {
-                    NotifAction::Continue
-                }
-            }
-        });
-    }
+    // /etc/hosts is registered above the chroot block — see the comment there.
 
     // ------------------------------------------------------------------
     // Deterministic directory listing
@@ -935,6 +976,10 @@ fn register_cow_handlers(table: &mut DispatchTable, ctx: &Arc<SupervisorCtx>) {
 
     table.register(libc::SYS_chdir, cow_call!(crate::cow::dispatch::handle_cow_chdir));
     table.register(libc::SYS_getcwd, cow_call!(crate::cow::dispatch::handle_cow_getcwd));
+
+    for &nr in &[libc::SYS_execve, libc::SYS_execveat] {
+        table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_exec));
+    }
 }
 
 // ============================================================
@@ -942,7 +987,7 @@ fn register_cow_handlers(table: &mut DispatchTable, ctx: &Arc<SupervisorCtx>) {
 // ============================================================
 
 #[cfg(test)]
-mod extra_handler_tests {
+mod handler_tests {
     //! Unit tests for the user-supplied handler extension API.
     //!
     //! Drive the actual `DispatchTable::dispatch` walker against a minimal
@@ -952,7 +997,7 @@ mod extra_handler_tests {
     //! short-circuit on first non-`Continue`, append-after-builtin
     //! placement) are exercised end-to-end without needing a live
     //! Landlock+seccomp sandbox — those scenarios live under
-    //! `crates/sandlock-core/tests/integration/test_extra_handlers.rs`.
+    //! `crates/sandlock-core/tests/integration/test_handlers.rs`.
     use super::*;
     use crate::netlink::NetlinkState;
     use crate::seccomp::ctx::SupervisorCtx;
@@ -1015,7 +1060,7 @@ mod extra_handler_tests {
                 deterministic_dirs: false,
                 virtual_hostname: None,
                 has_http_acl: false,
-                virtual_etc_hosts: None,
+                virtual_etc_hosts: String::new(),
             }),
             child_pidfd: None,
             notif_fd: -1,
@@ -1175,7 +1220,7 @@ mod extra_handler_tests {
     /// `DEFAULT_BLOCKLIST_SYSCALLS` — putting it into `extra_deny_syscalls` is the only
     /// way it ends up on the extra blocklist, so the test isolates the user-supplied
     /// path of `blocklist_syscall_numbers` from the default branch covered by
-    /// `extra_handler_on_default_blocklist_syscall_is_rejected`.
+    /// `handler_on_default_blocklist_syscall_is_rejected`.
     ///
     /// Pure-logic counterpart to the integration test of the same name —
     /// runs without a live sandbox so the contract is enforced even on

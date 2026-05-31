@@ -59,7 +59,7 @@ class ChildError(SandboxError):
 
 
 class BranchError(SandboxError):
-    """BranchFS branch operation failed."""
+    """COW branch operation failed."""
 
     pass
 

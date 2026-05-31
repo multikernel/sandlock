@@ -1,6 +1,6 @@
 //! Audit every `openat(2)` that a sandboxed process performs.
 //!
-//! Demonstrates [`Sandbox::run_with_extra_handlers`]: a downstream crate
+//! Demonstrates [`Sandbox::run_with_handlers`]: a downstream crate
 //! registers a user handler for `SYS_openat` that logs the call and falls
 //! through to default (builtin) processing.
 //!
@@ -62,7 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let result = policy.clone().with_name("openat-audit")
-        .run_with_extra_handlers(
+        .run_with_handlers(
             &cmd_ref,
             [(libc::SYS_openat, audit)],
         )

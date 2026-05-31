@@ -66,8 +66,6 @@ pub struct FilesystemSection {
     pub read: Vec<PathBuf>,
     pub write: Vec<PathBuf>,
     pub deny: Vec<PathBuf>,
-    /// One of `"none"`, `"overlayfs"`, `"branchfs"`. Maps to `Sandbox::fs_isolation`.
-    pub isolation: Option<String>,
     pub chroot: Option<PathBuf>,
     /// Each entry has the form `"VIRTUAL:HOST"`, matching `--fs-mount` syntax.
     pub mount: Vec<String>,
@@ -124,9 +122,9 @@ pub struct LimitsSection {
 /// Convert a parsed `ProfileInput` into a `(Sandbox, ProgramSpec)` pair.
 ///
 /// Forwards each schema section's fields to the corresponding `SandboxBuilder`
-/// method calls. The three private helpers (`parse_fs_isolation`,
-/// `parse_branch_action`, `parse_mount_spec`) handle string-to-typed-value
-/// conversions for fields that lack `FromStr` impls on their target types.
+/// method calls. The two private helpers (`parse_branch_action`,
+/// `parse_mount_spec`) handle string-to-typed-value conversions for fields
+/// that lack `FromStr` impls on their target types.
 pub fn parse_input(input: ProfileInput) -> Result<(Sandbox, ProgramSpec), SandlockError> {
     let mut b = Sandbox::builder();
 
@@ -156,9 +154,6 @@ pub fn parse_input(input: ProfileInput) -> Result<(Sandbox, ProgramSpec), Sandlo
     for p in input.filesystem.read.iter()  { b = b.fs_read(p); }
     for p in input.filesystem.write.iter() { b = b.fs_write(p); }
     for p in input.filesystem.deny.iter()  { b = b.fs_deny(p); }
-    if let Some(s) = input.filesystem.isolation.as_deref() {
-        b = b.fs_isolation(parse_fs_isolation(s)?);
-    }
     if let Some(c) = input.filesystem.chroot         { b = b.chroot(c); }
     for spec in input.filesystem.mount.iter() {
         let (virt, host) = parse_mount_spec(spec)?;
@@ -202,20 +197,6 @@ pub fn parse_input(input: ProfileInput) -> Result<(Sandbox, ProgramSpec), Sandlo
     let policy = b.build()?;
     let spec = ProgramSpec { exec: input.program.exec, args: input.program.args };
     Ok((policy, spec))
-}
-
-/// Parses the `[filesystem].isolation` schema string into a `FsIsolation`.
-fn parse_fs_isolation(s: &str) -> Result<crate::sandbox::FsIsolation, SandlockError> {
-    use crate::error::SandboxError;
-    use crate::sandbox::FsIsolation;
-    Ok(match s {
-        "none"      => FsIsolation::None,
-        "overlayfs" => FsIsolation::OverlayFs,
-        "branchfs"  => FsIsolation::BranchFs,
-        other       => return Err(SandlockError::Sandbox(SandboxError::Invalid(
-            format!("invalid fs isolation {other:?}; expected \"none\" | \"overlayfs\" | \"branchfs\""),
-        ))),
-    })
 }
 
 /// Parses an `[filesystem].on_exit` / `on_error` string into a `BranchAction`.
@@ -420,7 +401,6 @@ mod tests {
             read      = ["/usr", "/etc/redis"]
             write     = ["/var/lib/redis/state"]
             deny      = ["/proc/sys"]
-            isolation = "overlayfs"
             chroot    = "/var/lib/redis-rootfs"
             mount     = ["/data:/srv/redis-data"]
             on_exit   = "commit"
@@ -509,42 +489,15 @@ mod tests {
     }
 
     #[test]
-    fn isolation_overlayfs_without_workdir_is_error() {
-        let toml = r#"
-            [program]
-            exec = "/bin/true"
-            [filesystem]
-            isolation = "overlayfs"
-        "#;
-        let err = parse_profile(toml).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.to_lowercase().contains("workdir"),
-            "expected error to mention workdir; got: {msg}"
-        );
-    }
-
-    #[test]
-    fn isolation_none_without_workdir_is_ok() {
+    fn isolation_key_is_rejected() {
         let toml = r#"
             [program]
             exec = "/bin/true"
             [filesystem]
             isolation = "none"
         "#;
-        let (_p, _s) = parse_profile(toml).unwrap();
-    }
-
-    #[test]
-    fn isolation_overlayfs_with_workdir_is_ok() {
-        let toml = r#"
-            [program]
-            exec = "/bin/true"
-            [config]
-            workdir = "/tmp/wd"
-            [filesystem]
-            isolation = "overlayfs"
-        "#;
-        let (_p, _s) = parse_profile(toml).unwrap();
+        let err = parse_profile(toml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("unknown field"), "got: {msg}");
     }
 }

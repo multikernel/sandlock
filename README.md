@@ -468,17 +468,25 @@ The async notification supervisor (tokio) handles intercepted syscalls:
 | `getdents64` | PID filtering, COW directory merging |
 | `getsockname` | Port remap translation |
 
+### Custom Handlers
+
+Downstream Rust crates can append their own seccomp-notification
+handlers to the supervisor chain alongside the builtins, registering
+for any syscall they care about via the `Handler` trait and
+`Sandbox::run_with_handlers`. The builtin chain runs first, so
+user handlers cannot subvert confinement; the registration step also
+rejects handlers on syscalls in the default blocklist or
+`extra_deny_syscalls`. See
+[`docs/extension-handlers.md`](docs/extension-handlers.md) for the
+full API, ordering semantics, and state patterns.
+
 ### COW Filesystem
 
-Two modes of copy-on-write filesystem isolation:
-
-**Seccomp COW** (default when `workdir` is set): Intercepts filesystem
-syscalls via seccomp notification. Writes go to an upper directory;
-reads resolve upper-then-lower. No mount namespace, no root. Committed
-on exit, aborted on error.
-
-**OverlayFS COW**: Uses kernel OverlayFS in a user namespace. Requires
-unprivileged user namespaces to be enabled.
+Copy-on-write filesystem isolation via seccomp notification: when
+`workdir` is set, sandlock intercepts filesystem syscalls and stages
+writes in an upper directory; reads resolve upper-then-lower. No mount
+namespace, no user namespace, no root. Committed on exit, aborted on
+error.
 
 **Dry-run mode**: `--dry-run` runs the command, inspects the COW layer
 for changes (added/modified/deleted files), prints a summary, then
@@ -682,70 +690,5 @@ cd python && pip install -e . && pytest tests/
 
 ## Sandbox Reference
 
-```python
-Sandbox(
-    # Filesystem (Landlock)
-    fs_writable=["/tmp"],          # Read/write access
-    fs_readable=["/usr", "/lib"],  # Read-only access
-    fs_denied=["/proc/kcore"],     # Explicitly denied
-
-    # Syscall filtering (seccomp)
-    extra_deny_syscalls=[],         # Extra syscalls to block in addition to Sandlock defaults
-
-    # Network — see "Network Model" above. Each entry is one of:
-    #   bare host:port[,port,...]  — TCP (default scheme)
-    #   tcp://host:port            — explicit TCP
-    #   udp://host:port            — UDP (`udp://*:*` for any UDP)
-    #   icmp://host                — kernel ping socket (`icmp://*` = any)
-    # Empty list = deny all outbound. Protocol gating falls out of rule
-    # presence: with no UDP/ICMP rule, the corresponding socket creation
-    # is denied at the seccomp layer. Raw ICMP is not exposed.
-    net_allow=[
-        "api.example.com:443",
-        "github.com:22,443",
-        "udp://1.1.1.1:53",        # DNS over UDP
-        "icmp://github.com",       # ping (gated by ping_group_range)
-    ],
-    net_bind=[8080],               # TCP bind ports (Landlock; ABI v4+)
-
-    # HTTP ACL (transparent proxy)
-    http_allow=["POST api.openai.com/v1/*"],  # Allow rules (METHOD host/path)
-    http_deny=["* */admin/*"],     # Block rules (checked first)
-    http_ports=[80],               # Ports to intercept (default: [80])
-    http_ca="ca.pem",              # CA cert for HTTPS MITM (adds port 443)
-    http_key="ca-key.pem",         # CA key for HTTPS MITM
-
-    # Resources
-    max_memory="512M",             # Memory limit
-    max_processes=64,              # Peak concurrent process limit
-    max_cpu=50,                    # CPU throttle (% of one core)
-    max_open_files=256,            # fd limit
-    port_remap=False,              # Virtual port space
-
-
-    # Deterministic execution
-    time_start="2000-01-01T00:00:00",  # Frozen time
-    random_seed=42,                # Deterministic getrandom()
-    no_randomize_memory=False,     # Disable ASLR
-    no_huge_pages=False,           # Disable THP
-    no_coredump=False,             # Disable core dumps
-
-    # Environment
-    clean_env=False,               # Minimal env
-    env={"KEY": "value"},          # Override env vars
-
-    # Chroot + mount mapping
-    chroot=None,                   # Path to chroot into
-    fs_mount={"/work": "/host/sandbox/work"},  # Map virtual paths to host dirs
-
-    # COW isolation
-    workdir=None,                  # COW root directory
-    cwd=None,                      # Child working directory
-    fs_isolation=FsIsolation.NONE, # NONE | OVERLAYFS | BRANCHFS
-    on_exit=BranchAction.COMMIT,   # COMMIT | ABORT | KEEP
-    on_error=BranchAction.ABORT,
-
-    # Misc
-    uid=None,                      # Map to given UID in user namespace (e.g. 0 for fake root)
-)
-```
+The full `Sandbox` configuration reference — every field, default,
+and grouping — lives in [`docs/sandbox-reference.md`](docs/sandbox-reference.md).

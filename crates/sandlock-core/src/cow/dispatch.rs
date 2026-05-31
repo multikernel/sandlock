@@ -162,12 +162,12 @@ pub(crate) async fn handle_cow_open(
 
     let nr = notif.data.nr as i64;
 
-    // open(path, flags, mode):     args[0]=path, args[1]=flags
-    // openat(dirfd, path, flags):  args[0]=dirfd, args[1]=path, args[2]=flags
-    let (path_ptr, dirfd, flags) = if Some(nr) == arch::SYS_OPEN {
-        (notif.data.args[0], libc::AT_FDCWD as i64, notif.data.args[1])
+    // open(path, flags, mode):         args[0]=path, args[1]=flags, args[2]=mode
+    // openat(dirfd, path, flags, mode): args[0]=dirfd, args[1]=path, args[2]=flags, args[3]=mode
+    let (path_ptr, dirfd, flags, mode) = if Some(nr) == arch::SYS_OPEN {
+        (notif.data.args[0], libc::AT_FDCWD as i64, notif.data.args[1], notif.data.args[2])
     } else {
-        (notif.data.args[1], notif.data.args[0] as i64, notif.data.args[2])
+        (notif.data.args[1], notif.data.args[0] as i64, notif.data.args[2], notif.data.args[3])
     };
 
     let rel_path = match read_path(notif, path_ptr, notif_fd) {
@@ -248,7 +248,12 @@ pub(crate) async fn handle_cow_open(
         Ok(c) => c,
         Err(_) => return NotifAction::Continue,
     };
-    let fd = unsafe { libc::open(c_path.as_ptr(), open_flags, 0o666) };
+    // Honor the child's requested creation mode (masked to permission bits).
+    // Hardcoding 0o666 dropped the execute bits, so a binary copied into the
+    // workdir (e.g. `cp /bin/echo m`) landed in upper non-executable and
+    // `./m` failed with EACCES. The kernel ignores mode unless O_CREAT is set.
+    let create_mode = (mode & 0o7777) as libc::c_uint;
+    let fd = unsafe { libc::open(c_path.as_ptr(), open_flags, create_mode) };
     if fd < 0 {
         return NotifAction::Continue;
     }
@@ -801,7 +806,13 @@ pub(crate) async fn handle_cow_stat(
     NotifAction::ReturnValue(0)
 }
 
-/// Handle statx — resolve path then let kernel handle (complex struct).
+/// Handle statx — resolve the path to upper/lower and run statx ourselves.
+///
+/// We cannot return Continue when the file exists: on Continue the kernel
+/// re-runs statx against the original (un-redirected) path, which for a
+/// COW-only file lives only in the upper layer and is invisible to the
+/// kernel under the lower workdir → ENOENT. So mirror `handle_cow_stat`:
+/// statx the resolved path in the supervisor and write the buffer back.
 pub(crate) async fn handle_cow_statx(
     notif: &SeccompNotif,
     cow_state: &Arc<Mutex<CowState>>,
@@ -810,27 +821,169 @@ pub(crate) async fn handle_cow_statx(
 ) -> NotifAction {
     // statx(dirfd, pathname, flags, mask, statxbuf)
     let dirfd = notif.data.args[0] as i64;
-    let virtual_cwd = current_virtual_cwd(processes, notif.pid).await;
-    let path = match read_path(notif, notif.data.args[1], notif_fd) {
-        Some(p) => resolve_at_path_with_virtual(notif, dirfd, &p, virtual_cwd.as_deref()),
-        None => return NotifAction::Continue,
-    };
+    let flags = notif.data.args[2] as i32;
+    let mask = notif.data.args[3] as u32;
+    let statxbuf_addr = notif.data.args[4];
 
-    let st = cow_state.lock().await;
-    let cow = match st.branch.as_ref() {
-        Some(c) => c,
-        None => return NotifAction::Continue,
-    };
-
-    let path = map_cow_upper_path(cow, &path);
-    if !cow.has_changes() || !cow.matches(&path) {
+    // AT_EMPTY_PATH stats the dirfd itself, no path resolution needed.
+    // The fd was already redirected at open time, so let the kernel handle it.
+    if (flags & libc::AT_EMPTY_PATH) != 0 {
         return NotifAction::Continue;
     }
 
-    match cow.handle_stat(&path) {
-        Some(_) => NotifAction::Continue, // exists, let kernel handle
-        None => NotifAction::Errno(libc::ENOENT), // deleted
+    let virtual_cwd = current_virtual_cwd(processes, notif.pid).await;
+    let path = match read_path(notif, notif.data.args[1], notif_fd) {
+        Some(p) if !p.is_empty() => resolve_at_path_with_virtual(notif, dirfd, &p, virtual_cwd.as_deref()),
+        _ => return NotifAction::Continue,
+    };
+
+    let real_path = {
+        let st = cow_state.lock().await;
+        let cow = match st.branch.as_ref() {
+            Some(c) => c,
+            None => return NotifAction::Continue,
+        };
+
+        let path = map_cow_upper_path(cow, &path);
+        if !cow.has_changes() || !cow.matches(&path) {
+            return NotifAction::Continue;
+        }
+
+        match cow.handle_stat(&path) {
+            Some(p) => p,
+            None => return NotifAction::Errno(libc::ENOENT), // deleted or absent
+        }
+    };
+
+    let c_path = match std::ffi::CString::new(real_path.to_str().unwrap_or("")) {
+        Ok(c) => c,
+        Err(_) => return NotifAction::Continue,
+    };
+    let mut stx_buf = vec![0u8; 256]; // sizeof(struct statx)
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_statx,
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            flags,
+            mask,
+            stx_buf.as_mut_ptr(),
+        )
+    };
+    if ret < 0 {
+        let errno = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO);
+        return NotifAction::Errno(errno);
     }
+
+    if write_child_mem(notif_fd, notif.id, notif.pid, statxbuf_addr, &stx_buf).is_err() {
+        return NotifAction::Continue;
+    }
+    NotifAction::ReturnValue(0)
+}
+
+// ============================================================
+// execve / execveat handler
+// ============================================================
+
+/// Handle execve/execveat under COW: when the binary resolves into the
+/// upper layer (created or modified inside the workdir), open the upper
+/// file and inject it as an fd, rewriting the path to /proc/self/fd/N so
+/// the kernel execs the COW version.
+///
+/// Without this, execve resolves the original (un-redirected) path, which
+/// for a COW-only binary lives only in upper and is invisible under the
+/// lower workdir → ENOENT. Files resolving to the lower layer are
+/// unmodified, so the kernel finds them at the original path and we leave
+/// them alone.
+pub(crate) async fn handle_cow_exec(
+    notif: &SeccompNotif,
+    cow_state: &Arc<Mutex<CowState>>,
+    processes: &Arc<ProcessIndex>,
+    notif_fd: RawFd,
+) -> NotifAction {
+    let nr = notif.data.nr as i64;
+    // execve(path, argv, envp):        args[0] = path
+    // execveat(dirfd, path, argv, ..): args[0]=dirfd, args[1]=path
+    let (dirfd, path_ptr) = if nr == libc::SYS_execveat {
+        (notif.data.args[0] as i64, notif.data.args[1])
+    } else {
+        (libc::AT_FDCWD as i64, notif.data.args[0])
+    };
+
+    let rel_path = match read_path(notif, path_ptr, notif_fd) {
+        Some(p) => p,
+        None => return NotifAction::Continue,
+    };
+
+    let virtual_cwd = if (dirfd as i32) == libc::AT_FDCWD && !Path::new(&rel_path).is_absolute() {
+        current_virtual_cwd(processes, notif.pid).await
+    } else {
+        None
+    };
+    let resolved = resolve_at_path_with_virtual(notif, dirfd, &rel_path, virtual_cwd.as_deref());
+
+    let upper_path = {
+        let st = cow_state.lock().await;
+        let cow = match st.branch.as_ref() {
+            Some(c) => c,
+            None => return NotifAction::Continue,
+        };
+        let path = map_cow_upper_path(cow, &resolved);
+        if !cow.has_changes() || !cow.matches(&path) {
+            return NotifAction::Continue;
+        }
+        match cow.handle_stat(&path) {
+            // Only redirect when the binary lives in the upper layer.
+            Some(real) if real.starts_with(cow.upper_dir()) => real,
+            // Lower-layer (unmodified) binary — kernel resolves it fine.
+            Some(_) => return NotifAction::Continue,
+            // Deleted in the COW layer (or absent) — must not exec the lower file.
+            None => return NotifAction::Errno(libc::ENOENT),
+        }
+    };
+
+    // Open the upper binary and inject the fd into the child.
+    let c_path = match std::ffi::CString::new(upper_path.to_str().unwrap_or("")) {
+        Ok(c) => c,
+        Err(_) => return NotifAction::Continue,
+    };
+    let src_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if src_fd < 0 {
+        return NotifAction::Errno(libc::ENOENT);
+    }
+
+    let addfd = crate::sys::structs::SeccompNotifAddfd {
+        id: notif.id,
+        flags: 0,
+        srcfd: src_fd as u32,
+        newfd: 0,
+        newfd_flags: 0, // no O_CLOEXEC — the kernel must read it at exec time
+    };
+    let child_fd = unsafe {
+        libc::ioctl(
+            notif_fd,
+            crate::sys::structs::SECCOMP_IOCTL_NOTIF_ADDFD as libc::c_ulong,
+            &addfd as *const _,
+        )
+    };
+    unsafe { libc::close(src_fd) };
+
+    if child_fd < 0 {
+        return NotifAction::Errno(libc::EIO);
+    }
+
+    // Rewrite the path argument to /proc/self/fd/N so the kernel execs the
+    // injected fd. execve replaces the whole address space on success, so
+    // (unlike chdir) writing past the original buffer is harmless — the
+    // only memory the kernel still reads is argv/envp, which sit elsewhere.
+    let fd_path = format!("/proc/self/fd/{}\0", child_fd);
+    if write_child_mem(notif_fd, notif.id, notif.pid, path_ptr, fd_path.as_bytes()).is_err() {
+        return NotifAction::Errno(libc::EFAULT);
+    }
+
+    NotifAction::Continue
 }
 
 /// Handle readlinkat — read symlink from upper/lower, write to child buffer.

@@ -9,8 +9,14 @@ use std::ptr;
 use std::time::Duration;
 
 use sandlock_core::pipeline::Stage;
-use sandlock_core::sandbox::{BranchAction, ByteSize, FsIsolation, SandboxBuilder};
+use sandlock_core::sandbox::{BranchAction, ByteSize, SandboxBuilder};
 use sandlock_core::{Sandbox, RunResult};
+
+pub mod handler;
+pub mod notif_repr;
+mod runtime;
+
+use runtime::{block_on_runtime, build_live_runtime, build_runtime, with_runtime};
 
 // ----------------------------------------------------------------
 // Opaque wrapper types
@@ -20,6 +26,24 @@ use sandlock_core::{Sandbox, RunResult};
 #[repr(C)]
 pub struct sandlock_sandbox_t {
     _private: Sandbox,
+}
+
+impl sandlock_sandbox_t {
+    /// Crate-private accessor used by `handler.rs` to reach the inner
+    /// `Sandbox` when wiring `sandlock_run_with_handlers`. Public-API
+    /// callers still go through the opaque-pointer functions in this
+    /// module.
+    pub(crate) fn inner(&self) -> &Sandbox {
+        &self._private
+    }
+}
+
+impl sandlock_result_t {
+    /// Crate-private constructor used by `handler.rs` to wrap a
+    /// freshly-produced [`RunResult`] in the opaque public type.
+    pub(crate) fn from_run_result(rr: RunResult) -> Self {
+        Self { _private: rr }
+    }
 }
 
 /// Opaque handle wrapping a [`RunResult`].
@@ -93,26 +117,6 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_fs_storage(
     let path = CStr::from_ptr(path).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.fs_storage(path)))
-}
-
-/// Set filesystem isolation mode.
-/// `mode`: 0 = None, 1 = OverlayFs, 2 = BranchFs.
-///
-/// # Safety
-/// `b` must be a valid builder pointer.
-#[no_mangle]
-pub unsafe extern "C" fn sandlock_sandbox_builder_fs_isolation(
-    b: *mut SandboxBuilder,
-    mode: u8,
-) -> *mut SandboxBuilder {
-    if b.is_null() { return b; }
-    let builder = *Box::from_raw(b);
-    let iso = match mode {
-        1 => FsIsolation::OverlayFs,
-        2 => FsIsolation::BranchFs,
-        _ => FsIsolation::None,
-    };
-    Box::into_raw(Box::new(builder.fs_isolation(iso)))
 }
 
 /// # Safety
@@ -506,6 +510,35 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_extra_allow_syscalls(
     Box::into_raw(Box::new(builder.extra_allow_syscalls(names)))
 }
 
+/// Resolve a syscall name (e.g. `"openat"`) to its kernel syscall
+/// number for the host architecture.
+///
+/// Intended for filling a `sandlock_handler_registration_t`'s
+/// `syscall_nr` without hard-coding architecture-specific numbers.
+///
+/// Returns the syscall number on success, or `-1` if `name` is NULL,
+/// is not valid UTF-8, or names a syscall sandlock does not know. The
+/// resolvable set covers the syscalls sandlock filters or supervises;
+/// syscalls outside that set (e.g. `getpid`) return `-1` and must be
+/// registered by raw number.
+///
+/// # Safety
+/// `name` must be NULL or a valid NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_syscall_nr(name: *const c_char) -> i64 {
+    if name.is_null() {
+        return -1;
+    }
+    let name = match CStr::from_ptr(name).to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    match sandlock_core::context::syscall_name_to_nr(name) {
+        Some(nr) => i64::from(nr),
+        None => -1,
+    }
+}
+
 /// # Safety
 /// `b` must be a valid builder pointer.
 #[no_mangle]
@@ -670,46 +703,45 @@ pub unsafe extern "C" fn sandlock_run(
     let args = read_argv(argv, argc);
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(_) => return ptr::null_mut(),
-    };
     let mut sb = match name {
         Some(ref n) => policy.clone().with_name(n.clone()),
         None => policy.clone(),
     };
-    match rt.block_on(sb.run(&arg_refs)) {
-        Ok(result) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
-        Err(_) => ptr::null_mut(),
+    match with_runtime(|rt| rt.block_on(sb.run(&arg_refs))) {
+        Some(Ok(result)) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
+        _ => ptr::null_mut(),
     }
 }
 
 // ----------------------------------------------------------------
-// Sandbox handle (spawn / wait — for pause/resume via PID)
+// Sandbox handle (create / start / wait — for pause/resume via PID)
 // ----------------------------------------------------------------
 
-/// Opaque handle for a live (spawned) sandbox.
-/// Owns both the Sandbox and the tokio Runtime that drives its supervisor.
+/// Opaque handle for a live sandbox.
+///
+/// Owns both the Sandbox and a small Tokio runtime that drives its
+/// supervisor. Live handles need a runtime whose spawned tasks keep
+/// progressing after `sandlock_start` returns.
 #[allow(non_camel_case_types)]
 pub struct sandlock_handle_t {
     sandbox: Sandbox,
     runtime: tokio::runtime::Runtime,
 }
 
-/// Spawn a sandboxed process without waiting. Returns a live handle.
-/// Use `sandlock_handle_pid` to get the PID, then `sandlock_handle_wait`
-/// to collect the result when done.
+/// Fork the child and install policy; the child is parked between policy
+/// install and execve. Returns a live handle. Call `sandlock_start` to
+/// release the child to execve.
 ///
 /// # Safety
 /// `policy` must be a valid policy pointer. `name` may be NULL to
 /// auto-generate a sandbox name, or a valid NUL-terminated string.
 /// `argv` must point to `argc` C strings.
-#[no_mangle]
-pub unsafe extern "C" fn sandlock_spawn(
+unsafe fn sandlock_create_with_runtime(
     policy: *const sandlock_sandbox_t,
     name: *const c_char,
     argv: *const *const c_char,
     argc: c_uint,
+    build_rt: fn() -> Option<tokio::runtime::Runtime>,
 ) -> *mut sandlock_handle_t {
     if policy.is_null() || argv.is_null() { return ptr::null_mut(); }
     let policy = &(*policy)._private;
@@ -720,9 +752,9 @@ pub unsafe extern "C" fn sandlock_spawn(
     let args = read_argv(argv, argc);
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(_) => return ptr::null_mut(),
+    let rt = match build_rt() {
+        Some(rt) => rt,
+        None => return ptr::null_mut(),
     };
 
     let mut sb = match name {
@@ -730,17 +762,61 @@ pub unsafe extern "C" fn sandlock_spawn(
         None => policy.clone(),
     };
 
-    if rt.block_on(sb.spawn_captured(&arg_refs)).is_err() {
+    if !matches!(block_on_runtime(&rt, sb.create(&arg_refs)), Some(Ok(()))) {
         return ptr::null_mut();
     }
 
     Box::into_raw(Box::new(sandlock_handle_t { sandbox: sb, runtime: rt }))
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_create(
+    policy: *const sandlock_sandbox_t,
+    name: *const c_char,
+    argv: *const *const c_char,
+    argc: c_uint,
+) -> *mut sandlock_handle_t {
+    sandlock_create_with_runtime(policy, name, argv, argc, build_live_runtime)
+}
+
+/// Create a sandbox handle for immediate start+wait use on the calling
+/// FFI thread. Unlike `sandlock_create`, this uses the thread-local
+/// `current_thread` runtime and does not create Tokio worker threads.
+///
+/// This is intended for blocking one-shot wrappers that call
+/// `sandlock_start` and `sandlock_handle_wait*` immediately from the
+/// same thread. Long-lived handles should use `sandlock_create` so the
+/// supervisor keeps progressing between FFI calls.
+///
+/// # Safety
+/// Same constraints as `sandlock_create`.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_create_for_run(
+    policy: *const sandlock_sandbox_t,
+    name: *const c_char,
+    argv: *const *const c_char,
+    argc: c_uint,
+) -> *mut sandlock_handle_t {
+    sandlock_create_with_runtime(policy, name, argv, argc, build_runtime)
+}
+
+/// Release a previously `sandlock_create`d child to execve. Returns 0 on
+/// success, -1 on error.
+///
+/// # Safety
+/// `h` must be a valid handle from `sandlock_create`.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_start(h: *mut sandlock_handle_t) -> c_int {
+    if h.is_null() { return -1; }
+    let h = &mut *h;
+    if h.sandbox.start().is_err() { return -1; }
+    0
+}
+
 /// Get the child PID. Returns 0 if not available.
 ///
 /// # Safety
-/// `h` must be a valid handle from `sandlock_spawn`.
+/// `h` must be a valid handle from `sandlock_create`.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_handle_pid(h: *const sandlock_handle_t) -> i32 {
     if h.is_null() { return 0; }
@@ -750,14 +826,14 @@ pub unsafe extern "C" fn sandlock_handle_pid(h: *const sandlock_handle_t) -> i32
 /// Wait for the sandbox to exit. Returns a result handle with stdout/stderr.
 ///
 /// # Safety
-/// `h` must be a valid handle from `sandlock_spawn`.
+/// `h` must be a valid handle from `sandlock_create`.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_handle_wait(h: *mut sandlock_handle_t) -> *mut sandlock_result_t {
     if h.is_null() { return ptr::null_mut(); }
     let h = &mut *h;
-    match h.runtime.block_on(h.sandbox.wait()) {
-        Ok(result) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
-        Err(_) => ptr::null_mut(),
+    match block_on_runtime(&h.runtime, h.sandbox.wait()) {
+        Some(Ok(result)) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
+        _ => ptr::null_mut(),
     }
 }
 
@@ -766,7 +842,7 @@ pub unsafe extern "C" fn sandlock_handle_wait(h: *mut sandlock_handle_t) -> *mut
 /// killed and a result with `ExitStatus::Timeout` is returned.
 ///
 /// # Safety
-/// `h` must be a valid handle from `sandlock_spawn`.
+/// `h` must be a valid handle from `sandlock_create`.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_handle_wait_timeout(
     h: *mut sandlock_handle_t,
@@ -777,19 +853,19 @@ pub unsafe extern "C" fn sandlock_handle_wait_timeout(
 
     if timeout_ms == 0 {
         // No timeout -- same as sandlock_handle_wait.
-        return match h.runtime.block_on(h.sandbox.wait()) {
-            Ok(result) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
-            Err(_) => ptr::null_mut(),
+        return match block_on_runtime(&h.runtime, h.sandbox.wait()) {
+            Some(Ok(result)) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
+            _ => ptr::null_mut(),
         };
     }
 
     let dur = Duration::from_millis(timeout_ms);
-    match h.runtime.block_on(async {
+    match block_on_runtime(&h.runtime, async {
         tokio::time::timeout(dur, h.sandbox.wait()).await
     }) {
-        Ok(Ok(result)) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
-        Ok(Err(_)) => ptr::null_mut(),
-        Err(_) => {
+        Some(Ok(Ok(result))) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
+        Some(Ok(Err(_))) | None => ptr::null_mut(),
+        Some(Err(_)) => {
             // Timeout -- kill the process and return a timeout result.
             let _ = h.sandbox.kill();
             let result = RunResult::timeout();
@@ -803,14 +879,17 @@ pub unsafe extern "C" fn sandlock_handle_wait_timeout(
 /// Returns null if port_remap is not active or no ports are mapped.
 ///
 /// # Safety
-/// `h` must be a valid handle from `sandlock_spawn`.
+/// `h` must be a valid handle from `sandlock_create`.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_handle_port_mappings(
     h: *const sandlock_handle_t,
 ) -> *mut c_char {
     if h.is_null() { return ptr::null_mut(); }
     let h = &*h;
-    let map = h.runtime.block_on(h.sandbox.port_mappings());
+    let map = match block_on_runtime(&h.runtime, h.sandbox.port_mappings()) {
+        Some(map) => map,
+        None => return ptr::null_mut(),
+    };
     if map.is_empty() { return ptr::null_mut(); }
     let json = serde_json::to_string(&map).unwrap_or_default();
     match CString::new(json) {
@@ -822,7 +901,7 @@ pub unsafe extern "C" fn sandlock_handle_port_mappings(
 /// Free a sandbox handle. Kills the process if still running.
 ///
 /// # Safety
-/// `h` must be null or a valid handle from `sandlock_spawn`.
+/// `h` must be null or a valid handle from `sandlock_create`.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_handle_free(h: *mut sandlock_handle_t) {
     if !h.is_null() {
@@ -853,17 +932,13 @@ pub unsafe extern "C" fn sandlock_run_interactive(
     let args = read_argv(argv, argc);
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(_) => return -1,
-    };
     let mut sb = match name {
         Some(ref n) => policy.clone().with_name(n.clone()),
         None => policy.clone(),
     };
-    match rt.block_on(sb.run_interactive(&arg_refs)) {
-        Ok(result) => result.code().unwrap_or(-1),
-        Err(_) => -1,
+    match with_runtime(|rt| rt.block_on(sb.run_interactive(&arg_refs))) {
+        Some(Ok(result)) => result.code().unwrap_or(-1),
+        _ => -1,
     }
 }
 
@@ -1005,17 +1080,13 @@ pub unsafe extern "C" fn sandlock_dry_run(
     let args = read_argv(argv, argc);
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(_) => return ptr::null_mut(),
-    };
     let mut sb = match name {
         Some(ref n) => policy.clone().with_name(n.clone()),
         None => policy.clone(),
     };
-    match rt.block_on(sb.dry_run(&arg_refs)) {
-        Ok(result) => Box::into_raw(Box::new(sandlock_dry_run_result_t { _private: result })),
-        Err(_) => ptr::null_mut(),
+    match with_runtime(|rt| rt.block_on(sb.dry_run(&arg_refs))) {
+        Some(Ok(result)) => Box::into_raw(Box::new(sandlock_dry_run_result_t { _private: result })),
+        _ => ptr::null_mut(),
     }
 }
 
@@ -1187,14 +1258,9 @@ pub unsafe extern "C" fn sandlock_pipeline_run(
         None
     };
 
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(_) => return ptr::null_mut(),
-    };
-
-    match rt.block_on(pipeline.run(timeout)) {
-        Ok(result) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
-        Err(_) => ptr::null_mut(),
+    match with_runtime(|rt| rt.block_on(pipeline.run(timeout))) {
+        Some(Ok(result)) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
+        _ => ptr::null_mut(),
     }
 }
 
@@ -1293,14 +1359,9 @@ pub unsafe extern "C" fn sandlock_gather_run(
         None
     };
 
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(_) => return ptr::null_mut(),
-    };
-
-    match rt.block_on(gather.run(timeout)) {
-        Ok(result) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
-        Err(_) => ptr::null_mut(),
+    match with_runtime(|rt| rt.block_on(gather.run(timeout))) {
+        Some(Ok(result)) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
+        _ => ptr::null_mut(),
     }
 }
 
@@ -1591,14 +1652,9 @@ pub unsafe extern "C" fn sandlock_fork(
     if sb.is_null() { return ptr::null_mut(); }
     let sb = &mut *sb;
 
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(_) => return ptr::null_mut(),
-    };
-
-    match rt.block_on(sb.fork(n)) {
-        Ok(clones) => Box::into_raw(Box::new(sandlock_fork_result_t { clones })),
-        Err(_) => ptr::null_mut(),
+    match with_runtime(|rt| rt.block_on(sb.fork(n))) {
+        Some(Ok(clones)) => Box::into_raw(Box::new(sandlock_fork_result_t { clones })),
+        _ => ptr::null_mut(),
     }
 }
 
@@ -1642,19 +1698,14 @@ pub unsafe extern "C" fn sandlock_reduce(
     let args = read_argv(argv, argc);
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(_) => return ptr::null_mut(),
-    };
-
     let reducer = match name {
         Some(ref n) => policy.clone().with_name(n.clone()),
         None => policy.clone(),
     };
 
-    match rt.block_on(reducer.reduce(&arg_refs, &mut fr.clones.as_mut_slice())) {
-        Ok(result) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
-        Err(_) => ptr::null_mut(),
+    match with_runtime(|rt| rt.block_on(reducer.reduce(&arg_refs, &mut fr.clones.as_mut_slice()))) {
+        Some(Ok(result)) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
+        _ => ptr::null_mut(),
     }
 }
 
@@ -1673,14 +1724,9 @@ pub unsafe extern "C" fn sandlock_wait(sb: *mut Sandbox) -> c_int {
     if sb.is_null() { return -1; }
     let sb = &mut *sb;
 
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(_) => return -1,
-    };
-
-    match rt.block_on(sb.wait()) {
-        Ok(r) => r.code().unwrap_or(-1),
-        Err(_) => -1,
+    match with_runtime(|rt| rt.block_on(sb.wait())) {
+        Some(Ok(r)) => r.code().unwrap_or(-1),
+        _ => -1,
     }
 }
 
@@ -1708,16 +1754,16 @@ pub struct sandlock_checkpoint_t {
 /// then thawed. Returns NULL on error.
 ///
 /// # Safety
-/// `h` must be a valid handle from `sandlock_spawn`.
+/// `h` must be a valid handle from `sandlock_create`.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_handle_checkpoint(
     h: *mut sandlock_handle_t,
 ) -> *mut sandlock_checkpoint_t {
     if h.is_null() { return ptr::null_mut(); }
     let h = &mut *h;
-    match h.runtime.block_on(h.sandbox.checkpoint()) {
-        Ok(cp) => Box::into_raw(Box::new(sandlock_checkpoint_t { _private: cp })),
-        Err(_) => ptr::null_mut(),
+    match block_on_runtime(&h.runtime, h.sandbox.checkpoint()) {
+        Some(Ok(cp)) => Box::into_raw(Box::new(sandlock_checkpoint_t { _private: cp })),
+        _ => ptr::null_mut(),
     }
 }
 

@@ -1700,7 +1700,7 @@ dependencies = [
 
 [[package]]
 name = "sandlock-cli"
-version = "0.7.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1715,7 +1715,7 @@ dependencies = [
 
 [[package]]
 name = "sandlock-core"
-version = "0.7.0"
+version = "0.8.1"
 dependencies = [
  "bincode",
  "clap",
@@ -1739,8 +1739,9 @@ dependencies = [
 
 [[package]]
 name = "sandlock-ffi"
-version = "0.7.0"
+version = "0.8.1"
 dependencies = [
+ "libc",
  "sandlock-core",
  "serde_json",
  "tokio",

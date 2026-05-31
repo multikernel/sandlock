@@ -12,7 +12,8 @@ from ._sdk import (
     landlock_abi_version, min_landlock_abi, confine,
 )
 from .inputs import inputs
-from .sandbox import Sandbox, FsIsolation, BranchAction, parse_ports, Change, DryRunResult
+from .handler import Handler, NotifAction, HandlerCtx, ExceptionPolicy
+from .sandbox import Sandbox, BranchAction, parse_ports, Change, DryRunResult
 from ._profile import load_profile, list_profiles
 from .exceptions import (
     SandlockError,
@@ -43,11 +44,15 @@ __all__ = [
     "Gather",
     "GatherPipeline",
     "inputs",
-    "FsIsolation",
     "BranchAction",
     "parse_ports",
     "Change",
     "DryRunResult",
+    # Handler ABI
+    "Handler",
+    "NotifAction",
+    "HandlerCtx",
+    "ExceptionPolicy",
     # Platform
     "landlock_abi_version",
     "min_landlock_abi",

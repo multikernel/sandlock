@@ -1,8 +1,8 @@
 pub mod error;
+pub mod http;
 pub mod sandbox;     // formerly `policy`; contains Sandbox + SandboxBuilder + Confinement
 pub mod profile;
 pub mod result;
-pub mod process;     // runtime helpers (is_nested, CONFINED); SandboxProcess removed
 pub(crate) mod arch;
 pub(crate) mod sys;
 pub mod landlock;
@@ -15,7 +15,7 @@ pub(crate) mod random;
 pub(crate) mod time;
 pub(crate) mod cow;
 pub(crate) mod checkpoint;
-pub(crate) mod sandbox_freeze;
+pub(crate) mod freeze;
 pub mod netlink;
 pub(crate) mod procfs;
 pub(crate) mod port_remap;
@@ -28,6 +28,7 @@ pub mod dry_run;
 pub(crate) mod http_acl;
 
 pub use error::SandlockError;
+pub use sys::structs::{SeccompData, SeccompNotif};
 pub use checkpoint::Checkpoint;
 pub use sandbox::{Confinement, ConfinementBuilder, Sandbox, SandboxBuilder};
 pub use result::{RunResult, ExitStatus};

@@ -47,80 +47,8 @@ from mcp import types
 from mcp.server.lowlevel.server import Server
 from mcp.server.stdio import stdio_server
 
+from ._builtins import shell, python, read_file, write_file, list_files
 from ._sandbox import McpSandbox
-
-# ---------------------------------------------------------------------------
-# Built-in tool functions (self-contained — imports inside body)
-# ---------------------------------------------------------------------------
-
-
-def shell(command: str) -> str:
-    """Run a shell command and return stdout+stderr."""
-    import subprocess
-
-    result = subprocess.run(
-        command,
-        shell=True,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    output = result.stdout
-    if result.stderr:
-        output += result.stderr
-    if result.returncode != 0:
-        output += f"\n[exit code: {result.returncode}]"
-    return output
-
-
-def python(code: str) -> str:
-    """Execute Python code and return stdout."""
-    import io
-    import contextlib
-
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        exec(code)
-    return buf.getvalue()
-
-
-def read_file(path: str) -> str:
-    """Read a file from the workspace."""
-    import os
-
-    workspace = os.environ["SANDLOCK_WORKSPACE"]
-    full = os.path.join(workspace, path)
-    with open(full) as f:
-        return f.read()
-
-
-def write_file(path: str, content: str) -> str:
-    """Write content to a file in the workspace."""
-    import os
-
-    workspace = os.environ["SANDLOCK_WORKSPACE"]
-    full = os.path.join(workspace, path)
-    parent = os.path.dirname(full)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    with open(full, "w") as f:
-        f.write(content)
-    return f"Wrote {len(content)} bytes to {path}"
-
-
-def list_files(subdir: str = "") -> str:
-    """List files in the workspace directory."""
-    import os
-
-    workspace = os.environ["SANDLOCK_WORKSPACE"]
-    target = os.path.join(workspace, subdir) if subdir else workspace
-    entries = sorted(os.listdir(target))
-    lines = []
-    for e in entries:
-        kind = "dir" if os.path.isdir(os.path.join(target, e)) else "file"
-        lines.append(f"{kind}  {e}")
-    return "\n".join(lines) if lines else "(empty)"
-
 
 # ---------------------------------------------------------------------------
 # Tool definitions (name -> schema + sandbox registration info)
@@ -227,16 +155,12 @@ _TOOL_DEFS: list[dict] = [
 
 def _register_tools(sandbox: McpSandbox, workspace: str) -> None:
     """Register built-in tools on the McpSandbox."""
-    ws_env = {"SANDLOCK_WORKSPACE": workspace}
-
     for td in _TOOL_DEFS:
-        caps = {"env": ws_env}
-        caps.update(td["capabilities_extra"](workspace))
         sandbox.add_tool(
             td["name"],
             td["func"],
             description=td["description"],
-            capabilities=caps,
+            capabilities=td["capabilities_extra"](workspace),
             input_schema=td["input_schema"],
         )
 

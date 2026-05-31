@@ -171,6 +171,117 @@ async fn test_denied_path_blocks_exec() {
 }
 
 #[tokio::test]
+async fn test_path_rule_on_regular_file() {
+    // A path rule targeting a regular file (not a directory) must not crash
+    // child setup. Landlock rejects directory-only access rights (READ_DIR,
+    // MAKE_*, REMOVE_*, REFER) on a non-directory with EINVAL, so sandlock
+    // must mask the requested access down to the file-applicable set.
+    let dir = temp_file("regfile-read-dir");
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join("data.txt");
+    std::fs::write(&file, "regfile-contents").unwrap();
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_read(file.to_str().unwrap()) // regular file, not a directory
+        .fs_write("/tmp")
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .with_name("test")
+        .run(&["cat", file.to_str().unwrap()])
+        .await
+        .unwrap();
+    assert!(
+        result.success(),
+        "a read rule on a regular file should not crash confinement"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_path_rule_on_device_node() {
+    // A write rule targeting a device node (/dev/null is a char device, not a
+    // directory) must not crash child setup, and the grant must let the child
+    // write to it.
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write("/tmp")
+        .fs_write("/dev/null") // char device, not a directory
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .with_name("test")
+        .run_interactive(&["sh", "-c", "echo hi > /dev/null"])
+        .await
+        .unwrap();
+    assert!(
+        result.success(),
+        "a write rule on a device node should not crash confinement"
+    );
+}
+
+#[tokio::test]
+async fn test_path_rule_on_fifo_does_not_block() {
+    // Opening a FIFO with O_RDONLY blocks until a writer appears. add_path_rule
+    // must reference the path with O_PATH so a read rule on a FIFO does not hang
+    // child setup.
+    let dir = temp_file("fifo-dir");
+    let _ = std::fs::create_dir_all(&dir);
+    let fifo = dir.join("pipe");
+    let _ = std::fs::remove_file(&fifo);
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("spawn mkfifo");
+    assert!(status.success(), "mkfifo should create the FIFO");
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_read(fifo.to_str().unwrap()) // FIFO, not a directory
+        .fs_write("/tmp")
+        .build()
+        .unwrap();
+
+    let mut sandbox = policy.clone().with_name("test");
+    let run = sandbox.run(&["/bin/true"]);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(20), run).await;
+    assert!(
+        result.is_ok(),
+        "a read rule on a FIFO must not block child setup (open with O_PATH)"
+    );
+    assert!(
+        result.unwrap().unwrap().success(),
+        "child should run with a FIFO read rule present"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn test_isolate_ipc() {
     if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 {
         eprintln!("Skipping: Landlock ABI v6 required");

@@ -1,4 +1,4 @@
-use sandlock_core::sandbox::{ByteSize, FsIsolation, BranchAction, Sandbox};
+use sandlock_core::sandbox::{ByteSize, BranchAction, Sandbox};
 
 #[test]
 fn test_default_policy() {
@@ -78,14 +78,6 @@ fn test_unknown_syscall_is_rejected() {
 fn test_invalid_cpu_percent() {
     assert!(Sandbox::builder().max_cpu(0).build().is_err());
     assert!(Sandbox::builder().max_cpu(101).build().is_err());
-}
-
-#[test]
-fn test_fs_isolation_requires_workdir() {
-    assert!(Sandbox::builder()
-        .fs_isolation(FsIsolation::OverlayFs)
-        .build()
-        .is_err());
 }
 
 #[test]

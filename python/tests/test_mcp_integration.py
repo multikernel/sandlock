@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Integration tests for sandlock.mcp — per-tool sandboxed execution."""
 
+from __future__ import annotations
+
 import asyncio
 import json
 import os
@@ -11,6 +13,13 @@ import pytest
 
 from sandlock.mcp import policy_for_tool, McpSandbox
 
+from _tool_helpers import (
+    _read_file_tool,
+    _write_file_tool,
+    _run_python_tool,
+    _list_files_tool,
+)
+
 
 # -- Helpers --
 
@@ -18,37 +27,6 @@ def _run_in_sandbox(capabilities, script, workspace, timeout=15.0):
     """Run a script in a sandbox with given capabilities."""
     policy = policy_for_tool(workspace=workspace, capabilities=capabilities)
     return policy.run([sys.executable, "-c", script], timeout=timeout)
-
-
-# -- Tool functions for McpSandbox tests --
-
-def _read_file_tool(path: str) -> str:
-    import os
-    workspace = os.environ["SANDLOCK_WORKSPACE"]
-    with open(os.path.join(workspace, path)) as f:
-        return f.read()
-
-
-def _write_file_tool(path: str, content: str) -> str:
-    import os
-    workspace = os.environ["SANDLOCK_WORKSPACE"]
-    with open(os.path.join(workspace, path), "w") as f:
-        f.write(content)
-    return f"wrote {len(content)} bytes"
-
-
-def _run_python_tool(code: str) -> str:
-    import io, contextlib
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        exec(code)
-    return buf.getvalue()
-
-
-def _list_files_tool() -> str:
-    import os, json
-    workspace = os.environ["SANDLOCK_WORKSPACE"]
-    return json.dumps(sorted(os.listdir(workspace)))
 
 
 # -- Tests --
@@ -156,23 +134,21 @@ class TestMcpSandboxLocalTools:
     def test_env_capability_passes_vars(self, tmp_path):
         """Only explicitly granted env vars are visible."""
         workspace = str(tmp_path)
-        ws_env = {"SANDLOCK_WORKSPACE": workspace}
 
         mcp = McpSandbox(workspace=workspace)
-        mcp.add_tool("read_file", _read_file_tool,
-                      capabilities={"env": ws_env})
+        mcp.add_tool("run_python", _run_python_tool,
+                      capabilities={"env": {"MY_TOKEN": "granted"}})
 
-        (tmp_path / "test.txt").write_text("hello")
-        result = self._run(mcp.call_tool("read_file", {"path": "test.txt"}))
-        assert "hello" in result
+        result = self._run(mcp.call_tool("run_python", {
+            "code": "import os; print(os.environ.get('MY_TOKEN', 'MISSING'))",
+        }))
+        assert "granted" in result
 
     def test_write_requires_capability(self, tmp_path):
         workspace = str(tmp_path)
-        ws_env = {"SANDLOCK_WORKSPACE": workspace}
 
         mcp = McpSandbox(workspace=workspace)
-        mcp.add_tool("write_file", _write_file_tool,
-                      capabilities={"env": ws_env})  # env but no fs_writable
+        mcp.add_tool("write_file", _write_file_tool)  # no fs_writable
 
         with pytest.raises(RuntimeError, match="failed"):
             self._run(mcp.call_tool(
@@ -181,13 +157,11 @@ class TestMcpSandboxLocalTools:
 
     def test_write_with_capability(self, tmp_path):
         workspace = str(tmp_path)
-        ws_env = {"SANDLOCK_WORKSPACE": workspace}
 
         mcp = McpSandbox(workspace=workspace)
         mcp.add_tool("write_file", _write_file_tool,
-                      capabilities={"fs_writable": [workspace], "env": ws_env})
-        mcp.add_tool("read_file", _read_file_tool,
-                      capabilities={"env": ws_env})
+                      capabilities={"fs_writable": [workspace]})
+        mcp.add_tool("read_file", _read_file_tool)
 
         self._run(mcp.call_tool(
             "write_file", {"path": "test.txt", "content": "hello"},
@@ -222,16 +196,13 @@ class TestMcpSandboxLocalTools:
 
     def test_full_workflow(self, tmp_path):
         workspace = str(tmp_path)
-        ws_env = {"SANDLOCK_WORKSPACE": workspace}
 
         mcp = McpSandbox(workspace=workspace)
         mcp.add_tool("write_file", _write_file_tool,
-                      capabilities={"fs_writable": [workspace], "env": ws_env})
-        mcp.add_tool("read_file", _read_file_tool,
-                      capabilities={"env": ws_env})
+                      capabilities={"fs_writable": [workspace]})
+        mcp.add_tool("read_file", _read_file_tool)
         mcp.add_tool("run_python", _run_python_tool)
-        mcp.add_tool("list_files", _list_files_tool,
-                      capabilities={"env": ws_env})
+        mcp.add_tool("list_files", _list_files_tool)
 
         async def workflow():
             await mcp.call_tool("write_file",
@@ -246,3 +217,83 @@ class TestMcpSandboxLocalTools:
             assert "HELLO" in await mcp.call_tool("read_file", {"path": "out.txt"})
 
         self._run(workflow())
+
+
+# -- Import-by-entrypoint execution --
+
+def test_policy_extra_readable_is_added():
+    pol = policy_for_tool(workspace="/tmp/ws", extra_readable=["/opt/tools"])
+    assert "/opt/tools" in pol.fs_readable
+    assert "/tmp/ws" in pol.fs_readable  # default still present
+
+
+def test_worker_invokes_module_function(capsys):
+    import sandlock.mcp._worker as worker
+    here = os.path.dirname(os.path.abspath(__file__))
+    rc = worker.main(["--syspath", here, "_worker_fixture", "echo", '{"text": "hi"}'])
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "fixture:hi"
+
+
+def test_module_level_state_tool_runs(tmp_path):
+    import _worker_fixture  # tests dir is on sys.path under pytest
+    mcp = McpSandbox(workspace=str(tmp_path))
+    mcp.add_tool("echo", _worker_fixture.echo)  # top-level import + const + helper
+    out = asyncio.run(mcp.call_tool("echo", {"text": "hi"}))
+    assert out.strip() == "fixture:hi"
+
+
+def test_lambda_rejected():
+    with pytest.raises(ValueError):
+        McpSandbox().add_tool("bad", lambda x: x)
+
+
+def test_method_rejected():
+    class C:
+        def m(self, x):
+            return x
+    with pytest.raises(ValueError):
+        McpSandbox().add_tool("bad", C().m)
+
+
+def test_nested_function_rejected():
+    def outer():
+        def inner(x):
+            return x
+        return inner
+    with pytest.raises(ValueError):
+        McpSandbox().add_tool("bad", outer())
+
+
+def test_workspace_injected(tmp_path):
+    import _worker_fixture
+    mcp = McpSandbox(workspace=str(tmp_path))
+    mcp.add_tool("whereami", _worker_fixture.whereami)  # no env wiring
+    out = asyncio.run(mcp.call_tool("whereami", {}))
+    assert out.strip() == str(tmp_path)
+
+
+def test_llm_cannot_override_workspace(tmp_path):
+    import _worker_fixture
+    mcp = McpSandbox(workspace=str(tmp_path))
+    mcp.add_tool("whereami", _worker_fixture.whereami)
+    out = asyncio.run(mcp.call_tool("whereami", {"workspace": "/evil"}))
+    assert out.strip() == str(tmp_path)
+
+
+def test_builtins_import_does_not_pull_in_mcp():
+    """The per-call worker imports the built-in tools' module; it must stay
+    light, i.e. not drag in the heavy ``mcp`` framework."""
+    import subprocess
+    code = "import sandlock.mcp._builtins, sys; print('mcp' in sys.modules)"
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True,
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "False", out.stdout
+
+
+def test_create_server_still_importable():
+    """create_server is lazily importable from the package."""
+    from sandlock.mcp import create_server
+    assert callable(create_server)
