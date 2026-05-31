@@ -9,7 +9,7 @@
 
 use anyhow::Result;
 use oci_spec::runtime::Spec;
-use sandlock_core::sandbox::{ByteSize, FsIsolation, Sandbox, SandboxBuilder};
+use sandlock_core::sandbox::{ByteSize, Sandbox, SandboxBuilder};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -73,15 +73,22 @@ impl OciPolicy {
             map_mounts(mounts, bundle, &rootfs, &mut fs_mount, &mut fs_read, &mut fs_write);
         }
 
-        let cwd = spec
-            .process()
-            .and_then(|p| p.cwd())
-            .filter(|c| !c.as_os_str().is_empty())
-            .map(|c| c.to_path_buf());
+        // oci-spec 0.7: sub-struct getters (via #[getset]) return &T / &Option<T>.
+        // Use .clone() on those to get owned values so closures return owned types
+        // (avoids E0515 "returns a value referencing closure parameter").
 
-        let env = spec
-            .process()
-            .and_then(|p| p.env())
+        // spec.process() / spec.linux() return &Option<T>; .as_ref() converts to Option<&T>
+        // so and_then/map can work without moving out of the spec reference (E0507).
+        // Closures return owned values (.clone()) so no "reference to closure param" errors.
+
+        let cwd = spec.process().as_ref()
+            .and_then(|p| {
+                let c = p.cwd().clone();
+                if c.as_os_str().is_empty() { None } else { Some(c) }
+            });
+
+        let env: HashMap<String, String> = spec.process().as_ref()
+            .and_then(|p| p.env().clone())
             .map(|env| {
                 env.iter()
                     .filter_map(|v| v.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
@@ -89,35 +96,33 @@ impl OciPolicy {
             })
             .unwrap_or_default();
 
-        let max_memory = spec
-            .linux()
-            .and_then(|linux| linux.resources())
-            .and_then(|res| res.memory())
-            .and_then(|mem| mem.limit())
-            .filter(|&limit| limit > 0)
-            .map(|limit| ByteSize::bytes(limit as u64));
+        let max_memory = spec.linux().as_ref()
+            .and_then(|l| l.resources().clone())
+            .and_then(|res| res.memory().clone())
+            .and_then(|mem| {
+                mem.limit().filter(|&l| l > 0).map(|l| ByteSize::bytes(l as u64))
+            });
 
-        let max_processes = spec
-            .linux()
-            .and_then(|linux| linux.resources())
-            .and_then(|res| res.pids())
-            .filter(|pids| pids.limit() > 0)
-            .map(|pids| pids.limit() as u32);
+        let max_processes = spec.linux().as_ref()
+            .and_then(|l| l.resources().clone())
+            .and_then(|res| res.pids().clone())
+            .and_then(|pids| {
+                let limit = pids.limit();
+                if limit > 0 { Some(limit as u32) } else { None }
+            });
 
-        let max_cpu = spec
-            .linux()
-            .and_then(|linux| linux.resources())
-            .and_then(|res| res.cpu())
+        let max_cpu = spec.linux().as_ref()
+            .and_then(|l| l.resources().clone())
+            .and_then(|res| res.cpu().clone())
             .and_then(|cpu| {
                 let quota = cpu.quota()?;
                 let period = cpu.period()?;
                 if quota > 0 && period > 0 {
                     let pct = ((quota as f64 / period as f64) * 100.0).min(100.0) as u8;
-                    if pct > 0 {
-                        return Some(pct);
-                    }
+                    if pct > 0 { Some(pct) } else { None }
+                } else {
+                    None
                 }
-                None
             });
 
         Ok(OciPolicy {
@@ -173,9 +178,6 @@ impl OciPolicy {
             builder = builder.max_cpu(cpu);
         }
 
-        // The OCI runtime does not use COW or fs_isolation by default.
-        builder = builder.fs_isolation(FsIsolation::None);
-
         // Build without cross-section validation since we're constructing from
         // a spec that may omit some fields that the builder requires.
         builder.build_unchecked().map_err(Into::into)
@@ -187,7 +189,7 @@ impl OciPolicy {
     /// It must be called in the child process after SIGCONT and before execve.
     pub fn confine(&self) -> Result<()> {
         let confinement = self.to_confinement();
-        sandlock_core::confine(&confinement)
+        sandlock_core::confine(&confinement).map_err(Into::into)
     }
 
     /// Convert the OCI policy into a `Confinement` for Landlock application.
@@ -216,7 +218,14 @@ impl OciPolicy {
     pub fn apply_and_exec(&self, cmd: &[String]) -> ! {
         // 1. chroot into rootfs if configured
         if let Some(ref rootfs) = self.rootfs {
-            if unsafe { libc::chroot(rootfs.as_ptr() as *const libc::c_char) } != 0 {
+            let rootfs_cstr = match CString::new(rootfs.to_string_lossy().as_ref()) {
+                Ok(c) => c,
+                Err(_) => {
+                    eprintln!("sandlock-oci: rootfs path contains NUL byte");
+                    unsafe { libc::_exit(127) };
+                }
+            };
+            if unsafe { libc::chroot(rootfs_cstr.as_ptr()) } != 0 {
                 let err = std::io::Error::last_os_error();
                 eprintln!("sandlock-oci: chroot({:?}) failed: {}", rootfs, err);
                 unsafe { libc::_exit(127) };
@@ -237,7 +246,14 @@ impl OciPolicy {
             } else {
                 cwd
             };
-            if unsafe { libc::chdir(target.as_ptr() as *const libc::c_char) } != 0 {
+            let target_cstr = match CString::new(target.to_string_lossy().as_ref()) {
+                Ok(c) => c,
+                Err(_) => {
+                    eprintln!("sandlock-oci: cwd path contains NUL byte");
+                    unsafe { libc::_exit(127) };
+                }
+            };
+            if unsafe { libc::chdir(target_cstr.as_ptr()) } != 0 {
                 let err = std::io::Error::last_os_error();
                 eprintln!("sandlock-oci: chdir({:?}) failed: {}", cwd, err);
                 unsafe { libc::_exit(127) };
@@ -293,22 +309,20 @@ impl OciPolicy {
 }
 
 /// Resolve the rootfs path from the OCI spec.
+/// Returns `None` when the spec has no root, an empty path, or a path that
+/// doesn't exist on disk (allows rootfs-less invocations and tests without a
+/// real bundle).
 fn rootfs_path(spec: &Spec, bundle: &Path) -> Option<PathBuf> {
-    let raw = spec
-        .root()
-        .as_ref()
-        .map(|r| r.path().clone())
-        .unwrap_or_else(|| PathBuf::from("rootfs"));
+    let raw = spec.root().as_ref()
+        .and_then(|r| {
+            let p = r.path().clone();
+            if p.as_os_str().is_empty() { None } else { Some(p) }
+        })?;
     if raw.is_absolute() {
-        Some(raw)
+        if raw.exists() { Some(raw) } else { None }
     } else {
         let joined = bundle.join(&raw);
-        if joined.exists() {
-            Some(joined)
-        } else {
-            // Bundle-relative path that doesn't exist yet
-            Some(joined)
-        }
+        if joined.exists() { Some(joined) } else { None }
     }
 }
 
@@ -391,7 +405,7 @@ mod tests {
             .process(
                 ProcessBuilder::default()
                     .cwd("/app")
-                    .args(vec!["sh".to_string(), "-c".to_string(), "echo hello"])
+                    .args(vec!["sh".to_string(), "-c".to_string(), "echo hello".to_string()])
                     .env(vec!["PATH=/usr/bin:/bin".to_string(), "FOO=bar".to_string()])
                     .build()
                     .unwrap(),

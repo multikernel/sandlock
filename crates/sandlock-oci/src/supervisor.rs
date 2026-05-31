@@ -49,7 +49,7 @@ pub enum SupervisorReply {
 
 /// Returns the path to the supervisor socket for the given container ID.
 pub fn socket_path(id: &str) -> PathBuf {
-    Path::new(crate::state::state_dir())
+    PathBuf::from(crate::state::state_dir())
         .join(id)
         .join(SUPERVISOR_SOCKET)
 }
@@ -59,7 +59,7 @@ pub fn socket_path(id: &str) -> PathBuf {
 /// The protocol is newline-delimited JSON over a Unix socket.
 /// Each request and response is a single JSON line terminated with '\n'.
 pub fn send_command(id: &str, cmd: SupervisorCmd) -> Result<SupervisorReply> {
-    use std::io::{BufRead, Read, Write};
+    use std::io::{BufRead, Write};
     use std::os::unix::net::UnixStream;
 
     let path = socket_path(id);
@@ -142,7 +142,14 @@ pub fn run_supervisor(
 
         // 1. Apply chroot if the policy has a rootfs.
         if let Some(ref rootfs) = policy.rootfs {
-            if unsafe { libc::chroot(rootfs.as_ptr() as *const libc::c_char) } != 0 {
+            let rootfs_cstr = match std::ffi::CString::new(rootfs.to_string_lossy().as_ref()) {
+                Ok(c) => c,
+                Err(_) => {
+                    eprintln!("sandlock-oci: rootfs path contains NUL byte");
+                    unsafe { libc::_exit(127) };
+                }
+            };
+            if unsafe { libc::chroot(rootfs_cstr.as_ptr()) } != 0 {
                 let err = std::io::Error::last_os_error();
                 eprintln!("sandlock-oci: chroot({:?}) failed: {}", rootfs, err);
                 unsafe { libc::_exit(127) };
@@ -156,8 +163,14 @@ pub fn run_supervisor(
 
         // 2. Change working directory.
         if let Some(ref cwd) = policy.cwd {
-            let cwd_str = cwd.to_string_lossy();
-            if unsafe { libc::chdir(cwd_str.as_ptr() as *const libc::c_char) } != 0 {
+            let cwd_cstr = match std::ffi::CString::new(cwd.to_string_lossy().as_ref()) {
+                Ok(c) => c,
+                Err(_) => {
+                    eprintln!("sandlock-oci: cwd path contains NUL byte");
+                    unsafe { libc::_exit(127) };
+                }
+            };
+            if unsafe { libc::chdir(cwd_cstr.as_ptr()) } != 0 {
                 let err = std::io::Error::last_os_error();
                 eprintln!("sandlock-oci: chdir({:?}) failed: {}", cwd, err);
                 unsafe { libc::_exit(127) };

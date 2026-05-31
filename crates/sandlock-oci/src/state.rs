@@ -186,7 +186,8 @@ impl ContainerState {
 
 /// List all container IDs currently tracked in STATE_DIR.
 pub fn list_containers() -> Result<Vec<String>> {
-    let dir = Path::new(&state_dir());
+    let dir_str = state_dir();
+    let dir = Path::new(&dir_str);
     if !dir.exists() {
         return Ok(vec![]);
     }
