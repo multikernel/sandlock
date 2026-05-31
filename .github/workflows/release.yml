@@ -163,6 +163,9 @@ jobs:
   publish-crates:
     name: Publish to crates.io
     needs: [build, test]
+    # Only publish on a real tag push. A manual workflow_dispatch (used to
+    # test the build/upload path) must never publish to crates.io.
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -182,6 +185,8 @@ jobs:
   publish-pypi:
     name: Publish to PyPI
     needs: [sdist, wheels, test]
+    # Only publish on a real tag push, not on a manual workflow_dispatch.
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -212,6 +217,9 @@ jobs:
   github-release:
     name: GitHub Release
     needs: [build, test]
+    # Only cut a GitHub Release on a real tag push, not on a manual
+    # workflow_dispatch (which has no tag to attach assets to).
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
