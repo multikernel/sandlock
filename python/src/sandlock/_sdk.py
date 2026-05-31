@@ -480,6 +480,9 @@ _lib.sandlock_handler_new.argtypes = [
 _lib.sandlock_handler_free.restype = None
 _lib.sandlock_handler_free.argtypes = [_c_handler_p]
 
+_lib.sandlock_handler_set_deferred.restype = None
+_lib.sandlock_handler_set_deferred.argtypes = [_c_handler_p, ctypes.c_bool]
+
 _lib.sandlock_run_with_handlers.restype = _c_result_p
 _lib.sandlock_run_with_handlers.argtypes = [
     _c_policy_p, ctypes.c_char_p,

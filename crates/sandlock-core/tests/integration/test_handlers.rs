@@ -667,3 +667,52 @@ async fn run_with_handlers_rejects_handler_on_default_blocklist_syscall() {
         other => panic!("expected Handler(OnDenySyscall), got {:?}", other.err()),
     }
 }
+
+/// End-to-end coverage for `NotifAction::inject_bytes`: a handler on
+/// `SYS_openat` materialises synthetic content as a sealed memfd and injects
+/// it as the guest's `openat` result. The guest `cat`s a path that does not
+/// exist on the host, yet reads back the injected bytes — proving the kernel
+/// returned the supervisor's fd rather than performing the real open.
+#[tokio::test]
+async fn inject_bytes_delivers_synthetic_content_to_guest() {
+    let policy = base_policy().build().unwrap();
+    let out = temp_out("inject-bytes-content");
+    // Sentinel path: never created on the host. `cat` opens it (intercepted),
+    // the handler injects content, and `cat` writes that to `out`.
+    let virt = "/tmp/sandlock-virtual-inject-XYZ";
+    let content = "INJECTED_SECRET_42\n";
+    let cmd = format!("cat {virt} > {}", out.display());
+
+    let handler = |cx: &HandlerCtx| {
+        // openat(2): args[1] is the path. Read it synchronously, then move only
+        // the owned path into the future (don't borrow `cx` across it). Only the
+        // sentinel injects; every other openat (libc, the output file, ...)
+        // falls through.
+        let path = sandlock_core::seccomp::notif::read_child_cstr(
+            cx.notif_fd, cx.notif.id, cx.notif.pid, cx.notif.data.args[1], 4096,
+        );
+        async move {
+            match path {
+                Some(p) if p.ends_with("sandlock-virtual-inject-XYZ") => {
+                    NotifAction::inject_bytes(b"INJECTED_SECRET_42\n")
+                }
+                _ => NotifAction::Continue,
+            }
+        }
+    };
+
+    let result = policy
+        .clone()
+        .run_with_handlers(&["sh", "-c", &cmd], [(libc::SYS_openat, handler)])
+        .await
+        .expect("sandbox spawn failed");
+
+    let contents = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+
+    assert!(result.success(), "shell wrapper should exit 0");
+    assert_eq!(
+        contents, content,
+        "guest must read back exactly the injected bytes for a host-nonexistent path"
+    );
+}

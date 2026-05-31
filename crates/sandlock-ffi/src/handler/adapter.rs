@@ -154,8 +154,15 @@ impl Handler for FfiHandler {
         let handler_fn = self.inner.handler_fn;
         let ud = UdPtr(self.inner.ud);
         let on_exception_fallback = self.exception_action(child_pgid);
+        let deferred = self.inner.deferred;
 
-        Box::pin(async move {
+        // The whole callback (including its slow work) runs on a blocking
+        // worker. When `deferred` is set we hand this future to the
+        // supervisor as `NotifAction::Defer` so it runs off the notification
+        // loop; otherwise the supervisor awaits it inline as before. The
+        // future is fully owned (`'static`) either way — nothing borrows
+        // `self`/`cx`.
+        let run = async move {
             let join = tokio::task::spawn_blocking(move || {
                 // Rust 2021 disjoint closure captures (RFC 2229) would
                 // otherwise capture `ud.0` (a bare `*mut c_void`, not
@@ -210,7 +217,15 @@ impl Handler for FfiHandler {
                     on_exception_fallback
                 }
             }
-        })
+        };
+
+        if deferred {
+            // Resolves immediately to Defer; the supervisor moves `run` onto
+            // a worker task and sends the response when it completes.
+            Box::pin(async move { NotifAction::defer(run) })
+        } else {
+            Box::pin(run)
+        }
     }
 }
 

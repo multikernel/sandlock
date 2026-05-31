@@ -8,6 +8,7 @@ time; runtime state (``_native``, ``_handle``) is initialized lazily.
 
 from __future__ import annotations
 
+import inspect
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -602,6 +603,10 @@ class Sandbox:
                         "sandlock_handler_new returned NULL for syscall "
                         f"{syscall_nr}"
                     )
+                # An async `handle` runs off the supervisor loop. Flag the
+                # container before it is handed to the run.
+                if _is_deferred_handler(handler):
+                    _lib.sandlock_handler_set_deferred(container, True)
                 regs[i].syscall_nr = int(syscall_nr)
                 regs[i].handler = container
                 # Ownership now lives in regs[i]; clear the pending ref so
@@ -1035,6 +1040,16 @@ def _encode(s: str) -> bytes:
     if b'\x00' in result:
         raise ValueError(f"NUL byte in string argument: {result!r}")
     return result
+
+
+def _is_deferred_handler(handler) -> bool:
+    """Whether a handler runs off the supervisor loop.
+
+    True when its ``handle`` is an ``async def`` (a coroutine function): the
+    coroutine is driven to completion on a worker thread, which would block
+    the supervisor loop if run inline, so it must be deferred.
+    """
+    return inspect.iscoroutinefunction(getattr(handler, "handle", None))
 
 
 def _resolve_syscall(key) -> int:

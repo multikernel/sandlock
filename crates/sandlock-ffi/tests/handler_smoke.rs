@@ -369,6 +369,46 @@ async fn ffi_handler_translates_return_value() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deferred_ffi_handler_returns_defer_that_resolves_to_callback() {
+    // A handler flagged deferred must return NotifAction::Defer (so the
+    // supervisor runs it off-loop), and driving that future must yield the
+    // same action the C callback would have produced inline.
+    let raw = unsafe {
+        sandlock_ffi::handler::sandlock_handler_new(
+            Some(return_value_42),
+            std::ptr::null_mut(),
+            None,
+            sandlock_exception_policy_t::Kill as u32,
+        )
+    };
+    unsafe { sandlock_ffi::handler::sandlock_handler_set_deferred(raw, true) };
+    let h = unsafe { FfiHandler::from_raw(raw) };
+    let cx = fake_ctx();
+    let action = h.handle(&cx).await;
+    let deferred = match action {
+        NotifAction::Defer(d) => d,
+        other => panic!("deferred handler must return Defer, got {other:?}"),
+    };
+    assert!(matches!(deferred.run().await, NotifAction::ReturnValue(42)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_deferred_ffi_handler_stays_inline() {
+    // Without the flag, handle() resolves the action inline (no Defer).
+    let raw = unsafe {
+        sandlock_ffi::handler::sandlock_handler_new(
+            Some(return_value_42),
+            std::ptr::null_mut(),
+            None,
+            sandlock_exception_policy_t::Kill as u32,
+        )
+    };
+    let h = unsafe { FfiHandler::from_raw(raw) };
+    let cx = fake_ctx();
+    assert!(matches!(h.handle(&cx).await, NotifAction::ReturnValue(42)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ffi_handler_applies_exception_policy_on_failure() {
     let raw = unsafe {
         sandlock_ffi::handler::sandlock_handler_new(

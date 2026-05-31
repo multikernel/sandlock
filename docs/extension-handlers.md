@@ -256,6 +256,60 @@ fn handle<'a>(
 }
 ```
 
+### Injecting synthetic content (`inject_bytes`)
+
+When a handler hands the guest synthetic file content (a secret, a generated config, a fetched
+object) as the result of an `open`/`openat`, use
+[`NotifAction::inject_bytes`](../crates/sandlock-core/src/seccomp/notif.rs) instead of building a
+`memfd` by hand. It creates an in-memory file populated with the bytes, rewinds it, seals it
+read-only, and returns an `InjectFdSend` action carrying that fd:
+
+```rust
+use sandlock_core::seccomp::notif::NotifAction;
+
+// Inside a handler: serve the bytes as the openat result fd.
+return NotifAction::inject_bytes(b"INJECTED CONTENT\n");
+```
+
+`inject_bytes` owns the fd end to end: the supervisor creates, populates, seals, and (on dispatch)
+closes it, so the caller never touches a raw fd and there is no "when do I close this" question. On
+an allocation failure it collapses to `Errno(EIO)`, which is why it returns a `NotifAction`
+directly rather than a `Result`.
+
+The two defaults both suit the dominant case (synthetic, often sensitive, read-only content):
+
+- **Sealed read-only.** The fd carries `F_SEAL_SEAL | F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK`,
+  so the guest cannot modify or resize the content it is handed.
+- **`O_CLOEXEC` on the child-side fd**, so the content does not leak into programs the guest later
+  `execve`s (see the note below).
+
+When you are impersonating a real file and want byte-for-byte the semantics the guest asked for (a
+writable fd, or the guest's own `O_CLOEXEC` choice), drop to the lower-level primitive
+[`content_memfd(content, seal)`](../crates/sandlock-core/src/seccomp/notif.rs), which returns an
+`OwnedFd` you pass to `NotifAction::InjectFdSend { srcfd, newfd_flags }` yourself:
+
+```rust
+use sandlock_core::seccomp::notif::{content_memfd, NotifAction};
+
+// Writable injected fd, mirroring the guest's own O_CLOEXEC request.
+let fd = match content_memfd(&bytes, /* seal */ false) {
+    Ok(fd) => fd,
+    Err(_) => return NotifAction::Errno(libc::EIO),
+};
+let cloexec = (cx.notif.data.args[2] as i32 & libc::O_CLOEXEC) != 0; // openat flags
+NotifAction::InjectFdSend {
+    srcfd: fd,
+    newfd_flags: if cloexec { libc::O_CLOEXEC as u32 } else { 0 },
+}
+```
+
+> **Why `O_CLOEXEC` by default.** `newfd_flags` sets the close-on-exec bit on the *child-side* fd
+> (distinct from the supervisor's own `MFD_CLOEXEC` copy of the memfd). Without it, a subprocess
+> the guest `execve`s inherits an open fd to the injected content and can read it without ever
+> opening the file. For secret injection that is a silent leak, so `inject_bytes` closes the fd
+> across `exec`; handlers that virtualize a real file and need to honor the guest's request opt out
+> via `content_memfd` (or, over the C ABI, the documented flags).
+
 ### State patterns
 
 Common confusion: when a handler holds mutable state, what kind of synchronisation is needed?
@@ -377,6 +431,12 @@ The contract is exercised at two layers:
 | `InjectFd { srcfd, targetfd }` | Inject `srcfd` into the guest at slot `targetfd`, then continue. |
 | `InjectFdSendTracked { srcfd, newfd_flags, on_success }` | Inject `srcfd`; `on_success` callback runs synchronously when the kernel returns the slot, so downstream tracking cannot race with the guest seeing the new fd. |
 | `Kill { sig, pgid }` | Send `sig` to the guest's process group. |
+| `Defer(Deferred)` | Run the carried future off the supervisor loop; its terminal action is sent later, keyed by `notif.id`. Non-`Continue`, so it ends the chain. See [Deferred handlers](#deferred-handlers). |
+
+`InjectFd`/`InjectFdSend`/`InjectFdSendTracked` carry a file descriptor. To synthesise *content*
+(rather than inject an fd you already hold), construct the action with
+[`NotifAction::inject_bytes`](#injecting-synthetic-content-inject_bytes); it builds the sealed
+`memfd` and produces an `InjectFdSend` for you.
 
 ### Continue-site safety
 
@@ -391,12 +451,80 @@ handler-owned state on `&self`: a `tokio::sync::Mutex<T>` or `RwLock<T>` field o
 must not be held across an `.await` point. If the guard is alive when control returns to the
 supervisor loop, the next notification that needs the same lock parks, the response for the
 current notification is not sent, and the child stays trapped in the syscall. Acquire, mutate,
-drop — `await` only after the guard is out of scope.
+drop, and `await` only after the guard is out of scope. For work that is genuinely slow (a network
+round-trip, a blocking syscall) rather than a short critical section, do not block the loop at
+all: return [`NotifAction::Defer`](#deferred-handlers) and let the supervisor run it off-loop.
 
 See [issue #27][i27] for the underlying supervisor-loop contract that this convention extends to
 user handlers.
 
 [i27]: https://github.com/multikernel/sandlock/issues/27
+
+### Deferred handlers
+
+Continue-site safety exists because the supervisor processes notifications sequentially: a handler
+that blocks (a network round-trip, a blocking syscall, a slow lock) stalls every other trapped
+syscall until it returns. `NotifAction::Defer` is the escape hatch. A handler that returns `Defer`
+hands the supervisor an owned, `'static` future; the supervisor moves it onto a worker task, lets
+the notification loop proceed immediately, and sends the response (keyed by `notif.id`) when the
+future resolves. The trapped child stays parked in the syscall until then, so `notif.id` stays
+valid and the child-memory helpers keep working inside the deferred future.
+
+```rust
+use std::future::Future;
+use std::pin::Pin;
+use sandlock_core::{Handler, HandlerCtx};
+use sandlock_core::seccomp::notif::{read_child_cstr, NotifAction};
+
+fn handle<'a>(
+    &'a self,
+    cx: &'a HandlerCtx,
+) -> Pin<Box<dyn Future<Output = NotifAction> + Send + 'a>> {
+    // Copy out what the deferred future needs: `notif` is `Copy`, `notif_fd`
+    // is a `RawFd`, and `Arc` state is cloned. Never borrow `&self`/`cx`:
+    // the deferred future is `'static` and outlives this call.
+    let (fd, id, pid) = (cx.notif_fd, cx.notif.id, cx.notif.pid);
+    let key = read_child_cstr(fd, id, pid, cx.notif.data.args[1], 4096);
+    let backend = self.backend.clone();
+    Box::pin(async move {
+        let Some(key) = key else { return NotifAction::Continue };
+        NotifAction::defer(async move {
+            // Runs on a worker, off the supervisor loop. The child is still
+            // parked, so child-memory helpers and `id` are valid here.
+            match backend.get(&key).await {
+                Ok(_data) => NotifAction::ReturnValue(0), // e.g. inject a memfd of `_data`
+                Err(_) => NotifAction::Errno(libc::EIO),
+            }
+        })
+    })
+}
+```
+
+The deferred future must be `Send + 'static`: `Send` so the supervisor can move it onto a worker,
+and `'static` so it can outlive the borrowed `HandlerCtx`. It does **not** need to be `Sync` (the
+supervisor moves it, never shares it by reference). Capture owned data only: copy `notif` (it is
+`Copy`), clone an `Arc` for shared state, and never borrow `&self`/`cx`.
+
+Contract:
+
+- **Terminal decision.** `Defer` is non-`Continue`, so it short-circuits the handler chain exactly
+  like `Errno`/`ReturnValue`: later handlers on the same syscall do not run. A deferring handler
+  decides the outcome.
+- **No deferral on freeze/fork syscalls.** Deferral is refused (with `EPERM`) on
+  `execve`/`execveat` and fork-creating syscalls, because moving the response off-loop would skip
+  the argv-safety freeze (see [issue #27][i27]) and process creation-tracking that those paths
+  require before `Continue`.
+- **Bounded fan-out.** At most `DEFER_MAX_INFLIGHT` deferred futures run concurrently; beyond that,
+  further deferrals fail fast with `EAGAIN` rather than queuing. The cap also bounds the resources
+  workers hold (memfds, sockets).
+- **No nesting.** A deferred future that itself resolves to `Defer` is a bug; the supervisor
+  collapses it to `EIO` so the child is never left wedged.
+- **Stale id.** If the child exits mid-defer, the eventual `send_response` is a no-op and the
+  child-memory helpers fail safe (they are `id_valid`-bracketed), matching the inline path's
+  "child may have exited" tolerance.
+
+Do not defer trivial fast handlers: the worker hop adds latency. Defer only when the work would
+otherwise block the loop.
 
 ## Security boundary
 
@@ -416,8 +544,8 @@ User handlers can:
   syscall must have returned `Continue` for the user handler to see it.
 - Fake results (`ReturnValue`, `Errno`) — but only after the builtins for the same syscall
   returned `Continue`, so they cannot subvert confinement.
-- Inject fds (`InjectFd`/`InjectFdSendTracked`) — useful for materialising virtual file content
-  via `memfd` without ever touching the host filesystem.
+- Inject fds (`inject_bytes`, `InjectFd`, `InjectFdSendTracked`) to materialise virtual file
+  content via `memfd` without ever touching the host filesystem.
 
 ### BPF coverage
 
@@ -506,6 +634,11 @@ translate filesystem operations into multipart-upload calls. Those interceptors 
 the same supervisor task as sandlock's builtins — `SECCOMP_FILTER_FLAG_NEW_LISTENER` allows only
 one listener per process.
 
+Because the multipart-upload calls are slow network operations, return
+[`NotifAction::Defer`](#deferred-handlers) from those handlers so the uploads run off the
+notification loop. Otherwise each upload blocks the single supervisor task and stalls every other
+trapped syscall for the duration of the round-trip.
+
 Wrap each handler in `Box<dyn Handler>` so the iterator's `H` parameter is uniform across
 heterogeneous handler types:
 
@@ -529,11 +662,17 @@ against the configured policy.
 
 ### Synthetic file content via `InjectFdSendTracked`
 
+For the common read-only case,
+[`NotifAction::inject_bytes`](#injecting-synthetic-content-inject_bytes) is the one-liner: it
+builds the sealed `memfd` and returns the inject action for you. Reach for `InjectFdSendTracked`
+only when you must know the exact fd number the kernel assigned in the child (for example to key
+per-fd bookkeeping); its `on_success` callback delivers that number without racing the guest.
+
 A read-only virtual file (e.g. `/etc/hostname`, an in-memory configuration generated per-call)
 can be exposed by intercepting `openat` and injecting a sealed `memfd` containing the content.
 The kernel returns the new fd slot to the guest, the handler's `on_success` callback runs
 synchronously to register the fd in the handler's bookkeeping, and the guest reads the content
-via the `memfd` — no host filesystem touched.
+via the `memfd` (no host filesystem touched).
 
 ### Deterministic audit trail for compliance
 
@@ -647,6 +786,36 @@ break. Consequently the caller MUST ensure their `ud` pointer is
 thread-safe: either immutable, or guarded by their own synchronization
 primitives (atomics, mutex, etc.). Rust offers no synchronization for
 an opaque `void*`; the responsibility is on the C side.
+
+### Injecting content (`sandlock_action_set_inject_bytes`)
+
+The C counterpart of
+[`NotifAction::inject_bytes`](#injecting-synthetic-content-inject_bytes) is:
+
+```c
+void sandlock_action_set_inject_bytes(sandlock_action_out_t *out,
+                                      const uint8_t *data, size_t len,
+                                      uint32_t flags);
+```
+
+The supervisor copies `data` during the call (so it need not outlive the
+call), builds the backing in-memory file, and owns the resulting fd.
+Unlike `sandlock_action_set_inject_fd_send`, the caller passes no fd and
+frees nothing. On an allocation failure the action becomes `Errno(EIO)`,
+so the one-setter callback contract still holds.
+
+`flags` is a bitmask whose zero value is the safe default (sealed
+read-only, child-side fd `O_CLOEXEC`), matching `inject_bytes`:
+
+| `flags` | effect |
+|---|---|
+| `0` | sealed read-only, `O_CLOEXEC` (recommended) |
+| `SANDLOCK_INJECT_WRITABLE` | leave the memfd writable (do not seal) |
+| `SANDLOCK_INJECT_NO_CLOEXEC` | clear `O_CLOEXEC` on the child-side fd |
+
+`data` may be `NULL` when `len == 0`, which injects an empty file. The
+pure-C check in `crates/sandlock-ffi/tests/c/handler_smoke.c` exercises
+both the sealed default and the `SANDLOCK_INJECT_WRITABLE` variant.
 
 ### Minimal example
 

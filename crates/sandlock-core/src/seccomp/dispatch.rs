@@ -1209,6 +1209,47 @@ mod handler_tests {
         );
     }
 
+    /// A handler returning `Defer` is non-`Continue`, so it must short-circuit
+    /// the chain exactly like `Errno`/`ReturnValue`: later handlers on the same
+    /// syscall do not run.  Deferral is therefore a terminal decision.
+    #[tokio::test]
+    async fn dispatch_short_circuits_on_defer() {
+        let mut table = DispatchTable::new();
+        let later_ran = Arc::new(AtomicUsize::new(0));
+
+        table.register(
+            libc::SYS_openat,
+            |_cx: &HandlerCtx| async { NotifAction::defer(async { NotifAction::ReturnValue(1) }) },
+        );
+
+        let later = Arc::clone(&later_ran);
+        table.register(
+            libc::SYS_openat,
+            move |_cx: &HandlerCtx| {
+                let later = Arc::clone(&later);
+                async move {
+                    later.fetch_add(1, Ordering::SeqCst);
+                    NotifAction::Continue
+                }
+            },
+        );
+
+        let _ctx = fake_supervisor_ctx();
+        let action = table
+            .dispatch(fake_notif(libc::SYS_openat as i32), -1)
+            .await;
+
+        assert!(
+            matches!(action, NotifAction::Defer(_)),
+            "dispatch must return the Defer produced by the first handler"
+        );
+        assert_eq!(
+            later_ran.load(Ordering::SeqCst),
+            0,
+            "Defer must short-circuit the chain like any non-Continue action"
+        );
+    }
+
     /// `validate_handler_syscalls_against_policy` must reject handlers whose
     /// syscall is in the policy's user-specified blocklist, with the same
     /// rationale as DEFAULT_BLOCKLIST: the BPF program emits notif JEQs before

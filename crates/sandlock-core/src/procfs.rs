@@ -19,16 +19,14 @@
 //     contents, so the seccomp_unotify TOCTOU class doesn't apply.
 
 use std::collections::HashSet;
-use std::io::{Seek, SeekFrom, Write};
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::seccomp::notif::{read_child_cstr, write_child_mem, NotifAction, NotifPolicy};
+use crate::seccomp::notif::{content_memfd, read_child_cstr, write_child_mem, NotifAction, NotifPolicy};
 use crate::seccomp::state::{NetworkState, ProcessIndex};
 use crate::sys::structs::{SeccompNotif, EACCES};
-use crate::sys::syscall;
 
 // ============================================================
 // Sensitive path detection
@@ -340,49 +338,19 @@ fn parse_proc_net_tcp_port(line: &str) -> Option<u16> {
 // memfd injection
 // ============================================================
 
-/// Create a memfd with the given content and return an InjectFd action.
+/// Create a sealed memfd of `content` and inject it as the child's openat
+/// result. The memfd is created in the supervisor, sealed read-only, and
+/// handed to the child via NOTIF_ADDFD, so the kernel never re-resolves the
+/// virtualized /proc path string after injection.
 ///
-/// The memfd is created in the supervisor process, written with content,
-/// seeked to the beginning, then injected into the child via NOTIF_ADDFD.
-/// The child sees it as the fd returned by their openat call.
-///
-/// IMPORTANT: The returned OwnedFd must stay alive until after the ioctl
-/// in send_response completes. We leak it intentionally here because the
-/// supervisor loop calls inject_fd immediately after this returns. A more
-/// robust design would store it in an arena, but leaking is acceptable for
-/// the supervisor's lifetime.
+/// On memfd allocation failure we fall through to `Continue` (let the real
+/// open proceed) rather than `Errno`, preserving this module's long-standing
+/// behavior: a failure to synthesise /proc content is not a denial.
 fn inject_memfd(content: &[u8]) -> NotifAction {
-    let memfd = match syscall::memfd_create(
-        "sandlock",
-        (libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) as u32,
-    ) {
-        Ok(fd) => fd,
-        Err(_) => return NotifAction::Continue, // fallback: let real open proceed
-    };
-
-    // Write content and seek to start.
-    // Borrow the raw fd for File I/O without transferring ownership.
-    let raw = memfd.as_raw_fd();
-    {
-        let mut file = unsafe { std::fs::File::from_raw_fd(raw) };
-        if file.write_all(content).is_err() || file.seek(SeekFrom::Start(0)).is_err() {
-            std::mem::forget(file);
-            return NotifAction::Continue;
-        }
-        // Forget the File so it doesn't close the fd — memfd (OwnedFd) still owns it.
-        std::mem::forget(file);
+    match content_memfd(content, true) {
+        Ok(fd) => NotifAction::InjectFdSend { srcfd: fd, newfd_flags: libc::O_CLOEXEC as u32 },
+        Err(_) => NotifAction::Continue, // fallback: let real open proceed
     }
-
-    // Lock the memfd: the child gets an injected fd to the same description
-    // (memfd_create returns RW), so without sealing they could overwrite the
-    // synthesised /proc content. Best-effort — if F_ADD_SEALS fails (very old
-    // kernel without sealing support), we still inject the fd, since the child
-    // is still bounded by everything else in the policy.
-    let seals = libc::F_SEAL_SEAL | libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK;
-    unsafe { libc::fcntl(raw, libc::F_ADD_SEALS, seals) };
-
-    // Move the OwnedFd into InjectFdSend — send_response will close it after the ioctl.
-    NotifAction::InjectFdSend { srcfd: memfd, newfd_flags: libc::O_CLOEXEC as u32 }
 }
 
 // ============================================================

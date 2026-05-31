@@ -49,6 +49,46 @@ def test_inject_fd_send_rejects_negative_srcfd():
         NotifAction.inject_fd_send(-1)
 
 
+def test_inject_bytes_returns_injectfdsend_with_readable_content():
+    import os
+    a = NotifAction.inject_bytes(b"hello-bytes")
+    assert a.kind == 4  # SANDLOCK_ACTION_INJECT_FD_SEND
+    assert a.newfd_flags == os.O_CLOEXEC
+    try:
+        assert os.pread(a.srcfd, 64, 0) == b"hello-bytes"
+    finally:
+        os.close(a.srcfd)  # not dispatched in this test, so we close it
+
+
+def test_inject_bytes_seals_read_only_by_default():
+    import os, fcntl
+    a = NotifAction.inject_bytes(b"x")
+    try:
+        seals = fcntl.fcntl(a.srcfd, fcntl.F_GET_SEALS)
+        assert seals & fcntl.F_SEAL_WRITE
+    finally:
+        os.close(a.srcfd)
+
+
+def test_inject_bytes_writable_skips_seal():
+    import os, fcntl
+    a = NotifAction.inject_bytes(b"x", seal=False)
+    try:
+        seals = fcntl.fcntl(a.srcfd, fcntl.F_GET_SEALS)
+        assert not (seals & fcntl.F_SEAL_WRITE)
+    finally:
+        os.close(a.srcfd)
+
+
+def test_inject_bytes_no_cloexec_clears_newfd_flags():
+    import os
+    a = NotifAction.inject_bytes(b"x", cloexec=False)
+    try:
+        assert a.newfd_flags == 0
+    finally:
+        os.close(a.srcfd)
+
+
 def test_notif_action_is_frozen():
     import dataclasses
     a = NotifAction.continue_()
@@ -685,6 +725,121 @@ def test_run_with_handlers_rejects_non_handler():
             cmd=[_SYSTEM_PYTHON, "-c", "pass"],
             handlers=[(257, "not a handler")],
         )
+
+
+# ----------------------------------------------------------------
+# Deferred (off-loop) handler dispatch.
+# ----------------------------------------------------------------
+
+
+def test_is_deferred_handler_detects_async():
+    """Registration treats a handler as deferred iff its `handle` is an
+    `async def`. A synchronous handler runs inline. This pins the helper."""
+    from sandlock.sandbox import _is_deferred_handler
+
+    class Sync(Handler):
+        def handle(self, ctx):
+            return NotifAction.continue_()
+
+    class Async(Handler):
+        async def handle(self, ctx):
+            return NotifAction.continue_()
+
+    assert _is_deferred_handler(Sync()) is False
+    assert _is_deferred_handler(Async()) is True
+
+
+def test_async_handle_delivers_errno_e2e(tmp_dir):
+    """An `async def handle` that awaits and then returns errno(EACCES) must
+    make the child's openat fail with EACCES (exit 7). Proves the trampoline
+    drives the coroutine to completion: if it did not, `handle()` would return
+    a coroutine (not a NotifAction), the handler would be treated as failed,
+    and the KILL policy would terminate the child instead (no exit 7)."""
+    if not os.path.exists(_SYSTEM_PYTHON):
+        pytest.skip(f"{_SYSTEM_PYTHON} not available")
+
+    import asyncio  # noqa: F401  (used inside the handler)
+    import errno as _errno
+
+    probe = tmp_dir / "async-errno-probe.txt"
+    probe.write_text("payload\n")
+    probe_path = str(probe)
+
+    class _AsyncDeny(Handler):
+        on_exception = ExceptionPolicy.KILL
+
+        async def handle(self, ctx):
+            import asyncio
+            await asyncio.sleep(0)  # actually suspend on the event loop
+            path = ctx.read_cstr(ctx.args[1], max_len=4096)
+            if path == probe_path:
+                return NotifAction.errno(_errno.EACCES)
+            return NotifAction.continue_()
+
+    sb = sandlock.Sandbox(fs_readable=[*_PYTHON_READABLE, str(tmp_dir)])
+    script = (
+        "import os, sys\n"
+        "try:\n"
+        "    os.open(%r, os.O_RDONLY)\n"
+        "    sys.exit(0)\n"
+        "except OSError as e:\n"
+        "    sys.exit(7 if e.errno == %d else 8)\n" % (probe_path, _errno.EACCES)
+    )
+    result = sb.run_with_handlers(
+        cmd=[_SYSTEM_PYTHON, "-c", script],
+        handlers=[("openat", _AsyncDeny())],
+    )
+    assert not result.success, result
+    assert result.exit_code == 7, (result.exit_code, result.stderr)
+
+
+def test_async_handle_short_circuits_chain_e2e(tmp_dir):
+    """An `async def handle` is auto-deferred, hence terminal: when it
+    continues, a later handler on the same syscall must NOT run. First
+    handler is async and always continues; second denies the probe. The
+    child opening successfully proves the async handler auto-deferred (a
+    non-deferred async handler driven inline would Continue, letting the
+    second handler deny -> child fails)."""
+    if not os.path.exists(_SYSTEM_PYTHON):
+        pytest.skip(f"{_SYSTEM_PYTHON} not available")
+
+    import errno as _errno
+
+    probe = tmp_dir / "async-chain-probe.txt"
+    probe.write_text("payload\n")
+    probe_path = str(probe)
+
+    class _AsyncContinue(Handler):
+        on_exception = ExceptionPolicy.CONTINUE
+
+        async def handle(self, ctx):
+            import asyncio
+            await asyncio.sleep(0)
+            return NotifAction.continue_()
+
+    class _DenyProbe(Handler):
+        on_exception = ExceptionPolicy.KILL
+
+        def handle(self, ctx):
+            path = ctx.read_cstr(ctx.args[1], max_len=4096)
+            if path == probe_path:
+                return NotifAction.errno(_errno.EACCES)
+            return NotifAction.continue_()
+
+    sb = sandlock.Sandbox(fs_readable=[*_PYTHON_READABLE, str(tmp_dir)])
+    script = (
+        "import os, sys\n"
+        "fd = os.open(%r, os.O_RDONLY)\n"
+        "os.close(fd)\n" % probe_path
+    )
+    result = sb.run_with_handlers(
+        cmd=[_SYSTEM_PYTHON, "-c", script],
+        handlers=[("openat", _AsyncContinue()), ("openat", _DenyProbe())],
+    )
+    assert result.success, (
+        "async handler must auto-defer (terminal), so the deny handler never "
+        f"runs; got {result}"
+    )
 
 
 # ----------------------------------------------------------------

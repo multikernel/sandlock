@@ -3,9 +3,11 @@
 // sends responses.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::io;
 use std::net::IpAddr;
 use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
+use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::error::NotifError;
@@ -42,6 +44,53 @@ impl OnInjectSuccess {
     }
 }
 
+/// A deferred decision: an owned, `'static` future that produces the real
+/// [`NotifAction`] off the supervisor's notification loop.
+///
+/// A handler returns [`NotifAction::Defer`] when computing the response is
+/// slow (a network round-trip, a blocking syscall) and must not stall the
+/// single supervisor task that gates every other trapped syscall.  The
+/// supervisor moves the future onto a worker, lets the loop proceed, and
+/// sends the response (via the still-valid `notif.id`) when the future
+/// resolves.  The future is `'static` because it outlives the borrowed
+/// `HandlerCtx` — capture what you need (`notif` is `Copy`, `notif_fd` is a
+/// `RawFd`) by value rather than borrowing `&self`.
+///
+/// The deferred future need only be `Send` (not `Sync`): the supervisor
+/// moves it onto a worker task and never shares it by reference.  Requiring
+/// `Sync` of user futures would be a leaky bound (it would reject a future
+/// capturing, say, a `Cell`), so it is not required.
+pub struct Deferred(Pin<Box<dyn Future<Output = NotifAction> + Send + 'static>>);
+
+// Safety: `NotifAction` must stay `Sync` so it can live in `Sync` contexts
+// (handler `&self` state, etc.; the `Handler` trait is `Send + Sync`), which
+// requires `Deferred: Sync`.  A `Send`-only future is not `Sync`, but the
+// boxed future is unreachable through a shared `&Deferred`: the field is
+// private, `Debug` touches only a static string, and `run(self)` consumes
+// the value (it is never callable through `&self`).  With no path to poll or
+// read the future via a shared reference, sharing `&Deferred` across threads
+// cannot race, so asserting `Sync` is sound while keeping user futures
+// `Send`-only.
+unsafe impl Sync for Deferred {}
+
+impl std::fmt::Debug for Deferred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Deferred(<future>)")
+    }
+}
+
+impl Deferred {
+    pub fn new<F: Future<Output = NotifAction> + Send + 'static>(f: F) -> Self {
+        Self(Box::pin(f))
+    }
+
+    /// Drive the deferred future to its terminal action.  Consumes `self`
+    /// because the future is run exactly once, on a worker task.
+    pub async fn run(self) -> NotifAction {
+        self.0.await
+    }
+}
+
 /// How the supervisor should respond to a notification.
 #[derive(Debug)]
 pub enum NotifAction {
@@ -72,6 +121,100 @@ pub enum NotifAction {
     /// Kill the child process group (OOM-kill semantics).
     /// Fields: signal, process group leader pid.
     Kill { sig: i32, pgid: i32 },
+    /// Defer the response: run the carried future on a worker task and
+    /// send its terminal action later, keyed by `notif.id`.  Non-`Continue`,
+    /// so it short-circuits the handler chain — a deferring handler makes a
+    /// terminal decision.  See [`Deferred`].
+    Defer(Deferred),
+}
+
+impl NotifAction {
+    /// Construct a [`NotifAction::Defer`] from a `'static` future.  Ergonomic
+    /// shorthand for `NotifAction::Defer(Deferred::new(fut))`.
+    pub fn defer<F: Future<Output = NotifAction> + Send + 'static>(fut: F) -> Self {
+        NotifAction::Defer(Deferred::new(fut))
+    }
+
+    /// Inject `content` into the child as the syscall's returned fd, backed by
+    /// a sealed (read-only, fixed-size), `O_CLOEXEC` in-memory file.
+    ///
+    /// The fd is created, populated, sealed, and owned end to end by sandlock;
+    /// the caller never sees or closes it. On allocation failure this collapses
+    /// to `Errno(EIO)`, so a handler can return it directly:
+    ///
+    /// ```ignore
+    /// return NotifAction::inject_bytes(&secret);
+    /// ```
+    ///
+    /// For a *writable* injected fd, build one with
+    /// [`content_memfd(content, false)`](content_memfd) and pass it to
+    /// [`NotifAction::InjectFdSend`] yourself.
+    pub fn inject_bytes(content: &[u8]) -> NotifAction {
+        match content_memfd(content, true) {
+            Ok(fd) => NotifAction::InjectFdSend {
+                srcfd: fd,
+                newfd_flags: libc::O_CLOEXEC as u32,
+            },
+            Err(_) => NotifAction::Errno(libc::EIO),
+        }
+    }
+}
+
+/// Create an anonymous in-memory file ("memfd") populated with `content` and
+/// rewound to offset 0, ready to inject as a syscall's returned fd via
+/// [`NotifAction::InjectFdSend`].
+///
+/// When `seal` is true the fd is sealed read-only and fixed-size
+/// (`F_SEAL_SEAL | F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK`) so the guest
+/// cannot modify or resize the content it is handed. Sealing is best-effort:
+/// on a kernel without sealing support the fd is still returned, bounded by
+/// the rest of the policy. Pass `false` only when the guest genuinely needs a
+/// writable injected fd.
+///
+/// Most callers want [`NotifAction::inject_bytes`], which wraps this in the
+/// common sealed + `O_CLOEXEC` configuration.
+pub fn content_memfd(content: &[u8], seal: bool) -> io::Result<OwnedFd> {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::unix::io::FromRawFd;
+
+    let flags = if seal {
+        (libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) as u32
+    } else {
+        libc::MFD_CLOEXEC as u32
+    };
+    let memfd = crate::sys::syscall::memfd_create("sandlock-content", flags)?;
+
+    // Write the content and rewind. Borrow the raw fd for File I/O without
+    // transferring ownership: `memfd` (the OwnedFd) keeps owning it.
+    {
+        let raw = memfd.as_raw_fd();
+        let mut file = unsafe { std::fs::File::from_raw_fd(raw) };
+        let res = file
+            .write_all(content)
+            .and_then(|()| file.seek(SeekFrom::Start(0)).map(|_| ()));
+        std::mem::forget(file); // don't close `raw`; `memfd` still owns it
+        res?;
+    }
+
+    if seal {
+        // Best-effort: ignore failure on kernels lacking sealing support.
+        let seals =
+            libc::F_SEAL_SEAL | libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK;
+        unsafe { libc::fcntl(memfd.as_raw_fd(), libc::F_ADD_SEALS, seals) };
+    }
+
+    Ok(memfd)
+}
+
+/// Collapse a deferred future's resolved action into a sendable terminal
+/// action.  A deferred future that itself resolves to `Defer` is a bug
+/// (no nested deferral); collapse it to `EIO` so the trapped child gets a
+/// definite response instead of wedging forever waiting for one.
+fn finalize_deferred(action: NotifAction) -> NotifAction {
+    match action {
+        NotifAction::Defer(_) => NotifAction::Errno(libc::EIO),
+        other => other,
+    }
 }
 
 // ============================================================
@@ -599,6 +742,13 @@ fn send_response(fd: RawFd, id: u64, action: NotifAction) -> io::Result<()> {
         }
         NotifAction::ReturnValue(val) => respond_value(fd, id, val),
         NotifAction::Hold => Ok(()), // Don't send a response.
+        NotifAction::Defer(_) => {
+            // Defer is intercepted in `handle_notification` and never reaches
+            // here on the normal path. If it ever does, fail closed with EIO
+            // rather than dropping the future and wedging the child.
+            debug_assert!(false, "Defer reached send_response; should be intercepted earlier");
+            respond_errno(fd, id, libc::EIO)
+        }
         NotifAction::Kill { sig, pgid } => {
             // Kill the entire process group, then return ENOMEM so the
             // seccomp notification is resolved (avoids a kernel warning).
@@ -1009,11 +1159,59 @@ async fn emit_policy_event(
 
 /// Process a single seccomp notification: vDSO re-patch, path denial check,
 /// dispatch, policy event emission, and response.
+/// Maximum number of deferred handler futures running concurrently. Caps
+/// the worker fan-out (and any resources those workers hold, e.g. memfds or
+/// sockets) so a burst of deferrals cannot exhaust the supervisor process.
+const DEFER_MAX_INFLIGHT: usize = 64;
+
+/// Maximum time a deferred handler future may run before the supervisor gives
+/// up and fails the trapped syscall closed. Bounds the worst case so a hung
+/// future (e.g. a stalled network fetch in a token-injection handler) cannot
+/// park the child forever or permanently leak its `DEFER_MAX_INFLIGHT` slot.
+const DEFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Drive a deferred future to its terminal action, bounded by `limit`.
+///
+/// On timeout, fail closed with `EIO` so the trapped child gets a definite
+/// response instead of parking forever; `finalize_deferred` still guards a
+/// future that resolves to a nested `Defer`.
+async fn run_deferred_within(deferred: Deferred, limit: std::time::Duration) -> NotifAction {
+    match tokio::time::timeout(limit, deferred.run()).await {
+        Ok(action) => finalize_deferred(action),
+        Err(_) => {
+            eprintln!(
+                "sandlock: deferred handler exceeded {:?}; failing syscall with EIO",
+                limit
+            );
+            NotifAction::Errno(libc::EIO)
+        }
+    }
+}
+
+/// Spawn a worker task that drives a deferred handler future to its terminal
+/// action and sends the seccomp response, keyed by `id`. The `permit` is
+/// held for the worker's lifetime, releasing its `DEFER_MAX_INFLIGHT` slot on
+/// completion. A stale `id` (child exited mid-defer) makes `send_response`
+/// a no-op, matching the inline path's "child may have exited" tolerance.
+fn spawn_deferred(
+    fd: RawFd,
+    id: u64,
+    deferred: Deferred,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) {
+    tokio::spawn(async move {
+        let _permit = permit; // released when the worker finishes
+        let action = run_deferred_within(deferred, DEFER_TIMEOUT).await;
+        let _ = send_response(fd, id, action);
+    });
+}
+
 async fn handle_notification(
     notif: SeccompNotif,
     ctx: &Arc<super::ctx::SupervisorCtx>,
     dispatch_table: &super::dispatch::DispatchTable,
     fd: RawFd,
+    defer_sem: &Arc<tokio::sync::Semaphore>,
 ) {
     let policy = &ctx.policy;
 
@@ -1138,6 +1336,34 @@ async fn handle_notification(
         }
     }
 
+    // Deferred response: run the handler's future on a worker task so the
+    // single supervisor loop is not blocked waiting for slow work (a network
+    // round-trip, a blocking syscall). The trapped child stays parked in the
+    // syscall; the worker sends the real response later, keyed by notif.id.
+    //
+    // Deferral is refused on syscalls whose Continue path requires the
+    // execve argv-safety freeze or fork creation-tracking: sending the
+    // response off-loop would skip that TOCTOU-closing work. (When `action`
+    // is Defer it is not Continue, so `exec_freeze`/`creation_trace` above
+    // are already None — there is nothing to unwind here.)
+    if let NotifAction::Defer(deferred) = action {
+        if crate::freeze::requires_freeze_on_continue(nr)
+            || crate::resource::requires_process_creation_tracking(&notif, fd, policy)
+        {
+            let _ = send_response(fd, notif.id, NotifAction::Errno(libc::EPERM));
+            return;
+        }
+        match Arc::clone(defer_sem).try_acquire_owned() {
+            Ok(permit) => spawn_deferred(fd, notif.id, deferred, permit),
+            // Too many deferrals in flight: fail fast with EAGAIN rather than
+            // blocking the loop or letting unbounded workers accrete.
+            Err(_) => {
+                let _ = send_response(fd, notif.id, NotifAction::Errno(libc::EAGAIN));
+            }
+        }
+        return;
+    }
+
     // Ignore error — child may have exited between recv and response.
     let exec_continued = exec_freeze.is_some() && matches!(action, NotifAction::Continue);
     let send_result = send_response(fd, notif.id, action);
@@ -1226,6 +1452,11 @@ pub async fn supervisor(
     // still per-child pidfd readiness in `spawn_pid_watcher`.
     let gc = tokio::spawn(process_index_gc(Arc::clone(&ctx.processes)));
 
+    // Bounds the number of in-flight deferred handler futures (see
+    // `DEFER_MAX_INFLIGHT`). Shared across all notifications this supervisor
+    // processes.
+    let defer_sem = Arc::new(tokio::sync::Semaphore::new(DEFER_MAX_INFLIGHT));
+
     // Edge-triggered drain: each `readable().await` returns once per
     // epoll edge, then we drain the kernel queue via `probe_notif_fd`
     // until empty. The drain is necessary because tokio's AsyncFd is
@@ -1251,7 +1482,7 @@ pub async fn supervisor(
                         Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
                         Err(_) => break 'outer,
                     };
-                    handle_notification(notif, &ctx, &dispatch_table, fd).await;
+                    handle_notification(notif, &ctx, &dispatch_table, fd, &defer_sem).await;
                 }
                 NotifFdState::Empty => break,
                 NotifFdState::Terminal => break 'outer,
@@ -1442,6 +1673,120 @@ mod tests {
         let _ = format!("{:?}", NotifAction::ReturnValue(42));
         let _ = format!("{:?}", NotifAction::Hold);
         let _ = format!("{:?}", NotifAction::Kill { sig: 9, pgid: 1 });
+        let _ = format!("{:?}", NotifAction::defer(async { NotifAction::Continue }));
+    }
+
+    #[tokio::test]
+    async fn deferred_future_need_not_be_sync() {
+        // A deferred future may capture Send-but-not-Sync state across an
+        // await. `Cell` is Send but never Sync; holding it across `.await`
+        // makes the future !Sync. Only `Send` is required (the supervisor
+        // moves the future to a worker, never shares it by reference).
+        use std::cell::Cell;
+        let action = NotifAction::defer(async move {
+            let counter = Cell::new(0);
+            counter.set(counter.get() + 41);
+            tokio::task::yield_now().await; // hold the !Sync Cell across await
+            NotifAction::ReturnValue(counter.get() + 1)
+        });
+        let NotifAction::Defer(d) = action else { panic!("expected Defer") };
+        assert!(matches!(d.run().await, NotifAction::ReturnValue(42)));
+    }
+
+    #[tokio::test]
+    async fn deferred_runs_to_its_terminal_action() {
+        // A Defer carries a future; running it yields the deferred decision.
+        let action = NotifAction::defer(async { NotifAction::ReturnValue(7) });
+        let NotifAction::Defer(deferred) = action else {
+            panic!("defer() must construct a NotifAction::Defer");
+        };
+        assert!(matches!(deferred.run().await, NotifAction::ReturnValue(7)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deferred_times_out_to_eio() {
+        // A deferred future that exceeds its limit must fail closed (EIO) so
+        // the trapped child gets a definite response instead of parking
+        // forever (and leaking its DEFER_MAX_INFLIGHT slot).
+        let slow = Deferred::new(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            NotifAction::ReturnValue(7)
+        });
+        let action = run_deferred_within(slow, std::time::Duration::from_secs(1)).await;
+        assert!(matches!(action, NotifAction::Errno(e) if e == libc::EIO));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deferred_within_limit_passes_through() {
+        // A future that resolves within the limit returns its terminal action.
+        let fast = Deferred::new(async { NotifAction::ReturnValue(7) });
+        let action = run_deferred_within(fast, std::time::Duration::from_secs(1)).await;
+        assert!(matches!(action, NotifAction::ReturnValue(7)));
+    }
+
+    #[test]
+    fn finalize_deferred_collapses_nested_defer_to_eio() {
+        // A deferred future that itself resolves to Defer is a bug: collapse
+        // to EIO so the trapped child is never wedged waiting for a response.
+        let nested = NotifAction::defer(async { NotifAction::Continue });
+        assert!(matches!(finalize_deferred(nested), NotifAction::Errno(e) if e == libc::EIO));
+        // Non-nested terminal actions pass through unchanged.
+        assert!(matches!(finalize_deferred(NotifAction::Continue), NotifAction::Continue));
+        assert!(matches!(
+            finalize_deferred(NotifAction::ReturnValue(3)),
+            NotifAction::ReturnValue(3)
+        ));
+    }
+
+    #[test]
+    fn content_memfd_roundtrips_content() {
+        use std::io::Read;
+        let fd = content_memfd(b"hello world", true).expect("content_memfd");
+        // The fd is rewound to offset 0, so a plain read returns the content.
+        let mut f = std::fs::File::from(fd);
+        let mut buf = String::new();
+        f.read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "hello world");
+    }
+
+    #[test]
+    fn content_memfd_sealed_applies_write_seal() {
+        let fd = content_memfd(b"data", true).expect("content_memfd");
+        let seals = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GET_SEALS) };
+        assert!(seals >= 0, "F_GET_SEALS failed");
+        assert!(
+            seals & libc::F_SEAL_WRITE != 0,
+            "expected F_SEAL_WRITE on a sealed memfd, got {seals:#x}"
+        );
+    }
+
+    #[test]
+    fn content_memfd_unsealed_has_no_write_seal() {
+        let fd = content_memfd(b"data", false).expect("content_memfd");
+        let seals = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GET_SEALS) };
+        assert!(seals >= 0, "F_GET_SEALS failed");
+        assert_eq!(
+            seals & libc::F_SEAL_WRITE,
+            0,
+            "unsealed memfd must not carry a write seal, got {seals:#x}"
+        );
+    }
+
+    #[test]
+    fn inject_bytes_produces_sealed_cloexec_injectfdsend() {
+        use std::io::Read;
+        match NotifAction::inject_bytes(b"payload") {
+            NotifAction::InjectFdSend { srcfd, newfd_flags } => {
+                assert_eq!(newfd_flags, libc::O_CLOEXEC as u32);
+                let seals = unsafe { libc::fcntl(srcfd.as_raw_fd(), libc::F_GET_SEALS) };
+                assert!(seals & libc::F_SEAL_WRITE != 0, "inject_bytes must seal");
+                let mut f = std::fs::File::from(srcfd);
+                let mut buf = String::new();
+                f.read_to_string(&mut buf).unwrap();
+                assert_eq!(buf, "payload");
+            }
+            other => panic!("expected InjectFdSend, got {other:?}"),
+        }
     }
 
     #[test]
