@@ -21,7 +21,6 @@ mod supervisor;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use serde::{Deserialize, Serialize};
 use state::{ContainerState, Status};
 use std::path::PathBuf;
 

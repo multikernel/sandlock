@@ -12,7 +12,6 @@ use oci_spec::runtime::Spec;
 use sandlock_core::sandbox::{ByteSize, Sandbox, SandboxBuilder};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::ffi::CString;
 use std::path::{Path, PathBuf};
 
 /// Serializable OCI-to-sandlock policy representation.
@@ -138,11 +137,13 @@ impl OciPolicy {
         })
     }
 
-    /// Convert this OCI policy into a `Sandbox` for the supervisor's use.
+    /// Convert this OCI policy into a [`Sandbox`] ready to be driven by
+    /// `create_interactive()` + `start()` + `wait()`.
     ///
-    /// The supervisor uses this to configure the seccomp notifier, resource
-    /// tracking, and network policy.  The returned Sandbox is not started —
-    /// it is only used for its configuration fields.
+    /// The resulting `Sandbox` carries: chroot, filesystem rules (read/write/
+    /// mount), working directory, environment (clean), resource limits (memory,
+    /// CPU, process count), and bind-mount mappings.  The caller is responsible
+    /// for calling `sandbox.set_name(id)` and then `create_interactive`.
     pub fn to_sandbox(&self) -> Result<Sandbox> {
         let mut builder = SandboxBuilder::default();
 
@@ -164,6 +165,9 @@ impl OciPolicy {
             builder = builder.cwd(cwd);
         }
 
+        // Start from a clean environment so the container sees exactly the
+        // vars declared in the OCI spec, not the supervisor's inherited env.
+        builder = builder.clean_env(true);
         for (k, v) in &self.env {
             builder = builder.env_var(k, v);
         }
@@ -178,133 +182,7 @@ impl OciPolicy {
             builder = builder.max_cpu(cpu);
         }
 
-        // Build without cross-section validation since we're constructing from
-        // a spec that may omit some fields that the builder requires.
         builder.build_unchecked().map_err(Into::into)
-    }
-
-    /// Apply filesystem confinement (Landlock rules) to the current process.
-    ///
-    /// This sets NO_NEW_PRIVS and installs the Landlock filesystem filter.
-    /// It must be called in the child process after SIGCONT and before execve.
-    pub fn confine(&self) -> Result<()> {
-        let confinement = self.to_confinement();
-        sandlock_core::confine(&confinement).map_err(Into::into)
-    }
-
-    /// Convert the OCI policy into a `Confinement` for Landlock application.
-    fn to_confinement(&self) -> sandlock_core::Confinement {
-        let mut builder = sandlock_core::ConfinementBuilder::default();
-        for path in &self.fs_read {
-            builder = builder.fs_read(path);
-        }
-        for path in &self.fs_write {
-            builder = builder.fs_write(path);
-        }
-        builder.build()
-    }
-
-    /// Apply namespace-like setup and exec the command.
-    ///
-    /// This is called in the SIGSTOP'd child process after SIGCONT:
-    ///   1. chroot (if rootfs is configured)
-    ///   2. chdir to the spec's cwd (or chroot root)
-    ///   3. Set environment variables from the spec
-    ///   4. Apply Landlock confinement
-    ///   5. execvp the command
-    ///
-    /// This function never returns on success.  On failure it prints to
-    /// stderr and calls `_exit(127)`.
-    pub fn apply_and_exec(&self, cmd: &[String]) -> ! {
-        // 1. chroot into rootfs if configured
-        if let Some(ref rootfs) = self.rootfs {
-            let rootfs_cstr = match CString::new(rootfs.to_string_lossy().as_ref()) {
-                Ok(c) => c,
-                Err(_) => {
-                    eprintln!("sandlock-oci: rootfs path contains NUL byte");
-                    unsafe { libc::_exit(127) };
-                }
-            };
-            if unsafe { libc::chroot(rootfs_cstr.as_ptr()) } != 0 {
-                let err = std::io::Error::last_os_error();
-                eprintln!("sandlock-oci: chroot({:?}) failed: {}", rootfs, err);
-                unsafe { libc::_exit(127) };
-            }
-            // After chroot, ensure we're inside the new root
-            if unsafe { libc::chdir(b"/\0".as_ptr() as *const libc::c_char) } != 0 {
-                let err = std::io::Error::last_os_error();
-                eprintln!("sandlock-oci: chdir(/) after chroot failed: {}", err);
-                unsafe { libc::_exit(127) };
-            }
-        }
-
-        // 2. Change working directory
-        if let Some(ref cwd) = self.cwd {
-            let target = if self.rootfs.is_some() {
-                // cwd is already relative to the chroot
-                cwd.strip_prefix("/").unwrap_or(cwd)
-            } else {
-                cwd
-            };
-            let target_cstr = match CString::new(target.to_string_lossy().as_ref()) {
-                Ok(c) => c,
-                Err(_) => {
-                    eprintln!("sandlock-oci: cwd path contains NUL byte");
-                    unsafe { libc::_exit(127) };
-                }
-            };
-            if unsafe { libc::chdir(target_cstr.as_ptr()) } != 0 {
-                let err = std::io::Error::last_os_error();
-                eprintln!("sandlock-oci: chdir({:?}) failed: {}", cwd, err);
-                unsafe { libc::_exit(127) };
-            }
-        }
-
-        // 3. Set environment variables
-        // Clear existing environment first if any env vars are specified
-        if !self.env.is_empty() {
-            // Remove all existing env vars that aren't in the spec
-            for (key, _) in std::env::vars_os() {
-                // Keep PATH if the spec doesn't provide one (fallback safety)
-                if key == "PATH" && !self.env.contains_key("PATH") {
-                    continue;
-                }
-                std::env::remove_var(&key);
-            }
-        }
-        for (key, value) in &self.env {
-            std::env::set_var(key, value);
-        }
-
-        // 4. Apply Landlock confinement
-        if let Err(e) = self.confine() {
-            eprintln!("sandlock-oci: failed to confine process: {}", e);
-            unsafe { libc::_exit(127) };
-        }
-
-        // 5. execvp
-        let c_args: Vec<CString> = cmd
-            .iter()
-            .map(|a| {
-                CString::new(a.as_str()).unwrap_or_else(|_| {
-                    eprintln!("sandlock-oci: invalid argument string");
-                    unsafe { libc::_exit(127) };
-                })
-            })
-            .collect();
-        let mut ptrs: Vec<*const libc::c_char> = c_args.iter().map(|a| a.as_ptr()).collect();
-        ptrs.push(std::ptr::null());
-
-        eprintln!(
-            "sandlock-oci: execvp({:?})",
-            c_args.first().map(|c| c.to_string_lossy())
-        );
-        unsafe { libc::execvp(c_args[0].as_ptr(), ptrs.as_ptr()) };
-
-        // execvp failed
-        let err = std::io::Error::last_os_error();
-        eprintln!("sandlock-oci: execvp failed: {}", err);
-        unsafe { libc::_exit(127) };
     }
 }
 

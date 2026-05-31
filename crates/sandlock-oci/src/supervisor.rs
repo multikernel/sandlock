@@ -1,44 +1,40 @@
-//! Supervisor process — manages the child lifecycle via signal synchronization.
+//! Supervisor process — drives the OCI container lifecycle via sandlock-core.
 //!
-//! Implements Phase 2 of the plan: the Supervisor forks the child (User
-//! Application), parks it in a wait state, then on `start` triggers `execve`.
+//! `run_supervisor` converts the OCI policy into a `sandlock_core::Sandbox` and
+//! drives the two-phase OCI lifecycle:
 //!
-//! Communication with the CLI is via a Unix socket written to the state dir.
+//! 1. `sandbox.create_interactive(cmd)` — forks the child, installs the full
+//!    sandlock policy (Landlock + seccomp-notify + resource limits + network
+//!    ACL), and parks the child before execve.
+//! 2. The supervisor writes the child PID to the caller's pipe and then waits
+//!    on its Unix socket for a `Start` command.
+//! 3. On `Start`: `sandbox.start()` releases the parked child to execve.
+//! 4. `sandbox.wait()` collects the exit status and persists it to state.json.
 //!
-//! Lifecycle:
-//!
-//! 1. Supervisor creates a Unix socket and forks the child.
-//! 2. The child SIGSTOPs itself immediately.
-//! 3. The supervisor writes child PID to the pipe (for the CLI to read
-//!    synchronously, no sleep/race), then enters an accept loop.
-//! 4. On `start`: supervisor sends SIGCONT to the child.  The child wakes
-//!    up, applies Landlock confinement + chroot + cwd + env, then execs.
-//! 5. On `ping`: supervisor replies with the child PID.
-//! 6. After the child exits, the supervisor updates state to Stopped and
-//!    returns.
+//! Communication with the CLI is newline-delimited JSON over a Unix socket in
+//! the container's state directory.
 
-use anyhow::{bail, Context, Result};
-use std::os::unix::net::UnixListener;
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::policy::OciPolicy;
 use crate::state::ContainerState;
 
-/// Filename of the supervisor's control socket inside the state dir.
+/// Filename of the supervisor control socket inside the container state dir.
 pub const SUPERVISOR_SOCKET: &str = "supervisor.sock";
 
 /// Commands the CLI sends to the Supervisor over the Unix socket.
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "cmd", rename_all = "lowercase")]
 pub enum SupervisorCmd {
-    /// Tell the supervisor to release the child (trigger execve).
+    /// Release the parked child to execve.
     Start,
-    /// Request the current PID.
+    /// Query the child PID.
     Ping,
 }
 
-/// Response from the Supervisor.
+/// Responses from the Supervisor.
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "result", rename_all = "lowercase")]
 pub enum SupervisorReply {
@@ -54,10 +50,9 @@ pub fn socket_path(id: &str) -> PathBuf {
         .join(SUPERVISOR_SOCKET)
 }
 
-/// Send a command to an already-running supervisor and return its reply.
+/// Send a command to a running supervisor and return its reply (blocking).
 ///
 /// The protocol is newline-delimited JSON over a Unix socket.
-/// Each request and response is a single JSON line terminated with '\n'.
 pub fn send_command(id: &str, cmd: SupervisorCmd) -> Result<SupervisorReply> {
     use std::io::{BufRead, Write};
     use std::os::unix::net::UnixStream;
@@ -67,288 +62,168 @@ pub fn send_command(id: &str, cmd: SupervisorCmd) -> Result<SupervisorReply> {
         .with_context(|| format!("connect to supervisor socket {:?}", path))?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
 
-    // Write the command as a newline-terminated JSON line.
     let msg = serde_json::to_string(&cmd)?;
     stream.write_all(msg.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
 
-    // Read a single newline-delimited response line, which avoids ambiguity
-    // if the stream stays open for future commands.
     let mut reader = std::io::BufReader::new(&stream);
     let mut line = String::new();
     reader.read_line(&mut line)?;
 
-    let reply: SupervisorReply = serde_json::from_str(line.trim())
-        .context("parse supervisor reply")?;
-    Ok(reply)
+    serde_json::from_str(line.trim()).context("parse supervisor reply")
 }
 
-/// Run the supervisor event loop in the **current process**.
+/// Run the supervisor in the **current process**.
 ///
-/// # Arguments
-///
-/// * `id` — container identifier
-/// * `cmd` — the command the child should exec after SIGCONT
-/// * `policy` — the OCI policy to apply to the child (chroot, env, resources)
-/// * `pid_write_fd` — raw fd to write the child PID to (owned by caller)
-///
-/// The child applies confinement itself after being released via SIGCONT.
-/// This function never returns except on fatal error.
+/// Builds a `Sandbox` from the OCI policy, drives the full create/start/wait
+/// lifecycle using `sandlock_core`, and communicates the child PID back to the
+/// CLI via `pid_write_fd`.
 pub fn run_supervisor(
     id: &str,
     cmd: &[String],
     policy: OciPolicy,
     pid_write_fd: i32,
 ) -> Result<()> {
-    use std::io::{Read, Write};
-
-    // Validate the command is non-empty (OCI spec requirement).
     if cmd.is_empty() {
-        bail!("OCI spec error: process.args is empty; cannot run a container with no command");
+        anyhow::bail!("OCI spec error: process.args is empty");
     }
 
-    let sock_path = socket_path(id);
+    // Build the Sandbox from the OCI policy — this carries chroot, env, fs
+    // rules, resource limits, and network policy into sandlock-core.
+    let mut sandbox = policy.to_sandbox().context("build Sandbox from OCI policy")?;
+    sandbox.set_name(id);
 
-    // Create the listener before forking so it's ready before the CLI calls start.
+    let sock_path = socket_path(id);
     if sock_path.exists() {
         std::fs::remove_file(&sock_path).ok();
     }
+
+    // A multi-threaded runtime is required: sandlock-core spawns tokio tasks
+    // for the seccomp-notify supervisor, CPU throttle, and load-avg tracking.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime")?;
+
+    rt.block_on(supervisor_main(id, cmd, sandbox, sock_path, pid_write_fd))
+}
+
+/// Async body of `run_supervisor`.
+async fn supervisor_main(
+    id: &str,
+    cmd: &[String],
+    mut sandbox: sandlock_core::Sandbox,
+    sock_path: PathBuf,
+    pid_write_fd: i32,
+) -> Result<()> {
+    use sandlock_core::ExitStatus;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixListener;
+
+    use crate::state::ExitInfo;
+
+    // Bind the socket BEFORE create() so the CLI can call `start` the moment
+    // `create` returns without a race on socket availability.
     let listener = UnixListener::bind(&sock_path)
         .with_context(|| format!("bind supervisor socket {:?}", sock_path))?;
 
-    // ── Fork child and immediately SIGSTOP it ────────────────────────────────
-    let child_pid = unsafe { libc::fork() };
-    if child_pid < 0 {
-        bail!("fork failed: {}", std::io::Error::last_os_error());
+    // OCI `create` — forks the child, installs the full sandlock policy
+    // (seccomp-notify + Landlock + resource limits + network ACL), and parks
+    // the child before execve using a pipe rather than SIGSTOP.
+    let cmd_refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
+    sandbox
+        .create_interactive(&cmd_refs)
+        .await
+        .context("sandbox create_interactive")?;
+
+    let child_pid = sandbox.pid().unwrap_or(0) as i32;
+
+    // Notify the CLI of the child PID so it can write the pid-file and update
+    // state without racing. This fd is write-once then closed.
+    {
+        let s = format!("{}\n", child_pid);
+        unsafe {
+            libc::write(pid_write_fd, s.as_ptr() as *const libc::c_void, s.len());
+            libc::close(pid_write_fd);
+        }
     }
 
-    if child_pid == 0 {
-        // ===== CHILD PROCESS =====
+    // Persist Created state with the real child PID.
+    {
+        let mut state = ContainerState::load(id).unwrap_or_else(|_| {
+            ContainerState::new(id, Path::new("/"), "1.0.2")
+        });
+        state.set_created(child_pid);
+        state.save().ok();
+    }
 
-        // Close the parent's copy of the pid pipe — child doesn't use it.
-        unsafe { libc::close(pid_write_fd) };
+    // Accept-loop: serve CLI commands until `Start` is received.
+    loop {
+        let (mut stream, _) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(_) => break,
+        };
 
-        // Stop ourselves and wait for SIGCONT from the supervisor.
-        unsafe {
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
-            libc::raise(libc::SIGSTOP);
+        let mut buf = vec![0u8; 4096];
+        let n = stream.read(&mut buf).await.unwrap_or(0);
+        if n == 0 {
+            continue;
         }
 
-        // After SIGCONT, the child is now running.
-        // Apply confinement, chdir, env, then exec.
-        // These are all applied in the child process — the supervisor never
-        // chroots or changes its own environment.
-
-        // 1. Apply chroot if the policy has a rootfs.
-        if let Some(ref rootfs) = policy.rootfs {
-            let rootfs_cstr = match std::ffi::CString::new(rootfs.to_string_lossy().as_ref()) {
-                Ok(c) => c,
-                Err(_) => {
-                    eprintln!("sandlock-oci: rootfs path contains NUL byte");
-                    unsafe { libc::_exit(127) };
-                }
-            };
-            if unsafe { libc::chroot(rootfs_cstr.as_ptr()) } != 0 {
-                let err = std::io::Error::last_os_error();
-                eprintln!("sandlock-oci: chroot({:?}) failed: {}", rootfs, err);
-                unsafe { libc::_exit(127) };
-            }
-            if unsafe { libc::chdir(b"/\0".as_ptr() as *const libc::c_char) } != 0 {
-                let err = std::io::Error::last_os_error();
-                eprintln!("sandlock-oci: chdir(/) after chroot failed: {}", err);
-                unsafe { libc::_exit(127) };
-            }
-        }
-
-        // 2. Change working directory.
-        if let Some(ref cwd) = policy.cwd {
-            let cwd_cstr = match std::ffi::CString::new(cwd.to_string_lossy().as_ref()) {
-                Ok(c) => c,
-                Err(_) => {
-                    eprintln!("sandlock-oci: cwd path contains NUL byte");
-                    unsafe { libc::_exit(127) };
-                }
-            };
-            if unsafe { libc::chdir(cwd_cstr.as_ptr()) } != 0 {
-                let err = std::io::Error::last_os_error();
-                eprintln!("sandlock-oci: chdir({:?}) failed: {}", cwd, err);
-                unsafe { libc::_exit(127) };
-            }
-        }
-
-        // 3. Set environment variables from the spec.
-        // Clear all existing env vars if the spec provides any.
-        if !policy.env.is_empty() {
-            for (key, _) in std::env::vars_os() {
-                // Keep PATH as a fallback if the spec doesn't override it.
-                if key == "PATH" && !policy.env.contains_key("PATH") {
-                    continue;
-                }
-                std::env::remove_var(&key);
-            }
-        }
-        for (key, value) in &policy.env {
-            std::env::set_var(key, value);
-        }
-
-        // 4. Apply Landlock filesystem confinement (irreversible).
-        if let Err(e) = policy.confine() {
-            eprintln!("sandlock-oci: failed to apply Landlock confinement: {}", e);
-            unsafe { libc::_exit(127) };
-        }
-
-        // 5. execvp — the child is now fully confined.
-        let prog = match std::ffi::CString::new(cmd[0].as_str()) {
+        let incoming: SupervisorCmd = match serde_json::from_slice(&buf[..n]) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("sandlock-oci: invalid command string: {}", e);
-                unsafe { libc::_exit(127) };
+                let reply = serde_json::to_vec(&SupervisorReply::Err { msg: e.to_string() })
+                    .unwrap_or_default();
+                let _ = stream.write_all(&reply).await;
+                let _ = stream.write_all(b"\n").await;
+                continue;
             }
         };
-        let c_args: Vec<std::ffi::CString> = cmd
-            .iter()
-            .map(|a| {
-                std::ffi::CString::new(a.as_str()).unwrap_or_else(|_| {
-                    eprintln!("sandlock-oci: invalid argument string");
-                    unsafe { libc::_exit(127) };
-                })
-            })
-            .collect();
-        let mut ptrs: Vec<*const libc::c_char> = c_args.iter().map(|a| a.as_ptr()).collect();
-        ptrs.push(std::ptr::null());
 
-        unsafe { libc::execvp(prog.as_ptr(), ptrs.as_ptr()) };
-
-        // execvp failed
-        let err = std::io::Error::last_os_error();
-        eprintln!("sandlock-oci: execvp({:?}) failed: {}", cmd[0], err);
-        unsafe { libc::_exit(127) };
-    }
-
-    // ===== PARENT (Supervisor) =====
-
-    // Write the child PID to the pipe immediately so the CLI can read it
-    // synchronously without sleeping or racing.
-    let pid_str = format!("{}\n", child_pid);
-    unsafe {
-        libc::write(
-            pid_write_fd,
-            pid_str.as_ptr() as *const libc::c_void,
-            pid_str.len(),
-        );
-        libc::close(pid_write_fd);
-    }
-
-    // Update state with the child PID. Status is Created because it's SIGSTOP'd.
-    let mut state = ContainerState::load(id).unwrap_or_else(|_| {
-        ContainerState::new(id, Path::new("/"), "1.0.2")
-    });
-    state.set_created(child_pid);
-    state.save().ok();
-
-    // ── Event loop: serve CLI commands over the Unix socket ────────────────
-    // Use blocking mode.  WasBlock can appear transiently in some cases;
-    // handle it as a retry, not a dead code branch.
-    listener
-        .set_nonblocking(false)
-        .expect("set_nonblocking call failed");
-
-    'outer: loop {
-        match listener.accept() {
-            Ok((mut stream, _addr)) => {
-                // Read the request (newline-delimited JSON).
-                let mut buf = [0u8; 4096];
-                let mut request = Vec::new();
-
-                loop {
-                    match stream.read(&mut buf) {
-                        Ok(0) => break, // EOF
-                        Ok(n) => {
-                            request.extend_from_slice(&buf[..n]);
-                            if request.iter().rposition(|&b| b == b'\n').is_some() {
-                                break;
-                            }
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            // Transient in blocking mode — retry read.
-                            std::thread::sleep(Duration::from_millis(10));
-                            continue;
-                        }
-                        Err(_) => break,
-                    }
-                }
-
-                if request.is_empty() {
-                    continue;
-                }
-
-                let cmd: SupervisorCmd = match serde_json::from_slice(&request) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let reply = SupervisorReply::Err { msg: e.to_string() };
-                        let _ = serde_json::to_writer(&stream, &reply);
-                        let _ = stream.write_all(b"\n");
-                        let _ = stream.flush();
-                        continue;
-                    }
-                };
-
-                match cmd {
-                    SupervisorCmd::Ping => {
-                        let reply = SupervisorReply::Pid { pid: child_pid };
-                        let _ = serde_json::to_writer(&stream, &reply);
-                        let _ = stream.write_all(b"\n");
-                        let _ = stream.flush();
-                    }
-                    SupervisorCmd::Start => {
-                        // Release the child by sending SIGCONT.
-                        unsafe { libc::kill(child_pid, libc::SIGCONT) };
-
-                        // Update state to Running.
+        match incoming {
+            SupervisorCmd::Ping => {
+                let reply =
+                    serde_json::to_vec(&SupervisorReply::Pid { pid: child_pid }).unwrap_or_default();
+                let _ = stream.write_all(&reply).await;
+                let _ = stream.write_all(b"\n").await;
+            }
+            SupervisorCmd::Start => {
+                // OCI `start` — write to the ready pipe so the parked child
+                // proceeds to execve with the full sandlock policy already in
+                // place.
+                let reply = match sandbox.start() {
+                    Ok(()) => {
                         if let Ok(mut s) = ContainerState::load(id) {
                             s.set_running();
                             s.save().ok();
                         }
-
-                        let _ = serde_json::to_writer(&stream, &SupervisorReply::Ok);
-                        let _ = stream.write_all(b"\n");
-                        let _ = stream.flush();
-
-                        // Break out of the accept loop — the child is now running
-                        // and we just need to wait for it to exit.
-                        break 'outer;
+                        SupervisorReply::Ok
                     }
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // Avoid spinning: sleep briefly before retrying accept.
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(_) => {
-                // Fatal accept error.
+                    Err(e) => SupervisorReply::Err { msg: e.to_string() },
+                };
+                let reply_bytes = serde_json::to_vec(&reply).unwrap_or_default();
+                let _ = stream.write_all(&reply_bytes).await;
+                let _ = stream.write_all(b"\n").await;
                 break;
             }
         }
     }
 
-    // Monitor the child until it exits.
-    loop {
-        let mut status = 0i32;
-        let ret = unsafe { libc::waitpid(child_pid, &mut status, 0) };
-        if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            break;
-        }
-        break;
-    }
+    // Wait for the child to exit and record the exit status.
+    let exit_info = match sandbox.wait().await {
+        Ok(result) => match result.exit_status {
+            ExitStatus::Code(code) => Some(ExitInfo { code: Some(code), signal: None }),
+            ExitStatus::Signal(sig) => Some(ExitInfo { code: None, signal: Some(sig) }),
+            ExitStatus::Killed => Some(ExitInfo { code: None, signal: Some(libc::SIGKILL) }),
+            ExitStatus::Timeout => Some(ExitInfo { code: Some(124), signal: None }),
+        },
+        Err(_) => None,
+    };
 
-    // Update state to stopped, capturing exit info.
     if let Ok(mut s) = ContainerState::load(id) {
-        s.set_stopped(None);
+        s.set_stopped(exit_info);
         s.save().ok();
     }
 
@@ -396,9 +271,7 @@ mod tests {
 
     #[test]
     fn supervisor_reply_err_serde() {
-        let reply = SupervisorReply::Err {
-            msg: "test error".into(),
-        };
+        let reply = SupervisorReply::Err { msg: "test error".into() };
         let json = serde_json::to_string(&reply).unwrap();
         assert!(json.contains("err"));
         assert!(json.contains("test error"));
