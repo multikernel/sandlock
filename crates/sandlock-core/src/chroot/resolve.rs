@@ -184,11 +184,62 @@ pub fn resolve_existing_in_root(chroot_root: &Path, child_path: &str) -> Option<
     }
 }
 
+/// Resolve the configured chroot root to a canonical, on-disk path.
+///
+/// `None` chroot yields `Ok(None)`. A configured chroot path that cannot be
+/// canonicalized (missing or inaccessible) is a hard error: silently dropping
+/// it would disable the seccomp-notify chroot mediation without telling the
+/// caller, leaving the workload effectively unconfined.
+pub fn resolve_chroot_root(
+    chroot: Option<&Path>,
+) -> Result<Option<PathBuf>, crate::error::SandboxError> {
+    match chroot {
+        Some(p) => match std::fs::canonicalize(p) {
+            Ok(resolved) => Ok(Some(resolved)),
+            Err(source) => Err(crate::error::SandboxError::ChrootNotFound {
+                path: p.to_path_buf(),
+                source,
+            }),
+        },
+        None => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
+
+    #[test]
+    fn resolve_chroot_root_none_is_ok_none() {
+        assert!(resolve_chroot_root(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_chroot_root_existing_canonicalizes() {
+        // /tmp exists on every supported target.
+        let resolved = resolve_chroot_root(Some(Path::new("/tmp")))
+            .unwrap()
+            .expect("an existing chroot path should resolve to Some");
+        assert!(resolved.is_absolute());
+    }
+
+    #[test]
+    fn resolve_chroot_root_missing_path_errors() {
+        // A configured chroot that does not exist must error rather than
+        // silently disabling confinement. Regression: the old
+        // `canonicalize(p).ok()` swallowed this into `None`, turning off the
+        // seccomp-notify chroot mediation without telling the caller.
+        let err = resolve_chroot_root(Some(Path::new(
+            "/nonexistent/sandlock/rootfs/does-not-exist",
+        )))
+        .unwrap_err();
+        assert!(
+            matches!(err, crate::error::SandboxError::ChrootNotFound { .. }),
+            "expected ChrootNotFound, got: {err:?}"
+        );
+    }
 
     #[test]
     fn test_confine_absolute() {

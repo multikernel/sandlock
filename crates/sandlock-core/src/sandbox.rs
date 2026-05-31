@@ -1111,6 +1111,11 @@ impl Sandbox {
             return Err(SandboxRuntimeError::Child("empty command".into()).into());
         }
 
+        // Resolve the chroot root eagerly, before any fork or confinement work:
+        // a configured-but-missing chroot must be a hard error, never a silent
+        // drop to "no confinement".
+        let chroot_root = crate::chroot::resolve::resolve_chroot_root(self.chroot.as_deref())?;
+
         let c_cmd: Vec<CString> = cmd
             .iter()
             .map(|s| CString::new(*s).map_err(|_| SandboxRuntimeError::Child("invalid command string".into())))
@@ -1313,7 +1318,7 @@ impl Sandbox {
                 num_cpus: self.num_cpus,
                 port_remap: self.port_remap,
                 cow_enabled: self.workdir.is_some(),
-                chroot_root: self.chroot.as_ref().and_then(|p| std::fs::canonicalize(p).ok()),
+                chroot_root: chroot_root.clone(),
                 chroot_readable: self.fs_readable.clone(),
                 chroot_writable: self.fs_writable.clone(),
                 chroot_denied: self.fs_denied.clone(),
