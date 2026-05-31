@@ -1322,9 +1322,7 @@ impl Sandbox {
                 chroot_readable: self.fs_readable.clone(),
                 chroot_writable: self.fs_writable.clone(),
                 chroot_denied: self.fs_denied.clone(),
-                chroot_mounts: self.fs_mount.iter().map(|(vp, hp)| {
-                    (vp.clone(), std::fs::canonicalize(hp).unwrap_or_else(|_| hp.clone()))
-                }).collect(),
+                chroot_mounts: crate::chroot::resolve::resolve_chroot_mounts(&self.fs_mount),
                 deterministic_dirs: self.deterministic_dirs,
                 virtual_hostname: Some(rt_name),
                 has_http_acl: !self.http_allow.is_empty() || !self.http_deny.is_empty(),
