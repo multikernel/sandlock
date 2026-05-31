@@ -27,6 +27,13 @@ pub enum SandboxError {
 
     #[error("confine() only accepts Landlock filesystem policy; unsupported fields: {0}")]
     UnsupportedForConfine(String),
+
+    #[error("chroot path {path} does not exist or is inaccessible: {source}")]
+    ChrootNotFound {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Errors from the sandbox process runtime (fork, confinement, child, etc.).
