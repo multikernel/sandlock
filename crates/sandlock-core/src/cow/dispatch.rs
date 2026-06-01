@@ -590,9 +590,6 @@ pub(crate) async fn handle_cow_write(
 // access() handler — fake W_OK for COW-managed paths
 // ============================================================
 
-/// SYS_faccessat2 syscall number on x86_64 (439). Not always in libc crate.
-pub(crate) const SYS_FACCESSAT2: i64 = 439;
-
 /// Handle faccessat/faccessat2/access — return success for W_OK checks on
 /// COW-managed paths so programs that pre-check write permissions (like dpkg)
 /// don't fail before the COW layer can redirect their writes.
@@ -768,7 +765,7 @@ pub(crate) async fn handle_cow_stat(
     };
     drop(st);
 
-    if nr == libc::SYS_faccessat || nr == SYS_FACCESSAT2 {
+    if nr == libc::SYS_faccessat || nr == crate::arch::SYS_FACCESSAT2 {
         // For faccessat, just check if the file exists (we already resolved it)
         if real_path.exists() || real_path.is_symlink() {
             return NotifAction::ReturnValue(0);

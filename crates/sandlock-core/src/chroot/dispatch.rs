@@ -334,9 +334,6 @@ fn exec_on_host(f: impl FnOnce(*const libc::c_char) -> libc::c_int, host: &Path)
     }
 }
 
-/// SYS_faccessat2 syscall number (439 on both x86_64 and aarch64).
-pub(crate) const SYS_FACCESSAT2: i64 = 439;
-
 // ============================================================
 // openat handler
 // ============================================================
@@ -1072,7 +1069,7 @@ pub(crate) async fn handle_chroot_stat(
         Err(a) => return a,
     };
 
-    if nr == libc::SYS_faccessat || nr == SYS_FACCESSAT2 {
+    if nr == libc::SYS_faccessat || nr == crate::arch::SYS_FACCESSAT2 {
         return if real_path.exists() || real_path.is_symlink() {
             NotifAction::ReturnValue(0)
         } else {

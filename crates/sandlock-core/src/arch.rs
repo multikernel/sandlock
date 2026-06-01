@@ -1,5 +1,12 @@
 //! Architecture-specific syscall and seccomp helpers.
 
+/// `faccessat2(2)` syscall number on Sandlock's supported Linux architectures.
+///
+/// The `libc` crate does not expose this constant on all supported build
+/// targets yet, but the seccomp filters and path virtualization handlers need
+/// to intercept it because glibc 2.33+ may prefer it over `faccessat`.
+pub const SYS_FACCESSAT2: i64 = 439;
+
 #[cfg(target_arch = "x86_64")]
 mod imp {
     pub const AUDIT_ARCH: u32 = 0xC000_003E;

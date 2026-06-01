@@ -244,7 +244,7 @@ pub fn notif_syscalls(policy: &Sandbox, sandbox_name: Option<&str>) -> Vec<u32> 
             libc::SYS_newfstatat as u32,
             libc::SYS_statx as u32,
             libc::SYS_faccessat as u32,
-            439u32,                       // SYS_faccessat2 — glibc 2.33+ uses this instead of faccessat
+            arch::SYS_FACCESSAT2 as u32,
             libc::SYS_readlinkat as u32,
             libc::SYS_getdents64 as u32,
             libc::SYS_chdir as u32,
@@ -277,7 +277,7 @@ pub fn notif_syscalls(policy: &Sandbox, sandbox_name: Option<&str>) -> Vec<u32> 
             libc::SYS_newfstatat as u32,
             libc::SYS_statx as u32,
             libc::SYS_faccessat as u32,
-            439u32,                       // SYS_faccessat2 — glibc 2.33+ uses this instead of faccessat
+            arch::SYS_FACCESSAT2 as u32,
             libc::SYS_readlinkat as u32,
             libc::SYS_getdents64 as u32,
             libc::SYS_chdir as u32,
@@ -1071,8 +1071,6 @@ mod tests {
     /// chroot and COW modes — glibc 2.33+ uses it instead of faccessat.
     #[test]
     fn test_notif_syscalls_faccessat2() {
-        const SYS_FACCESSAT2: u32 = 439;
-
         // Chroot mode
         let policy = Sandbox::builder()
             .chroot("/tmp")
@@ -1080,7 +1078,7 @@ mod tests {
             .unwrap();
         let nrs = notif_syscalls(&policy, None);
         assert!(nrs.contains(&(libc::SYS_faccessat as u32)));
-        assert!(nrs.contains(&SYS_FACCESSAT2),
+        assert!(nrs.contains(&(arch::SYS_FACCESSAT2 as u32)),
                 "chroot notif filter must include SYS_faccessat2 (439)");
 
         // COW mode
@@ -1090,7 +1088,7 @@ mod tests {
             .unwrap();
         let nrs = notif_syscalls(&policy, None);
         assert!(nrs.contains(&(libc::SYS_faccessat as u32)));
-        assert!(nrs.contains(&SYS_FACCESSAT2),
+        assert!(nrs.contains(&(arch::SYS_FACCESSAT2 as u32)),
                 "COW notif filter must include SYS_faccessat2 (439)");
     }
 

@@ -849,7 +849,7 @@ fn register_chroot_handlers(
     for &nr in &[
         libc::SYS_newfstatat,
         libc::SYS_faccessat,
-        crate::chroot::dispatch::SYS_FACCESSAT2,
+        arch::SYS_FACCESSAT2,
     ] {
         table.register(nr, chroot_handler!(policy,
             crate::chroot::dispatch::handle_chroot_stat));
@@ -942,7 +942,7 @@ fn register_cow_handlers(table: &mut DispatchTable, ctx: &Arc<SupervisorCtx>) {
 
     table.register(libc::SYS_utimensat, cow_call!(crate::cow::dispatch::handle_cow_utimensat));
 
-    let mut access_nrs = vec![libc::SYS_faccessat, crate::cow::dispatch::SYS_FACCESSAT2];
+    let mut access_nrs = vec![libc::SYS_faccessat, arch::SYS_FACCESSAT2];
     access_nrs.extend(arch::SYS_ACCESS);
     for nr in access_nrs {
         table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_access));
