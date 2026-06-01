@@ -1674,7 +1674,7 @@ fn validate_syscall_names(names: &[String]) -> Result<(), SandboxError> {
     let unknown: Vec<&str> = names
         .iter()
         .map(String::as_str)
-        .filter(|name| crate::context::syscall_name_to_nr(name).is_none())
+        .filter(|name| crate::seccomp::syscall_names::syscall_name_to_nr(name).is_none())
         .collect();
     if unknown.is_empty() {
         Ok(())
