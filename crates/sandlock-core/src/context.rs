@@ -298,6 +298,18 @@ fn chroot_path_syscalls() -> Vec<i64> {
         libc::SYS_getcwd,
         libc::SYS_statfs,
         libc::SYS_utimensat,
+        // xattr family (path-based): must be mediated so that paths under an
+        // fs_mount/chroot resolve to the real backing file rather than the
+        // empty mount point (issue #84). The fd-based f*xattr variants need
+        // no mediation — their fd already points at the resolved file.
+        libc::SYS_getxattr,
+        libc::SYS_lgetxattr,
+        libc::SYS_setxattr,
+        libc::SYS_lsetxattr,
+        libc::SYS_listxattr,
+        libc::SYS_llistxattr,
+        libc::SYS_removexattr,
+        libc::SYS_lremovexattr,
     ];
     v.extend(
         [

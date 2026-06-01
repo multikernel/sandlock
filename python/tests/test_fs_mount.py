@@ -32,7 +32,8 @@ def rootfs(tmp_path):
 
     for name in ("sh", "cat", "echo", "ls", "pwd", "readlink", "stat",
                   "mkdir", "rmdir", "chmod", "ln", "rm", "mv", "true",
-                  "false", "write", "access"):
+                  "false", "write", "access", "getxattr", "setxattr",
+                  "listxattr"):
         link = tmp_path / "usr" / "bin" / name
         if not link.exists():
             os.symlink("rootfs-helper", link)
@@ -97,6 +98,70 @@ class TestFsMount:
         assert result.success, f"failed: {result.stderr}"
         assert b"aaa.txt" in result.stdout
         assert b"bbb.txt" in result.stdout
+
+    def test_fs_mount_getxattr(self, rootfs, tmp_path):
+        """getxattr on a mounted file must resolve to the mount source (issue #84).
+
+        The *xattr syscalls were not mediated, so a path-based getxattr
+        resolved against the empty real mount point and returned ENOENT
+        even though statx on the same path succeeded.
+        """
+        work_dir = tmp_path / "hostwork"
+        work_dir.mkdir()
+        target = work_dir / "f.txt"
+        target.write_text("hi")
+        try:
+            os.setxattr(target, "user.greeting", b"hello")
+        except OSError:
+            pytest.skip("filesystem does not support user xattrs")
+
+        policy = _mount_policy(rootfs, work_dir)
+        result = policy.run(["getxattr", "/work/f.txt", "user.greeting"])
+        assert result.success, f"failed: {result.stderr.decode(errors='replace')}"
+        assert b"OK hello" in result.stdout
+
+    def test_fs_mount_listxattr(self, rootfs, tmp_path):
+        """listxattr on a mounted file must resolve to the mount source (issue #84)."""
+        work_dir = tmp_path / "hostwork"
+        work_dir.mkdir()
+        target = work_dir / "f.txt"
+        target.write_text("hi")
+        try:
+            os.setxattr(target, "user.alpha", b"1")
+        except OSError:
+            pytest.skip("filesystem does not support user xattrs")
+
+        policy = _mount_policy(rootfs, work_dir)
+        result = policy.run(["listxattr", "/work/f.txt"])
+        assert result.success, f"failed: {result.stderr.decode(errors='replace')}"
+        assert b"user.alpha" in result.stdout
+
+    def test_fs_mount_setxattr(self, rootfs, tmp_path):
+        """setxattr on a mounted file must write through to the mount source (issue #84)."""
+        work_dir = tmp_path / "hostwork"
+        work_dir.mkdir()
+        target = work_dir / "f.txt"
+        target.write_text("hi")
+        # Probe host xattr support up front so an unsupported fs skips cleanly.
+        try:
+            os.setxattr(target, "user.probe", b"x")
+            os.removexattr(target, "user.probe")
+        except OSError:
+            pytest.skip("filesystem does not support user xattrs")
+
+        # /work must be writable for setxattr; _mount_policy maps it
+        # readable-only, so build a writable policy here.
+        policy = Sandbox(
+            chroot=str(rootfs),
+            fs_mount={"/work": str(work_dir)},
+            fs_readable=list(_FS_READABLE),
+            fs_writable=["/work"],
+            clean_env=True,
+            env={"PATH": "/bin:/usr/bin"},
+        )
+        result = policy.run(["setxattr", "/work/f.txt", "user.color", "blue"])
+        assert result.success, f"failed: {result.stderr.decode(errors='replace')}"
+        assert os.getxattr(target, "user.color") == b"blue"
 
     def test_fs_mount_cwd(self, rootfs, tmp_path):
         """Set cwd=/work, verify cat with relative path works."""

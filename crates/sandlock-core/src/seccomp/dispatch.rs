@@ -900,6 +900,17 @@ fn register_chroot_handlers(
         crate::chroot::dispatch::handle_chroot_statfs));
     table.register(libc::SYS_utimensat as i64, chroot_handler!(policy,
         crate::chroot::dispatch::handle_chroot_utimensat));
+
+    // xattr family (path-based) — get/set/list/remove and their l* variants
+    for &nr in &[
+        libc::SYS_getxattr, libc::SYS_lgetxattr,
+        libc::SYS_setxattr, libc::SYS_lsetxattr,
+        libc::SYS_listxattr, libc::SYS_llistxattr,
+        libc::SYS_removexattr, libc::SYS_lremovexattr,
+    ] {
+        table.register(nr, chroot_handler!(policy,
+            crate::chroot::dispatch::handle_chroot_xattr));
+    }
 }
 
 // ============================================================

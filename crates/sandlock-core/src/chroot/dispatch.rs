@@ -1264,6 +1264,199 @@ pub(crate) async fn handle_chroot_readlink(
 }
 
 // ============================================================
+// xattr handler
+// ============================================================
+
+/// The four path-based xattr operations. Each maps onto a pair of libc
+/// syscalls (follow / no-follow) that differ only in their `l` prefix.
+#[derive(Clone, Copy)]
+enum XattrOp {
+    /// `getxattr(path, name, value, size)` — copy a value out to the child.
+    Get,
+    /// `setxattr(path, name, value, size, flags)` — copy a value in.
+    Set,
+    /// `listxattr(path, list, size)` — copy the name list out.
+    List,
+    /// `removexattr(path, name)`.
+    Remove,
+}
+
+/// Classify a syscall as a path-based xattr op plus whether it follows the
+/// final symlink. Returns `None` for anything else.
+fn classify_xattr(nr: i64) -> Option<(XattrOp, bool)> {
+    Some(match nr {
+        libc::SYS_getxattr => (XattrOp::Get, true),
+        libc::SYS_lgetxattr => (XattrOp::Get, false),
+        libc::SYS_setxattr => (XattrOp::Set, true),
+        libc::SYS_lsetxattr => (XattrOp::Set, false),
+        libc::SYS_listxattr => (XattrOp::List, true),
+        libc::SYS_llistxattr => (XattrOp::List, false),
+        libc::SYS_removexattr => (XattrOp::Remove, true),
+        libc::SYS_lremovexattr => (XattrOp::Remove, false),
+        _ => return None,
+    })
+}
+
+/// Kernel ceiling for an xattr value (`XATTR_SIZE_MAX`) and name list
+/// (`XATTR_LIST_MAX`). The supervisor never needs a larger buffer, so
+/// clamping the child's requested size here both bounds our allocation and
+/// can never cause a spurious `ERANGE` (a real result never exceeds it).
+const XATTR_MAX: usize = 65536;
+
+/// Shared read path for `getxattr`/`listxattr`: run the syscall on the
+/// rewritten host path into a supervisor buffer, then copy the result back
+/// into the child's buffer. `name` is `Some` for getxattr, `None` for
+/// listxattr. `buf_idx`/`size_idx` are the child arg positions of the output
+/// buffer pointer and its capacity.
+fn xattr_read(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+    c_path: &CString,
+    name: Option<&CString>,
+    follow: bool,
+    buf_idx: usize,
+    size_idx: usize,
+) -> NotifAction {
+    let buf_addr = notif.data.args[buf_idx];
+    let size = (notif.data.args[size_idx] as usize).min(XATTR_MAX);
+    let mut buf = vec![0u8; size];
+    // size == 0 is a probe for the needed length — pass NULL so the kernel
+    // just reports the size without touching a buffer.
+    let buf_ptr = if size == 0 {
+        std::ptr::null_mut()
+    } else {
+        buf.as_mut_ptr() as *mut libc::c_void
+    };
+    // getxattr takes a name (4 args), listxattr does not (3 args).
+    let ret = unsafe {
+        match name {
+            Some(n) if follow => {
+                libc::syscall(libc::SYS_getxattr, c_path.as_ptr(), n.as_ptr(), buf_ptr, size)
+            }
+            Some(n) => {
+                libc::syscall(libc::SYS_lgetxattr, c_path.as_ptr(), n.as_ptr(), buf_ptr, size)
+            }
+            None if follow => libc::syscall(libc::SYS_listxattr, c_path.as_ptr(), buf_ptr, size),
+            None => libc::syscall(libc::SYS_llistxattr, c_path.as_ptr(), buf_ptr, size),
+        }
+    };
+    if ret < 0 {
+        return NotifAction::Errno(last_errno(libc::ENODATA));
+    }
+    // size == 0 returns the needed length without writing anything back.
+    if size > 0 && ret as usize > 0 {
+        let written = write_child_mem(notif_fd, notif.id, notif.pid, buf_addr, &buf[..ret as usize]);
+        if written.is_err() {
+            return NotifAction::Errno(libc::EFAULT);
+        }
+    }
+    NotifAction::ReturnValue(ret)
+}
+
+/// Mediate the path-based xattr syscalls. Without this, a `getxattr` on a
+/// path under an `fs_mount`/chroot resolves against the empty real mount
+/// point and returns `ENOENT`, even though `statx` on the same path is
+/// rewritten correctly (issue #84).
+pub(crate) async fn handle_chroot_xattr(
+    notif: &SeccompNotif,
+    _chroot_state: &Arc<Mutex<ChrootState>>,
+    cow_state: &Arc<Mutex<CowState>>,
+    notif_fd: RawFd,
+    ctx: &ChrootCtx<'_>,
+) -> NotifAction {
+    let (op, follow) = match classify_xattr(notif.data.nr as i64) {
+        Some(x) => x,
+        None => return NotifAction::Continue,
+    };
+
+    // The path is always arg 0; xattr syscalls have no dirfd, so relative
+    // paths resolve against the child's cwd (AT_FDCWD).
+    let path = match read_path(notif, notif.data.args[0], notif_fd) {
+        Some(p) if !p.is_empty() => p,
+        _ => return NotifAction::Continue,
+    };
+    let (host_path, vp) =
+        match resolve_chroot_path_existing(notif, libc::AT_FDCWD as i64, &path, ctx) {
+            Some(r) => r,
+            None => return NotifAction::Errno(libc::ENOENT),
+        };
+
+    let writing = matches!(op, XattrOp::Set | XattrOp::Remove);
+    let allowed = if writing { ctx.can_write(&vp) } else { ctx.can_read(&vp) };
+    if !allowed {
+        return NotifAction::Errno(libc::EACCES);
+    }
+
+    let real_path = match cow_resolve(cow_state, &host_path).await {
+        Ok(p) => p,
+        Err(a) => return a,
+    };
+    let c_path = match path_cstr(&real_path, libc::ENOENT) {
+        Ok(c) => c,
+        Err(a) => return a,
+    };
+
+    // Read the attribute name (arg 1) for the ops that carry one.
+    let read_name = || -> Result<CString, NotifAction> {
+        let n = read_path(notif, notif.data.args[1], notif_fd)
+            .ok_or(NotifAction::Errno(libc::EFAULT))?;
+        CString::new(n).map_err(|_| NotifAction::Errno(libc::EINVAL))
+    };
+
+    match op {
+        XattrOp::Get => {
+            let name = match read_name() {
+                Ok(n) => n,
+                Err(a) => return a,
+            };
+            xattr_read(notif, notif_fd, &c_path, Some(&name), follow, 2, 3)
+        }
+        XattrOp::List => xattr_read(notif, notif_fd, &c_path, None, follow, 1, 2),
+        XattrOp::Set => {
+            let name = match read_name() {
+                Ok(n) => n,
+                Err(a) => return a,
+            };
+            let size = notif.data.args[3] as usize;
+            let flags = notif.data.args[4] as i32;
+            let value = match read_child_mem(notif_fd, notif.id, notif.pid, notif.data.args[2], size) {
+                Ok(v) => v,
+                Err(_) => return NotifAction::Errno(libc::EFAULT),
+            };
+            let nr = if follow { libc::SYS_setxattr } else { libc::SYS_lsetxattr };
+            let ret = unsafe {
+                libc::syscall(
+                    nr,
+                    c_path.as_ptr(),
+                    name.as_ptr(),
+                    value.as_ptr() as *const libc::c_void,
+                    size,
+                    flags,
+                )
+            };
+            if ret < 0 {
+                NotifAction::Errno(last_errno(libc::EIO))
+            } else {
+                NotifAction::ReturnValue(0)
+            }
+        }
+        XattrOp::Remove => {
+            let name = match read_name() {
+                Ok(n) => n,
+                Err(a) => return a,
+            };
+            let nr = if follow { libc::SYS_removexattr } else { libc::SYS_lremovexattr };
+            let ret = unsafe { libc::syscall(nr, c_path.as_ptr(), name.as_ptr()) };
+            if ret < 0 {
+                NotifAction::Errno(last_errno(libc::EIO))
+            } else {
+                NotifAction::ReturnValue(0)
+            }
+        }
+    }
+}
+
+// ============================================================
 // getdents handler
 // ============================================================
 
