@@ -2,7 +2,7 @@ use std::os::fd::OwnedFd;
 use std::path::Path;
 
 use crate::error::{ConfinementError, SandlockError};
-use crate::protection::{Protection, ProtectionPolicy, ProtectionState};
+use crate::protection::{Protection, ProtectionPolicy, ProtectionStatus};
 use crate::sandbox::Sandbox;
 use crate::sys::structs::{
     LandlockNetPortAttr, LandlockPathBeneathAttr, LandlockRulesetAttr,
@@ -193,49 +193,16 @@ fn add_net_rule(ruleset_fd: &OwnedFd, port: u16, access: u64) -> Result<(), Conf
 // Per-protection availability resolution
 // ============================================================
 
-/// Resolution for a single `Protection` against the host's Landlock
-/// ABI and the policy's state for it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[doc(hidden)]
-pub enum Resolved {
-    /// Enforce: protection is available on the host and the policy
-    /// requires (or allows) it.
-    Active,
-    /// Enforce-not: protection is unavailable on the host but the
-    /// policy named it `Degradable`, so we skip it silently.
-    Degraded,
-    /// Off: the policy disabled this protection (regardless of host
-    /// support).
-    Disabled,
-    /// Error: the policy is `Strict` but the host kernel cannot
-    /// provide this protection.
-    StrictlyUnavailable,
-}
-
-/// Resolve a single `Protection` against the host ABI and a
-/// `ProtectionPolicy` into one of four states.
-#[doc(hidden)]
-pub fn resolve(p: Protection, host_abi: u32, policy: &ProtectionPolicy) -> Resolved {
-    let available = host_abi >= p.min_abi();
-    match (policy.state(p), available) {
-        (ProtectionState::Disabled, _) => Resolved::Disabled,
-        (ProtectionState::Strict, true) => Resolved::Active,
-        (ProtectionState::Strict, false) => Resolved::StrictlyUnavailable,
-        (ProtectionState::Degradable, true) => Resolved::Active,
-        (ProtectionState::Degradable, false) => Resolved::Degraded,
-    }
-}
-
 /// Compute the `scoped` mask from the per-protection resolutions of
 /// the two scope protections.
 ///
 /// # Precondition
 ///
 /// The caller must have already rejected any `Protection` whose
-/// `resolve()` is `Resolved::StrictlyUnavailable` — otherwise this
-/// function silently produces a mask that omits the bit, which is the
-/// right answer for `Disabled` / `Degraded` but the *wrong* answer for
-/// `StrictlyUnavailable` (where the call should never have reached
+/// `ProtectionStatus::resolve()` is `ProtectionStatus::Unavailable` —
+/// otherwise this function silently produces a mask that omits the bit,
+/// which is the right answer for `Disabled` / `Degraded` but the *wrong*
+/// answer for `Unavailable` (where the call should never have reached
 /// the mask-compute stage). `confine_inner` enforces this by walking
 /// `Protection::all()` and returning `ProtectionUnavailable` for any
 /// strict-unavailable protection before this function is called.
@@ -245,26 +212,28 @@ pub fn resolve(p: Protection, host_abi: u32, policy: &ProtectionPolicy) -> Resol
 pub(crate) fn compute_scope_mask(abi: u32, pol: &ProtectionPolicy) -> u64 {
     debug_assert!(
         !matches!(
-            resolve(Protection::SignalScope, abi, pol),
-            Resolved::StrictlyUnavailable,
+            ProtectionStatus::resolve(Protection::SignalScope, abi, pol),
+            ProtectionStatus::Unavailable,
         ),
-        "compute_scope_mask called with SignalScope StrictlyUnavailable; \
+        "compute_scope_mask called with SignalScope Unavailable; \
          caller must filter via confine_inner's Protection::all() walk first"
     );
     debug_assert!(
         !matches!(
-            resolve(Protection::AbstractUnixSocketScope, abi, pol),
-            Resolved::StrictlyUnavailable,
+            ProtectionStatus::resolve(Protection::AbstractUnixSocketScope, abi, pol),
+            ProtectionStatus::Unavailable,
         ),
-        "compute_scope_mask called with AbstractUnixSocketScope StrictlyUnavailable; \
+        "compute_scope_mask called with AbstractUnixSocketScope Unavailable; \
          caller must filter via confine_inner's Protection::all() walk first"
     );
 
     let mut mask: u64 = 0;
-    if resolve(Protection::AbstractUnixSocketScope, abi, pol) == Resolved::Active {
+    if ProtectionStatus::resolve(Protection::AbstractUnixSocketScope, abi, pol)
+        == ProtectionStatus::Active
+    {
         mask |= LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET;
     }
-    if resolve(Protection::SignalScope, abi, pol) == Resolved::Active {
+    if ProtectionStatus::resolve(Protection::SignalScope, abi, pol) == ProtectionStatus::Active {
         mask |= LANDLOCK_SCOPE_SIGNAL;
     }
     mask
@@ -286,20 +255,20 @@ pub(crate) fn compute_scope_mask(abi: u32, pol: &ProtectionPolicy) -> u64 {
 pub fn compute_fs_mask(abi: u32, pol: &ProtectionPolicy) -> u64 {
     let mut mask = base_fs_access(abi);
     if matches!(
-        resolve(Protection::FsRefer, abi, pol),
-        Resolved::Disabled | Resolved::Degraded
+        ProtectionStatus::resolve(Protection::FsRefer, abi, pol),
+        ProtectionStatus::Disabled | ProtectionStatus::Degraded
     ) {
         mask &= !LANDLOCK_ACCESS_FS_REFER;
     }
     if matches!(
-        resolve(Protection::FsTruncate, abi, pol),
-        Resolved::Disabled | Resolved::Degraded
+        ProtectionStatus::resolve(Protection::FsTruncate, abi, pol),
+        ProtectionStatus::Disabled | ProtectionStatus::Degraded
     ) {
         mask &= !LANDLOCK_ACCESS_FS_TRUNCATE;
     }
     if matches!(
-        resolve(Protection::FsIoctlDev, abi, pol),
-        Resolved::Disabled | Resolved::Degraded
+        ProtectionStatus::resolve(Protection::FsIoctlDev, abi, pol),
+        ProtectionStatus::Disabled | ProtectionStatus::Degraded
     ) {
         mask &= !LANDLOCK_ACCESS_FS_IOCTL_DEV;
     }
@@ -329,7 +298,7 @@ pub fn compute_net_mask(
     if !handle_net {
         return (0, false);
     }
-    if resolve(Protection::NetTcp, abi, pol) != Resolved::Active {
+    if ProtectionStatus::resolve(Protection::NetTcp, abi, pol) != ProtectionStatus::Active {
         return (0, false);
     }
     use crate::sandbox::Protocol;
@@ -380,11 +349,11 @@ fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError
     // is a hard error here; `Degradable` becomes a silent skip and
     // `Disabled` is honoured regardless of host support. With the
     // default `ProtectionPolicy::strict_all()` on a v6+ host this
-    // produces `Resolved::Active` for every protection — preserving
-    // the historical `MIN_ABI = 6` floor exactly.
+    // produces `ProtectionStatus::Active` for every protection —
+    // preserving the historical `MIN_ABI = 6` floor exactly.
     let pol = &policy.protection_policy;
     for protection in Protection::all() {
-        if resolve(protection, abi, pol) == Resolved::StrictlyUnavailable {
+        if ProtectionStatus::resolve(protection, abi, pol) == ProtectionStatus::Unavailable {
             return Err(SandlockError::Runtime(
                 crate::error::SandboxRuntimeError::Confinement(
                     ConfinementError::ProtectionUnavailable {
@@ -505,7 +474,8 @@ fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError
     // `Protection::NetTcp` is not `Active` (either policy-disabled or
     // degraded on a host without TCP network hooks) — `handled_access_net`
     // is 0 in that case and the kernel would reject any rule with EINVAL.
-    let net_tcp_active = resolve(Protection::NetTcp, abi, pol) == Resolved::Active;
+    let net_tcp_active =
+        ProtectionStatus::resolve(Protection::NetTcp, abi, pol) == ProtectionStatus::Active;
     if handle_net && net_tcp_active {
         for &port in &policy.net_bind {
             add_net_rule(&ruleset_fd, port, LANDLOCK_ACCESS_NET_BIND_TCP).map_err(|e| {
@@ -569,6 +539,7 @@ fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError
 #[cfg(test)]
 mod mask_contract_tests {
     use super::*;
+    use crate::protection::ProtectionState;
     use crate::Sandbox;
 
     // ---------- compute_scope_mask ----------

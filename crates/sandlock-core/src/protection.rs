@@ -161,7 +161,12 @@ pub enum ProtectionStatus {
 }
 
 impl ProtectionStatus {
-    pub(crate) fn resolve(p: Protection, host_abi: u32, pol: &ProtectionPolicy) -> Self {
+    /// Resolve a single `Protection` against the host ABI and a
+    /// `ProtectionPolicy`. Marked `#[doc(hidden)] pub` so integration
+    /// tests in the `tests/` directory can drive the resolver directly
+    /// with synthetic ABI values; not part of the stable public surface.
+    #[doc(hidden)]
+    pub fn resolve(p: Protection, host_abi: u32, pol: &ProtectionPolicy) -> Self {
         let available = host_abi >= p.min_abi();
         match (pol.state(p), available) {
             (ProtectionState::Disabled, _) => ProtectionStatus::Disabled,

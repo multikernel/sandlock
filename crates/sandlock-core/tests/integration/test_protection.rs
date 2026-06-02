@@ -2,10 +2,10 @@
 //! in `landlock::confine_inner`.
 //!
 //! These tests exercise the policy-driven resolution path directly via
-//! the `pub(crate)` `resolve()` helper with synthetic ABI values, so
-//! they are independent of the host kernel's actual Landlock ABI.
+//! the `ProtectionStatus::resolve()` helper with synthetic ABI values,
+//! so they are independent of the host kernel's actual Landlock ABI.
 
-use sandlock_core::landlock::{compute_fs_mask, resolve, Resolved};
+use sandlock_core::landlock::compute_fs_mask;
 use sandlock_core::{Protection, ProtectionPolicy, ProtectionState, ProtectionStatus};
 
 // Landlock FS access constants (kernel ABI, stable). Kept local to the
@@ -16,7 +16,7 @@ const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
 const LANDLOCK_ACCESS_FS_IOCTL_DEV: u64 = 1 << 15;
 
 // ----------------------------------------------------------------------
-// resolve() — Strict
+// ProtectionStatus::resolve() — Strict
 // ----------------------------------------------------------------------
 
 #[test]
@@ -24,8 +24,8 @@ fn strict_on_supporting_host_resolves_to_active() {
     // SignalScope needs ABI v6; host claims v6.
     let pol = ProtectionPolicy::strict_all();
     assert_eq!(
-        resolve(Protection::SignalScope, 6, &pol),
-        Resolved::Active,
+        ProtectionStatus::resolve(Protection::SignalScope, 6, &pol),
+        ProtectionStatus::Active,
         "Strict + available host must resolve to Active"
     );
 }
@@ -34,10 +34,10 @@ fn strict_on_supporting_host_resolves_to_active() {
 fn strictly_unavailable_returns_protection_unavailable() {
     // SignalScope needs ABI v6; host only has v5.
     let pol = ProtectionPolicy::strict_all();
-    let r = resolve(Protection::SignalScope, 5, &pol);
+    let r = ProtectionStatus::resolve(Protection::SignalScope, 5, &pol);
     assert_eq!(
         r,
-        Resolved::StrictlyUnavailable,
+        ProtectionStatus::Unavailable,
         "Strict + unavailable host must resolve to StrictlyUnavailable"
     );
 }
@@ -50,8 +50,8 @@ fn strict_all_on_v6_host_resolves_every_protection_active() {
     let pol = ProtectionPolicy::strict_all();
     for p in Protection::all() {
         assert_eq!(
-            resolve(p, 6, &pol),
-            Resolved::Active,
+            ProtectionStatus::resolve(p, 6, &pol),
+            ProtectionStatus::Active,
             "{:?} under strict_all on v6 host must be Active",
             p
         );
@@ -59,17 +59,17 @@ fn strict_all_on_v6_host_resolves_every_protection_active() {
 }
 
 // ----------------------------------------------------------------------
-// resolve() — Degradable
+// ProtectionStatus::resolve() — Degradable
 // ----------------------------------------------------------------------
 
 #[test]
 fn degradable_on_unavailable_host_resolves_to_degraded() {
     let mut pol = ProtectionPolicy::strict_all();
     pol.set(Protection::SignalScope, ProtectionState::Degradable);
-    let r = resolve(Protection::SignalScope, 5, &pol);
+    let r = ProtectionStatus::resolve(Protection::SignalScope, 5, &pol);
     assert_eq!(
         r,
-        Resolved::Degraded,
+        ProtectionStatus::Degraded,
         "Degradable + unavailable host must resolve to Degraded (silent skip)"
     );
 }
@@ -80,24 +80,24 @@ fn degradable_on_supporting_host_resolves_to_active() {
     pol.set(Protection::FsTruncate, ProtectionState::Degradable);
     // FsTruncate needs v3.
     assert_eq!(
-        resolve(Protection::FsTruncate, 6, &pol),
-        Resolved::Active,
+        ProtectionStatus::resolve(Protection::FsTruncate, 6, &pol),
+        ProtectionStatus::Active,
         "Degradable + available host must enforce (Active)"
     );
 }
 
 // ----------------------------------------------------------------------
-// resolve() — Disabled
+// ProtectionStatus::resolve() — Disabled
 // ----------------------------------------------------------------------
 
 #[test]
 fn disabled_on_supporting_host_resolves_to_disabled() {
     let mut pol = ProtectionPolicy::strict_all();
     pol.set(Protection::SignalScope, ProtectionState::Disabled);
-    let r = resolve(Protection::SignalScope, 6, &pol);
+    let r = ProtectionStatus::resolve(Protection::SignalScope, 6, &pol);
     assert_eq!(
         r,
-        Resolved::Disabled,
+        ProtectionStatus::Disabled,
         "Disabled must resolve to Disabled regardless of host support"
     );
 }
@@ -106,10 +106,10 @@ fn disabled_on_supporting_host_resolves_to_disabled() {
 fn disabled_on_unavailable_host_resolves_to_disabled() {
     let mut pol = ProtectionPolicy::strict_all();
     pol.set(Protection::SignalScope, ProtectionState::Disabled);
-    let r = resolve(Protection::SignalScope, 5, &pol);
+    let r = ProtectionStatus::resolve(Protection::SignalScope, 5, &pol);
     assert_eq!(
         r,
-        Resolved::Disabled,
+        ProtectionStatus::Disabled,
         "Disabled wins over host availability — never StrictlyUnavailable"
     );
 }
@@ -124,20 +124,20 @@ fn strict_all_on_v4_host_fails_only_for_v5_plus_protections() {
     // (v4); fails on FsIoctlDev (v5), SignalScope (v6),
     // AbstractUnixSocketScope (v6).
     let pol = ProtectionPolicy::strict_all();
-    assert_eq!(resolve(Protection::FsRefer, 4, &pol), Resolved::Active);
-    assert_eq!(resolve(Protection::FsTruncate, 4, &pol), Resolved::Active);
-    assert_eq!(resolve(Protection::NetTcp, 4, &pol), Resolved::Active);
+    assert_eq!(ProtectionStatus::resolve(Protection::FsRefer, 4, &pol), ProtectionStatus::Active);
+    assert_eq!(ProtectionStatus::resolve(Protection::FsTruncate, 4, &pol), ProtectionStatus::Active);
+    assert_eq!(ProtectionStatus::resolve(Protection::NetTcp, 4, &pol), ProtectionStatus::Active);
     assert_eq!(
-        resolve(Protection::FsIoctlDev, 4, &pol),
-        Resolved::StrictlyUnavailable
+        ProtectionStatus::resolve(Protection::FsIoctlDev, 4, &pol),
+        ProtectionStatus::Unavailable
     );
     assert_eq!(
-        resolve(Protection::SignalScope, 4, &pol),
-        Resolved::StrictlyUnavailable
+        ProtectionStatus::resolve(Protection::SignalScope, 4, &pol),
+        ProtectionStatus::Unavailable
     );
     assert_eq!(
-        resolve(Protection::AbstractUnixSocketScope, 4, &pol),
-        Resolved::StrictlyUnavailable
+        ProtectionStatus::resolve(Protection::AbstractUnixSocketScope, 4, &pol),
+        ProtectionStatus::Unavailable
     );
 }
 
@@ -151,9 +151,9 @@ fn fully_degradable_policy_never_returns_strictly_unavailable_even_on_v1() {
         pol.set(p, ProtectionState::Degradable);
     }
     for p in Protection::all() {
-        let r = resolve(p, 1, &pol);
+        let r = ProtectionStatus::resolve(p, 1, &pol);
         assert!(
-            matches!(r, Resolved::Active | Resolved::Degraded),
+            matches!(r, ProtectionStatus::Active | ProtectionStatus::Degraded),
             "{:?} on v1 host with Degradable must not be StrictlyUnavailable, got {:?}",
             p,
             r
@@ -165,7 +165,7 @@ fn fully_degradable_policy_never_returns_strictly_unavailable_even_on_v1() {
 // compute_fs_mask() — Degraded protections must be masked off
 //
 // Regression guards for the bug where `compute_fs_mask` only masked
-// off `Resolved::Disabled` bits, leaving a `Degraded` bit in the
+// off `ProtectionStatus::Disabled` bits, leaving a `Degraded` bit in the
 // handled-fs mask. The kernel then rejects `landlock_create_ruleset`
 // with EINVAL — breaking the `Degradable` silent-skip contract.
 //
@@ -184,8 +184,8 @@ fn degradable_fs_truncate_on_v1_host_masks_off_truncate_bit() {
     pol.set(Protection::FsTruncate, ProtectionState::Degradable);
     // Sanity: the protection resolves Degraded on this host.
     assert_eq!(
-        resolve(Protection::FsTruncate, 1, &pol),
-        Resolved::Degraded
+        ProtectionStatus::resolve(Protection::FsTruncate, 1, &pol),
+        ProtectionStatus::Degraded
     );
     let mask = compute_fs_mask(1, &pol);
     assert_eq!(
@@ -202,7 +202,7 @@ fn degradable_fs_refer_on_v1_host_masks_off_refer_bit() {
     // must drop LANDLOCK_ACCESS_FS_REFER from the handled-fs mask.
     let mut pol = ProtectionPolicy::strict_all();
     pol.set(Protection::FsRefer, ProtectionState::Degradable);
-    assert_eq!(resolve(Protection::FsRefer, 1, &pol), Resolved::Degraded);
+    assert_eq!(ProtectionStatus::resolve(Protection::FsRefer, 1, &pol), ProtectionStatus::Degraded);
     let mask = compute_fs_mask(1, &pol);
     assert_eq!(
         mask & LANDLOCK_ACCESS_FS_REFER,
@@ -219,8 +219,8 @@ fn degradable_fs_ioctl_dev_on_v4_host_masks_off_ioctl_dev_bit() {
     let mut pol = ProtectionPolicy::strict_all();
     pol.set(Protection::FsIoctlDev, ProtectionState::Degradable);
     assert_eq!(
-        resolve(Protection::FsIoctlDev, 4, &pol),
-        Resolved::Degraded
+        ProtectionStatus::resolve(Protection::FsIoctlDev, 4, &pol),
+        ProtectionStatus::Degraded
     );
     let mask = compute_fs_mask(4, &pol);
     assert_eq!(
