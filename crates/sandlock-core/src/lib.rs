@@ -24,6 +24,7 @@ pub mod pipeline;
 pub mod policy_fn;
 pub mod image;
 pub mod fork;
+pub(crate) mod ca_inject;
 pub(crate) mod chroot;
 pub mod dry_run;
 pub(crate) mod http_acl;
