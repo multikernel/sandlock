@@ -95,6 +95,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -620,10 +621,17 @@ func SyscallNr(name string) (int, error) {
 // Process is a live sandboxed process started by Spawn. It supports PID
 // inspection, pause/resume/kill via the process group, and Wait. A Process
 // holds at most one running command; create separate Spawns for concurrency.
+//
+// The underlying FFI handle is not safe for concurrent access, so all handle
+// operations are serialized. Pause/Resume/Kill act on the OS process group by
+// PID and touch no handle state, so they remain usable while Wait blocks on
+// the handle — that is how Kill interrupts a blocked Wait. Ports, by contrast,
+// reads the handle and is reported as empty while a Wait is in flight.
 type Process struct {
-	mu  sync.Mutex
-	h   unsafe.Pointer
-	pid int
+	mu      sync.Mutex
+	h       unsafe.Pointer
+	pid     int
+	waiting bool // a Wait owns the handle; other handle ops must defer to it
 }
 
 // Spawn forks the sandboxed child, installs the policy, and releases it to
@@ -655,7 +663,29 @@ func (s *Sandbox) Spawn(cmd ...string) (*Process, error) {
 		C.sandlock_handle_free(h)
 		return nil, fmt.Errorf("sandlock: failed to start sandbox")
 	}
-	return &Process{h: h, pid: int(C.sandlock_handle_pid(h))}, nil
+	p := &Process{h: h, pid: int(C.sandlock_handle_pid(h))}
+	// Last-resort cleanup if the caller drops the Process without Wait/Close:
+	// kill the child and release the handle so neither is leaked. Wait and
+	// Close clear this once they have done the cleanup themselves.
+	runtime.SetFinalizer(p, (*Process).finalize)
+	return p, nil
+}
+
+// finalize is the SetFinalizer cleanup for a Process abandoned without
+// Wait/Close. It can only run once the Process is unreachable, which implies
+// no Wait is in flight (a blocked Wait keeps the Process reachable), so the
+// handle is not concurrently borrowed and is safe to free here.
+func (p *Process) finalize() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.h == nil {
+		return
+	}
+	if p.pid > 0 {
+		_ = syscall.Kill(-p.pid, syscall.SIGKILL)
+	}
+	C.sandlock_handle_free(p.h)
+	p.h = nil
 }
 
 // Pid returns the child process ID, or 0 if it is not available.
@@ -667,15 +697,29 @@ func (p *Process) Pid() int {
 
 // Wait blocks until the process exits, returns its captured Result, and
 // releases the handle. After Wait the Process is no longer running.
+//
+// The blocking native wait runs without holding the mutex so that Kill (and
+// Pause/Resume), which signal the process group by PID, can run concurrently
+// and interrupt it. The waiting flag reserves exclusive use of the handle for
+// the duration, so no other handle operation aliases it.
 func (p *Process) Wait() (*Result, error) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.h == nil {
+	if p.h == nil || p.waiting {
+		p.mu.Unlock()
 		return nil, ErrNotRunning
 	}
-	r := C.sandlock_handle_wait(p.h)
-	C.sandlock_handle_free(p.h)
+	h := p.h
+	p.waiting = true
+	p.mu.Unlock()
+
+	r := C.sandlock_handle_wait(h)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.waiting = false
+	C.sandlock_handle_free(h)
 	p.h = nil
+	runtime.SetFinalizer(p, nil)
 	if r == nil {
 		return nil, fmt.Errorf("sandlock: wait failed")
 	}
@@ -715,7 +759,9 @@ func (p *Process) Kill() error {
 func (p *Process) Ports() (map[int]int, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.h == nil {
+	// While a Wait holds the handle, reading port mappings would alias it;
+	// report empty rather than touch the handle concurrently.
+	if p.h == nil || p.waiting {
 		return map[int]int{}, nil
 	}
 	c := C.sandlock_handle_port_mappings(p.h)
@@ -744,9 +790,19 @@ func (p *Process) Ports() (map[int]int, error) {
 func (p *Process) Close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.h != nil {
-		C.sandlock_handle_free(p.h)
-		p.h = nil
+	if p.h == nil {
+		return nil
 	}
+	if p.waiting {
+		// A Wait owns the handle and will free it; just kill the process
+		// group by PID to unblock that Wait, without touching the handle.
+		if p.pid > 0 {
+			_ = syscall.Kill(-p.pid, syscall.SIGKILL)
+		}
+		return nil
+	}
+	C.sandlock_handle_free(p.h)
+	p.h = nil
+	runtime.SetFinalizer(p, nil)
 	return nil
 }

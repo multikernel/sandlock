@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	sandlock "github.com/multikernel/sandlock/go"
 )
@@ -110,6 +111,36 @@ func TestDryRun(t *testing.T) {
 		t.Fatalf("dry run leaked a write to the host")
 	}
 	t.Logf("changes: %+v", res.Changes)
+}
+
+func TestProcessKillInterruptsWait(t *testing.T) {
+	requireLandlock(t)
+	sb := &sandlock.Sandbox{FSReadable: rootfs}
+	p, err := sb.Spawn("sleep", "60")
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer p.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		_, werr := p.Wait()
+		done <- werr
+	}()
+
+	// Wait is now blocked in the native wait. Kill must acquire the mutex and
+	// signal the process group even though Wait is in flight; if Wait still
+	// held the mutex across the blocking call, this would block until timeout.
+	if err := p.Kill(); err != nil {
+		t.Fatalf("Kill: %v", err)
+	}
+
+	select {
+	case <-done:
+		// Wait returned promptly after the kill, as intended.
+	case <-time.After(5 * time.Second):
+		t.Fatal("Kill did not interrupt a blocked Wait within 5s")
+	}
 }
 
 func TestSyscallNr(t *testing.T) {
