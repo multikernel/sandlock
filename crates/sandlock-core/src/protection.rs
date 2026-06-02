@@ -12,8 +12,10 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 /// A single Landlock-provided protection, ABI-gated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Protection {
     /// `LANDLOCK_ACCESS_FS_REFER` — ABI v2+.
     FsRefer,
@@ -87,7 +89,7 @@ mod tests {
 
 /// What a `ProtectionPolicy` instructs sandlock to do with a given
 /// `Protection`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProtectionState {
     /// Enforce; if the host kernel cannot provide this protection,
     /// `confine_inner` returns an error naming the protection and the
@@ -108,7 +110,7 @@ pub enum ProtectionState {
 /// not explicitly named is `ProtectionState::Strict` — meaning a
 /// freshly-constructed `ProtectionPolicy` produces the same behaviour
 /// as the current hard `MIN_ABI = 6` floor.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ProtectionPolicy {
     states: HashMap<Protection, ProtectionState>,
 }

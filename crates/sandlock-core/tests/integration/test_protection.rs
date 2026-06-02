@@ -320,3 +320,36 @@ fn builder_methods_fluent_chain() {
         ProtectionState::Strict
     );
 }
+
+// ----------------------------------------------------------------------
+// Checkpoint round-trip: protection_policy must survive serialization
+//
+// `Checkpoint::save`/`load` bincode-serialize the whole `Sandbox`. A
+// sandbox built with a `disable()` opt-out must restore with that exact
+// posture — otherwise restore silently resets to `strict_all()` and, on
+// a host that required the opt-out (e.g. a v5 kernel that cannot provide
+// a v6 scope), `confine` then fails with ProtectionUnavailable.
+//
+// This test fails if `protection_policy` is `#[serde(skip)]` (it would
+// deserialize back to `Strict`); it passes only when the field and the
+// protection enums actually serialize.
+// ----------------------------------------------------------------------
+
+#[test]
+fn protection_policy_survives_bincode_round_trip() {
+    let sb = sandlock_core::Sandbox::builder()
+        .disable(Protection::SignalScope)
+        .build_unchecked()
+        .expect("build");
+
+    let bytes = bincode::serialize(&sb).expect("serialize sandbox");
+    let restored: sandlock_core::Sandbox =
+        bincode::deserialize(&bytes).expect("deserialize sandbox");
+
+    assert_eq!(
+        restored.protection_policy.state(Protection::SignalScope),
+        ProtectionState::Disabled,
+        "a disabled protection must survive the checkpoint round-trip, \
+         not reset to strict_all() on load"
+    );
+}

@@ -216,14 +216,14 @@ pub struct Sandbox {
 
     /// Per-protection enforcement policy. Default
     /// (`ProtectionPolicy::strict_all()`) preserves the historical hard
-    /// `MIN_ABI = 6` behaviour. Builder methods to deviate from
-    /// strict-all are added in a follow-up.
+    /// `MIN_ABI = 6` behaviour; `SandboxBuilder::allow_degraded` /
+    /// `::disable` deviate from strict-all per protection.
     ///
-    /// Not serialized — policy-file representation of per-protection
-    /// state arrives with the public builder API in a later change.
-    /// Deserialized sandboxes get `ProtectionPolicy::default()`, which
-    /// is identical to `strict_all()`.
-    #[serde(skip)]
+    /// Part of the checkpoint: a saved sandbox restores with its exact
+    /// protection posture. Without this, a sandbox built with a
+    /// `disable()` opt-out (required on, e.g., a v5 host that cannot
+    /// provide a v6 scope) would silently reset to `strict_all()` on
+    /// load and fail to restore.
     pub protection_policy: ProtectionPolicy,
 
     // Network
