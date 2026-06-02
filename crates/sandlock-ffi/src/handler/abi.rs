@@ -491,11 +491,25 @@ impl Drop for sandlock_handler_t {
 /// and the run completes.
 /// If `on_exception` does not match a defined `sandlock_exception_policy_t`
 /// discriminant (0, 1, 2, or 3), the call returns null and no allocation occurs.
+// The two callback parameters are spelled inline rather than via the
+// `sandlock_handler_fn_t` / `sandlock_handler_ud_drop_t` aliases. A type alias
+// is the same type to Rust, so this is ABI-identical and the body is
+// unchanged, but cbindgen only flattens an `Option<fn>` into a nullable C
+// function pointer when the `fn` is written inline; `Option<NamedAlias>` is
+// emitted as an (uncallable) opaque by-value struct. The aliases remain in use
+// by the struct fields and the Rust tests.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_handler_new(
-    handler_fn: Option<sandlock_handler_fn_t>,
+    handler_fn: Option<
+        extern "C-unwind" fn(
+            ud: *mut std::ffi::c_void,
+            notif: *const crate::notif_repr::sandlock_notif_data_t,
+            mem: *mut sandlock_mem_handle_t,
+            out: *mut sandlock_action_out_t,
+        ) -> i32,
+    >,
     ud: *mut std::ffi::c_void,
-    ud_drop: Option<sandlock_handler_ud_drop_t>,
+    ud_drop: Option<extern "C-unwind" fn(ud: *mut std::ffi::c_void)>,
     on_exception: u32,
 ) -> *mut sandlock_handler_t {
     if handler_fn.is_none() {
