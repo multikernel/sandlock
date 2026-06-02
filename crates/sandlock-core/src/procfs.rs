@@ -615,7 +615,7 @@ pub(crate) fn resolve_open_target(
     notif_fd: RawFd,
 ) -> Option<std::path::PathBuf> {
     let nr = notif.data.nr as i64;
-    let (dirfd, path_ptr): (i64, u64) = if Some(nr) == crate::arch::SYS_OPEN {
+    let (dirfd, path_ptr): (i64, u64) = if Some(nr) == crate::arch::sys_open() {
         // open(path, flags, mode) — no dirfd, behaves as AT_FDCWD.
         (libc::AT_FDCWD as i64, notif.data.args[0])
     } else if nr == libc::SYS_openat || nr == crate::arch::SYS_OPENAT2 {

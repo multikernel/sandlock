@@ -40,8 +40,8 @@ pub fn to_virtual_path(chroot_root: &Path, host_path: &Path) -> Option<PathBuf> 
 // openat2(RESOLVE_IN_ROOT) based resolution
 // ============================================================
 
-/// openat2 syscall number (same on x86_64 and aarch64).
-const SYS_OPENAT2: libc::c_long = 437;
+/// openat2 syscall number, sourced from the `syscalls` crate via `arch`.
+const SYS_OPENAT2: libc::c_long = crate::arch::SYS_OPENAT2;
 
 /// RESOLVE_IN_ROOT — treat the dirfd as the filesystem root for resolution.
 const RESOLVE_IN_ROOT: u64 = 0x10;

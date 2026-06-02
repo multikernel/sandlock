@@ -48,17 +48,32 @@ pub(crate) fn jump(code: u16, k: u32, jt: u8, jf: u8) -> SockFilter {
 /// * `block_syscalls`   — syscalls that return ERRNO(EPERM)
 /// * `arg_block`       — pre-built arg filter instructions (from `context::arg_filters`)
 ///
-/// Returns an error if the resulting program would exceed the kernel's
-/// `BPF_MAXINSNS` (4096) instruction limit. Catching this here gives a
-/// clearer error than the kernel's `EINVAL` from `seccomp(2)`, and also
-/// guards the `(idx - n) as u8` jump-offset arithmetic below — cBPF jump
-/// offsets are u8, so a program over 256 instructions plus careless
-/// changes could silently truncate offsets.
+/// Returns an error if a syscall appears in both notification and deny lists,
+/// or if the resulting program would exceed the kernel's `BPF_MAXINSNS`
+/// (4096) instruction limit. Catching the size limit here gives a clearer
+/// error than the kernel's `EINVAL` from `seccomp(2)`, and also guards the
+/// `(idx - n) as u8` jump-offset arithmetic below — cBPF jump offsets are u8,
+/// so a program over 256 instructions plus careless changes could silently
+/// truncate offsets.
 pub fn assemble_filter(
     notif_syscalls: &[u32],
     block_syscalls: &[u32],
     arg_block: &[SockFilter],
 ) -> Result<Vec<SockFilter>, std::io::Error> {
+    if let Some(&nr) = notif_syscalls
+        .iter()
+        .find(|&&nr| block_syscalls.contains(&nr))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "syscall {} appears in both notification and deny lists; \
+                 notification rules are evaluated first",
+                nr
+            ),
+        ));
+    }
+
     // ---- compute final layout sizes ----
     let arch_block = 2usize;                       // LD arch, JEQ arch (KILL is in ret section)
     let arg_block_len = arg_block.len();
@@ -224,6 +239,25 @@ mod tests {
             .iter()
             .any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K) && f.k == libc::SYS_openat as u32);
         assert!(has_openat);
+    }
+
+    #[test]
+    fn test_rejects_notif_deny_overlap() {
+        let err = match assemble_filter(
+            &[libc::SYS_openat as u32],
+            &[libc::SYS_openat as u32],
+            &[],
+        ) {
+            Ok(_) => panic!("expected notif/deny overlap to be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("both notification and deny lists"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]

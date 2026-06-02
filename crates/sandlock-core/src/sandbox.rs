@@ -1674,7 +1674,7 @@ fn validate_syscall_names(names: &[String]) -> Result<(), SandboxError> {
     let unknown: Vec<&str> = names
         .iter()
         .map(String::as_str)
-        .filter(|name| crate::context::syscall_name_to_nr(name).is_none())
+        .filter(|name| crate::seccomp::syscall::syscall_name_to_nr(name).is_none())
         .collect();
     if unknown.is_empty() {
         Ok(())
@@ -2216,40 +2216,12 @@ impl SandboxBuilder {
             .map(|s| NetAllow::parse(&s))
             .collect::<Result<_, _>>()?;
 
-        // Auto-merge HTTP rules into the network allowlist so the proxy's
-        // intercept ports remain reachable. A rule with a concrete host
-        // tightens the IP allowlist (only that host on http_ports);
-        // wildcard hosts add a `:port` (any IP) rule. This mirrors the
-        // intent of the old `http_port → net_connect` merge but at the
-        // endpoint level so HTTP and net_allow stay aligned.
-        if !http_ports.is_empty() {
-            let mut wildcard_seen = false;
-            let mut concrete_hosts: Vec<String> = Vec::new();
-            for rule in http_allow.iter().chain(http_deny.iter()) {
-                if rule.host == "*" {
-                    wildcard_seen = true;
-                } else if !concrete_hosts.iter().any(|h| h.eq_ignore_ascii_case(&rule.host)) {
-                    concrete_hosts.push(rule.host.clone());
-                }
-            }
-            if wildcard_seen || (http_allow.is_empty() && http_deny.is_empty()) {
-                // Fallback: explicit --http-port without rules, or wildcard rules.
-                net_allow.push(NetAllow {
-                    protocol: Protocol::Tcp,
-                    host: None,
-                    ports: http_ports.clone(),
-                    all_ports: false,
-                });
-            }
-            for h in concrete_hosts {
-                net_allow.push(NetAllow {
-                    protocol: Protocol::Tcp,
-                    host: Some(h),
-                    ports: http_ports.clone(),
-                    all_ports: false,
-                });
-            }
-        }
+        crate::http::extend_net_allow_for_http(
+            &mut net_allow,
+            &http_allow,
+            &http_deny,
+            &http_ports,
+        );
 
         Ok(Sandbox {
             fs_writable: self.fs_writable,

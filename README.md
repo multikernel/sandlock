@@ -250,7 +250,7 @@ result = (
 assert b"SECRET" in result.stdout
 ```
 
-**XOA pattern** (eXecute Over Architecture) — planner generates code,
+**XOA pattern** (eXecute Only Agents): planner generates code,
 executor runs it with data access but no network:
 
 ```python

@@ -533,7 +533,7 @@ pub unsafe extern "C" fn sandlock_syscall_nr(name: *const c_char) -> i64 {
         Ok(s) => s,
         Err(_) => return -1,
     };
-    match sandlock_core::context::syscall_name_to_nr(name) {
+    match sandlock_core::seccomp::syscall::syscall_name_to_nr(name) {
         Some(nr) => i64::from(nr),
         None => -1,
     }

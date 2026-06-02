@@ -60,7 +60,7 @@ fn clone_flags(notif: &SeccompNotif, notif_fd: RawFd) -> Option<u64> {
         let arr: [u8; 8] = buf.as_slice().try_into().ok()?;
         return Some(u64::from_ne_bytes(arr));
     }
-    if Some(nr) == crate::arch::SYS_VFORK || Some(nr) == crate::arch::SYS_FORK {
+    if Some(nr) == crate::arch::sys_vfork() || Some(nr) == crate::arch::sys_fork() {
         return Some(0);
     }
     None
@@ -204,7 +204,7 @@ impl Drop for ProcessCreationTrace {
 }
 
 fn is_process_creation_notif(notif: &SeccompNotif) -> bool {
-    crate::arch::FORK_LIKE_SYSCALLS.contains(&(notif.data.nr as i64))
+    crate::arch::fork_like_syscalls().contains(&(notif.data.nr as i64))
 }
 
 /// True when `handle_fork` would have incremented the concurrent
@@ -699,12 +699,12 @@ mod tests {
         assert!(requires_process_creation_tracking(&clone3, fd, &argv_safety));
         assert!(!requires_process_creation_tracking(&openat, fd, &argv_safety));
 
-        if let Some(fork_nr) = crate::arch::SYS_FORK {
+        if let Some(fork_nr) = crate::arch::sys_fork() {
             let fork = fake_notif(fork_nr, 0);
             assert!(fork_counted_on_continue(&fork, fd));
             assert!(requires_process_creation_tracking(&fork, fd, &argv_safety));
         }
-        if let Some(vfork_nr) = crate::arch::SYS_VFORK {
+        if let Some(vfork_nr) = crate::arch::sys_vfork() {
             let vfork = fake_notif(vfork_nr, 0);
             assert!(fork_counted_on_continue(&vfork, fd));
             assert!(requires_process_creation_tracking(&vfork, fd, &argv_safety));

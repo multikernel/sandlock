@@ -10,8 +10,9 @@ description = "Lightweight process sandbox using Landlock, seccomp-bpf, and secc
 
 [dependencies]
 libc = "0.2"
+syscalls = { version = "0.8", default-features = false }
 nix = { version = "0.29", features = ["process", "signal", "fs", "ioctl", "poll"] }
-tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros", "io-util"] }
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros", "io-util", "fs"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 rand = "0.8"
@@ -25,7 +26,10 @@ toml = "0.8"
 jiff = "0.2"
 pathdiff = "0.2"
 hudsucker = "0.22"
+tar = "0.4"
 clap = { version = "4", features = ["derive"], optional = true }
+bollard = "0.21"
+futures-util = "0.3"
 
 [features]
 default = []

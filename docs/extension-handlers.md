@@ -256,60 +256,6 @@ fn handle<'a>(
 }
 ```
 
-### Injecting synthetic content (`inject_bytes`)
-
-When a handler hands the guest synthetic file content (a secret, a generated config, a fetched
-object) as the result of an `open`/`openat`, use
-[`NotifAction::inject_bytes`](../crates/sandlock-core/src/seccomp/notif.rs) instead of building a
-`memfd` by hand. It creates an in-memory file populated with the bytes, rewinds it, seals it
-read-only, and returns an `InjectFdSend` action carrying that fd:
-
-```rust
-use sandlock_core::seccomp::notif::NotifAction;
-
-// Inside a handler: serve the bytes as the openat result fd.
-return NotifAction::inject_bytes(b"INJECTED CONTENT\n");
-```
-
-`inject_bytes` owns the fd end to end: the supervisor creates, populates, seals, and (on dispatch)
-closes it, so the caller never touches a raw fd and there is no "when do I close this" question. On
-an allocation failure it collapses to `Errno(EIO)`, which is why it returns a `NotifAction`
-directly rather than a `Result`.
-
-The two defaults both suit the dominant case (synthetic, often sensitive, read-only content):
-
-- **Sealed read-only.** The fd carries `F_SEAL_SEAL | F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK`,
-  so the guest cannot modify or resize the content it is handed.
-- **`O_CLOEXEC` on the child-side fd**, so the content does not leak into programs the guest later
-  `execve`s (see the note below).
-
-When you are impersonating a real file and want byte-for-byte the semantics the guest asked for (a
-writable fd, or the guest's own `O_CLOEXEC` choice), drop to the lower-level primitive
-[`content_memfd(content, seal)`](../crates/sandlock-core/src/seccomp/notif.rs), which returns an
-`OwnedFd` you pass to `NotifAction::InjectFdSend { srcfd, newfd_flags }` yourself:
-
-```rust
-use sandlock_core::seccomp::notif::{content_memfd, NotifAction};
-
-// Writable injected fd, mirroring the guest's own O_CLOEXEC request.
-let fd = match content_memfd(&bytes, /* seal */ false) {
-    Ok(fd) => fd,
-    Err(_) => return NotifAction::Errno(libc::EIO),
-};
-let cloexec = (cx.notif.data.args[2] as i32 & libc::O_CLOEXEC) != 0; // openat flags
-NotifAction::InjectFdSend {
-    srcfd: fd,
-    newfd_flags: if cloexec { libc::O_CLOEXEC as u32 } else { 0 },
-}
-```
-
-> **Why `O_CLOEXEC` by default.** `newfd_flags` sets the close-on-exec bit on the *child-side* fd
-> (distinct from the supervisor's own `MFD_CLOEXEC` copy of the memfd). Without it, a subprocess
-> the guest `execve`s inherits an open fd to the injected content and can read it without ever
-> opening the file. For secret injection that is a silent leak, so `inject_bytes` closes the fd
-> across `exec`; handlers that virtualize a real file and need to honor the guest's request opt out
-> via `content_memfd` (or, over the C ABI, the documented flags).
-
 ### State patterns
 
 Common confusion: when a handler holds mutable state, what kind of synchronisation is needed?
@@ -437,6 +383,62 @@ The contract is exercised at two layers:
 (rather than inject an fd you already hold), construct the action with
 [`NotifAction::inject_bytes`](#injecting-synthetic-content-inject_bytes); it builds the sealed
 `memfd` and produces an `InjectFdSend` for you.
+
+### Injecting synthetic content (`inject_bytes`)
+
+When a handler hands the guest synthetic file content (a secret, a generated config, a fetched
+object) as the result of an `open`/`openat`, use
+[`NotifAction::inject_bytes`](../crates/sandlock-core/src/seccomp/notif.rs) instead of building a
+`memfd` by hand. It creates an in-memory file populated with the bytes, rewinds it, seals it
+read-only, and returns an `InjectFdSend` action carrying that fd:
+
+```rust
+use sandlock_core::seccomp::notif::NotifAction;
+
+// Inside a handler: serve the bytes as the openat result fd.
+return NotifAction::inject_bytes(b"INJECTED CONTENT\n");
+```
+
+`inject_bytes` owns the fd end to end: the supervisor creates, populates, seals, and (on dispatch)
+closes it, so the caller never touches a raw fd and there is no "when do I close this" question. On
+an allocation failure it collapses to `Errno(EIO)`, which is why it returns a `NotifAction`
+directly rather than a `Result`.
+
+The two defaults both suit the dominant case (synthetic, often sensitive, read-only content):
+
+- **Sealed read-only.** The fd carries `F_SEAL_SEAL | F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK`,
+  so the guest cannot modify or resize the content it is handed. Sealing is best-effort: on a
+  kernel without sealing support the fd is still injected but unsealed, bounded only by the rest
+  of the policy.
+- **`O_CLOEXEC` on the child-side fd**, so the content does not leak into programs the guest later
+  `execve`s (see the note below).
+
+When you are impersonating a real file and want byte-for-byte the semantics the guest asked for (a
+writable fd, or the guest's own `O_CLOEXEC` choice), drop to the lower-level primitive
+[`content_memfd(content, seal)`](../crates/sandlock-core/src/seccomp/notif.rs), which returns an
+`OwnedFd` you pass to `NotifAction::InjectFdSend { srcfd, newfd_flags }` yourself:
+
+```rust
+use sandlock_core::seccomp::notif::{content_memfd, NotifAction};
+
+// Writable injected fd, mirroring the guest's own O_CLOEXEC request.
+let fd = match content_memfd(&bytes, /* seal */ false) {
+    Ok(fd) => fd,
+    Err(_) => return NotifAction::Errno(libc::EIO),
+};
+let cloexec = (cx.notif.data.args[2] as i32 & libc::O_CLOEXEC) != 0; // openat flags
+NotifAction::InjectFdSend {
+    srcfd: fd,
+    newfd_flags: if cloexec { libc::O_CLOEXEC as u32 } else { 0 },
+}
+```
+
+> **Why `O_CLOEXEC` by default.** `newfd_flags` sets the close-on-exec bit on the *child-side* fd
+> (distinct from the supervisor's own `MFD_CLOEXEC` copy of the memfd). Without it, a subprocess
+> the guest `execve`s inherits an open fd to the injected content and can read it without ever
+> opening the file. For secret injection that is a silent leak, so `inject_bytes` closes the fd
+> across `exec`; handlers that virtualize a real file and need to honor the guest's request opt out
+> via `content_memfd` (or, over the C ABI, the documented flags).
 
 ### Continue-site safety
 

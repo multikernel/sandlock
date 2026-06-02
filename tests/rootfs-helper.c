@@ -19,6 +19,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 /* ── echo ───────────────────────────────────────────────────── */
@@ -219,6 +220,49 @@ static int cmd_access(int argc, char **argv) {
         return 1;
     }
     printf("OK\n");
+    return 0;
+}
+
+/* ── getxattr (non-standard: print an extended attribute value) ── */
+static int cmd_getxattr(int argc, char **argv) {
+    if (argc < 2) { fprintf(stderr, "getxattr: usage: getxattr <file> <name>\n"); return 1; }
+    char buf[4096];
+    ssize_t n = getxattr(argv[0], argv[1], buf, sizeof(buf));
+    if (n < 0) {
+        printf("ERR %d\n", errno);
+        return 1;
+    }
+    fputs("OK ", stdout);
+    fflush(stdout);
+    write(STDOUT_FILENO, buf, n);
+    putchar('\n');
+    return 0;
+}
+
+/* ── setxattr (non-standard: set an extended attribute) ──────── */
+static int cmd_setxattr(int argc, char **argv) {
+    if (argc < 3) { fprintf(stderr, "setxattr: usage: setxattr <file> <name> <value>\n"); return 1; }
+    if (setxattr(argv[0], argv[1], argv[2], strlen(argv[2]), 0) < 0) {
+        printf("ERR %d\n", errno);
+        return 1;
+    }
+    printf("OK\n");
+    return 0;
+}
+
+/* ── listxattr (non-standard: print attribute names, NUL -> ',') ─ */
+static int cmd_listxattr(int argc, char **argv) {
+    if (argc < 1) { fprintf(stderr, "listxattr: usage: listxattr <file>\n"); return 1; }
+    char buf[4096];
+    ssize_t n = listxattr(argv[0], buf, sizeof(buf));
+    if (n < 0) {
+        printf("ERR %d\n", errno);
+        return 1;
+    }
+    fputs("OK ", stdout);
+    for (ssize_t i = 0; i < n; i++)
+        putchar(buf[i] ? buf[i] : ',');
+    putchar('\n');
     return 0;
 }
 
@@ -524,6 +568,9 @@ static int dispatch(const char *cmd, int argc, char **argv) {
         return 1;
     }
     if (strcmp(cmd, "access") == 0)         return cmd_access(argc, argv);
+    if (strcmp(cmd, "getxattr") == 0)       return cmd_getxattr(argc, argv);
+    if (strcmp(cmd, "setxattr") == 0)       return cmd_setxattr(argc, argv);
+    if (strcmp(cmd, "listxattr") == 0)      return cmd_listxattr(argc, argv);
     if (strcmp(cmd, "fstat-fd") == 0)      return cmd_fstat_fd(argc, argv);
     if (strcmp(cmd, "true") == 0)           return 0;
     if (strcmp(cmd, "false") == 0)          return 1;

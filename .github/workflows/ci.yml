@@ -58,6 +58,29 @@ jobs:
           CC_riscv64gc_unknown_linux_gnu: riscv64-linux-gnu-gcc
         run: cargo build --release --target riscv64gc-unknown-linux-gnu
 
+  cbindgen-header:
+    name: cbindgen header up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cbindgen
+        run: cargo install cbindgen --version 0.29.2 --locked
+
+      # Regenerate include/sandlock.h in place and fail if it differs from the
+      # committed copy, so the C ABI header can never drift from the crate's
+      # #[no_mangle] definitions.
+      - name: Regenerate header and check it is up to date
+        run: |
+          cbindgen --config crates/sandlock-ffi/cbindgen.toml \
+            --crate sandlock-ffi \
+            --output crates/sandlock-ffi/include/sandlock.h
+          git diff --exit-code crates/sandlock-ffi/include/sandlock.h \
+            || { echo "::error::sandlock.h is stale; regenerate it with cbindgen (see crates/sandlock-ffi/cbindgen.toml)"; exit 1; }
+
   python:
     name: Python tests (${{ matrix.runner }}, py${{ matrix.python-version }})
     runs-on: ${{ matrix.runner }}

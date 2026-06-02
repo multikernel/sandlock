@@ -160,7 +160,7 @@ pub enum HandlerError {
 /// notification — otherwise `RET_ALLOW` makes the handler unreachable.
 fn open_family_syscalls() -> Vec<i64> {
     let mut v = vec![libc::SYS_openat, arch::SYS_OPENAT2];
-    if let Some(legacy_open) = arch::SYS_OPEN {
+    if let Some(legacy_open) = arch::sys_open() {
         v.push(legacy_open);
     }
     v
@@ -274,7 +274,7 @@ pub(crate) fn build_dispatch_table(
     // ------------------------------------------------------------------
     // Fork/clone family (always on)
     // ------------------------------------------------------------------
-    for &nr in arch::FORK_LIKE_SYSCALLS {
+    for nr in arch::fork_like_syscalls() {
         let policy_for_fork = Arc::clone(policy);
         let resource_for_fork = Arc::clone(resource);
         table.register(nr, move |cx: &HandlerCtx| {
@@ -480,7 +480,7 @@ pub(crate) fn build_dispatch_table(
         });
     }
     let mut getdents_nrs = vec![libc::SYS_getdents64];
-    if let Some(getdents) = arch::SYS_GETDENTS {
+    if let Some(getdents) = arch::sys_getdents() {
         getdents_nrs.push(getdents);
     }
     for nr in getdents_nrs {
@@ -551,7 +551,7 @@ pub(crate) fn build_dispatch_table(
     // ------------------------------------------------------------------
     if policy.deterministic_dirs {
         let mut getdents_nrs = vec![libc::SYS_getdents64];
-        if let Some(getdents) = arch::SYS_GETDENTS {
+        if let Some(getdents) = arch::sys_getdents() {
             getdents_nrs.push(getdents);
         }
         for nr in getdents_nrs {
@@ -750,7 +750,7 @@ fn register_chroot_handlers(
         crate::chroot::dispatch::handle_chroot_open));
 
     // open (legacy) — fallthrough if Continue
-    if let Some(open) = arch::SYS_OPEN {
+    if let Some(open) = arch::sys_open() {
         table.register(open, chroot_handler_fallthrough!(policy,
             crate::chroot::dispatch::handle_chroot_legacy_open));
     }
@@ -772,37 +772,37 @@ fn register_chroot_handlers(
     }
 
     // Legacy write syscalls
-    if let Some(nr) = arch::SYS_UNLINK {
+    if let Some(nr) = arch::sys_unlink() {
         table.register(nr, chroot_handler!(policy,
             crate::chroot::dispatch::handle_chroot_legacy_unlink));
     }
-    if let Some(nr) = arch::SYS_RMDIR {
+    if let Some(nr) = arch::sys_rmdir() {
         table.register(nr, chroot_handler!(policy,
             crate::chroot::dispatch::handle_chroot_legacy_rmdir));
     }
-    if let Some(nr) = arch::SYS_MKDIR {
+    if let Some(nr) = arch::sys_mkdir() {
         table.register(nr, chroot_handler!(policy,
             crate::chroot::dispatch::handle_chroot_legacy_mkdir));
     }
-    if let Some(nr) = arch::SYS_RENAME {
+    if let Some(nr) = arch::sys_rename() {
         table.register(nr, chroot_handler!(policy,
             crate::chroot::dispatch::handle_chroot_legacy_rename));
     }
-    if let Some(nr) = arch::SYS_SYMLINK {
+    if let Some(nr) = arch::sys_symlink() {
         table.register(nr, chroot_handler!(policy,
             crate::chroot::dispatch::handle_chroot_legacy_symlink));
     }
-    if let Some(nr) = arch::SYS_LINK {
+    if let Some(nr) = arch::sys_link() {
         table.register(nr, chroot_handler!(policy,
             crate::chroot::dispatch::handle_chroot_legacy_link));
     }
-    if let Some(nr) = arch::SYS_CHMOD {
+    if let Some(nr) = arch::sys_chmod() {
         table.register(nr, chroot_handler!(policy,
             crate::chroot::dispatch::handle_chroot_legacy_chmod));
     }
 
     // chown — non-follow
-    if let Some(chown) = arch::SYS_CHOWN {
+    if let Some(chown) = arch::sys_chown() {
         let policy_for_chown = Arc::clone(policy);
         let __sup = Arc::clone(ctx);
         table.register(chown, move |cx: &HandlerCtx| {
@@ -824,7 +824,7 @@ fn register_chroot_handlers(
     }
 
     // lchown — follow
-    if let Some(lchown) = arch::SYS_LCHOWN {
+    if let Some(lchown) = arch::sys_lchown() {
         let policy_for_lchown = Arc::clone(policy);
         let __sup = Arc::clone(ctx);
         table.register(lchown, move |cx: &HandlerCtx| {
@@ -849,22 +849,22 @@ fn register_chroot_handlers(
     for &nr in &[
         libc::SYS_newfstatat,
         libc::SYS_faccessat,
-        crate::chroot::dispatch::SYS_FACCESSAT2,
+        arch::SYS_FACCESSAT2,
     ] {
         table.register(nr, chroot_handler!(policy,
             crate::chroot::dispatch::handle_chroot_stat));
     }
 
     // Legacy stat
-    if let Some(nr) = arch::SYS_STAT {
+    if let Some(nr) = arch::sys_stat() {
         table.register(nr, chroot_handler!(policy,
             crate::chroot::dispatch::handle_chroot_legacy_stat));
     }
-    if let Some(nr) = arch::SYS_LSTAT {
+    if let Some(nr) = arch::sys_lstat() {
         table.register(nr, chroot_handler!(policy,
             crate::chroot::dispatch::handle_chroot_legacy_lstat));
     }
-    if let Some(nr) = arch::SYS_ACCESS {
+    if let Some(nr) = arch::sys_access() {
         table.register(nr, chroot_handler!(policy,
             crate::chroot::dispatch::handle_chroot_legacy_access));
     }
@@ -876,14 +876,14 @@ fn register_chroot_handlers(
     // readlink
     table.register(libc::SYS_readlinkat, chroot_handler!(policy,
         crate::chroot::dispatch::handle_chroot_readlink));
-    if let Some(nr) = arch::SYS_READLINK {
+    if let Some(nr) = arch::sys_readlink() {
         table.register(nr, chroot_handler!(policy,
             crate::chroot::dispatch::handle_chroot_legacy_readlink));
     }
 
     // getdents
     let mut getdents_nrs = vec![libc::SYS_getdents64];
-    if let Some(getdents) = arch::SYS_GETDENTS {
+    if let Some(getdents) = arch::sys_getdents() {
         getdents_nrs.push(getdents);
     }
     for nr in getdents_nrs {
@@ -900,6 +900,17 @@ fn register_chroot_handlers(
         crate::chroot::dispatch::handle_chroot_statfs));
     table.register(libc::SYS_utimensat as i64, chroot_handler!(policy,
         crate::chroot::dispatch::handle_chroot_utimensat));
+
+    // xattr family (path-based) — get/set/list/remove and their l* variants
+    for &nr in &[
+        libc::SYS_getxattr, libc::SYS_lgetxattr,
+        libc::SYS_setxattr, libc::SYS_lsetxattr,
+        libc::SYS_listxattr, libc::SYS_llistxattr,
+        libc::SYS_removexattr, libc::SYS_lremovexattr,
+    ] {
+        table.register(nr, chroot_handler!(policy,
+            crate::chroot::dispatch::handle_chroot_xattr));
+    }
 }
 
 // ============================================================
@@ -932,9 +943,9 @@ fn register_cow_handlers(table: &mut DispatchTable, ctx: &Arc<SupervisorCtx>) {
         libc::SYS_fchownat, libc::SYS_truncate,
     ];
     write_nrs.extend([
-        arch::SYS_UNLINK, arch::SYS_RMDIR, arch::SYS_MKDIR, arch::SYS_RENAME,
-        arch::SYS_SYMLINK, arch::SYS_LINK, arch::SYS_CHMOD, arch::SYS_CHOWN,
-        arch::SYS_LCHOWN,
+        arch::sys_unlink(), arch::sys_rmdir(), arch::sys_mkdir(), arch::sys_rename(),
+        arch::sys_symlink(), arch::sys_link(), arch::sys_chmod(), arch::sys_chown(),
+        arch::sys_lchown(),
     ].into_iter().flatten());
     for nr in write_nrs {
         table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_write));
@@ -942,20 +953,20 @@ fn register_cow_handlers(table: &mut DispatchTable, ctx: &Arc<SupervisorCtx>) {
 
     table.register(libc::SYS_utimensat, cow_call!(crate::cow::dispatch::handle_cow_utimensat));
 
-    let mut access_nrs = vec![libc::SYS_faccessat, crate::cow::dispatch::SYS_FACCESSAT2];
-    access_nrs.extend(arch::SYS_ACCESS);
+    let mut access_nrs = vec![libc::SYS_faccessat, arch::SYS_FACCESSAT2];
+    access_nrs.extend(arch::sys_access());
     for nr in access_nrs {
         table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_access));
     }
 
     let mut open_nrs = vec![libc::SYS_openat];
-    open_nrs.extend(arch::SYS_OPEN);
+    open_nrs.extend(arch::sys_open());
     for nr in open_nrs {
         table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_open));
     }
 
     let mut stat_nrs = vec![libc::SYS_newfstatat, libc::SYS_faccessat];
-    stat_nrs.extend([arch::SYS_STAT, arch::SYS_LSTAT, arch::SYS_ACCESS].into_iter().flatten());
+    stat_nrs.extend([arch::sys_stat(), arch::sys_lstat(), arch::sys_access()].into_iter().flatten());
     for nr in stat_nrs {
         table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_stat));
     }
@@ -963,13 +974,13 @@ fn register_cow_handlers(table: &mut DispatchTable, ctx: &Arc<SupervisorCtx>) {
     table.register(libc::SYS_statx, cow_call!(crate::cow::dispatch::handle_cow_statx));
 
     let mut readlink_nrs = vec![libc::SYS_readlinkat];
-    readlink_nrs.extend(arch::SYS_READLINK);
+    readlink_nrs.extend(arch::sys_readlink());
     for nr in readlink_nrs {
         table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_readlink));
     }
 
     let mut getdents_nrs = vec![libc::SYS_getdents64];
-    getdents_nrs.extend(arch::SYS_GETDENTS);
+    getdents_nrs.extend(arch::sys_getdents());
     for nr in getdents_nrs {
         table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_getdents));
     }

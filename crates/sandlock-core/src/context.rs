@@ -5,6 +5,8 @@ use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
+use syscalls::{Sysno, SysnoSet};
+
 use crate::arch;
 use crate::sandbox::Sandbox;
 use crate::seccomp::bpf::{self, stmt, jump};
@@ -119,141 +121,268 @@ pub(crate) fn read_u32_fd(fd: RawFd) -> io::Result<u32> {
     Ok(u32::from_le_bytes(buf))
 }
 
-// ============================================================
-// Syscall name → number mapping
-// ============================================================
-
-/// Map a syscall name to its `libc::SYS_*` number.
-///
-/// Covers all names in `DEFAULT_BLOCKLIST_SYSCALLS` plus extras needed for
-/// notif and arg-filter lists.
-pub fn syscall_name_to_nr(name: &str) -> Option<u32> {
-    let nr: i64 = match name {
-        "mount" => libc::SYS_mount,
-        "umount2" => libc::SYS_umount2,
-        "pivot_root" => libc::SYS_pivot_root,
-        "swapon" => libc::SYS_swapon,
-        "swapoff" => libc::SYS_swapoff,
-        "reboot" => libc::SYS_reboot,
-        "sethostname" => libc::SYS_sethostname,
-        "setdomainname" => libc::SYS_setdomainname,
-        "kexec_load" => libc::SYS_kexec_load,
-        "init_module" => libc::SYS_init_module,
-        "finit_module" => libc::SYS_finit_module,
-        "delete_module" => libc::SYS_delete_module,
-        "unshare" => libc::SYS_unshare,
-        "setns" => libc::SYS_setns,
-        "perf_event_open" => libc::SYS_perf_event_open,
-        "bpf" => libc::SYS_bpf,
-        "userfaultfd" => libc::SYS_userfaultfd,
-        "keyctl" => libc::SYS_keyctl,
-        "add_key" => libc::SYS_add_key,
-        "request_key" => libc::SYS_request_key,
-        "ptrace" => libc::SYS_ptrace,
-        "process_vm_readv" => libc::SYS_process_vm_readv,
-        "process_vm_writev" => libc::SYS_process_vm_writev,
-        "open_by_handle_at" => libc::SYS_open_by_handle_at,
-        "name_to_handle_at" => libc::SYS_name_to_handle_at,
-        "ioperm" => arch::SYS_IOPERM?,
-        "iopl" => arch::SYS_IOPL?,
-        "quotactl" => libc::SYS_quotactl,
-        "acct" => libc::SYS_acct,
-        "lookup_dcookie" => libc::SYS_lookup_dcookie,
-        // nfsservctl was removed in Linux 3.1; no libc constant — skip
-        "personality" => libc::SYS_personality,
-        "io_uring_setup" => libc::SYS_io_uring_setup,
-        "io_uring_enter" => libc::SYS_io_uring_enter,
-        "io_uring_register" => libc::SYS_io_uring_register,
-        // Additional syscalls for notif/arg filters
-        "clone" => libc::SYS_clone,
-        "clone3" => libc::SYS_clone3,
-        "vfork" => arch::SYS_VFORK?,
-        "mmap" => libc::SYS_mmap,
-        "munmap" => libc::SYS_munmap,
-        "brk" => libc::SYS_brk,
-        "mremap" => libc::SYS_mremap,
-        "connect" => libc::SYS_connect,
-        "sendto" => libc::SYS_sendto,
-        "sendmsg" => libc::SYS_sendmsg,
-        "sendmmsg" => libc::SYS_sendmmsg,
-        "ioctl" => libc::SYS_ioctl,
-        "socket" => libc::SYS_socket,
-        "prctl" => libc::SYS_prctl,
-        "getrandom" => libc::SYS_getrandom,
-        "openat" => libc::SYS_openat,
-        "open" => arch::SYS_OPEN?,
-        "getdents64" => libc::SYS_getdents64,
-        "getdents" => arch::SYS_GETDENTS?,
-        "bind" => libc::SYS_bind,
-        "getsockname" => libc::SYS_getsockname,
-        "clock_gettime" => libc::SYS_clock_gettime,
-        "gettimeofday" => libc::SYS_gettimeofday,
-        "time" => arch::SYS_TIME?,
-        "clock_nanosleep" => libc::SYS_clock_nanosleep,
-        "timerfd_settime" => libc::SYS_timerfd_settime,
-        "timer_settime" => libc::SYS_timer_settime,
-        "execve" => libc::SYS_execve,
-        "execveat" => libc::SYS_execveat,
-        // COW filesystem syscalls
-        "unlinkat" => libc::SYS_unlinkat,
-        "mkdirat" => libc::SYS_mkdirat,
-        "renameat2" => libc::SYS_renameat2,
-        "newfstatat" => libc::SYS_newfstatat,
-        "statx" => libc::SYS_statx,
-        "faccessat" => libc::SYS_faccessat,
-        "symlinkat" => libc::SYS_symlinkat,
-        "linkat" => libc::SYS_linkat,
-        "fchmodat" => libc::SYS_fchmodat,
-        "fchownat" => libc::SYS_fchownat,
-        "readlinkat" => libc::SYS_readlinkat,
-        "truncate" => libc::SYS_truncate,
-        "utimensat" => libc::SYS_utimensat,
-        "unlink" => arch::SYS_UNLINK?,
-        "rmdir" => arch::SYS_RMDIR?,
-        "mkdir" => arch::SYS_MKDIR?,
-        "rename" => arch::SYS_RENAME?,
-        "stat" => arch::SYS_STAT?,
-        "lstat" => arch::SYS_LSTAT?,
-        "access" => arch::SYS_ACCESS?,
-        "symlink" => arch::SYS_SYMLINK?,
-        "link" => arch::SYS_LINK?,
-        "chmod" => arch::SYS_CHMOD?,
-        "chown" => arch::SYS_CHOWN?,
-        "lchown" => arch::SYS_LCHOWN?,
-        "readlink" => arch::SYS_READLINK?,
-        "futimesat" => arch::SYS_FUTIMESAT?,
-        "fork" => arch::SYS_FORK?,
-        // SysV IPC (gated by extra_allow_syscalls=["sysv_ipc"]; denied by default)
-        "shmget" => libc::SYS_shmget,
-        "shmat" => libc::SYS_shmat,
-        "shmdt" => libc::SYS_shmdt,
-        "shmctl" => libc::SYS_shmctl,
-        "msgget" => libc::SYS_msgget,
-        "msgsnd" => libc::SYS_msgsnd,
-        "msgrcv" => libc::SYS_msgrcv,
-        "msgctl" => libc::SYS_msgctl,
-        "semget" => libc::SYS_semget,
-        "semop" => libc::SYS_semop,
-        "semctl" => libc::SYS_semctl,
-        "semtimedop" => libc::SYS_semtimedop,
-        _ => return None,
-    };
-    Some(nr as u32)
-}
+#[cfg(test)]
+use crate::seccomp::syscall::syscall_name_to_nr;
 
 // ============================================================
 // Sandbox → syscall lists
 // ============================================================
 
+#[derive(Default)]
+struct SyscallList {
+    nrs: Vec<u32>,
+}
+
+impl SyscallList {
+    fn with(syscalls: &[i64]) -> Self {
+        let mut list = Self::default();
+        list.extend(syscalls);
+        list
+    }
+
+    fn push(&mut self, nr: i64) {
+        self.nrs.push(nr as u32);
+    }
+
+    fn extend(&mut self, syscalls: &[i64]) {
+        self.nrs.extend(syscalls.iter().map(|&nr| nr as u32));
+    }
+
+    fn push_optional(&mut self, nr: Option<i64>) {
+        if let Some(nr) = nr {
+            self.push(nr);
+        }
+    }
+
+
+    fn finish(mut self) -> Vec<u32> {
+        self.nrs.sort_unstable();
+        self.nrs.dedup();
+        self.nrs
+    }
+}
+
+const BASE_NOTIF_SYSCALLS: &[i64] = &[
+    libc::SYS_clone,
+    libc::SYS_clone3,
+    libc::SYS_wait4,
+    libc::SYS_waitid,
+];
+
+const MEMORY_NOTIF_SYSCALLS: &[i64] = &[
+    libc::SYS_mmap,
+    libc::SYS_munmap,
+    libc::SYS_brk,
+    libc::SYS_mremap,
+];
+
+const NETWORK_POLICY_SYSCALLS: &[i64] = &[
+    libc::SYS_connect,
+    libc::SYS_sendto,
+    libc::SYS_sendmsg,
+    libc::SYS_sendmmsg,
+    libc::SYS_bind,
+];
+
+// Also intercept openat so the supervisor can re-patch vDSO after exec.
+const RANDOM_NOTIF_SYSCALLS: &[i64] = &[libc::SYS_getrandom, libc::SYS_openat];
+
+// Also intercept openat so the supervisor gets a notification after exec
+// and can re-patch the vDSO (exec replaces vDSO with a fresh copy).
+const TIME_NOTIF_SYSCALLS: &[i64] = &[
+    libc::SYS_clock_nanosleep,
+    libc::SYS_timerfd_settime,
+    libc::SYS_timer_settime,
+    libc::SYS_openat,
+];
+
+// /proc virtualization + /etc/hosts virtualization (always on).
+//
+// `openat` carries the simple `(AT_FDCWD, "/proc/...")` and
+// `(AT_FDCWD, "/etc/hosts")` spellings; `openat2` is the same shape
+// on newer libcs; legacy `open(path, ...)` is the same path without a
+// dirfd. The handlers normalize all three into a single absolute path
+// check, so we have to put every variant on the notif list -- otherwise
+// a caller that picks `open` or `openat2` slips past virtualization
+// and reads the real on-disk file.
+fn procfs_hosts_notif_syscalls() -> Vec<i64> {
+    let mut v = vec![libc::SYS_openat, arch::SYS_OPENAT2, libc::SYS_getdents64];
+    v.extend([arch::sys_open(), arch::sys_getdents()].into_iter().flatten());
+    v
+}
+
+// Netlink virtualization (always on):
+//   socket, bind, getsockname -- swap in a unix socketpair for AF_NETLINK
+//   recvfrom, recvmsg         -- zero msg_name so glibc accepts the reply
+//                                (kernel only writes sun_family on unix
+//                                 recvmsg, leaving nl_pid uninitialized)
+//   close                     -- unregister (pid, fd) so reuse doesn't
+//                                collide with the cookie set
+// Send traffic flows through the real socketpair untouched.
+const NETLINK_NOTIF_SYSCALLS: &[i64] = &[
+    libc::SYS_socket,
+    libc::SYS_bind,
+    libc::SYS_getsockname,
+    libc::SYS_recvfrom,
+    libc::SYS_recvmsg,
+    libc::SYS_close,
+];
+
+fn cow_path_syscalls() -> Vec<i64> {
+    let mut v = vec![
+        libc::SYS_openat,
+        libc::SYS_execve,
+        libc::SYS_execveat,
+        libc::SYS_unlinkat,
+        libc::SYS_mkdirat,
+        libc::SYS_renameat2,
+        libc::SYS_symlinkat,
+        libc::SYS_linkat,
+        libc::SYS_fchmodat,
+        libc::SYS_fchownat,
+        libc::SYS_truncate,
+        libc::SYS_utimensat,
+        libc::SYS_newfstatat,
+        libc::SYS_statx,
+        libc::SYS_faccessat,
+        arch::SYS_FACCESSAT2,
+        libc::SYS_readlinkat,
+        libc::SYS_getdents64,
+        libc::SYS_chdir,
+        libc::SYS_getcwd,
+    ];
+    v.extend(
+        [
+            arch::sys_open(),
+            arch::sys_unlink(),
+            arch::sys_rmdir(),
+            arch::sys_mkdir(),
+            arch::sys_rename(),
+            arch::sys_symlink(),
+            arch::sys_link(),
+            arch::sys_chmod(),
+            arch::sys_chown(),
+            arch::sys_lchown(),
+            arch::sys_stat(),
+            arch::sys_lstat(),
+            arch::sys_access(),
+            arch::sys_readlink(),
+            arch::sys_getdents(),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    v
+}
+
+fn chroot_path_syscalls() -> Vec<i64> {
+    let mut v = vec![
+        libc::SYS_openat,
+        libc::SYS_execve,
+        libc::SYS_execveat,
+        libc::SYS_unlinkat,
+        libc::SYS_mkdirat,
+        libc::SYS_renameat2,
+        libc::SYS_symlinkat,
+        libc::SYS_linkat,
+        libc::SYS_fchmodat,
+        libc::SYS_fchownat,
+        libc::SYS_truncate,
+        libc::SYS_newfstatat,
+        libc::SYS_statx,
+        libc::SYS_faccessat,
+        arch::SYS_FACCESSAT2,
+        libc::SYS_readlinkat,
+        libc::SYS_getdents64,
+        libc::SYS_chdir,
+        libc::SYS_getcwd,
+        libc::SYS_statfs,
+        libc::SYS_utimensat,
+        // xattr family (path-based): must be mediated so that paths under an
+        // fs_mount/chroot resolve to the real backing file rather than the
+        // empty mount point (issue #84). The fd-based f*xattr variants need
+        // no mediation — their fd already points at the resolved file.
+        libc::SYS_getxattr,
+        libc::SYS_lgetxattr,
+        libc::SYS_setxattr,
+        libc::SYS_lsetxattr,
+        libc::SYS_listxattr,
+        libc::SYS_llistxattr,
+        libc::SYS_removexattr,
+        libc::SYS_lremovexattr,
+    ];
+    v.extend(
+        [
+            arch::sys_open(),
+            arch::sys_stat(),
+            arch::sys_lstat(),
+            arch::sys_access(),
+            arch::sys_readlink(),
+            arch::sys_getdents(),
+            arch::sys_unlink(),
+            arch::sys_rmdir(),
+            arch::sys_mkdir(),
+            arch::sys_rename(),
+            arch::sys_symlink(),
+            arch::sys_link(),
+            arch::sys_chmod(),
+            arch::sys_chown(),
+            arch::sys_lchown(),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    v
+}
+
+fn fs_denied_path_syscalls() -> Vec<i64> {
+    let mut v = vec![
+        libc::SYS_openat,
+        libc::SYS_execve,
+        libc::SYS_execveat,
+        libc::SYS_linkat,
+        libc::SYS_renameat2,
+        libc::SYS_symlinkat,
+    ];
+    v.extend(
+        [
+            arch::sys_open(),
+            arch::sys_link(),
+            arch::sys_rename(),
+            arch::sys_symlink(),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    v
+}
+
+const POLICY_EVENT_SYSCALLS: &[i64] = &[
+    libc::SYS_openat,
+    libc::SYS_connect,
+    libc::SYS_sendto,
+    libc::SYS_bind,
+    libc::SYS_execve,
+    libc::SYS_execveat,
+];
+
+const PORT_REMAP_SYSCALLS: &[i64] = &[
+    libc::SYS_bind,
+    libc::SYS_getsockname,
+];
+
+fn needs_network_supervision(policy: &Sandbox) -> bool {
+    !policy.net_allow.is_empty()
+        || policy.policy_fn.is_some()
+        || !policy.http_allow.is_empty()
+        || !policy.http_deny.is_empty()
+}
+
 /// Determine which syscalls need `SECCOMP_RET_USER_NOTIF`.
 pub fn notif_syscalls(policy: &Sandbox, sandbox_name: Option<&str>) -> Vec<u32> {
-    let mut nrs = vec![
-        libc::SYS_clone as u32,
-        libc::SYS_clone3 as u32,
-        libc::SYS_wait4 as u32,
-        libc::SYS_waitid as u32,
-    ];
-    arch::push_optional_syscall(&mut nrs, arch::SYS_VFORK);
+    let mut nrs = SyscallList::with(BASE_NOTIF_SYSCALLS);
+    nrs.push_optional(arch::sys_vfork());
+
     // Bare fork(2) carries none of the namespace/process-limit risk of
     // clone/clone3 and was historically left out of the BPF filter so
     // hot fork-loops (COW map-reduce) bypass the supervisor entirely.
@@ -261,223 +390,102 @@ pub fn notif_syscalls(policy: &Sandbox, sandbox_name: Option<&str>) -> Vec<u32> 
     // supervisor can register the new child via ptrace fork events
     // before it can run user code (argv-safety invariant).
     if policy.policy_fn.is_some() {
-        arch::push_optional_syscall(&mut nrs, arch::SYS_FORK);
+        nrs.push_optional(arch::sys_fork());
     }
 
     if policy.max_memory.is_some() {
-        nrs.push(libc::SYS_mmap as u32);
-        nrs.push(libc::SYS_munmap as u32);
-        nrs.push(libc::SYS_brk as u32);
-        nrs.push(libc::SYS_mremap as u32);
+        nrs.extend(MEMORY_NOTIF_SYSCALLS);
         // shmget is in notif only when SysV IPC is allowed. The BPF
         // layout puts notif JEQs before deny JEQs, so a syscall on
         // both lists would notify (RET_USER_NOTIF) and silently
         // bypass the kernel-level deny. When extra_allow_syscalls does not contain "sysv_ipc",
         // shmget belongs only on the blocklist.
         if policy.allows_sysv_ipc() {
-            nrs.push(libc::SYS_shmget as u32);
+            nrs.push(libc::SYS_shmget);
         }
     }
 
-    if !policy.net_allow.is_empty()
-        || policy.policy_fn.is_some()
-        || !policy.http_allow.is_empty()
-        || !policy.http_deny.is_empty()
-    {
-        nrs.push(libc::SYS_connect as u32);
-        nrs.push(libc::SYS_sendto as u32);
-        nrs.push(libc::SYS_sendmsg as u32);
-        nrs.push(libc::SYS_sendmmsg as u32);
-        nrs.push(libc::SYS_bind as u32);
+    if needs_network_supervision(policy) {
+        nrs.extend(NETWORK_POLICY_SYSCALLS);
     }
 
     if policy.random_seed.is_some() {
-        nrs.push(libc::SYS_getrandom as u32);
-        // Also intercept openat so the supervisor can re-patch vDSO after exec.
-        nrs.push(libc::SYS_openat as u32);
+        nrs.extend(RANDOM_NOTIF_SYSCALLS);
     }
 
     if policy.time_start.is_some() {
-        nrs.extend_from_slice(&[
-            libc::SYS_clock_nanosleep as u32,
-            libc::SYS_timerfd_settime as u32,
-            libc::SYS_timer_settime as u32,
-        ]);
-        // Also intercept openat so the supervisor gets a notification after exec
-        // and can re-patch the vDSO (exec replaces vDSO with a fresh copy).
-        nrs.push(libc::SYS_openat as u32);
+        nrs.extend(TIME_NOTIF_SYSCALLS);
     }
 
-    // /proc virtualization + /etc/hosts virtualization (always on).
-    //
-    // `openat` carries the simple `(AT_FDCWD, "/proc/...")` and
-    // `(AT_FDCWD, "/etc/hosts")` spellings; `openat2` is the same shape
-    // on newer libcs; legacy `open(path, ...)` is the same path without a
-    // dirfd. The handlers normalize all three into a single absolute path
-    // check, so we have to put every variant on the notif list — otherwise
-    // a caller that picks `open` or `openat2` slips past virtualization
-    // and reads the real on-disk file.
-    nrs.push(libc::SYS_openat as u32);
-    nrs.push(arch::SYS_OPENAT2 as u32);
-    arch::push_optional_syscall(&mut nrs, arch::SYS_OPEN);
-    nrs.push(libc::SYS_getdents64 as u32);
-    arch::push_optional_syscall(&mut nrs, arch::SYS_GETDENTS);
+    nrs.extend(&procfs_hosts_notif_syscalls());
+    nrs.extend(NETLINK_NOTIF_SYSCALLS);
 
-    // Netlink virtualization (always on):
-    //   socket, bind, getsockname — swap in a unix socketpair for AF_NETLINK
-    //   recvfrom, recvmsg         — zero msg_name so glibc accepts the reply
-    //                                (kernel only writes sun_family on unix
-    //                                 recvmsg, leaving nl_pid uninitialized)
-    //   close                     — unregister (pid, fd) so reuse doesn't
-    //                                collide with the cookie set
-    // Send traffic flows through the real socketpair untouched.
-    nrs.push(libc::SYS_socket as u32);
-    nrs.push(libc::SYS_bind as u32);
-    nrs.push(libc::SYS_getsockname as u32);
-    nrs.push(libc::SYS_recvfrom as u32);
-    nrs.push(libc::SYS_recvmsg as u32);
-    nrs.push(libc::SYS_close as u32);
     // Virtualize sched_getaffinity so nproc/sysconf agree with /proc/cpuinfo
     if policy.num_cpus.is_some() {
-        nrs.push(libc::SYS_sched_getaffinity as u32);
+        nrs.push(libc::SYS_sched_getaffinity);
     }
     if sandbox_name.is_some() {
-        nrs.push(libc::SYS_uname as u32);
-        nrs.push(libc::SYS_openat as u32);
+        nrs.extend(&[libc::SYS_uname, libc::SYS_openat]);
     }
 
     // COW filesystem interception (seccomp-based, unprivileged)
     if policy.workdir.is_some() {
-        nrs.extend_from_slice(&[
-            libc::SYS_openat as u32,
-            libc::SYS_execve as u32,
-            libc::SYS_execveat as u32,
-            libc::SYS_unlinkat as u32,
-            libc::SYS_mkdirat as u32,
-            libc::SYS_renameat2 as u32,
-            libc::SYS_symlinkat as u32,
-            libc::SYS_linkat as u32,
-            libc::SYS_fchmodat as u32,
-            libc::SYS_fchownat as u32,
-            libc::SYS_truncate as u32,
-            libc::SYS_utimensat as u32,
-            libc::SYS_newfstatat as u32,
-            libc::SYS_statx as u32,
-            libc::SYS_faccessat as u32,
-            439u32,                       // SYS_faccessat2 — glibc 2.33+ uses this instead of faccessat
-            libc::SYS_readlinkat as u32,
-            libc::SYS_getdents64 as u32,
-            libc::SYS_chdir as u32,
-            libc::SYS_getcwd as u32,
-        ]);
-        for nr in [
-            arch::SYS_OPEN, arch::SYS_UNLINK, arch::SYS_RMDIR, arch::SYS_MKDIR,
-            arch::SYS_RENAME, arch::SYS_SYMLINK, arch::SYS_LINK, arch::SYS_CHMOD,
-            arch::SYS_CHOWN, arch::SYS_LCHOWN, arch::SYS_STAT, arch::SYS_LSTAT,
-            arch::SYS_ACCESS, arch::SYS_READLINK, arch::SYS_GETDENTS,
-        ] {
-            arch::push_optional_syscall(&mut nrs, nr);
-        }
+        nrs.extend(&cow_path_syscalls());
     }
 
     // Chroot path interception
     if policy.chroot.is_some() {
-        nrs.extend_from_slice(&[
-            libc::SYS_openat as u32,
-            libc::SYS_execve as u32,
-            libc::SYS_execveat as u32,
-            libc::SYS_unlinkat as u32,
-            libc::SYS_mkdirat as u32,
-            libc::SYS_renameat2 as u32,
-            libc::SYS_symlinkat as u32,
-            libc::SYS_linkat as u32,
-            libc::SYS_fchmodat as u32,
-            libc::SYS_fchownat as u32,
-            libc::SYS_truncate as u32,
-            libc::SYS_newfstatat as u32,
-            libc::SYS_statx as u32,
-            libc::SYS_faccessat as u32,
-            439u32,                       // SYS_faccessat2 — glibc 2.33+ uses this instead of faccessat
-            libc::SYS_readlinkat as u32,
-            libc::SYS_getdents64 as u32,
-            libc::SYS_chdir as u32,
-            libc::SYS_getcwd as u32,
-            libc::SYS_statfs as u32,
-            libc::SYS_utimensat as u32,
-        ]);
-        for nr in [
-            arch::SYS_OPEN, arch::SYS_STAT, arch::SYS_LSTAT, arch::SYS_ACCESS,
-            arch::SYS_READLINK, arch::SYS_GETDENTS, arch::SYS_UNLINK,
-            arch::SYS_RMDIR, arch::SYS_MKDIR, arch::SYS_RENAME,
-            arch::SYS_SYMLINK, arch::SYS_LINK, arch::SYS_CHMOD,
-            arch::SYS_CHOWN, arch::SYS_LCHOWN,
-        ] {
-            arch::push_optional_syscall(&mut nrs, nr);
-        }
+        nrs.extend(&chroot_path_syscalls());
     }
 
     // Explicit deny-paths need path-bearing syscalls intercepted.
     if !policy.fs_denied.is_empty() {
-        nrs.extend_from_slice(&[
-            libc::SYS_openat as u32,
-            libc::SYS_execve as u32,
-            libc::SYS_execveat as u32,
-            libc::SYS_linkat as u32,
-            libc::SYS_renameat2 as u32,
-            libc::SYS_symlinkat as u32,
-        ]);
-        for nr in [arch::SYS_OPEN, arch::SYS_LINK, arch::SYS_RENAME, arch::SYS_SYMLINK] {
-            arch::push_optional_syscall(&mut nrs, nr);
-        }
+        nrs.extend(&fs_denied_path_syscalls());
     }
 
     // Dynamic policy callback — intercept key syscalls for event emission.
     if policy.policy_fn.is_some() {
-        nrs.extend_from_slice(&[
-            libc::SYS_openat as u32,
-            libc::SYS_connect as u32,
-            libc::SYS_sendto as u32,
-            libc::SYS_bind as u32,
-            libc::SYS_execve as u32,
-            libc::SYS_execveat as u32,
-        ]);
+        nrs.extend(POLICY_EVENT_SYSCALLS);
     }
 
     // Port remapping
     if policy.port_remap {
-        nrs.extend_from_slice(&[
-            libc::SYS_bind as u32,
-            libc::SYS_getsockname as u32,
-        ]);
+        nrs.extend(PORT_REMAP_SYSCALLS);
     }
 
-    nrs.sort_unstable();
-    nrs.dedup();
-    nrs
+    nrs.finish()
+}
+
+/// Resolve `base` syscall names plus policy extras (and SysV IPC syscalls when
+/// `policy.allows_sysv_ipc()` is false) to a deduplicated, ascending list of
+/// numbers for the current architecture.
+///
+/// A `SysnoSet` accumulates the membership: it dedups inherently (so SysV IPC
+/// folds in with a plain `insert`) and iterates in ascending syscall order.
+/// Names that do not exist on this architecture resolve to nothing and are
+/// skipped, so the result stays arch-correct.
+fn resolve_blocklist(base: &[&str], policy: &Sandbox) -> Vec<u32> {
+    let mut set: SysnoSet = base
+        .iter()
+        .copied()
+        .chain(policy.extra_deny_syscalls.iter().map(String::as_str))
+        .filter_map(|n| n.parse::<Sysno>().ok())
+        .collect();
+    if !policy.allows_sysv_ipc() {
+        for name in SYSV_IPC_BLOCKLIST_SYSCALLS {
+            if let Ok(sysno) = name.parse::<Sysno>() {
+                set.insert(sysno);
+            }
+        }
+    }
+    set.iter().map(|s| s.id() as u32).collect()
 }
 
 /// Resolve `NO_SUPERVISOR_BLOCKLIST_SYSCALLS` names to numbers, plus
 /// SysV IPC syscalls when `policy.allows_sysv_ipc()` is false.
 pub fn no_supervisor_blocklist_syscall_numbers(policy: &Sandbox) -> Vec<u32> {
     use crate::sys::structs::NO_SUPERVISOR_BLOCKLIST_SYSCALLS;
-    let mut nrs: Vec<u32> = NO_SUPERVISOR_BLOCKLIST_SYSCALLS
-        .iter()
-        .copied()
-        .chain(policy.extra_deny_syscalls.iter().map(String::as_str))
-        .filter_map(|n| syscall_name_to_nr(n))
-        .collect();
-    if !policy.allows_sysv_ipc() {
-        for name in SYSV_IPC_BLOCKLIST_SYSCALLS {
-            if let Some(nr) = syscall_name_to_nr(name) {
-                if !nrs.contains(&nr) {
-                    nrs.push(nr);
-                }
-            }
-        }
-    }
-    nrs.sort_unstable();
-    nrs.dedup();
-    nrs
+    resolve_blocklist(NO_SUPERVISOR_BLOCKLIST_SYSCALLS, policy)
 }
 
 /// Resolve the default syscall blocklist plus policy extras to numbers.
@@ -485,24 +493,7 @@ pub fn no_supervisor_blocklist_syscall_numbers(policy: &Sandbox) -> Vec<u32> {
 /// SysV IPC syscalls are appended to the resolved blocklist when
 /// `policy.allows_sysv_ipc()` is false.
 pub fn blocklist_syscall_numbers(policy: &Sandbox) -> Vec<u32> {
-    let mut nrs: Vec<u32> = DEFAULT_BLOCKLIST_SYSCALLS
-        .iter()
-        .copied()
-        .chain(policy.extra_deny_syscalls.iter().map(String::as_str))
-        .filter_map(|n| syscall_name_to_nr(n))
-        .collect();
-    if !policy.allows_sysv_ipc() {
-        for name in SYSV_IPC_BLOCKLIST_SYSCALLS {
-            if let Some(nr) = syscall_name_to_nr(name) {
-                if !nrs.contains(&nr) {
-                    nrs.push(nr);
-                }
-            }
-        }
-    }
-    nrs.sort_unstable();
-    nrs.dedup();
-    nrs
+    resolve_blocklist(DEFAULT_BLOCKLIST_SYSCALLS, policy)
 }
 
 /// Build argument-level seccomp filter instructions matching the Python
@@ -951,7 +942,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
             n == libc::SYS_execve as u32 || n == libc::SYS_execveat as u32
         });
         if exec_extra {
-            arch::push_optional_syscall(&mut notif, arch::SYS_FORK);
+            arch::push_optional_syscall(&mut notif, arch::sys_fork());
         }
         notif.sort_unstable();
         notif.dedup();
@@ -1107,21 +1098,21 @@ mod tests {
         let nrs = notif_syscalls(&policy, None);
         assert!(nrs.contains(&(libc::SYS_clone as u32)));
         assert!(nrs.contains(&(libc::SYS_clone3 as u32)));
-        if let Some(vfork) = arch::SYS_VFORK {
+        if let Some(vfork) = arch::sys_vfork() {
             assert!(nrs.contains(&(vfork as u32)));
         }
         // Bare fork(2) is intercepted only when policy_fn is active —
         // see notif_syscalls. The default policy has no policy_fn, so
         // fork stays out of the BPF filter and hot fork-loops keep
         // bypassing the supervisor.
-        if let Some(fork) = arch::SYS_FORK {
+        if let Some(fork) = arch::sys_fork() {
             assert!(!nrs.contains(&(fork as u32)));
         }
     }
 
     #[test]
     fn test_notif_syscalls_fork_gated_on_policy_fn() {
-        let Some(fork) = arch::SYS_FORK else { return };
+        let Some(fork) = arch::sys_fork() else { return };
         let policy = Sandbox::builder()
             .policy_fn(|_event, _ctx| crate::policy_fn::Verdict::Allow)
             .build()
@@ -1191,8 +1182,6 @@ mod tests {
     /// chroot and COW modes — glibc 2.33+ uses it instead of faccessat.
     #[test]
     fn test_notif_syscalls_faccessat2() {
-        const SYS_FACCESSAT2: u32 = 439;
-
         // Chroot mode
         let policy = Sandbox::builder()
             .chroot("/tmp")
@@ -1200,7 +1189,7 @@ mod tests {
             .unwrap();
         let nrs = notif_syscalls(&policy, None);
         assert!(nrs.contains(&(libc::SYS_faccessat as u32)));
-        assert!(nrs.contains(&SYS_FACCESSAT2),
+        assert!(nrs.contains(&(arch::SYS_FACCESSAT2 as u32)),
                 "chroot notif filter must include SYS_faccessat2 (439)");
 
         // COW mode
@@ -1210,7 +1199,7 @@ mod tests {
             .unwrap();
         let nrs = notif_syscalls(&policy, None);
         assert!(nrs.contains(&(libc::SYS_faccessat as u32)));
-        assert!(nrs.contains(&SYS_FACCESSAT2),
+        assert!(nrs.contains(&(arch::SYS_FACCESSAT2 as u32)),
                 "COW notif filter must include SYS_faccessat2 (439)");
     }
 
@@ -1363,8 +1352,10 @@ mod tests {
     fn test_syscall_name_to_nr_covers_defaults() {
         // Every name in DEFAULT_BLOCKLIST_SYSCALLS should resolve unless the
         // running architecture does not expose that syscall.
+        // `nfsservctl` now resolves: the syscalls crate carries it (kernel
+        // returns ENOSYS, but the ABI number exists), so it is enforced in the
+        // blocklist rather than silently dropped. `ioperm`/`iopl` are x86-only.
         let expected_unresolved: &[&str] = &[
-            "nfsservctl",
             #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             "ioperm",
             #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
