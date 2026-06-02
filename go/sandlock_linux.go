@@ -3,91 +3,13 @@
 package sandlock
 
 /*
+#cgo CFLAGS: -I${SRCDIR}/../crates/sandlock-ffi/include
 #cgo LDFLAGS: -L${SRCDIR}/../target/release -Wl,-rpath,${SRCDIR}/../target/release -lsandlock_ffi -lpthread -ldl -lm
 
-#include <stdint.h>
-#include <stddef.h>
+// The C declarations come from the cbindgen-generated header, so the cgo
+// prototypes stay in lock-step with crates/sandlock-ffi automatically.
 #include <stdlib.h>
-
-// Opaque handles are passed as void*; C imposes no name mangling, so these
-// prototypes resolve directly to the #[no_mangle] symbols in sandlock-ffi.
-// Kept in lock-step with crates/sandlock-ffi/src/lib.rs.
-
-void* sandlock_sandbox_builder_new(void);
-void* sandlock_sandbox_builder_fs_read(void* b, const char* path);
-void* sandlock_sandbox_builder_fs_write(void* b, const char* path);
-void* sandlock_sandbox_builder_fs_deny(void* b, const char* path);
-void* sandlock_sandbox_builder_fs_storage(void* b, const char* path);
-void* sandlock_sandbox_builder_workdir(void* b, const char* path);
-void* sandlock_sandbox_builder_cwd(void* b, const char* path);
-void* sandlock_sandbox_builder_chroot(void* b, const char* path);
-void* sandlock_sandbox_builder_fs_mount(void* b, const char* vpath, const char* hpath);
-void* sandlock_sandbox_builder_on_exit(void* b, uint8_t action);
-void* sandlock_sandbox_builder_on_error(void* b, uint8_t action);
-void* sandlock_sandbox_builder_gpu_devices(void* b, const uint32_t* devs, uint32_t len);
-void* sandlock_sandbox_builder_cpu_cores(void* b, const uint32_t* cores, uint32_t len);
-void* sandlock_sandbox_builder_max_memory(void* b, uint64_t bytes);
-void* sandlock_sandbox_builder_max_disk(void* b, uint64_t bytes);
-void* sandlock_sandbox_builder_max_processes(void* b, uint32_t n);
-void* sandlock_sandbox_builder_max_cpu(void* b, uint8_t pct);
-void* sandlock_sandbox_builder_num_cpus(void* b, uint32_t n);
-void* sandlock_sandbox_builder_max_open_files(void* b, unsigned int n);
-void* sandlock_sandbox_builder_net_allow(void* b, const char* spec);
-void* sandlock_sandbox_builder_net_bind_port(void* b, uint16_t port);
-void* sandlock_sandbox_builder_port_remap(void* b, unsigned char v);
-void* sandlock_sandbox_builder_uid(void* b, uint32_t id);
-void* sandlock_sandbox_builder_http_allow(void* b, const char* rule);
-void* sandlock_sandbox_builder_http_deny(void* b, const char* rule);
-void* sandlock_sandbox_builder_http_port(void* b, uint16_t port);
-void* sandlock_sandbox_builder_http_ca(void* b, const char* path);
-void* sandlock_sandbox_builder_http_key(void* b, const char* path);
-void* sandlock_sandbox_builder_random_seed(void* b, uint64_t seed);
-void* sandlock_sandbox_builder_clean_env(void* b, unsigned char v);
-void* sandlock_sandbox_builder_env_var(void* b, const char* k, const char* v);
-void* sandlock_sandbox_builder_time_start(void* b, uint64_t epoch_secs);
-void* sandlock_sandbox_builder_extra_deny_syscalls(void* b, const char* names);
-void* sandlock_sandbox_builder_extra_allow_syscalls(void* b, const char* names);
-void* sandlock_sandbox_builder_no_randomize_memory(void* b, unsigned char v);
-void* sandlock_sandbox_builder_no_huge_pages(void* b, unsigned char v);
-void* sandlock_sandbox_builder_no_coredump(void* b, unsigned char v);
-void* sandlock_sandbox_builder_deterministic_dirs(void* b, unsigned char v);
-void* sandlock_sandbox_build(void* b, int* err, char** err_msg);
-void  sandlock_sandbox_free(void* p);
-void  sandlock_string_free(char* s);
-
-int sandlock_confine(const void* policy);
-
-void* sandlock_run(const void* policy, const char* name, const char* const* argv, unsigned int argc);
-int   sandlock_run_interactive(const void* policy, const char* name, const char* const* argv, unsigned int argc);
-
-void*   sandlock_create(const void* policy, const char* name, const char* const* argv, unsigned int argc);
-void*   sandlock_create_for_run(const void* policy, const char* name, const char* const* argv, unsigned int argc);
-int     sandlock_start(void* h);
-int32_t sandlock_handle_pid(const void* h);
-void*   sandlock_handle_wait(void* h);
-void*   sandlock_handle_wait_timeout(void* h, uint64_t timeout_ms);
-char*   sandlock_handle_port_mappings(const void* h);
-void    sandlock_handle_free(void* h);
-
-int            sandlock_result_exit_code(const void* r);
-unsigned char  sandlock_result_success(const void* r);
-const uint8_t* sandlock_result_stdout_bytes(const void* r, size_t* len);
-const uint8_t* sandlock_result_stderr_bytes(const void* r, size_t* len);
-void           sandlock_result_free(void* r);
-
-void*          sandlock_dry_run(const void* policy, const char* name, const char* const* argv, unsigned int argc);
-int            sandlock_dry_run_result_exit_code(const void* r);
-unsigned char  sandlock_dry_run_result_success(const void* r);
-const uint8_t* sandlock_dry_run_result_stdout_bytes(const void* r, size_t* len);
-const uint8_t* sandlock_dry_run_result_stderr_bytes(const void* r, size_t* len);
-size_t         sandlock_dry_run_result_changes_len(const void* r);
-char           sandlock_dry_run_result_change_kind(const void* r, size_t i);
-char*          sandlock_dry_run_result_change_path(const void* r, size_t i);
-void           sandlock_dry_run_result_free(void* r);
-
-int     sandlock_landlock_abi_version(void);
-int     sandlock_min_landlock_abi(void);
-int64_t sandlock_syscall_nr(const char* name);
+#include "sandlock.h"
 */
 import "C"
 
@@ -109,12 +31,7 @@ import (
 // the conversion to a C string.
 func hasNUL(s string) bool { return strings.IndexByte(s, 0) >= 0 }
 
-func boolByte(v bool) C.uchar {
-	if v {
-		return 1
-	}
-	return 0
-}
+func cbool(v bool) C.bool { return C.bool(v) }
 
 // validateStrings rejects any configuration string carrying a NUL byte before
 // a builder is allocated. The FFI has no builder-free entry point, so a failure
@@ -151,7 +68,7 @@ func (s *Sandbox) validateStrings() error {
 
 // buildPolicy translates the Sandbox configuration into a native policy handle.
 // The returned pointer must be released with C.sandlock_sandbox_free.
-func (s *Sandbox) buildPolicy() (unsafe.Pointer, error) {
+func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 	if err := s.validateStrings(); err != nil {
 		return nil, err
 	}
@@ -159,29 +76,41 @@ func (s *Sandbox) buildPolicy() (unsafe.Pointer, error) {
 	b := C.sandlock_sandbox_builder_new()
 
 	// str calls a one-string builder setter, freeing the C string afterward.
-	str := func(fn func(unsafe.Pointer, *C.char) unsafe.Pointer, val string) {
+	str := func(fn func(*C.sandlock_builder_t, *C.char) *C.sandlock_builder_t, val string) {
 		c := C.CString(val)
 		b = fn(b, c)
 		C.free(unsafe.Pointer(c))
 	}
 
 	for _, p := range s.FSReadable {
-		str(func(b unsafe.Pointer, c *C.char) unsafe.Pointer { return C.sandlock_sandbox_builder_fs_read(b, c) }, p)
+		str(func(b *C.sandlock_builder_t, c *C.char) *C.sandlock_builder_t {
+			return C.sandlock_sandbox_builder_fs_read(b, c)
+		}, p)
 	}
 	for _, p := range s.FSWritable {
-		str(func(b unsafe.Pointer, c *C.char) unsafe.Pointer { return C.sandlock_sandbox_builder_fs_write(b, c) }, p)
+		str(func(b *C.sandlock_builder_t, c *C.char) *C.sandlock_builder_t {
+			return C.sandlock_sandbox_builder_fs_write(b, c)
+		}, p)
 	}
 	for _, p := range s.FSDenied {
-		str(func(b unsafe.Pointer, c *C.char) unsafe.Pointer { return C.sandlock_sandbox_builder_fs_deny(b, c) }, p)
+		str(func(b *C.sandlock_builder_t, c *C.char) *C.sandlock_builder_t {
+			return C.sandlock_sandbox_builder_fs_deny(b, c)
+		}, p)
 	}
 	if s.Workdir != "" {
-		str(func(b unsafe.Pointer, c *C.char) unsafe.Pointer { return C.sandlock_sandbox_builder_workdir(b, c) }, s.Workdir)
+		str(func(b *C.sandlock_builder_t, c *C.char) *C.sandlock_builder_t {
+			return C.sandlock_sandbox_builder_workdir(b, c)
+		}, s.Workdir)
 	}
 	if s.Cwd != "" {
-		str(func(b unsafe.Pointer, c *C.char) unsafe.Pointer { return C.sandlock_sandbox_builder_cwd(b, c) }, s.Cwd)
+		str(func(b *C.sandlock_builder_t, c *C.char) *C.sandlock_builder_t {
+			return C.sandlock_sandbox_builder_cwd(b, c)
+		}, s.Cwd)
 	}
 	if s.Chroot != "" {
-		str(func(b unsafe.Pointer, c *C.char) unsafe.Pointer { return C.sandlock_sandbox_builder_chroot(b, c) }, s.Chroot)
+		str(func(b *C.sandlock_builder_t, c *C.char) *C.sandlock_builder_t {
+			return C.sandlock_sandbox_builder_chroot(b, c)
+		}, s.Chroot)
 	}
 	for vp, hp := range s.FSMount {
 		cv, ch := C.CString(vp), C.CString(hp)
@@ -192,7 +121,9 @@ func (s *Sandbox) buildPolicy() (unsafe.Pointer, error) {
 
 	// Network.
 	for _, spec := range s.NetAllow {
-		str(func(b unsafe.Pointer, c *C.char) unsafe.Pointer { return C.sandlock_sandbox_builder_net_allow(b, c) }, spec)
+		str(func(b *C.sandlock_builder_t, c *C.char) *C.sandlock_builder_t {
+			return C.sandlock_sandbox_builder_net_allow(b, c)
+		}, spec)
 	}
 	if len(s.NetBind) > 0 {
 		ports, err := policy.ParsePorts(s.NetBind)
@@ -205,24 +136,32 @@ func (s *Sandbox) buildPolicy() (unsafe.Pointer, error) {
 		}
 	}
 	if s.PortRemap {
-		b = C.sandlock_sandbox_builder_port_remap(b, boolByte(true))
+		b = C.sandlock_sandbox_builder_port_remap(b, cbool(true))
 	}
 
 	// HTTP ACL.
 	for _, r := range s.HTTPAllow {
-		str(func(b unsafe.Pointer, c *C.char) unsafe.Pointer { return C.sandlock_sandbox_builder_http_allow(b, c) }, r)
+		str(func(b *C.sandlock_builder_t, c *C.char) *C.sandlock_builder_t {
+			return C.sandlock_sandbox_builder_http_allow(b, c)
+		}, r)
 	}
 	for _, r := range s.HTTPDeny {
-		str(func(b unsafe.Pointer, c *C.char) unsafe.Pointer { return C.sandlock_sandbox_builder_http_deny(b, c) }, r)
+		str(func(b *C.sandlock_builder_t, c *C.char) *C.sandlock_builder_t {
+			return C.sandlock_sandbox_builder_http_deny(b, c)
+		}, r)
 	}
 	for _, p := range s.HTTPPorts {
 		b = C.sandlock_sandbox_builder_http_port(b, C.uint16_t(p))
 	}
 	if s.HTTPCAFile != "" {
-		str(func(b unsafe.Pointer, c *C.char) unsafe.Pointer { return C.sandlock_sandbox_builder_http_ca(b, c) }, s.HTTPCAFile)
+		str(func(b *C.sandlock_builder_t, c *C.char) *C.sandlock_builder_t {
+			return C.sandlock_sandbox_builder_http_ca(b, c)
+		}, s.HTTPCAFile)
 	}
 	if s.HTTPKeyFile != "" {
-		str(func(b unsafe.Pointer, c *C.char) unsafe.Pointer { return C.sandlock_sandbox_builder_http_key(b, c) }, s.HTTPKeyFile)
+		str(func(b *C.sandlock_builder_t, c *C.char) *C.sandlock_builder_t {
+			return C.sandlock_sandbox_builder_http_key(b, c)
+		}, s.HTTPKeyFile)
 	}
 
 	// Resource limits.
@@ -267,12 +206,12 @@ func (s *Sandbox) buildPolicy() (unsafe.Pointer, error) {
 
 	// Syscall filtering.
 	if len(s.ExtraDenySyscalls) > 0 {
-		str(func(b unsafe.Pointer, c *C.char) unsafe.Pointer {
+		str(func(b *C.sandlock_builder_t, c *C.char) *C.sandlock_builder_t {
 			return C.sandlock_sandbox_builder_extra_deny_syscalls(b, c)
 		}, strings.Join(s.ExtraDenySyscalls, ","))
 	}
 	if len(s.ExtraAllowSyscalls) > 0 {
-		str(func(b unsafe.Pointer, c *C.char) unsafe.Pointer {
+		str(func(b *C.sandlock_builder_t, c *C.char) *C.sandlock_builder_t {
 			return C.sandlock_sandbox_builder_extra_allow_syscalls(b, c)
 		}, strings.Join(s.ExtraAllowSyscalls, ","))
 	}
@@ -290,18 +229,18 @@ func (s *Sandbox) buildPolicy() (unsafe.Pointer, error) {
 		b = C.sandlock_sandbox_builder_time_start(b, C.uint64_t(secs))
 	}
 	if s.NoRandomizeMemory {
-		b = C.sandlock_sandbox_builder_no_randomize_memory(b, boolByte(true))
+		b = C.sandlock_sandbox_builder_no_randomize_memory(b, cbool(true))
 	}
 	if s.NoHugePages {
-		b = C.sandlock_sandbox_builder_no_huge_pages(b, boolByte(true))
+		b = C.sandlock_sandbox_builder_no_huge_pages(b, cbool(true))
 	}
 	if s.DeterministicDirs {
-		b = C.sandlock_sandbox_builder_deterministic_dirs(b, boolByte(true))
+		b = C.sandlock_sandbox_builder_deterministic_dirs(b, cbool(true))
 	}
 
 	// Environment.
 	if s.CleanEnv {
-		b = C.sandlock_sandbox_builder_clean_env(b, boolByte(true))
+		b = C.sandlock_sandbox_builder_clean_env(b, cbool(true))
 	}
 	for k, v := range s.Env {
 		ck, cv := C.CString(k), C.CString(v)
@@ -315,12 +254,14 @@ func (s *Sandbox) buildPolicy() (unsafe.Pointer, error) {
 		b = C.sandlock_sandbox_builder_uid(b, C.uint32_t(*s.UID))
 	}
 	if s.NoCoredump {
-		b = C.sandlock_sandbox_builder_no_coredump(b, boolByte(true))
+		b = C.sandlock_sandbox_builder_no_coredump(b, cbool(true))
 	}
 
 	// Copy-on-write branch handling.
 	if s.FSStorage != "" {
-		str(func(b unsafe.Pointer, c *C.char) unsafe.Pointer { return C.sandlock_sandbox_builder_fs_storage(b, c) }, s.FSStorage)
+		str(func(b *C.sandlock_builder_t, c *C.char) *C.sandlock_builder_t {
+			return C.sandlock_sandbox_builder_fs_storage(b, c)
+		}, s.FSStorage)
 	}
 	if s.OnExit != BranchActionDefault {
 		b = C.sandlock_sandbox_builder_on_exit(b, C.uint8_t(s.OnExit-1))
@@ -348,7 +289,7 @@ func (s *Sandbox) buildPolicy() (unsafe.Pointer, error) {
 // consumer, so we build and immediately free the resulting policy (or discard
 // a build error). Reached only on the rare numeric-parse error paths after the
 // builder already exists.
-func freeBuilderViaBuild(b unsafe.Pointer) {
+func freeBuilderViaBuild(b *C.sandlock_builder_t) {
 	var errCode C.int
 	var errMsg *C.char
 	p := C.sandlock_sandbox_build(b, &errCode, &errMsg)
@@ -425,18 +366,18 @@ func timeoutMs(ctx context.Context) C.uint64_t {
 	return C.uint64_t(ms)
 }
 
-func readResult(r unsafe.Pointer) *Result {
+func readResult(r *C.sandlock_result_t) *Result {
 	res := &Result{
 		ExitCode: int(C.sandlock_result_exit_code(r)),
-		Success:  C.sandlock_result_success(r) != 0,
+		Success:  bool(C.sandlock_result_success(r)),
 	}
 	res.Stdout = readBytes(r, true)
 	res.Stderr = readBytes(r, false)
 	return res
 }
 
-func readBytes(r unsafe.Pointer, stdout bool) []byte {
-	var n C.size_t
+func readBytes(r *C.sandlock_result_t, stdout bool) []byte {
+	var n C.uintptr_t
 	var p *C.uint8_t
 	if stdout {
 		p = C.sandlock_result_stdout_bytes(r, &n)
@@ -556,9 +497,9 @@ func (s *Sandbox) DryRun(ctx context.Context, cmd ...string) (*DryRunResult, err
 
 	out := &DryRunResult{Result: Result{
 		ExitCode: int(C.sandlock_dry_run_result_exit_code(r)),
-		Success:  C.sandlock_dry_run_result_success(r) != 0,
+		Success:  bool(C.sandlock_dry_run_result_success(r)),
 	}}
-	var n C.size_t
+	var n C.uintptr_t
 	if p := C.sandlock_dry_run_result_stdout_bytes(r, &n); p != nil && n > 0 {
 		out.Stdout = C.GoBytes(unsafe.Pointer(p), C.int(n))
 	}
@@ -567,9 +508,9 @@ func (s *Sandbox) DryRun(ctx context.Context, cmd ...string) (*DryRunResult, err
 	}
 	count := int(C.sandlock_dry_run_result_changes_len(r))
 	for i := 0; i < count; i++ {
-		kind := byte(C.sandlock_dry_run_result_change_kind(r, C.size_t(i)))
+		kind := byte(C.sandlock_dry_run_result_change_kind(r, C.uintptr_t(i)))
 		var path string
-		if pc := C.sandlock_dry_run_result_change_path(r, C.size_t(i)); pc != nil {
+		if pc := C.sandlock_dry_run_result_change_path(r, C.uintptr_t(i)); pc != nil {
 			path = C.GoString(pc)
 			C.sandlock_string_free(pc)
 		}
@@ -629,7 +570,7 @@ func SyscallNr(name string) (int, error) {
 // reads the handle and is reported as empty while a Wait is in flight.
 type Process struct {
 	mu      sync.Mutex
-	h       unsafe.Pointer
+	h       *C.sandlock_handle_t
 	pid     int
 	waiting bool // a Wait owns the handle; other handle ops must defer to it
 }
