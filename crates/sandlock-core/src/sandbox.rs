@@ -1174,13 +1174,42 @@ impl Sandbox {
             &resolved_net_allow.concrete_host_entries,
         );
 
+        let mut ca_inject_pem: Option<std::sync::Arc<Vec<u8>>> = None;
         if !self.http_allow.is_empty() || !self.http_deny.is_empty() {
+            // Generate an ephemeral CA when injection is requested without BYO.
+            let generate = !self.http_inject_ca.is_empty();
+            let ca_material = crate::http_acl::resolve_ca(
+                self.http_ca.as_deref(),
+                self.http_key.as_deref(),
+                generate,
+            )
+            .map_err(SandboxRuntimeError::Io)?;
+
+            // Export the public cert if requested.
+            if let (Some(out), Some(cm)) = (self.http_ca_out.as_deref(), ca_material.as_ref()) {
+                std::fs::write(out, cm.cert_pem.as_bytes()).map_err(SandboxRuntimeError::Io)?;
+            }
+
+            // Keep the public cert for trust injection (only when paths declared).
+            if !self.http_inject_ca.is_empty() {
+                if let Some(cm) = ca_material.as_ref() {
+                    ca_inject_pem = Some(std::sync::Arc::new(cm.cert_pem.clone().into_bytes()));
+                }
+            }
+
+            let (cert_pem, key_pem) = match ca_material.as_ref() {
+                Some(cm) => (Some(cm.cert_pem.as_str()), Some(cm.key_pem.as_str())),
+                None => (None, None),
+            };
+
             let handle = crate::http_acl::spawn_http_acl_proxy(
                 self.http_allow.clone(),
                 self.http_deny.clone(),
-                self.http_ca.as_deref(),
-                self.http_key.as_deref(),
-            ).await.map_err(SandboxRuntimeError::Io)?;
+                cert_pem,
+                key_pem,
+            )
+            .await
+            .map_err(SandboxRuntimeError::Io)?;
             self.rt_mut().http_acl_handle = Some(handle);
         }
 
@@ -1362,6 +1391,8 @@ impl Sandbox {
                 virtual_hostname: Some(rt_name),
                 has_http_acl: !self.http_allow.is_empty() || !self.http_deny.is_empty(),
                 virtual_etc_hosts,
+                ca_inject_paths: self.http_inject_ca.clone(),
+                ca_inject_pem: ca_inject_pem.clone(),
             };
 
             use rand::SeedableRng;

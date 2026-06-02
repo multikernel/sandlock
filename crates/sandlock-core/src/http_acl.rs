@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
 use std::sync::Arc;
 
 use hudsucker::certificate_authority::RcgenAuthority;
@@ -213,30 +212,60 @@ static DUMMY_CA: std::sync::LazyLock<std::io::Result<(Vec<u8>, Vec<u8>)>> =
         Ok((kp.serialize_pem().into_bytes(), cert.pem().into_bytes()))
     });
 
-/// Spawn a hudsucker-based HTTP ACL proxy.
-///
-/// If `ca_cert` and `ca_key` are provided, the proxy also intercepts HTTPS
-/// traffic via MITM using the given CA. Otherwise, only plaintext HTTP
-/// (port 80) is intercepted.
-pub async fn spawn_http_acl_proxy(
-    allow: Vec<HttpRule>,
-    deny: Vec<HttpRule>,
-    ca_cert: Option<&Path>,
-    ca_key: Option<&Path>,
-) -> std::io::Result<HttpAclProxyHandle> {
-    // Load CA for HTTPS MITM if provided.
+/// In-memory CA material (public cert + private key, PEM-encoded).
+pub struct CaMaterial {
+    pub cert_pem: String,
+    pub key_pem: String,
+}
 
-    let (key_pair, cert) = if let (Some(cert_path), Some(key_path)) = (ca_cert, ca_key) {
-        let key_pem = std::fs::read_to_string(key_path).map_err(|e| {
-            std::io::Error::new(e.kind(), format!("failed to read --http-key {:?}: {e}", key_path))
-        })?;
+/// Resolve the CA used for HTTPS MITM.
+///
+/// - Both `ca_cert` and `ca_key` set: load them from disk (bring-your-own).
+/// - Neither set but `generate` is true: generate an ephemeral in-memory CA.
+///   The private key never touches disk.
+/// - Otherwise: `None` (HTTP-only; the proxy uses its internal dummy CA).
+pub fn resolve_ca(
+    ca_cert: Option<&std::path::Path>,
+    ca_key: Option<&std::path::Path>,
+    generate: bool,
+) -> std::io::Result<Option<CaMaterial>> {
+    if let (Some(cert_path), Some(key_path)) = (ca_cert, ca_key) {
         let cert_pem = std::fs::read_to_string(cert_path).map_err(|e| {
             std::io::Error::new(e.kind(), format!("failed to read --http-ca {:?}: {e}", cert_path))
         })?;
-        let kp = KeyPair::from_pem(&key_pem).map_err(|e| {
+        let key_pem = std::fs::read_to_string(key_path).map_err(|e| {
+            std::io::Error::new(e.kind(), format!("failed to read --http-key {:?}: {e}", key_path))
+        })?;
+        return Ok(Some(CaMaterial { cert_pem, key_pem }));
+    }
+    if generate {
+        let (kp, cert) = dummy_ca()?;
+        return Ok(Some(CaMaterial {
+            cert_pem: cert.pem(),
+            key_pem: kp.serialize_pem(),
+        }));
+    }
+    Ok(None)
+}
+
+/// Spawn a hudsucker-based HTTP ACL proxy.
+///
+/// If `ca_cert_pem` and `ca_key_pem` are provided, the proxy also intercepts
+/// HTTPS traffic via MITM using the given in-memory CA. Otherwise, only
+/// plaintext HTTP (port 80) is intercepted via the dummy CA.
+pub async fn spawn_http_acl_proxy(
+    allow: Vec<HttpRule>,
+    deny: Vec<HttpRule>,
+    ca_cert_pem: Option<&str>,
+    ca_key_pem: Option<&str>,
+) -> std::io::Result<HttpAclProxyHandle> {
+    // Load CA for HTTPS MITM if provided (in-memory PEM), else fall back to
+    // the lazily-generated dummy CA for HTTP-only mode.
+    let (key_pair, cert) = if let (Some(cert_pem), Some(key_pem)) = (ca_cert_pem, ca_key_pem) {
+        let kp = KeyPair::from_pem(key_pem).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, format!("invalid CA key: {e}"))
         })?;
-        let params = CertificateParams::from_ca_cert_pem(&cert_pem).map_err(|e| {
+        let params = CertificateParams::from_ca_cert_pem(cert_pem).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, format!("invalid CA cert: {e}"))
         })?;
         let cert = params.self_signed(&kp).map_err(|e| {
@@ -299,4 +328,25 @@ pub async fn spawn_http_acl_proxy(
         orig_dest,
         shutdown_tx: Some(shutdown_tx),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_ca_generate_produces_parseable_ca() {
+        let m = resolve_ca(None, None, true).unwrap().expect("should generate");
+        let kp = KeyPair::from_pem(&m.key_pem).expect("key parses");
+        let _ = CertificateParams::from_ca_cert_pem(&m.cert_pem)
+            .expect("cert parses")
+            .self_signed(&kp)
+            .expect("re-sign ok");
+        assert!(m.cert_pem.contains("BEGIN CERTIFICATE"));
+    }
+
+    #[test]
+    fn resolve_ca_none_without_generate() {
+        assert!(resolve_ca(None, None, false).unwrap().is_none());
+    }
 }

@@ -385,6 +385,11 @@ pub struct NotifPolicy {
     /// host's on-disk `/etc/hosts` never leaks in. The content is the
     /// loopback base plus any concrete hostnames resolved from `net_allow`.
     pub virtual_etc_hosts: String,
+    /// User-declared trust-bundle paths to splice the MITM CA into.
+    pub ca_inject_paths: Vec<std::path::PathBuf>,
+    /// Active MITM CA public cert (PEM bytes) to inject. `Some` only when
+    /// HTTPS MITM is active (BYO or generated).
+    pub ca_inject_pem: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 // ============================================================

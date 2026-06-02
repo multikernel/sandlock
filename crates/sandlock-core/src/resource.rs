@@ -654,6 +654,8 @@ mod tests {
             virtual_hostname: None,
             has_http_acl: false,
             virtual_etc_hosts: String::new(),
+            ca_inject_paths: Vec::new(),
+            ca_inject_pem: None,
         }
     }
 
