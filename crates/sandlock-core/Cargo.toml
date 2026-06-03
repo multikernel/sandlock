@@ -26,6 +26,13 @@ toml = "0.8"
 jiff = "0.2"
 pathdiff = "0.2"
 hudsucker = "0.22"
+tokio-rustls = "0.25"
+rustls = "0.22"
+rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
+hyper-rustls = "0.26"
 tar = "0.4"
 clap = { version = "4", features = ["derive"], optional = true }
 bollard = "0.21"
