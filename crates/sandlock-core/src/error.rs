@@ -63,13 +63,6 @@ pub enum ConfinementError {
     #[error("landlock unavailable: {0}")]
     LandlockUnavailable(String),
 
-    #[error("landlock ABI v{required} required (kernel has v{actual}): {feature}")]
-    InsufficientAbi {
-        required: u32,
-        actual: u32,
-        feature: String,
-    },
-
     /// A `Protection` in `ProtectionState::Strict` is unavailable
     /// because the host kernel's Landlock ABI is below the
     /// protection's `min_abi()`. Build (or `confine`) refuses to
