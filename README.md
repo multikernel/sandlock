@@ -134,9 +134,23 @@ sandlock run \
   --http-deny "* */admin/*" \
   -r /usr -r /lib -r /etc -- python3 agent.py
 
-# HTTPS MITM with user-provided CA (enables ACL on port 443)
-# Generate a CA, add the cert to the sandbox's trust store
-# (e.g. /etc/ssl/certs/), then pass both files here.
+# HTTPS MITM, zero-config: sandlock generates an ephemeral CA and splices it
+# into the trust bundle(s) you name. No openssl, no manual install.
+sandlock run \
+  --http-allow "POST api.openai.com/v1/*" \
+  --http-inject-ca /etc/ssl/certs/ca-certificates.crt \
+  -r /usr -r /lib -r /etc -- python3 agent.py
+
+# Node and other runtimes with a compiled-in CA list: export the cert and
+# wire the runtime's own env var.
+sandlock run \
+  --http-allow "POST api.example.com/*" \
+  --http-inject-ca /etc/ssl/certs/ca-certificates.crt \
+  --http-ca-out /tmp/sandlock-ca.pem \
+  --env NODE_EXTRA_CA_CERTS=/tmp/sandlock-ca.pem \
+  -r /usr -r /lib -r /etc -- node agent.js
+
+# HTTPS MITM with your own CA (still supported)
 sandlock run \
   --http-allow "POST api.openai.com/v1/*" \
   --http-ca ca.pem --http-key ca-key.pem \
@@ -630,12 +644,16 @@ matching ports through a transparent proxy. Each rule with a concrete
 host auto-extends `--net-allow` with `host:80` (and `host:443` when
 `--http-ca` is set) so the proxy's intercept ports are reachable;
 wildcard hosts auto-add `:80` / `:443` (any IP). All auto-added
-entries are TCP. HTTPS MITM is opt-in: pass `--http-ca <cert>` and
-`--http-key <key>` for a CA *you generate* and trust inside the
-sandbox (typically install the cert into the workload's
-`/etc/ssl/certs/`). Without `--http-ca`, port 443 is not intercepted
-— `--net-allow host:443` permits raw TLS to the host with no content
-inspection.
+entries are TCP. HTTPS MITM is enabled two ways: pass `--http-ca <cert>`
+and `--http-key <key>` to bring your own CA, or pass `--http-inject-ca
+<bundle>` to have sandlock generate an ephemeral CA (private key in
+memory only) and splice its public cert into each named trust bundle at
+open time, so the workload trusts the proxy with no manual install. For
+runtimes with a compiled-in CA store such as Node, `--http-ca-out
+<path>` writes the public cert so you can point the runtime's own env
+var at it (e.g. `NODE_EXTRA_CA_CERTS`). Without any of these, port 443
+is not intercepted: `--net-allow host:443` permits raw TLS to the host
+with no content inspection.
 
 **Bind.** `--net-bind <port>` is independent from `--net-allow` and
 governs server-side `bind()`. Landlock enforces it (TCP only);

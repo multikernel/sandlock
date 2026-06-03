@@ -127,6 +127,8 @@ denied by default. Block rules are checked first and take precedence.
 | `http_ports` | `list[int]` | `[80]` | TCP ports to intercept (443 added when `http_ca` is set) |
 | `http_ca` | `str \| None` | `None` | CA certificate for HTTPS MITM |
 | `http_key` | `str \| None` | `None` | CA private key for HTTPS MITM |
+| `http_inject_ca` | `list[str]` | `[]` | Trust bundle paths to splice the active MITM CA's public cert into at open time. Without `http_ca`, generates an ephemeral CA (key in memory only) and intercepts port 443. Requires an `http_allow` / `http_deny` rule |
+| `http_ca_out` | `str \| None` | `None` | Writes the active CA's public certificate (PEM) to this path; never the private key. Requires an `http_allow` / `http_deny` rule |
 
 Rule format: `"METHOD host/path"` where method and host can be `*` for
 wildcard, and path supports trailing `*` for prefix matching. Paths are
