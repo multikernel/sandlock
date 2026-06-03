@@ -20,6 +20,77 @@ use crate::sys::structs::{SeccompNotif, AF_INET, AF_INET6, ECONNREFUSED};
 /// Prevents a sandboxed process from triggering OOM in the supervisor.
 const MAX_SEND_BUF: usize = 64 << 20;
 
+/// An IPv4 or IPv6 address with a prefix length, used by `--net-deny`
+/// to match destination IPs by exact address (`/32`, `/128`) or by range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IpCidr {
+    pub addr: IpAddr,
+    pub prefix_len: u8,
+}
+
+impl IpCidr {
+    /// Parse `addr` or `addr/prefix`. A bare address becomes a host route
+    /// (`/32` for IPv4, `/128` for IPv6). Hostnames are rejected: the
+    /// address part must parse as a literal IP.
+    pub fn parse(s: &str) -> Result<Self, SandboxError> {
+        let (addr_str, prefix) = match s.split_once('/') {
+            Some((a, p)) => {
+                let len: u8 = p.parse().map_err(|_| {
+                    SandboxError::Invalid(format!(
+                        "--net-deny: invalid prefix length in `{}`",
+                        s
+                    ))
+                })?;
+                (a, Some(len))
+            }
+            None => (s, None),
+        };
+        let addr: IpAddr = addr_str.parse().map_err(|_| {
+            SandboxError::Invalid(format!(
+                "--net-deny: `{}` is not an IP or CIDR (hostnames are not \
+                 allowed; use --http-deny for domains)",
+                s
+            ))
+        })?;
+        let max = match addr {
+            IpAddr::V4(_) => 32u8,
+            IpAddr::V6(_) => 128u8,
+        };
+        let prefix_len = prefix.unwrap_or(max);
+        if prefix_len > max {
+            return Err(SandboxError::Invalid(format!(
+                "--net-deny: prefix /{} too large for {} in `{}`",
+                prefix_len,
+                if max == 32 { "IPv4" } else { "IPv6" },
+                s
+            )));
+        }
+        Ok(IpCidr { addr, prefix_len })
+    }
+
+    /// True iff `ip` falls within this network. Different address
+    /// families never match.
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self.addr, ip) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                if self.prefix_len == 0 {
+                    return true;
+                }
+                let mask = u32::MAX << (32 - self.prefix_len);
+                (u32::from(net) & mask) == (u32::from(ip) & mask)
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                if self.prefix_len == 0 {
+                    return true;
+                }
+                let mask = u128::MAX << (128 - self.prefix_len);
+                (u128::from(net) & mask) == (u128::from(ip) & mask)
+            }
+            _ => false,
+        }
+    }
+}
+
 /// L4 protocol that a `NetAllow` rule applies to.
 ///
 /// `Tcp` is the default if a rule has no scheme (the bare `host:port`
@@ -1659,5 +1730,47 @@ mod tests {
             "v4 loopback should still be injected: {out}"
         );
         let _ = std::fs::remove_dir_all(&rootfs);
+    }
+
+    // --- IpCidr tests ---
+
+    #[test]
+    fn ipcidr_parse_bare_ipv4_is_host_route() {
+        let c = IpCidr::parse("1.2.3.4").unwrap();
+        assert_eq!(c.prefix_len, 32);
+        assert!(c.contains("1.2.3.4".parse().unwrap()));
+        assert!(!c.contains("1.2.3.5".parse().unwrap()));
+    }
+
+    #[test]
+    fn ipcidr_parse_ipv4_range_contains() {
+        let c = IpCidr::parse("10.0.0.0/8").unwrap();
+        assert!(c.contains("10.3.7.9".parse().unwrap()));
+        assert!(!c.contains("11.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn ipcidr_parse_ipv6_range_contains() {
+        let c = IpCidr::parse("fc00::/7").unwrap();
+        assert!(c.contains("fd00::1".parse().unwrap()));
+        assert!(!c.contains("2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn ipcidr_zero_prefix_matches_all_same_family() {
+        let c = IpCidr::parse("0.0.0.0/0").unwrap();
+        assert!(c.contains("8.8.8.8".parse().unwrap()));
+        assert!(!c.contains("::1".parse().unwrap())); // family mismatch
+    }
+
+    #[test]
+    fn ipcidr_rejects_hostname() {
+        assert!(IpCidr::parse("example.com").is_err());
+    }
+
+    #[test]
+    fn ipcidr_rejects_oversized_prefix() {
+        assert!(IpCidr::parse("10.0.0.0/33").is_err());
+        assert!(IpCidr::parse("fc00::/129").is_err());
     }
 }
