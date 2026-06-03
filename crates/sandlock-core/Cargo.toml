@@ -25,7 +25,6 @@ walkdir = "2"
 toml = "0.8"
 jiff = "0.2"
 pathdiff = "0.2"
-hudsucker = "0.22"
 tokio-rustls = "0.25"
 rustls = "0.22"
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
