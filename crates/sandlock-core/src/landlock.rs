@@ -280,6 +280,11 @@ pub fn compute_fs_mask(abi: u32, pol: &ProtectionPolicy) -> u64 {
 /// covers every port we drop `CONNECT_TCP` from the handled set (the
 /// on-behalf path is then the sole enforcer).
 ///
+/// `--net-deny` is default-allow: every TCP connect must reach the
+/// on-behalf seccomp path (the DenyList enforcer), so Landlock must not
+/// gate `CONNECT_TCP` at all. A non-empty `net_deny` therefore forces the
+/// wildcard treatment, exactly like an all-ports `--net-allow` rule.
+///
 /// Returns `(0, false)` when `Protection::NetTcp` is not `Active`
 /// (either disabled by policy or degraded on a kernel that does not
 /// provide TCP network hooks).
@@ -302,10 +307,11 @@ pub fn compute_net_mask(
         return (0, false);
     }
     use crate::sandbox::Protocol;
-    let net_wildcard = sandbox
-        .net_allow
-        .iter()
-        .any(|r| r.protocol == Protocol::Tcp && r.all_ports);
+    let net_wildcard = !sandbox.net_deny.is_empty()
+        || sandbox
+            .net_allow
+            .iter()
+            .any(|r| r.protocol == Protocol::Tcp && r.all_ports);
     let mask = if net_wildcard {
         LANDLOCK_ACCESS_NET_BIND_TCP
     } else {
