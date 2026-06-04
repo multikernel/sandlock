@@ -82,6 +82,7 @@ pub struct FilesystemSection {
 pub struct NetworkSection {
     pub bind: Vec<u16>,
     pub allow: Vec<String>,
+    pub deny: Vec<String>,
     pub port_remap: bool,
 }
 
@@ -169,6 +170,7 @@ pub fn parse_input(input: ProfileInput) -> Result<(Sandbox, ProgramSpec), Sandlo
     // [network]
     for p in input.network.bind.iter()  { b = b.net_bind_port(*p); }
     for r in input.network.allow.iter() { b = b.net_allow(r.as_str()); }
+    for r in input.network.deny.iter()  { b = b.net_deny(r.as_str()); }
     if input.network.port_remap         { b = b.port_remap(true); }
 
     // [http]
@@ -507,6 +509,16 @@ mod tests {
         let err = parse_profile(toml).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("time_start"), "got: {msg}");
+    }
+
+    #[test]
+    fn profile_network_deny_parses() {
+        let toml = r#"
+            [network]
+            deny = ["10.0.0.0/8", "private"]
+        "#;
+        let (policy, _spec) = parse_profile(toml).unwrap();
+        assert!(policy.net_deny.len() > 1);
     }
 
     #[test]

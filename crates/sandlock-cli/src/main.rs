@@ -357,6 +357,9 @@ async fn run_command(args: RunArgs) -> Result<i32> {
             };
             b = b.net_allow(spec);
         }
+        for rule in &base.net_deny {
+            b = b.net_deny(format_net_deny(rule));
+        }
         for p in &base.net_bind { b = b.net_bind_port(*p); }
         for rule in &base.http_allow {
             let s = format!("{} {}{}", rule.method, rule.host, rule.path);
@@ -761,6 +764,37 @@ fn validate_no_supervisor_profile(profile: &Sandbox, source: &str) -> Result<()>
     }
 
     Ok(())
+}
+
+/// Render a parsed NetDeny rule back into a --net-deny spec string, so a
+/// profile loaded via --profile-file round-trips through the builder.
+fn format_net_deny(rule: &sandlock_core::sandbox::NetDeny) -> String {
+    use sandlock_core::sandbox::{DenyTarget, Protocol};
+    let target = match &rule.target {
+        DenyTarget::AnyIp => "*".to_string(),
+        DenyTarget::Cidr(c) => {
+            let base = format!("{}/{}", c.addr, c.prefix_len);
+            // Bracket IPv6 only when a port suffix will follow, because a
+            // bare addr:port is itself a valid IPv6 address.
+            if matches!(c.addr, std::net::IpAddr::V6(_)) && !rule.all_ports {
+                format!("[{}]", base)
+            } else {
+                base
+            }
+        }
+    };
+    match rule.protocol {
+        Protocol::Icmp => format!("icmp://{}", target),
+        proto => {
+            let scheme = if matches!(proto, Protocol::Udp) { "udp://" } else { "" };
+            if rule.all_ports {
+                format!("{}{}", scheme, target)
+            } else {
+                let ports = format_ports(&rule.ports, false);
+                format!("{}{}:{}", scheme, target, ports)
+            }
+        }
+    }
 }
 
 /// Parse an ISO 8601 timestamp (e.g. "2000-01-01T00:00:00Z") into a SystemTime.

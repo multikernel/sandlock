@@ -10,7 +10,7 @@ use tokio::task::JoinHandle;
 use crate::context;
 use crate::error::SandboxError;
 pub use crate::http::{http_acl_check, normalize_path, prefix_or_exact_match, HttpRule};
-pub use crate::network::{NetAllow, NetDeny, Protocol};
+pub use crate::network::{DenyTarget, IpCidr, NetAllow, NetDeny, Protocol};
 use crate::protection::{Protection, ProtectionPolicy, ProtectionState, ProtectionStatus};
 
 /// A byte size value.
