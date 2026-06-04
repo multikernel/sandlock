@@ -22,7 +22,7 @@ const MAX_SEND_BUF: usize = 64 << 20;
 
 /// An IPv4 or IPv6 address with a prefix length, used by `--net-deny`
 /// to match destination IPs by exact address (`/32`, `/128`) or by range.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IpCidr {
     pub addr: IpAddr,
     pub prefix_len: u8,
@@ -92,7 +92,7 @@ impl IpCidr {
 }
 
 /// What a deny rule targets at the IP layer.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DenyTarget {
     /// Any destination IP (the `:port` / `*:port` form).
     AnyIp,
@@ -103,7 +103,7 @@ pub enum DenyTarget {
 /// A single `--net-deny` rule. Unlike `NetAllow`, the target is always
 /// a literal IP/CIDR (or any-IP) resolved at parse time, never a
 /// hostname, so no DNS is involved and matching is rebinding-safe.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NetDeny {
     pub protocol: Protocol,
     pub target: DenyTarget,

@@ -10,7 +10,7 @@ use tokio::task::JoinHandle;
 use crate::context;
 use crate::error::SandboxError;
 pub use crate::http::{http_acl_check, normalize_path, prefix_or_exact_match, HttpRule};
-pub use crate::network::{NetAllow, Protocol};
+pub use crate::network::{NetAllow, NetDeny, Protocol};
 use crate::protection::{Protection, ProtectionPolicy, ProtectionState, ProtectionStatus};
 
 /// A byte size value.
@@ -252,6 +252,9 @@ pub struct Sandbox {
     /// remain reachable. HTTP rules with wildcard hosts auto-add
     /// `(Tcp, None, [80])` instead.
     pub net_allow: Vec<NetAllow>,
+    /// Parsed `--net-deny` rules (default-allow, IP/CIDR/port denylist).
+    /// Mutually exclusive with `net_allow`.
+    pub net_deny: Vec<NetDeny>,
     pub net_bind: Vec<u16>,
     // HTTP ACL
     pub http_allow: Vec<HttpRule>,
@@ -375,6 +378,7 @@ impl Clone for Sandbox {
             extra_allow_syscalls: self.extra_allow_syscalls.clone(),
             protection_policy: self.protection_policy.clone(),
             net_allow: self.net_allow.clone(),
+            net_deny: self.net_deny.clone(),
             net_bind: self.net_bind.clone(),
             http_allow: self.http_allow.clone(),
             http_deny: self.http_deny.clone(),
@@ -1805,6 +1809,13 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "net-allow", value_name = "SPEC"))]
     pub net_allow: Vec<String>,
 
+    /// `--net-deny`: default-allow networking, block these IPs/CIDRs/ports.
+    /// Accepts `<ip>`, `<cidr>`, `<cidr>:<port>`, `:<port>`, `[<ipv6>]:<port>`,
+    /// and the `private` token (all internal ranges). Hostnames are rejected;
+    /// use `--http-deny` for domains. Mutually exclusive with `--net-allow`.
+    #[cfg_attr(feature = "cli", arg(long = "net-deny", value_name = "SPEC", value_delimiter = ','))]
+    pub net_deny: Vec<String>,
+
     #[cfg_attr(feature = "cli", arg(long = "net-bind"))]
     pub net_bind: Vec<u16>,
 
@@ -1975,6 +1986,7 @@ impl Clone for SandboxBuilder {
             extra_deny_syscalls: self.extra_deny_syscalls.clone(),
             extra_allow_syscalls: self.extra_allow_syscalls.clone(),
             net_allow: self.net_allow.clone(),
+            net_deny: self.net_deny.clone(),
             net_bind: self.net_bind.clone(),
             http_allow: self.http_allow.clone(),
             http_deny: self.http_deny.clone(),
@@ -2088,6 +2100,12 @@ impl SandboxBuilder {
     /// - `.net_allow(":8080")` — any IP on port 8080
     pub fn net_allow(mut self, spec: impl Into<String>) -> Self {
         self.net_allow.push(spec.into());
+        self
+    }
+
+    /// Add a `--net-deny` rule. See the field docs for accepted forms.
+    pub fn net_deny(mut self, spec: impl Into<String>) -> Self {
+        self.net_deny.push(spec.into());
         self
     }
 
@@ -2372,6 +2390,22 @@ impl SandboxBuilder {
             .map(|s| NetAllow::parse(&s))
             .collect::<Result<_, _>>()?;
 
+        // Parse --net-deny rules (the `private` token expands here).
+        // NetDeny::parse returns a Vec per spec, so flatten.
+        let mut net_deny: Vec<NetDeny> = Vec::new();
+        for spec in self.net_deny {
+            net_deny.extend(NetDeny::parse(&spec)?);
+        }
+
+        // --net-allow and --net-deny are mutually exclusive. Check the
+        // user-supplied allow count (the original specs), not the post-HTTP
+        // extension, so a coexisting --http-deny does not false-trigger.
+        if !net_allow.is_empty() && !net_deny.is_empty() {
+            return Err(SandboxError::Invalid(
+                "--net-allow and --net-deny are mutually exclusive".into(),
+            ));
+        }
+
         crate::http::extend_net_allow_for_http(
             &mut net_allow,
             &http_allow,
@@ -2387,6 +2421,7 @@ impl SandboxBuilder {
             extra_allow_syscalls: self.extra_allow_syscalls,
             protection_policy: self.protection_policy,
             net_allow,
+            net_deny,
             net_bind: self.net_bind,
             http_allow,
             http_deny,
@@ -2613,6 +2648,39 @@ mod tests {
             .build()
             .unwrap();
         assert!(!p3.allows_sysv_ipc());
+    }
+
+    #[test]
+    fn builder_parses_net_deny() {
+        let policy = Sandbox::builder()
+            .net_deny("10.0.0.0/8")
+            .build()
+            .unwrap();
+        assert_eq!(policy.net_deny.len(), 1);
+    }
+
+    #[test]
+    fn builder_net_deny_private_expands() {
+        let policy = Sandbox::builder()
+            .net_deny("private")
+            .build()
+            .unwrap();
+        assert!(policy.net_deny.len() > 3); // expanded across CIDRs x protocols
+    }
+
+    #[test]
+    fn builder_rejects_net_allow_and_net_deny_together() {
+        let err = Sandbox::builder()
+            .net_allow("github.com:443")
+            .net_deny("10.0.0.0/8")
+            .build();
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn builder_net_deny_rejects_hostname() {
+        let err = Sandbox::builder().net_deny("evil.com:443").build();
+        assert!(err.is_err());
     }
 
 }
