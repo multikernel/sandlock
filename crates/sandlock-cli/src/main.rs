@@ -128,7 +128,9 @@ struct RunArgs {
     allow_degraded: Vec<String>,
 
     /// Disable the named protection entirely (no rule emitted, no error on missing ABI).
-    /// Repeatable. Accepts the same values as --allow-degraded.
+    /// Repeatable. Accepts the same values as --allow-degraded, except fs-refer:
+    /// the kernel denies REFER by default even when unhandled, so disabling it
+    /// only tightens the sandbox and is rejected.
     #[arg(long = "disable", value_name = "PROTECTION")]
     disable: Vec<String>,
 

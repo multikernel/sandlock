@@ -353,3 +353,110 @@ fn protection_policy_survives_bincode_round_trip() {
          not reset to strict_all() on load"
     );
 }
+
+// ----------------------------------------------------------------------
+// Regression: disable() of an FS protection must not cause confine to
+// fail with EINVAL when the sandbox has a writable path.
+//
+// `compute_fs_mask` drops the disabled bit (REFER/TRUNCATE/IOCTL_DEV)
+// from `handled_access_fs`, but the per-path write mask is derived from
+// `write_access(abi)` alone. If the two are not intersected, the
+// writable-path rule still requests the dropped bit, which is no longer
+// a subset of the ruleset's handled accesses, and `landlock_add_rule`
+// rejects it with EINVAL, breaking every real sandbox (one that has at
+// least one writable path) under `disable(FsRefer/FsTruncate/FsIoctlDev)`.
+//
+// This must run a real `confine_filesystem` against the host kernel, so
+// it forks: confinement is irreversible. NO_NEW_PRIVS is set in the
+// child so `restrict_self` succeeds; the child then exits 0 only if
+// every `add_path_rule` (including the writable-path rule) was accepted.
+// ----------------------------------------------------------------------
+
+/// Run `confine_filesystem(sandbox)` in a forked child and return true
+/// iff it succeeds end-to-end (child exits 0). Exit codes: 0 = Ok,
+/// 1 = confine_filesystem returned Err (the EINVAL bug), 2 = NO_NEW_PRIVS
+/// prctl failed (harness problem, not the code under test).
+fn confine_filesystem_succeeds_in_child(sandbox: &sandlock_core::Sandbox) -> i32 {
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork failed");
+    if pid == 0 {
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+            unsafe { libc::_exit(2) };
+        }
+        let code = match sandlock_core::landlock::confine_filesystem(sandbox) {
+            Ok(()) => 0,
+            Err(_) => 1,
+        };
+        unsafe { libc::_exit(code) };
+    }
+    let mut status: i32 = 0;
+    unsafe { libc::waitpid(pid, &mut status, 0) };
+    assert!(libc::WIFEXITED(status), "child did not exit normally");
+    libc::WEXITSTATUS(status)
+}
+
+#[test]
+fn disable_fs_protection_with_writable_path_does_not_einval() {
+    // Needs a real v6+ host: the default policy keeps the v6 scope
+    // protections Strict, so confine_filesystem would otherwise abort
+    // with ProtectionUnavailable before reaching the FS rules.
+    if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 {
+        eprintln!("Skipping: Landlock ABI v6 required");
+        return;
+    }
+
+    // A writable path is the trigger: without one, no write rule is
+    // installed and the handled-vs-rule inconsistency never surfaces.
+    // (FsRefer is excluded: disabling it is rejected at build time; see
+    // `disable_fsrefer_is_rejected_at_build` below.)
+    for p in [Protection::FsTruncate, Protection::FsIoctlDev] {
+        let sandbox = sandlock_core::Sandbox::builder()
+            .disable(p)
+            .fs_write("/tmp")
+            .build()
+            .expect("build sandbox");
+
+        assert_eq!(
+            confine_filesystem_succeeds_in_child(&sandbox),
+            0,
+            "disable({:?}) + fs_write(\"/tmp\") must confine cleanly, \
+             not fail with EINVAL when installing the writable-path rule",
+            p
+        );
+    }
+}
+
+// ----------------------------------------------------------------------
+// disable(FsRefer) is a footgun: Landlock denies REFER by default even
+// when unhandled, so disabling it can only tighten the sandbox, never
+// loosen it (contrary to what `disable()` promises). It is rejected at
+// build time. `allow_degraded(FsRefer)` stays meaningful and is allowed.
+// ----------------------------------------------------------------------
+
+#[test]
+fn disable_fsrefer_is_rejected_at_build() {
+    let err = sandlock_core::Sandbox::builder()
+        .disable(Protection::FsRefer)
+        .build()
+        .expect_err("disable(FsRefer) must be rejected at build");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("FsRefer"),
+        "rejection message should name FsRefer, got: {msg}"
+    );
+
+    // The unchecked path must reject it too.
+    assert!(
+        sandlock_core::Sandbox::builder()
+            .disable(Protection::FsRefer)
+            .build_unchecked()
+            .is_err(),
+        "build_unchecked must also reject disable(FsRefer)"
+    );
+
+    // allow_degraded(FsRefer) is still meaningful and must build cleanly.
+    sandlock_core::Sandbox::builder()
+        .allow_degraded(Protection::FsRefer)
+        .build()
+        .expect("allow_degraded(FsRefer) must remain allowed");
+}

@@ -420,7 +420,15 @@ fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError
     // The PT_INTERP patching in handle_chroot_exec ensures the kernel loads
     // the image's ELF interpreter via an injected fd, not a host path.
     let chroot_root = policy.chroot.as_deref();
-    let fs_write_mask = write_access(abi);
+    // Intersect the per-path write mask with the resolved handled set so
+    // every installed rule is a subset of `handled_access_fs` by
+    // construction. `compute_fs_mask` drops the REFER/TRUNCATE/IOCTL_DEV
+    // bit for any FS protection that is Disabled or Degraded; without this
+    // intersection the writable-path rule would still request the dropped
+    // bit and `landlock_add_rule` would reject it with EINVAL. (The file
+    // path inside `add_path_rule` further narrows this with `& ACCESS_FILE`,
+    // which preserves the subset property.)
+    let fs_write_mask = write_access(abi) & handled_access_fs;
     for path in &policy.fs_writable {
         let host;
         let rule_path = if let Some(root) = chroot_root {

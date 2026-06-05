@@ -1967,6 +1967,14 @@ impl SandboxBuilder {
     /// it. Intended for workloads that legitimately need the capability
     /// the protection blocks (e.g. signalling a sibling process when
     /// `SignalScope` would normally prevent it).
+    ///
+    /// `Protection::FsRefer` cannot be disabled: Landlock denies REFER
+    /// (cross-directory rename/link) by default in every ruleset even when
+    /// it is not handled, so disabling it only tightens the sandbox rather
+    /// than loosening it. `build()` (and `build_unchecked()`) return
+    /// `SandboxError::Invalid` if `disable(Protection::FsRefer)` was called.
+    /// Use [`allow_degraded`](Self::allow_degraded) if you want REFER
+    /// enforced only where the kernel supports it.
     pub fn disable(mut self, protection: Protection) -> Self {
         self.protection_policy.set(protection, ProtectionState::Disabled);
         self
@@ -2227,6 +2235,25 @@ impl SandboxBuilder {
     /// construct sandboxes violating cross-section invariants.
     pub fn build_unchecked(self) -> Result<Sandbox, SandboxError> {
         validate_syscall_names(&self.extra_deny_syscalls)?;
+
+        // Reject disable(FsRefer): the kernel denies REFER (cross-directory
+        // rename/link) by default in every ruleset even when REFER is not
+        // handled. Controlled cross-directory rename within writable areas
+        // works precisely *because* REFER is handled and granted on writable
+        // paths (the Strict and Degradable states do this). Disabling REFER
+        // un-handles it, which can only make rename stricter, never looser,
+        // so it cannot do what disable() promises and is a footgun. Degrading
+        // (allow_degraded) REFER is still meaningful and remains allowed.
+        if self.protection_policy.state(Protection::FsRefer) == ProtectionState::Disabled {
+            return Err(SandboxError::Invalid(
+                "disable(Protection::FsRefer) is not permitted: Landlock denies \
+                 REFER (cross-directory rename/link) by default even when it is \
+                 not handled, so disabling it only tightens the sandbox, never \
+                 loosens it. Remove the disable() call (use allow_degraded() if \
+                 you wanted REFER enforced only where the kernel supports it)."
+                    .into(),
+            ));
+        }
 
         // Validate: max_cpu must be 1-100
         if let Some(cpu) = self.max_cpu {
