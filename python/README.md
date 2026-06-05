@@ -234,6 +234,36 @@ Sandlock always applies its default syscall blocklist.
 | `on_exit` | `BranchAction` | `COMMIT` | `COMMIT`, `ABORT`, or `KEEP` |
 | `on_error` | `BranchAction` | `ABORT` | `COMMIT`, `ABORT`, or `KEEP` |
 
+#### Protection opt-out
+
+By default sandlock enforces every Landlock protection the host kernel
+supports and refuses to start when a required protection is
+unavailable. Two keyword arguments on `Sandbox` opt out of the strict
+default on a per-protection basis:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `allow_degraded` | `list[Protection]` | `[]` | Enforce each listed protection where the host kernel supports it, silently skip it where it does not. |
+| `disable` | `list[Protection]` | `[]` | Never enforce each listed protection, even on a kernel that supports it. |
+
+```python
+from sandlock import Sandbox, Protection
+
+sb = Sandbox(
+    fs_readable=["/data"],
+    fs_writable=["/tmp"],
+    allow_degraded=[Protection.SIGNAL_SCOPE, Protection.ABSTRACT_UNIX_SOCKET_SCOPE],
+)
+```
+
+The two `allow_degraded` entries let the sandbox build on Linux kernels
+below 6.12, where the v6 IPC scopes are unavailable; on a capable kernel
+the scopes remain enforced. The protection policy is persisted with a
+checkpoint, so a restored sandbox keeps the exact posture it was built
+with. See the "Protection opt-out" section of
+[`../docs/sandbox-reference.md`](../docs/sandbox-reference.md#protection-opt-out)
+for the per-protection ABI floors and the full semantics.
+
 #### `sandbox.run(cmd, timeout=None) -> Result`
 
 Run a command, capturing stdout and stderr.

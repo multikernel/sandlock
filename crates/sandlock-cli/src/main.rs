@@ -121,8 +121,42 @@ struct RunArgs {
     #[arg(long)]
     no_supervisor: bool,
 
+    /// Allow the named protection to degrade silently if the host kernel ABI lacks support.
+    /// Repeatable. Accepted values: fs-refer, fs-truncate, net-tcp, fs-ioctl-dev,
+    /// signal-scope, abstract-unix-socket-scope.
+    #[arg(long = "allow-degraded", value_name = "PROTECTION")]
+    allow_degraded: Vec<String>,
+
+    /// Disable the named protection entirely (no rule emitted, no error on missing ABI).
+    /// Repeatable. Accepts the same values as --allow-degraded.
+    #[arg(long = "disable", value_name = "PROTECTION")]
+    disable: Vec<String>,
+
     #[arg(last = true)]
     cmd: Vec<String>,
+}
+
+/// Parse a kebab-case protection name into a `Protection` value.
+///
+/// The canonical names match the Landlock kernel constants
+/// (`LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` → `abstract-unix-socket-scope`,
+/// etc.) and are case-insensitive. Accepted: `fs-refer`, `fs-truncate`,
+/// `net-tcp`, `fs-ioctl-dev`, `signal-scope`,
+/// `abstract-unix-socket-scope`.
+fn parse_protection(s: &str) -> Result<sandlock_core::Protection, String> {
+    use sandlock_core::Protection;
+    match s.to_ascii_lowercase().as_str() {
+        "fs-refer" => Ok(Protection::FsRefer),
+        "fs-truncate" => Ok(Protection::FsTruncate),
+        "net-tcp" => Ok(Protection::NetTcp),
+        "fs-ioctl-dev" => Ok(Protection::FsIoctlDev),
+        "signal-scope" => Ok(Protection::SignalScope),
+        "abstract-unix-socket-scope" => Ok(Protection::AbstractUnixSocketScope),
+        other => Err(format!(
+            "unknown protection: {} (valid: fs-refer, fs-truncate, net-tcp, fs-ioctl-dev, signal-scope, abstract-unix-socket-scope)",
+            other,
+        )),
+    }
 }
 
 #[derive(Subcommand)]
@@ -221,6 +255,14 @@ async fn main() -> Result<()> {
                     println!("  Device ioctl:   {}", if v >= 5 { "supported (ABI v5+)" } else { "not supported" });
                     println!("  IPC scoping:    {}", if v >= 6 { "supported (ABI v6+)" } else { "not supported" });
                     println!("  Signal scoping: {}", if v >= 6 { "supported (ABI v6+)" } else { "not supported" });
+
+                    println!();
+                    println!("Per-protection availability (host Landlock ABI v{}):", v);
+                    for p in sandlock_core::Protection::all() {
+                        let available = v >= p.min_abi();
+                        let marker = if available { "available" } else { "unavailable" };
+                        println!("  {:<22} requires v{} — {}", format!("{:?}", p), p.min_abi(), marker);
+                    }
                 }
                 Err(e) => {
                     println!("  Landlock: unavailable ({})", e);
@@ -473,6 +515,14 @@ async fn run_command(args: RunArgs) -> Result<i32> {
 
     if args.no_supervisor {
         builder = builder.no_supervisor(true);
+    }
+
+    // CLI overrides — protection policy
+    for s in &args.allow_degraded {
+        builder = builder.allow_degraded(parse_protection(s).map_err(|e| anyhow!(e))?);
+    }
+    for s in &args.disable {
+        builder = builder.disable(parse_protection(s).map_err(|e| anyhow!(e))?);
     }
 
     let policy = builder.build()?;

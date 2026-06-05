@@ -529,6 +529,52 @@ sandlock_builder_t *sandlock_sandbox_builder_no_coredump(sandlock_builder_t *b, 
 sandlock_builder_t *sandlock_sandbox_builder_deterministic_dirs(sandlock_builder_t *b, bool v);
 
 /**
+ * Per-protection minimum Landlock ABI version required by the host
+ * kernel for this protection to be available.
+ *
+ * Returns `0` for any `protection` value that is not a known
+ * discriminant — `0` is below every real `min_abi()` (which start at
+ * `2`), so callers can use it as an "unknown protection" sentinel
+ * without colliding with a valid version number.
+ */
+uint32_t sandlock_protection_min_abi(uint32_t protection);
+
+/**
+ * Mark `protection` as degradable on the builder: enforced when the
+ * host kernel supports it, silently skipped otherwise.
+ *
+ * Returns the (possibly relocated) builder pointer, mirroring the
+ * move-semantics convention used by every other
+ * `sandlock_sandbox_builder_*` setter. A null `b` is returned
+ * unchanged. An unknown `protection` discriminant is treated as a
+ * no-op: the builder is returned untouched.
+ *
+ * # Safety
+ * `b` must be a valid builder pointer returned by
+ * `sandlock_sandbox_builder_new` (or a previous builder setter) and
+ * not freed.
+ */
+sandlock_builder_t *sandlock_sandbox_builder_allow_degraded(sandlock_builder_t *b,
+                                                            uint32_t protection);
+
+/**
+ * Mark `protection` as disabled on the builder: never enforced, even
+ * on a host kernel that supports it.
+ *
+ * Returns the (possibly relocated) builder pointer, mirroring the
+ * move-semantics convention used by every other
+ * `sandlock_sandbox_builder_*` setter. A null `b` is returned
+ * unchanged. An unknown `protection` discriminant is treated as a
+ * no-op: the builder is returned untouched.
+ *
+ * # Safety
+ * `b` must be a valid builder pointer returned by
+ * `sandlock_sandbox_builder_new` (or a previous builder setter) and
+ * not freed.
+ */
+sandlock_builder_t *sandlock_sandbox_builder_disable(sandlock_builder_t *b, uint32_t protection);
+
+/**
  * Consume the builder and produce a policy.
  * On success, `*err` is 0 and a non-null policy pointer is returned.
  * On failure, `*err` is -1, null is returned, and `*err_msg` (if

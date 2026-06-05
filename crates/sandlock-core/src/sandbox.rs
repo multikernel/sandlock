@@ -11,6 +11,7 @@ use crate::context;
 use crate::error::SandboxError;
 pub use crate::http::{http_acl_check, normalize_path, prefix_or_exact_match, HttpRule};
 pub use crate::network::{NetAllow, Protocol};
+use crate::protection::{Protection, ProtectionPolicy, ProtectionState, ProtectionStatus};
 
 /// A byte size value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,6 +214,18 @@ pub struct Sandbox {
     pub extra_deny_syscalls: Vec<String>,
     pub extra_allow_syscalls: Vec<String>,
 
+    /// Per-protection enforcement policy. Default
+    /// (`ProtectionPolicy::strict_all()`) preserves the historical hard
+    /// `MIN_ABI = 6` behaviour; `SandboxBuilder::allow_degraded` /
+    /// `::disable` deviate from strict-all per protection.
+    ///
+    /// Part of the checkpoint: a saved sandbox restores with its exact
+    /// protection posture. Without this, a sandbox built with a
+    /// `disable()` opt-out (required on, e.g., a v5 host that cannot
+    /// provide a v6 scope) would silently reset to `strict_all()` on
+    /// load and fail to restore.
+    pub protection_policy: ProtectionPolicy,
+
     // Network
     /// Outbound endpoint allowlist as a list of `(protocol, host?, ports)`
     /// rules. Each rule names a protocol (TCP/UDP/ICMP) and either a
@@ -353,6 +366,7 @@ impl Clone for Sandbox {
             fs_denied: self.fs_denied.clone(),
             extra_deny_syscalls: self.extra_deny_syscalls.clone(),
             extra_allow_syscalls: self.extra_allow_syscalls.clone(),
+            protection_policy: self.protection_policy.clone(),
             net_allow: self.net_allow.clone(),
             net_bind: self.net_bind.clone(),
             http_allow: self.http_allow.clone(),
@@ -415,6 +429,18 @@ impl Sandbox {
     /// stability. Idempotent: calling repeatedly is safe.
     pub fn validate(&self) -> Result<(), SandboxError> {
         Ok(())
+    }
+
+    /// Resolve the per-protection state against the host's current
+    /// Landlock ABI. Returns one entry per `Protection`. Useful for
+    /// post-`build()` posture inspection.
+    pub fn active_protections(&self) -> Result<Vec<(Protection, ProtectionStatus)>, crate::error::SandlockError> {
+        let host_abi = crate::landlock::abi_version().map_err(|e| {
+            crate::error::SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
+        })?;
+        Ok(Protection::all()
+            .map(|p| (p, ProtectionStatus::resolve(p, host_abi, &self.protection_policy)))
+            .collect())
     }
 
     // ================================================================
@@ -1831,6 +1857,12 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "uid"))]
     pub uid: Option<u32>,
 
+    /// Per-protection state overrides. Defaults to `strict_all` — every
+    /// protection enforced, matching the historical `MIN_ABI = 6` floor.
+    /// Use the `allow_degraded` / `disable` builder methods to deviate.
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub protection_policy: ProtectionPolicy,
+
     // Internal callback — never a CLI flag.
     #[cfg_attr(feature = "cli", clap(skip))]
     pub policy_fn: Option<crate::policy_fn::PolicyCallback>,
@@ -1905,6 +1937,7 @@ impl Clone for SandboxBuilder {
             port_remap: self.port_remap,
             no_supervisor: self.no_supervisor,
             uid: self.uid,
+            protection_policy: self.protection_policy.clone(),
             policy_fn: self.policy_fn.clone(),
             name: self.name.clone(),
             // init_fn (FnOnce) cannot be cloned — drop to None.
@@ -1916,6 +1949,29 @@ impl Clone for SandboxBuilder {
 }
 
 impl SandboxBuilder {
+    /// Permit `protection` to be enforced when the host kernel
+    /// supports it, and silently skipped when it does not (fallback
+    /// for kernels below the protection's `min_abi()`).
+    ///
+    /// The default policy enforces every protection strictly; calling
+    /// `allow_degraded` lifts the strictness for the named protection
+    /// only. `sandlock check` and `Sandbox::active_protections()`
+    /// continue to report the degraded protection so the posture is
+    /// observable.
+    pub fn allow_degraded(mut self, protection: Protection) -> Self {
+        self.protection_policy.set(protection, ProtectionState::Degradable);
+        self
+    }
+
+    /// Never enforce `protection`, even on a host kernel that supports
+    /// it. Intended for workloads that legitimately need the capability
+    /// the protection blocks (e.g. signalling a sibling process when
+    /// `SignalScope` would normally prevent it).
+    pub fn disable(mut self, protection: Protection) -> Self {
+        self.protection_policy.set(protection, ProtectionState::Disabled);
+        self
+    }
+
     pub fn fs_write(mut self, path: impl Into<PathBuf>) -> Self {
         self.fs_writable.push(path.into());
         self
@@ -2229,6 +2285,7 @@ impl SandboxBuilder {
             fs_denied: self.fs_denied,
             extra_deny_syscalls: self.extra_deny_syscalls,
             extra_allow_syscalls: self.extra_allow_syscalls,
+            protection_policy: self.protection_policy,
             net_allow,
             net_bind: self.net_bind,
             http_allow,

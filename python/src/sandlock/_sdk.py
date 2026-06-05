@@ -8,6 +8,7 @@ import os
 import signal
 import sys
 from dataclasses import dataclass, field
+from enum import IntEnum
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -107,6 +108,56 @@ _b_no_huge_pages = _builder_fn("sandlock_sandbox_builder_no_huge_pages", ctypes.
 _b_no_coredump = _builder_fn("sandlock_sandbox_builder_no_coredump", ctypes.c_bool)
 _b_deterministic_dirs = _builder_fn("sandlock_sandbox_builder_deterministic_dirs", ctypes.c_bool)
 _b_cpu_cores = _builder_fn("sandlock_sandbox_builder_cpu_cores", ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32)
+
+# Protection opt-out — mirror of the C ABI `sandlock_protection_t`.
+# Discriminant values must stay in sync with `sandlock_core::Protection`
+# and `sandlock_protection_t` in `crates/sandlock-ffi/include/sandlock.h`.
+class Protection(IntEnum):
+    """Per-protection Landlock feature identifier.
+
+    Pass values from this enum to ``Sandbox(allow_degraded=...)`` or
+    ``Sandbox(disable=...)`` to opt out of strict enforcement for the
+    named protection. See the C header for kernel ABI requirements.
+    """
+
+    FS_REFER = 0
+    FS_TRUNCATE = 1
+    NET_TCP = 2
+    FS_IOCTL_DEV = 3
+    SIGNAL_SCOPE = 4
+    ABSTRACT_UNIX_SOCKET_SCOPE = 5
+
+
+_lib.sandlock_protection_min_abi.restype = ctypes.c_uint32
+_lib.sandlock_protection_min_abi.argtypes = [ctypes.c_uint32]
+
+# Move-semantics setters: each returns the (possibly relocated) builder
+# pointer, mirroring the convention of the other `_builder_fn` setters.
+# The C ABI accepts the protection as a `uint32_t` so an out-of-range
+# value is rejected at the FFI boundary (no `#[repr(C)]` enum cast).
+_b_allow_degraded = _builder_fn(
+    "sandlock_sandbox_builder_allow_degraded", ctypes.c_uint32
+)
+_b_disable = _builder_fn(
+    "sandlock_sandbox_builder_disable", ctypes.c_uint32
+)
+
+
+def _validate_protection(p: int, *, field: str) -> int:
+    """Coerce a caller-supplied protection value to a known discriminant
+    or raise :class:`ValueError`. Centralises the range check so the FFI
+    is never invoked with an unknown integer (the Rust setters silently
+    no-op on bad input, which is the wrong UX for the Python caller —
+    we want a loud failure at the SDK boundary instead).
+    """
+    try:
+        return int(Protection(int(p)))
+    except (ValueError, TypeError) as e:
+        valid = ", ".join(f"{m.name}={int(m)}" for m in Protection)
+        raise ValueError(
+            f"{field}: {p!r} is not a known Protection discriminant "
+            f"(valid: {valid})"
+        ) from e
 
 # Policy callback (policy_fn).
 # Path strings absent (issue #27 — path-based control belongs in Landlock).
@@ -905,6 +956,8 @@ class _NativePolicy:
         "random_seed", "time_start", "clean_env", "env",
         "extra_deny_syscalls", "extra_allow_syscalls", "max_open_files",
         "no_randomize_memory", "no_huge_pages", "no_coredump", "deterministic_dirs",
+        # Landlock protection opt-out (see Protection IntEnum):
+        "allow_degraded", "disable",
         # Managed outside _build_from_policy:
         "notif_policy",
         # Runtime-only kwargs — not sent to FFI:
@@ -1025,6 +1078,17 @@ class _NativePolicy:
             b = _b_no_coredump(b, True)
         if policy.deterministic_dirs:
             b = _b_deterministic_dirs(b, True)
+
+        # Landlock protection opt-out. The C ABI setters use move-semantics
+        # and return the (possibly relocated) builder pointer — mirror that
+        # by rebinding `b` on each call. Idempotent / last-wins: if the
+        # same Protection appears in both lists, the later call wins
+        # (matching the underlying `ProtectionPolicy::set` semantics).
+        for p in (policy.allow_degraded or ()):
+            b = _b_allow_degraded(b, _validate_protection(p, field="allow_degraded"))
+        for p in (policy.disable or ()):
+            b = _b_disable(b, _validate_protection(p, field="disable"))
+
         # Guard: warn if any dataclass field was set to a non-default value
         # but is not in _HANDLED_FIELDS (i.e. silently dropped).
         import dataclasses as _dc
