@@ -64,10 +64,12 @@ sandbox = Sandbox(
 
 ```toml
 [config]
-http_ca    = "/path/to/ca.pem"
-http_key   = "/path/to/ca.key"
-fs_storage = "/var/lib/sandlock"
-workdir    = "/opt/project"
+http_ca         = "/path/to/ca.pem"
+http_key        = "/path/to/ca.key"
+http_inject_ca  = ["/etc/ssl/certs/ca-certificates.crt"]
+http_ca_out     = "/tmp/sandlock-ca.pem"
+fs_storage      = "/var/lib/sandlock"
+workdir         = "/opt/project"
 
 [determinism]
 random_seed         = 42
@@ -127,14 +129,25 @@ Top-level configuration for the supervisor and COW workspace.
 | ------------ | ----------- | ------------- | ------- | ---------------------------------------------------------------------------------------- |
 | `http_ca`    | `http_ca`   | `str \| None` | `None`  | PEM CA certificate path for HTTPS MITM. When set, port `443` is added to `http_ports`.   |
 | `http_key`   | `http_key`  | `str \| None` | `None`  | PEM CA private key path. Required whenever `http_ca` is set.                             |
+| `http_inject_ca` | `http_inject_ca` | `list[str]` | `[]` | Trust bundle paths to splice the active MITM CA's public cert into at open time. Without `http_ca`, generates an ephemeral CA (private key in memory only, never on disk) and intercepts port `443`. Requires at least one `http_allow` / `http_deny` rule. |
+| `http_ca_out` | `http_ca_out` | `str \| None` | `None`  | Writes the active CA's public certificate (PEM) to this path; never the private key. Requires at least one `http_allow` / `http_deny` rule. |
 | `fs_storage` | `fs_storage`| `str \| None` | `None`  | Separate storage directory for the seccomp COW upper layer / deltas. |
 | `workdir`    | `workdir`   | `str \| None` | `None`  | COW root directory. Controls which directory COW tracks; does **not** set the child's working directory. |
 
-HTTPS interception is opt-in: without `http_ca`, port 443 is not
-intercepted, and `net_allow host:443` permits raw TLS to the host with
-no content inspection. When `http_ca` is set, the CA must be one the
-caller has generated and installed into the sandbox's trust store
-(typically `/etc/ssl/certs/`).
+HTTPS interception is opt-in: without `http_ca` or `http_inject_ca`,
+port 443 is not intercepted, and `net_allow host:443` permits raw TLS to
+the host with no content inspection. When `http_ca` is set, the CA must
+be one the caller has generated and installed into the sandbox's trust
+store (typically `/etc/ssl/certs/`). Alternatively, `http_inject_ca`
+generates an ephemeral CA (private key kept in memory, never written to
+disk) and splices its public cert into each named trust bundle at open
+time, so the workload trusts the proxy with no manual install. File
+injection covers tools that read a trust file from disk (curl, git,
+OpenSSL CLI, Go, Python stdlib ssl, and Python requests / httpx via
+certifi's `cacert.pem` if you name that path). Runtimes with a
+compiled-in CA list such as Node and Java are not reachable by file
+injection; for those use `http_ca_out` to export the public cert and
+point the runtime's own env var at it (e.g. `NODE_EXTRA_CA_CERTS`).
 
 ## `[determinism]`
 

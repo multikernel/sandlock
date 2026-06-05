@@ -385,6 +385,8 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         // HTTP MITM material
         if let Some(ref ca) = base.http_ca { b = b.http_ca(ca); }
         if let Some(ref key) = base.http_key { b = b.http_key(key); }
+        for p in &base.http_inject_ca { b = b.http_inject_ca(p); }
+        if let Some(ref out) = base.http_ca_out { b = b.http_ca_out(out); }
         // Filesystem extras
         if let Some(ref path) = base.chroot { b = b.chroot(path); }
         if let Some(ref path) = base.fs_storage { b = b.fs_storage(path); }
@@ -433,6 +435,8 @@ async fn run_command(args: RunArgs) -> Result<i32> {
     for port in &pb.http_ports { builder = builder.http_port(*port); }
     if let Some(ref ca) = pb.http_ca { builder = builder.http_ca(ca); }
     if let Some(ref key) = pb.http_key { builder = builder.http_key(key); }
+    for p in &pb.http_inject_ca { builder = builder.http_inject_ca(p); }
+    if let Some(ref out) = pb.http_ca_out { builder = builder.http_ca_out(out); }
     if pb.port_remap { builder = builder.port_remap(true); }
     if pb.no_randomize_memory { builder = builder.no_randomize_memory(true); }
     if pb.no_huge_pages { builder = builder.no_huge_pages(true); }

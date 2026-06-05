@@ -433,6 +433,32 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_http_key(
     Box::into_raw(Box::new(builder.http_key(path)))
 }
 
+/// # Safety
+/// `b` and `path` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_http_inject_ca(
+    b: *mut SandboxBuilder,
+    path: *const c_char,
+) -> *mut SandboxBuilder {
+    if b.is_null() || path.is_null() { return b; }
+    let path = CStr::from_ptr(path).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.http_inject_ca(path)))
+}
+
+/// # Safety
+/// `b` and `path` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_http_ca_out(
+    b: *mut SandboxBuilder,
+    path: *const c_char,
+) -> *mut SandboxBuilder {
+    if b.is_null() || path.is_null() { return b; }
+    let path = CStr::from_ptr(path).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.http_ca_out(path)))
+}
+
 // ----------------------------------------------------------------
 // Sandbox Builder — isolation & determinism
 // ----------------------------------------------------------------

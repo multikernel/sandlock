@@ -95,6 +95,8 @@ _b_http_deny = _builder_fn("sandlock_sandbox_builder_http_deny", ctypes.c_char_p
 _b_http_port = _builder_fn("sandlock_sandbox_builder_http_port", ctypes.c_uint16)
 _b_http_ca = _builder_fn("sandlock_sandbox_builder_http_ca", ctypes.c_char_p)
 _b_http_key = _builder_fn("sandlock_sandbox_builder_http_key", ctypes.c_char_p)
+_b_http_inject_ca = _builder_fn("sandlock_sandbox_builder_http_inject_ca", ctypes.c_char_p)
+_b_http_ca_out = _builder_fn("sandlock_sandbox_builder_http_ca_out", ctypes.c_char_p)
 _b_uid = _builder_fn("sandlock_sandbox_builder_uid", ctypes.c_uint32)
 _b_random_seed = _builder_fn("sandlock_sandbox_builder_random_seed", ctypes.c_uint64)
 _b_clean_env = _builder_fn("sandlock_sandbox_builder_clean_env", ctypes.c_bool)
@@ -1046,6 +1048,10 @@ class _NativePolicy:
             b = _b_http_ca(b, _encode(str(policy.http_ca)))
         if policy.http_key:
             b = _b_http_key(b, _encode(str(policy.http_key)))
+        for path in (policy.http_inject_ca or []):
+            b = _b_http_inject_ca(b, _encode(str(path)))
+        if policy.http_ca_out:
+            b = _b_http_ca_out(b, _encode(str(policy.http_ca_out)))
 
         if policy.port_remap:
             b = _b_port_remap(b, True)

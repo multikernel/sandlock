@@ -33,6 +33,8 @@ pub struct ProfileInput {
 pub struct ConfigSection {
     pub http_ca: Option<PathBuf>,
     pub http_key: Option<PathBuf>,
+    pub http_inject_ca: Vec<PathBuf>,
+    pub http_ca_out: Option<PathBuf>,
     pub fs_storage: Option<PathBuf>,
     pub workdir: Option<PathBuf>,
 }
@@ -131,6 +133,8 @@ pub fn parse_input(input: ProfileInput) -> Result<(Sandbox, ProgramSpec), Sandlo
     // [config]
     if let Some(p) = input.config.http_ca       { b = b.http_ca(p); }
     if let Some(p) = input.config.http_key      { b = b.http_key(p); }
+    for p in input.config.http_inject_ca       { b = b.http_inject_ca(p); }
+    if let Some(p) = input.config.http_ca_out  { b = b.http_ca_out(p); }
     if let Some(p) = input.config.fs_storage    { b = b.fs_storage(p); }
     if let Some(p) = input.config.workdir       { b = b.workdir(p); }
 
@@ -330,6 +334,23 @@ mod tests {
         let (policy, _spec) = parse_input(input).unwrap();
         assert_eq!(policy.http_ca.as_deref(), Some(std::path::Path::new("/tmp/ca.pem")));
         assert_eq!(policy.http_key.as_deref(), Some(std::path::Path::new("/tmp/ca.key")));
+    }
+
+    #[test]
+    fn parses_http_inject_ca_and_ca_out() {
+        let toml = r#"
+            [config]
+            http_inject_ca = ["/etc/ssl/certs/ca-certificates.crt"]
+            http_ca_out = "/tmp/ca.pem"
+            [http]
+            allow = ["GET example.com/*"]
+            [program]
+            exec = "/bin/true"
+        "#;
+        let input: ProfileInput = toml::from_str(toml).unwrap();
+        let (policy, _prog) = parse_input(input).unwrap();
+        assert_eq!(policy.http_inject_ca.len(), 1);
+        assert_eq!(policy.http_ca_out.as_deref(), Some(std::path::Path::new("/tmp/ca.pem")));
     }
 
     #[test]

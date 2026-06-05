@@ -200,6 +200,14 @@ class Sandbox:
     http_key: str | None = None
     """PEM CA private key path for HTTPS MITM. Required with http_ca."""
 
+    http_inject_ca: Sequence[str] = field(default_factory=list)
+    """Trust bundle paths to splice the MITM CA into. Without http_ca this
+    generates an ephemeral CA and intercepts port 443."""
+
+    http_ca_out: str | None = None
+    """Path to write the active MITM CA public certificate (PEM). Never the
+    private key. Useful for NODE_EXTRA_CA_CERTS and similar."""
+
     # Resource limits
     max_memory: str | int | None = None
     """Memory limit. String like '512M' or int bytes."""

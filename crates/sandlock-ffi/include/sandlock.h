@@ -442,6 +442,19 @@ sandlock_builder_t *sandlock_sandbox_builder_http_key(sandlock_builder_t *b, con
 
 /**
  * # Safety
+ * `b` and `path` must be valid pointers.
+ */
+sandlock_builder_t *sandlock_sandbox_builder_http_inject_ca(sandlock_builder_t *b,
+                                                            const char *path);
+
+/**
+ * # Safety
+ * `b` and `path` must be valid pointers.
+ */
+sandlock_builder_t *sandlock_sandbox_builder_http_ca_out(sandlock_builder_t *b, const char *path);
+
+/**
+ * # Safety
  * `b` must be a valid builder pointer.
  */
 sandlock_builder_t *sandlock_sandbox_builder_random_seed(sandlock_builder_t *b, uint64_t seed);

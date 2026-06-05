@@ -444,6 +444,34 @@ pub(crate) fn build_dispatch_table(
     }
 
     // ------------------------------------------------------------------
+    // CA injection: splice the active MITM CA into user-declared trust
+    // bundles. Registered before chroot/COW so the substituted memfd wins
+    // over a real open of the bundle file. Only active when MITM is on and
+    // the user declared at least one --http-inject-ca path.
+    // ------------------------------------------------------------------
+    if let Some(ca_pem) = policy.ca_inject_pem.clone() {
+        if !policy.ca_inject_paths.is_empty() {
+            let inject_paths = std::sync::Arc::new(policy.ca_inject_paths.clone());
+            for nr in open_family_syscalls() {
+                let ca_pem = std::sync::Arc::clone(&ca_pem);
+                let inject_paths = std::sync::Arc::clone(&inject_paths);
+                table.register(nr, move |cx: &HandlerCtx| {
+                    let notif = cx.notif;
+                    let notif_fd = cx.notif_fd;
+                    let ca_pem = std::sync::Arc::clone(&ca_pem);
+                    let inject_paths = std::sync::Arc::clone(&inject_paths);
+                    async move {
+                        crate::ca_inject::handle_ca_inject_open(
+                            &notif, &inject_paths, &ca_pem, notif_fd,
+                        )
+                        .unwrap_or(NotifAction::Continue)
+                    }
+                });
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Chroot path interception (before COW)
     // ------------------------------------------------------------------
     if policy.chroot_root.is_some() {
@@ -1072,6 +1100,8 @@ mod handler_tests {
                 virtual_hostname: None,
                 has_http_acl: false,
                 virtual_etc_hosts: String::new(),
+                ca_inject_paths: Vec::new(),
+                ca_inject_pem: None,
             }),
             child_pidfd: None,
             notif_fd: -1,

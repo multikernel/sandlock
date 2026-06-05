@@ -52,6 +52,8 @@ _SECTIONS: dict[str, dict[str, tuple[str | None, type]]] = {
     "config": {
         "http_ca":    ("http_ca",    str),
         "http_key":   ("http_key",   str),
+        "http_inject_ca": ("http_inject_ca", list),
+        "http_ca_out":    ("http_ca_out",    str),
         "fs_storage": ("fs_storage", str),
         "workdir":    ("workdir",    str),
     },

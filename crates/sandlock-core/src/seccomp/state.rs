@@ -318,7 +318,7 @@ pub struct NetworkState {
     /// TCP ports to intercept and redirect to the HTTP ACL proxy.
     pub http_acl_ports: HashSet<u16>,
     /// Shared map for recording original destination IPs on proxy redirect.
-    pub http_acl_orig_dest: Option<crate::http_acl::OrigDestMap>,
+    pub http_acl_orig_dest: Option<crate::transparent_proxy::OrigDestMap>,
 }
 
 impl NetworkState {
