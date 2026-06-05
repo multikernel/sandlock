@@ -737,4 +737,25 @@ mod mask_contract_tests {
         assert_eq!(mask, 0);
         assert!(!wildcard);
     }
+
+    #[test]
+    fn net_mask_net_deny_forces_wildcard_dropping_connect_tcp() {
+        // `--net-deny` is default-allow and enforced on the on-behalf
+        // seccomp path, so Landlock must not gate CONNECT_TCP: a non-empty
+        // net_deny forces the wildcard treatment (BIND_TCP only), exactly
+        // like an all-ports --net-allow rule. This pins the reconciliation
+        // of the net-deny runtime relaxation with compute_net_mask.
+        let pol = ProtectionPolicy::strict_all();
+        let sb = Sandbox::builder()
+            .net_deny("10.0.0.0/8")
+            .build()
+            .expect("net_deny sandbox builds");
+        let (mask, wildcard) = compute_net_mask(6, &pol, &sb, true);
+        assert_eq!(
+            mask,
+            LANDLOCK_ACCESS_NET_BIND_TCP,
+            "net_deny must drop CONNECT_TCP so all TCP connects reach the on-behalf path",
+        );
+        assert!(wildcard, "net_deny must set the wildcard flag");
+    }
 }
