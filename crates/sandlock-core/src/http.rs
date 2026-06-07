@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::SandboxError;
-use crate::network::{NetAllow, Protocol};
+use crate::network::{NetAllow, NetTarget, Protocol};
 
 /// An HTTP access control rule.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -205,7 +205,7 @@ pub(crate) fn extend_net_allow_for_http(
     if wildcard_seen || (http_allow.is_empty() && http_deny.is_empty()) {
         net_allow.push(NetAllow {
             protocol: Protocol::Tcp,
-            host: None,
+            target: NetTarget::AnyIp,
             ports: http_ports.to_vec(),
             all_ports: false,
         });
@@ -214,7 +214,7 @@ pub(crate) fn extend_net_allow_for_http(
     for host in concrete_hosts {
         net_allow.push(NetAllow {
             protocol: Protocol::Tcp,
-            host: Some(host),
+            target: NetTarget::Host(host),
             ports: http_ports.to_vec(),
             all_ports: false,
         });
@@ -474,10 +474,10 @@ mod tests {
 
         assert_eq!(net_allow.len(), 2);
         assert_eq!(net_allow[0].protocol, Protocol::Tcp);
-        assert_eq!(net_allow[0].host.as_deref(), Some("api.example.com"));
+        assert!(matches!(&net_allow[0].target, NetTarget::Host(h) if h == "api.example.com"));
         assert_eq!(net_allow[0].ports, vec![80, 443]);
         assert_eq!(net_allow[1].protocol, Protocol::Tcp);
-        assert_eq!(net_allow[1].host.as_deref(), Some("admin.example.com"));
+        assert!(matches!(&net_allow[1].target, NetTarget::Host(h) if h == "admin.example.com"));
         assert_eq!(net_allow[1].ports, vec![80, 443]);
     }
 
@@ -487,7 +487,7 @@ mod tests {
         extend_net_allow_for_http(&mut net_allow, &[], &[], &[8080]);
         assert_eq!(net_allow.len(), 1);
         assert_eq!(net_allow[0].protocol, Protocol::Tcp);
-        assert_eq!(net_allow[0].host, None);
+        assert_eq!(net_allow[0].target, NetTarget::AnyIp);
         assert_eq!(net_allow[0].ports, vec![8080]);
 
         let allow = vec![HttpRule::parse("* */public/*").unwrap()];
@@ -495,7 +495,7 @@ mod tests {
         extend_net_allow_for_http(&mut net_allow, &allow, &[], &[80]);
         assert_eq!(net_allow.len(), 1);
         assert_eq!(net_allow[0].protocol, Protocol::Tcp);
-        assert_eq!(net_allow[0].host, None);
+        assert_eq!(net_allow[0].target, NetTarget::AnyIp);
         assert_eq!(net_allow[0].ports, vec![80]);
     }
 }

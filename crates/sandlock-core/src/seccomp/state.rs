@@ -354,6 +354,7 @@ impl NetworkState {
             let per_ip = ips.iter().map(|&ip| (ip, PortAllow::Any)).collect();
             NetworkPolicy::AllowList {
                 per_ip,
+                cidrs: Vec::new(),
                 any_ip_ports: HashSet::new(),
             }
         };

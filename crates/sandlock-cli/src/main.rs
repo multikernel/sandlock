@@ -341,10 +341,10 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         for p in &base.fs_writable { b = b.fs_write(p); }
         for p in &base.fs_denied { b = b.fs_deny(p); }
         for rule in &base.net_allow {
-            b = b.net_allow(format_net_allow(rule));
+            b = b.net_allow(format_net_rule(rule));
         }
         for rule in &base.net_deny {
-            b = b.net_deny(format_net_deny(rule));
+            b = b.net_deny(format_net_rule(rule));
         }
         for p in &base.net_bind { b = b.net_bind_port(*p); }
         for rule in &base.http_allow {
@@ -580,7 +580,11 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         let registered_hosts: Vec<String> = policy
             .net_allow
             .iter()
-            .filter_map(|r| r.host.clone())
+            .filter_map(|r| match &r.target {
+                sandlock_core::sandbox::NetTarget::Host(h) => Some(h.clone()),
+                sandlock_core::sandbox::NetTarget::Cidr(c) => Some(c.to_string()),
+                sandlock_core::sandbox::NetTarget::AnyIp => None,
+            })
             .collect();
         if let Err(e) = network_registry::register(
             &sandbox_name, pid, std::collections::HashMap::new(),
@@ -755,41 +759,23 @@ fn validate_no_supervisor_profile(profile: &Sandbox, source: &str) -> Result<()>
     Ok(())
 }
 
-/// Render a parsed NetAllow rule back into a --net-allow spec string, so a
-/// profile loaded via --profile-file round-trips through the builder. Mirrors
-/// `format_net_deny`: bare TCP, explicit `udp://`/`icmp://`, and the all-ports
-/// case drops the redundant `:*`.
-fn format_net_allow(rule: &sandlock_core::sandbox::NetAllow) -> String {
-    use sandlock_core::sandbox::Protocol;
-    let host = rule.host.as_deref().unwrap_or("*");
-    match rule.protocol {
-        Protocol::Icmp => format!("icmp://{}", host),
-        proto => {
-            let scheme = if matches!(proto, Protocol::Udp) { "udp://" } else { "" };
-            if rule.all_ports {
-                format!("{}{}", scheme, host)
-            } else {
-                let ports = format_ports(&rule.ports);
-                format!("{}{}:{}", scheme, host, ports)
-            }
-        }
-    }
-}
-
-/// Render a parsed NetDeny rule back into a --net-deny spec string, so a
-/// profile loaded via --profile-file round-trips through the builder.
-fn format_net_deny(rule: &sandlock_core::sandbox::NetDeny) -> String {
-    use sandlock_core::sandbox::{DenyTarget, Protocol};
+/// Render a parsed `NetRule` back into a `--net-allow` / `--net-deny` spec
+/// string, so a profile loaded via `--profile-file` round-trips through the
+/// builder. Allow and deny share one grammar: bare TCP, explicit
+/// `udp://`/`icmp://`, IPv6 bracketed only when a port follows, and the
+/// all-ports case drops the redundant `:*`.
+fn format_net_rule(rule: &sandlock_core::sandbox::NetRule) -> String {
+    use sandlock_core::sandbox::{NetTarget, Protocol};
     let target = match &rule.target {
-        DenyTarget::AnyIp => "*".to_string(),
-        DenyTarget::Cidr(c) => {
-            let base = format!("{}/{}", c.addr, c.prefix_len);
+        NetTarget::AnyIp => "*".to_string(),
+        NetTarget::Host(h) => h.clone(),
+        NetTarget::Cidr(c) => {
             // Bracket IPv6 only when a port suffix will follow, because a
             // bare addr:port is itself a valid IPv6 address.
             if matches!(c.addr, std::net::IpAddr::V6(_)) && !rule.all_ports {
-                format!("[{}]", base)
+                format!("[{}]", c)
             } else {
-                base
+                c.to_string()
             }
         }
     };
@@ -833,33 +819,45 @@ fn parse_branch_action(flag: &str, s: &str) -> Result<BranchAction> {
 #[cfg(test)]
 mod render_tests {
     use super::*;
-    use sandlock_core::sandbox::NetAllow;
+    use sandlock_core::sandbox::NetRule;
 
     #[test]
     fn render_allow_drops_redundant_all_ports_star() {
-        let r = NetAllow::parse("udp://*:*").unwrap();
-        assert_eq!(format_net_allow(&r), "udp://*");
+        let r = NetRule::parse_allow("udp://*:*").unwrap();
+        assert_eq!(format_net_rule(&r), "udp://*");
     }
 
     #[test]
     fn render_allow_any_ip_all_ports_tcp_is_bare_star() {
-        let r = NetAllow::parse(":*").unwrap();
-        assert_eq!(format_net_allow(&r), "*");
+        let r = NetRule::parse_allow(":*").unwrap();
+        assert_eq!(format_net_rule(&r), "*");
     }
 
     #[test]
     fn render_allow_host_ports() {
-        let r = NetAllow::parse("example.com:443").unwrap();
-        assert_eq!(format_net_allow(&r), "example.com:443");
+        let r = NetRule::parse_allow("example.com:443").unwrap();
+        assert_eq!(format_net_rule(&r), "example.com:443");
     }
 
     #[test]
-    fn render_allow_roundtrips_through_parse() {
-        for spec in ["example.com:443", "udp://1.1.1.1:53", "icmp://github.com", "*", "udp://*"] {
-            let r = NetAllow::parse(spec).unwrap();
-            let rendered = format_net_allow(&r);
-            let r2 = NetAllow::parse(&rendered).unwrap();
-            assert_eq!(r.host, r2.host, "host mismatch for {spec}");
+    fn render_cidr_and_ipv6_round_trip() {
+        // CIDR and IPv6-literal targets render identically for allow/deny.
+        assert_eq!(format_net_rule(&NetRule::parse_allow("10.0.0.0/8:80").unwrap()), "10.0.0.0/8:80");
+        assert_eq!(format_net_rule(&NetRule::parse_deny("10.0.0.0/8").unwrap()), "10.0.0.0/8");
+        assert_eq!(format_net_rule(&NetRule::parse_allow("[::1]:443").unwrap()), "[::1]:443");
+        assert_eq!(format_net_rule(&NetRule::parse_allow("::1").unwrap()), "::1");
+    }
+
+    #[test]
+    fn render_roundtrips_through_parse() {
+        for spec in [
+            "example.com:443", "udp://1.1.1.1:53", "icmp://github.com", "*", "udp://*",
+            "10.0.0.0/8:80", "[fc00::/7]:443", "::1", "1.2.3.4",
+        ] {
+            let r = NetRule::parse_allow(spec).unwrap();
+            let rendered = format_net_rule(&r);
+            let r2 = NetRule::parse_allow(&rendered).unwrap();
+            assert_eq!(r.target, r2.target, "target mismatch for {spec}");
             assert_eq!(r.ports, r2.ports, "ports mismatch for {spec}");
             assert_eq!(r.all_ports, r2.all_ports, "all_ports mismatch for {spec}");
             assert_eq!(r.protocol, r2.protocol, "protocol mismatch for {spec}");

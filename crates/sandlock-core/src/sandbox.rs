@@ -10,7 +10,7 @@ use tokio::task::JoinHandle;
 use crate::context;
 use crate::error::SandboxError;
 pub use crate::http::{http_acl_check, normalize_path, prefix_or_exact_match, HttpRule};
-pub use crate::network::{DenyTarget, IpCidr, NetAllow, NetDeny, Protocol};
+pub use crate::network::{IpCidr, NetAllow, NetDeny, NetRule, NetTarget, Protocol};
 use crate::protection::{Protection, ProtectionPolicy, ProtectionState, ProtectionStatus};
 
 /// A byte size value.
@@ -1456,6 +1456,7 @@ impl Sandbox {
                             .collect();
                         crate::seccomp::notif::NetworkPolicy::AllowList {
                             per_ip,
+                            cidrs: resolved.cidrs.clone(),
                             any_ip_ports: resolved.any_ip_ports.clone(),
                         }
                     }
@@ -1494,8 +1495,15 @@ impl Sandbox {
                 let mut allowed_ips: std::collections::HashSet<std::net::IpAddr> =
                     std::collections::HashSet::new();
                 for p in [&net_state.tcp_policy, &net_state.udp_policy, &net_state.icmp_policy] {
-                    if let crate::seccomp::notif::NetworkPolicy::AllowList { per_ip, .. } = p {
+                    if let crate::seccomp::notif::NetworkPolicy::AllowList { per_ip, cidrs, .. } = p {
                         allowed_ips.extend(per_ip.keys().copied());
+                        // IP literals resolve to single-host CIDRs (/32 or
+                        // /128); surface them as concrete allowed IPs too.
+                        for (net, _) in cidrs {
+                            if net.is_single_host() {
+                                allowed_ips.insert(net.addr);
+                            }
+                        }
                     }
                 }
                 let live = crate::policy_fn::LivePolicy {
@@ -2396,14 +2404,14 @@ impl SandboxBuilder {
         let mut net_allow: Vec<NetAllow> = self
             .net_allow
             .into_iter()
-            .map(|s| NetAllow::parse(&s))
+            .map(|s| NetRule::parse_allow(&s))
             .collect::<Result<_, _>>()?;
 
         // Parse --net-deny rules (one rule per spec).
         let net_deny: Vec<NetDeny> = self
             .net_deny
             .into_iter()
-            .map(|s| NetDeny::parse(&s))
+            .map(|s| NetRule::parse_deny(&s))
             .collect::<Result<_, _>>()?;
 
         // --net-allow and --net-deny are mutually exclusive. Check the
