@@ -89,6 +89,24 @@ class TestSandboxRun:
         assert not result.success
 
 
+class TestNetDeny:
+    """`net_deny` wired through the FFI: default-allow networking with an
+    IP/CIDR/port denylist, mutually exclusive with `net_allow`."""
+
+    def test_net_deny_builds_and_runs(self):
+        result = _policy(
+            net_deny=["10.0.0.0/8", "169.254.169.254:80", "udp://*"]
+        ).run(["echo", "ok"])
+        assert result.success
+        assert result.stdout.strip() == b"ok"
+
+    def test_net_allow_and_net_deny_mutually_exclusive(self):
+        with pytest.raises(RuntimeError, match="mutually exclusive"):
+            _policy(
+                net_allow=["github.com:443"], net_deny=["10.0.0.0/8"]
+            ).run(["echo", "ok"])
+
+
 class TestSandlockRunCAbiMultiThreaded:
     """Regression for issue #47 covering only the C ABI ``sandlock_run`` path.
 

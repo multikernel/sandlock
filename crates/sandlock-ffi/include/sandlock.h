@@ -394,9 +394,16 @@ sandlock_builder_t *sandlock_sandbox_builder_net_allow(sandlock_builder_t *b, co
 
 /**
  * # Safety
+ * `b` and `spec` must be valid pointers.
+ */
+sandlock_builder_t *sandlock_sandbox_builder_net_deny(sandlock_builder_t *b, const char *spec);
+
+/**
+ * # Safety
  * `b` must be a valid builder pointer.
  */
-sandlock_builder_t *sandlock_sandbox_builder_net_bind_port(sandlock_builder_t *b, uint16_t port);
+sandlock_builder_t *sandlock_sandbox_builder_net_allow_bind_port(sandlock_builder_t *b,
+                                                                 uint16_t port);
 
 /**
  * # Safety

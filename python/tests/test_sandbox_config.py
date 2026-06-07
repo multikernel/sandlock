@@ -248,3 +248,15 @@ class TestNetAllow:
             ":8080",
         ]
 
+
+class TestNetDeny:
+    """Endpoint denylist semantics for `net_deny` (default-allow, inverse of
+    `net_allow`, mutually exclusive with it). Targets are literal IP/CIDR."""
+
+    def test_default_is_empty(self):
+        assert Sandbox().net_deny == []
+
+    def test_specs_preserved_as_strings(self):
+        p = Sandbox(net_deny=["10.0.0.0/8", "169.254.169.254:80", "udp://*"])
+        assert list(p.net_deny) == ["10.0.0.0/8", "169.254.169.254:80", "udp://*"]
+

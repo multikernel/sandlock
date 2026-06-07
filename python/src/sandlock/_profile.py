@@ -14,7 +14,7 @@ Rust CLI). Each section maps to a subset of ``Sandbox`` fields:
     [filesystem]  → fs_readable (read), fs_writable (write),
                     fs_denied (deny), chroot,
                     fs_mount (mount), on_exit, on_error
-    [network]     → net_allow_bind (allow_bind), net_allow (allow), port_remap
+    [network]     → net_allow_bind (allow_bind), net_allow (allow), net_deny (deny), port_remap
     [http]        → http_ports (ports), http_allow (allow),
                     http_deny (deny)
     [syscalls]    → extra_allow_syscalls (extra_allow),
@@ -85,6 +85,7 @@ _SECTIONS: dict[str, dict[str, tuple[str | None, type]]] = {
     "network": {
         "allow_bind": ("net_allow_bind", list),
         "allow":      ("net_allow",  list),
+        "deny":       ("net_deny",   list),
         "port_remap": ("port_remap", bool),
     },
     "http": {

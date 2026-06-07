@@ -327,6 +327,18 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_net_allow(
 }
 
 /// # Safety
+/// `b` and `spec` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_net_deny(
+    b: *mut SandboxBuilder, spec: *const c_char,
+) -> *mut SandboxBuilder {
+    if b.is_null() || spec.is_null() { return b; }
+    let spec = CStr::from_ptr(spec).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.net_deny(spec)))
+}
+
+/// # Safety
 /// `b` must be a valid builder pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_net_allow_bind_port(

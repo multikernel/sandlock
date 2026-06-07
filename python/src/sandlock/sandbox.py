@@ -169,10 +169,20 @@ class Sandbox:
 
     Protocol gating falls out of rule presence: with no UDP/ICMP rules,
     UDP and ICMP socket creation are denied at the seccomp layer.
-    Hostnames are resolved at sandbox-creation time and pinned via a
-    synthetic ``/etc/hosts``. Empty = deny all outbound. HTTP rules with
-    concrete hosts auto-add a matching TCP entry on :attr:`http_ports`.
-    See README "Network Model" for details."""
+    A target may also be an IP, a CIDR range, or an IPv6 literal
+    (``"10.0.0.0/8:443"``, ``"[2606:4700::/32]:443"``), matched by
+    containment with no DNS. Hostnames are resolved at sandbox-creation
+    time and pinned via a synthetic ``/etc/hosts``. Empty = deny all
+    outbound. HTTP rules with concrete hosts auto-add a matching TCP entry
+    on :attr:`http_ports`. See README "Network Model" for details."""
+
+    net_deny: Sequence[str] = field(default_factory=list)
+    """Outbound endpoint denylist: default-allow networking, block these
+    targets. The inverse of :attr:`net_allow` and **mutually exclusive**
+    with it. Same grammar as ``net_allow`` except targets must be a literal
+    IP/CIDR or ``"*"`` (hostnames are rejected; use :attr:`http_deny` for
+    domains), e.g. ``["10.0.0.0/8", "169.254.169.254:80", "udp://*"]``.
+    Empty = no denylist. See README "Network Model" for details."""
 
     no_coredump: bool = False
     """Disable core dumps and restrict /proc/pid access from other
