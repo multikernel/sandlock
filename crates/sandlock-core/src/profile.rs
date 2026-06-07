@@ -77,10 +77,21 @@ pub struct FilesystemSection {
     pub on_error: Option<String>,
 }
 
+/// One `[network].allow_bind` entry: a bare integer port (`8080`) or a
+/// quoted string holding a comma list and/or `lo-hi` range (`"9000-9005"`).
+/// The untagged form lets a TOML array mix the two, e.g.
+/// `allow_bind = [8080, "9000-9005"]`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum PortSpec {
+    Port(u16),
+    Spec(String),
+}
+
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct NetworkSection {
-    pub allow_bind: Vec<u16>,
+    pub allow_bind: Vec<PortSpec>,
     pub allow: Vec<String>,
     pub deny: Vec<String>,
     pub port_remap: bool,
@@ -168,7 +179,12 @@ pub fn parse_input(input: ProfileInput) -> Result<(Sandbox, ProgramSpec), Sandlo
     if let Some(s) = input.filesystem.on_error.as_deref() { b = b.on_error(parse_branch_action(s)?); }
 
     // [network]
-    for p in input.network.allow_bind.iter()  { b = b.net_allow_bind_port(*p); }
+    for entry in input.network.allow_bind.iter() {
+        b = match entry {
+            PortSpec::Port(p) => b.net_allow_bind_port(*p),
+            PortSpec::Spec(s) => b.net_allow_bind(s),
+        };
+    }
     for r in input.network.allow.iter() { b = b.net_allow(r.as_str()); }
     for r in input.network.deny.iter()  { b = b.net_deny(r.as_str()); }
     if input.network.port_remap         { b = b.port_remap(true); }
@@ -430,7 +446,7 @@ mod tests {
             on_error  = "abort"
 
             [network]
-            allow_bind = [8080]
+            allow_bind = [8080, "9000-9002"]
             allow      = ["tcp://cache.internal:6379"]
             port_remap = true
 
@@ -459,6 +475,8 @@ mod tests {
         // rule that the builder auto-merges (api.internal on http.ports). The
         // merge is the contract being verified here.
         assert!(policy.net_allow.len() >= 2);
+        // allow_bind mixes a bare int port and a quoted range string.
+        assert_eq!(policy.net_allow_bind, vec![8080, 9000, 9001, 9002]);
         assert_eq!(policy.http_allow.len(), 1);
         assert_eq!(policy.fs_mount.len(), 1);
     }
