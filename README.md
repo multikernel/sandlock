@@ -166,8 +166,9 @@ sandlock run \
   --http-ca ca.pem --http-key ca-key.pem \
   -r /usr -r /lib -r /etc -- python3 agent.py
 
-# Server listening on a port (Landlock --net-allow-bind, separate from --net-allow)
-sandlock run --net-allow-bind 8080 -r /usr -r /lib -r /etc -- python3 server.py
+# Server listening on ports (Landlock --net-allow-bind, separate from --net-allow;
+# accepts comma-separated ports and lo-hi ranges, repeatable)
+sandlock run --net-allow-bind 8080,9000-9005 -r /usr -r /lib -r /etc -- python3 server.py
 
 # Clean environment
 sandlock run --clean-env --env CC=gcc \
@@ -695,9 +696,11 @@ var at it (e.g. `NODE_EXTRA_CA_CERTS`). Without any of these, port 443
 is not intercepted: `--net-allow host:443` permits raw TLS to the host
 with no content inspection.
 
-**Bind.** `--net-allow-bind <port>` is independent from `--net-allow` and
-governs server-side `bind()`. Landlock enforces it (TCP only);
-`--port-remap` adds on-behalf virtualization for binding.
+**Bind.** `--net-allow-bind <ports>` is independent from `--net-allow` and
+governs server-side `bind()` as a default-deny allowlist. Each value is a
+comma-separated list of single ports or inclusive `lo-hi` ranges (e.g.
+`--net-allow-bind 8080,9000-9005`), and the flag repeats. Landlock enforces
+it (TCP only); `--port-remap` adds on-behalf virtualization for binding.
 
 **AF_UNIX sockets** are governed by Landlock's
 `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`, independent from `--net-allow`.

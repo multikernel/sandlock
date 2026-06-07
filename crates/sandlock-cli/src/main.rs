@@ -406,7 +406,7 @@ async fn run_command(args: RunArgs) -> Result<i32> {
     if let Some(n) = pb.max_processes { builder = builder.max_processes(n); }
     for spec in &pb.net_allow { builder = builder.net_allow(spec); }
     for spec in &pb.net_deny { builder = builder.net_deny(spec); }
-    for p in &pb.net_allow_bind { builder = builder.net_allow_bind_port(*p); }
+    for spec in &pb.net_allow_bind { builder = builder.net_allow_bind(spec); }
     if let Some(seed) = pb.random_seed { builder = builder.random_seed(seed); }
     if pb.clean_env { builder = builder.clean_env(true); }
     if let Some(n) = pb.num_cpus { builder = builder.num_cpus(n); }

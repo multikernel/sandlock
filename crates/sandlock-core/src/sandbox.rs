@@ -1833,8 +1833,11 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "net-deny", value_name = "SPEC"))]
     pub net_deny: Vec<String>,
 
-    #[cfg_attr(feature = "cli", arg(long = "net-allow-bind"))]
-    pub net_allow_bind: Vec<u16>,
+    /// `--net-allow-bind`: TCP ports the sandbox may bind/listen on
+    /// (default-deny). Each value is a comma-separated list of single ports
+    /// or inclusive `lo-hi` ranges, e.g. `8080,9000-9005`. Repeatable.
+    #[cfg_attr(feature = "cli", arg(long = "net-allow-bind", value_name = "PORTS"))]
+    pub net_allow_bind: Vec<String>,
 
     #[cfg_attr(feature = "cli", arg(long = "http-allow", value_name = "RULE"))]
     pub http_allow: Vec<String>,
@@ -2126,8 +2129,17 @@ impl SandboxBuilder {
         self
     }
 
+    /// Allow binding a single TCP port. For comma-separated lists or
+    /// `lo-hi` ranges, use [`net_allow_bind`](Self::net_allow_bind).
     pub fn net_allow_bind_port(mut self, port: u16) -> Self {
-        self.net_allow_bind.push(port);
+        self.net_allow_bind.push(port.to_string());
+        self
+    }
+
+    /// Allow binding TCP ports from a spec: a comma-separated list of single
+    /// ports or inclusive `lo-hi` ranges (e.g. `"8080,9000-9005"`).
+    pub fn net_allow_bind(mut self, spec: impl Into<String>) -> Self {
+        self.net_allow_bind.push(spec.into());
         self
     }
 
@@ -2439,7 +2451,7 @@ impl SandboxBuilder {
             protection_policy: self.protection_policy,
             net_allow,
             net_deny,
-            net_allow_bind: self.net_allow_bind,
+            net_allow_bind: parse_bind_ports(&self.net_allow_bind)?,
             http_allow,
             http_deny,
             http_ports,
@@ -2488,6 +2500,48 @@ impl SandboxBuilder {
         p.validate()?;
         Ok(p)
     }
+}
+
+/// Expand `--net-allow-bind` specs into a sorted, deduplicated port list.
+/// Each spec is a comma-separated list of single ports (`8080`) or inclusive
+/// `lo-hi` ranges (`8000-8010`). Mirrors the Python SDK's `parse_ports`.
+fn parse_bind_ports(specs: &[String]) -> Result<Vec<u16>, SandboxError> {
+    let mut ports: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+    for spec in specs {
+        for part in spec.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                return Err(SandboxError::Invalid(format!(
+                    "--net-allow-bind: empty port in `{}`",
+                    spec
+                )));
+            }
+            match part.split_once('-') {
+                Some((lo, hi)) => {
+                    let lo: u16 = lo.trim().parse().map_err(|_| {
+                        SandboxError::Invalid(format!("--net-allow-bind: invalid port range `{}`", part))
+                    })?;
+                    let hi: u16 = hi.trim().parse().map_err(|_| {
+                        SandboxError::Invalid(format!("--net-allow-bind: invalid port range `{}`", part))
+                    })?;
+                    if lo > hi {
+                        return Err(SandboxError::Invalid(format!(
+                            "--net-allow-bind: reversed port range `{}` (lo > hi)",
+                            part
+                        )));
+                    }
+                    ports.extend(lo..=hi);
+                }
+                None => {
+                    let p: u16 = part.parse().map_err(|_| {
+                        SandboxError::Invalid(format!("--net-allow-bind: invalid port `{}`", part))
+                    })?;
+                    ports.insert(p);
+                }
+            }
+        }
+    }
+    Ok(ports.into_iter().collect())
 }
 
 /// Resolve a path as seen inside the sandbox to its host-side location, so its
@@ -2674,6 +2728,26 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(policy.net_deny.len(), 1);
+    }
+
+    #[test]
+    fn builder_net_allow_bind_comma_and_ranges() {
+        // Comma-separated ports and `lo-hi` ranges expand, sort, and dedup.
+        let policy = Sandbox::builder()
+            .net_allow_bind("8080,9000-9002")
+            .net_allow_bind_port(443)
+            .net_allow_bind("9001,443") // overlaps dedup away
+            .build()
+            .unwrap();
+        assert_eq!(policy.net_allow_bind, vec![443, 8080, 9000, 9001, 9002]);
+    }
+
+    #[test]
+    fn builder_net_allow_bind_rejects_bad_specs() {
+        assert!(Sandbox::builder().net_allow_bind("9000-8000").build().is_err()); // reversed
+        assert!(Sandbox::builder().net_allow_bind("80,abc").build().is_err());    // bad port
+        assert!(Sandbox::builder().net_allow_bind("70000").build().is_err());     // > u16
+        assert!(Sandbox::builder().net_allow_bind("8080,").build().is_err());     // empty part
     }
 
     #[test]
