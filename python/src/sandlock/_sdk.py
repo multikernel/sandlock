@@ -1176,7 +1176,9 @@ class _NativePolicy:
                     return -2
                 if isinstance(result, int) and result > 0:
                     return result
-                return 0
+                # Unrecognized return values fail closed (deny) rather than
+                # silently allowing the syscall.
+                return -1
 
             c_callback = _POLICY_FN_TYPE(_c_callback)
             b = _lib.sandlock_sandbox_builder_policy_fn(b, c_callback, None, None)
