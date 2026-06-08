@@ -142,5 +142,5 @@ jobs:
       - name: Vet and test
         working-directory: go
         run: |
-          go vet ./...
-          go test ./... -v
+          go vet -tags sandlock_repo ./...
+          go test -tags sandlock_repo ./... -v
