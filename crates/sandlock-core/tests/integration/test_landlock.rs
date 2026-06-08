@@ -370,6 +370,131 @@ async fn test_isolate_ipc() {
     let _ = std::fs::remove_file(&ready_file);
 }
 
+// Stronger companion to `test_isolate_ipc`: that test catches a bare
+// `OSError` and so cannot tell a *contained* connect (Landlock scope ->
+// EPERM) apart from a *refused* one (no listener -> ECONNREFUSED), which
+// means a silently-dead listener would false-pass. This test removes both
+// ambiguities:
+//   1. a positive control proves the abstract socket is genuinely reachable
+//      from *outside* the sandbox before we test the inside, and
+//   2. the in-sandbox connect must fail with the specific errno the
+//      `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` scope returns (EPERM), not just
+//      "some error".
+// So a pass attributes the block to the scope and nothing else.
+#[tokio::test]
+async fn test_abstract_unix_socket_contained() {
+    if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 {
+        eprintln!("Skipping: Landlock ABI v6 required");
+        return;
+    }
+
+    let out = temp_file("abstract-sock-result");
+    let ready_file = temp_file("abstract-sock-ready");
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&ready_file);
+
+    let sock_name = format!("sandlock_test_abstract_{}", std::process::id());
+
+    // Host-side listener bound to an abstract-namespace address (leading NUL).
+    // It is created *outside* any sandbox, so it lives in the shared host
+    // abstract namespace that a netns-less sandbox would otherwise reach.
+    let listener_script = format!(
+        concat!(
+            "import socket, time\n",
+            "sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n",
+            "sock.bind('\\x00{sock_name}')\n",
+            "sock.listen(5)\n",
+            "open('{ready}', 'w').write('ready')\n",
+            "time.sleep(15)\n",
+            "sock.close()\n",
+        ),
+        sock_name = sock_name,
+        ready = ready_file.display(),
+    );
+
+    let mut listener_proc = std::process::Command::new("python3")
+        .args(["-c", &listener_script])
+        .spawn()
+        .unwrap();
+
+    for _ in 0..100 {
+        if ready_file.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(ready_file.exists(), "listener should signal readiness");
+
+    // Positive control: from this (unsandboxed) test process the abstract
+    // socket MUST be connectable. If this fails the listener is broken and
+    // the negative result below would be meaningless, so we assert it first.
+    {
+        use std::os::linux::net::SocketAddrExt;
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(sock_name.as_bytes())
+            .expect("build abstract socket addr");
+        let control = std::os::unix::net::UnixStream::connect_addr(&addr);
+        assert!(
+            control.is_ok(),
+            "positive control: host must be able to reach the abstract socket \
+             (got {control:?}); the containment assertion would be meaningless otherwise"
+        );
+    }
+
+    // In-sandbox connect: record the *exact* errno rather than collapsing
+    // every failure to "BLOCKED".
+    let child_script = format!(
+        concat!(
+            "import socket\n",
+            "sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n",
+            "try:\n",
+            "    sock.connect('\\x00{sock_name}')\n",
+            "    result = 'CONNECTED'\n",
+            "except OSError as e:\n",
+            "    result = 'ERRNO:%d' % e.errno\n",
+            "finally:\n",
+            "    sock.close()\n",
+            "open('{out}', 'w').write(result)\n",
+        ),
+        sock_name = sock_name,
+        out = out.display(),
+    );
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write("/tmp")
+        .build()
+        .unwrap();
+
+    policy
+        .clone()
+        .with_name("test")
+        .run_interactive(&["python3", "-c", &child_script])
+        .await
+        .unwrap();
+
+    let contents = std::fs::read_to_string(&out).unwrap_or_default();
+    // EPERM (1) is what LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET returns when a
+    // sandboxed task connects to an abstract socket created outside its
+    // Landlock domain. Anything else (CONNECTED, or ECONNREFUSED=111, etc.)
+    // means the scope did not do the blocking.
+    assert_eq!(
+        contents, "ERRNO:1",
+        "sandboxed connect to an outside abstract socket must be blocked by the \
+         abstract-unix-socket scope with EPERM (got {contents:?})"
+    );
+
+    let _ = listener_proc.kill();
+    let _ = listener_proc.wait();
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&ready_file);
+}
+
 #[tokio::test]
 async fn test_isolate_signals_blocks_parent() {
     if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 {
