@@ -3,9 +3,11 @@
 package sandlock
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../crates/sandlock-ffi/include
-#cgo LDFLAGS: -L${SRCDIR}/../target/release -Wl,-rpath,${SRCDIR}/../target/release -lsandlock_ffi -lpthread -ldl -lm
-
+// Build flags (include path plus link flags) are supplied by build-tagged
+// companion files: cgo_pkgconfig.go by default (resolves the installed library
+// via pkg-config) and cgo_repo.go under `-tags sandlock_repo` (resolves the
+// library from this checkout's target/release without installing).
+//
 // The C declarations come from the cbindgen-generated header, so the cgo
 // prototypes stay in lock-step with crates/sandlock-ffi automatically.
 #include <stdlib.h>

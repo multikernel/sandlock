@@ -14,19 +14,41 @@ import sandlock "github.com/multikernel/sandlock/go"
 
 ## Building
 
-cgo links against `libsandlock_ffi`, produced by the Rust workspace. The
-default link flags resolve the library relative to this package
-(`../target/release`), so build from a checkout of the sandlock repository:
+cgo links against `libsandlock_ffi`, produced by the Rust workspace. There are
+two build modes.
+
+### Released mode (default): installed library via pkg-config
+
+The default build resolves the library and header through `pkg-config`, so the
+SDK is usable from another module once the native side is installed. From a
+checkout of the sandlock repository:
 
 ```bash
-cargo build --release            # writes target/release/libsandlock_ffi.so
-cd go && go test ./...
+sudo make install-go-lib         # installs libsandlock_ffi.so, sandlock.h, sandlock.pc
+go get github.com/multikernel/sandlock/go
 ```
 
-To use the SDK from another module, point cgo at an installed library, e.g.:
+`make install-go-lib` honors `PREFIX` (default `/usr/local`) and `DESTDIR`. For
+a non-standard prefix, point pkg-config at it:
 
 ```bash
-CGO_LDFLAGS="-L/usr/local/lib -Wl,-rpath,/usr/local/lib" go build
+make install-go-lib PREFIX=$HOME/.local
+export PKG_CONFIG_PATH=$HOME/.local/lib/pkgconfig
+```
+
+The installed `sandlock.pc` bakes an rpath to its `libdir`, so binaries find the
+shared library at runtime without `LD_LIBRARY_PATH`.
+
+### In-tree mode: build against this checkout (`-tags sandlock_repo`)
+
+For development without installing, build with `-tags sandlock_repo`, which
+points cgo at this checkout's `target/release`:
+
+```bash
+cargo build --release -p sandlock-ffi    # writes target/release/libsandlock_ffi.so
+cd go && go build -tags sandlock_repo ./...
+# run the test suite the same way:
+go test -tags sandlock_repo ./...
 ```
 
 ## Quick start
