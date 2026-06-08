@@ -52,7 +52,11 @@ parse_deps = false
 # Force-emit the two action/exception enums: they are referenced from Rust only
 # via `... as u32` casts, never as a typed field or parameter, so cbindgen would
 # otherwise drop them as unreferenced even though their constants are public ABI.
-include = ["sandlock_action_kind_t", "sandlock_exception_policy_t"]
+include = [
+    "sandlock_action_kind_t",
+    "sandlock_exception_policy_t",
+    "sandlock_policy_ud_drop_t",
+]
 exclude = [
     "SandboxBuilder",
     "Sandbox",

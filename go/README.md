@@ -76,6 +76,7 @@ fresh native policy on each call.
 | Environment | `CleanEnv`, `Env` |
 | Misc | `UID`, `NoCoredump`, `Name` |
 | COW branch | `FSStorage`, `OnExit`, `OnError` |
+| Dynamic policy | `PolicyFn` |
 
 `NetAllow` entries follow sandlock's rule grammar: bare `host:port` is TCP
 (`"api.openai.com:443"`, `"github.com:22,443"`, `":53"`); a target may be a
@@ -105,6 +106,44 @@ func (s *Sandbox) Spawn(cmd ...string) (*Process, error)
   filesystem `Changes` it would have made, and discards them. Requires
   `Workdir`.
 - **Spawn** starts a process without waiting, returning a `*Process`.
+
+### Dynamic policy callbacks
+
+```go
+type PolicyFunc func(event SyscallEvent, ctx *PolicyContext) PolicyDecision
+
+func Allow() PolicyDecision
+func Deny() PolicyDecision
+func Audit() PolicyDecision
+func DenyWith(errnoValue int) PolicyDecision
+
+func (e SyscallEvent) ArgvContains(sub string) bool
+
+func (ctx *PolicyContext) RestrictNetwork(ips []string) error
+func (ctx *PolicyContext) GrantNetwork(ips []string) error
+func (ctx *PolicyContext) RestrictMaxMemory(bytes uint64)
+func (ctx *PolicyContext) RestrictMaxProcesses(n uint32)
+func (ctx *PolicyContext) RestrictPIDNetwork(pid uint32, ips []string) error
+func (ctx *PolicyContext) DenyPath(path string) error
+func (ctx *PolicyContext) AllowPath(path string) error
+```
+
+`PolicyFn` receives dynamic syscall events from sandlock's policy-fn worker
+thread. Path strings are deliberately absent; use Landlock fields for static
+path policy and `DenyPath`/`AllowPath` for the dynamic path-deny hook. `Argv`
+is populated for `execve`/`execveat` events.
+
+```go
+sb := &sandlock.Sandbox{
+    FSReadable: []string{"/usr", "/lib", "/lib64", "/bin", "/etc"},
+    PolicyFn: func(event sandlock.SyscallEvent, ctx *sandlock.PolicyContext) sandlock.PolicyDecision {
+        if event.Syscall == "execve" && event.ArgvContains("curl") {
+            return sandlock.Deny()
+        }
+        return sandlock.Allow()
+    },
+}
+```
 
 ### Process lifecycle
 
@@ -140,14 +179,10 @@ func SyscallNr(name string) (int, error)
 
 ## Status
 
-This SDK covers the static policy surface plus in-process `Confine`. The
-following sandlock features are not yet bound and are tracked as follow-ups:
-dynamic `policy_fn` callbacks, custom seccomp handlers, pipelines, gather
-(fan-in), COW `fork`/`reduce`, and `checkpoint`/restore.
-
-`policy_fn` in particular needs a small upstream addition — a `void *user_data`
-parameter on `sandlock_sandbox_builder_policy_fn` — before Go can route the
-callback to a per-`Sandbox` closure. See the SDK's tracking issue.
+This SDK covers the static policy surface, dynamic `policy_fn` callbacks, and
+in-process `Confine`. The following sandlock features are not yet bound and are
+tracked as follow-ups: custom seccomp handlers, pipelines, gather (fan-in), COW
+`fork`/`reduce`, and `checkpoint`/restore.
 
 ## License
 

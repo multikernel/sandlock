@@ -162,7 +162,9 @@ typedef struct {
  * Return value: 0 = allow, -1 = deny (EPERM), -2 = audit (allow + flag),
  * positive = deny with that errno (e.g. 13 = EACCES).
  */
-typedef int32_t (*sandlock_policy_fn_t)(const sandlock_event_t *event, sandlock_ctx_t *ctx);
+typedef int32_t (*sandlock_policy_fn_t)(const sandlock_event_t *event,
+                                        sandlock_ctx_t *ctx,
+                                        void *user_data);
 
 /**
  * C callback types for fork init and work functions.
@@ -259,6 +261,15 @@ typedef struct {
   int64_t syscall_nr;
   sandlock_handler_t *handler;
 } sandlock_handler_registration_t;
+
+/**
+ * C destructor type for policy_fn user data.
+ *
+ * Called when the native policy callback is dropped. This may be later than a
+ * single run when the policy has been cloned; it fires once for the final
+ * callback reference.
+ */
+typedef void (*sandlock_policy_ud_drop_t)(void *user_data);
 
 #ifdef __cplusplus
 extern "C" {
@@ -955,10 +966,16 @@ void sandlock_gather_free(sandlock_gather_t *g);
  *
  * # Safety
  * `b` must be a valid builder pointer. `cb` must be a valid function pointer
- * that remains valid for the lifetime of the sandbox.
+ * that remains valid for the lifetime of the sandbox callback.
+ * `user_data` is opaque to Rust and is passed back to every callback
+ * invocation. It must remain valid and be safe to access from the policy-fn
+ * worker thread until `user_data_drop` is invoked. `user_data_drop = None` is
+ * legal when no cleanup is needed; if provided, it must not unwind.
  */
 sandlock_builder_t *sandlock_sandbox_builder_policy_fn(sandlock_builder_t *b,
-                                                       sandlock_policy_fn_t cb);
+                                                       sandlock_policy_fn_t cb,
+                                                       void *user_data,
+                                                       void (*user_data_drop)(void *user_data));
 
 /**
  * Restrict network to the given IPs. Permanent — cannot grant back.

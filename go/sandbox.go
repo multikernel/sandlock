@@ -30,6 +30,11 @@
 //	fmt.Printf("%d: %s", res.ExitCode, res.Stdout)
 package sandlock
 
+import (
+	"strings"
+	"unsafe"
+)
+
 // BranchAction is the action taken on a copy-on-write working-directory
 // branch when the sandbox exits. The zero value, BranchActionDefault, leaves
 // the choice to sandlock's own defaults (commit on success, abort on error).
@@ -45,6 +50,105 @@ const (
 	// BranchActionKeep leaves the branch in place for the caller to handle.
 	BranchActionKeep
 )
+
+// SyscallCategory is the high-level category of an intercepted syscall event.
+type SyscallCategory uint8
+
+const (
+	// CategoryFile covers filesystem operations such as openat and unlinkat.
+	CategoryFile SyscallCategory = iota
+	// CategoryNetwork covers network operations such as connect and bind.
+	CategoryNetwork
+	// CategoryProcess covers process lifecycle operations such as execve.
+	CategoryProcess
+	// CategoryMemory covers memory-management operations such as mmap.
+	CategoryMemory
+)
+
+// String returns the category name used by the Python SDK.
+func (c SyscallCategory) String() string {
+	switch c {
+	case CategoryFile:
+		return "file"
+	case CategoryNetwork:
+		return "network"
+	case CategoryProcess:
+		return "process"
+	case CategoryMemory:
+		return "memory"
+	default:
+		return "unknown"
+	}
+}
+
+// SyscallEvent is a policy_fn event delivered by the sandbox supervisor.
+//
+// Path strings are intentionally absent. Path-based access control belongs in
+// Landlock rules (FSReadable, FSWritable, FSDenied). Argv is populated only for
+// execve/execveat events, where sandlock freezes sibling tasks before exposing
+// it to the policy callback.
+type SyscallEvent struct {
+	Syscall   string
+	Category  SyscallCategory
+	PID       uint32
+	ParentPID uint32
+	Host      string
+	Port      uint16
+	Denied    bool
+	Argv      []string
+}
+
+// ArgvContains reports whether any argv element contains sub.
+func (e SyscallEvent) ArgvContains(sub string) bool {
+	for _, arg := range e.Argv {
+		if strings.Contains(arg, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// PolicyDecision is the result returned by a PolicyFunc.
+type PolicyDecision int32
+
+const (
+	// DecisionAllow allows the syscall.
+	DecisionAllow PolicyDecision = 0
+	// DecisionDeny denies the syscall with EPERM.
+	DecisionDeny PolicyDecision = -1
+	// DecisionAudit allows the syscall and flags it for audit.
+	DecisionAudit PolicyDecision = -2
+)
+
+// Allow returns a decision that allows the syscall.
+func Allow() PolicyDecision { return DecisionAllow }
+
+// Deny returns a decision that denies the syscall with EPERM.
+func Deny() PolicyDecision { return DecisionDeny }
+
+// Audit returns a decision that allows the syscall and flags it for audit.
+func Audit() PolicyDecision { return DecisionAudit }
+
+// DenyWith returns a decision that denies the syscall with errnoValue.
+func DenyWith(errnoValue int) PolicyDecision {
+	if errnoValue <= 0 {
+		return DecisionDeny
+	}
+	return PolicyDecision(errnoValue)
+}
+
+// PolicyContext lets a PolicyFunc adjust selected live policy state.
+//
+// A PolicyContext is valid only during the PolicyFunc call that received it.
+// Do not retain it after the callback returns.
+type PolicyContext struct {
+	ptr unsafe.Pointer
+}
+
+// PolicyFunc is a dynamic policy callback invoked from sandlock's policy-fn
+// worker thread. Callbacks may be invoked concurrently with other sandbox
+// activity, so captured state should be synchronized when mutated.
+type PolicyFunc func(event SyscallEvent, ctx *PolicyContext) PolicyDecision
 
 // Sandbox holds the policy configuration for confining a process. Every field
 // is optional; an unset field means "no restriction" unless documented
@@ -136,6 +240,10 @@ type Sandbox struct {
 	// Name is the sandbox name and its virtual hostname inside the sandbox.
 	// Empty auto-generates "sandbox-{pid}".
 	Name string
+
+	// PolicyFn receives dynamic syscall events and may return an allow/deny
+	// decision or modify live policy through the supplied context.
+	PolicyFn PolicyFunc
 }
 
 // Result is the outcome of a captured run.

@@ -4,13 +4,13 @@
 //! using opaque handle patterns.  Each `*mut` / `*const` pointer returned by
 //! these functions must be freed with its corresponding `_free` function.
 
-use std::ffi::{c_char, c_int, c_uint, CStr, CString};
+use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
 use std::ptr;
 use std::time::Duration;
 
 use sandlock_core::pipeline::Stage;
 use sandlock_core::sandbox::{BranchAction, ByteSize, SandboxBuilder};
-use sandlock_core::{Protection, Sandbox, RunResult};
+use sandlock_core::{Protection, RunResult, Sandbox};
 
 pub mod handler;
 pub mod notif_repr;
@@ -74,7 +74,9 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_fs_read(
     b: *mut SandboxBuilder,
     path: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || path.is_null() { return b; }
+    if b.is_null() || path.is_null() {
+        return b;
+    }
     let path = CStr::from_ptr(path).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.fs_read(path)))
@@ -87,7 +89,9 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_fs_write(
     b: *mut SandboxBuilder,
     path: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || path.is_null() { return b; }
+    if b.is_null() || path.is_null() {
+        return b;
+    }
     let path = CStr::from_ptr(path).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.fs_write(path)))
@@ -100,7 +104,9 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_fs_deny(
     b: *mut SandboxBuilder,
     path: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || path.is_null() { return b; }
+    if b.is_null() || path.is_null() {
+        return b;
+    }
     let path = CStr::from_ptr(path).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.fs_deny(path)))
@@ -113,7 +119,9 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_fs_storage(
     b: *mut SandboxBuilder,
     path: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || path.is_null() { return b; }
+    if b.is_null() || path.is_null() {
+        return b;
+    }
     let path = CStr::from_ptr(path).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.fs_storage(path)))
@@ -123,9 +131,13 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_fs_storage(
 /// `b` must be a valid pointer. `devices` must point to `len` u32 values (or be null when len == 0).
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_gpu_devices(
-    b: *mut SandboxBuilder, devices: *const u32, len: u32,
+    b: *mut SandboxBuilder,
+    devices: *const u32,
+    len: u32,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || (len > 0 && devices.is_null()) { return b; }
+    if b.is_null() || (len > 0 && devices.is_null()) {
+        return b;
+    }
     let slice = if len > 0 {
         std::slice::from_raw_parts(devices, len as usize)
     } else {
@@ -142,7 +154,9 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_workdir(
     b: *mut SandboxBuilder,
     path: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || path.is_null() { return b; }
+    if b.is_null() || path.is_null() {
+        return b;
+    }
     let path = CStr::from_ptr(path).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.workdir(path)))
@@ -155,7 +169,9 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_cwd(
     b: *mut SandboxBuilder,
     path: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || path.is_null() { return b; }
+    if b.is_null() || path.is_null() {
+        return b;
+    }
     let path = CStr::from_ptr(path).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.cwd(path)))
@@ -168,7 +184,9 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_chroot(
     b: *mut SandboxBuilder,
     path: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || path.is_null() { return b; }
+    if b.is_null() || path.is_null() {
+        return b;
+    }
     let path = CStr::from_ptr(path).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.chroot(path)))
@@ -184,7 +202,9 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_fs_mount(
     virtual_path: *const c_char,
     host_path: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || virtual_path.is_null() || host_path.is_null() { return b; }
+    if b.is_null() || virtual_path.is_null() || host_path.is_null() {
+        return b;
+    }
     let vp = CStr::from_ptr(virtual_path).to_str().unwrap_or("");
     let hp = CStr::from_ptr(host_path).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
@@ -201,7 +221,9 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_on_exit(
     b: *mut SandboxBuilder,
     action: u8,
 ) -> *mut SandboxBuilder {
-    if b.is_null() { return b; }
+    if b.is_null() {
+        return b;
+    }
     let builder = *Box::from_raw(b);
     let action = match action {
         1 => BranchAction::Abort,
@@ -221,7 +243,9 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_on_error(
     b: *mut SandboxBuilder,
     action: u8,
 ) -> *mut SandboxBuilder {
-    if b.is_null() { return b; }
+    if b.is_null() {
+        return b;
+    }
     let builder = *Box::from_raw(b);
     let action = match action {
         1 => BranchAction::Abort,
@@ -239,9 +263,12 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_on_error(
 /// `b` must be a valid builder pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_max_memory(
-    b: *mut SandboxBuilder, bytes: u64,
+    b: *mut SandboxBuilder,
+    bytes: u64,
 ) -> *mut SandboxBuilder {
-    if b.is_null() { return b; }
+    if b.is_null() {
+        return b;
+    }
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.max_memory(ByteSize(bytes))))
 }
@@ -250,9 +277,12 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_max_memory(
 /// `b` must be a valid builder pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_max_disk(
-    b: *mut SandboxBuilder, bytes: u64,
+    b: *mut SandboxBuilder,
+    bytes: u64,
 ) -> *mut SandboxBuilder {
-    if b.is_null() { return b; }
+    if b.is_null() {
+        return b;
+    }
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.max_disk(ByteSize(bytes))))
 }
@@ -261,9 +291,12 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_max_disk(
 /// `b` must be a valid builder pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_max_processes(
-    b: *mut SandboxBuilder, n: u32,
+    b: *mut SandboxBuilder,
+    n: u32,
 ) -> *mut SandboxBuilder {
-    if b.is_null() { return b; }
+    if b.is_null() {
+        return b;
+    }
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.max_processes(n)))
 }
@@ -272,9 +305,12 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_max_processes(
 /// `b` must be a valid builder pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_max_cpu(
-    b: *mut SandboxBuilder, pct: u8,
+    b: *mut SandboxBuilder,
+    pct: u8,
 ) -> *mut SandboxBuilder {
-    if b.is_null() { return b; }
+    if b.is_null() {
+        return b;
+    }
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.max_cpu(pct)))
 }
@@ -283,9 +319,12 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_max_cpu(
 /// `b` must be a valid builder pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_num_cpus(
-    b: *mut SandboxBuilder, n: u32,
+    b: *mut SandboxBuilder,
+    n: u32,
 ) -> *mut SandboxBuilder {
-    if b.is_null() { return b; }
+    if b.is_null() {
+        return b;
+    }
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.num_cpus(n)))
 }
@@ -294,9 +333,13 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_num_cpus(
 /// `b` must be a valid builder pointer.  `cores` must point to `len` u32 values.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_cpu_cores(
-    b: *mut SandboxBuilder, cores: *const u32, len: u32,
+    b: *mut SandboxBuilder,
+    cores: *const u32,
+    len: u32,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || (len > 0 && cores.is_null()) { return b; }
+    if b.is_null() || (len > 0 && cores.is_null()) {
+        return b;
+    }
     let slice = if len > 0 {
         std::slice::from_raw_parts(cores, len as usize)
     } else {
@@ -318,9 +361,12 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_cpu_cores(
 /// `b` and `spec` must be valid pointers.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_net_allow(
-    b: *mut SandboxBuilder, spec: *const c_char,
+    b: *mut SandboxBuilder,
+    spec: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || spec.is_null() { return b; }
+    if b.is_null() || spec.is_null() {
+        return b;
+    }
     let spec = CStr::from_ptr(spec).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.net_allow(spec)))
@@ -330,9 +376,12 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_net_allow(
 /// `b` and `spec` must be valid pointers.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_net_deny(
-    b: *mut SandboxBuilder, spec: *const c_char,
+    b: *mut SandboxBuilder,
+    spec: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || spec.is_null() { return b; }
+    if b.is_null() || spec.is_null() {
+        return b;
+    }
     let spec = CStr::from_ptr(spec).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.net_deny(spec)))
@@ -342,9 +391,12 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_net_deny(
 /// `b` must be a valid builder pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_net_allow_bind_port(
-    b: *mut SandboxBuilder, port: u16,
+    b: *mut SandboxBuilder,
+    port: u16,
 ) -> *mut SandboxBuilder {
-    if b.is_null() { return b; }
+    if b.is_null() {
+        return b;
+    }
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.net_allow_bind_port(port)))
 }
@@ -353,9 +405,12 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_net_allow_bind_port(
 /// `b` must be a valid builder pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_net_deny_bind_port(
-    b: *mut SandboxBuilder, port: u16,
+    b: *mut SandboxBuilder,
+    port: u16,
 ) -> *mut SandboxBuilder {
-    if b.is_null() { return b; }
+    if b.is_null() {
+        return b;
+    }
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.net_deny_bind_port(port)))
 }
@@ -364,9 +419,12 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_net_deny_bind_port(
 /// `b` must be a valid builder pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_port_remap(
-    b: *mut SandboxBuilder, v: bool,
+    b: *mut SandboxBuilder,
+    v: bool,
 ) -> *mut SandboxBuilder {
-    if b.is_null() { return b; }
+    if b.is_null() {
+        return b;
+    }
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.port_remap(v)))
 }
@@ -381,9 +439,12 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_port_remap(
 /// `b` must be a valid builder pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_uid(
-    b: *mut SandboxBuilder, id: u32,
+    b: *mut SandboxBuilder,
+    id: u32,
 ) -> *mut SandboxBuilder {
-    if b.is_null() { return b; }
+    if b.is_null() {
+        return b;
+    }
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.uid(id)))
 }
@@ -399,7 +460,9 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_http_allow(
     b: *mut SandboxBuilder,
     rule: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || rule.is_null() { return b; }
+    if b.is_null() || rule.is_null() {
+        return b;
+    }
     let rule = CStr::from_ptr(rule).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.http_allow(rule)))
@@ -412,7 +475,9 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_http_deny(
     b: *mut SandboxBuilder,
     rule: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || rule.is_null() { return b; }
+    if b.is_null() || rule.is_null() {
+        return b;
+    }
     let rule = CStr::from_ptr(rule).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.http_deny(rule)))
@@ -425,7 +490,9 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_http_port(
     b: *mut SandboxBuilder,
     port: u16,
 ) -> *mut SandboxBuilder {
-    if b.is_null() { return b; }
+    if b.is_null() {
+        return b;
+    }
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.http_port(port)))
 }
@@ -437,7 +504,9 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_http_ca(
     b: *mut SandboxBuilder,
     path: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || path.is_null() { return b; }
+    if b.is_null() || path.is_null() {
+        return b;
+    }
     let path = CStr::from_ptr(path).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.http_ca(path)))
@@ -450,7 +519,9 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_http_key(
     b: *mut SandboxBuilder,
     path: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || path.is_null() { return b; }
+    if b.is_null() || path.is_null() {
+        return b;
+    }
     let path = CStr::from_ptr(path).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.http_key(path)))
@@ -463,7 +534,9 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_http_inject_ca(
     b: *mut SandboxBuilder,
     path: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || path.is_null() { return b; }
+    if b.is_null() || path.is_null() {
+        return b;
+    }
     let path = CStr::from_ptr(path).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.http_inject_ca(path)))
@@ -476,7 +549,9 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_http_ca_out(
     b: *mut SandboxBuilder,
     path: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || path.is_null() { return b; }
+    if b.is_null() || path.is_null() {
+        return b;
+    }
     let path = CStr::from_ptr(path).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.http_ca_out(path)))
@@ -490,9 +565,12 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_http_ca_out(
 /// `b` must be a valid builder pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_random_seed(
-    b: *mut SandboxBuilder, seed: u64,
+    b: *mut SandboxBuilder,
+    seed: u64,
 ) -> *mut SandboxBuilder {
-    if b.is_null() { return b; }
+    if b.is_null() {
+        return b;
+    }
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.random_seed(seed)))
 }
@@ -501,9 +579,12 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_random_seed(
 /// `b` must be a valid builder pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_clean_env(
-    b: *mut SandboxBuilder, v: bool,
+    b: *mut SandboxBuilder,
+    v: bool,
 ) -> *mut SandboxBuilder {
-    if b.is_null() { return b; }
+    if b.is_null() {
+        return b;
+    }
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.clean_env(v)))
 }
@@ -512,9 +593,13 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_clean_env(
 /// `b`, `key`, and `value` must be valid pointers.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_env_var(
-    b: *mut SandboxBuilder, key: *const c_char, value: *const c_char,
+    b: *mut SandboxBuilder,
+    key: *const c_char,
+    value: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || key.is_null() || value.is_null() { return b; }
+    if b.is_null() || key.is_null() || value.is_null() {
+        return b;
+    }
     let key = CStr::from_ptr(key).to_str().unwrap_or("");
     let value = CStr::from_ptr(value).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
@@ -525,9 +610,12 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_env_var(
 /// `b` must be a valid builder pointer. `epoch_secs` is seconds since UNIX epoch.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_time_start(
-    b: *mut SandboxBuilder, epoch_secs: u64,
+    b: *mut SandboxBuilder,
+    epoch_secs: u64,
 ) -> *mut SandboxBuilder {
-    if b.is_null() { return b; }
+    if b.is_null() {
+        return b;
+    }
     let builder = *Box::from_raw(b);
     let t = std::time::UNIX_EPOCH + Duration::from_secs(epoch_secs);
     Box::into_raw(Box::new(builder.time_start(t)))
@@ -537,12 +625,19 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_time_start(
 /// `b` must be a valid builder pointer. `names` is a comma-separated NUL-terminated string.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_extra_deny_syscalls(
-    b: *mut SandboxBuilder, names: *const c_char,
+    b: *mut SandboxBuilder,
+    names: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || names.is_null() { return b; }
+    if b.is_null() || names.is_null() {
+        return b;
+    }
     let builder = *Box::from_raw(b);
     let s = CStr::from_ptr(names).to_str().unwrap_or("");
-    let calls: Vec<String> = s.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    let calls: Vec<String> = s
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
     Box::into_raw(Box::new(builder.extra_deny_syscalls(calls)))
 }
 
@@ -550,12 +645,19 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_extra_deny_syscalls(
 /// `b` must be a valid builder pointer. `names` is a comma-separated NUL-terminated string.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_extra_allow_syscalls(
-    b: *mut SandboxBuilder, names: *const c_char,
+    b: *mut SandboxBuilder,
+    names: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || names.is_null() { return b; }
+    if b.is_null() || names.is_null() {
+        return b;
+    }
     let builder = *Box::from_raw(b);
     let s = CStr::from_ptr(names).to_str().unwrap_or("");
-    let names: Vec<String> = s.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    let names: Vec<String> = s
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
     Box::into_raw(Box::new(builder.extra_allow_syscalls(names)))
 }
 
@@ -592,9 +694,12 @@ pub unsafe extern "C" fn sandlock_syscall_nr(name: *const c_char) -> i64 {
 /// `b` must be a valid builder pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_max_open_files(
-    b: *mut SandboxBuilder, n: c_uint,
+    b: *mut SandboxBuilder,
+    n: c_uint,
 ) -> *mut SandboxBuilder {
-    if b.is_null() { return b; }
+    if b.is_null() {
+        return b;
+    }
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.max_open_files(n)))
 }
@@ -603,9 +708,12 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_max_open_files(
 /// `b` must be a valid builder pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_no_randomize_memory(
-    b: *mut SandboxBuilder, v: bool,
+    b: *mut SandboxBuilder,
+    v: bool,
 ) -> *mut SandboxBuilder {
-    if b.is_null() { return b; }
+    if b.is_null() {
+        return b;
+    }
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.no_randomize_memory(v)))
 }
@@ -614,9 +722,12 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_no_randomize_memory(
 /// `b` must be a valid builder pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_no_huge_pages(
-    b: *mut SandboxBuilder, v: bool,
+    b: *mut SandboxBuilder,
+    v: bool,
 ) -> *mut SandboxBuilder {
-    if b.is_null() { return b; }
+    if b.is_null() {
+        return b;
+    }
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.no_huge_pages(v)))
 }
@@ -625,9 +736,12 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_no_huge_pages(
 /// `b` must be a valid builder pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_no_coredump(
-    b: *mut SandboxBuilder, v: bool,
+    b: *mut SandboxBuilder,
+    v: bool,
 ) -> *mut SandboxBuilder {
-    if b.is_null() { return b; }
+    if b.is_null() {
+        return b;
+    }
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.no_coredump(v)))
 }
@@ -636,9 +750,12 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_no_coredump(
 /// `b` must be a valid builder pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_deterministic_dirs(
-    b: *mut SandboxBuilder, v: bool,
+    b: *mut SandboxBuilder,
+    v: bool,
 ) -> *mut SandboxBuilder {
-    if b.is_null() { return b; }
+    if b.is_null() {
+        return b;
+    }
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.deterministic_dirs(v)))
 }
@@ -712,7 +829,9 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_allow_degraded(
     b: *mut SandboxBuilder,
     protection: u32,
 ) -> *mut SandboxBuilder {
-    if b.is_null() { return b; }
+    if b.is_null() {
+        return b;
+    }
     let p = match try_protection_from_raw(protection) {
         Some(p) => p,
         None => return b,
@@ -739,7 +858,9 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_disable(
     b: *mut SandboxBuilder,
     protection: u32,
 ) -> *mut SandboxBuilder {
-    if b.is_null() { return b; }
+    if b.is_null() {
+        return b;
+    }
     let p = match try_protection_from_raw(protection) {
         Some(p) => p,
         None => return b,
@@ -765,26 +886,36 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_disable(
 /// storage for one `*mut c_char`.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_build(
-    b: *mut SandboxBuilder, err: *mut c_int, err_msg: *mut *mut c_char,
+    b: *mut SandboxBuilder,
+    err: *mut c_int,
+    err_msg: *mut *mut c_char,
 ) -> *mut sandlock_sandbox_t {
-    if !err_msg.is_null() { *err_msg = ptr::null_mut(); }
+    if !err_msg.is_null() {
+        *err_msg = ptr::null_mut();
+    }
     if b.is_null() {
         // Null-builder is a programmer error in the binding layer,
         // not a policy-validation failure. We surface the err code
         // but deliberately leave err_msg null — there is no
         // user-actionable message and inventing one here would
         // require a hard-coded literal living in the wrong layer.
-        if !err.is_null() { *err = -1; }
+        if !err.is_null() {
+            *err = -1;
+        }
         return ptr::null_mut();
     }
     let builder = *Box::from_raw(b);
     match builder.build() {
         Ok(policy) => {
-            if !err.is_null() { *err = 0; }
+            if !err.is_null() {
+                *err = 0;
+            }
             Box::into_raw(Box::new(sandlock_sandbox_t { _private: policy }))
         }
         Err(e) => {
-            if !err.is_null() { *err = -1; }
+            if !err.is_null() {
+                *err = -1;
+            }
             if !err_msg.is_null() {
                 // CString::new fails only on embedded NULs; thiserror
                 // Display impls don't produce NULs in this codebase,
@@ -803,7 +934,9 @@ pub unsafe extern "C" fn sandlock_sandbox_build(
 /// `p` must be null or a valid pointer from `sandlock_sandbox_build`.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_free(p: *mut sandlock_sandbox_t) {
-    if !p.is_null() { drop(Box::from_raw(p)); }
+    if !p.is_null() {
+        drop(Box::from_raw(p));
+    }
 }
 
 // ----------------------------------------------------------------
@@ -816,10 +949,10 @@ pub unsafe extern "C" fn sandlock_sandbox_free(p: *mut sandlock_sandbox_t) {
 /// # Safety
 /// `policy` must be a valid policy pointer.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_confine(
-    policy: *const sandlock_sandbox_t,
-) -> c_int {
-    if policy.is_null() { return -1; }
+pub unsafe extern "C" fn sandlock_confine(policy: *const sandlock_sandbox_t) -> c_int {
+    if policy.is_null() {
+        return -1;
+    }
     let policy = &(*policy)._private;
     let confinement = match sandlock_core::sandbox::Confinement::try_from(policy) {
         Ok(c) => c,
@@ -848,7 +981,9 @@ pub unsafe extern "C" fn sandlock_run(
     argv: *const *const c_char,
     argc: c_uint,
 ) -> *mut sandlock_result_t {
-    if policy.is_null() || argv.is_null() { return ptr::null_mut(); }
+    if policy.is_null() || argv.is_null() {
+        return ptr::null_mut();
+    }
     let policy = &(*policy)._private;
     let name = match optional_name(name) {
         Ok(name) => name,
@@ -897,7 +1032,9 @@ unsafe fn sandlock_create_with_runtime(
     argc: c_uint,
     build_rt: fn() -> Option<tokio::runtime::Runtime>,
 ) -> *mut sandlock_handle_t {
-    if policy.is_null() || argv.is_null() { return ptr::null_mut(); }
+    if policy.is_null() || argv.is_null() {
+        return ptr::null_mut();
+    }
     let policy = &(*policy)._private;
     let name = match optional_name(name) {
         Ok(name) => name,
@@ -920,7 +1057,10 @@ unsafe fn sandlock_create_with_runtime(
         return ptr::null_mut();
     }
 
-    Box::into_raw(Box::new(sandlock_handle_t { sandbox: sb, runtime: rt }))
+    Box::into_raw(Box::new(sandlock_handle_t {
+        sandbox: sb,
+        runtime: rt,
+    }))
 }
 
 #[no_mangle]
@@ -961,9 +1101,13 @@ pub unsafe extern "C" fn sandlock_create_for_run(
 /// `h` must be a valid handle from `sandlock_create`.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_start(h: *mut sandlock_handle_t) -> c_int {
-    if h.is_null() { return -1; }
+    if h.is_null() {
+        return -1;
+    }
     let h = &mut *h;
-    if h.sandbox.start().is_err() { return -1; }
+    if h.sandbox.start().is_err() {
+        return -1;
+    }
     0
 }
 
@@ -973,7 +1117,9 @@ pub unsafe extern "C" fn sandlock_start(h: *mut sandlock_handle_t) -> c_int {
 /// `h` must be a valid handle from `sandlock_create`.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_handle_pid(h: *const sandlock_handle_t) -> i32 {
-    if h.is_null() { return 0; }
+    if h.is_null() {
+        return 0;
+    }
     (*h).sandbox.pid().unwrap_or(0)
 }
 
@@ -983,7 +1129,9 @@ pub unsafe extern "C" fn sandlock_handle_pid(h: *const sandlock_handle_t) -> i32
 /// `h` must be a valid handle from `sandlock_create`.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_handle_wait(h: *mut sandlock_handle_t) -> *mut sandlock_result_t {
-    if h.is_null() { return ptr::null_mut(); }
+    if h.is_null() {
+        return ptr::null_mut();
+    }
     let h = &mut *h;
     match block_on_runtime(&h.runtime, h.sandbox.wait()) {
         Some(Ok(result)) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
@@ -1002,7 +1150,9 @@ pub unsafe extern "C" fn sandlock_handle_wait_timeout(
     h: *mut sandlock_handle_t,
     timeout_ms: u64,
 ) -> *mut sandlock_result_t {
-    if h.is_null() { return ptr::null_mut(); }
+    if h.is_null() {
+        return ptr::null_mut();
+    }
     let h = &mut *h;
 
     if timeout_ms == 0 {
@@ -1035,16 +1185,18 @@ pub unsafe extern "C" fn sandlock_handle_wait_timeout(
 /// # Safety
 /// `h` must be a valid handle from `sandlock_create`.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_handle_port_mappings(
-    h: *const sandlock_handle_t,
-) -> *mut c_char {
-    if h.is_null() { return ptr::null_mut(); }
+pub unsafe extern "C" fn sandlock_handle_port_mappings(h: *const sandlock_handle_t) -> *mut c_char {
+    if h.is_null() {
+        return ptr::null_mut();
+    }
     let h = &*h;
     let map = match block_on_runtime(&h.runtime, h.sandbox.port_mappings()) {
         Some(map) => map,
         None => return ptr::null_mut(),
     };
-    if map.is_empty() { return ptr::null_mut(); }
+    if map.is_empty() {
+        return ptr::null_mut();
+    }
     let json = serde_json::to_string(&map).unwrap_or_default();
     match CString::new(json) {
         Ok(cs) => cs.into_raw(),
@@ -1077,7 +1229,9 @@ pub unsafe extern "C" fn sandlock_run_interactive(
     argv: *const *const c_char,
     argc: c_uint,
 ) -> c_int {
-    if policy.is_null() || argv.is_null() { return -1; }
+    if policy.is_null() || argv.is_null() {
+        return -1;
+    }
     let policy = &(*policy)._private;
     let name = match optional_name(name) {
         Ok(name) => name,
@@ -1104,7 +1258,9 @@ pub unsafe extern "C" fn sandlock_run_interactive(
 /// `r` must be null or a valid result pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_result_exit_code(r: *const sandlock_result_t) -> c_int {
-    if r.is_null() { return -1; }
+    if r.is_null() {
+        return -1;
+    }
     (*r)._private.code().unwrap_or(-1)
 }
 
@@ -1112,7 +1268,9 @@ pub unsafe extern "C" fn sandlock_result_exit_code(r: *const sandlock_result_t) 
 /// `r` must be null or a valid result pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_result_success(r: *const sandlock_result_t) -> bool {
-    if r.is_null() { return false; }
+    if r.is_null() {
+        return false;
+    }
     (*r)._private.success()
 }
 
@@ -1123,7 +1281,9 @@ pub unsafe extern "C" fn sandlock_result_success(r: *const sandlock_result_t) ->
 /// `r` must be null or a valid result pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_result_stdout(r: *const sandlock_result_t) -> *mut c_char {
-    if r.is_null() { return ptr::null_mut(); }
+    if r.is_null() {
+        return ptr::null_mut();
+    }
     match (*r)._private.stdout.as_ref() {
         Some(bytes) => {
             let s = String::from_utf8_lossy(bytes);
@@ -1142,7 +1302,9 @@ pub unsafe extern "C" fn sandlock_result_stdout(r: *const sandlock_result_t) -> 
 /// `r` must be null or a valid result pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_result_stderr(r: *const sandlock_result_t) -> *mut c_char {
-    if r.is_null() { return ptr::null_mut(); }
+    if r.is_null() {
+        return ptr::null_mut();
+    }
     match (*r)._private.stderr.as_ref() {
         Some(bytes) => {
             let s = String::from_utf8_lossy(bytes);
@@ -1162,12 +1324,21 @@ pub unsafe extern "C" fn sandlock_result_stderr(r: *const sandlock_result_t) -> 
 /// `r` must be a valid result pointer. `len` must be a valid pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_result_stdout_bytes(
-    r: *const sandlock_result_t, len: *mut usize,
+    r: *const sandlock_result_t,
+    len: *mut usize,
 ) -> *const u8 {
-    if r.is_null() || len.is_null() { return ptr::null(); }
+    if r.is_null() || len.is_null() {
+        return ptr::null();
+    }
     match (*r)._private.stdout.as_ref() {
-        Some(bytes) => { *len = bytes.len(); bytes.as_ptr() }
-        None => { *len = 0; ptr::null() }
+        Some(bytes) => {
+            *len = bytes.len();
+            bytes.as_ptr()
+        }
+        None => {
+            *len = 0;
+            ptr::null()
+        }
     }
 }
 
@@ -1177,12 +1348,21 @@ pub unsafe extern "C" fn sandlock_result_stdout_bytes(
 /// `r` must be a valid result pointer. `len` must be a valid pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_result_stderr_bytes(
-    r: *const sandlock_result_t, len: *mut usize,
+    r: *const sandlock_result_t,
+    len: *mut usize,
 ) -> *const u8 {
-    if r.is_null() || len.is_null() { return ptr::null(); }
+    if r.is_null() || len.is_null() {
+        return ptr::null();
+    }
     match (*r)._private.stderr.as_ref() {
-        Some(bytes) => { *len = bytes.len(); bytes.as_ptr() }
-        None => { *len = 0; ptr::null() }
+        Some(bytes) => {
+            *len = bytes.len();
+            bytes.as_ptr()
+        }
+        None => {
+            *len = 0;
+            ptr::null()
+        }
     }
 }
 
@@ -1190,7 +1370,9 @@ pub unsafe extern "C" fn sandlock_result_stderr_bytes(
 /// `r` must be null or a valid pointer from `sandlock_run`.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_result_free(r: *mut sandlock_result_t) {
-    if !r.is_null() { drop(Box::from_raw(r)); }
+    if !r.is_null() {
+        drop(Box::from_raw(r));
+    }
 }
 
 /// Free a string returned by `sandlock_result_stdout` or `sandlock_result_stderr`.
@@ -1199,7 +1381,9 @@ pub unsafe extern "C" fn sandlock_result_free(r: *mut sandlock_result_t) {
 /// `s` must be null or a pointer from a `sandlock_result_std*` function.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_string_free(s: *mut c_char) {
-    if !s.is_null() { drop(CString::from_raw(s)); }
+    if !s.is_null() {
+        drop(CString::from_raw(s));
+    }
 }
 
 // ----------------------------------------------------------------
@@ -1225,7 +1409,9 @@ pub unsafe extern "C" fn sandlock_dry_run(
     argv: *const *const c_char,
     argc: c_uint,
 ) -> *mut sandlock_dry_run_result_t {
-    if policy.is_null() || argv.is_null() { return ptr::null_mut(); }
+    if policy.is_null() || argv.is_null() {
+        return ptr::null_mut();
+    }
     let policy = &(*policy)._private;
     let name = match optional_name(name) {
         Ok(name) => name,
@@ -1249,8 +1435,12 @@ pub unsafe extern "C" fn sandlock_dry_run(
 /// # Safety
 /// `r` must be a valid dry-run result pointer.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_dry_run_result_exit_code(r: *const sandlock_dry_run_result_t) -> c_int {
-    if r.is_null() { return -1; }
+pub unsafe extern "C" fn sandlock_dry_run_result_exit_code(
+    r: *const sandlock_dry_run_result_t,
+) -> c_int {
+    if r.is_null() {
+        return -1;
+    }
     (*r)._private.run_result.code().unwrap_or(-1) as c_int
 }
 
@@ -1259,8 +1449,12 @@ pub unsafe extern "C" fn sandlock_dry_run_result_exit_code(r: *const sandlock_dr
 /// # Safety
 /// `r` must be a valid dry-run result pointer.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_dry_run_result_success(r: *const sandlock_dry_run_result_t) -> bool {
-    if r.is_null() { return false; }
+pub unsafe extern "C" fn sandlock_dry_run_result_success(
+    r: *const sandlock_dry_run_result_t,
+) -> bool {
+    if r.is_null() {
+        return false;
+    }
     (*r)._private.run_result.success()
 }
 
@@ -1270,12 +1464,24 @@ pub unsafe extern "C" fn sandlock_dry_run_result_success(r: *const sandlock_dry_
 /// `r` must be a valid dry-run result pointer. `len` must be a valid pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_dry_run_result_stdout_bytes(
-    r: *const sandlock_dry_run_result_t, len: *mut usize,
+    r: *const sandlock_dry_run_result_t,
+    len: *mut usize,
 ) -> *const u8 {
-    if r.is_null() { if !len.is_null() { *len = 0; } return ptr::null(); }
+    if r.is_null() {
+        if !len.is_null() {
+            *len = 0;
+        }
+        return ptr::null();
+    }
     match &(*r)._private.run_result.stdout {
-        Some(v) => { *len = v.len(); v.as_ptr() }
-        None => { *len = 0; ptr::null() }
+        Some(v) => {
+            *len = v.len();
+            v.as_ptr()
+        }
+        None => {
+            *len = 0;
+            ptr::null()
+        }
     }
 }
 
@@ -1285,12 +1491,24 @@ pub unsafe extern "C" fn sandlock_dry_run_result_stdout_bytes(
 /// `r` must be a valid dry-run result pointer. `len` must be a valid pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_dry_run_result_stderr_bytes(
-    r: *const sandlock_dry_run_result_t, len: *mut usize,
+    r: *const sandlock_dry_run_result_t,
+    len: *mut usize,
 ) -> *const u8 {
-    if r.is_null() { if !len.is_null() { *len = 0; } return ptr::null(); }
+    if r.is_null() {
+        if !len.is_null() {
+            *len = 0;
+        }
+        return ptr::null();
+    }
     match &(*r)._private.run_result.stderr {
-        Some(v) => { *len = v.len(); v.as_ptr() }
-        None => { *len = 0; ptr::null() }
+        Some(v) => {
+            *len = v.len();
+            v.as_ptr()
+        }
+        None => {
+            *len = 0;
+            ptr::null()
+        }
     }
 }
 
@@ -1299,8 +1517,12 @@ pub unsafe extern "C" fn sandlock_dry_run_result_stderr_bytes(
 /// # Safety
 /// `r` must be a valid dry-run result pointer.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_dry_run_result_changes_len(r: *const sandlock_dry_run_result_t) -> usize {
-    if r.is_null() { return 0; }
+pub unsafe extern "C" fn sandlock_dry_run_result_changes_len(
+    r: *const sandlock_dry_run_result_t,
+) -> usize {
+    if r.is_null() {
+        return 0;
+    }
     (*r)._private.changes.len()
 }
 
@@ -1310,11 +1532,16 @@ pub unsafe extern "C" fn sandlock_dry_run_result_changes_len(r: *const sandlock_
 /// `r` must be a valid dry-run result pointer. `i` must be < changes_len.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_dry_run_result_change_kind(
-    r: *const sandlock_dry_run_result_t, i: usize,
+    r: *const sandlock_dry_run_result_t,
+    i: usize,
 ) -> c_char {
-    if r.is_null() { return 0; }
+    if r.is_null() {
+        return 0;
+    }
     let changes = &(*r)._private.changes;
-    if i >= changes.len() { return 0; }
+    if i >= changes.len() {
+        return 0;
+    }
     use sandlock_core::ChangeKind;
     match changes[i].kind {
         ChangeKind::Added => b'A' as c_char,
@@ -1329,11 +1556,16 @@ pub unsafe extern "C" fn sandlock_dry_run_result_change_kind(
 /// `r` must be a valid dry-run result pointer. `i` must be < changes_len.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_dry_run_result_change_path(
-    r: *const sandlock_dry_run_result_t, i: usize,
+    r: *const sandlock_dry_run_result_t,
+    i: usize,
 ) -> *mut c_char {
-    if r.is_null() { return ptr::null_mut(); }
+    if r.is_null() {
+        return ptr::null_mut();
+    }
     let changes = &(*r)._private.changes;
-    if i >= changes.len() { return ptr::null_mut(); }
+    if i >= changes.len() {
+        return ptr::null_mut();
+    }
     let path = changes[i].path.to_string_lossy();
     match CString::new(path.as_bytes()) {
         Ok(cs) => cs.into_raw(),
@@ -1347,7 +1579,9 @@ pub unsafe extern "C" fn sandlock_dry_run_result_change_path(
 /// `r` must be null or a valid dry-run result pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_dry_run_result_free(r: *mut sandlock_dry_run_result_t) {
-    if !r.is_null() { drop(Box::from_raw(r)); }
+    if !r.is_null() {
+        drop(Box::from_raw(r));
+    }
 }
 
 // ----------------------------------------------------------------
@@ -1372,7 +1606,9 @@ pub unsafe extern "C" fn sandlock_pipeline_add_stage(
     argv: *const *const c_char,
     argc: c_uint,
 ) {
-    if pipe.is_null() || policy.is_null() || argv.is_null() { return; }
+    if pipe.is_null() || policy.is_null() || argv.is_null() {
+        return;
+    }
     let policy = (*policy)._private.clone();
     let args = read_argv(argv, argc);
     (*pipe).stages.push((policy, args));
@@ -1388,15 +1624,23 @@ pub unsafe extern "C" fn sandlock_pipeline_run(
     pipe: *mut sandlock_pipeline_t,
     timeout_ms: u64,
 ) -> *mut sandlock_result_t {
-    if pipe.is_null() { return ptr::null_mut(); }
+    if pipe.is_null() {
+        return ptr::null_mut();
+    }
     let pipe = *Box::from_raw(pipe);
 
-    if pipe.stages.len() < 2 { return ptr::null_mut(); }
+    if pipe.stages.len() < 2 {
+        return ptr::null_mut();
+    }
 
-    let mut stages: Vec<Stage> = pipe.stages.into_iter().map(|(policy, args)| {
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        Stage::new(&policy, &arg_refs)
-    }).collect();
+    let mut stages: Vec<Stage> = pipe
+        .stages
+        .into_iter()
+        .map(|(policy, args)| {
+            let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            Stage::new(&policy, &arg_refs)
+        })
+        .collect();
 
     // Build pipeline using BitOr
     let first = stages.remove(0);
@@ -1424,7 +1668,9 @@ pub unsafe extern "C" fn sandlock_pipeline_run(
 /// `pipe` must be null or a valid pipeline pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_pipeline_free(pipe: *mut sandlock_pipeline_t) {
-    if !pipe.is_null() { drop(Box::from_raw(pipe)); }
+    if !pipe.is_null() {
+        drop(Box::from_raw(pipe));
+    }
 }
 
 // ----------------------------------------------------------------
@@ -1458,7 +1704,9 @@ pub unsafe extern "C" fn sandlock_gather_add_source(
     argv: *const *const c_char,
     argc: c_uint,
 ) {
-    if g.is_null() || name.is_null() || policy.is_null() || argv.is_null() { return; }
+    if g.is_null() || name.is_null() || policy.is_null() || argv.is_null() {
+        return;
+    }
     let name = CStr::from_ptr(name).to_str().unwrap_or("").to_string();
     let policy = (*policy)._private.clone();
     let args = read_argv(argv, argc);
@@ -1476,7 +1724,9 @@ pub unsafe extern "C" fn sandlock_gather_set_consumer(
     argv: *const *const c_char,
     argc: c_uint,
 ) {
-    if g.is_null() || policy.is_null() || argv.is_null() { return; }
+    if g.is_null() || policy.is_null() || argv.is_null() {
+        return;
+    }
     let policy = (*policy)._private.clone();
     let args = read_argv(argv, argc);
     (*g).consumer = Some((policy, args));
@@ -1491,7 +1741,9 @@ pub unsafe extern "C" fn sandlock_gather_run(
     g: *mut sandlock_gather_t,
     timeout_ms: u64,
 ) -> *mut sandlock_result_t {
-    if g.is_null() { return ptr::null_mut(); }
+    if g.is_null() {
+        return ptr::null_mut();
+    }
     let g = *Box::from_raw(g);
 
     let (consumer_policy, consumer_args) = match g.consumer {
@@ -1525,7 +1777,9 @@ pub unsafe extern "C" fn sandlock_gather_run(
 /// `g` must be null or a valid gather pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_gather_free(g: *mut sandlock_gather_t) {
-    if !g.is_null() { drop(Box::from_raw(g)); }
+    if !g.is_null() {
+        drop(Box::from_raw(g));
+    }
 }
 
 // ----------------------------------------------------------------
@@ -1543,8 +1797,8 @@ pub struct sandlock_event_t {
     /// Category: 0=File, 1=Network, 2=Process, 3=Memory
     pub category: u8,
     pub pid: u32,
-    pub parent_pid: u32, // 0 if unknown
-    pub host: *const c_char,   // NULL if not applicable
+    pub parent_pid: u32,     // 0 if unknown
+    pub host: *const c_char, // NULL if not applicable
     pub port: u16,
     pub denied: bool,
     pub argv: *const *const c_char, // NULL-terminated array, or NULL
@@ -1564,30 +1818,86 @@ pub struct sandlock_ctx_t {
 pub type sandlock_policy_fn_t = unsafe extern "C" fn(
     event: *const sandlock_event_t,
     ctx: *mut sandlock_ctx_t,
+    user_data: *mut c_void,
 ) -> i32;
+
+/// C destructor type for policy_fn user data.
+///
+/// Called when the native policy callback is dropped. This may be later than a
+/// single run when the policy has been cloned; it fires once for the final
+/// callback reference.
+#[allow(non_camel_case_types)]
+pub type sandlock_policy_ud_drop_t = unsafe extern "C" fn(user_data: *mut c_void);
+
+struct PolicyCallbackState {
+    cb: sandlock_policy_fn_t,
+    user_data: *mut c_void,
+    user_data_drop: Option<sandlock_policy_ud_drop_t>,
+}
+
+// SAFETY: `user_data` is opaque to Rust. The FFI caller promises it remains
+// valid for the callback lifetime and is safe to access from sandlock's
+// policy-fn worker thread. The function pointers are immutable.
+unsafe impl Send for PolicyCallbackState {}
+unsafe impl Sync for PolicyCallbackState {}
+
+impl PolicyCallbackState {
+    unsafe fn call(&self, event: *const sandlock_event_t, ctx: *mut sandlock_ctx_t) -> i32 {
+        (self.cb)(event, ctx, self.user_data)
+    }
+}
+
+impl Drop for PolicyCallbackState {
+    fn drop(&mut self) {
+        if let Some(drop_fn) = self.user_data_drop {
+            unsafe { drop_fn(self.user_data) };
+        }
+    }
+}
 
 /// Set a policy callback on the builder.
 ///
 /// # Safety
 /// `b` must be a valid builder pointer. `cb` must be a valid function pointer
-/// that remains valid for the lifetime of the sandbox.
+/// that remains valid for the lifetime of the sandbox callback.
+/// `user_data` is opaque to Rust and is passed back to every callback
+/// invocation. It must remain valid and be safe to access from the policy-fn
+/// worker thread until `user_data_drop` is invoked. `user_data_drop = None` is
+/// legal when no cleanup is needed; if provided, it must not unwind.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_policy_fn(
     b: *mut SandboxBuilder,
     cb: sandlock_policy_fn_t,
+    user_data: *mut c_void,
+    user_data_drop: Option<unsafe extern "C" fn(user_data: *mut c_void)>,
 ) -> *mut SandboxBuilder {
-    if b.is_null() { return b; }
+    if b.is_null() {
+        return b;
+    }
     let builder = *Box::from_raw(b);
+    let state = PolicyCallbackState {
+        cb,
+        user_data,
+        user_data_drop,
+    };
 
     // Wrap the C callback in a Rust closure
     let cb_fn = move |event: sandlock_core::policy_fn::SyscallEvent,
                       ctx: &mut sandlock_core::policy_fn::PolicyContext| {
         let syscall_c = CString::new(event.syscall.as_str()).unwrap_or_default();
-        let host_c = event.host.map(|ip| CString::new(ip.to_string()).unwrap_or_default());
+        let host_c = event
+            .host
+            .map(|ip| CString::new(ip.to_string()).unwrap_or_default());
 
         // Convert argv to C string array. CStrings live until end of closure.
-        let argv_c: Vec<CString> = event.argv.as_ref()
-            .map(|args| args.iter().filter_map(|s| CString::new(s.as_str()).ok()).collect())
+        let argv_c: Vec<CString> = event
+            .argv
+            .as_ref()
+            .map(|args| {
+                args.iter()
+                    .filter_map(|s| CString::new(s.as_str()).ok())
+                    .collect()
+            })
             .unwrap_or_default();
         let argv_ptrs: Vec<*const c_char> = argv_c.iter().map(|c| c.as_ptr()).collect();
         let argc = argv_ptrs.len() as u32;
@@ -1607,15 +1917,17 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_policy_fn(
             host: host_c.as_ref().map_or(ptr::null(), |c| c.as_ptr()),
             port: event.port.unwrap_or(0),
             denied: event.denied,
-            argv: if argv_ptrs.is_empty() { ptr::null() } else { argv_ptrs.as_ptr() },
+            argv: if argv_ptrs.is_empty() {
+                ptr::null()
+            } else {
+                argv_ptrs.as_ptr()
+            },
             argc,
         };
 
-        let mut c_ctx = sandlock_ctx_t {
-            ctx: ctx as *mut _,
-        };
+        let mut c_ctx = sandlock_ctx_t { ctx: ctx as *mut _ };
 
-        let ret = unsafe { cb(&c_event, &mut c_ctx) };
+        let ret = unsafe { state.call(&c_event, &mut c_ctx) };
         match ret {
             0 => sandlock_core::policy_fn::Verdict::Allow,
             -1 => sandlock_core::policy_fn::Verdict::Deny,
@@ -1639,7 +1951,9 @@ pub unsafe extern "C" fn sandlock_ctx_restrict_network(
     ips: *const *const c_char,
     count: u32,
 ) {
-    if ctx.is_null() { return; }
+    if ctx.is_null() {
+        return;
+    }
     let ctx = &mut *(*ctx).ctx;
     let parsed: Vec<std::net::IpAddr> = (0..count as usize)
         .filter_map(|i| {
@@ -1660,7 +1974,9 @@ pub unsafe extern "C" fn sandlock_ctx_grant_network(
     ips: *const *const c_char,
     count: u32,
 ) {
-    if ctx.is_null() { return; }
+    if ctx.is_null() {
+        return;
+    }
     let ctx = &mut *(*ctx).ctx;
     let parsed: Vec<std::net::IpAddr> = (0..count as usize)
         .filter_map(|i| {
@@ -1676,10 +1992,10 @@ pub unsafe extern "C" fn sandlock_ctx_grant_network(
 /// # Safety
 /// `ctx` must be a valid context pointer.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_ctx_restrict_max_memory(
-    ctx: *mut sandlock_ctx_t, bytes: u64,
-) {
-    if ctx.is_null() { return; }
+pub unsafe extern "C" fn sandlock_ctx_restrict_max_memory(ctx: *mut sandlock_ctx_t, bytes: u64) {
+    if ctx.is_null() {
+        return;
+    }
     let ctx = &mut *(*ctx).ctx;
     ctx.restrict_max_memory(bytes);
 }
@@ -1689,10 +2005,10 @@ pub unsafe extern "C" fn sandlock_ctx_restrict_max_memory(
 /// # Safety
 /// `ctx` must be a valid context pointer.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_ctx_restrict_max_processes(
-    ctx: *mut sandlock_ctx_t, n: u32,
-) {
-    if ctx.is_null() { return; }
+pub unsafe extern "C" fn sandlock_ctx_restrict_max_processes(ctx: *mut sandlock_ctx_t, n: u32) {
+    if ctx.is_null() {
+        return;
+    }
     let ctx = &mut *(*ctx).ctx;
     ctx.restrict_max_processes(n);
 }
@@ -1708,7 +2024,9 @@ pub unsafe extern "C" fn sandlock_ctx_restrict_pid_network(
     ips: *const *const c_char,
     count: u32,
 ) {
-    if ctx.is_null() { return; }
+    if ctx.is_null() {
+        return;
+    }
     let ctx = &mut *(*ctx).ctx;
     let parsed: Vec<std::net::IpAddr> = (0..count as usize)
         .filter_map(|i| {
@@ -1724,10 +2042,10 @@ pub unsafe extern "C" fn sandlock_ctx_restrict_pid_network(
 /// # Safety
 /// `ctx` must be a valid context pointer. `path` must be a valid C string.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_ctx_deny_path(
-    ctx: *mut sandlock_ctx_t, path: *const c_char,
-) {
-    if ctx.is_null() || path.is_null() { return; }
+pub unsafe extern "C" fn sandlock_ctx_deny_path(ctx: *mut sandlock_ctx_t, path: *const c_char) {
+    if ctx.is_null() || path.is_null() {
+        return;
+    }
     let ctx = &*(*ctx).ctx;
     let path = CStr::from_ptr(path).to_str().unwrap_or("");
     ctx.deny_path(path);
@@ -1738,10 +2056,10 @@ pub unsafe extern "C" fn sandlock_ctx_deny_path(
 /// # Safety
 /// `ctx` must be a valid context pointer. `path` must be a valid C string.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_ctx_allow_path(
-    ctx: *mut sandlock_ctx_t, path: *const c_char,
-) {
-    if ctx.is_null() || path.is_null() { return; }
+pub unsafe extern "C" fn sandlock_ctx_allow_path(ctx: *mut sandlock_ctx_t, path: *const c_char) {
+    if ctx.is_null() || path.is_null() {
+        return;
+    }
     let ctx = &*(*ctx).ctx;
     let path = CStr::from_ptr(path).to_str().unwrap_or("");
     ctx.allow_path(path);
@@ -1770,15 +2088,17 @@ pub unsafe extern "C" fn sandlock_new_with_fns(
     init_fn: sandlock_init_fn_t,
     work_fn: sandlock_work_fn_t,
 ) -> *mut Sandbox {
-    if policy.is_null() { return ptr::null_mut(); }
+    if policy.is_null() {
+        return ptr::null_mut();
+    }
     let policy = &(*policy)._private;
     let name = match optional_name(name) {
         Ok(name) => name,
         Err(_) => return ptr::null_mut(),
     };
 
-    let init = move || { unsafe { init_fn() } };
-    let work = move |id: u32| { unsafe { work_fn(id) } };
+    let init = move || unsafe { init_fn() };
+    let work = move |id: u32| unsafe { work_fn(id) };
 
     let sb = match name {
         Some(ref n) => policy.clone().with_name(n.clone()),
@@ -1799,11 +2119,10 @@ pub struct sandlock_fork_result_t {
 /// # Safety
 /// `sb` must be a valid sandbox pointer from `sandlock_new_with_fns`.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_fork(
-    sb: *mut Sandbox,
-    n: u32,
-) -> *mut sandlock_fork_result_t {
-    if sb.is_null() { return ptr::null_mut(); }
+pub unsafe extern "C" fn sandlock_fork(sb: *mut Sandbox, n: u32) -> *mut sandlock_fork_result_t {
+    if sb.is_null() {
+        return ptr::null_mut();
+    }
     let sb = &mut *sb;
 
     match with_runtime(|rt| rt.block_on(sb.fork(n))) {
@@ -1815,15 +2134,25 @@ pub unsafe extern "C" fn sandlock_fork(
 /// Get the number of clones.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_fork_result_count(r: *const sandlock_fork_result_t) -> u32 {
-    if r.is_null() { return 0; }
+    if r.is_null() {
+        return 0;
+    }
     (*r).clones.len() as u32
 }
 
 /// Get a clone's PID.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_fork_result_pid(r: *const sandlock_fork_result_t, index: u32) -> i32 {
-    if r.is_null() { return 0; }
-    (&(*r).clones).get(index as usize).and_then(|c| c.pid()).unwrap_or(0)
+pub unsafe extern "C" fn sandlock_fork_result_pid(
+    r: *const sandlock_fork_result_t,
+    index: u32,
+) -> i32 {
+    if r.is_null() {
+        return 0;
+    }
+    (&(*r).clones)
+        .get(index as usize)
+        .and_then(|c| c.pid())
+        .unwrap_or(0)
 }
 
 /// Reduce: read all clone stdout pipes, feed to reducer stdin, return result.
@@ -1866,7 +2195,9 @@ pub unsafe extern "C" fn sandlock_reduce(
 /// Free a fork result without reducing.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_fork_result_free(r: *mut sandlock_fork_result_t) {
-    if !r.is_null() { drop(Box::from_raw(r)); }
+    if !r.is_null() {
+        drop(Box::from_raw(r));
+    }
 }
 
 /// Wait for the sandbox template to exit. Returns exit code.
@@ -1875,7 +2206,9 @@ pub unsafe extern "C" fn sandlock_fork_result_free(r: *mut sandlock_fork_result_
 /// `sb` must be a valid sandbox pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_wait(sb: *mut Sandbox) -> c_int {
-    if sb.is_null() { return -1; }
+    if sb.is_null() {
+        return -1;
+    }
     let sb = &mut *sb;
 
     match with_runtime(|rt| rt.block_on(sb.wait())) {
@@ -1890,7 +2223,9 @@ pub unsafe extern "C" fn sandlock_wait(sb: *mut Sandbox) -> c_int {
 /// `sb` must be null or a valid Sandbox pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_fns_free(sb: *mut Sandbox) {
-    if !sb.is_null() { drop(Box::from_raw(sb)); }
+    if !sb.is_null() {
+        drop(Box::from_raw(sb));
+    }
 }
 
 // ----------------------------------------------------------------
@@ -1913,7 +2248,9 @@ pub struct sandlock_checkpoint_t {
 pub unsafe extern "C" fn sandlock_handle_checkpoint(
     h: *mut sandlock_handle_t,
 ) -> *mut sandlock_checkpoint_t {
-    if h.is_null() { return ptr::null_mut(); }
+    if h.is_null() {
+        return ptr::null_mut();
+    }
     let h = &mut *h;
     match block_on_runtime(&h.runtime, h.sandbox.checkpoint()) {
         Some(Ok(cp)) => Box::into_raw(Box::new(sandlock_checkpoint_t { _private: cp })),
@@ -1931,7 +2268,9 @@ pub unsafe extern "C" fn sandlock_checkpoint_save(
     cp: *const sandlock_checkpoint_t,
     dir: *const c_char,
 ) -> c_int {
-    if cp.is_null() || dir.is_null() { return -1; }
+    if cp.is_null() || dir.is_null() {
+        return -1;
+    }
     let dir = CStr::from_ptr(dir).to_str().unwrap_or("");
     match (*cp)._private.save(std::path::Path::new(dir)) {
         Ok(()) => 0,
@@ -1948,7 +2287,9 @@ pub unsafe extern "C" fn sandlock_checkpoint_save(
 pub unsafe extern "C" fn sandlock_checkpoint_load(
     dir: *const c_char,
 ) -> *mut sandlock_checkpoint_t {
-    if dir.is_null() { return ptr::null_mut(); }
+    if dir.is_null() {
+        return ptr::null_mut();
+    }
     let dir = CStr::from_ptr(dir).to_str().unwrap_or("");
     match sandlock_core::Checkpoint::load(std::path::Path::new(dir)) {
         Ok(cp) => Box::into_raw(Box::new(sandlock_checkpoint_t { _private: cp })),
@@ -1965,7 +2306,9 @@ pub unsafe extern "C" fn sandlock_checkpoint_set_name(
     cp: *mut sandlock_checkpoint_t,
     name: *const c_char,
 ) {
-    if cp.is_null() || name.is_null() { return; }
+    if cp.is_null() || name.is_null() {
+        return;
+    }
     (*cp)._private.name = CStr::from_ptr(name).to_str().unwrap_or("").to_string();
 }
 
@@ -1974,10 +2317,10 @@ pub unsafe extern "C" fn sandlock_checkpoint_set_name(
 /// # Safety
 /// `cp` must be a valid checkpoint pointer.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_checkpoint_name(
-    cp: *const sandlock_checkpoint_t,
-) -> *mut c_char {
-    if cp.is_null() { return ptr::null_mut(); }
+pub unsafe extern "C" fn sandlock_checkpoint_name(cp: *const sandlock_checkpoint_t) -> *mut c_char {
+    if cp.is_null() {
+        return ptr::null_mut();
+    }
     match CString::new((*cp)._private.name.as_str()) {
         Ok(cs) => cs.into_raw(),
         Err(_) => ptr::null_mut(),
@@ -1994,7 +2337,9 @@ pub unsafe extern "C" fn sandlock_checkpoint_set_app_state(
     data: *const u8,
     len: usize,
 ) {
-    if cp.is_null() { return; }
+    if cp.is_null() {
+        return;
+    }
     if data.is_null() || len == 0 {
         (*cp)._private.app_state = None;
     } else {
@@ -2012,10 +2357,18 @@ pub unsafe extern "C" fn sandlock_checkpoint_app_state(
     cp: *const sandlock_checkpoint_t,
     len: *mut usize,
 ) -> *const u8 {
-    if cp.is_null() || len.is_null() { return ptr::null(); }
+    if cp.is_null() || len.is_null() {
+        return ptr::null();
+    }
     match (*cp)._private.app_state.as_ref() {
-        Some(data) => { *len = data.len(); data.as_ptr() }
-        None => { *len = 0; ptr::null() }
+        Some(data) => {
+            *len = data.len();
+            data.as_ptr()
+        }
+        None => {
+            *len = 0;
+            ptr::null()
+        }
     }
 }
 
@@ -2025,7 +2378,9 @@ pub unsafe extern "C" fn sandlock_checkpoint_app_state(
 /// `cp` must be null or a valid checkpoint pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_checkpoint_free(cp: *mut sandlock_checkpoint_t) {
-    if !cp.is_null() { drop(Box::from_raw(cp)); }
+    if !cp.is_null() {
+        drop(Box::from_raw(cp));
+    }
 }
 
 // ----------------------------------------------------------------
@@ -2063,7 +2418,10 @@ unsafe fn optional_name(name: *const c_char) -> Result<Option<String>, std::str:
 unsafe fn read_argv(argv: *const *const c_char, argc: c_uint) -> Vec<String> {
     let mut args = Vec::new();
     for i in 0..argc as usize {
-        let arg = CStr::from_ptr(*argv.add(i)).to_str().unwrap_or("").to_string();
+        let arg = CStr::from_ptr(*argv.add(i))
+            .to_str()
+            .unwrap_or("")
+            .to_string();
         args.push(arg);
     }
     args

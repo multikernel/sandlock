@@ -35,9 +35,7 @@ fn notif_data_from_seccomp_notif_copies_all_fields() {
     assert_eq!(snap.args, [1, 2, 3, 4, 5, 6]);
 }
 
-use sandlock_ffi::handler::{
-    sandlock_mem_read, sandlock_mem_read_cstr, sandlock_mem_write,
-};
+use sandlock_ffi::handler::{sandlock_mem_read, sandlock_mem_read_cstr, sandlock_mem_write};
 
 #[test]
 fn mem_accessors_reject_null_arguments() {
@@ -89,8 +87,11 @@ fn action_setters_record_kind_and_payload() {
     a.payload.none = SENTINEL;
     unsafe { sandlock_action_set_continue(&mut a) };
     assert_eq!(a.kind, sandlock_action_kind_t::Continue as u32);
-    assert_eq!(unsafe { a.payload.none }, SENTINEL,
-               "set_continue must be tag-only and leave payload untouched");
+    assert_eq!(
+        unsafe { a.payload.none },
+        SENTINEL,
+        "set_continue must be tag-only and leave payload untouched"
+    );
 
     unsafe { sandlock_action_set_errno(&mut a, 13) };
     assert_eq!(a.kind, sandlock_action_kind_t::Errno as u32);
@@ -103,8 +104,11 @@ fn action_setters_record_kind_and_payload() {
     a.payload.none = SENTINEL;
     unsafe { sandlock_action_set_hold(&mut a) };
     assert_eq!(a.kind, sandlock_action_kind_t::Hold as u32);
-    assert_eq!(unsafe { a.payload.none }, SENTINEL,
-               "set_hold must be tag-only and leave payload untouched");
+    assert_eq!(
+        unsafe { a.payload.none },
+        SENTINEL,
+        "set_hold must be tag-only and leave payload untouched"
+    );
 
     unsafe { sandlock_action_set_kill(&mut a, libc::SIGKILL, 4321) };
     assert_eq!(a.kind, sandlock_action_kind_t::Kill as u32);
@@ -116,13 +120,19 @@ fn action_setters_record_kind_and_payload() {
 fn action_out_layout_is_stable() {
     // Size + align are gross guards; pin down field offsets so a
     // field reorder that preserves size still gets caught.
-    use std::mem::{align_of, size_of, MaybeUninit};
     use sandlock_ffi::handler::sandlock_action_out_t;
+    use std::mem::{align_of, size_of, MaybeUninit};
 
-    assert_eq!(size_of::<sandlock_action_out_t>(), 24,
-               "size drift breaks the C ABI layout");
-    assert_eq!(align_of::<sandlock_action_out_t>(), 8,
-               "align drift breaks the C ABI layout");
+    assert_eq!(
+        size_of::<sandlock_action_out_t>(),
+        24,
+        "size drift breaks the C ABI layout"
+    );
+    assert_eq!(
+        align_of::<sandlock_action_out_t>(),
+        8,
+        "align drift breaks the C ABI layout"
+    );
 
     // Hand-roll offset_of through MaybeUninit — works on stable Rust
     // without an extra crate. The C header has kind at offset 0 and
@@ -130,15 +140,19 @@ fn action_out_layout_is_stable() {
     let mut probe = MaybeUninit::<sandlock_action_out_t>::uninit();
     let base = probe.as_mut_ptr() as usize;
     let kind_offset = unsafe { std::ptr::addr_of_mut!((*probe.as_mut_ptr()).kind) as usize - base };
-    let payload_offset = unsafe { std::ptr::addr_of_mut!((*probe.as_mut_ptr()).payload) as usize - base };
+    let payload_offset =
+        unsafe { std::ptr::addr_of_mut!((*probe.as_mut_ptr()).payload) as usize - base };
     assert_eq!(kind_offset, 0, "kind must be at offset 0");
-    assert_eq!(payload_offset, 8, "payload must be at offset 8 (kind+4 bytes padding)");
+    assert_eq!(
+        payload_offset, 8,
+        "payload must be at offset 8 (kind+4 bytes padding)"
+    );
 }
 
 #[test]
 fn notif_data_field_offsets_are_stable() {
-    use std::mem::MaybeUninit;
     use sandlock_ffi::notif_repr::sandlock_notif_data_t;
+    use std::mem::MaybeUninit;
 
     let probe = MaybeUninit::<sandlock_notif_data_t>::uninit();
     let base = probe.as_ptr() as usize;
@@ -173,7 +187,9 @@ fn notif_data_field_offsets_are_stable() {
         "arch must be at offset 20",
     );
     assert_eq!(
-        unsafe { std::ptr::addr_of!((*probe.as_ptr()).instruction_pointer) as *const u8 as usize - base },
+        unsafe {
+            std::ptr::addr_of!((*probe.as_ptr()).instruction_pointer) as *const u8 as usize - base
+        },
         24,
         "instruction_pointer must be at offset 24",
     );
@@ -185,7 +201,7 @@ fn notif_data_field_offsets_are_stable() {
 }
 
 use sandlock_ffi::handler::{
-    sandlock_exception_policy_t, sandlock_handler_free, sandlock_handler_fn_t,
+    sandlock_exception_policy_t, sandlock_handler_fn_t, sandlock_handler_free,
     sandlock_handler_new, sandlock_handler_t,
 };
 
@@ -204,7 +220,9 @@ static ROUND_TRIP_DROPPER_CALLS: std::sync::atomic::AtomicUsize =
 
 extern "C-unwind" fn round_trip_dropper(ud: *mut std::ffi::c_void) {
     // Reclaim the leaked Box so its destructor runs (real drop path).
-    unsafe { drop(Box::from_raw(ud as *mut u32)); }
+    unsafe {
+        drop(Box::from_raw(ud as *mut u32));
+    }
     ROUND_TRIP_DROPPER_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
@@ -265,9 +283,15 @@ use sandlock_ffi::handler::FfiHandler;
 fn fake_ctx() -> HandlerCtx {
     HandlerCtx {
         notif: SeccompNotif {
-            id: 1, pid: std::process::id(), flags: 0,
-            data: SeccompData { nr: 39, arch: 0xC000003E,
-                                instruction_pointer: 0, args: [0; 6] },
+            id: 1,
+            pid: std::process::id(),
+            flags: 0,
+            data: SeccompData {
+                nr: 39,
+                arch: 0xC000003E,
+                instruction_pointer: 0,
+                args: [0; 6],
+            },
         },
         notif_fd: -1,
     }
@@ -324,9 +348,15 @@ fn fake_ctx_with_isolated_child() -> (HandlerCtx, std::process::Child) {
     );
     let ctx = HandlerCtx {
         notif: SeccompNotif {
-            id: 1, pid: child_pid as u32, flags: 0,
-            data: SeccompData { nr: 39, arch: 0xC000003E,
-                                instruction_pointer: 0, args: [0; 6] },
+            id: 1,
+            pid: child_pid as u32,
+            flags: 0,
+            data: SeccompData {
+                nr: 39,
+                arch: 0xC000003E,
+                instruction_pointer: 0,
+                args: [0; 6],
+            },
         },
         notif_fd: -1,
     };
@@ -424,10 +454,8 @@ async fn ffi_handler_applies_exception_policy_on_failure() {
     assert!(matches!(action, NotifAction::Errno(e) if e == libc::EPERM));
 }
 
+use sandlock_ffi::handler::{sandlock_handler_registration_t, sandlock_run_with_handlers};
 use std::ffi::CString;
-use sandlock_ffi::handler::{
-    sandlock_handler_registration_t, sandlock_run_with_handlers,
-};
 
 extern "C-unwind" fn force_getpid_to_777(
     _ud: *mut std::ffi::c_void,
@@ -492,20 +520,14 @@ fn run_with_handlers_intercepts_getpid() {
         handler,
     }];
 
-    let script = CString::new(
-        "import os, sys; sys.stdout.write(str(os.getpid()))",
-    ).unwrap();
+    let script = CString::new("import os, sys; sys.stdout.write(str(os.getpid()))").unwrap();
     // Use the system python3 directly. Running through `/usr/bin/env
     // python3` would pick up any venv shim in $PATH whose pyvenv.cfg
     // sits outside the sandbox's read allowlist and fail before our
     // handler ever gets a chance to fire.
     let arg0 = CString::new("/usr/bin/python3").unwrap();
     let arg1 = CString::new("-c").unwrap();
-    let argv = [
-        arg0.as_ptr(),
-        arg1.as_ptr(),
-        script.as_ptr(),
-    ];
+    let argv = [arg0.as_ptr(), arg1.as_ptr(), script.as_ptr()];
 
     let rr = unsafe {
         sandlock_run_with_handlers(
@@ -521,12 +543,20 @@ fn run_with_handlers_intercepts_getpid() {
     let stdout = unsafe {
         let mut len: usize = 0;
         let p = sandlock_result_stdout_bytes(rr, &mut len);
-        if p.is_null() { Vec::new() } else { std::slice::from_raw_parts(p, len).to_vec() }
+        if p.is_null() {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(p, len).to_vec()
+        }
     };
     let stderr = unsafe {
         let mut len: usize = 0;
         let p = sandlock_result_stderr_bytes(rr, &mut len);
-        if p.is_null() { Vec::new() } else { std::slice::from_raw_parts(p, len).to_vec() }
+        if p.is_null() {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(p, len).to_vec()
+        }
     };
     let stdout_str = String::from_utf8_lossy(&stdout);
     let stderr_str = String::from_utf8_lossy(&stderr);
@@ -536,12 +566,21 @@ fn run_with_handlers_intercepts_getpid() {
     // the full stdout — a substring check would silently pass on a
     // mutation that broke dispatch when the real pid happened to
     // contain "777" (pids 7770-7779, 17770-17779, ...).
-    assert_eq!(stdout_str.trim_end_matches('\n'), "777",
-               "expected getpid to be intercepted; exit={} stdout={:?} stderr={:?}",
-               exit_code, stdout_str, stderr_str);
+    assert_eq!(
+        stdout_str.trim_end_matches('\n'),
+        "777",
+        "expected getpid to be intercepted; exit={} stdout={:?} stderr={:?}",
+        exit_code,
+        stdout_str,
+        stderr_str
+    );
 
-    unsafe { sandlock_result_free(rr); }
-    unsafe { sandlock_sandbox_free(policy); }
+    unsafe {
+        sandlock_result_free(rr);
+    }
+    unsafe {
+        sandlock_sandbox_free(policy);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1130,12 +1169,14 @@ async fn ffi_handler_callback_returns_zero_but_never_sets_action_triggers_fallba
 
 // ---- Group F: handler_new edge cases ------------------------------------
 
-static NULL_UD_DROP_CALLS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static NULL_UD_DROP_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 extern "C-unwind" fn counting_null_ud_dropper(ud: *mut std::ffi::c_void) {
     // Sanity: confirm the dropper sees the null ud we passed in.
-    assert!(ud.is_null(), "dropper invoked with non-null ud unexpectedly");
+    assert!(
+        ud.is_null(),
+        "dropper invoked with non-null ud unexpectedly"
+    );
     NULL_UD_DROP_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
@@ -1220,9 +1261,14 @@ fn run_with_handlers_null_argv_returns_null() {
             0,
         )
     };
-    assert!(rr.is_null(), "expected null result for null argv with argc > 0");
+    assert!(
+        rr.is_null(),
+        "expected null result for null argv with argc > 0"
+    );
 
-    unsafe { sandlock_sandbox_free(policy); }
+    unsafe {
+        sandlock_sandbox_free(policy);
+    }
 }
 
 #[test]
@@ -1252,7 +1298,9 @@ fn run_with_handlers_zero_argc_returns_null() {
     };
     assert!(rr.is_null(), "expected null result for argc == 0");
 
-    unsafe { sandlock_sandbox_free(policy); }
+    unsafe {
+        sandlock_sandbox_free(policy);
+    }
 }
 
 #[test]
@@ -1277,9 +1325,14 @@ fn run_with_handlers_null_registrations_with_nonzero_count_returns_null() {
             1,
         )
     };
-    assert!(rr.is_null(), "expected null result for null registrations + count > 0");
+    assert!(
+        rr.is_null(),
+        "expected null result for null registrations + count > 0"
+    );
 
-    unsafe { sandlock_sandbox_free(policy); }
+    unsafe {
+        sandlock_sandbox_free(policy);
+    }
 }
 
 #[test]
@@ -1315,7 +1368,9 @@ fn run_with_handlers_rejects_oversize_argc() {
     };
     assert!(rr.is_null(), "expected null result for argc > MAX_ARGV");
 
-    unsafe { sandlock_sandbox_free(policy); }
+    unsafe {
+        sandlock_sandbox_free(policy);
+    }
 }
 
 #[test]
@@ -1353,9 +1408,14 @@ fn run_with_handlers_rejects_oversize_nregistrations() {
             5000, // > MAX_REGISTRATIONS (4096)
         )
     };
-    assert!(rr.is_null(), "expected null result for nregistrations > MAX_REGISTRATIONS");
+    assert!(
+        rr.is_null(),
+        "expected null result for nregistrations > MAX_REGISTRATIONS"
+    );
 
-    unsafe { sandlock_sandbox_free(policy); }
+    unsafe {
+        sandlock_sandbox_free(policy);
+    }
 }
 
 #[test]
@@ -1409,13 +1469,24 @@ fn run_with_handlers_empty_registrations_runs_normally() {
             0,
         )
     };
-    assert!(!rr.is_null(), "empty registrations should still run /bin/true");
+    assert!(
+        !rr.is_null(),
+        "empty registrations should still run /bin/true"
+    );
     let success = unsafe { sandlock_result_success(rr) };
     let exit_code = unsafe { sandlock_result_exit_code(rr) };
-    assert!(success, "/bin/true should exit successfully; exit={}", exit_code);
+    assert!(
+        success,
+        "/bin/true should exit successfully; exit={}",
+        exit_code
+    );
 
-    unsafe { sandlock_result_free(rr); }
-    unsafe { sandlock_sandbox_free(policy); }
+    unsafe {
+        sandlock_result_free(rr);
+    }
+    unsafe {
+        sandlock_sandbox_free(policy);
+    }
 }
 
 static ONE_SHOT_DROPPER_CALLS: std::sync::atomic::AtomicUsize =
@@ -1425,7 +1496,9 @@ extern "C-unwind" fn one_shot_dropper(ud: *mut std::ffi::c_void) {
     ONE_SHOT_DROPPER_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     if !ud.is_null() {
         // Reclaim the leaked Box so leak-sanitizer builds stay clean.
-        unsafe { drop(Box::from_raw(ud as *mut u32)); }
+        unsafe {
+            drop(Box::from_raw(ud as *mut u32));
+        }
     }
 }
 
@@ -1483,14 +1556,19 @@ fn run_with_handlers_null_handler_in_array_returns_null() {
             regs.len(),
         )
     };
-    assert!(rr.is_null(), "expected null result when an array entry is null");
+    assert!(
+        rr.is_null(),
+        "expected null result when an array entry is null"
+    );
     assert_eq!(
         ONE_SHOT_DROPPER_CALLS.load(std::sync::atomic::Ordering::SeqCst),
         1,
         "dropper must fire exactly once (from the supervisor's release_registrations)",
     );
 
-    unsafe { sandlock_sandbox_free(policy); }
+    unsafe {
+        sandlock_sandbox_free(policy);
+    }
 }
 
 // ---- Group H: multiple handlers -----------------------------------------
@@ -1580,16 +1658,12 @@ fn run_with_handlers_two_handlers_each_fires_for_own_syscall() {
         },
     ];
 
-    let script = CString::new(
-        "import os, sys; sys.stdout.write(str(os.getpid())+'|'+str(os.getppid()))",
-    ).unwrap();
+    let script =
+        CString::new("import os, sys; sys.stdout.write(str(os.getpid())+'|'+str(os.getppid()))")
+            .unwrap();
     let arg0 = CString::new("/usr/bin/python3").unwrap();
     let arg1 = CString::new("-c").unwrap();
-    let argv = [
-        arg0.as_ptr(),
-        arg1.as_ptr(),
-        script.as_ptr(),
-    ];
+    let argv = [arg0.as_ptr(), arg1.as_ptr(), script.as_ptr()];
 
     let rr = unsafe {
         sandlock_run_with_handlers(
@@ -1605,12 +1679,20 @@ fn run_with_handlers_two_handlers_each_fires_for_own_syscall() {
     let stdout = unsafe {
         let mut len: usize = 0;
         let p = sandlock_result_stdout_bytes(rr, &mut len);
-        if p.is_null() { Vec::new() } else { std::slice::from_raw_parts(p, len).to_vec() }
+        if p.is_null() {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(p, len).to_vec()
+        }
     };
     let stderr = unsafe {
         let mut len: usize = 0;
         let p = sandlock_result_stderr_bytes(rr, &mut len);
-        if p.is_null() { Vec::new() } else { std::slice::from_raw_parts(p, len).to_vec() }
+        if p.is_null() {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(p, len).to_vec()
+        }
     };
     let stdout_str = String::from_utf8_lossy(&stdout);
     let stderr_str = String::from_utf8_lossy(&stderr);
@@ -1623,11 +1705,17 @@ fn run_with_handlers_two_handlers_each_fires_for_own_syscall() {
         stdout_str.trim_end_matches('\n'),
         "111|222",
         "expected both handlers to fire; exit={} stdout={:?} stderr={:?}",
-        exit_code, stdout_str, stderr_str,
+        exit_code,
+        stdout_str,
+        stderr_str,
     );
 
-    unsafe { sandlock_result_free(rr); }
-    unsafe { sandlock_sandbox_free(policy); }
+    unsafe {
+        sandlock_result_free(rr);
+    }
+    unsafe {
+        sandlock_sandbox_free(policy);
+    }
 }
 
 // ---- Group I: live-fd mem_read_cstr -------------------------------------
@@ -1647,7 +1735,11 @@ extern "C-unwind" fn deny_magic_marker_path(
     let mut n: usize = 0;
     let rc = unsafe {
         sandlock_ffi::handler::sandlock_mem_read_cstr(
-            mem, addr, buf.as_mut_ptr(), buf.len(), &mut n,
+            mem,
+            addr,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut n,
         )
     };
     if rc != 0 {
@@ -1724,14 +1816,11 @@ fn mem_read_cstr_reads_path_from_intercepted_openat() {
          except OSError as e:\n\
          \x20   sys.stderr.write('errno=' + str(e.errno) + '\\n')\n\
          \x20   sys.exit(1)\n",
-    ).unwrap();
+    )
+    .unwrap();
     let arg0 = CString::new("/usr/bin/python3").unwrap();
     let arg1 = CString::new("-c").unwrap();
-    let argv = [
-        arg0.as_ptr(),
-        arg1.as_ptr(),
-        script.as_ptr(),
-    ];
+    let argv = [arg0.as_ptr(), arg1.as_ptr(), script.as_ptr()];
 
     let rr = unsafe {
         sandlock_run_with_handlers(
@@ -1747,12 +1836,20 @@ fn mem_read_cstr_reads_path_from_intercepted_openat() {
     let stderr = unsafe {
         let mut len: usize = 0;
         let p = sandlock_result_stderr_bytes(rr, &mut len);
-        if p.is_null() { Vec::new() } else { std::slice::from_raw_parts(p, len).to_vec() }
+        if p.is_null() {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(p, len).to_vec()
+        }
     };
     let stdout = unsafe {
         let mut len: usize = 0;
         let p = sandlock_result_stdout_bytes(rr, &mut len);
-        if p.is_null() { Vec::new() } else { std::slice::from_raw_parts(p, len).to_vec() }
+        if p.is_null() {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(p, len).to_vec()
+        }
     };
     let stderr_str = String::from_utf8_lossy(&stderr);
     let stdout_str = String::from_utf8_lossy(&stdout);
@@ -1765,11 +1862,17 @@ fn mem_read_cstr_reads_path_from_intercepted_openat() {
         stderr_str.contains("errno=13"),
         "expected handler to inject EACCES via mem_read_cstr; \
          exit={} stdout={:?} stderr={:?}",
-        exit_code, stdout_str, stderr_str,
+        exit_code,
+        stdout_str,
+        stderr_str,
     );
 
-    unsafe { sandlock_result_free(rr); }
-    unsafe { sandlock_sandbox_free(policy); }
+    unsafe {
+        sandlock_result_free(rr);
+    }
+    unsafe {
+        sandlock_sandbox_free(policy);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1809,7 +1912,12 @@ fn make_pipe() -> (i32, i32) {
     // success and returns 0; we assert success below.
     let mut fds = [0i32; 2];
     let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
-    assert_eq!(rc, 0, "pipe2() failed: errno={}", std::io::Error::last_os_error());
+    assert_eq!(
+        rc,
+        0,
+        "pipe2() failed: errno={}",
+        std::io::Error::last_os_error()
+    );
     (fds[0], fds[1])
 }
 
@@ -1825,7 +1933,11 @@ fn make_pipe() -> (i32, i32) {
 // copy) is gone.
 fn wait_for_eof(fd: i32) -> isize {
     const TIMEOUT_MS: i32 = 2000;
-    let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
     // SAFETY: `pfd` is a stack-local with a single valid fd; `poll`
     // reads/writes only the supplied entry.
     let pret = unsafe { libc::poll(&mut pfd, 1, TIMEOUT_MS) };
@@ -1912,9 +2024,13 @@ async fn a1_ffi_handler_drains_inject_fd_on_panic() {
     // leak-clean. `write_fd` itself is owned by the drain path; do NOT
     // close it here.
     // SAFETY: `fd_ptr` came from `Box::into_raw` on a `Box<i32>`.
-    unsafe { drop(Box::from_raw(fd_ptr as *mut i32)); }
+    unsafe {
+        drop(Box::from_raw(fd_ptr as *mut i32));
+    }
     // SAFETY: `read_fd` is still open; close it.
-    unsafe { libc::close(read_fd); }
+    unsafe {
+        libc::close(read_fd);
+    }
 }
 
 extern "C-unwind" fn arm_inject_fd_send_tracked_discriminant(
@@ -1976,13 +2092,16 @@ async fn a2_ffi_handler_drains_inject_fd_tracked_discriminant() {
     );
 
     // SAFETY: `fd_ptr` came from `Box::into_raw` on a `Box<i32>`.
-    unsafe { drop(Box::from_raw(fd_ptr as *mut i32)); }
+    unsafe {
+        drop(Box::from_raw(fd_ptr as *mut i32));
+    }
     // SAFETY: `read_fd` is still open; close it.
-    unsafe { libc::close(read_fd); }
+    unsafe {
+        libc::close(read_fd);
+    }
 }
 
-static A3_UD_DROPPER_CALLS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static A3_UD_DROPPER_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 extern "C-unwind" fn a3_counter_dropper(_ud: *mut std::ffi::c_void) {
     A3_UD_DROPPER_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2034,10 +2153,8 @@ extern "C-unwind" fn a5_panicking_dropper(_ud: *mut std::ffi::c_void) {
     panic!("test panic from dropper");
 }
 
-static C_NEW_1_DROPPER_A: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static C_NEW_1_DROPPER_B: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static C_NEW_1_DROPPER_A: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static C_NEW_1_DROPPER_B: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 extern "C-unwind" fn c_new_1_dropper_a(_ud: *mut std::ffi::c_void) {
     C_NEW_1_DROPPER_A.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2082,24 +2199,28 @@ fn release_registrations_continues_after_mid_loop_panic() {
     };
     assert!(!h1.is_null() && !h2.is_null(), "handler_new must succeed");
     let regs = [
-        sandlock_handler_registration_t { syscall_nr: libc::SYS_getpid, handler: h1 },
-        sandlock_handler_registration_t { syscall_nr: libc::SYS_getppid, handler: h2 },
+        sandlock_handler_registration_t {
+            syscall_nr: libc::SYS_getpid,
+            handler: h1,
+        },
+        sandlock_handler_registration_t {
+            syscall_nr: libc::SYS_getppid,
+            handler: h2,
+        },
     ];
     // Null policy triggers `release_registrations` on the
     // early-return path. With the fix, `sandlock_run_with_handlers`
     // unwinds (extern "C-unwind") because dropper_a panics;
     // `catch_unwind` here captures it.
-    let result = std::panic::catch_unwind(|| {
-        unsafe {
-            sandlock_run_with_handlers(
-                std::ptr::null(),
-                std::ptr::null(),
-                std::ptr::null(),
-                0,
-                regs.as_ptr(),
-                regs.len(),
-            )
-        }
+    let result = std::panic::catch_unwind(|| unsafe {
+        sandlock_run_with_handlers(
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            regs.as_ptr(),
+            regs.len(),
+        )
     });
     assert!(
         result.is_err(),
@@ -2174,8 +2295,11 @@ async fn ffi_handler_deny_eio_policy_on_callback_rc_nonzero() {
     let h = unsafe { sandlock_ffi::handler::FfiHandler::from_raw(raw) };
     let cx = fake_ctx();
     let action = h.handle(&cx).await;
-    assert!(matches!(action, NotifAction::Errno(e) if e == libc::EIO),
-            "expected Errno(EIO), got {:?}", action);
+    assert!(
+        matches!(action, NotifAction::Errno(e) if e == libc::EIO),
+        "expected Errno(EIO), got {:?}",
+        action
+    );
 }
 
 // ----------------------------------------------------------------
@@ -2187,7 +2311,8 @@ fn syscall_nr_resolves_a_known_name() {
     let name = std::ffi::CString::new("openat").unwrap();
     let nr = unsafe { sandlock_ffi::sandlock_syscall_nr(name.as_ptr()) };
     assert_eq!(
-        nr, libc::SYS_openat,
+        nr,
+        libc::SYS_openat,
         "\"openat\" must resolve to the host-arch SYS_openat",
     );
 }

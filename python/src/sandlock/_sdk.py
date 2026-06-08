@@ -180,10 +180,20 @@ class _CEvent(ctypes.Structure):
     ]
 
 _c_ctx_p = ctypes.c_void_p
-_POLICY_FN_TYPE = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.POINTER(_CEvent), _c_ctx_p)
+_POLICY_FN_TYPE = ctypes.CFUNCTYPE(
+    ctypes.c_int32,
+    ctypes.POINTER(_CEvent),
+    _c_ctx_p,
+    ctypes.c_void_p,
+)
 
 _lib.sandlock_sandbox_builder_policy_fn.restype = _c_builder_p
-_lib.sandlock_sandbox_builder_policy_fn.argtypes = [_c_builder_p, _POLICY_FN_TYPE]
+_lib.sandlock_sandbox_builder_policy_fn.argtypes = [
+    _c_builder_p,
+    _POLICY_FN_TYPE,
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+]
 
 _lib.sandlock_ctx_restrict_network.restype = None
 _lib.sandlock_ctx_restrict_network.argtypes = [_c_ctx_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint32]
@@ -1130,7 +1140,7 @@ class _NativePolicy:
         # Store callback reference to prevent GC
         c_callback = None
         if policy_fn is not None:
-            def _c_callback(event_p, ctx_p):
+            def _c_callback(event_p, ctx_p, _user_data):
                 ev = event_p.contents
                 py_argv = None
                 if ev.argv and ev.argc > 0:
@@ -1169,7 +1179,7 @@ class _NativePolicy:
                 return 0
 
             c_callback = _POLICY_FN_TYPE(_c_callback)
-            b = _lib.sandlock_sandbox_builder_policy_fn(b, c_callback)
+            b = _lib.sandlock_sandbox_builder_policy_fn(b, c_callback, None, None)
 
         err = ctypes.c_int(0)
         err_msg = ctypes.c_char_p()

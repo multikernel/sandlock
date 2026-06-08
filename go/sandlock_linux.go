@@ -10,6 +10,9 @@ package sandlock
 // prototypes stay in lock-step with crates/sandlock-ffi automatically.
 #include <stdlib.h>
 #include "sandlock.h"
+
+extern int32_t goPolicyCallback(sandlock_event_t *event, sandlock_ctx_t *ctx, void *user_data);
+extern void goPolicyDrop(void *user_data);
 */
 import "C"
 
@@ -20,6 +23,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -32,6 +36,88 @@ import (
 func hasNUL(s string) bool { return strings.IndexByte(s, 0) >= 0 }
 
 func cbool(v bool) C.bool { return C.bool(v) }
+
+var (
+	nextPolicyCallbackID atomic.Uint64
+	policyCallbacks      sync.Map // uint64 -> PolicyFunc
+)
+
+func registerPolicyCallback(fn PolicyFunc) unsafe.Pointer {
+	id := nextPolicyCallbackID.Add(1)
+	userData := C.malloc(C.size_t(unsafe.Sizeof(C.uint64_t(0))))
+	if userData == nil {
+		panic("sandlock: failed to allocate policy callback handle")
+	}
+	*(*C.uint64_t)(userData) = C.uint64_t(id)
+	policyCallbacks.Store(id, fn)
+	return userData
+}
+
+func unregisterPolicyCallback(userData unsafe.Pointer) {
+	if userData == nil {
+		return
+	}
+	policyCallbacks.Delete(uint64(*(*C.uint64_t)(userData)))
+	C.free(userData)
+}
+
+func policyCallbackID(userData unsafe.Pointer) uint64 {
+	if userData == nil {
+		return 0
+	}
+	return uint64(*(*C.uint64_t)(userData))
+}
+
+func policyEventFromC(ev *C.sandlock_event_t) SyscallEvent {
+	if ev == nil {
+		return SyscallEvent{}
+	}
+	out := SyscallEvent{
+		Syscall:   C.GoString(ev.syscall),
+		Category:  SyscallCategory(ev.category),
+		PID:       uint32(ev.pid),
+		ParentPID: uint32(ev.parent_pid),
+		Port:      uint16(ev.port),
+		Denied:    bool(ev.denied),
+	}
+	if ev.host != nil {
+		out.Host = C.GoString(ev.host)
+	}
+	if ev.argv != nil && ev.argc > 0 {
+		args := unsafe.Slice((**C.char)(unsafe.Pointer(ev.argv)), int(ev.argc))
+		out.Argv = make([]string, 0, len(args))
+		for _, arg := range args {
+			if arg != nil {
+				out.Argv = append(out.Argv, C.GoString(arg))
+			}
+		}
+	}
+	return out
+}
+
+//export goPolicyCallback
+func goPolicyCallback(event *C.sandlock_event_t, ctx *C.sandlock_ctx_t, userData unsafe.Pointer) (ret C.int32_t) {
+	ret = C.int32_t(DecisionDeny)
+	defer func() {
+		if recover() != nil {
+			ret = C.int32_t(DecisionDeny)
+		}
+	}()
+
+	fn, ok := policyCallbacks.Load(policyCallbackID(userData))
+	if !ok {
+		return C.int32_t(DecisionDeny)
+	}
+	decision := fn.(PolicyFunc)(policyEventFromC(event), &PolicyContext{
+		ptr: unsafe.Pointer(ctx),
+	})
+	return C.int32_t(decision)
+}
+
+//export goPolicyDrop
+func goPolicyDrop(userData unsafe.Pointer) {
+	unregisterPolicyCallback(userData)
+}
 
 // validateStrings rejects any configuration string carrying a NUL byte before
 // a builder is allocated. The FFI has no builder-free entry point, so a failure
@@ -284,6 +370,14 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 	if s.OnError != BranchActionDefault {
 		b = C.sandlock_sandbox_builder_on_error(b, C.uint8_t(s.OnError-1))
 	}
+	if s.PolicyFn != nil {
+		b = C.sandlock_sandbox_builder_policy_fn(
+			b,
+			(C.sandlock_policy_fn_t)(C.goPolicyCallback),
+			registerPolicyCallback(s.PolicyFn),
+			(*[0]byte)(C.goPolicyDrop),
+		)
+	}
 
 	var errCode C.int
 	var errMsg *C.char
@@ -337,6 +431,102 @@ func freeArgv(argv []*C.char) {
 	for _, p := range argv {
 		C.free(unsafe.Pointer(p))
 	}
+}
+
+func cStringArray(vals []string) ([]*C.char, error) {
+	out := make([]*C.char, len(vals))
+	for i, v := range vals {
+		if hasNUL(v) {
+			for j := 0; j < i; j++ {
+				C.free(unsafe.Pointer(out[j]))
+			}
+			return nil, ErrInvalidString
+		}
+		out[i] = C.CString(v)
+	}
+	return out, nil
+}
+
+func cStringArrayPtr(vals []*C.char) (**C.char, C.uint32_t) {
+	if len(vals) == 0 {
+		return nil, 0
+	}
+	return (**C.char)(unsafe.Pointer(&vals[0])), C.uint32_t(len(vals))
+}
+
+func (c *PolicyContext) cptr() *C.sandlock_ctx_t {
+	if c == nil || c.ptr == nil {
+		return nil
+	}
+	return (*C.sandlock_ctx_t)(c.ptr)
+}
+
+// RestrictNetwork permanently restricts the live network policy to ips.
+func (c *PolicyContext) RestrictNetwork(ips []string) error {
+	cips, err := cStringArray(ips)
+	if err != nil {
+		return err
+	}
+	defer freeArgv(cips)
+	ptr, n := cStringArrayPtr(cips)
+	C.sandlock_ctx_restrict_network(c.cptr(), ptr, n)
+	return nil
+}
+
+// GrantNetwork grants ips within the sandbox's immutable network ceiling.
+func (c *PolicyContext) GrantNetwork(ips []string) error {
+	cips, err := cStringArray(ips)
+	if err != nil {
+		return err
+	}
+	defer freeArgv(cips)
+	ptr, n := cStringArrayPtr(cips)
+	C.sandlock_ctx_grant_network(c.cptr(), ptr, n)
+	return nil
+}
+
+// RestrictMaxMemory permanently restricts the live max-memory policy.
+func (c *PolicyContext) RestrictMaxMemory(bytes uint64) {
+	C.sandlock_ctx_restrict_max_memory(c.cptr(), C.uint64_t(bytes))
+}
+
+// RestrictMaxProcesses permanently restricts the live max-processes policy.
+func (c *PolicyContext) RestrictMaxProcesses(n uint32) {
+	C.sandlock_ctx_restrict_max_processes(c.cptr(), C.uint32_t(n))
+}
+
+// RestrictPIDNetwork restricts network access for a specific process.
+func (c *PolicyContext) RestrictPIDNetwork(pid uint32, ips []string) error {
+	cips, err := cStringArray(ips)
+	if err != nil {
+		return err
+	}
+	defer freeArgv(cips)
+	ptr, n := cStringArrayPtr(cips)
+	C.sandlock_ctx_restrict_pid_network(c.cptr(), C.uint32_t(pid), ptr, n)
+	return nil
+}
+
+// DenyPath dynamically denies access to path for mediated openat checks.
+func (c *PolicyContext) DenyPath(path string) error {
+	if hasNUL(path) {
+		return ErrInvalidString
+	}
+	cp := C.CString(path)
+	defer C.free(unsafe.Pointer(cp))
+	C.sandlock_ctx_deny_path(c.cptr(), cp)
+	return nil
+}
+
+// AllowPath removes a dynamic path denial previously added by DenyPath.
+func (c *PolicyContext) AllowPath(path string) error {
+	if hasNUL(path) {
+		return ErrInvalidString
+	}
+	cp := C.CString(path)
+	defer C.free(unsafe.Pointer(cp))
+	C.sandlock_ctx_allow_path(c.cptr(), cp)
+	return nil
 }
 
 // argvPtr returns the pointer/count pair for an argv slice.

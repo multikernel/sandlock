@@ -64,12 +64,25 @@ fn protection_discriminants_cover_rust_enum_in_order() {
     // order so external callers (Python ctypes, hand-written C) can
     // index via the raw integer.
     let rust_order: Vec<Protection> = Protection::all().collect();
-    assert_eq!(rust_order.len(), 6, "if a new protection lands, extend the FFI discriminants and the PROT_* constants");
+    assert_eq!(
+        rust_order.len(),
+        6,
+        "if a new protection lands, extend the FFI discriminants and the PROT_* constants"
+    );
     assert_eq!(rust_order[PROT_FS_REFER as usize], Protection::FsRefer);
-    assert_eq!(rust_order[PROT_FS_TRUNCATE as usize], Protection::FsTruncate);
+    assert_eq!(
+        rust_order[PROT_FS_TRUNCATE as usize],
+        Protection::FsTruncate
+    );
     assert_eq!(rust_order[PROT_NET_TCP as usize], Protection::NetTcp);
-    assert_eq!(rust_order[PROT_FS_IOCTL_DEV as usize], Protection::FsIoctlDev);
-    assert_eq!(rust_order[PROT_SIGNAL_SCOPE as usize], Protection::SignalScope);
+    assert_eq!(
+        rust_order[PROT_FS_IOCTL_DEV as usize],
+        Protection::FsIoctlDev
+    );
+    assert_eq!(
+        rust_order[PROT_SIGNAL_SCOPE as usize],
+        Protection::SignalScope
+    );
     assert_eq!(
         rust_order[PROT_ABSTRACT_UNIX_SOCKET_SCOPE as usize],
         Protection::AbstractUnixSocketScope,
@@ -82,7 +95,9 @@ fn protection_discriminants_cover_rust_enum_in_order() {
 /// inspect `protection_policy`.
 fn build_via_ffi<F>(configure: F) -> Sandbox
 where
-    F: FnOnce(*mut sandlock_core::sandbox::SandboxBuilder) -> *mut sandlock_core::sandbox::SandboxBuilder,
+    F: FnOnce(
+        *mut sandlock_core::sandbox::SandboxBuilder,
+    ) -> *mut sandlock_core::sandbox::SandboxBuilder,
 {
     let b = sandlock_sandbox_builder_new();
     assert!(!b.is_null(), "builder_new returned null");
@@ -96,9 +111,8 @@ where
 
 #[test]
 fn builder_allow_degraded_marks_protection_degradable() {
-    let sandbox = build_via_ffi(|b| unsafe {
-        sandlock_sandbox_builder_allow_degraded(b, PROT_SIGNAL_SCOPE)
-    });
+    let sandbox =
+        build_via_ffi(|b| unsafe { sandlock_sandbox_builder_allow_degraded(b, PROT_SIGNAL_SCOPE) });
     assert_eq!(
         sandbox.protection_policy.state(Protection::SignalScope),
         ProtectionState::Degradable,
@@ -116,7 +130,9 @@ fn builder_disable_marks_protection_disabled() {
         sandlock_sandbox_builder_disable(b, PROT_ABSTRACT_UNIX_SOCKET_SCOPE)
     });
     assert_eq!(
-        sandbox.protection_policy.state(Protection::AbstractUnixSocketScope),
+        sandbox
+            .protection_policy
+            .state(Protection::AbstractUnixSocketScope),
         ProtectionState::Disabled,
     );
     assert_eq!(
@@ -161,14 +177,11 @@ fn builder_setters_chain_and_last_call_wins() {
 fn builder_setters_tolerate_null_builder() {
     // Null in, null out — no panic. Matches the convention of every
     // other `sandlock_sandbox_builder_*` setter.
-    let out = unsafe {
-        sandlock_sandbox_builder_allow_degraded(std::ptr::null_mut(), PROT_SIGNAL_SCOPE)
-    };
+    let out =
+        unsafe { sandlock_sandbox_builder_allow_degraded(std::ptr::null_mut(), PROT_SIGNAL_SCOPE) };
     assert!(out.is_null(), "allow_degraded(null, _) must return null");
 
-    let out = unsafe {
-        sandlock_sandbox_builder_disable(std::ptr::null_mut(), PROT_FS_REFER)
-    };
+    let out = unsafe { sandlock_sandbox_builder_disable(std::ptr::null_mut(), PROT_FS_REFER) };
     assert!(out.is_null(), "disable(null, _) must return null");
 }
 
@@ -200,15 +213,14 @@ fn allow_degraded_with_unknown_discriminant_is_a_noop() {
     // The builder pointer must be returned untouched, and the
     // resulting Sandbox must have no `Degradable` state set.
     for &raw in INVALID_DISCRIMINANTS {
-        let sandbox = build_via_ffi(|b| unsafe {
-            sandlock_sandbox_builder_allow_degraded(b, raw)
-        });
+        let sandbox = build_via_ffi(|b| unsafe { sandlock_sandbox_builder_allow_degraded(b, raw) });
         for p in Protection::all() {
             assert_eq!(
                 sandbox.protection_policy.state(p),
                 ProtectionState::Strict,
                 "raw discriminant {} must leave {:?} at the default Strict state",
-                raw, p,
+                raw,
+                p,
             );
         }
     }
@@ -217,15 +229,14 @@ fn allow_degraded_with_unknown_discriminant_is_a_noop() {
 #[test]
 fn disable_with_unknown_discriminant_is_a_noop() {
     for &raw in INVALID_DISCRIMINANTS {
-        let sandbox = build_via_ffi(|b| unsafe {
-            sandlock_sandbox_builder_disable(b, raw)
-        });
+        let sandbox = build_via_ffi(|b| unsafe { sandlock_sandbox_builder_disable(b, raw) });
         for p in Protection::all() {
             assert_eq!(
                 sandbox.protection_policy.state(p),
                 ProtectionState::Strict,
                 "raw discriminant {} must leave {:?} at the default Strict state",
-                raw, p,
+                raw,
+                p,
             );
         }
     }

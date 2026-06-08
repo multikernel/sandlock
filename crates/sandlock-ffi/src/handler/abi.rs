@@ -5,7 +5,9 @@
 use std::os::unix::io::{IntoRawFd, RawFd};
 use std::slice;
 
-use sandlock_core::seccomp::notif::{content_memfd, read_child_cstr, read_child_mem, write_child_mem};
+use sandlock_core::seccomp::notif::{
+    content_memfd, read_child_cstr, read_child_mem, write_child_mem,
+};
 
 /// `flags` bit for [`sandlock_action_set_inject_bytes`]: leave the injected
 /// memfd writable (do not seal). Default (bit clear) seals it read-only.
@@ -29,7 +31,11 @@ pub struct sandlock_mem_handle_t {
 
 impl sandlock_mem_handle_t {
     pub(super) fn new(notif_fd: RawFd, notif_id: u64, pid: u32) -> Self {
-        Self { notif_fd, notif_id, pid }
+        Self {
+            notif_fd,
+            notif_id,
+            pid,
+        }
     }
 }
 
@@ -237,7 +243,9 @@ impl sandlock_action_out_t {
 /// no-op).
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_action_set_continue(out: *mut sandlock_action_out_t) {
-    if out.is_null() { return; }
+    if out.is_null() {
+        return;
+    }
     (*out).kind = sandlock_action_kind_t::Continue as u32;
 }
 
@@ -250,7 +258,9 @@ pub unsafe extern "C" fn sandlock_action_set_errno(
     out: *mut sandlock_action_out_t,
     errno_value: i32,
 ) {
-    if out.is_null() { return; }
+    if out.is_null() {
+        return;
+    }
     (*out).kind = sandlock_action_kind_t::Errno as u32;
     (*out).payload.errno_value = errno_value;
 }
@@ -264,7 +274,9 @@ pub unsafe extern "C" fn sandlock_action_set_return_value(
     out: *mut sandlock_action_out_t,
     value: i64,
 ) {
-    if out.is_null() { return; }
+    if out.is_null() {
+        return;
+    }
     (*out).kind = sandlock_action_kind_t::ReturnValue as u32;
     (*out).payload.return_value = value;
 }
@@ -289,7 +301,9 @@ pub unsafe extern "C" fn sandlock_action_set_inject_fd_send(
     srcfd: RawFd,
     newfd_flags: u32,
 ) {
-    if out.is_null() { return; }
+    if out.is_null() {
+        return;
+    }
     (*out).kind = sandlock_action_kind_t::InjectFdSend as u32;
     (*out).payload.inject_send = sandlock_action_inject_t { srcfd, newfd_flags };
 }
@@ -318,7 +332,9 @@ pub unsafe extern "C" fn sandlock_action_set_inject_bytes(
     len: usize,
     flags: u32,
 ) {
-    if out.is_null() { return; }
+    if out.is_null() {
+        return;
+    }
 
     let seal = flags & SANDLOCK_INJECT_WRITABLE == 0;
     let newfd_flags = if flags & SANDLOCK_INJECT_NO_CLOEXEC == 0 {
@@ -355,7 +371,9 @@ pub unsafe extern "C" fn sandlock_action_set_inject_bytes(
 /// Same constraints as `sandlock_action_set_continue`.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_action_set_hold(out: *mut sandlock_action_out_t) {
-    if out.is_null() { return; }
+    if out.is_null() {
+        return;
+    }
     (*out).kind = sandlock_action_kind_t::Hold as u32;
 }
 
@@ -372,7 +390,9 @@ pub unsafe extern "C" fn sandlock_action_set_kill(
     sig: i32,
     pgid: i32,
 ) {
-    if out.is_null() { return; }
+    if out.is_null() {
+        return;
+    }
     (*out).kind = sandlock_action_kind_t::Kill as u32;
     (*out).payload.kill = sandlock_action_kill_t { sig, pgid };
 }
@@ -550,11 +570,10 @@ pub unsafe extern "C" fn sandlock_handler_new(
 /// `h` must be a non-null pointer returned by `sandlock_handler_new` that has
 /// not yet been registered with a run or freed.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_handler_set_deferred(
-    h: *mut sandlock_handler_t,
-    deferred: bool,
-) {
-    if h.is_null() { return; }
+pub unsafe extern "C" fn sandlock_handler_set_deferred(h: *mut sandlock_handler_t, deferred: bool) {
+    if h.is_null() {
+        return;
+    }
     (*h).deferred = deferred;
 }
 
@@ -575,7 +594,9 @@ pub unsafe extern "C" fn sandlock_handler_set_deferred(
 /// supervisor and has not already been freed.
 #[no_mangle]
 pub unsafe extern "C-unwind" fn sandlock_handler_free(h: *mut sandlock_handler_t) {
-    if h.is_null() { return; }
+    if h.is_null() {
+        return;
+    }
     drop(Box::from_raw(h));
 }
 
@@ -631,7 +652,10 @@ mod inject_bytes_tests {
         let data = b"rw";
         unsafe {
             sandlock_action_set_inject_bytes(
-                &mut out, data.as_ptr(), data.len(), SANDLOCK_INJECT_WRITABLE,
+                &mut out,
+                data.as_ptr(),
+                data.len(),
+                SANDLOCK_INJECT_WRITABLE,
             )
         };
         assert_eq!(out.kind, sandlock_action_kind_t::InjectFdSend as u32);
@@ -647,7 +671,10 @@ mod inject_bytes_tests {
         let data = b"x";
         unsafe {
             sandlock_action_set_inject_bytes(
-                &mut out, data.as_ptr(), data.len(), SANDLOCK_INJECT_NO_CLOEXEC,
+                &mut out,
+                data.as_ptr(),
+                data.len(),
+                SANDLOCK_INJECT_NO_CLOEXEC,
             )
         };
         let inject = unsafe { out.payload.inject_send };

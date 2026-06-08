@@ -87,22 +87,87 @@ static int force_getpid_to_777(
     return 0;
 }
 
-int main(void) {
-    /* Pure-C check of the content-injection setter, independent of a live
-     * sandbox run. */
-    if (check_inject_bytes() != 0) {
+struct policy_ud {
+    int magic;
+    int drops;
+};
+
+static int policy_fn_record_ud(
+    const sandlock_event_t *event,
+    sandlock_ctx_t *ctx,
+    void *ud
+) {
+    (void)ctx;
+    struct policy_ud *state = (struct policy_ud *)ud;
+    if (state == NULL || state->magic != 0x5150) {
         return 1;
     }
+    (void)event;
+    return 0;
+}
 
-    /* Build a sandbox that exposes just enough of the host for the
-     * system python3 interpreter to start. Mirrors the read mounts
-     * from the Rust integration test in tests/handler_smoke.rs. */
+static void policy_fn_drop_ud(void *ud) {
+    struct policy_ud *state = (struct policy_ud *)ud;
+    if (state != NULL && state->magic == 0x5150) {
+        state->drops++;
+    }
+}
+
+static int check_policy_fn_user_data_drop(void) {
+    struct policy_ud state = {
+        .magic = 0x5150,
+        .drops = 0,
+    };
+
     sandlock_builder_t *b = sandlock_sandbox_builder_new();
     b = sandlock_sandbox_builder_fs_read(b, "/usr");
     b = sandlock_sandbox_builder_fs_read(b, "/bin");
     b = sandlock_sandbox_builder_fs_read(b, "/lib");
     b = sandlock_sandbox_builder_fs_read(b, "/lib64");
     b = sandlock_sandbox_builder_fs_read(b, "/etc");
+    b = sandlock_sandbox_builder_fs_read(b, "/proc");
+    b = sandlock_sandbox_builder_fs_read(b, "/dev");
+    b = sandlock_sandbox_builder_fs_write(b, "/tmp");
+    b = sandlock_sandbox_builder_policy_fn(
+        b, policy_fn_record_ud, &state, policy_fn_drop_ud);
+
+    int err = 0;
+    sandlock_sandbox_t *p = sandlock_sandbox_build(b, &err, NULL);
+    if (p == NULL) {
+        fprintf(stderr, "policy_fn: sandbox build failed: err=%d\n", err);
+        return 1;
+    }
+
+    sandlock_sandbox_free(p);
+
+    if (state.drops != 1) {
+        fprintf(stderr, "policy_fn: user_data drop count=%d, want 1\n", state.drops);
+        return 1;
+    }
+    return 0;
+}
+
+int main(void) {
+    /* Pure-C check of the content-injection setter, independent of a live
+     * sandbox run. */
+    if (check_inject_bytes() != 0) {
+        return 1;
+    }
+    if (check_policy_fn_user_data_drop() != 0) {
+        return 1;
+    }
+
+    /* Build a sandbox that exposes just enough of the host for the
+     * system python3 interpreter to start. Mirrors the read mounts used by
+     * the live handler/proc runtime tests. */
+    sandlock_builder_t *b = sandlock_sandbox_builder_new();
+    b = sandlock_sandbox_builder_fs_read(b, "/usr");
+    b = sandlock_sandbox_builder_fs_read(b, "/bin");
+    b = sandlock_sandbox_builder_fs_read(b, "/lib");
+    b = sandlock_sandbox_builder_fs_read(b, "/lib64");
+    b = sandlock_sandbox_builder_fs_read(b, "/etc");
+    b = sandlock_sandbox_builder_fs_read(b, "/proc");
+    b = sandlock_sandbox_builder_fs_read(b, "/dev");
     b = sandlock_sandbox_builder_fs_write(b, "/tmp");
 
     int err = 0;

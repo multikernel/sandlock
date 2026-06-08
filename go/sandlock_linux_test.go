@@ -91,6 +91,86 @@ func TestRunNULRejected(t *testing.T) {
 	}
 }
 
+func TestSyscallEventArgvContains(t *testing.T) {
+	ev := sandlock.SyscallEvent{Argv: []string{"python3", "-c", "print(1)"}}
+	if !ev.ArgvContains("python") {
+		t.Fatal("ArgvContains did not find substring")
+	}
+	if ev.ArgvContains("ruby") {
+		t.Fatal("ArgvContains found absent substring")
+	}
+}
+
+func TestPolicyDecisionValues(t *testing.T) {
+	if sandlock.Allow() != sandlock.DecisionAllow {
+		t.Fatal("Allow did not return DecisionAllow")
+	}
+	if sandlock.Deny() != sandlock.DecisionDeny {
+		t.Fatal("Deny did not return DecisionDeny")
+	}
+	if sandlock.Audit() != sandlock.DecisionAudit {
+		t.Fatal("Audit did not return DecisionAudit")
+	}
+	if got := sandlock.DenyWith(13); got == sandlock.DecisionAllow {
+		t.Fatal("DenyWith returned allow for positive errno")
+	}
+	if got := sandlock.DenyWith(0); got != sandlock.DecisionDeny {
+		t.Fatalf("DenyWith(0) = %d, want deny", got)
+	}
+}
+
+func TestPolicyFnDenyByArgv(t *testing.T) {
+	requireLandlock(t)
+	sb := &sandlock.Sandbox{
+		FSReadable: rootfs,
+		PolicyFn: func(event sandlock.SyscallEvent, ctx *sandlock.PolicyContext) sandlock.PolicyDecision {
+			if event.Syscall == "execve" && event.ArgvContains("sandlock-go-deny-token") {
+				return sandlock.Deny()
+			}
+			return sandlock.Allow()
+		},
+	}
+	res, err := sb.Run(context.Background(), "sh", "-c", "echo sandlock-go-deny-token")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Success {
+		t.Fatalf("expected policy_fn to deny execve, got success stdout=%q", res.Stdout)
+	}
+}
+
+func TestPolicyFnReceivesExecveArgv(t *testing.T) {
+	requireLandlock(t)
+	seen := make(chan []string, 1)
+	sb := &sandlock.Sandbox{
+		FSReadable: rootfs,
+		PolicyFn: func(event sandlock.SyscallEvent, ctx *sandlock.PolicyContext) sandlock.PolicyDecision {
+			if event.Syscall == "execve" && len(event.Argv) > 0 {
+				select {
+				case seen <- append([]string(nil), event.Argv...):
+				default:
+				}
+			}
+			return sandlock.Allow()
+		},
+	}
+	res, err := sb.Run(context.Background(), "echo", "policy-fn-ok")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !res.Success {
+		t.Fatalf("expected success, got exit=%d stderr=%q", res.ExitCode, res.Stderr)
+	}
+	select {
+	case argv := <-seen:
+		if len(argv) == 0 {
+			t.Fatal("empty argv")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("policy_fn did not receive execve argv")
+	}
+}
+
 func TestDryRun(t *testing.T) {
 	requireLandlock(t)
 	dir := t.TempDir()
