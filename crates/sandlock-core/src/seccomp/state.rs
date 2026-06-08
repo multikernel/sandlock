@@ -310,6 +310,10 @@ pub struct NetworkState {
     pub icmp_policy: crate::seccomp::notif::NetworkPolicy,
     /// Port binding and remapping tracker.
     pub port_map: crate::port_remap::PortMap,
+    /// `--net-deny-bind`: TCP ports the sandbox may NOT bind (default-allow
+    /// denylist). The on-behalf `bind()` handler rejects a TCP bind to any
+    /// port in this set with `EACCES`; empty = no bind denylist.
+    pub bind_deny_ports: HashSet<u16>,
     /// Per-PID network overrides from policy_fn (IP-only via the legacy
     /// `restrict_network(ips)` API; any port is permitted to listed IPs).
     pub pid_ip_overrides: std::sync::Arc<std::sync::RwLock<HashMap<u32, HashSet<std::net::IpAddr>>>>,
@@ -328,6 +332,7 @@ impl NetworkState {
             udp_policy: crate::seccomp::notif::NetworkPolicy::Unrestricted,
             icmp_policy: crate::seccomp::notif::NetworkPolicy::Unrestricted,
             port_map: crate::port_remap::PortMap::new(),
+            bind_deny_ports: HashSet::new(),
             pid_ip_overrides: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
             http_acl_addr: None,
             http_acl_ports: HashSet::new(),
@@ -354,6 +359,7 @@ impl NetworkState {
             let per_ip = ips.iter().map(|&ip| (ip, PortAllow::Any)).collect();
             NetworkPolicy::AllowList {
                 per_ip,
+                cidrs: Vec::new(),
                 any_ip_ports: HashSet::new(),
             }
         };

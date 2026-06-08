@@ -40,7 +40,7 @@ func cbool(v bool) C.bool { return C.bool(v) }
 func (s *Sandbox) validateStrings() error {
 	groups := [][]string{
 		s.FSReadable, s.FSWritable, s.FSDenied,
-		s.NetAllow, s.NetBind,
+		s.NetAllow, s.NetDeny, s.NetAllowBind, s.NetDenyBind,
 		s.HTTPAllow, s.HTTPDeny,
 		s.ExtraAllowSyscalls, s.ExtraDenySyscalls,
 		{s.Workdir, s.Cwd, s.Chroot, s.FSStorage, s.MaxMemory, s.MaxDisk,
@@ -125,14 +125,29 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 			return C.sandlock_sandbox_builder_net_allow(b, c)
 		}, spec)
 	}
-	if len(s.NetBind) > 0 {
-		ports, err := policy.ParsePorts(s.NetBind)
+	for _, spec := range s.NetDeny {
+		str(func(b *C.sandlock_builder_t, c *C.char) *C.sandlock_builder_t {
+			return C.sandlock_sandbox_builder_net_deny(b, c)
+		}, spec)
+	}
+	if len(s.NetAllowBind) > 0 {
+		ports, err := policy.ParsePorts(s.NetAllowBind)
 		if err != nil {
 			freeBuilderViaBuild(b)
 			return nil, err
 		}
 		for _, p := range ports {
-			b = C.sandlock_sandbox_builder_net_bind_port(b, C.uint16_t(p))
+			b = C.sandlock_sandbox_builder_net_allow_bind_port(b, C.uint16_t(p))
+		}
+	}
+	if len(s.NetDenyBind) > 0 {
+		ports, err := policy.ParsePorts(s.NetDenyBind)
+		if err != nil {
+			freeBuilderViaBuild(b)
+			return nil, err
+		}
+		for _, p := range ports {
+			b = C.sandlock_sandbox_builder_net_deny_bind_port(b, C.uint16_t(p))
 		}
 	}
 	if s.PortRemap {

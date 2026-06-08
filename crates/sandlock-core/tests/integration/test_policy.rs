@@ -29,28 +29,31 @@ fn test_builder_fs_paths() {
 #[test]
 fn test_builder_network() {
     let policy = Sandbox::builder()
-        .net_bind_port(8080)
+        .net_allow_bind_port(8080)
         .net_allow("api.example.com:443,80")
         .build()
         .unwrap();
-    assert_eq!(policy.net_bind, vec![8080]);
+    assert_eq!(policy.net_allow_bind, vec![8080]);
     assert_eq!(policy.net_allow.len(), 1);
     let rule = &policy.net_allow[0];
-    assert_eq!(rule.host.as_deref(), Some("api.example.com"));
+    assert!(matches!(&rule.target, sandlock_core::sandbox::NetTarget::Host(h) if h == "api.example.com"));
     assert_eq!(rule.ports, vec![443, 80]);
 }
 
 #[test]
 fn test_net_allow_parse_grammar() {
-    use sandlock_core::sandbox::NetAllow;
-    assert!(NetAllow::parse("foo.com:443").is_ok());
-    assert!(NetAllow::parse("foo.com:22,443").is_ok());
-    assert!(NetAllow::parse(":8080").is_ok());
-    assert!(NetAllow::parse("*:8080").is_ok());
-    assert!(NetAllow::parse("foo.com").is_err()); // missing port
-    assert!(NetAllow::parse("foo.com:abc").is_err()); // bad port
-    assert!(NetAllow::parse("foo.com:0").is_err()); // port 0 reserved
-    assert!(NetAllow::parse("foo.com:").is_err()); // empty port list
+    use sandlock_core::sandbox::NetRule;
+    assert!(NetRule::parse_allow("foo.com:443").is_ok());
+    assert!(NetRule::parse_allow("foo.com:22,443").is_ok());
+    assert!(NetRule::parse_allow(":8080").is_ok());
+    assert!(NetRule::parse_allow("*:8080").is_ok());
+    assert!(NetRule::parse_allow("foo.com").is_ok()); // no port -> all ports
+    assert!(NetRule::parse_allow("foo.com").unwrap().all_ports);
+    assert!(NetRule::parse_allow("*").is_ok()); // any host, all ports
+    assert!(NetRule::parse_allow("").is_err()); // empty rule
+    assert!(NetRule::parse_allow("foo.com:abc").is_err()); // bad port
+    assert!(NetRule::parse_allow("foo.com:0").is_err()); // port 0 reserved
+    assert!(NetRule::parse_allow("foo.com:").is_err()); // empty port list
 }
 
 #[test]

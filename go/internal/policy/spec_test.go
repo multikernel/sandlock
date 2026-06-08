@@ -51,10 +51,13 @@ func TestParsePorts(t *testing.T) {
 		{[]string{"8000-8002"}, []uint16{8000, 8001, 8002}, false},
 		{[]string{"443", "80", "443"}, []uint16{80, 443}, false},
 		{[]string{"3000-3001", "3001-3002"}, []uint16{3000, 3001, 3002}, false},
+		{[]string{"8080,9090"}, []uint16{8080, 9090}, false},
+		{[]string{"8080,9000-9002", "443"}, []uint16{443, 8080, 9000, 9001, 9002}, false},
 		{nil, []uint16{}, false},
 		{[]string{"70000"}, nil, true},
 		{[]string{"10-5"}, nil, true},
 		{[]string{"x"}, nil, true},
+		{[]string{"8080,"}, nil, true},
 	}
 	for _, c := range cases {
 		got, err := ParsePorts(c.in)

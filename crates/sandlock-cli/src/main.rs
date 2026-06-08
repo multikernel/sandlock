@@ -341,23 +341,13 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         for p in &base.fs_writable { b = b.fs_write(p); }
         for p in &base.fs_denied { b = b.fs_deny(p); }
         for rule in &base.net_allow {
-            let host_part = rule.host.as_deref().unwrap_or("*");
-            let spec = match rule.protocol {
-                sandlock_core::sandbox::Protocol::Tcp => {
-                    let ports = format_ports(&rule.ports, rule.all_ports);
-                    format!("tcp://{}:{}", host_part, ports)
-                }
-                sandlock_core::sandbox::Protocol::Udp => {
-                    let ports = format_ports(&rule.ports, rule.all_ports);
-                    format!("udp://{}:{}", host_part, ports)
-                }
-                sandlock_core::sandbox::Protocol::Icmp => {
-                    format!("icmp://{}", host_part)
-                }
-            };
-            b = b.net_allow(spec);
+            b = b.net_allow(format_net_rule(rule));
         }
-        for p in &base.net_bind { b = b.net_bind_port(*p); }
+        for rule in &base.net_deny {
+            b = b.net_deny(format_net_rule(rule));
+        }
+        for p in &base.net_allow_bind { b = b.net_allow_bind_port(*p); }
+        for p in &base.net_deny_bind { b = b.net_deny_bind_port(*p); }
         for rule in &base.http_allow {
             let s = format!("{} {}{}", rule.method, rule.host, rule.path);
             b = b.http_allow(&s);
@@ -416,7 +406,9 @@ async fn run_command(args: RunArgs) -> Result<i32> {
     for p in &pb.fs_writable { builder = builder.fs_write(p); }
     if let Some(n) = pb.max_processes { builder = builder.max_processes(n); }
     for spec in &pb.net_allow { builder = builder.net_allow(spec); }
-    for p in &pb.net_bind { builder = builder.net_bind_port(*p); }
+    for spec in &pb.net_deny { builder = builder.net_deny(spec); }
+    for spec in &pb.net_allow_bind { builder = builder.net_allow_bind(spec); }
+    for spec in &pb.net_deny_bind { builder = builder.net_deny_bind(spec); }
     if let Some(seed) = pb.random_seed { builder = builder.random_seed(seed); }
     if pb.clean_env { builder = builder.clean_env(true); }
     if let Some(n) = pb.num_cpus { builder = builder.num_cpus(n); }
@@ -590,7 +582,11 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         let registered_hosts: Vec<String> = policy
             .net_allow
             .iter()
-            .filter_map(|r| r.host.clone())
+            .filter_map(|r| match &r.target {
+                sandlock_core::sandbox::NetTarget::Host(h) => Some(h.clone()),
+                sandlock_core::sandbox::NetTarget::Cidr(c) => Some(c.to_string()),
+                sandlock_core::sandbox::NetTarget::AnyIp => None,
+            })
             .collect();
         if let Err(e) = network_registry::register(
             &sandbox_name, pid, std::collections::HashMap::new(),
@@ -664,7 +660,9 @@ fn validate_no_supervisor(args: &RunArgs) -> Result<()> {
     if pb.max_open_files.is_some() { bad.push("--max-open-files"); }
     if args.timeout.is_some() { bad.push("--timeout"); }
     if !pb.net_allow.is_empty() { bad.push("--net-allow"); }
-    if !pb.net_bind.is_empty() { bad.push("--net-bind"); }
+    if !pb.net_deny.is_empty() { bad.push("--net-deny"); }
+    if !pb.net_allow_bind.is_empty() { bad.push("--net-allow-bind"); }
+    if !pb.net_deny_bind.is_empty() { bad.push("--net-deny-bind"); }
     if !pb.http_allow.is_empty() { bad.push("--http-allow"); }
     if !pb.http_deny.is_empty() { bad.push("--http-deny"); }
     if !pb.http_ports.is_empty() { bad.push("--http-port"); }
@@ -722,7 +720,9 @@ fn validate_no_supervisor_profile(profile: &Sandbox, source: &str) -> Result<()>
 
     if !profile.fs_denied.is_empty() { bad.push("[filesystem].deny"); }
     if !profile.net_allow.is_empty() { bad.push("[network].allow"); }
-    if !profile.net_bind.is_empty() { bad.push("[network].bind"); }
+    if !profile.net_deny.is_empty() { bad.push("[network].deny"); }
+    if !profile.net_allow_bind.is_empty() { bad.push("[network].allow_bind"); }
+    if !profile.net_deny_bind.is_empty() { bad.push("[network].deny_bind"); }
     if profile.port_remap { bad.push("[network].port_remap"); }
     if !profile.http_allow.is_empty() { bad.push("[http].allow"); }
     if !profile.http_deny.is_empty() { bad.push("[http].deny"); }
@@ -763,17 +763,48 @@ fn validate_no_supervisor_profile(profile: &Sandbox, source: &str) -> Result<()>
     Ok(())
 }
 
-/// Parse an ISO 8601 timestamp (e.g. "2000-01-01T00:00:00Z") into a SystemTime.
-/// Render a port list back into the `--net-allow` port-suffix form:
-/// concrete ports become `80,443`; the all-ports wildcard becomes `*`.
-fn format_ports(ports: &[u16], all_ports: bool) -> String {
-    if all_ports {
-        "*".to_string()
-    } else {
-        ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",")
+/// Render a parsed `NetRule` back into a `--net-allow` / `--net-deny` spec
+/// string, so a profile loaded via `--profile-file` round-trips through the
+/// builder. Allow and deny share one grammar: bare TCP, explicit
+/// `udp://`/`icmp://`, IPv6 bracketed only when a port follows, and the
+/// all-ports case drops the redundant `:*`.
+fn format_net_rule(rule: &sandlock_core::sandbox::NetRule) -> String {
+    use sandlock_core::sandbox::{NetTarget, Protocol};
+    let target = match &rule.target {
+        NetTarget::AnyIp => "*".to_string(),
+        NetTarget::Host(h) => h.clone(),
+        NetTarget::Cidr(c) => {
+            // Bracket IPv6 only when a port suffix will follow, because a
+            // bare addr:port is itself a valid IPv6 address.
+            if matches!(c.addr, std::net::IpAddr::V6(_)) && !rule.all_ports {
+                format!("[{}]", c)
+            } else {
+                c.to_string()
+            }
+        }
+    };
+    match rule.protocol {
+        Protocol::Icmp => format!("icmp://{}", target),
+        proto => {
+            let scheme = if matches!(proto, Protocol::Udp) { "udp://" } else { "" };
+            if rule.all_ports {
+                format!("{}{}", scheme, target)
+            } else {
+                let ports = format_ports(&rule.ports);
+                format!("{}{}:{}", scheme, target, ports)
+            }
+        }
     }
 }
 
+/// Render a concrete port list into the comma-separated port-suffix form
+/// (`80,443`). The all-ports case is handled by the callers, which drop the
+/// suffix entirely rather than emitting `:*`.
+fn format_ports(ports: &[u16]) -> String {
+    ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",")
+}
+
+/// Parse an ISO 8601 timestamp (e.g. "2000-01-01T00:00:00Z") into a SystemTime.
 fn parse_time_start(s: &str) -> Result<SystemTime> {
     let ts: jiff::Timestamp = s.parse()
         .map_err(|e| anyhow!("invalid --time-start '{}': {}", s, e))?;
@@ -786,5 +817,54 @@ fn parse_branch_action(flag: &str, s: &str) -> Result<BranchAction> {
         "abort"  => Ok(BranchAction::Abort),
         "keep"   => Ok(BranchAction::Keep),
         other    => Err(anyhow!("invalid {} value '{}': expected commit | abort | keep", flag, other)),
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+    use sandlock_core::sandbox::NetRule;
+
+    #[test]
+    fn render_allow_drops_redundant_all_ports_star() {
+        let r = NetRule::parse_allow("udp://*:*").unwrap();
+        assert_eq!(format_net_rule(&r), "udp://*");
+    }
+
+    #[test]
+    fn render_allow_any_ip_all_ports_tcp_is_bare_star() {
+        let r = NetRule::parse_allow(":*").unwrap();
+        assert_eq!(format_net_rule(&r), "*");
+    }
+
+    #[test]
+    fn render_allow_host_ports() {
+        let r = NetRule::parse_allow("example.com:443").unwrap();
+        assert_eq!(format_net_rule(&r), "example.com:443");
+    }
+
+    #[test]
+    fn render_cidr_and_ipv6_round_trip() {
+        // CIDR and IPv6-literal targets render identically for allow/deny.
+        assert_eq!(format_net_rule(&NetRule::parse_allow("10.0.0.0/8:80").unwrap()), "10.0.0.0/8:80");
+        assert_eq!(format_net_rule(&NetRule::parse_deny("10.0.0.0/8").unwrap()), "10.0.0.0/8");
+        assert_eq!(format_net_rule(&NetRule::parse_allow("[::1]:443").unwrap()), "[::1]:443");
+        assert_eq!(format_net_rule(&NetRule::parse_allow("::1").unwrap()), "::1");
+    }
+
+    #[test]
+    fn render_roundtrips_through_parse() {
+        for spec in [
+            "example.com:443", "udp://1.1.1.1:53", "icmp://github.com", "*", "udp://*",
+            "10.0.0.0/8:80", "[fc00::/7]:443", "::1", "1.2.3.4",
+        ] {
+            let r = NetRule::parse_allow(spec).unwrap();
+            let rendered = format_net_rule(&r);
+            let r2 = NetRule::parse_allow(&rendered).unwrap();
+            assert_eq!(r.target, r2.target, "target mismatch for {spec}");
+            assert_eq!(r.ports, r2.ports, "ports mismatch for {spec}");
+            assert_eq!(r.all_ports, r2.all_ports, "all_ports mismatch for {spec}");
+            assert_eq!(r.protocol, r2.protocol, "protocol mismatch for {spec}");
+        }
     }
 }

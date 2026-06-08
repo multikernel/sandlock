@@ -58,8 +58,11 @@ _PORT_RANGE_RE = re.compile(r"^(\d+)(?:-(\d+))?$")
 def parse_ports(specs: Sequence[int | str]) -> list[int]:
     """Parse port specifications into a sorted list of unique port numbers.
 
-    Each spec is an int (single port) or a string like ``"80"``,
-    ``"8000-9000"``.  Raises ValueError on out-of-range or bad format.
+    Each spec is an int (single port) or a string holding a comma-separated
+    list of single ports / inclusive ``"lo-hi"`` ranges, e.g. ``"80"``,
+    ``"8000-9000"``, or ``"8080,9000-9005"`` (matching the CLI's
+    ``--net-allow-bind`` grammar).  Raises ValueError on out-of-range or bad
+    format.
     """
     ports: set[int] = set()
     for spec in specs:
@@ -68,14 +71,16 @@ def parse_ports(specs: Sequence[int | str]) -> list[int]:
                 raise ValueError(f"port out of range: {spec}")
             ports.add(spec)
             continue
-        m = _PORT_RANGE_RE.match(spec.strip())
-        if m is None:
-            raise ValueError(f"invalid port spec: {spec!r}")
-        lo = int(m.group(1))
-        hi = int(m.group(2)) if m.group(2) else lo
-        if lo > hi or not 0 <= lo <= 65535 or not 0 <= hi <= 65535:
-            raise ValueError(f"invalid port range: {spec!r}")
-        ports.update(range(lo, hi + 1))
+        for part in spec.split(","):
+            part = part.strip()
+            m = _PORT_RANGE_RE.match(part)
+            if m is None:
+                raise ValueError(f"invalid port spec: {part!r}")
+            lo = int(m.group(1))
+            hi = int(m.group(2)) if m.group(2) else lo
+            if lo > hi or not 0 <= lo <= 65535 or not 0 <= hi <= 65535:
+                raise ValueError(f"invalid port range: {part!r}")
+            ports.update(range(lo, hi + 1))
     return sorted(ports)
 
 
@@ -164,10 +169,20 @@ class Sandbox:
 
     Protocol gating falls out of rule presence: with no UDP/ICMP rules,
     UDP and ICMP socket creation are denied at the seccomp layer.
-    Hostnames are resolved at sandbox-creation time and pinned via a
-    synthetic ``/etc/hosts``. Empty = deny all outbound. HTTP rules with
-    concrete hosts auto-add a matching TCP entry on :attr:`http_ports`.
-    See README "Network Model" for details."""
+    A target may also be an IP, a CIDR range, or an IPv6 literal
+    (``"10.0.0.0/8:443"``, ``"[2606:4700::/32]:443"``), matched by
+    containment with no DNS. Hostnames are resolved at sandbox-creation
+    time and pinned via a synthetic ``/etc/hosts``. Empty = deny all
+    outbound. HTTP rules with concrete hosts auto-add a matching TCP entry
+    on :attr:`http_ports`. See README "Network Model" for details."""
+
+    net_deny: Sequence[str] = field(default_factory=list)
+    """Outbound endpoint denylist: default-allow networking, block these
+    targets. The inverse of :attr:`net_allow` and **mutually exclusive**
+    with it. Same grammar as ``net_allow`` except targets must be a literal
+    IP/CIDR or ``"*"`` (hostnames are rejected; use :attr:`http_deny` for
+    domains), e.g. ``["10.0.0.0/8", "169.254.169.254:80", "udp://*"]``.
+    Empty = no denylist. See README "Network Model" for details."""
 
     no_coredump: bool = False
     """Disable core dumps and restrict /proc/pid access from other
@@ -175,10 +190,17 @@ class Sandbox:
     leaking sandbox memory contents but breaks gdb/strace/perf."""
 
     # Network — bind allowlist (Landlock ABI v4+, TCP only)
-    net_bind: Sequence[int | str] = field(default_factory=list)
-    """TCP ports the sandbox may bind. Empty = deny all. Each entry is
-    a port number or a ``"lo-hi"`` range string. Landlock's port hooks
-    are TCP-only — UDP bind is not separately gated."""
+    net_allow_bind: Sequence[int | str] = field(default_factory=list)
+    """TCP ports the sandbox may bind (default-deny allowlist). Empty = deny
+    all. Each entry is a port number or a ``"lo-hi"`` range string (or a
+    comma-separated list). Landlock's port hooks are TCP-only — UDP bind is
+    not separately gated. Mutually exclusive with :attr:`net_deny_bind`."""
+
+    net_deny_bind: Sequence[int | str] = field(default_factory=list)
+    """TCP ports the sandbox may NOT bind (default-allow denylist; the
+    inverse of :attr:`net_allow_bind`, enforced on the on-behalf ``bind()``
+    path). Same port syntax. Empty = no bind denylist. Mutually exclusive
+    with :attr:`net_allow_bind`."""
 
     # HTTP ACL
     http_allow: Sequence[str] = field(default_factory=list)
@@ -404,8 +426,12 @@ class Sandbox:
     # ------------------------------------------------------------------
 
     def bind_ports(self) -> list[int]:
-        """Return parsed bind port list, or empty if unrestricted."""
-        return parse_ports(self.net_bind) if self.net_bind else []
+        """Return parsed allow-bind port list, or empty if unrestricted."""
+        return parse_ports(self.net_allow_bind) if self.net_allow_bind else []
+
+    def deny_bind_ports(self) -> list[int]:
+        """Return parsed deny-bind port list, or empty if none."""
+        return parse_ports(self.net_deny_bind) if self.net_deny_bind else []
 
     def memory_bytes(self) -> int | None:
         """Return max_memory as bytes, or None if unset."""

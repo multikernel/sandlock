@@ -39,7 +39,7 @@ sandbox = Sandbox(
     on_exit=BranchAction.COMMIT, on_error=BranchAction.ABORT,
 
     # [network]
-    net_bind=(), net_allow=(), port_remap=False,
+    net_allow_bind=(), net_allow=(), port_remap=False,
 
     # [http]
     http_ports=(), http_allow=(), http_deny=(),
@@ -97,7 +97,7 @@ on_exit   = "commit"                  # "commit" | "abort" | "keep"
 on_error  = "abort"
 
 [network]
-bind       = [8080]
+allow_bind = [8080]
 allow      = ["api.example.com:443", "udp://1.1.1.1:53"]
 port_remap = false
 
@@ -215,7 +215,8 @@ Rule shapes:
 | Python       | TOML         | Type                    | Default | Description                                                                                                                                          |
 | ------------ | ------------ | ----------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `net_allow`  | `allow`      | `Sequence[str]`         | `()`    | Outbound endpoint allowlist. Empty list denies all outbound.                                                                                         |
-| `net_bind`   | `bind`       | `Sequence[int \| str]`  | `()`    | TCP ports the sandbox may bind. Each entry is a port or a `"lo-hi"` range. Landlock ABI v4+ (TCP only; UDP `bind()` is not separately gated).        |
+| `net_allow_bind`   | `allow_bind` | `Sequence[int \| str]`  | `()`    | TCP ports the sandbox may bind/listen on (default-deny allowlist). Each entry is a port or a `"lo-hi"` range. Landlock ABI v4+ (TCP only; UDP `bind()` is not separately gated). Mutually exclusive with `net_deny_bind`.        |
+| `net_deny_bind`    | `deny_bind`  | `Sequence[int \| str]`  | `()`    | TCP ports the sandbox may NOT bind (default-allow denylist; inverse of `net_allow_bind`). Same port syntax. Enforced on the on-behalf `bind()` path (Landlock `BIND_TCP` is relaxed). Mutually exclusive with `net_allow_bind`.        |
 | `port_remap` | `port_remap` | `bool`                  | `False` | Enable transparent TCP port virtualization. Each sandbox receives an independent virtual port space; conflicting binds are remapped to unique real ports via `pidfd_getfd`. |
 
 Hostnames are resolved once at sandbox creation and pinned via a

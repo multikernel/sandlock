@@ -638,6 +638,7 @@ mod tests {
             max_processes: 0,
             has_memory_limit: false,
             has_net_allowlist: false,
+            has_bind_denylist: false,
             has_random_seed: false,
             has_time_start: false,
             argv_safety_required,

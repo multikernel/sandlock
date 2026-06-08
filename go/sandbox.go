@@ -71,14 +71,26 @@ type Sandbox struct {
 	// Network.
 	//
 	// NetAllow entries are outbound endpoint rules. The bare form is TCP
-	// ("api.openai.com:443", "github.com:22,443", ":53"); scheme prefixes opt
-	// other protocols in ("tcp://", "udp://host:port", "udp://*:*",
-	// "icmp://host", "icmp://*"). Empty denies all outbound.
+	// ("api.openai.com:443", "github.com:22,443", ":53"); a target may be a
+	// host, IP, or CIDR ("10.0.0.0/8:443", "[2606:4700::/32]:443"), and
+	// scheme prefixes opt other protocols in ("tcp://", "udp://host:port",
+	// "udp://*", "icmp://host", "icmp://*"). Empty denies all outbound.
 	NetAllow []string
-	// NetBind lists TCP ports the sandbox may bind. Each entry is a single
-	// port ("8080") or an inclusive range ("3000-3010"). Empty denies all.
-	NetBind   []string
-	PortRemap bool // transparent per-sandbox TCP port virtualization
+	// NetDeny is the inverse of NetAllow: default-allow networking, block
+	// these targets. Same grammar as NetAllow except targets must be a
+	// literal IP/CIDR or "*" (no hostnames; use HTTPDeny for domains).
+	// Mutually exclusive with NetAllow.
+	NetDeny []string
+	// NetAllowBind lists TCP ports the sandbox may bind/listen on
+	// (default-deny). Each entry is a comma-separated list of single ports
+	// or inclusive "lo-hi" ranges ("8080", "3000-3010", "8080,9000-9005").
+	// Mutually exclusive with NetDenyBind.
+	NetAllowBind []string
+	// NetDenyBind is the inverse of NetAllowBind: default-allow binding,
+	// deny these TCP ports (same port syntax). Mutually exclusive with
+	// NetAllowBind.
+	NetDenyBind []string
+	PortRemap   bool // transparent per-sandbox TCP port virtualization
 
 	// HTTP ACL (method + host + path rules via a transparent proxy).
 	HTTPAllow   []string // allow rules, "METHOD host/path"

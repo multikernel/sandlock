@@ -244,9 +244,25 @@ pub enum NetworkPolicy {
         /// Per-IP port rules. From `--net-allow host:ports` after
         /// hostname resolution, or from `policy_fn` overrides.
         per_ip: HashMap<IpAddr, PortAllow>,
+        /// (network, allowed-ports) rules from `--net-allow` IP/CIDR
+        /// targets, matched by containment with no DNS. `PortAllow::Any`
+        /// permits every port to the range.
+        cidrs: Vec<(crate::network::IpCidr, PortAllow)>,
         /// Ports permitted for any IP (from `--net-allow :port` /
         /// `*:port`).
         any_ip_ports: HashSet<u16>,
+    },
+    /// Default-allow denylist: a connection is permitted unless the
+    /// destination IP/port matches a deny rule. From `--net-deny`.
+    DenyList {
+        /// (network, denied-ports) rules. `PortAllow::Any` denies every
+        /// port to the network; `Specific` denies only those ports.
+        cidrs: Vec<(crate::network::IpCidr, PortAllow)>,
+        /// Ports denied for any IP (the `:port` form).
+        any_ip_ports: HashSet<u16>,
+        /// Deny everything (the `:*` / `*:*` form). Rare; here for
+        /// completeness so the form is not silently a no-op.
+        deny_all: bool,
     },
 }
 
@@ -255,15 +271,49 @@ impl NetworkPolicy {
     pub fn allows(&self, ip: IpAddr, port: u16) -> bool {
         match self {
             NetworkPolicy::Unrestricted => true,
-            NetworkPolicy::AllowList { per_ip, any_ip_ports } => {
+            NetworkPolicy::AllowList { per_ip, cidrs, any_ip_ports } => {
                 if any_ip_ports.contains(&port) {
                     return true;
                 }
                 match per_ip.get(&ip) {
-                    Some(PortAllow::Any) => true,
-                    Some(PortAllow::Specific(s)) => s.contains(&port),
-                    None => false,
+                    Some(PortAllow::Any) => return true,
+                    Some(PortAllow::Specific(s)) if s.contains(&port) => return true,
+                    _ => {}
                 }
+                for (net, allowed) in cidrs {
+                    if net.contains(ip) {
+                        match allowed {
+                            PortAllow::Any => return true,
+                            PortAllow::Specific(s) => {
+                                if s.contains(&port) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+                false
+            }
+            NetworkPolicy::DenyList { cidrs, any_ip_ports, deny_all } => {
+                if *deny_all {
+                    return false;
+                }
+                if any_ip_ports.contains(&port) {
+                    return false;
+                }
+                for (net, denied) in cidrs {
+                    if net.contains(ip) {
+                        match denied {
+                            PortAllow::Any => return false,
+                            PortAllow::Specific(s) => {
+                                if s.contains(&port) {
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                }
+                true
             }
         }
     }
@@ -355,6 +405,10 @@ pub struct NotifPolicy {
     pub max_processes: u32,
     pub has_memory_limit: bool,
     pub has_net_allowlist: bool,
+    /// `--net-deny-bind` is active: trap `bind()` and register the on-behalf
+    /// handler so denied TCP ports can be refused (independent of the
+    /// connect-side `has_net_allowlist`).
+    pub has_bind_denylist: bool,
     pub has_random_seed: bool,
     pub has_time_start: bool,
     /// Argv-safety gate: the supervisor must freeze every task that
@@ -1841,5 +1895,71 @@ mod tests {
         let result = write_child_mem_vm(pid, addr, &payload);
         assert!(result.is_ok());
         assert_eq!(data, 0x1234567890ABCDEF);
+    }
+
+    #[test]
+    fn denylist_blocks_matching_cidr_allows_rest() {
+        use crate::network::IpCidr;
+        let policy = NetworkPolicy::DenyList {
+            cidrs: vec![(IpCidr::parse("10.0.0.0/8").unwrap(), PortAllow::Any)],
+            any_ip_ports: HashSet::new(),
+            deny_all: false,
+        };
+        assert!(!policy.allows("10.1.2.3".parse().unwrap(), 443)); // denied
+        assert!(policy.allows("8.8.8.8".parse().unwrap(), 443));   // allowed
+    }
+
+    #[test]
+    fn denylist_blocks_any_ip_port() {
+        let mut ports = HashSet::new();
+        ports.insert(25u16);
+        let policy = NetworkPolicy::DenyList {
+            cidrs: Vec::new(),
+            any_ip_ports: ports,
+            deny_all: false,
+        };
+        assert!(!policy.allows("8.8.8.8".parse().unwrap(), 25)); // denied
+        assert!(policy.allows("8.8.8.8".parse().unwrap(), 80));  // allowed
+    }
+
+    #[test]
+    fn denylist_specific_ports_on_cidr() {
+        use crate::network::IpCidr;
+        let mut ports = HashSet::new();
+        ports.insert(443u16);
+        let policy = NetworkPolicy::DenyList {
+            cidrs: vec![(IpCidr::parse("1.2.3.4/32").unwrap(), PortAllow::Specific(ports))],
+            any_ip_ports: HashSet::new(),
+            deny_all: false,
+        };
+        assert!(!policy.allows("1.2.3.4".parse().unwrap(), 443)); // denied
+        assert!(policy.allows("1.2.3.4".parse().unwrap(), 80));   // allowed
+    }
+
+    #[test]
+    fn allowlist_permits_matching_cidr_only() {
+        use crate::network::IpCidr;
+        let mut ports = HashSet::new();
+        ports.insert(80u16);
+        let policy = NetworkPolicy::AllowList {
+            per_ip: HashMap::new(),
+            cidrs: vec![(IpCidr::parse("10.0.0.0/8").unwrap(), PortAllow::Specific(ports))],
+            any_ip_ports: HashSet::new(),
+        };
+        assert!(policy.allows("10.1.2.3".parse().unwrap(), 80));   // in range, port ok
+        assert!(!policy.allows("10.1.2.3".parse().unwrap(), 443)); // in range, wrong port
+        assert!(!policy.allows("8.8.8.8".parse().unwrap(), 80));   // out of range
+    }
+
+    #[test]
+    fn allowlist_cidr_all_ports() {
+        use crate::network::IpCidr;
+        let policy = NetworkPolicy::AllowList {
+            per_ip: HashMap::new(),
+            cidrs: vec![(IpCidr::parse("192.168.0.0/16").unwrap(), PortAllow::Any)],
+            any_ip_ports: HashSet::new(),
+        };
+        assert!(policy.allows("192.168.5.5".parse().unwrap(), 9999)); // any port in range
+        assert!(!policy.allows("10.0.0.1".parse().unwrap(), 9999));   // out of range
     }
 }

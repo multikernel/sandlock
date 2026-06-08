@@ -97,7 +97,7 @@ def policy_for_tool(
             workspace, "/usr", "/lib", "/lib64", "/etc", "/bin", "/sbin",
             _PYTHON_PREFIX, *_INTERP_READABLE, *extra_readable,
         ])),
-        "net_bind": [],
+        "net_allow_bind": [],
         "net_allow": [],
         "clean_env": True,
     }

@@ -10,7 +10,7 @@ use tokio::task::JoinHandle;
 use crate::context;
 use crate::error::SandboxError;
 pub use crate::http::{http_acl_check, normalize_path, prefix_or_exact_match, HttpRule};
-pub use crate::network::{NetAllow, Protocol};
+pub use crate::network::{IpCidr, NetAllow, NetDeny, NetRule, NetTarget, Protocol};
 use crate::protection::{Protection, ProtectionPolicy, ProtectionState, ProtectionStatus};
 
 /// A byte size value.
@@ -109,7 +109,9 @@ impl TryFrom<&Sandbox> for Confinement {
         if !sandbox.fs_denied.is_empty() { unsupported.push("fs_denied"); }
         if !sandbox.extra_deny_syscalls.is_empty() { unsupported.push("extra_deny_syscalls"); }
         if !sandbox.net_allow.is_empty() { unsupported.push("net_allow"); }
-        if !sandbox.net_bind.is_empty() { unsupported.push("net_bind"); }
+        if !sandbox.net_deny.is_empty() { unsupported.push("net_deny"); }
+        if !sandbox.net_allow_bind.is_empty() { unsupported.push("net_allow_bind"); }
+        if !sandbox.net_deny_bind.is_empty() { unsupported.push("net_deny_bind"); }
         if sandbox.allows_sysv_ipc() { unsupported.push("extra_allow_syscalls=[\"sysv_ipc\"]"); }
         if !sandbox.http_allow.is_empty() { unsupported.push("http_allow"); }
         if !sandbox.http_deny.is_empty() { unsupported.push("http_deny"); }
@@ -252,7 +254,16 @@ pub struct Sandbox {
     /// remain reachable. HTTP rules with wildcard hosts auto-add
     /// `(Tcp, None, [80])` instead.
     pub net_allow: Vec<NetAllow>,
-    pub net_bind: Vec<u16>,
+    /// Parsed `--net-deny` rules (default-allow, IP/CIDR/port denylist).
+    /// Mutually exclusive with `net_allow`.
+    pub net_deny: Vec<NetDeny>,
+    /// `--net-allow-bind`: TCP ports the sandbox may bind (default-deny
+    /// allowlist, Landlock-enforced). Mutually exclusive with `net_deny_bind`.
+    pub net_allow_bind: Vec<u16>,
+    /// `--net-deny-bind`: TCP ports the sandbox may NOT bind (default-allow
+    /// denylist, enforced on the on-behalf `bind()` path). Mutually
+    /// exclusive with `net_allow_bind`.
+    pub net_deny_bind: Vec<u16>,
     // HTTP ACL
     pub http_allow: Vec<HttpRule>,
     pub http_deny: Vec<HttpRule>,
@@ -375,7 +386,9 @@ impl Clone for Sandbox {
             extra_allow_syscalls: self.extra_allow_syscalls.clone(),
             protection_policy: self.protection_policy.clone(),
             net_allow: self.net_allow.clone(),
-            net_bind: self.net_bind.clone(),
+            net_deny: self.net_deny.clone(),
+            net_allow_bind: self.net_allow_bind.clone(),
+            net_deny_bind: self.net_deny_bind.clone(),
             http_allow: self.http_allow.clone(),
             http_deny: self.http_deny.clone(),
             http_ports: self.http_ports.clone(),
@@ -1390,9 +1403,11 @@ impl Sandbox {
                 max_processes: self.max_processes,
                 has_memory_limit: self.max_memory.is_some(),
                 has_net_allowlist: !self.net_allow.is_empty()
+                    || !self.net_deny.is_empty()
                     || self.policy_fn.is_some()
                     || !self.http_allow.is_empty()
                     || !self.http_deny.is_empty(),
+                has_bind_denylist: !self.net_deny_bind.is_empty(),
                 has_random_seed: self.random_seed.is_some(),
                 has_time_start: self.time_start.is_some(),
                 argv_safety_required: self.policy_fn.is_some()
@@ -1425,36 +1440,45 @@ impl Sandbox {
             let time_random_state = TimeRandomState::new(time_offset, random_state);
 
             let mut net_state = NetworkState::new();
-            let no_rules = self.net_allow.is_empty();
-            let policy_from = |resolved: &network::ResolvedNetAllow| {
-                if no_rules || resolved.any_ip_all_ports {
-                    crate::seccomp::notif::NetworkPolicy::Unrestricted
-                } else {
-                    use crate::seccomp::notif::PortAllow;
-                    let per_ip = resolved
-                        .per_ip
-                        .iter()
-                        .map(|(ip, ports)| {
-                            let allow = if resolved.per_ip_all_ports.contains(ip) {
-                                PortAllow::Any
-                            } else {
-                                PortAllow::Specific(ports.clone())
-                            };
-                            (*ip, allow)
-                        })
-                        .collect();
-                    crate::seccomp::notif::NetworkPolicy::AllowList {
-                        per_ip,
-                        any_ip_ports: resolved.any_ip_ports.clone(),
+            if !self.net_deny.is_empty() {
+                let resolved_deny = network::resolve_net_deny(&self.net_deny);
+                net_state.tcp_policy = resolved_deny.tcp;
+                net_state.udp_policy = resolved_deny.udp;
+                net_state.icmp_policy = resolved_deny.icmp;
+            } else {
+                let no_rules = self.net_allow.is_empty();
+                let policy_from = |resolved: &network::ResolvedNetAllow| {
+                    if no_rules || resolved.any_ip_all_ports {
+                        crate::seccomp::notif::NetworkPolicy::Unrestricted
+                    } else {
+                        use crate::seccomp::notif::PortAllow;
+                        let per_ip = resolved
+                            .per_ip
+                            .iter()
+                            .map(|(ip, ports)| {
+                                let allow = if resolved.per_ip_all_ports.contains(ip) {
+                                    PortAllow::Any
+                                } else {
+                                    PortAllow::Specific(ports.clone())
+                                };
+                                (*ip, allow)
+                            })
+                            .collect();
+                        crate::seccomp::notif::NetworkPolicy::AllowList {
+                            per_ip,
+                            cidrs: resolved.cidrs.clone(),
+                            any_ip_ports: resolved.any_ip_ports.clone(),
+                        }
                     }
-                }
-            };
-            net_state.tcp_policy = policy_from(&resolved_net_allow.tcp);
-            net_state.udp_policy = policy_from(&resolved_net_allow.udp);
-            net_state.icmp_policy = policy_from(&resolved_net_allow.icmp);
+                };
+                net_state.tcp_policy = policy_from(&resolved_net_allow.tcp);
+                net_state.udp_policy = policy_from(&resolved_net_allow.udp);
+                net_state.icmp_policy = policy_from(&resolved_net_allow.icmp);
+            }
             net_state.http_acl_addr = self.rt().http_acl_handle.as_ref().map(|h| h.addr);
             net_state.http_acl_ports = self.http_ports.iter().copied().collect();
             net_state.http_acl_orig_dest = self.rt().http_acl_handle.as_ref().map(|h| h.orig_dest.clone());
+            net_state.bind_deny_ports = self.net_deny_bind.iter().copied().collect();
             if let Some(cb) = self.rt_mut().on_bind.take() {
                 net_state.port_map.on_bind = Some(cb);
             }
@@ -1482,8 +1506,15 @@ impl Sandbox {
                 let mut allowed_ips: std::collections::HashSet<std::net::IpAddr> =
                     std::collections::HashSet::new();
                 for p in [&net_state.tcp_policy, &net_state.udp_policy, &net_state.icmp_policy] {
-                    if let crate::seccomp::notif::NetworkPolicy::AllowList { per_ip, .. } = p {
+                    if let crate::seccomp::notif::NetworkPolicy::AllowList { per_ip, cidrs, .. } = p {
                         allowed_ips.extend(per_ip.keys().copied());
+                        // IP literals resolve to single-host CIDRs (/32 or
+                        // /128); surface them as concrete allowed IPs too.
+                        for (net, _) in cidrs {
+                            if net.is_single_host() {
+                                allowed_ips.insert(net.addr);
+                            }
+                        }
                     }
                 }
                 let live = crate::policy_fn::LivePolicy {
@@ -1805,8 +1836,26 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "net-allow", value_name = "SPEC"))]
     pub net_allow: Vec<String>,
 
-    #[cfg_attr(feature = "cli", arg(long = "net-bind"))]
-    pub net_bind: Vec<u16>,
+    /// `--net-deny`: default-allow networking, block these IPs/CIDRs/ports.
+    /// Accepts `<ip>`, `<cidr>`, `<cidr>:<port[,port]>`, `:<port>`, `*`, and
+    /// `[<ipv6>]:<port>`. The port is optional (no `:port` means all ports).
+    /// Hostnames are rejected; use `--http-deny` for domains. Repeat the flag
+    /// for multiple rules. Mutually exclusive with `--net-allow`.
+    #[cfg_attr(feature = "cli", arg(long = "net-deny", value_name = "SPEC"))]
+    pub net_deny: Vec<String>,
+
+    /// `--net-allow-bind`: TCP ports the sandbox may bind/listen on
+    /// (default-deny). Each value is a comma-separated list of single ports
+    /// or inclusive `lo-hi` ranges, e.g. `8080,9000-9005`. Repeatable.
+    #[cfg_attr(feature = "cli", arg(long = "net-allow-bind", value_name = "PORTS"))]
+    pub net_allow_bind: Vec<String>,
+
+    /// `--net-deny-bind`: TCP ports the sandbox may NOT bind/listen on
+    /// (default-allow denylist; the inverse of `--net-allow-bind`). Same
+    /// port syntax (comma-separated ports / `lo-hi` ranges). Repeatable.
+    /// Mutually exclusive with `--net-allow-bind`.
+    #[cfg_attr(feature = "cli", arg(long = "net-deny-bind", value_name = "PORTS"))]
+    pub net_deny_bind: Vec<String>,
 
     #[cfg_attr(feature = "cli", arg(long = "http-allow", value_name = "RULE"))]
     pub http_allow: Vec<String>,
@@ -1975,7 +2024,9 @@ impl Clone for SandboxBuilder {
             extra_deny_syscalls: self.extra_deny_syscalls.clone(),
             extra_allow_syscalls: self.extra_allow_syscalls.clone(),
             net_allow: self.net_allow.clone(),
-            net_bind: self.net_bind.clone(),
+            net_deny: self.net_deny.clone(),
+            net_allow_bind: self.net_allow_bind.clone(),
+            net_deny_bind: self.net_deny_bind.clone(),
             http_allow: self.http_allow.clone(),
             http_deny: self.http_deny.clone(),
             http_ports: self.http_ports.clone(),
@@ -2091,8 +2142,39 @@ impl SandboxBuilder {
         self
     }
 
-    pub fn net_bind_port(mut self, port: u16) -> Self {
-        self.net_bind.push(port);
+    /// Add a `--net-deny` rule. See the field docs for accepted forms.
+    pub fn net_deny(mut self, spec: impl Into<String>) -> Self {
+        self.net_deny.push(spec.into());
+        self
+    }
+
+    /// Allow binding a single TCP port. For comma-separated lists or
+    /// `lo-hi` ranges, use [`net_allow_bind`](Self::net_allow_bind).
+    pub fn net_allow_bind_port(mut self, port: u16) -> Self {
+        self.net_allow_bind.push(port.to_string());
+        self
+    }
+
+    /// Allow binding TCP ports from a spec: a comma-separated list of single
+    /// ports or inclusive `lo-hi` ranges (e.g. `"8080,9000-9005"`).
+    pub fn net_allow_bind(mut self, spec: impl Into<String>) -> Self {
+        self.net_allow_bind.push(spec.into());
+        self
+    }
+
+    /// Deny binding a single TCP port (default-allow denylist). For
+    /// comma-separated lists or `lo-hi` ranges, use
+    /// [`net_deny_bind`](Self::net_deny_bind).
+    pub fn net_deny_bind_port(mut self, port: u16) -> Self {
+        self.net_deny_bind.push(port.to_string());
+        self
+    }
+
+    /// Deny binding TCP ports from a spec: a comma-separated list of single
+    /// ports or inclusive `lo-hi` ranges (e.g. `"8080,9000-9005"`). The
+    /// inverse of [`net_allow_bind`](Self::net_allow_bind).
+    pub fn net_deny_bind(mut self, spec: impl Into<String>) -> Self {
+        self.net_deny_bind.push(spec.into());
         self
     }
 
@@ -2369,8 +2451,34 @@ impl SandboxBuilder {
         let mut net_allow: Vec<NetAllow> = self
             .net_allow
             .into_iter()
-            .map(|s| NetAllow::parse(&s))
+            .map(|s| NetRule::parse_allow(&s))
             .collect::<Result<_, _>>()?;
+
+        // Parse --net-deny rules (one rule per spec).
+        let net_deny: Vec<NetDeny> = self
+            .net_deny
+            .into_iter()
+            .map(|s| NetRule::parse_deny(&s))
+            .collect::<Result<_, _>>()?;
+
+        // --net-allow and --net-deny are mutually exclusive. Check the
+        // user-supplied allow count (the original specs), not the post-HTTP
+        // extension, so a coexisting --http-deny does not false-trigger.
+        if !net_allow.is_empty() && !net_deny.is_empty() {
+            return Err(SandboxError::Invalid(
+                "--net-allow and --net-deny are mutually exclusive".into(),
+            ));
+        }
+
+        // Expand bind port specs. --net-allow-bind (default-deny allowlist)
+        // and --net-deny-bind (default-allow denylist) are contradictory.
+        let net_allow_bind = parse_bind_ports(&self.net_allow_bind, "--net-allow-bind")?;
+        let net_deny_bind = parse_bind_ports(&self.net_deny_bind, "--net-deny-bind")?;
+        if !net_allow_bind.is_empty() && !net_deny_bind.is_empty() {
+            return Err(SandboxError::Invalid(
+                "--net-allow-bind and --net-deny-bind are mutually exclusive".into(),
+            ));
+        }
 
         crate::http::extend_net_allow_for_http(
             &mut net_allow,
@@ -2387,7 +2495,9 @@ impl SandboxBuilder {
             extra_allow_syscalls: self.extra_allow_syscalls,
             protection_policy: self.protection_policy,
             net_allow,
-            net_bind: self.net_bind,
+            net_deny,
+            net_allow_bind,
+            net_deny_bind,
             http_allow,
             http_deny,
             http_ports,
@@ -2436,6 +2546,48 @@ impl SandboxBuilder {
         p.validate()?;
         Ok(p)
     }
+}
+
+/// Expand `--net-allow-bind` specs into a sorted, deduplicated port list.
+/// Each spec is a comma-separated list of single ports (`8080`) or inclusive
+/// `lo-hi` ranges (`8000-8010`). Mirrors the Python SDK's `parse_ports`.
+fn parse_bind_ports(specs: &[String], label: &str) -> Result<Vec<u16>, SandboxError> {
+    let mut ports: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+    for spec in specs {
+        for part in spec.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                return Err(SandboxError::Invalid(format!(
+                    "{}: empty port in `{}`",
+                    label, spec
+                )));
+            }
+            match part.split_once('-') {
+                Some((lo, hi)) => {
+                    let lo: u16 = lo.trim().parse().map_err(|_| {
+                        SandboxError::Invalid(format!("{}: invalid port range `{}`", label, part))
+                    })?;
+                    let hi: u16 = hi.trim().parse().map_err(|_| {
+                        SandboxError::Invalid(format!("{}: invalid port range `{}`", label, part))
+                    })?;
+                    if lo > hi {
+                        return Err(SandboxError::Invalid(format!(
+                            "{}: reversed port range `{}` (lo > hi)",
+                            label, part
+                        )));
+                    }
+                    ports.extend(lo..=hi);
+                }
+                None => {
+                    let p: u16 = part.parse().map_err(|_| {
+                        SandboxError::Invalid(format!("{}: invalid port `{}`", label, part))
+                    })?;
+                    ports.insert(p);
+                }
+            }
+        }
+    }
+    Ok(ports.into_iter().collect())
 }
 
 /// Resolve a path as seen inside the sandbox to its host-side location, so its
@@ -2613,6 +2765,80 @@ mod tests {
             .build()
             .unwrap();
         assert!(!p3.allows_sysv_ipc());
+    }
+
+    #[test]
+    fn builder_parses_net_deny() {
+        let policy = Sandbox::builder()
+            .net_deny("10.0.0.0/8")
+            .build()
+            .unwrap();
+        assert_eq!(policy.net_deny.len(), 1);
+    }
+
+    #[test]
+    fn builder_net_allow_bind_comma_and_ranges() {
+        // Comma-separated ports and `lo-hi` ranges expand, sort, and dedup.
+        let policy = Sandbox::builder()
+            .net_allow_bind("8080,9000-9002")
+            .net_allow_bind_port(443)
+            .net_allow_bind("9001,443") // overlaps dedup away
+            .build()
+            .unwrap();
+        assert_eq!(policy.net_allow_bind, vec![443, 8080, 9000, 9001, 9002]);
+    }
+
+    #[test]
+    fn builder_net_allow_bind_rejects_bad_specs() {
+        assert!(Sandbox::builder().net_allow_bind("9000-8000").build().is_err()); // reversed
+        assert!(Sandbox::builder().net_allow_bind("80,abc").build().is_err());    // bad port
+        assert!(Sandbox::builder().net_allow_bind("70000").build().is_err());     // > u16
+        assert!(Sandbox::builder().net_allow_bind("8080,").build().is_err());     // empty part
+    }
+
+    #[test]
+    fn builder_rejects_net_allow_and_net_deny_together() {
+        let err = Sandbox::builder()
+            .net_allow("github.com:443")
+            .net_deny("10.0.0.0/8")
+            .build();
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn builder_net_deny_bind_comma_and_ranges() {
+        // Same port grammar as --net-allow-bind (comma lists + lo-hi ranges).
+        let policy = Sandbox::builder()
+            .net_deny_bind("8080,9000-9002")
+            .net_deny_bind_port(443)
+            .build()
+            .unwrap();
+        assert_eq!(policy.net_deny_bind, vec![443, 8080, 9000, 9001, 9002]);
+        assert!(policy.net_allow_bind.is_empty());
+    }
+
+    #[test]
+    fn builder_rejects_allow_bind_and_deny_bind_together() {
+        let err = Sandbox::builder()
+            .net_allow_bind("8080")
+            .net_deny_bind("9090")
+            .build();
+        assert!(err.is_err());
+        assert!(format!("{}", err.unwrap_err()).contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn builder_net_deny_rejects_hostname() {
+        let err = Sandbox::builder().net_deny("evil.com:443").build();
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn net_deny_resolves_to_denylist_policies() {
+        let policy = Sandbox::builder().net_deny("10.0.0.0/8").build().unwrap();
+        let set = crate::network::resolve_net_deny(&policy.net_deny);
+        assert!(!set.tcp.allows("10.0.0.5".parse().unwrap(), 443));
+        assert!(set.tcp.allows("8.8.8.8".parse().unwrap(), 443));
     }
 
 }

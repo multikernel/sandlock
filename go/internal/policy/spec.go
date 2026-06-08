@@ -45,31 +45,34 @@ func ParseMemory(s string) (uint64, error) {
 }
 
 // ParsePorts expands a list of port specs into a sorted, de-duplicated list of
-// individual port numbers. Each spec is a single port ("80") or an inclusive
-// range ("8000-9000"). Values must fall in [0, 65535].
+// individual port numbers. Each spec is a comma-separated list of single ports
+// ("80") or inclusive ranges ("8000-9000"), e.g. "8080,9000-9005" (matching
+// the CLI's --net-allow-bind grammar). Values must fall in [0, 65535].
 func ParsePorts(specs []string) ([]uint16, error) {
 	set := map[uint16]struct{}{}
 	for _, spec := range specs {
-		m := portRe.FindStringSubmatch(strings.TrimSpace(spec))
-		if m == nil {
-			return nil, fmt.Errorf("invalid port spec: %q", spec)
-		}
-		lo, err := strconv.Atoi(m[1])
-		if err != nil {
-			return nil, fmt.Errorf("invalid port spec: %q", spec)
-		}
-		hi := lo
-		if m[2] != "" {
-			hi, err = strconv.Atoi(m[2])
-			if err != nil {
-				return nil, fmt.Errorf("invalid port spec: %q", spec)
+		for _, part := range strings.Split(spec, ",") {
+			m := portRe.FindStringSubmatch(strings.TrimSpace(part))
+			if m == nil {
+				return nil, fmt.Errorf("invalid port spec: %q", part)
 			}
-		}
-		if lo > hi || lo < 0 || hi > 65535 {
-			return nil, fmt.Errorf("invalid port range: %q", spec)
-		}
-		for p := lo; p <= hi; p++ {
-			set[uint16(p)] = struct{}{}
+			lo, err := strconv.Atoi(m[1])
+			if err != nil {
+				return nil, fmt.Errorf("invalid port spec: %q", part)
+			}
+			hi := lo
+			if m[2] != "" {
+				hi, err = strconv.Atoi(m[2])
+				if err != nil {
+					return nil, fmt.Errorf("invalid port spec: %q", part)
+				}
+			}
+			if lo > hi || lo < 0 || hi > 65535 {
+				return nil, fmt.Errorf("invalid port range: %q", part)
+			}
+			for p := lo; p <= hi; p++ {
+				set[uint16(p)] = struct{}{}
+			}
 		}
 	}
 	out := make([]uint16, 0, len(set))

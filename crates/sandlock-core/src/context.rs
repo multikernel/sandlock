@@ -373,6 +373,8 @@ const PORT_REMAP_SYSCALLS: &[i64] = &[
 
 fn needs_network_supervision(policy: &Sandbox) -> bool {
     !policy.net_allow.is_empty()
+        || !policy.net_deny.is_empty()
+        || !policy.net_deny_bind.is_empty()
         || policy.policy_fn.is_some()
         || !policy.http_allow.is_empty()
         || !policy.http_deny.is_empty()
@@ -584,9 +586,14 @@ pub fn arg_filters(policy: &Sandbox) -> Vec<SockFilter> {
     use crate::sandbox::Protocol;
     let any_udp_rule = policy.net_allow.iter().any(|r| r.protocol == Protocol::Udp);
     let any_icmp_rule = policy.net_allow.iter().any(|r| r.protocol == Protocol::Icmp);
+    // `--net-deny` is default-allow, so UDP and the kernel ping socket
+    // (both SOCK_DGRAM) must be creatable; without this the sandbox
+    // could not even do DNS over UDP. Per-destination UDP/ICMP denial
+    // is still enforced on the sendto on-behalf path via the DenyList.
+    let net_deny_active = !policy.net_deny.is_empty();
     let mut blocked_types: Vec<u32> = Vec::new();
     blocked_types.push(SOCK_RAW);
-    if !any_udp_rule && !any_icmp_rule {
+    if !any_udp_rule && !any_icmp_rule && !net_deny_active {
         blocked_types.push(SOCK_DGRAM);
     }
 
@@ -1168,6 +1175,19 @@ mod tests {
         assert!(nrs.contains(&(libc::SYS_sendto as u32)));
         assert!(nrs.contains(&(libc::SYS_sendmsg as u32)));
         assert!(nrs.contains(&(libc::SYS_sendmmsg as u32)));
+    }
+
+    #[test]
+    fn test_notif_syscalls_net_deny() {
+        // --net-deny is default-allow but still needs every connect/sendto
+        // routed to the on-behalf path so the DenyList can refuse matches.
+        let policy = Sandbox::builder()
+            .net_deny("10.0.0.0/8")
+            .build()
+            .unwrap();
+        let nrs = notif_syscalls(&policy, None);
+        assert!(nrs.contains(&(libc::SYS_connect as u32)));
+        assert!(nrs.contains(&(libc::SYS_sendto as u32)));
     }
 
     #[test]

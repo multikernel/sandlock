@@ -280,6 +280,11 @@ pub fn compute_fs_mask(abi: u32, pol: &ProtectionPolicy) -> u64 {
 /// covers every port we drop `CONNECT_TCP` from the handled set (the
 /// on-behalf path is then the sole enforcer).
 ///
+/// `--net-deny` is default-allow: every TCP connect must reach the
+/// on-behalf seccomp path (the DenyList enforcer), so Landlock must not
+/// gate `CONNECT_TCP` at all. A non-empty `net_deny` therefore forces the
+/// wildcard treatment, exactly like an all-ports `--net-allow` rule.
+///
 /// Returns `(0, false)` when `Protection::NetTcp` is not `Active`
 /// (either disabled by policy or degraded on a kernel that does not
 /// provide TCP network hooks).
@@ -302,15 +307,24 @@ pub fn compute_net_mask(
         return (0, false);
     }
     use crate::sandbox::Protocol;
-    let net_wildcard = sandbox
-        .net_allow
-        .iter()
-        .any(|r| r.protocol == Protocol::Tcp && r.all_ports);
-    let mask = if net_wildcard {
+    let net_wildcard = !sandbox.net_deny.is_empty()
+        || sandbox
+            .net_allow
+            .iter()
+            .any(|r| r.protocol == Protocol::Tcp && r.all_ports);
+    let mut mask = if net_wildcard {
         LANDLOCK_ACCESS_NET_BIND_TCP
     } else {
         LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP
     };
+    // `--net-deny-bind` is default-allow: every TCP bind must reach the
+    // on-behalf seccomp handler (the bind denylist enforcer), so Landlock
+    // must not gate BIND_TCP. Drop it from the handled set; the on-behalf
+    // path becomes the sole bind enforcer. (Mutually exclusive with
+    // `--net-allow-bind`, so no kernel bind rules are installed either.)
+    if !sandbox.net_deny_bind.is_empty() {
+        mask &= !LANDLOCK_ACCESS_NET_BIND_TCP;
+    }
     (mask, net_wildcard)
 }
 
@@ -477,7 +491,7 @@ fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError
     let net_tcp_active =
         ProtectionStatus::resolve(Protection::NetTcp, abi, pol) == ProtectionStatus::Active;
     if handle_net && net_tcp_active {
-        for &port in &policy.net_bind {
+        for &port in &policy.net_allow_bind {
             add_net_rule(&ruleset_fd, port, LANDLOCK_ACCESS_NET_BIND_TCP).map_err(|e| {
                 SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
             })?;
@@ -730,5 +744,50 @@ mod mask_contract_tests {
         let (mask, wildcard) = compute_net_mask(3, &pol, &sb, true);
         assert_eq!(mask, 0);
         assert!(!wildcard);
+    }
+
+    #[test]
+    fn net_mask_net_deny_forces_wildcard_dropping_connect_tcp() {
+        // `--net-deny` is default-allow and enforced on the on-behalf
+        // seccomp path, so Landlock must not gate CONNECT_TCP: a non-empty
+        // net_deny forces the wildcard treatment (BIND_TCP only), exactly
+        // like an all-ports --net-allow rule. This pins the reconciliation
+        // of the net-deny runtime relaxation with compute_net_mask.
+        let pol = ProtectionPolicy::strict_all();
+        let sb = Sandbox::builder()
+            .net_deny("10.0.0.0/8")
+            .build()
+            .expect("net_deny sandbox builds");
+        let (mask, wildcard) = compute_net_mask(6, &pol, &sb, true);
+        assert_eq!(
+            mask,
+            LANDLOCK_ACCESS_NET_BIND_TCP,
+            "net_deny must drop CONNECT_TCP so all TCP connects reach the on-behalf path",
+        );
+        assert!(wildcard, "net_deny must set the wildcard flag");
+    }
+
+    #[test]
+    fn net_mask_net_deny_bind_drops_bind_tcp() {
+        // `--net-deny-bind` is default-allow and enforced on the on-behalf
+        // bind() path, so Landlock must NOT gate BIND_TCP: every TCP bind has
+        // to reach the supervisor's denylist check. The mask keeps CONNECT_TCP
+        // (no connect rules here) but drops BIND_TCP.
+        let pol = ProtectionPolicy::strict_all();
+        let sb = Sandbox::builder()
+            .net_deny_bind("8080")
+            .build()
+            .expect("net_deny_bind sandbox builds");
+        let (mask, _wildcard) = compute_net_mask(6, &pol, &sb, true);
+        assert_eq!(
+            mask & LANDLOCK_ACCESS_NET_BIND_TCP,
+            0,
+            "net_deny_bind must drop BIND_TCP so all TCP binds reach the on-behalf path",
+        );
+        assert_ne!(
+            mask & LANDLOCK_ACCESS_NET_CONNECT_TCP,
+            0,
+            "net_deny_bind must not affect CONNECT_TCP handling",
+        );
     }
 }

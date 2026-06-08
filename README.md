@@ -110,12 +110,17 @@ sandlock run --net-allow api.openai.com:443 -r /usr -r /lib -r /etc -- python3 a
 sandlock run --net-allow github.com:22,443 --net-allow :8080 \
   -r /usr -r /lib -r /etc -- python3 agent.py
 
-# Wildcard port — `host:*` permits every port to the host
-sandlock run --net-allow github.com:* -r /usr -r /lib -r /etc -- ssh user@github.com
+# Wildcard port (optional): a bare `host` (or `host:*`) permits every port
+sandlock run --net-allow github.com -r /usr -r /lib -r /etc -- ssh user@github.com
 
-# Unrestricted outbound — `:*` opens any host and any TCP port. For full
-# egress add a UDP wildcard via the `udp://*:*` scheme.
-sandlock run --net-allow :* --net-allow udp://*:* \
+# IP, CIDR range, or IPv6 literal as the target (matched by containment,
+# no DNS); same grammar as --net-deny
+sandlock run --net-allow 10.0.0.0/8:443 --net-allow '[2606:4700::/32]:443' \
+  -r /usr -r /lib -r /etc -- python3 agent.py
+
+# Unrestricted outbound: `*` opens any host and any TCP port (`:*` / `*:*`
+# are equivalent). For full egress add a UDP wildcard, `udp://*`.
+sandlock run --net-allow '*' --net-allow 'udp://*' \
   -r /usr -r /lib -r /etc -- ./client
 
 # UDP — scheme prefix gates the protocol and scopes the destination
@@ -125,6 +130,11 @@ sandlock run --net-allow udp://1.1.1.1:53 --net-allow :443 \
 
 # Ping — kernel ping socket (SOCK_DGRAM) gated by net.ipv4.ping_group_range
 sandlock run --net-allow icmp://github.com -r /usr -r /lib -r /etc -- ping github.com
+
+# Denylist: default-allow networking, block specific IPs/CIDRs/ports
+# (inverse of --net-allow; mutually exclusive with it). Port is optional.
+sandlock run --net-deny 169.254.169.254 --net-deny 10.0.0.0/8 \
+  -r /usr -r /lib -r /etc -- python3 agent.py
 
 # HTTP-level ACL (method + host + path rules via transparent proxy)
 # HTTP rules with concrete hosts auto-extend --net-allow with host:80,443
@@ -156,8 +166,9 @@ sandlock run \
   --http-ca ca.pem --http-key ca-key.pem \
   -r /usr -r /lib -r /etc -- python3 agent.py
 
-# Server listening on a port (Landlock --net-bind, separate from --net-allow)
-sandlock run --net-bind 8080 -r /usr -r /lib -r /etc -- python3 server.py
+# Server listening on ports (Landlock --net-allow-bind, separate from --net-allow;
+# accepts comma-separated ports and lo-hi ranges, repeatable)
+sandlock run --net-allow-bind 8080,9000-9005 -r /usr -r /lib -r /etc -- python3 server.py
 
 # Clean environment
 sandlock run --clean-env --env CC=gcc \
@@ -167,11 +178,11 @@ sandlock run --clean-env --env CC=gcc \
 sandlock run --time-start "2000-01-01T00:00:00Z" --random-seed 42 -- ./build.sh
 
 # Port virtualization (multiple sandboxes can bind the same port)
-sandlock run --port-remap --net-bind 6379 -r /usr -r /lib -r /etc -- redis-server --port 6379
+sandlock run --port-remap --net-allow-bind 6379 -r /usr -r /lib -r /etc -- redis-server --port 6379
 
 # Port virtualization with named sandboxes (enables network discovery)
-sandlock run --name api.local --port-remap --net-bind 8080 -r /usr -r /lib -r /etc -- python3 server.py
-sandlock run --name web.local --port-remap --net-bind 8080 -r /usr -r /lib -r /etc -- python3 server.py
+sandlock run --name api.local --port-remap --net-allow-bind 8080 -r /usr -r /lib -r /etc -- python3 server.py
+sandlock run --name web.local --port-remap --net-allow-bind 8080 -r /usr -r /lib -r /etc -- python3 server.py
 
 # List all running sandboxes
 sandlock list
@@ -575,16 +586,24 @@ Landlock + seccomp confinement. `CLONE_ID=0..N-1` is set automatically.
 
 ### Network Model
 
-Outbound traffic is gated by a single endpoint allowlist that names
-**protocol × destination**. Each `--net-allow` rule is one of:
+Outbound traffic is gated by an endpoint list naming
+**protocol × destination**. `--net-allow` (allowlist) and `--net-deny`
+(denylist) share one grammar and are mutually exclusive:
 
 ```
---net-allow <spec>          repeatable; no rules = deny all outbound
-  bare form  host:port[,port,...] / :port / *:port / host:* / :* / *:*   (TCP)
-  tcp://     same suffix grammar — explicit TCP
-  udp://     same suffix grammar — UDP (`udp://*:*` opens any UDP)
-  icmp://    host or `*`, no port — kernel ping socket (SOCK_DGRAM)
+<spec>     repeatable; the port is optional (a bare target = all ports)
+  target   host | <ip> | <cidr> | *           (`*` or empty target = any IP)
+  forms    target[:port[,port,...]] · :port · host:* · :* · *:*
+           [<ipv6|cidr>]:port                  (bracket IPv6 when a port follows)
+  scheme   tcp:// (default) · udp:// (`udp://*` = any UDP) · icmp:// (no port)
+
+  --net-allow  target may also be a hostname, resolved via DNS at start
+  --net-deny   target must be a literal IP/CIDR (no hostnames; use --http-deny)
 ```
+
+A comma groups ports within one spec (`host:80,443`); to pass multiple
+rules, repeat the flag. IP and CIDR targets are matched by containment
+with no DNS (an IP literal is a `/32` or `/128`); only hostnames resolve.
 
 Multiple rules are OR'd. A destination is permitted iff some rule
 matches the **same protocol** as the socket plus the destination IP
@@ -606,20 +625,39 @@ and port (port is N/A for ICMP).
 denies every TCP `connect()`, UDP / ICMP / raw socket creation are
 denied at the seccomp layer, and there is no on-behalf path active.
 For unrestricted TCP egress, opt in explicitly with
-`--net-allow :*`; for any UDP, add `--net-allow udp://*:*`.
+`--net-allow '*'`; for any UDP, add `--net-allow 'udp://*'`.
 
-**Resolution.** Concrete hostnames are resolved once at sandbox start
-and pinned in a synthetic `/etc/hosts` (across all protocols). The
-synthetic file replaces the real one only when at least one rule has
-a concrete host; pure `:port` / `udp://*:*` / `icmp://*` rules leave
-the real `/etc/hosts` and DNS visible.
+**Denylist (`--net-deny`).** The inverse of the allowlist: networking is
+default-allow and the listed targets are blocked. It uses the same
+grammar as `--net-allow` above, the only difference being that targets
+must be literal IPs/CIDRs (hostnames are rejected; use `--http-deny` for
+domains). Examples:
+
+```
+--net-deny 10.0.0.0/8               # all ports on a CIDR (all protocols)
+--net-deny 169.254.169.254:80      # one IP, one port
+--net-deny 169.254.169.254:80,443  # comma-separated ports in one rule
+--net-deny '*'                     # any IP, all ports (TCP)
+--net-deny 'udp://192.168.0.0/16'  # any UDP to a CIDR
+```
+
+**Resolution.** Only hostname targets touch DNS: they are resolved once
+at sandbox start and pinned in a synthetic `/etc/hosts` (across all
+protocols). IP and CIDR targets are matched by containment directly, so
+they never resolve and never appear in `/etc/hosts`. The synthetic file
+replaces the real one only when at least one rule has a concrete
+hostname; rules made purely of IPs/CIDRs, `:port`, `udp://*`, or
+`icmp://*` leave the real `/etc/hosts` and DNS visible.
 
 **Wildcards.** Hostnames are matched literally — `--net-allow
-*.example.com:443` is **not** supported, list each domain you need.
-The `*` token is allowed as the host (alias for empty: `*:port` ≡
-`:port`) and as the port for TCP/UDP rules (`host:*`, `:*`, `*:*`,
-`udp://*:*`). Mixing `*` with concrete ports (`host:80,*`) is
-rejected. When any TCP rule uses the all-ports wildcard, Landlock no
+*.example.com:443` is **not** supported, list each domain you need (or
+use a CIDR/IP target for an address range). The `*` token is allowed as
+the target (alias for empty: `*:port` ≡ `:port`) and as the port for
+TCP/UDP rules (`host:*`, `:*`, `*:*`).
+The port is optional: omitting it means all ports, so `host` ≡
+`host:*` and `*` ≡ `:*` ≡ `*:*` (and `udp://*` ≡ `udp://*:*`). Mixing
+`*` with concrete ports (`host:80,*`) is rejected. When any TCP rule
+uses the all-ports wildcard, Landlock no
 longer filters TCP connect at the kernel level (it cannot express
 "every port" without enumerating 65535 rules); the on-behalf path
 becomes the sole enforcer, and for `:*` it short-circuits to
@@ -627,12 +665,15 @@ allow-all.
 
 **Implementation.** Two enforcement paths:
 
-  * **Direct path** — pure `:port` TCP policies (no concrete host)
-    and no HTTP ACL. Landlock enforces the TCP port allowlist at the
-    kernel level; no per-syscall overhead. UDP and ICMP are not
-    covered by Landlock and always use the on-behalf path when allowed.
-  * **On-behalf path** — any concrete host, any HTTP ACL rule, or any
-    UDP / ICMP rule. Seccomp traps `connect()`, `sendto()`, `sendmsg()`,
+  * **Direct path** — pure `:port` TCP policies (any IP, no concrete
+    host/IP/CIDR) and no HTTP ACL. Landlock enforces the TCP port
+    allowlist at the kernel level; no per-syscall overhead. UDP and ICMP
+    are not covered by Landlock and always use the on-behalf path when
+    allowed.
+  * **On-behalf path** — any host, IP, or CIDR target, any HTTP ACL
+    rule, or any UDP / ICMP rule (the destination IP must be checked,
+    which Landlock cannot do). Seccomp traps `connect()`, `sendto()`,
+    `sendmsg()`,
     and `sendmmsg()`; the supervisor dups the child fd, queries
     `getsockopt(SOL_SOCKET, SO_PROTOCOL)` to learn whether the socket
     is TCP / UDP / ICMP, then checks the destination against that
@@ -655,9 +696,16 @@ var at it (e.g. `NODE_EXTRA_CA_CERTS`). Without any of these, port 443
 is not intercepted: `--net-allow host:443` permits raw TLS to the host
 with no content inspection.
 
-**Bind.** `--net-bind <port>` is independent from `--net-allow` and
-governs server-side `bind()`. Landlock enforces it (TCP only);
-`--port-remap` adds on-behalf virtualization for binding.
+**Bind.** `--net-allow-bind <ports>` is independent from `--net-allow` and
+governs server-side `bind()` as a default-deny allowlist. Each value is a
+comma-separated list of single ports or inclusive `lo-hi` ranges (e.g.
+`--net-allow-bind 8080,9000-9005`), and the flag repeats. Landlock enforces
+it (TCP only); `--port-remap` adds on-behalf virtualization for binding.
+`--net-deny-bind <ports>` is the inverse: default-allow binding, deny the
+listed TCP ports (same port syntax, mutually exclusive with
+`--net-allow-bind`). Because Landlock is allowlist-only, a deny-bind relaxes
+the Landlock `BIND_TCP` hook and enforces the denylist on the on-behalf
+seccomp `bind()` path instead.
 
 **AF_UNIX sockets** are governed by Landlock's
 `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`, independent from `--net-allow`.

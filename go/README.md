@@ -68,7 +68,7 @@ fresh native policy on each call.
 | Group | Fields |
 |---|---|
 | Filesystem | `FSReadable`, `FSWritable`, `FSDenied`, `Workdir`, `Cwd`, `Chroot`, `FSMount` |
-| Network | `NetAllow`, `NetBind`, `PortRemap` |
+| Network | `NetAllow`, `NetDeny`, `NetAllowBind`, `NetDenyBind`, `PortRemap` |
 | HTTP ACL | `HTTPAllow`, `HTTPDeny`, `HTTPPorts`, `HTTPCAFile`, `HTTPKeyFile` |
 | Resources | `MaxMemory`, `MaxDisk`, `MaxProcesses`, `MaxCPU`, `MaxOpenFiles`, `CPUCores`, `NumCPUs`, `GPUDevices` |
 | Syscalls | `ExtraAllowSyscalls`, `ExtraDenySyscalls` |
@@ -78,10 +78,15 @@ fresh native policy on each call.
 | COW branch | `FSStorage`, `OnExit`, `OnError` |
 
 `NetAllow` entries follow sandlock's rule grammar: bare `host:port` is TCP
-(`"api.openai.com:443"`, `"github.com:22,443"`, `":53"`); scheme prefixes opt
-other protocols in (`"udp://1.1.1.1:53"`, `"udp://*:*"`, `"icmp://host"`,
-`"icmp://*"`). `NetBind` entries are single ports (`"8080"`) or inclusive
-ranges (`"3000-3010"`).
+(`"api.openai.com:443"`, `"github.com:22,443"`, `":53"`); a target may be a
+host, IP, or CIDR (`"10.0.0.0/8:443"`, `"[2606:4700::/32]:443"`); scheme
+prefixes opt other protocols in (`"udp://1.1.1.1:53"`, `"udp://*"`,
+`"icmp://host"`, `"icmp://*"`). `NetDeny` is the inverse (default-allow
+denylist, IP/CIDR targets only, mutually exclusive with `NetAllow`).
+`NetAllowBind` entries are comma-separated single ports or inclusive ranges
+(`"8080"`, `"3000-3010"`, `"8080,9000-9005"`). `NetDenyBind` is the inverse
+(default-allow bind, deny these TCP ports; same syntax, mutually exclusive
+with `NetAllowBind`).
 
 ### Execution
 

@@ -88,7 +88,9 @@ _b_max_processes = _builder_fn("sandlock_sandbox_builder_max_processes", ctypes.
 _b_max_cpu = _builder_fn("sandlock_sandbox_builder_max_cpu", ctypes.c_uint8)
 _b_num_cpus = _builder_fn("sandlock_sandbox_builder_num_cpus", ctypes.c_uint32)
 _b_net_allow = _builder_fn("sandlock_sandbox_builder_net_allow", ctypes.c_char_p)
-_b_net_bind_port = _builder_fn("sandlock_sandbox_builder_net_bind_port", ctypes.c_uint16)
+_b_net_deny = _builder_fn("sandlock_sandbox_builder_net_deny", ctypes.c_char_p)
+_b_net_allow_bind_port = _builder_fn("sandlock_sandbox_builder_net_allow_bind_port", ctypes.c_uint16)
+_b_net_deny_bind_port = _builder_fn("sandlock_sandbox_builder_net_deny_bind_port", ctypes.c_uint16)
 _b_port_remap = _builder_fn("sandlock_sandbox_builder_port_remap", ctypes.c_bool)
 _b_http_allow = _builder_fn("sandlock_sandbox_builder_http_allow", ctypes.c_char_p)
 _b_http_deny = _builder_fn("sandlock_sandbox_builder_http_deny", ctypes.c_char_p)
@@ -951,7 +953,7 @@ class _NativePolicy:
         "workdir", "cwd", "chroot", "fs_mount", "on_exit", "on_error",
         "max_memory", "max_disk", "max_processes", "max_cpu", "num_cpus",
         "cpu_cores", "gpu_devices",
-        "net_allow", "net_bind",
+        "net_allow", "net_deny", "net_allow_bind", "net_deny_bind",
         "port_remap",
         "http_allow", "http_deny", "http_ports", "http_ca", "http_key",
         "uid",
@@ -1031,12 +1033,17 @@ class _NativePolicy:
 
         # net_allow: list of endpoint specs. Bare `host:port` means TCP;
         # `tcp://`/`udp://`/`icmp://` schemes opt other protocols in.
-        # Empty = deny all outbound. Validation of each spec happens in
-        # the native build().
+        # Empty = deny all outbound. net_deny is the inverse (default-allow
+        # denylist of IP/CIDR/port specs); the two are mutually exclusive.
+        # Validation of each spec happens in the native build().
         for spec in (policy.net_allow or []):
             b = _b_net_allow(b, _encode(str(spec)))
-        for port in parse_ports(policy.net_bind) if policy.net_bind else []:
-            b = _b_net_bind_port(b, port)
+        for spec in (policy.net_deny or []):
+            b = _b_net_deny(b, _encode(str(spec)))
+        for port in parse_ports(policy.net_allow_bind) if policy.net_allow_bind else []:
+            b = _b_net_allow_bind_port(b, port)
+        for port in parse_ports(policy.net_deny_bind) if policy.net_deny_bind else []:
+            b = _b_net_deny_bind_port(b, port)
 
         for rule in (policy.http_allow or []):
             b = _b_http_allow(b, _encode(str(rule)))
