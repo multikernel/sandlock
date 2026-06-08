@@ -160,7 +160,8 @@ typedef struct {
 /**
  * C callback type for policy_fn.
  * Return value: 0 = allow, -1 = deny (EPERM), -2 = audit (allow + flag),
- * positive = deny with that errno (e.g. 13 = EACCES).
+ * positive = deny with that errno (e.g. 13 = EACCES). Any other value fails
+ * closed (deny); do not return `-errno`, which is reserved and not allowed.
  */
 typedef int32_t (*sandlock_policy_fn_t)(const sandlock_event_t *event,
                                         sandlock_ctx_t *ctx,

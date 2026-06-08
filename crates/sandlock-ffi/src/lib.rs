@@ -1813,7 +1813,8 @@ pub struct sandlock_ctx_t {
 
 /// C callback type for policy_fn.
 /// Return value: 0 = allow, -1 = deny (EPERM), -2 = audit (allow + flag),
-/// positive = deny with that errno (e.g. 13 = EACCES).
+/// positive = deny with that errno (e.g. 13 = EACCES). Any other value fails
+/// closed (deny); do not return `-errno`, which is reserved and not allowed.
 #[allow(non_camel_case_types)]
 pub type sandlock_policy_fn_t = unsafe extern "C" fn(
     event: *const sandlock_event_t,
@@ -1852,6 +1853,24 @@ impl Drop for PolicyCallbackState {
         if let Some(drop_fn) = self.user_data_drop {
             unsafe { drop_fn(self.user_data) };
         }
+    }
+}
+
+/// Translate a C policy callback's return value into a core `Verdict`.
+///
+/// `0` allows, `-1` denies (EPERM), `-2` audits, and any positive value denies
+/// with that errno. Every other value fails closed (`Deny`): a negative other
+/// than -1/-2 is reserved and a likely `-errno` mistake by a caller used to
+/// kernel convention, so denying keeps a typo'd verdict from silently disabling
+/// the policy.
+fn policy_ret_to_verdict(ret: i32) -> sandlock_core::policy_fn::Verdict {
+    use sandlock_core::policy_fn::Verdict;
+    match ret {
+        0 => Verdict::Allow,
+        -1 => Verdict::Deny,
+        -2 => Verdict::Audit,
+        errno if errno > 0 => Verdict::DenyWith(errno),
+        _ => Verdict::Deny,
     }
 }
 
@@ -1928,13 +1947,7 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_policy_fn(
         let mut c_ctx = sandlock_ctx_t { ctx: ctx as *mut _ };
 
         let ret = unsafe { state.call(&c_event, &mut c_ctx) };
-        match ret {
-            0 => sandlock_core::policy_fn::Verdict::Allow,
-            -1 => sandlock_core::policy_fn::Verdict::Deny,
-            -2 => sandlock_core::policy_fn::Verdict::Audit,
-            errno if errno > 0 => sandlock_core::policy_fn::Verdict::DenyWith(errno),
-            _ => sandlock_core::policy_fn::Verdict::Allow,
-        }
+        policy_ret_to_verdict(ret)
     };
 
     Box::into_raw(Box::new(builder.policy_fn(cb_fn)))
@@ -2425,4 +2438,27 @@ unsafe fn read_argv(argv: *const *const c_char, argc: c_uint) -> Vec<String> {
         args.push(arg);
     }
     args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::policy_ret_to_verdict;
+    use sandlock_core::policy_fn::Verdict;
+
+    #[test]
+    fn policy_ret_maps_documented_values() {
+        assert_eq!(policy_ret_to_verdict(0), Verdict::Allow);
+        assert_eq!(policy_ret_to_verdict(-1), Verdict::Deny);
+        assert_eq!(policy_ret_to_verdict(-2), Verdict::Audit);
+        assert_eq!(policy_ret_to_verdict(13), Verdict::DenyWith(13));
+    }
+
+    #[test]
+    fn policy_ret_unrecognized_values_fail_closed() {
+        // A negative other than -1/-2 is the classic `-errno` mistake; it must
+        // deny, not silently allow.
+        assert_eq!(policy_ret_to_verdict(-13), Verdict::Deny);
+        assert_eq!(policy_ret_to_verdict(-3), Verdict::Deny);
+        assert_eq!(policy_ret_to_verdict(i32::MIN), Verdict::Deny);
+    }
 }
