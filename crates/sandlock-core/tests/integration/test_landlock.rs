@@ -714,6 +714,125 @@ async fn test_named_unix_socket_connect_allowed_with_fs_write() {
     let _ = std::fs::remove_dir_all(&sock_dir);
 }
 
+// Allow-path hardening (stage 2): a symlink inside a WRITE-granted directory
+// whose real target is a socket OUTSIDE the grants must not be a bypass. A
+// lexical check on the symlink's own path would see only the in-grant location
+// and permit it; the decision must be made on the symlink's REAL target, which
+// is ungranted, so the connect must be denied with EACCES.
+#[tokio::test]
+async fn test_named_unix_socket_symlink_escape_denied() {
+    if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 {
+        eprintln!("Skipping: Landlock ABI v6 required");
+        return;
+    }
+
+    let base = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("named-unixsock-symlink-{}", std::process::id()));
+    let granted = base.join("granted"); // fs_write granted
+    let outside = base.join("outside"); // NOT granted: the escape target
+    let _ = std::fs::create_dir_all(&granted);
+    let _ = std::fs::create_dir_all(&outside);
+    let real_sock = outside.join("real.sock");
+    let link_sock = granted.join("link.sock");
+    let _ = std::fs::remove_file(&real_sock);
+    let _ = std::fs::remove_file(&link_sock);
+    std::os::unix::fs::symlink(&real_sock, &link_sock).unwrap();
+
+    let out = temp_file("named-sock-symlink-result");
+    let ready_file = temp_file("named-sock-symlink-ready");
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&ready_file);
+
+    // Listener binds the REAL socket, in the ungranted directory.
+    let listener_script = format!(
+        concat!(
+            "import socket, time\n",
+            "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n",
+            "s.bind('{sock}')\n",
+            "s.listen(5)\n",
+            "open('{ready}', 'w').write('ready')\n",
+            "time.sleep(15)\n",
+            "s.close()\n",
+        ),
+        sock = real_sock.display(),
+        ready = ready_file.display(),
+    );
+    let mut listener_proc = std::process::Command::new("python3")
+        .args(["-c", &listener_script])
+        .spawn()
+        .unwrap();
+    for _ in 0..100 {
+        if ready_file.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(ready_file.exists(), "listener should signal readiness");
+
+    // Positive control: the symlink really does resolve and connect from outside
+    // the sandbox, so the escape path is live and the sandbox must refuse it.
+    {
+        let control = std::os::unix::net::UnixStream::connect(&link_sock);
+        assert!(
+            control.is_ok(),
+            "positive control: symlink must resolve+connect from host (got {control:?})"
+        );
+    }
+
+    // Child connects to the in-grant SYMLINK; its real target is ungranted.
+    let child_script = format!(
+        concat!(
+            "import socket\n",
+            "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n",
+            "try:\n",
+            "    s.connect('{sock}')\n",
+            "    result = 'CONNECTED'\n",
+            "except OSError as e:\n",
+            "    result = 'ERRNO:%d' % e.errno\n",
+            "finally:\n",
+            "    s.close()\n",
+            "open('{out}', 'w').write(result)\n",
+        ),
+        sock = link_sock.display(),
+        out = out.display(),
+    );
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write("/tmp")
+        // the symlink's directory is writable; the real target's dir is NOT granted
+        .fs_write(granted.to_str().unwrap())
+        .build()
+        .unwrap();
+
+    policy
+        .clone()
+        .with_name("test")
+        .run_interactive(&["python3", "-c", &child_script])
+        .await
+        .unwrap();
+
+    let contents = std::fs::read_to_string(&out).unwrap_or_default();
+    assert_eq!(
+        contents, "ERRNO:13",
+        "a symlink to an ungranted socket must be denied on its real target (got {contents:?})"
+    );
+
+    let _ = listener_proc.kill();
+    let _ = listener_proc.wait();
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&ready_file);
+    let _ = std::fs::remove_file(&real_sock);
+    let _ = std::fs::remove_file(&link_sock);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 #[tokio::test]
 async fn test_isolate_signals_blocks_parent() {
     if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 {

@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -719,19 +719,110 @@ async fn connect_on_behalf(
         // Abstract sockets (no path) are handled by the Landlock abstract scope.
         match named_unix_socket_path(&addr_bytes) {
             Some(path) if ctx.policy.has_unix_fs_gate => {
-                if path_under_any(&path, &ctx.policy.chroot_writable) {
-                    // Permitted by an fs-write grant. Hardening the allow path
-                    // into an on-behalf connect is a follow-up; this preserves
-                    // prior behavior for paths the operator already granted.
-                    NotifAction::Continue
+                if ctx.policy.chroot_root.is_some() {
+                    // Chroot mode: the child's paths are virtual, so a lexical
+                    // check against the (virtual) write grants is consistent,
+                    // and host socket paths are absent from the chroot view
+                    // anyway. Deny unless under a write grant.
+                    if path_under_any(&path, &ctx.policy.chroot_writable) {
+                        NotifAction::Continue
+                    } else {
+                        NotifAction::Errno(libc::EACCES)
+                    }
                 } else {
-                    NotifAction::Errno(libc::EACCES)
+                    // Non-chroot: resolve the symlink-followed real target and
+                    // connect on-behalf to the pinned inode, so a symlink inside
+                    // a granted dir cannot redirect to an ungranted socket.
+                    connect_named_unix_on_behalf(
+                        notif.pid,
+                        sockfd,
+                        &path,
+                        &ctx.policy.chroot_writable,
+                    )
                 }
             }
             // Abstract/unnamed socket, non-AF_UNIX family, or gate disabled.
             _ => NotifAction::Continue,
         }
     }
+}
+
+/// On-behalf connect for a NAMED `AF_UNIX` socket in non-chroot mode. Resolves
+/// `sun_path` to its real target inode (following symlinks in the child's root
+/// view via `/proc/<pid>/root`), verifies the target is under an fs-write
+/// grant, then connects the child's socket to that pinned inode through
+/// `/proc/self/fd`. TOCTOU- and symlink-safe: the inode that is checked is the
+/// exact inode that is connected, and the verdict never depends on re-resolving
+/// a path string the child could swap.
+fn connect_named_unix_on_behalf(
+    child_pid: u32,
+    sockfd: i32,
+    sun_path: &std::path::Path,
+    writable: &[std::path::PathBuf],
+) -> NotifAction {
+    // Resolve in the child's mount/root view so its symlinks (not ours) decide
+    // the target. `O_PATH` follows symlinks to the real socket inode and pins
+    // it without performing any I/O on the socket.
+    let proc_path = format!("/proc/{}/root{}", child_pid, sun_path.display());
+    let c_proc = match std::ffi::CString::new(proc_path) {
+        Ok(c) => c,
+        Err(_) => return NotifAction::Errno(libc::EACCES),
+    };
+    let pinned_raw = unsafe { libc::open(c_proc.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    if pinned_raw < 0 {
+        // Target missing or unreachable: refuse without leaking the reason.
+        return NotifAction::Errno(ECONNREFUSED);
+    }
+    let pinned = unsafe { OwnedFd::from_raw_fd(pinned_raw) };
+
+    // Canonical path of the pinned inode in our mount namespace.
+    let real = match std::fs::read_link(format!("/proc/self/fd/{}", pinned.as_raw_fd())) {
+        Ok(p) => p,
+        Err(_) => return NotifAction::Errno(libc::EACCES),
+    };
+    if !real_path_under_any(&real, writable) {
+        return NotifAction::Errno(libc::EACCES);
+    }
+
+    // Connect the child's socket to the validated inode. Targeting
+    // `/proc/self/fd/<fd>` reaches the exact inode we checked, immune to a path
+    // swap after the check.
+    let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(child_pid, sockfd) {
+        Ok(fd) => fd,
+        Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
+    };
+    let fd_path = format!("/proc/self/fd/{}", pinned.as_raw_fd());
+    let mut sun: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    sun.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = fd_path.as_bytes();
+    if bytes.len() >= sun.sun_path.len() {
+        return NotifAction::Errno(libc::ENAMETOOLONG);
+    }
+    for (i, &b) in bytes.iter().enumerate() {
+        sun.sun_path[i] = b as libc::c_char;
+    }
+    let len = (std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1) as libc::socklen_t;
+    let ret = unsafe {
+        libc::connect(
+            dup_fd.as_raw_fd(),
+            &sun as *const libc::sockaddr_un as *const libc::sockaddr,
+            len,
+        )
+    };
+    if ret == 0 {
+        NotifAction::ReturnValue(0)
+    } else {
+        NotifAction::Errno(unsafe { *libc::__errno_location() })
+    }
+}
+
+/// True if `real` (an already-canonical path) is at or under any of `prefixes`,
+/// canonicalizing each prefix so a symlinked grant path still matches.
+fn real_path_under_any(real: &std::path::Path, prefixes: &[std::path::PathBuf]) -> bool {
+    prefixes.iter().any(|p| {
+        let canon = std::fs::canonicalize(p);
+        real.starts_with(canon.as_deref().unwrap_or(p))
+    })
 }
 
 /// Extract the filesystem path of a NAMED `AF_UNIX` connect target from a raw
