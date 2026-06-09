@@ -409,6 +409,12 @@ pub struct NotifPolicy {
     /// handler so denied TCP ports can be refused (independent of the
     /// connect-side `has_net_allowlist`).
     pub has_bind_denylist: bool,
+    /// Named (pathname) `AF_UNIX` connect gate. When true, `connect()` to a
+    /// named unix socket whose path is not covered by an fs-write grant is
+    /// denied with EACCES. Landlock has no access right for unix-socket
+    /// connect, so the seccomp layer closes the escape; abstract sockets are
+    /// handled by `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` instead.
+    pub has_unix_fs_gate: bool,
     pub has_random_seed: bool,
     pub has_time_start: bool,
     /// Argv-safety gate: the supervisor must freeze every task that

@@ -324,9 +324,10 @@ pub(crate) fn build_dispatch_table(
     }
 
     // ------------------------------------------------------------------
-    // Network (conditional on has_net_allowlist || has_http_acl)
+    // Network (conditional on has_net_allowlist || has_http_acl ||
+    // has_unix_fs_gate; the last traps connect() to gate named unix sockets)
     // ------------------------------------------------------------------
-    if policy.has_net_allowlist || policy.has_http_acl {
+    if policy.has_net_allowlist || policy.has_http_acl || policy.has_unix_fs_gate {
         for &nr in &[
             libc::SYS_connect,
             libc::SYS_sendto,
@@ -1085,6 +1086,7 @@ mod handler_tests {
                 has_memory_limit: false,
                 has_net_allowlist: false,
                 has_bind_denylist: false,
+                has_unix_fs_gate: false,
                 has_random_seed: false,
                 has_time_start: false,
                 time_offset: 0,

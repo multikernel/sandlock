@@ -1075,6 +1075,15 @@ impl Sandbox {
         reducer.wait().await
     }
 
+    /// Whether named (pathname) `AF_UNIX` connects should be gated by the
+    /// fs-write grants (`has_unix_fs_gate`). Active whenever the sandbox
+    /// confines the filesystem; Landlock cannot gate unix-socket connect, so
+    /// the seccomp layer does. Single source of truth for both the
+    /// `NotifPolicy` flag and the `notif_syscalls` BPF set.
+    pub(crate) fn has_unix_fs_gate(&self) -> bool {
+        !self.fs_readable.is_empty() || !self.fs_writable.is_empty()
+    }
+
     /// Lazily initialize the runtime block.
     ///
     /// Called by lifecycle methods (`spawn`, `run`, `fork`, etc.) on first
@@ -1408,6 +1417,7 @@ impl Sandbox {
                     || !self.http_allow.is_empty()
                     || !self.http_deny.is_empty(),
                 has_bind_denylist: !self.net_deny_bind.is_empty(),
+                has_unix_fs_gate: self.has_unix_fs_gate(),
                 has_random_seed: self.random_seed.is_some(),
                 has_time_start: self.time_start.is_some(),
                 argv_safety_required: self.policy_fn.is_some()

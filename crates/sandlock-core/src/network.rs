@@ -708,9 +708,64 @@ async fn connect_on_behalf(
         }
         // dup_fd dropped here, closing supervisor's copy
     } else {
-        // Non-IP family (AF_UNIX etc.) — allow through
-        NotifAction::Continue
+        // Non-IP family. A NAMED (pathname) AF_UNIX connect is a gap Landlock
+        // cannot close (it has no access right for unix-socket connect), so a
+        // netns-less sandbox could reach a host service socket and escape.
+        // Connecting is a WRITE on the socket inode (kernel: unix_find_other ->
+        // path_permission(MAY_WRITE)), so require the path to be covered by an
+        // fs-write grant, mirroring the kernel's own DAC; otherwise deny with
+        // EACCES. The decision is made on `addr_bytes` (our immune copy) and we
+        // never return Continue on the deny path, so it is TOCTOU-safe.
+        // Abstract sockets (no path) are handled by the Landlock abstract scope.
+        match named_unix_socket_path(&addr_bytes) {
+            Some(path) if ctx.policy.has_unix_fs_gate => {
+                if path_under_any(&path, &ctx.policy.chroot_writable) {
+                    // Permitted by an fs-write grant. Hardening the allow path
+                    // into an on-behalf connect is a follow-up; this preserves
+                    // prior behavior for paths the operator already granted.
+                    NotifAction::Continue
+                } else {
+                    NotifAction::Errno(libc::EACCES)
+                }
+            }
+            // Abstract/unnamed socket, non-AF_UNIX family, or gate disabled.
+            _ => NotifAction::Continue,
+        }
     }
+}
+
+/// Extract the filesystem path of a NAMED `AF_UNIX` connect target from a raw
+/// `sockaddr`. Returns `None` for abstract sockets (`sun_path[0] == 0`),
+/// unnamed sockets, or any non-`AF_UNIX` family (none of which the fs gate
+/// applies to).
+fn named_unix_socket_path(addr_bytes: &[u8]) -> Option<std::path::PathBuf> {
+    // sockaddr_un layout: u16 sun_family, then sun_path. Need the family plus
+    // at least one path byte.
+    if addr_bytes.len() < 3 {
+        return None;
+    }
+    let family = u16::from_ne_bytes([addr_bytes[0], addr_bytes[1]]);
+    if family != libc::AF_UNIX as u16 {
+        return None;
+    }
+    let sun_path = &addr_bytes[2..];
+    if sun_path[0] == 0 {
+        return None; // abstract namespace (Landlock scope handles it)
+    }
+    let end = sun_path.iter().position(|&b| b == 0).unwrap_or(sun_path.len());
+    let raw = &sun_path[..end];
+    if raw.is_empty() {
+        return None;
+    }
+    std::str::from_utf8(raw).ok().map(std::path::PathBuf::from)
+}
+
+/// True if `path`, lexically normalized (`.`/`..` resolved without touching the
+/// filesystem), is at or under any of the granted `prefixes`. Mirrors the
+/// prefix matching the chroot fs enforcement uses.
+fn path_under_any(path: &std::path::Path, prefixes: &[std::path::PathBuf]) -> bool {
+    let norm = crate::chroot::resolve::confine(&path.to_string_lossy());
+    prefixes.iter().any(|p| norm.starts_with(p))
 }
 
 // ============================================================

@@ -409,6 +409,11 @@ pub fn notif_syscalls(policy: &Sandbox, sandbox_name: Option<&str>) -> Vec<u32> 
 
     if needs_network_supervision(policy) {
         nrs.extend(NETWORK_POLICY_SYSCALLS);
+    } else if policy.has_unix_fs_gate() {
+        // Named-unix connect gate: trap connect() so a connect to a unix socket
+        // outside the fs-write grants is denied, even when no IP network rules
+        // are present. Landlock cannot gate this.
+        nrs.push(libc::SYS_connect);
     }
 
     if policy.random_seed.is_some() {
