@@ -11,6 +11,8 @@ pub mod seccomp;
 pub(crate) mod resource;
 pub(crate) mod network;
 pub mod context;
+pub(crate) mod resolved;
+pub(crate) mod seccomp_plan;
 pub(crate) mod vdso;
 pub(crate) mod random;
 pub(crate) mod time;

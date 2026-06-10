@@ -97,12 +97,6 @@ pub fn is_known_syscall(nr: i64) -> bool {
     nr >= 0 && Sysno::new(nr as usize).is_some()
 }
 
-pub fn push_optional_syscall(v: &mut Vec<u32>, nr: Option<i64>) {
-    if let Some(nr) = nr {
-        v.push(nr as u32);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
