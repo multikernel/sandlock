@@ -305,13 +305,14 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
     if features.network_supervision {
         nrs.extend(NETWORK_POLICY_SYSCALLS);
     } else if features.unix_fs_gate {
-        // Named-unix gate: trap connect() (stream) and sendto()/sendmsg()
-        // (datagram) so reaching a unix socket outside the fs-write grants is
-        // denied, even when no IP network rules are present. Landlock cannot
-        // gate this. Handlers bail cheaply on addr-less (connected) sends.
+        // Named-unix gate: trap connect() (stream) and sendto()/sendmsg()/
+        // sendmmsg() (datagram) so reaching a unix socket outside the fs-write
+        // grants is denied, even when no IP network rules are present. Landlock
+        // cannot gate this. Handlers bail cheaply on addr-less (connected) sends.
         nrs.push(libc::SYS_connect);
         nrs.push(libc::SYS_sendto);
         nrs.push(libc::SYS_sendmsg);
+        nrs.push(libc::SYS_sendmmsg);
     }
 
     if features.random_seed {
