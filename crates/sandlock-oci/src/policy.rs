@@ -9,7 +9,7 @@
 
 use anyhow::Result;
 use oci_spec::runtime::Spec;
-use sandlock_core::sandbox::{ByteSize, Sandbox, SandboxBuilder};
+use sandlock_core::sandbox::{ByteSize, RunAs, Sandbox, SandboxBuilder};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -52,6 +52,11 @@ pub struct OciPolicy {
     /// and removed with the sandbox state dir on `delete`.
     #[serde(default)]
     pub scratch_dirs: Vec<PathBuf>,
+
+    /// Run-as identity from OCI `process.user` (uid/gid). Passed straight to
+    /// `builder.user(...)`; core decides whether a user namespace is actually
+    /// needed (it self-skips when the identity already matches the runtime).
+    pub run_user: Option<RunAs>,
 }
 
 impl OciPolicy {
@@ -145,6 +150,12 @@ impl OciPolicy {
                 }
             });
 
+        // OCI process.user → run-as identity (uid/gid, both required by the spec).
+        let run_user = spec.process().as_ref().map(|p| {
+            let u = p.user();
+            RunAs { uid: u.uid(), gid: u.gid() }
+        });
+
         Ok(OciPolicy {
             rootfs,
             fs_read,
@@ -156,6 +167,7 @@ impl OciPolicy {
             max_processes,
             max_cpu,
             scratch_dirs,
+            run_user,
         })
     }
 
@@ -202,6 +214,13 @@ impl OciPolicy {
         }
         if let Some(cpu) = self.max_cpu {
             builder = builder.max_cpu(cpu);
+        }
+
+        // OCI process.user: hand the requested identity to core unconditionally.
+        // Core engages a user namespace only when it differs from the runtime's
+        // own uid/gid, so we don't reimplement that decision here.
+        if let Some(ru) = self.run_user {
+            builder = builder.user(ru.uid, ru.gid);
         }
 
         builder.build_unchecked().map_err(Into::into)
@@ -507,5 +526,25 @@ mod tests {
         // Note: no rootfs dir created under the bundle.
         let err = OciPolicy::from_spec(&spec, bundle.path(), "test").unwrap_err();
         assert!(err.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn process_user_populates_run_as() {
+        let dir = tempdir().unwrap();
+        let bundle = dir.path();
+        fs::create_dir_all(bundle.join("rootfs")).unwrap();
+
+        let json = serde_json::json!({
+            "ociVersion": "1.0.2",
+            "root": { "path": "rootfs", "readonly": false },
+            "process": { "user": { "uid": 1000, "gid": 2000 }, "cwd": "/", "args": ["sh"] },
+        });
+        let spec: Spec = serde_json::from_value(json).unwrap();
+        let policy = OciPolicy::from_spec(&spec, bundle, "test").unwrap();
+        // process.user flows into run_user; the userns skip decision is core's.
+        assert_eq!(policy.run_user, Some(RunAs { uid: 1000, gid: 2000 }));
+
+        let sandbox = policy.to_sandbox().unwrap();
+        assert_eq!(sandbox.user, Some(RunAs { uid: 1000, gid: 2000 }));
     }
 }
