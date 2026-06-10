@@ -22,7 +22,9 @@ pub fn state_dir() -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
-    /// Container has been created but not yet started.
+    /// Transient state while the supervisor is setting up the container.
+    Creating,
+    /// Container has been created (child parked) but not yet started.
     Created,
     /// Container is currently running.
     Running,
@@ -33,6 +35,7 @@ pub enum Status {
 impl std::fmt::Display for Status {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Status::Creating => write!(f, "creating"),
             Status::Created => write!(f, "created"),
             Status::Running => write!(f, "running"),
             Status::Stopped => write!(f, "stopped"),
@@ -108,7 +111,7 @@ impl ContainerState {
         ContainerState {
             oci_version: oci_version.to_string(),
             id: id.to_string(),
-            status: Status::Created,
+            status: Status::Creating,
             pid: 0,
             bundle: bundle.to_path_buf(),
             created,
@@ -227,7 +230,8 @@ mod tests {
         let json = serde_json::to_string(&state).unwrap();
         let loaded: ContainerState = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.id, "test-ctr");
-        assert_eq!(loaded.status, Status::Created);
+        // new() begins in Creating; set_created() transitions to Created.
+        assert_eq!(loaded.status, Status::Creating);
     }
 
     #[test]

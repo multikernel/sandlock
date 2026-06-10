@@ -7,12 +7,16 @@
 //! ## Lifecycle
 //!
 //! ```text
-//!   create <id> -b <bundle>  →  spawn Supervisor, fork Child (SIGSTOP'd), save state
-//!   start  <id>              →  signal Supervisor → Child execve
-//!   state  <id>              →  print state.json
+//!   create <id> -b <bundle>  →  spawn Supervisor, sandbox.create(), park Child, save state
+//!   start  <id>              →  Supervisor.Start → sandbox.start() → Child execve
+//!   state  <id>              →  print state.json (reconciled against liveness)
 //!   kill   <id> <signal>     →  forward signal to Child PID
-//!   delete <id>              →  cleanup state dir, kill Supervisor/Child
+//!   delete <id>              →  send Shutdown to Supervisor, cleanup state dir
 //! ```
+//!
+//! ## Known limitations
+//!
+//! - `exec` is not implemented (required for `kubectl exec` / exec probes).
 
 mod policy;
 mod spec;
@@ -95,6 +99,18 @@ enum Command {
 
     /// Check kernel feature support (delegates to sandlock-core checks).
     Check,
+
+    /// Execute a process inside a running container.
+    ///
+    /// **Not yet implemented.** Required for `kubectl exec` and exec-based
+    /// liveness/readiness probes.  Tracked as a known limitation.
+    Exec {
+        /// Container identifier.
+        id: String,
+        /// Command and arguments (trailing, may contain hyphens).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -108,8 +124,15 @@ fn main() -> Result<()> {
             cmd_start(&id)?;
         }
         Command::State { id } => {
-            let state = ContainerState::load(&id)
+            let mut state = ContainerState::load(&id)
                 .with_context(|| format!("no such container: {}", id))?;
+            // Reconcile: if we believe the container is running but the process
+            // is gone (killed out-of-band), transition to stopped so callers
+            // see the current truth rather than stale state.
+            if state.status == Status::Running && !state.is_alive() {
+                state.set_stopped(None);
+                state.save().ok();
+            }
             println!("{}", serde_json::to_string_pretty(&state)?);
         }
         Command::Kill { id, signal, all } => {
@@ -130,6 +153,13 @@ fn main() -> Result<()> {
                     }
                 }
             }
+        }
+        Command::Exec { id: _, command: _ } => {
+            bail!(
+                "`exec` is not implemented in sandlock-oci. \
+                 It is required for kubectl exec and exec-based probes but has not \
+                 yet been built (tracked as a known limitation)."
+            );
         }
         Command::Check => {
             match sandlock_core::landlock_abi_version() {
@@ -240,17 +270,19 @@ fn cmd_create(id: &str, bundle: &PathBuf, pid_file: Option<&std::path::Path>) ->
         // Close the read end (inherited from intermediate, not needed here)
         unsafe { libc::close(read_fd); }
 
-        // Redirect stdout/stderr to /dev/null to avoid polluting the caller.
+        // Redirect only stdin to /dev/null — the supervisor daemon doesn't
+        // need input.  stdout/stderr are intentionally *not* redirected:
+        // containerd/CRI-O wire the runtime's stdio to the container's log
+        // FIFOs, so fds 1 and 2 must be passed through to the child process
+        // so that container output reaches `kubectl logs`.
         unsafe {
             let devnull = libc::open(
                 b"/dev/null\0".as_ptr() as *const libc::c_char,
-                libc::O_RDWR,
+                libc::O_RDONLY,
             );
             if devnull >= 0 {
                 libc::dup2(devnull, 0);
-                libc::dup2(devnull, 1);
-                libc::dup2(devnull, 2);
-                if devnull > 2 {
+                if devnull > 0 {
                     libc::close(devnull);
                 }
             }
@@ -272,29 +304,41 @@ fn cmd_create(id: &str, bundle: &PathBuf, pid_file: Option<&std::path::Path>) ->
     let mut wstatus = 0i32;
     unsafe { libc::waitpid(pid, &mut wstatus, 0) };
 
-    // Read the child PID from the pipe — blocks until the supervisor writes it.
+    // Read the supervisor's response from the pipe.
+    //
+    // Protocol: supervisor writes one of:
+    //   `OK <pid>\n`   — sandbox created, <pid> is the container's init PID
+    //   `ERR <msg>\n`  — setup failed; the container was never created
+    //   (EOF)          — supervisor crashed before writing; treated as error
     let child_pid = {
-        let mut buf = [0u8; 32];
+        let mut buf = [0u8; 512];
         let n = unsafe {
             libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
         };
         unsafe { libc::close(read_fd) };
-        if n > 0 {
-            let s = String::from_utf8_lossy(&buf[..n as usize]);
-            s.trim().parse::<i32>().unwrap_or(0)
+        if n <= 0 {
+            bail!("supervisor exited without reporting status (check system logs)");
+        }
+        let response = String::from_utf8_lossy(&buf[..n as usize]);
+        let response = response.trim();
+        if let Some(rest) = response.strip_prefix("OK ") {
+            rest.parse::<i32>()
+                .with_context(|| format!("invalid PID in supervisor response: {:?}", response))?
+        } else if let Some(msg) = response.strip_prefix("ERR ") {
+            bail!("container create failed: {}", msg);
         } else {
-            0
+            bail!("unexpected supervisor response: {:?}", response);
         }
     };
 
     // Update the state file with the actual PID.
-    if child_pid > 0 {
+    {
         let mut state = ContainerState::load(id)?;
         state.set_created(child_pid);
         state.save()?;
     }
 
-    // Write pid-file if requested (CRI-O / containerd expect this)
+    // Write pid-file if requested (CRI-O / containerd expect this).
     if let Some(pf) = pid_file {
         std::fs::write(pf, child_pid.to_string())
             .with_context(|| format!("write pid file {:?}", pf))?;
@@ -313,6 +357,7 @@ fn cmd_start(id: &str) -> Result<()> {
 
     match state.status {
         Status::Created => {} // expected
+        Status::Creating => bail!("container {} is still being created", id),
         Status::Running => bail!("container {} is already running", id),
         Status::Stopped => bail!("container {} has already stopped", id),
     }
@@ -372,10 +417,17 @@ fn cmd_delete(id: &str, force: bool) -> Result<()> {
         bail!("container {} is still running; use --force or kill it first", id);
     }
 
-    // Kill if still alive.
+    // If the supervisor is blocked waiting for `start`, send Shutdown so it
+    // exits cleanly rather than leaking a process.  Ignore send errors — the
+    // supervisor may have already exited or the socket may not exist yet.
+    if matches!(state.status, Status::Creating | Status::Created) {
+        let _ = supervisor::send_command(id, supervisor::SupervisorCmd::Shutdown);
+    }
+
+    // Kill the container process if it's still alive (Running + force, or any
+    // state where the child is alive).
     if state.pid > 0 && state.is_alive() {
         unsafe { libc::killpg(state.pid, libc::SIGKILL) };
-        // Give the kernel a moment to reap.
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 

@@ -32,6 +32,10 @@ pub enum SupervisorCmd {
     Start,
     /// Query the child PID.
     Ping,
+    /// Terminate the supervisor without starting the child (used by `delete`
+    /// when the container was never started).  The sandbox `Drop` kills the
+    /// parked child.
+    Shutdown,
 }
 
 /// Responses from the Supervisor.
@@ -109,6 +113,24 @@ pub fn run_supervisor(
     rt.block_on(supervisor_main(id, cmd, sandbox, sock_path, pid_write_fd))
 }
 
+/// Write a line to the notification pipe and close it.  Used for both the
+/// success case (`OK <pid>`) and the failure case (`ERR <message>`).
+fn pipe_write(fd: i32, line: &str) {
+    let s = format!("{}\n", line);
+    unsafe {
+        libc::write(fd, s.as_ptr() as *const libc::c_void, s.len());
+        libc::close(fd);
+    }
+}
+
+/// Reason the accept-loop exited.
+enum LoopExit {
+    /// `Start` was received — child is now running, call `sandbox.wait()`.
+    Started,
+    /// `Shutdown` was received — child was never started, drop sandbox to kill it.
+    Shutdown,
+}
+
 /// Async body of `run_supervisor`.
 async fn supervisor_main(
     id: &str,
@@ -125,29 +147,28 @@ async fn supervisor_main(
 
     // Bind the socket BEFORE create() so the CLI can call `start` the moment
     // `create` returns without a race on socket availability.
-    let listener = UnixListener::bind(&sock_path)
-        .with_context(|| format!("bind supervisor socket {:?}", sock_path))?;
+    let listener = match UnixListener::bind(&sock_path) {
+        Ok(l) => l,
+        Err(e) => {
+            pipe_write(pid_write_fd, &format!("ERR bind socket: {}", e));
+            anyhow::bail!("bind supervisor socket {:?}: {}", sock_path, e);
+        }
+    };
 
     // OCI `create` — forks the child, installs the full sandlock policy
     // (seccomp-notify + Landlock + resource limits + network ACL), and parks
     // the child before execve using a pipe rather than SIGSTOP.
     let cmd_refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
-    sandbox
-        .create_interactive(&cmd_refs)
-        .await
-        .context("sandbox create_interactive")?;
+    if let Err(e) = sandbox.create_interactive(&cmd_refs).await {
+        pipe_write(pid_write_fd, &format!("ERR create: {}", e));
+        return Err(anyhow::anyhow!("sandbox create_interactive: {}", e));
+    }
 
     let child_pid = sandbox.pid().unwrap_or(0) as i32;
 
-    // Notify the CLI of the child PID so it can write the pid-file and update
-    // state without racing. This fd is write-once then closed.
-    {
-        let s = format!("{}\n", child_pid);
-        unsafe {
-            libc::write(pid_write_fd, s.as_ptr() as *const libc::c_void, s.len());
-            libc::close(pid_write_fd);
-        }
-    }
+    // Notify the CLI: `OK <pid>` on success.  The CLI treats any non-OK
+    // response (or EOF) as a create failure, so this is the only success path.
+    pipe_write(pid_write_fd, &format!("OK {}", child_pid));
 
     // Persist Created state with the real child PID.
     {
@@ -158,11 +179,11 @@ async fn supervisor_main(
         state.save().ok();
     }
 
-    // Accept-loop: serve CLI commands until `Start` is received.
-    loop {
+    // Accept-loop: serve CLI commands until `Start` or `Shutdown`.
+    let loop_exit: LoopExit = loop {
         let (mut stream, _) = match listener.accept().await {
             Ok(pair) => pair,
-            Err(_) => break,
+            Err(_) => break LoopExit::Shutdown,
         };
 
         let mut buf = vec![0u8; 4096];
@@ -191,8 +212,7 @@ async fn supervisor_main(
             }
             SupervisorCmd::Start => {
                 // OCI `start` — write to the ready pipe so the parked child
-                // proceeds to execve with the full sandlock policy already in
-                // place.
+                // proceeds to execve with the full sandlock policy already in place.
                 let reply = match sandbox.start() {
                     Ok(()) => {
                         if let Ok(mut s) = ContainerState::load(id) {
@@ -206,12 +226,26 @@ async fn supervisor_main(
                 let reply_bytes = serde_json::to_vec(&reply).unwrap_or_default();
                 let _ = stream.write_all(&reply_bytes).await;
                 let _ = stream.write_all(b"\n").await;
-                break;
+                break LoopExit::Started;
+            }
+            SupervisorCmd::Shutdown => {
+                // `delete` before `start` — acknowledge and exit.  The sandbox
+                // Drop will kill and reap the parked child.
+                let reply = serde_json::to_vec(&SupervisorReply::Ok).unwrap_or_default();
+                let _ = stream.write_all(&reply).await;
+                let _ = stream.write_all(b"\n").await;
+                break LoopExit::Shutdown;
             }
         }
+    };
+
+    // On Shutdown (delete-before-start): return immediately.  The Sandbox Drop
+    // kills and reaps the parked child — no wait() needed.
+    if matches!(loop_exit, LoopExit::Shutdown) {
+        return Ok(());
     }
 
-    // Wait for the child to exit and record the exit status.
+    // On Start: wait for the child to exit and record the exit status.
     let exit_info = match sandbox.wait().await {
         Ok(result) => match result.exit_status {
             ExitStatus::Code(code) => Some(ExitInfo { code: Some(code), signal: None }),
@@ -253,6 +287,13 @@ mod tests {
         let cmd = SupervisorCmd::Ping;
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("ping"));
+    }
+
+    #[test]
+    fn supervisor_cmd_shutdown_serde() {
+        let cmd = SupervisorCmd::Shutdown;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("shutdown"));
     }
 
     #[test]

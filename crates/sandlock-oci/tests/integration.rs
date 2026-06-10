@@ -95,7 +95,8 @@ fn state_created_lifecycle() {
 
     let dir = tempdir().unwrap();
     let mut state = ContainerState::new("test-lifecycle", dir.path(), "1.0.2");
-    assert_eq!(state.status, Status::Created);
+    // new() starts in Creating; set_created() advances to Created.
+    assert_eq!(state.status, Status::Creating);
 
     state.set_created(9999);
     assert_eq!(state.status, Status::Created);

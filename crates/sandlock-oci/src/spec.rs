@@ -10,11 +10,24 @@ use std::path::Path;
 
 use crate::policy::OciPolicy;
 
-/// Parse an OCI `config.json` from the given bundle directory.
+/// OCI spec major.minor versions sandlock-oci supports.
+const SUPPORTED_OCI_VERSIONS: &[&str] = &["1.0.", "1.1.", "1.2."];
+
+/// Parse an OCI `config.json` from the given bundle directory and validate
+/// that its `ociVersion` is one we support.  Bundles declaring an unsupported
+/// version are rejected fast rather than silently mis-mapping fields.
 pub fn load_spec(bundle: &Path) -> Result<Spec> {
     let config_path = bundle.join("config.json");
-    Spec::load(&config_path)
-        .with_context(|| format!("failed to load OCI spec from {:?}", config_path))
+    let spec = Spec::load(&config_path)
+        .with_context(|| format!("failed to load OCI spec from {:?}", config_path))?;
+    let v = spec.version();
+    if !SUPPORTED_OCI_VERSIONS.iter().any(|p| v.starts_with(p)) {
+        anyhow::bail!(
+            "unsupported OCI spec version {:?}; supported: 1.0.x, 1.1.x, 1.2.x",
+            v
+        );
+    }
+    Ok(spec)
 }
 
 /// Map an OCI [`Spec`] to an [`OciPolicy`].
