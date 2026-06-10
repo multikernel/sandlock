@@ -225,6 +225,91 @@ async fn test_sendmmsg_partial_failure_on_blocked_destination() {
     );
 }
 
+/// Functional check that a `sendmmsg` on a CONNECTED socket (each entry has
+/// `msg_name == NULL`) is handled correctly while a destination policy is
+/// active: the connected-send on-behalf path must forward both datagrams to
+/// the allowed loopback listener rather than blocking or dropping them.
+///
+/// This does not attempt to reproduce the msg_name TOCTOU that motivated the
+/// on-behalf path (that race is not deterministically reproducible); it only
+/// asserts the path delivers correctly. Delivery is verified synchronously
+/// after the run: the send completes before `run_interactive` returns, so both
+/// datagrams are already buffered in the listener and can be drained without
+/// any background thread or timing race.
+#[tokio::test]
+async fn test_connected_sendmmsg_delivers_on_behalf() {
+    let listener = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // Bounded timeout so a regression that drops datagrams fails the recv
+    // below instead of hanging; on success the datagrams are already queued.
+    listener
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+
+    let out = temp_file("connected-sendmmsg");
+    let policy = base_policy()
+        .net_allow(&format!("udp://127.0.0.1:{}", port))
+        .build()
+        .unwrap();
+
+    let script = format!(concat!(
+        "import ctypes, socket\n",
+        "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
+        "libc.sendmmsg.restype = ctypes.c_int\n",
+        "class iovec(ctypes.Structure):\n",
+        "    _fields_ = [('iov_base', ctypes.c_void_p), ('iov_len', ctypes.c_size_t)]\n",
+        "class msghdr(ctypes.Structure):\n",
+        "    _fields_ = [('msg_name', ctypes.c_void_p), ('msg_namelen', ctypes.c_uint),\n",
+        "        ('_p1', ctypes.c_uint), ('msg_iov', ctypes.c_void_p),\n",
+        "        ('msg_iovlen', ctypes.c_size_t), ('msg_control', ctypes.c_void_p),\n",
+        "        ('msg_controllen', ctypes.c_size_t), ('msg_flags', ctypes.c_int), ('_p2', ctypes.c_uint)]\n",
+        "class mmsghdr(ctypes.Structure):\n",
+        "    _fields_ = [('msg_hdr', msghdr), ('msg_len', ctypes.c_uint), ('_p', ctypes.c_uint)]\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
+        "s.connect(('127.0.0.1', {port}))\n",
+        "data = ctypes.create_string_buffer(b'hi')\n",
+        "iovs = (iovec * 2)()\n",
+        "vec = (mmsghdr * 2)()\n",
+        "for k in range(2):\n",
+        "    iovs[k].iov_base = ctypes.cast(data, ctypes.c_void_p).value\n",
+        "    iovs[k].iov_len = 2\n",
+        "    vec[k].msg_hdr.msg_name = None\n",
+        "    vec[k].msg_hdr.msg_namelen = 0\n",
+        "    vec[k].msg_hdr.msg_iov = ctypes.cast(ctypes.pointer(iovs[k]), ctypes.c_void_p).value\n",
+        "    vec[k].msg_hdr.msg_iovlen = 1\n",
+        "ret = libc.sendmmsg(s.fileno(), vec, 2, 0)\n",
+        "open('{out}', 'w').write('ret=%d' % ret)\n",
+        "s.close()\n",
+    ), port = port, out = out.display());
+
+    let result = policy
+        .clone()
+        .with_name("test")
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(
+        content, "ret=2",
+        "connected sendmmsg must send both messages on-behalf, got: {content}"
+    );
+
+    // Drain the buffered datagrams synchronously: both were sent before the
+    // child exited, so recv_from returns the queued packets without blocking.
+    let mut buf = [0u8; 64];
+    let mut delivered = 0;
+    while delivered < 2 && listener.recv_from(&mut buf).is_ok() {
+        delivered += 1;
+    }
+    assert_eq!(
+        delivered, 2,
+        "both datagrams must be delivered to the allowed listener"
+    );
+}
+
 /// Defense-in-depth check that `sendmmsg` doesn't silently bypass the
 /// per-protocol routing. With a UDP-only rule, a TCP socket using
 /// `sendmsg`/`sendto` already fails (Phase 2 covered that). We verify

@@ -1300,14 +1300,21 @@ async fn sendmsg_on_behalf(
         }
     }
 
-    // Pre-scan for Continue cases (connected socket / non-IP family).
-    // Same TOCTOU-aware semantics as before: EFAULT on unreadable
-    // msghdr (vs. Continue, which would let the kernel re-read child
-    // memory and bypass our check).
-    match prescan_msghdr(notif, notif_fd, msghdr_ptr) {
-        PrescanResult::ContinueWholeCall => return NotifAction::Continue,
-        PrescanResult::Errno(e) => return NotifAction::Errno(e),
-        PrescanResult::OnBehalf => {}
+    // With a destination policy active, never Continue: the kernel would
+    // re-read `msg_name` from child memory, where a racing thread could swap a
+    // connected (NULL) name for a denied address. Send on-behalf (including
+    // connected sends) so the verdict is made on the immune copy. Without a
+    // policy there is nothing to bypass, so the Continue fast path below stands.
+    let dest_policy = ctx.policy.has_net_allowlist;
+    if !dest_policy {
+        // Pre-scan for Continue cases (connected socket / non-IP family).
+        // EFAULT on unreadable msghdr (vs. Continue, which would let the kernel
+        // re-read child memory and bypass our check).
+        match prescan_msghdr(notif, notif_fd, msghdr_ptr) {
+            PrescanResult::ContinueWholeCall => return NotifAction::Continue,
+            PrescanResult::Errno(e) => return NotifAction::Errno(e),
+            PrescanResult::OnBehalf => {}
+        }
     }
 
     let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
@@ -1405,33 +1412,46 @@ async fn send_msghdr_on_behalf(
     let msg_control_ptr = u64::from_ne_bytes(msghdr_bytes[32..40].try_into().unwrap());
     let msg_controllen = u64::from_ne_bytes(msghdr_bytes[40..48].try_into().unwrap());
 
-    let addr_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, msg_name_ptr, msg_namelen as usize) {
-        Ok(b) => b,
-        Err(_) => return Err(libc::EIO),
-    };
-    let ip = match parse_ip_from_sockaddr(&addr_bytes) {
-        Some(ip) => ip,
-        // Caller pre-checks via prescan_msghdr; reaching this branch
-        // means the sockaddr changed under us between the prescan and
-        // here. Fail closed.
-        None => return Err(libc::EAFNOSUPPORT),
-    };
-    let dest_port = parse_port_from_sockaddr(&addr_bytes);
-
-    let ns = ctx.network.lock().await;
-    let live_policy = {
-        let pfs = ctx.policy_fn.lock().await;
-        pfs.live_policy.clone()
-    };
-    let effective = ns.effective_network_policy(notif.pid, protocol, live_policy.as_ref());
-    if !matches!(effective, crate::seccomp::notif::NetworkPolicy::Unrestricted) {
-        match dest_port {
-            Some(p) if !effective.allows(ip, p) => return Err(ECONNREFUSED),
-            None => return Err(ECONNREFUSED),
-            Some(_) => {}
+    // A connected socket carries no per-message address (`msg_name == NULL` or
+    // zero length). There is nothing to check against the destination
+    // allowlist (the connection was gated at connect time), but we must still
+    // send it on-behalf rather than Continue: Continue lets the kernel re-read
+    // the msghdr from child memory, where a racing thread could have swapped a
+    // null `msg_name` for a denied address. A non-connected entry has its IP
+    // destination validated on the immune copy before the send.
+    let connected = msg_name_ptr == 0 || msg_namelen == 0;
+    let addr_bytes = if connected {
+        Vec::new()
+    } else {
+        match read_child_mem(notif_fd, notif.id, notif.pid, msg_name_ptr, msg_namelen as usize) {
+            Ok(b) => b,
+            Err(_) => return Err(libc::EIO),
         }
+    };
+    if !connected {
+        let ip = match parse_ip_from_sockaddr(&addr_bytes) {
+            Some(ip) => ip,
+            // A non-IP, non-connected address on an IP send path (e.g. the
+            // sockaddr changed under us). Fail closed.
+            None => return Err(libc::EAFNOSUPPORT),
+        };
+        let dest_port = parse_port_from_sockaddr(&addr_bytes);
+
+        let ns = ctx.network.lock().await;
+        let live_policy = {
+            let pfs = ctx.policy_fn.lock().await;
+            pfs.live_policy.clone()
+        };
+        let effective = ns.effective_network_policy(notif.pid, protocol, live_policy.as_ref());
+        if !matches!(effective, crate::seccomp::notif::NetworkPolicy::Unrestricted) {
+            match dest_port {
+                Some(p) if !effective.allows(ip, p) => return Err(ECONNREFUSED),
+                None => return Err(ECONNREFUSED),
+                Some(_) => {}
+            }
+        }
+        drop(ns);
     }
-    drop(ns);
 
     let iovlen = (msg_iovlen as usize).min(1024);
     let iov_size = iovlen * 16;
@@ -1474,8 +1494,10 @@ async fn send_msghdr_on_behalf(
     };
 
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_name = addr_bytes.as_ptr() as *mut libc::c_void;
-    msg.msg_namelen = addr_bytes.len() as u32;
+    if !connected {
+        msg.msg_name = addr_bytes.as_ptr() as *mut libc::c_void;
+        msg.msg_namelen = addr_bytes.len() as u32;
+    }
     msg.msg_iov = local_iovs.as_mut_ptr();
     msg.msg_iovlen = local_iovs.len();
     if let Some(ref ctrl) = control_buf {
@@ -1573,11 +1595,57 @@ async fn sendmmsg_on_behalf(
         }
     }
 
-    // Pre-scan every entry. If any has a Continue-eligible shape
-    // (NULL msg_name or non-IP family), Continue the whole sendmmsg.
-    // Mixed-shape sendmmsg calls (some entries on-behalf, others not)
-    // aren't supported because Continue is binary at the syscall
-    // level.
+    // Destination policy active: handle the whole batch on-behalf and never
+    // Continue. Continue would let the kernel re-read each `msghdr` from child
+    // memory, where a racing thread could swap a connected (NULL `msg_name`)
+    // entry for a denied address after our prescan, bypassing the allowlist on
+    // an unconnected datagram socket. On-behalf sends use the immune copy and
+    // validate every IP destination, so the verdict is TOCTOU-free.
+    if ctx.policy.has_net_allowlist {
+        let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
+            Ok(fd) => fd,
+            Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
+        };
+        let protocol = match query_socket_protocol(dup_fd.as_raw_fd()) {
+            Some(p) => p,
+            None => return NotifAction::Errno(ECONNREFUSED),
+        };
+        let mut sent: usize = 0;
+        let mut first_errno: Option<i32> = None;
+        for i in 0..vlen {
+            let entry_ptr = msgvec_ptr + (i * MMSGHDR_SIZE) as u64;
+            match send_msghdr_on_behalf(notif, ctx, notif_fd, &dup_fd, protocol, entry_ptr, flags)
+                .await
+            {
+                Ok(n) => {
+                    let bytes = (n as u32).to_ne_bytes();
+                    let _ = write_child_mem(
+                        notif_fd,
+                        notif.id,
+                        notif.pid,
+                        entry_ptr + MSG_LEN_OFFSET as u64,
+                        &bytes,
+                    );
+                    sent += 1;
+                }
+                Err(errno) => {
+                    first_errno = Some(errno);
+                    break;
+                }
+            }
+        }
+        return if sent > 0 {
+            NotifAction::ReturnValue(sent as i64)
+        } else {
+            NotifAction::Errno(first_errno.unwrap_or(ECONNREFUSED))
+        };
+    }
+
+    // No destination policy: the connected fast path is safe (nothing to
+    // bypass), so Continue is acceptable. Pre-scan every entry; if any has a
+    // Continue-eligible shape (NULL msg_name or non-IP family), Continue the
+    // whole sendmmsg. Mixed-shape calls aren't supported because Continue is
+    // binary at the syscall level.
     for i in 0..vlen {
         let entry_ptr = msgvec_ptr + (i * MMSGHDR_SIZE) as u64;
         match prescan_msghdr(notif, notif_fd, entry_ptr) {
