@@ -104,12 +104,17 @@ enum Command {
     ///
     /// **Not yet implemented.** Required for `kubectl exec` and exec-based
     /// liveness/readiness probes.  Tracked as a known limitation.
+    ///
+    /// All arguments are accepted without validation so that containerd/CRI-O
+    /// invocations (which pass flags like `--process`, `--detach`, `--pid-file`
+    /// *before* the container-id) parse cleanly and receive a clear error.
     Exec {
-        /// Container identifier.
-        id: String,
-        /// Command and arguments (trailing, may contain hyphens).
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        command: Vec<String>,
+        /// All exec arguments captured as-is (id, flags, command).
+        /// `allow_hyphen_values` + `trailing_var_arg` ensure that runc-style
+        /// flags preceding the container-id do not trigger an "unexpected
+        /// argument" error.
+        #[arg(num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true)]
+        _args: Vec<String>,
     },
 }
 
@@ -154,7 +159,7 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::Exec { id: _, command: _ } => {
+        Command::Exec { _args: _ } => {
             bail!(
                 "`exec` is not implemented in sandlock-oci. \
                  It is required for kubectl exec and exec-based probes but has not \
