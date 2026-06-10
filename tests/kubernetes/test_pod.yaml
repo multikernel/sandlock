@@ -1,11 +1,21 @@
-# Test Pod using the sandlock RuntimeClass.
-# This pod runs in the sandlock OCI runtime instead of runc/containerd-shim.
+# Kubernetes test manifests for sandlock-oci.
 #
 # Usage:
 #   kubectl apply -f runtimeclass.yaml
 #   kubectl apply -f test_pod.yaml
-#   kubectl logs sandlock-test-pod   # should print "sandlock-pod-ok"
+#   kubectl logs sandlock-test-pod          # expect "sandlock-pod-ok"
+#   kubectl logs -l job-name=sandlock-test-job  # expect "job-complete"
+#
+# Known limitations
+# -----------------
+# exec probes and `kubectl exec` are NOT supported with the sandlock runtime.
+# sandlock-oci returns a "not implemented" error for the exec subcommand.
+# Use httpGet or tcpSocket probes for liveness/readiness checks.
+# The exec-probe pod below documents this limitation by showing the expected
+# failure behaviour.
+
 ---
+# Basic smoke test: container runs and exits cleanly.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -14,7 +24,6 @@ metadata:
     app: sandlock-test
     component: oci-runtime-test
 spec:
-  # Use the sandlock OCI runtime
   runtimeClassName: sandlock
   restartPolicy: Never
   containers:
@@ -37,8 +46,9 @@ spec:
         requests:
           memory: "32Mi"
           cpu: "50m"
+
 ---
-# Job-based test: verify the process exits cleanly
+# Job-based test: verify a process can exit cleanly inside the sandbox.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -58,7 +68,6 @@ spec:
             - -c
             - |
               echo "Job running in sandlock runtime"
-              # Verify we can do basic operations
               ls /tmp
               echo "42" > /tmp/test.txt
               cat /tmp/test.txt
@@ -67,3 +76,81 @@ spec:
             limits:
               memory: "32Mi"
               cpu: "100m"
+
+---
+# httpGet probe pod — preferred liveness/readiness probe type for sandlock.
+# exec probes are not supported; use httpGet or tcpSocket instead.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sandlock-httpget-probe-pod
+  labels:
+    app: sandlock-test
+    component: httpget-probe-test
+spec:
+  runtimeClassName: sandlock
+  restartPolicy: Never
+  containers:
+    - name: server
+      image: busybox:latest
+      imagePullPolicy: IfNotPresent
+      command:
+        - sh
+        - -c
+        - |
+          while true; do
+            echo -e 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok' | nc -l -p 8080
+          done
+      ports:
+        - containerPort: 8080
+      livenessProbe:
+        httpGet:
+          path: /
+          port: 8080
+        initialDelaySeconds: 3
+        periodSeconds: 5
+      readinessProbe:
+        httpGet:
+          path: /
+          port: 8080
+        initialDelaySeconds: 3
+        periodSeconds: 5
+      resources:
+        limits:
+          memory: "32Mi"
+          cpu: "100m"
+
+---
+# exec probe pod — documents the known limitation.
+# This pod WILL FAIL because exec probes are not supported.
+# It is included so that the failure mode is visible and testable.
+#
+# Do NOT use exec probes with runtimeClassName: sandlock.
+# Replace them with httpGet or tcpSocket probes.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sandlock-exec-probe-pod
+  labels:
+    app: sandlock-test
+    component: exec-probe-limitation
+  annotations:
+    sandlock.io/known-failure: "exec-probe-not-supported"
+spec:
+  runtimeClassName: sandlock
+  restartPolicy: Never
+  containers:
+    - name: test
+      image: busybox:latest
+      imagePullPolicy: IfNotPresent
+      command: ["sh", "-c", "sleep 60"]
+      livenessProbe:
+        exec:
+          command: ["true"]
+        initialDelaySeconds: 2
+        periodSeconds: 5
+        failureThreshold: 2
+      resources:
+        limits:
+          memory: "32Mi"
+          cpu: "100m"

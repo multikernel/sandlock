@@ -10,6 +10,7 @@
 use anyhow::Result;
 use oci_spec::runtime::Spec;
 use sandlock_core::sandbox::{ByteSize, Sandbox, SandboxBuilder};
+use sandlock_core::{Protection, ProtectionState};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -170,6 +171,21 @@ impl OciPolicy {
         builder = builder.clean_env(true);
         for (k, v) in &self.env {
             builder = builder.env_var(k, v);
+        }
+
+        // The OCI runtime must run on diverse kernel versions.  Mark every
+        // protection that requires a Landlock ABI higher than v1 as Degradable
+        // so the sandbox starts on older kernels rather than failing hard.
+        // The effective protections are visible via `sandlock-oci check`.
+        for p in [
+            Protection::FsRefer,               // ABI v2
+            Protection::FsTruncate,             // ABI v3
+            Protection::NetTcp,                 // ABI v4
+            Protection::FsIoctlDev,             // ABI v5
+            Protection::SignalScope,            // ABI v6
+            Protection::AbstractUnixSocketScope, // ABI v6
+        ] {
+            builder.protection_policy.set(p, ProtectionState::Degradable);
         }
 
         if let Some(mem) = self.max_memory {
