@@ -327,6 +327,11 @@ class Sandbox:
     The child has no real host privileges regardless of the mapped UID.
     Only effective when user namespaces are available."""
 
+    gid: int | None = None
+    """Map to the given GID inside the user namespace.  Must be set together
+    with ``uid`` (both or neither).  An unprivileged user namespace maps a
+    single id, so supplementary groups are not available."""
+
     # Seccomp user notification (filesystem virtualization)
     notif_policy: NotifPolicy | None = None
     """If set, enables a seccomp user notification supervisor that

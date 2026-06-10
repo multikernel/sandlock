@@ -28,7 +28,7 @@ fn userns_available() -> bool {
     libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
 }
 
-/// Test that --uid 0 makes the child appear as uid 0.
+/// Test that --user 0:0 makes the child appear as uid 0.
 #[tokio::test]
 async fn test_uid_zero() {
     if !userns_available() {
@@ -43,7 +43,7 @@ async fn test_uid_zero() {
         .fs_read("/bin")
         .fs_read("/etc")
         .fs_read("/proc")
-        .uid(0)
+        .user(0, 0)
         .build()
         .unwrap();
 
@@ -53,7 +53,7 @@ async fn test_uid_zero() {
     assert_eq!(stdout.trim(), "0", "Expected uid 0, got: {:?}", stdout.trim());
 }
 
-/// Test that --uid 0 makes the child appear as gid 0.
+/// Test that --user 0:0 makes the child appear as gid 0.
 #[tokio::test]
 async fn test_uid_zero_gid_zero() {
     if !userns_available() {
@@ -68,7 +68,7 @@ async fn test_uid_zero_gid_zero() {
         .fs_read("/bin")
         .fs_read("/etc")
         .fs_read("/proc")
-        .uid(0)
+        .user(0, 0)
         .build()
         .unwrap();
 
@@ -78,7 +78,7 @@ async fn test_uid_zero_gid_zero() {
     assert_eq!(stdout.trim(), "0", "Expected gid 0, got: {:?}", stdout.trim());
 }
 
-/// Test that without --uid, uid is NOT 0 (assuming tests don't run as root).
+/// Test that without --user, uid is NOT 0 (assuming tests don't run as root).
 #[tokio::test]
 async fn test_no_uid_keeps_real_uid() {
     let policy = Sandbox::builder()
@@ -96,11 +96,11 @@ async fn test_no_uid_keeps_real_uid() {
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     // If running as root already, skip this check
     if unsafe { libc::getuid() } != 0 {
-        assert_ne!(stdout.trim(), "0", "Without --uid, uid should not be 0");
+        assert_ne!(stdout.trim(), "0", "Without --user, uid should not be 0");
     }
 }
 
-/// Test that --uid 0 doesn't break basic command execution.
+/// Test that --user 0:0 doesn't break basic command execution.
 #[tokio::test]
 async fn test_uid_zero_echo() {
     let policy = Sandbox::builder()
@@ -109,7 +109,7 @@ async fn test_uid_zero_echo() {
         .fs_read_if_exists("/lib64")
         .fs_read("/bin")
         .fs_read("/etc")
-        .uid(0)
+        .user(0, 0)
         .build()
         .unwrap();
 
@@ -119,7 +119,7 @@ async fn test_uid_zero_echo() {
     assert_eq!(stdout.trim(), "hello");
 }
 
-/// Test that --uid 1000 maps to the expected UID inside the namespace.
+/// Test that --user 1000:1000 maps to the expected UID inside the namespace.
 #[tokio::test]
 async fn test_uid_custom() {
     if !userns_available() {
@@ -134,7 +134,7 @@ async fn test_uid_custom() {
         .fs_read("/bin")
         .fs_read("/etc")
         .fs_read("/proc")
-        .uid(1000)
+        .user(1000, 1000)
         .build()
         .unwrap();
 

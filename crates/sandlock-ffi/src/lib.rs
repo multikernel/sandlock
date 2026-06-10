@@ -435,18 +435,22 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_port_remap(
 // Sandlock does not expose raw ICMP — SOCK_RAW is unconditionally
 // denied at the seccomp layer.
 
+/// Run the sandboxed process as `uid`/`gid` via a single-entry user namespace
+/// map (no host privilege required).
+///
 /// # Safety
 /// `b` must be a valid builder pointer.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_sandbox_builder_uid(
+pub unsafe extern "C" fn sandlock_sandbox_builder_user(
     b: *mut SandboxBuilder,
-    id: u32,
+    uid: u32,
+    gid: u32,
 ) -> *mut SandboxBuilder {
     if b.is_null() {
         return b;
     }
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.uid(id)))
+    Box::into_raw(Box::new(builder.user(uid, gid)))
 }
 
 // ----------------------------------------------------------------

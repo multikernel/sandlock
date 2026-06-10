@@ -66,6 +66,33 @@ impl ByteSize {
     }
 }
 
+/// Identity to run the sandboxed process as.
+///
+/// Applied via a single-entry user-namespace map (`unshare(CLONE_NEWUSER)` +
+/// `uid_map`/`gid_map`), so it requires no host privilege.  Because an
+/// unprivileged user namespace can only map a single id and must deny
+/// `setgroups`, exactly one uid and one gid are representable (no supplementary
+/// groups, no id ranges).
+///
+/// Parsed from `UID:GID`; both ids are required (no implicit default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunAs {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+impl std::str::FromStr for RunAs {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (u, g) = s
+            .split_once(':')
+            .ok_or_else(|| format!("expected UID:GID, got {:?}", s))?;
+        let uid = u.trim().parse::<u32>().map_err(|_| format!("invalid uid {:?}", u))?;
+        let gid = g.trim().parse::<u32>().map_err(|_| format!("invalid gid {:?}", g))?;
+        Ok(RunAs { uid, gid })
+    }
+}
+
 /// Confinement for confining the current process in place.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Confinement {
@@ -147,7 +174,7 @@ impl TryFrom<&Sandbox> for Confinement {
         if sandbox.cpu_cores.is_some() { unsupported.push("cpu_cores"); }
         if sandbox.num_cpus.is_some() { unsupported.push("num_cpus"); }
         if sandbox.port_remap { unsupported.push("port_remap"); }
-        if sandbox.uid.is_some() { unsupported.push("uid"); }
+        if sandbox.user.is_some() { unsupported.push("user"); }
         if sandbox.policy_fn.is_some() { unsupported.push("policy_fn"); }
 
         if !unsupported.is_empty() {
@@ -328,8 +355,8 @@ pub struct Sandbox {
     /// allows one `SECCOMP_FILTER_FLAG_NEW_LISTENER` per task.
     pub no_supervisor: bool,
 
-    // User namespace
-    pub uid: Option<u32>,
+    // User-namespace identity (run-as uid/gid)
+    pub user: Option<RunAs>,
 
     // Dynamic policy callback
     #[serde(skip)]
@@ -424,7 +451,7 @@ impl Clone for Sandbox {
             num_cpus: self.num_cpus,
             port_remap: self.port_remap,
             no_supervisor: self.no_supervisor,
-            uid: self.uid,
+            user: self.user,
             policy_fn: self.policy_fn.clone(),
             name: self.name.clone(),
             // init_fn (FnOnce) cannot be cloned — the clone gets None.

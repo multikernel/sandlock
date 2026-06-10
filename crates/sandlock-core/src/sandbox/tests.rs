@@ -1,5 +1,26 @@
 use super::*;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
+
+#[test]
+fn run_as_parses_uid_and_gid() {
+    let r = RunAs::from_str("1000:2000").unwrap();
+    assert_eq!(r.uid, 1000);
+    assert_eq!(r.gid, 2000);
+}
+
+#[test]
+fn run_as_requires_both_ids() {
+    // A bare UID (no `:GID`) is rejected — gid is not defaulted.
+    assert!(RunAs::from_str("1000").is_err());
+}
+
+#[test]
+fn run_as_rejects_garbage() {
+    assert!(RunAs::from_str("root").is_err());
+    assert!(RunAs::from_str("1000:abc").is_err());
+    assert!(RunAs::from_str("").is_err());
+}
 
 #[test]
 fn resolve_sandbox_path_plain() {

@@ -329,12 +329,12 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     let real_uid = unsafe { libc::getuid() };
     let real_gid = unsafe { libc::getgid() };
 
-    // 5b. User namespace for --uid mapping.
-    if let Some(target_uid) = sandbox.uid {
+    // 5b. User namespace for --user (run-as uid/gid) mapping.
+    if let Some(run_as) = sandbox.user {
         if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
             fail!("unshare(CLONE_NEWUSER)");
         }
-        write_id_maps(real_uid, real_gid, target_uid, target_uid);
+        write_id_maps(real_uid, real_gid, run_as.uid, run_as.gid);
     }
 
     // 6. Optional: change working directory

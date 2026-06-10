@@ -9,7 +9,7 @@ fn test_default_policy() {
     // for those protocols in `net_allow`, which is what the BPF filter
     // gates on now (no separate booleans).
     assert!(policy.net_allow.is_empty());
-    assert!(policy.uid.is_none());
+    assert!(policy.user.is_none());
     assert!(policy.fs_writable.is_empty());
     assert!(policy.fs_readable.is_empty());
 }

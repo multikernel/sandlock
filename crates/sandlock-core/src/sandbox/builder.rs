@@ -169,8 +169,8 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", clap(skip))]
     pub no_supervisor: bool,
 
-    #[cfg_attr(feature = "cli", arg(long = "uid"))]
-    pub uid: Option<u32>,
+    #[cfg_attr(feature = "cli", arg(long = "user", value_name = "UID:GID"))]
+    pub user: Option<RunAs>,
 
     /// Per-protection state overrides. Defaults to `strict_all`: every
     /// protection enforced, matching the historical `MIN_ABI = 6` floor.
@@ -255,7 +255,7 @@ impl Clone for SandboxBuilder {
             num_cpus: self.num_cpus,
             port_remap: self.port_remap,
             no_supervisor: self.no_supervisor,
-            uid: self.uid,
+            user: self.user,
             protection_policy: self.protection_policy.clone(),
             policy_fn: self.policy_fn.clone(),
             name: self.name.clone(),
@@ -559,8 +559,10 @@ impl SandboxBuilder {
         self
     }
 
-    pub fn uid(mut self, id: u32) -> Self {
-        self.uid = Some(id);
+    /// Run the sandboxed process as `uid`/`gid` via a single-entry user
+    /// namespace map (no host privilege required).
+    pub fn user(mut self, uid: u32, gid: u32) -> Self {
+        self.user = Some(RunAs { uid, gid });
         self
     }
 
@@ -753,7 +755,7 @@ impl SandboxBuilder {
             num_cpus: self.num_cpus,
             port_remap: self.port_remap,
             no_supervisor: self.no_supervisor,
-            uid: self.uid,
+            user: self.user,
             policy_fn: self.policy_fn,
             name: self.name,
             init_fn: self.init_fn,

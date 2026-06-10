@@ -230,6 +230,7 @@ type Sandbox struct {
 
 	// Misc.
 	UID        *int // map to this UID inside a user namespace; nil = unset
+	GID        *int // map to this GID inside the user namespace; must be set together with UID
 	NoCoredump bool // disable core dumps and restrict /proc/pid access
 
 	// Copy-on-write branch handling.

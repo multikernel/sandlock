@@ -353,8 +353,12 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 	}
 
 	// Misc.
-	if s.UID != nil {
-		b = C.sandlock_sandbox_builder_uid(b, C.uint32_t(*s.UID))
+	if s.UID != nil || s.GID != nil {
+		if s.UID == nil || s.GID == nil {
+			freeBuilderViaBuild(b)
+			return nil, fmt.Errorf("UID and GID must both be set (or both unset)")
+		}
+		b = C.sandlock_sandbox_builder_user(b, C.uint32_t(*s.UID), C.uint32_t(*s.GID))
 	}
 	if s.NoCoredump {
 		b = C.sandlock_sandbox_builder_no_coredump(b, cbool(true))

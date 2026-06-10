@@ -99,7 +99,7 @@ _b_http_ca = _builder_fn("sandlock_sandbox_builder_http_ca", ctypes.c_char_p)
 _b_http_key = _builder_fn("sandlock_sandbox_builder_http_key", ctypes.c_char_p)
 _b_http_inject_ca = _builder_fn("sandlock_sandbox_builder_http_inject_ca", ctypes.c_char_p)
 _b_http_ca_out = _builder_fn("sandlock_sandbox_builder_http_ca_out", ctypes.c_char_p)
-_b_uid = _builder_fn("sandlock_sandbox_builder_uid", ctypes.c_uint32)
+_b_user = _builder_fn("sandlock_sandbox_builder_user", ctypes.c_uint32, ctypes.c_uint32)
 _b_random_seed = _builder_fn("sandlock_sandbox_builder_random_seed", ctypes.c_uint64)
 _b_clean_env = _builder_fn("sandlock_sandbox_builder_clean_env", ctypes.c_bool)
 _b_env_var = _builder_fn("sandlock_sandbox_builder_env_var", ctypes.c_char_p, ctypes.c_char_p)
@@ -1073,8 +1073,10 @@ class _NativePolicy:
         if policy.port_remap:
             b = _b_port_remap(b, True)
 
-        if policy.uid is not None:
-            b = _b_uid(b, policy.uid)
+        if policy.uid is not None or policy.gid is not None:
+            if policy.uid is None or policy.gid is None:
+                raise ValueError("uid and gid must both be set (or both unset)")
+            b = _b_user(b, policy.uid, policy.gid)
 
         if policy.random_seed is not None:
             b = _b_random_seed(b, policy.random_seed)

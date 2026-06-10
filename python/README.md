@@ -224,7 +224,8 @@ Sandlock always applies its default syscall blocklist.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `uid` | `int \| None` | `None` | Map to given UID inside a user namespace (e.g. `0` for fake root) |
+| `uid` | `int \| None` | `None` | Map to given UID inside a user namespace (e.g. `0` for fake root). Set together with `gid` |
+| `gid` | `int \| None` | `None` | Map to given GID inside the user namespace. Must be set together with `uid` (both or neither) |
 | `no_coredump` | `bool` | `False` | Disable core dumps |
 
 #### COW filesystem isolation

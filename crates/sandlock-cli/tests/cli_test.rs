@@ -281,18 +281,18 @@ fn test_cow_commit_runs_on_cli_exit() {
     assert_eq!(contents.trim(), "committed");
 }
 
-/// Regression: `--uid N` maps the sandbox to UID `N` via an unprivileged
+/// Regression: `--user N:N` maps the sandbox to UID `N` via an unprivileged
 /// user namespace, even when the host UID is non-zero. This is the only
 /// remaining `CLONE_NEWUSER` site after the overlayfs backend removal;
 /// the test guards against accidentally tearing it out.
 #[test]
 fn test_uid_mapping_fakes_root() {
-    // `id -u` reports the in-namespace UID. Passing --uid 0 should make
+    // `id -u` reports the in-namespace UID. Passing --user 0:0 should make
     // the child see UID 0 (fake root) regardless of the host UID.
     let output = sandlock_bin()
         .args([
             "run",
-            "--uid", "0",
+            "--user", "0:0",
             "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "-r", "/etc",
             "--", "id", "-u",
         ])
@@ -300,7 +300,7 @@ fn test_uid_mapping_fakes_root() {
         .expect("failed to run sandlock");
     assert!(
         output.status.success(),
-        "sandlock --uid 0 failed: stderr={}",
+        "sandlock --user 0:0 failed: stderr={}",
         String::from_utf8_lossy(&output.stderr),
     );
     assert_eq!(
@@ -313,11 +313,11 @@ fn test_uid_mapping_fakes_root() {
 
 #[test]
 fn test_uid_mapping_arbitrary_uid() {
-    // Arbitrary --uid value should also map cleanly (not just 0).
+    // Arbitrary --user value should also map cleanly (not just 0).
     let output = sandlock_bin()
         .args([
             "run",
-            "--uid", "1234",
+            "--user", "1234:1234",
             "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "-r", "/etc",
             "--", "id", "-u",
         ])
@@ -325,7 +325,7 @@ fn test_uid_mapping_arbitrary_uid() {
         .expect("failed to run sandlock");
     assert!(
         output.status.success(),
-        "sandlock --uid 1234 failed: stderr={}",
+        "sandlock --user 1234:1234 failed: stderr={}",
         String::from_utf8_lossy(&output.stderr),
     );
     assert_eq!(

@@ -30,7 +30,7 @@ sandbox = Sandbox(
     deterministic_dirs=False, no_randomize_memory=False,
 
     # [program]  (process knobs only; exec/args are arguments to .run/.cmd)
-    env={}, cwd=None, uid=None,
+    env={}, cwd=None, uid=None, gid=None,
     clean_env=False, no_coredump=False, no_huge_pages=False,
 
     # [filesystem]
@@ -83,6 +83,7 @@ args          = ["-j4"]
 env           = { CC = "gcc" }
 cwd           = "/work"
 uid           = 0
+gid           = 0
 clean_env     = true
 no_coredump   = true
 no_huge_pages = true
@@ -171,7 +172,8 @@ fields on `Sandbox`.
 | --------------- | --------------- | ------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `env`           | `env`           | `Mapping[str, str]` | `{}`    | Variables to set or override in the child. Applied after `clean_env`.                                                                                |
 | `cwd`           | `cwd`           | `str \| None`       | `None`  | Child working directory (`chdir` target). Independent of `workdir`.                                                                                  |
-| `uid`           | `uid`           | `int \| None`       | `None`  | UID to map the child to inside a user namespace (e.g. `0` for fake root). The child retains no host privileges regardless of the mapped UID. Requires user namespaces to be available. |
+| `uid`           | `uid`           | `int \| None`       | `None`  | UID to map the child to inside a user namespace (e.g. `0` for fake root). Must be set together with `gid` (both or neither). The child retains no host privileges regardless of the mapped UID. Requires user namespaces to be available. |
+| `gid`           | `gid`           | `int \| None`       | `None`  | GID to map the child to inside the user namespace. Must be set together with `uid`. An unprivileged user namespace maps a single id, so supplementary groups are not available. |
 | `clean_env`     | `clean_env`     | `bool`              | `False` | When `True`, start with a minimal environment (`PATH`, `HOME`, `USER`, `TERM`, `LANG`) instead of inheriting the parent's.                            |
 | `no_coredump`   | `no_coredump`   | `bool`              | `False` | Apply `prctl(PR_SET_DUMPABLE, 0)`. Disables core dumps and restricts `/proc/<pid>` access from other processes. Breaks `gdb`, `strace`, and `perf`.   |
 | `no_huge_pages` | `no_huge_pages` | `bool`              | `False` | Disable transparent huge pages via `prctl(PR_SET_THP_DISABLE)`.                                                                                      |

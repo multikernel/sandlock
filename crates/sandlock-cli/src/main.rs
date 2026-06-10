@@ -394,7 +394,7 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         // Network virtualization
         b = b.port_remap(base.port_remap);
         // Process identity
-        if let Some(uid) = base.uid { b = b.uid(uid); }
+        if let Some(user) = base.user { b = b.user(user.uid, user.gid); }
         // Hardware constraints
         if let Some(ref devs) = base.gpu_devices { b = b.gpu_devices(devs.clone()); }
         if let Some(ref cores) = base.cpu_cores { b = b.cpu_cores(cores.clone()); }
@@ -418,7 +418,7 @@ async fn run_command(args: RunArgs) -> Result<i32> {
     if let Some(n) = pb.max_open_files { builder = builder.max_open_files(n); }
     for p in &pb.fs_denied { builder = builder.fs_deny(p); }
     if let Some(ref path) = pb.chroot { builder = builder.chroot(path); }
-    if let Some(id) = pb.uid { builder = builder.uid(id); }
+    if let Some(user) = pb.user { builder = builder.user(user.uid, user.gid); }
     if let Some(ref path) = pb.workdir { builder = builder.workdir(path); }
     if let Some(ref path) = pb.cwd { builder = builder.cwd(path); }
     if let Some(ref path) = pb.fs_storage { builder = builder.fs_storage(path); }
@@ -677,7 +677,7 @@ fn validate_no_supervisor(args: &RunArgs) -> Result<()> {
     if args.name.is_some() { bad.push("--name"); }
     if pb.chroot.is_some() { bad.push("--chroot"); }
     if args.image.is_some() { bad.push("--image"); }
-    if pb.uid.is_some() { bad.push("--uid"); }
+    if pb.user.is_some() { bad.push("--user"); }
     if pb.workdir.is_some() { bad.push("--workdir"); }
     if pb.cwd.is_some() { bad.push("--cwd"); }
     if pb.fs_storage.is_some() { bad.push("--fs-storage"); }
@@ -748,7 +748,7 @@ fn validate_no_supervisor_profile(profile: &Sandbox, source: &str) -> Result<()>
     if profile.workdir.is_some() { bad.push("[config].workdir"); }
     if profile.fs_storage.is_some() { bad.push("[config].fs_storage"); }
     if profile.cwd.is_some() { bad.push("[program].cwd"); }
-    if profile.uid.is_some() { bad.push("[program].uid"); }
+    if profile.user.is_some() { bad.push("[program].uid"); }
     if profile.chroot.is_some() { bad.push("[filesystem].chroot"); }
     if !profile.fs_mount.is_empty() { bad.push("[filesystem].mount"); }
     if profile.on_exit != BranchAction::Commit { bad.push("[filesystem].on_exit"); }

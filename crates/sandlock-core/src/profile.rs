@@ -57,6 +57,7 @@ pub struct ProgramSection {
     pub env: HashMap<String, String>,
     pub cwd: Option<PathBuf>,
     pub uid: Option<u32>,
+    pub gid: Option<u32>,
     pub clean_env: bool,
     pub no_coredump: bool,
     pub no_huge_pages: bool,
@@ -162,7 +163,13 @@ pub fn parse_input(input: ProfileInput) -> Result<(Sandbox, ProgramSpec), Sandlo
     // [program] — process knobs go to Sandbox; exec/args go to ProgramSpec.
     for (k, v) in input.program.env.iter() { b = b.env_var(k, v); }
     if let Some(c) = input.program.cwd             { b = b.cwd(c); }
-    if let Some(u) = input.program.uid             { b = b.uid(u); }
+    match (input.program.uid, input.program.gid) {
+        (Some(u), Some(g)) => b = b.user(u, g),
+        (None, None) => {}
+        _ => return Err(SandlockError::Sandbox(crate::error::SandboxError::Invalid(
+            "program.uid and program.gid must both be set".into(),
+        ))),
+    }
     if input.program.clean_env                     { b = b.clean_env(true); }
     if input.program.no_coredump                   { b = b.no_coredump(true); }
     if input.program.no_huge_pages                 { b = b.no_huge_pages(true); }
@@ -440,6 +447,7 @@ mod tests {
             args      = ["-h", "cache.internal", "-p", "6379"]
             cwd       = "/var/lib/redis"
             uid       = 1000
+            gid       = 1000
             clean_env = true
             no_coredump = true
 

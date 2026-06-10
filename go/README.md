@@ -96,7 +96,7 @@ fresh native policy on each call.
 | Syscalls | `ExtraAllowSyscalls`, `ExtraDenySyscalls` |
 | Determinism | `RandomSeed`, `TimeStart`, `NoRandomizeMemory`, `NoHugePages`, `DeterministicDirs` |
 | Environment | `CleanEnv`, `Env` |
-| Misc | `UID`, `NoCoredump`, `Name` |
+| Misc | `UID`, `GID`, `NoCoredump`, `Name` |
 | COW branch | `FSStorage`, `OnExit`, `OnError` |
 | Dynamic policy | `PolicyFn` |
 

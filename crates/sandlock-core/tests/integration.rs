@@ -43,8 +43,8 @@ mod test_policy_fn;
 #[path = "integration/test_fork.rs"]
 mod test_fork;
 
-#[path = "integration/test_privileged.rs"]
-mod test_privileged;
+#[path = "integration/test_user_mapping.rs"]
+mod test_user_mapping;
 
 #[path = "integration/test_chroot.rs"]
 mod test_chroot;

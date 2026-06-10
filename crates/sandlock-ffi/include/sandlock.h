@@ -431,10 +431,15 @@ sandlock_builder_t *sandlock_sandbox_builder_net_deny_bind_port(sandlock_builder
 sandlock_builder_t *sandlock_sandbox_builder_port_remap(sandlock_builder_t *b, bool v);
 
 /**
+ * Run the sandboxed process as `uid`/`gid` via a single-entry user namespace
+ * map (no host privilege required).
+ *
  * # Safety
  * `b` must be a valid builder pointer.
  */
-sandlock_builder_t *sandlock_sandbox_builder_uid(sandlock_builder_t *b, uint32_t id);
+sandlock_builder_t *sandlock_sandbox_builder_user(sandlock_builder_t *b,
+                                                  uint32_t uid,
+                                                  uint32_t gid);
 
 /**
  * # Safety
