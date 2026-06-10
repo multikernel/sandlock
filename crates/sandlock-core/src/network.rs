@@ -946,18 +946,35 @@ fn sendmsg_named_unix_on_behalf(
     sun_path: &std::path::Path,
     writable: &[std::path::PathBuf],
 ) -> NotifAction {
+    match send_named_unix_msghdr(notif, notif_fd, sockfd, msghdr_ptr, flags, sun_path, writable) {
+        Ok(n) => NotifAction::ReturnValue(n as i64),
+        Err(errno) => NotifAction::Errno(errno),
+    }
+}
+
+/// Core of the named-unix on-behalf `sendmsg`: resolve+verify `sun_path`, copy
+/// the message's iovecs/control from the child, and send to the pinned inode
+/// via `/proc/self/fd`. Returns the bytes sent or an errno. Shared by the
+/// single-message `sendmsg` path and the per-entry `sendmmsg` path.
+fn send_named_unix_msghdr(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+    sockfd: i32,
+    msghdr_ptr: u64,
+    flags: i32,
+    sun_path: &std::path::Path,
+    writable: &[std::path::PathBuf],
+) -> Result<isize, i32> {
     let pinned = match resolve_named_unix_target(notif.pid, sun_path, writable) {
         Ok(fd) => fd,
-        Err(action) => return action,
+        Err(NotifAction::Errno(e)) => return Err(e),
+        Err(_) => return Err(libc::EACCES),
     };
-    let (sun, sun_len) = match proc_self_fd_sockaddr(pinned.as_raw_fd()) {
-        Some(s) => s,
-        None => return NotifAction::Errno(libc::ENAMETOOLONG),
-    };
+    let (sun, sun_len) = proc_self_fd_sockaddr(pinned.as_raw_fd()).ok_or(libc::ENAMETOOLONG)?;
 
     let msghdr_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, msghdr_ptr, 56) {
         Ok(b) if b.len() >= 56 => b,
-        _ => return NotifAction::Errno(libc::EFAULT),
+        _ => return Err(libc::EFAULT),
     };
     let msg_iov_ptr = u64::from_ne_bytes(msghdr_bytes[16..24].try_into().unwrap());
     let msg_iovlen = u64::from_ne_bytes(msghdr_bytes[24..32].try_into().unwrap());
@@ -965,10 +982,8 @@ fn sendmsg_named_unix_on_behalf(
     let msg_controllen = u64::from_ne_bytes(msghdr_bytes[40..48].try_into().unwrap());
 
     let iovlen = (msg_iovlen as usize).min(1024);
-    let iov_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, msg_iov_ptr, iovlen * 16) {
-        Ok(b) => b,
-        Err(_) => return NotifAction::Errno(libc::EIO),
-    };
+    let iov_bytes = read_child_mem(notif_fd, notif.id, notif.pid, msg_iov_ptr, iovlen * 16)
+        .map_err(|_| libc::EIO)?;
     let mut data_bufs: Vec<Vec<u8>> = Vec::with_capacity(iovlen);
     for i in 0..iovlen {
         let off = i * 16;
@@ -978,16 +993,13 @@ fn sendmsg_named_unix_on_behalf(
         let base = u64::from_ne_bytes(iov_bytes[off..off + 8].try_into().unwrap());
         let len = u64::from_ne_bytes(iov_bytes[off + 8..off + 16].try_into().unwrap()) as usize;
         if len > MAX_SEND_BUF {
-            return NotifAction::Errno(libc::EMSGSIZE);
+            return Err(libc::EMSGSIZE);
         }
         if base == 0 || len == 0 {
             data_bufs.push(Vec::new());
             continue;
         }
-        match read_child_mem(notif_fd, notif.id, notif.pid, base, len) {
-            Ok(b) => data_bufs.push(b),
-            Err(_) => return NotifAction::Errno(libc::EIO),
-        }
+        data_bufs.push(read_child_mem(notif_fd, notif.id, notif.pid, base, len).map_err(|_| libc::EIO)?);
     }
     let mut local_iovs: Vec<libc::iovec> = data_bufs
         .iter()
@@ -1004,10 +1016,8 @@ fn sendmsg_named_unix_on_behalf(
         None
     };
 
-    let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
-        Ok(fd) => fd,
-        Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
-    };
+    let dup_fd = crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd)
+        .map_err(|e| e.raw_os_error().unwrap_or(libc::EBADF))?;
 
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_name = &sun as *const libc::sockaddr_un as *mut libc::c_void;
@@ -1020,9 +1030,81 @@ fn sendmsg_named_unix_on_behalf(
     }
     let ret = unsafe { libc::sendmsg(dup_fd.as_raw_fd(), &msg, flags) };
     if ret >= 0 {
-        NotifAction::ReturnValue(ret as i64)
+        Ok(ret)
     } else {
-        NotifAction::Errno(unsafe { *libc::__errno_location() })
+        Err(unsafe { *libc::__errno_location() })
+    }
+}
+
+/// Read a `sendmmsg` entry's `msg_name` and return its NAMED `AF_UNIX` path, or
+/// `None` for a connected (null-name), IP, or abstract entry. The entry's
+/// `msghdr` is the first field of `struct mmsghdr`, so it begins at `entry_ptr`.
+fn mmsg_entry_named_unix_path(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+    entry_ptr: u64,
+) -> Option<std::path::PathBuf> {
+    let hdr = read_child_mem(notif_fd, notif.id, notif.pid, entry_ptr, 12).ok()?;
+    if hdr.len() < 12 {
+        return None;
+    }
+    let msg_name_ptr = u64::from_ne_bytes(hdr[0..8].try_into().unwrap());
+    if msg_name_ptr == 0 {
+        return None;
+    }
+    let msg_namelen = u32::from_ne_bytes(hdr[8..12].try_into().unwrap());
+    let addr_bytes =
+        read_child_mem(notif_fd, notif.id, notif.pid, msg_name_ptr, msg_namelen as usize).ok()?;
+    named_unix_socket_path(&addr_bytes)
+}
+
+/// On-behalf `sendmmsg` for a batch containing NAMED `AF_UNIX` entries
+/// (non-chroot). Each named-unix entry is resolved, verified, and sent to its
+/// pinned inode; the loop stops at the first entry it cannot gate on-behalf
+/// (connected/abstract) or that is denied, returning the count sent so far
+/// (standard short-`sendmmsg` semantics). Never returns `Continue`, so a unix
+/// entry cannot ride out via the binary whole-call passthrough.
+fn sendmmsg_named_unix_on_behalf(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+    sockfd: i32,
+    msgvec_ptr: u64,
+    vlen: usize,
+    flags: i32,
+    writable: &[std::path::PathBuf],
+) -> NotifAction {
+    let mut sent: usize = 0;
+    let mut first_errno: Option<i32> = None;
+    for i in 0..vlen {
+        let entry_ptr = msgvec_ptr + (i * MMSGHDR_SIZE) as u64;
+        let path = match mmsg_entry_named_unix_path(notif, notif_fd, entry_ptr) {
+            Some(p) => p,
+            // Connected/abstract/unreadable entry: cannot gate on-behalf, so
+            // stop here and report a short send rather than passing it through.
+            None => break,
+        };
+        match send_named_unix_msghdr(notif, notif_fd, sockfd, entry_ptr, flags, &path, writable) {
+            Ok(n) => {
+                let bytes = (n as u32).to_ne_bytes();
+                let _ = write_child_mem(
+                    notif_fd,
+                    notif.id,
+                    notif.pid,
+                    entry_ptr + MSG_LEN_OFFSET as u64,
+                    &bytes,
+                );
+                sent += 1;
+            }
+            Err(errno) => {
+                first_errno = Some(errno);
+                break;
+            }
+        }
+    }
+    if sent > 0 {
+        NotifAction::ReturnValue(sent as i64)
+    } else {
+        NotifAction::Errno(first_errno.unwrap_or(libc::EACCES))
     }
 }
 
@@ -1449,6 +1531,46 @@ async fn sendmmsg_on_behalf(
 
     if vlen == 0 {
         return NotifAction::ReturnValue(0);
+    }
+
+    // Named-unix gate. If any entry targets a named AF_UNIX socket, handle the
+    // whole batch here: the existing prescan below would Continue the entire
+    // call on the first non-IP entry, which would let a unix entry bypass the
+    // gate.
+    if ctx.policy.has_unix_fs_gate {
+        let mut named_unix = false;
+        for i in 0..vlen {
+            let entry_ptr = msgvec_ptr + (i * MMSGHDR_SIZE) as u64;
+            if mmsg_entry_named_unix_path(notif, notif_fd, entry_ptr).is_some() {
+                named_unix = true;
+                break;
+            }
+        }
+        if named_unix {
+            if ctx.policy.chroot_root.is_some() {
+                // Chroot: lexical check; deny the whole call if any named-unix
+                // entry is outside the (virtual) write grants.
+                for i in 0..vlen {
+                    let entry_ptr = msgvec_ptr + (i * MMSGHDR_SIZE) as u64;
+                    if let Some(path) = mmsg_entry_named_unix_path(notif, notif_fd, entry_ptr) {
+                        if !path_under_any(&path, &ctx.policy.chroot_writable) {
+                            return NotifAction::Errno(libc::EACCES);
+                        }
+                    }
+                }
+                // All granted: fall through to the existing path.
+            } else {
+                return sendmmsg_named_unix_on_behalf(
+                    notif,
+                    notif_fd,
+                    sockfd,
+                    msgvec_ptr,
+                    vlen,
+                    flags,
+                    &ctx.policy.chroot_writable,
+                );
+            }
+        }
     }
 
     // Pre-scan every entry. If any has a Continue-eligible shape

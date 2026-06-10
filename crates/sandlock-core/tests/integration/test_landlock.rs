@@ -1164,6 +1164,237 @@ async fn test_named_unix_dgram_sendmsg_allowed_delivers() {
     dgram_allow_delivers("sendmsg", "msg").await;
 }
 
+// `sendmmsg()` (batched datagram send) is the last named-unix vector and Python
+// has no binding for it, so the child drives it via ctypes. Its handler used to
+// Continue the whole call whenever any entry was non-IP, which let a unix entry
+// bypass the gate. A sendmmsg whose entry targets a socket outside the fs-write
+// grants must be denied (EACCES).
+#[tokio::test]
+async fn test_named_unix_dgram_sendmmsg_denied_without_fs_write() {
+    if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 {
+        eprintln!("Skipping: Landlock ABI v6 required");
+        return;
+    }
+
+    let sock_dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("named-unixmmsg-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&sock_dir);
+    let sock_path = sock_dir.join("svc.dgram");
+    let _ = std::fs::remove_file(&sock_path);
+
+    let out = temp_file("named-mmsg-result");
+    let ready_file = temp_file("named-mmsg-ready");
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&ready_file);
+
+    let listener_script = format!(
+        concat!(
+            "import socket, time\n",
+            "s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)\n",
+            "s.bind('{sock}')\n",
+            "open('{ready}', 'w').write('ready')\n",
+            "time.sleep(15)\n",
+            "s.close()\n",
+        ),
+        sock = sock_path.display(),
+        ready = ready_file.display(),
+    );
+    let mut listener_proc = std::process::Command::new("python3")
+        .args(["-c", &listener_script])
+        .spawn()
+        .unwrap();
+    for _ in 0..100 {
+        if ready_file.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(ready_file.exists(), "listener should signal readiness");
+
+    let child_script = format!("{}{}", sendmmsg_ctypes_preamble(), format!(
+        concat!(
+            "rc = send_one('{sock}', b'escape')\n",
+            "open('{out}', 'w').write(rc)\n",
+        ),
+        sock = sock_path.display(),
+        out = out.display(),
+    ));
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write("/tmp")
+        .fs_read(sock_dir.to_str().unwrap())
+        .build()
+        .unwrap();
+
+    policy
+        .clone()
+        .with_name("test")
+        .run_interactive(&["python3", "-c", &child_script])
+        .await
+        .unwrap();
+
+    let contents = std::fs::read_to_string(&out).unwrap_or_default();
+    assert_eq!(
+        contents, "ERRNO:13",
+        "sendmmsg to a named dgram socket with no fs-write grant must be denied with EACCES (got {contents:?})"
+    );
+
+    let _ = listener_proc.kill();
+    let _ = listener_proc.wait();
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&ready_file);
+    let _ = std::fs::remove_file(&sock_path);
+    let _ = std::fs::remove_dir_all(&sock_dir);
+}
+
+// Python ctypes preamble defining `send_one(path, data)` which issues a
+// single-entry `sendmmsg()` to a named AF_UNIX address and returns
+// "SENT:<n>" or "ERRNO:<e>".
+fn sendmmsg_ctypes_preamble() -> &'static str {
+    concat!(
+        "import ctypes, socket, struct\n",
+        "libc = ctypes.CDLL(None, use_errno=True)\n",
+        "class iovec(ctypes.Structure):\n",
+        "    _fields_ = [('iov_base', ctypes.c_void_p), ('iov_len', ctypes.c_size_t)]\n",
+        "class msghdr(ctypes.Structure):\n",
+        "    _fields_ = [('msg_name', ctypes.c_void_p), ('msg_namelen', ctypes.c_uint),\n",
+        "                ('msg_iov', ctypes.c_void_p), ('msg_iovlen', ctypes.c_size_t),\n",
+        "                ('msg_control', ctypes.c_void_p), ('msg_controllen', ctypes.c_size_t),\n",
+        "                ('msg_flags', ctypes.c_int)]\n",
+        "class mmsghdr(ctypes.Structure):\n",
+        "    _fields_ = [('msg_hdr', msghdr), ('msg_len', ctypes.c_uint)]\n",
+        "def send_one(path, data):\n",
+        "    s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)\n",
+        "    sun = struct.pack('H', socket.AF_UNIX) + path.encode() + b'\\x00'\n",
+        "    sun_buf = ctypes.create_string_buffer(sun, len(sun))\n",
+        "    buf = ctypes.create_string_buffer(data, len(data))\n",
+        "    iov = iovec(ctypes.cast(buf, ctypes.c_void_p), len(data))\n",
+        "    mm = mmsghdr()\n",
+        "    mm.msg_hdr.msg_name = ctypes.cast(sun_buf, ctypes.c_void_p)\n",
+        "    mm.msg_hdr.msg_namelen = len(sun)\n",
+        "    mm.msg_hdr.msg_iov = ctypes.cast(ctypes.pointer(iov), ctypes.c_void_p)\n",
+        "    mm.msg_hdr.msg_iovlen = 1\n",
+        "    ctypes.set_errno(0)\n",
+        "    r = libc.sendmmsg(s.fileno(), ctypes.byref(mm), 1, 0)\n",
+        "    s.close()\n",
+        "    return 'ERRNO:%d' % ctypes.get_errno() if r < 0 else 'SENT:%d' % r\n",
+    )
+}
+
+// Allow+delivery guard for the sendmmsg on-behalf path: to a write-granted
+// socket the batched send must be permitted AND deliver the payload (exercises
+// sendmmsg_named_unix_on_behalf's success path, which the deny test misses).
+#[tokio::test]
+async fn test_named_unix_dgram_sendmmsg_allowed_delivers() {
+    if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 {
+        eprintln!("Skipping: Landlock ABI v6 required");
+        return;
+    }
+
+    let sock_dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("named-unixmmsg-rw-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&sock_dir);
+    let sock_path = sock_dir.join("svc.dgram");
+    let _ = std::fs::remove_file(&sock_path);
+
+    let out = temp_file("named-mmsg-rw-result");
+    let ready_file = temp_file("named-mmsg-rw-ready");
+    let recv_file = temp_file("named-mmsg-rw-recv");
+    for f in [&out, &ready_file, &recv_file] {
+        let _ = std::fs::remove_file(f);
+    }
+
+    let listener_script = format!(
+        concat!(
+            "import socket\n",
+            "s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)\n",
+            "s.bind('{sock}')\n",
+            "s.settimeout(12)\n",
+            "open('{ready}', 'w').write('ready')\n",
+            "try:\n",
+            "    data, _ = s.recvfrom(64)\n",
+            "    open('{recv}', 'w').write(data.decode())\n",
+            "except socket.timeout:\n",
+            "    open('{recv}', 'w').write('TIMEOUT')\n",
+            "s.close()\n",
+        ),
+        sock = sock_path.display(),
+        ready = ready_file.display(),
+        recv = recv_file.display(),
+    );
+    let mut listener_proc = std::process::Command::new("python3")
+        .args(["-c", &listener_script])
+        .spawn()
+        .unwrap();
+    for _ in 0..100 {
+        if ready_file.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(ready_file.exists(), "listener should signal readiness");
+
+    let child_script = format!("{}{}", sendmmsg_ctypes_preamble(), format!(
+        concat!(
+            "rc = send_one('{sock}', b'payload-42')\n",
+            "open('{out}', 'w').write(rc)\n",
+        ),
+        sock = sock_path.display(),
+        out = out.display(),
+    ));
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write("/tmp")
+        .fs_write(sock_dir.to_str().unwrap())
+        .build()
+        .unwrap();
+
+    policy
+        .clone()
+        .with_name("test")
+        .run_interactive(&["python3", "-c", &child_script])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap_or_default(),
+        "SENT:1",
+        "sendmmsg to a write-granted dgram socket must be permitted"
+    );
+    for _ in 0..100 {
+        if recv_file.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = listener_proc.wait();
+    assert_eq!(
+        std::fs::read_to_string(&recv_file).unwrap_or_default(),
+        "payload-42",
+        "sendmmsg on-behalf send must actually deliver the payload"
+    );
+
+    let _ = listener_proc.kill();
+    for f in [&out, &ready_file, &recv_file, &sock_path] {
+        let _ = std::fs::remove_file(f);
+    }
+    let _ = std::fs::remove_dir_all(&sock_dir);
+}
+
 #[tokio::test]
 async fn test_isolate_signals_blocks_parent() {
     if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 {
