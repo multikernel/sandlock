@@ -138,7 +138,7 @@ impl ContainerState {
         Ok(())
     }
 
-    /// Record the PID in Created state (SIGSTOP'd child).
+    /// Transition `Creating` -> `Created`, recording the parked child's init PID.
     pub fn set_created(&mut self, pid: i32) {
         self.status = Status::Created;
         self.pid = pid;

@@ -271,6 +271,12 @@ fn cmd_create(id: &str, bundle: &PathBuf, pid_file: Option<&std::path::Path>) ->
         // Close the read end (inherited from intermediate, not needed here)
         unsafe { libc::close(read_fd); }
 
+        // Detach the daemon's working directory from the caller's so we don't
+        // pin a filesystem the caller may later want to unmount.  The
+        // container's own cwd comes from the OCI spec via the sandbox policy,
+        // independent of the supervisor's cwd.
+        unsafe { libc::chdir(b"/\0".as_ptr() as *const libc::c_char); }
+
         // Redirect only stdin to /dev/null — the supervisor daemon doesn't
         // need input.  stdout/stderr are intentionally *not* redirected:
         // containerd/CRI-O wire the runtime's stdio to the container's log
