@@ -57,7 +57,7 @@ pub struct OciPolicy {
 impl OciPolicy {
     /// Build an OciPolicy from a parsed OCI Spec and its bundle directory.
     pub fn from_spec(spec: &Spec, bundle: &Path, id: &str) -> Result<Self> {
-        let rootfs = rootfs_path(spec, bundle);
+        let rootfs = rootfs_path(spec, bundle)?;
 
         // OCI `root.readonly`: when set, the container rootfs must be read-only,
         // so the whole chroot is granted read access rather than read-write.
@@ -209,20 +209,28 @@ impl OciPolicy {
 }
 
 /// Resolve the rootfs path from the OCI spec.
-/// Returns `None` when the spec has no root, an empty path, or a path that
-/// doesn't exist on disk (allows rootfs-less invocations and tests without a
-/// real bundle).
-fn rootfs_path(spec: &Spec, bundle: &Path) -> Option<PathBuf> {
-    let raw = spec.root().as_ref()
-        .and_then(|r| {
-            let p = r.path().clone();
-            if p.as_os_str().is_empty() { None } else { Some(p) }
-        })?;
-    if raw.is_absolute() {
-        if raw.exists() { Some(raw) } else { None }
+///
+/// Returns `Ok(None)` when the spec declares no root (or an empty path): a
+/// legitimately rootfs-less invocation. Returns an error when a root path *is*
+/// declared but does not resolve to an existing directory, so a broken bundle
+/// fails fast at `create` rather than launching chroot-less and failing
+/// obscurely at execve.
+fn rootfs_path(spec: &Spec, bundle: &Path) -> Result<Option<PathBuf>> {
+    let raw = match spec.root().as_ref().and_then(|r| {
+        let p = r.path().clone();
+        if p.as_os_str().is_empty() { None } else { Some(p) }
+    }) {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    let resolved = if raw.is_absolute() { raw } else { bundle.join(&raw) };
+    if resolved.exists() {
+        Ok(Some(resolved))
     } else {
-        let joined = bundle.join(&raw);
-        if joined.exists() { Some(joined) } else { None }
+        anyhow::bail!(
+            "rootfs path {:?} declared in config.json does not exist",
+            resolved
+        )
     }
 }
 
@@ -460,9 +468,12 @@ mod tests {
     }
 
     #[test]
-    fn default_stdin_paths_without_rootfs() {
+    fn rootfs_less_spec_yields_no_chroot() {
+        // An explicitly empty root path is a legitimately rootfs-less
+        // invocation: no chroot, confined against host paths only.
         let spec = SpecBuilder::default()
             .version("1.0.2")
+            .root(RootBuilder::default().path("").build().unwrap())
             .process(
                 ProcessBuilder::default()
                     .args(vec!["echo".to_string(), "hello".to_string()])
@@ -474,5 +485,27 @@ mod tests {
 
         let policy = OciPolicy::from_spec(&spec, Path::new("/tmp"), "test").unwrap();
         assert!(policy.rootfs.is_none());
+    }
+
+    #[test]
+    fn declared_but_missing_rootfs_errors() {
+        // A root path that is declared but does not exist must fail fast at
+        // policy build rather than silently launching without a chroot.
+        let spec = SpecBuilder::default()
+            .version("1.0.2")
+            .root(RootBuilder::default().path("rootfs").build().unwrap())
+            .process(
+                ProcessBuilder::default()
+                    .args(vec!["sh".to_string()])
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+
+        let bundle = tempdir().unwrap();
+        // Note: no rootfs dir created under the bundle.
+        let err = OciPolicy::from_spec(&spec, bundle.path(), "test").unwrap_err();
+        assert!(err.to_string().contains("does not exist"));
     }
 }
