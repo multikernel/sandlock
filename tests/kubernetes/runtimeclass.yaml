@@ -1,24 +1,38 @@
 # Kubernetes RuntimeClass for sandlock-oci
-# Apply with: kubectl apply -f runtimeclass.yaml
 #
-# This tells Kubernetes to use the "sandlock" handler name when scheduling
-# pods with runtimeClassName: sandlock. The handler must match the
-# runtime name in /etc/containerd/config.toml on each node.
+# Apply with:
+#   kubectl apply -f runtimeclass.yaml
 #
-# containerd config excerpt (on each node):
+# This registers the "sandlock" handler with Kubernetes so that pods with
+# `runtimeClassName: sandlock` are dispatched to sandlock-oci on each node.
+# The handler name must match the runtime key in /etc/containerd/config.toml.
+#
+# containerd config required on each node:
 #
 #   [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.sandlock]
 #     runtime_type = "io.containerd.runc.v2"
 #     [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.sandlock.options]
 #       BinaryName = "/usr/local/bin/sandlock-oci"
+#
+# Known limitations
+# -----------------
+# - `exec` is not implemented.  `kubectl exec` and exec-based liveness/
+#   readiness probes will fail for pods using this RuntimeClass.
+#   Use httpGet or tcpSocket probes instead.
+#
 ---
 apiVersion: node.k8s.io/v1
 kind: RuntimeClass
 metadata:
   name: sandlock
+  annotations:
+    # Advertise known limitations so tooling can surface them.
+    sandlock.io/exec-supported: "false"
+    sandlock.io/probe-types: "httpGet,tcpSocket"
 # handler must match the key in containerd's runtime config
 handler: sandlock
-# Optional scheduling hints (uncomment to restrict to labelled nodes)
+# Optional: restrict scheduling to nodes that have sandlock-oci installed.
+# Label nodes with: kubectl label node <name> sandlock.io/runtime=true
 # scheduling:
 #   nodeSelector:
 #     sandlock.io/runtime: "true"

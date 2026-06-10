@@ -168,16 +168,10 @@ async fn supervisor_main(
 
     // Notify the CLI: `OK <pid>` on success.  The CLI treats any non-OK
     // response (or EOF) as a create failure, so this is the only success path.
+    // The CLI reads this and immediately updates state to Created — the
+    // supervisor must NOT also write state here or the two writes race on the
+    // same file (one truncates while the other is reading).
     pipe_write(pid_write_fd, &format!("OK {}", child_pid));
-
-    // Persist Created state with the real child PID.
-    {
-        let mut state = ContainerState::load(id).unwrap_or_else(|_| {
-            ContainerState::new(id, Path::new("/"), "1.0.2")
-        });
-        state.set_created(child_pid);
-        state.save().ok();
-    }
 
     // Accept-loop: serve CLI commands until `Start` or `Shutdown`.
     let loop_exit: LoopExit = loop {

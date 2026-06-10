@@ -14,9 +14,12 @@
 //!   delete <id>              →  send Shutdown to Supervisor, cleanup state dir
 //! ```
 //!
-//! ## Known limitations
+//! ## exec
 //!
-//! - `exec` is not implemented (required for `kubectl exec` / exec probes).
+//! `exec` re-applies the container's Landlock policy to the calling process
+//! and then execvp's the requested command.  Because sandlock does not use
+//! Linux namespaces, exec simply confines the new process with the same
+//! filesystem rules as the original container.
 
 mod policy;
 mod spec;
@@ -102,19 +105,46 @@ enum Command {
 
     /// Execute a process inside a running container.
     ///
-    /// **Not yet implemented.** Required for `kubectl exec` and exec-based
-    /// liveness/readiness probes.  Tracked as a known limitation.
-    ///
-    /// All arguments are accepted without validation so that containerd/CRI-O
-    /// invocations (which pass flags like `--process`, `--detach`, `--pid-file`
-    /// *before* the container-id) parse cleanly and receive a clear error.
+    /// Re-applies the container's Landlock policy to the current process then
+    /// execvp's the requested command.  Supports both the inline-args form
+    /// (`exec <id> <cmd> [args...]`) and the process-spec form
+    /// (`exec --process spec.json <id>`).
     Exec {
-        /// All exec arguments captured as-is (id, flags, command).
-        /// `allow_hyphen_values` + `trailing_var_arg` ensure that runc-style
-        /// flags preceding the container-id do not trigger an "unexpected
-        /// argument" error.
-        #[arg(num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true)]
-        _args: Vec<String>,
+        /// Container identifier.
+        id: String,
+
+        /// Path to a process spec JSON file (OCI `Process` object).
+        /// Takes precedence over inline command args when provided.
+        #[arg(short = 'p', long = "process", value_name = "FILE")]
+        process: Option<PathBuf>,
+
+        /// Write the exec process PID to this file.
+        #[arg(long = "pid-file", value_name = "PATH")]
+        pid_file: Option<PathBuf>,
+
+        /// Detach: run the exec process in the background without waiting.
+        #[arg(short = 'd', long)]
+        detach: bool,
+
+        /// Console socket for PTY-based exec (parsed but not used).
+        #[arg(long = "console-socket", value_name = "PATH")]
+        console_socket: Option<PathBuf>,
+
+        /// Environment variable to set (KEY=VALUE). Repeatable.
+        #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
+
+        /// Working directory inside the container.
+        #[arg(long, value_name = "PATH")]
+        cwd: Option<PathBuf>,
+
+        /// Allocate a pseudo-TTY (flag accepted; TTY handling not yet wired).
+        #[arg(short = 't', long)]
+        tty: bool,
+
+        /// Command and arguments to execute inside the container.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
     },
 }
 
@@ -159,12 +189,8 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::Exec { _args: _ } => {
-            bail!(
-                "`exec` is not implemented in sandlock-oci. \
-                 It is required for kubectl exec and exec-based probes but has not \
-                 yet been built (tracked as a known limitation)."
-            );
+        Command::Exec { id, process, pid_file, detach, console_socket: _, tty: _, env, cwd, command } => {
+            cmd_exec(&id, process.as_deref(), pid_file.as_deref(), detach, &env, cwd.as_deref(), &command)?;
         }
         Command::Check => {
             match sandlock_core::landlock_abi_version() {
@@ -443,6 +469,152 @@ fn cmd_delete(id: &str, force: bool) -> Result<()> {
     // Remove state directory.
     state.delete()?;
     Ok(())
+}
+
+/// `sandlock-oci exec <id> [--process spec.json] [-- <cmd> [args...]]`
+///
+/// Re-applies the container's Landlock policy to the current process, then
+/// execvp's the requested command.  Because sandlock does not use Linux
+/// namespaces the exec simply runs with the same filesystem confinement as the
+/// original container — no `setns` / `nsenter` is required.
+fn cmd_exec(
+    id: &str,
+    process_file: Option<&std::path::Path>,
+    pid_file: Option<&std::path::Path>,
+    detach: bool,
+    extra_env: &[String],
+    extra_cwd: Option<&std::path::Path>,
+    inline_args: &[String],
+) -> Result<()> {
+    use std::ffi::CString;
+    use std::collections::HashMap;
+
+    let state = ContainerState::load(id)
+        .with_context(|| format!("no such container: {}", id))?;
+
+    if state.status != Status::Running {
+        bail!("container {} is not running (status: {})", id, state.status);
+    }
+
+    // ── Resolve the command, env, and cwd ─────────────────────────────────
+    let (cmd, mut env_map, resolved_cwd) = if let Some(pf) = process_file {
+        let raw = std::fs::read_to_string(pf)
+            .with_context(|| format!("read process spec {:?}", pf))?;
+        let proc: oci_spec::runtime::Process = serde_json::from_str(&raw)
+            .context("parse process spec JSON")?;
+
+        let cmd: Vec<String> = proc.args().as_ref().cloned()
+            .filter(|a| !a.is_empty())
+            .unwrap_or_default();
+
+        let env: HashMap<String, String> = proc.env().as_ref()
+            .map(|env| env.iter()
+                .filter_map(|v| v.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+                .collect())
+            .unwrap_or_default();
+
+        let cwd = Some(proc.cwd().clone());
+        (cmd, env, cwd)
+    } else {
+        if inline_args.is_empty() {
+            bail!("exec requires a command; pass it after the container ID or use --process");
+        }
+        (inline_args.to_vec(), HashMap::new(), extra_cwd.map(|p| p.to_path_buf()))
+    };
+
+    if cmd.is_empty() {
+        bail!("exec: command is empty");
+    }
+
+    // Merge any extra --env flags
+    for kv in extra_env {
+        if let Some((k, v)) = kv.split_once('=') {
+            env_map.insert(k.to_string(), v.to_string());
+        }
+    }
+
+    // ── Re-derive the OCI policy from the original bundle ─────────────────
+    let spec = spec::load_spec(&state.bundle)?;
+    let policy = spec::spec_to_policy(&spec, &state.bundle)?;
+
+    // ── If detach, fork and let the parent return immediately ─────────────
+    if detach {
+        let child = unsafe { libc::fork() };
+        if child < 0 {
+            bail!("fork for detach failed: {}", std::io::Error::last_os_error());
+        }
+        if child != 0 {
+            // Parent returns immediately; child continues below.
+            if let Some(pf) = pid_file {
+                std::fs::write(pf, child.to_string())
+                    .with_context(|| format!("write pid file {:?}", pf))?;
+            }
+            return Ok(());
+        }
+        // Detached child: redirect stdin/stdout/stderr to /dev/null
+        unsafe {
+            let devnull = libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_RDWR);
+            if devnull >= 0 {
+                libc::dup2(devnull, 0);
+                libc::dup2(devnull, 1);
+                libc::dup2(devnull, 2);
+                if devnull > 2 { libc::close(devnull); }
+            }
+        }
+    }
+
+    // ── Apply Landlock confinement from the original policy ────────────────
+    let mut cb = sandlock_core::ConfinementBuilder::default();
+    for p in &policy.fs_read  { cb = cb.fs_read(p); }
+    for p in &policy.fs_write { cb = cb.fs_write(p); }
+    sandlock_core::confine(&cb.build()).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    // ── Apply chroot (if the container had a rootfs) ───────────────────────
+    if let Some(ref rootfs) = policy.rootfs {
+        let c = CString::new(rootfs.to_string_lossy().as_ref())
+            .context("rootfs path contains NUL")?;
+        if unsafe { libc::chroot(c.as_ptr()) } != 0 {
+            bail!("chroot({:?}) failed: {}", rootfs, std::io::Error::last_os_error());
+        }
+        if unsafe { libc::chdir(b"/\0".as_ptr() as *const libc::c_char) } != 0 {
+            bail!("chdir(/) after chroot failed: {}", std::io::Error::last_os_error());
+        }
+    }
+
+    // ── Apply working directory ────────────────────────────────────────────
+    let cwd_to_use = resolved_cwd.as_deref().or(extra_cwd).or(policy.cwd.as_deref());
+    if let Some(cwd) = cwd_to_use {
+        let c = CString::new(cwd.to_string_lossy().as_ref())
+            .context("cwd path contains NUL")?;
+        if unsafe { libc::chdir(c.as_ptr()) } != 0 {
+            bail!("chdir({:?}) failed: {}", cwd, std::io::Error::last_os_error());
+        }
+    }
+
+    // ── Apply environment ─────────────────────────────────────────────────
+    for (k, v) in &env_map {
+        std::env::set_var(k, v);
+    }
+
+    // ── Write pid file (non-detach path) ──────────────────────────────────
+    if !detach {
+        if let Some(pf) = pid_file {
+            let pid = unsafe { libc::getpid() };
+            std::fs::write(pf, pid.to_string())
+                .with_context(|| format!("write pid file {:?}", pf))?;
+        }
+    }
+
+    // ── execvp ────────────────────────────────────────────────────────────
+    let prog = CString::new(cmd[0].as_str()).context("invalid command")?;
+    let c_args: Vec<CString> = cmd.iter()
+        .map(|a| CString::new(a.as_str()).unwrap_or_else(|_| CString::new("?").unwrap()))
+        .collect();
+    let mut ptrs: Vec<*const libc::c_char> = c_args.iter().map(|a| a.as_ptr()).collect();
+    ptrs.push(std::ptr::null());
+
+    unsafe { libc::execvp(prog.as_ptr(), ptrs.as_ptr()) };
+    bail!("execvp({:?}) failed: {}", cmd[0], std::io::Error::last_os_error())
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
