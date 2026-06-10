@@ -41,10 +41,11 @@ Caveats (this example is deliberately minimal):
 
   * Directory listings (getdents64) are not served, so ls /s3 is empty.
   * open fetches the whole object body (no range reads).
-  * A real (network) backend's head/get runs inside the supervisor
-    dispatch path while holding the GIL, so it blocks the supervisor.
-    Prefetch out of band for anything beyond a demo. FakeS3 is in-memory
-    and instant, so this does not apply here.
+  * The handlers are async (`async def handle`), so a real (network)
+    backend's head/get runs on a worker thread off the supervisor loop
+    rather than blocking it (CPython releases the GIL during socket I/O,
+    so concurrent fetches overlap). FakeS3 is in-memory and instant, so
+    being async is a no-op here but is what makes a real backend viable.
   * _pack_stat uses the x86_64 struct stat layout. statx is
     architecture-independent by design, so _pack_statx is portable.
 """
@@ -166,10 +167,14 @@ class Namespace:
             return None
         return path[len(PREFIX):]
 
-    def head(self, key: str) -> ObjectMeta:
+    # head()/get() are async: the handlers `await` them, which is what runs
+    # the handler off the supervisor loop. FakeS3's backend is synchronous
+    # and instant, so we call it directly; a real client (boto3's async
+    # variant, an aiohttp S3 client) would `await` its network call here.
+    async def head(self, key: str) -> ObjectMeta:
         return self._backend.head(key)
 
-    def get(self, key: str) -> bytes:
+    async def get(self, key: str) -> bytes:
         with self._lock:
             if key in self._body_cache:
                 return self._body_cache[key]
@@ -250,7 +255,16 @@ def _pack_statx(meta: ObjectMeta) -> bytes:
 class _NamespaceHandler(Handler):
     """Base: holds the shared Namespace. handle() maps its own errors to
     errno, so the KILL default never fires; DENY_EIO is a last-resort
-    backstop."""
+    backstop.
+
+    handle() is an `async def`, which runs it off the supervisor's
+    notification loop. A real backend's head()/get() is a network
+    round-trip; run inline it would block the single supervisor task (and
+    hold the GIL) for its full duration, stalling every other trapped
+    syscall. As an async handler it runs on a worker and `await`s the
+    fetch, so the loop stays free and concurrent fetches overlap. FakeS3
+    is instant so this changes nothing here, but it is what makes a real
+    backend viable beyond a demo."""
 
     on_exception = ExceptionPolicy.DENY_EIO
 
@@ -261,7 +275,7 @@ class _NamespaceHandler(Handler):
 class OpenatHandler(_NamespaceHandler):
     """openat(dirfd, pathname, flags, mode): inject a memfd of the object."""
 
-    def handle(self, ctx: HandlerCtx) -> NotifAction:
+    async def handle(self, ctx: HandlerCtx) -> NotifAction:
         key = self._ns.key_for(ctx.read_path())  # openat path arg inferred
         if key is None:
             return NotifAction.continue_()        # not ours: kernel handles it
@@ -271,32 +285,27 @@ class OpenatHandler(_NamespaceHandler):
             return NotifAction.errno(errno.EROFS)  # read-only, no writes
 
         try:
-            data = self._ns.get(key)               # S3 GetObject
+            data = await self._ns.get(key)         # S3 GetObject (off-loop)
         except Exception as e:
             return NotifAction.errno(_errno_for(e))
 
-        fd = os.memfd_create(f"s3:{key}", os.MFD_CLOEXEC)
+        # inject_bytes builds the (sealed, read-only) memfd, rewinds it, and
+        # transfers fd ownership to the supervisor — no manual memfd dance.
         try:
-            os.write(fd, data)
-            os.lseek(fd, 0, os.SEEK_SET)  # ADDFD shares the offset, so rewind
+            return NotifAction.inject_bytes(data, cloexec=bool(flags & os.O_CLOEXEC))
         except OSError:
-            os.close(fd)
             return NotifAction.errno(errno.EIO)
-
-        # Ownership of fd transfers to the supervisor, so do NOT close it here.
-        newfd_flags = os.O_CLOEXEC if (flags & os.O_CLOEXEC) else 0
-        return NotifAction.inject_fd_send(fd, newfd_flags)
 
 
 class NewfstatatHandler(_NamespaceHandler):
     """newfstatat(dirfd, pathname, statbuf, flags): write a struct stat."""
 
-    def handle(self, ctx: HandlerCtx) -> NotifAction:
+    async def handle(self, ctx: HandlerCtx) -> NotifAction:
         key = self._ns.key_for(ctx.read_path(arg=1))
         if key is None:
             return NotifAction.continue_()
         try:
-            meta = self._ns.head(key)              # S3 HeadObject
+            meta = await self._ns.head(key)        # S3 HeadObject (off-loop)
         except Exception as e:
             return NotifAction.errno(_errno_for(e))
         if not ctx.write(ctx.args[2], _pack_stat(meta)):  # args[2] = statbuf
@@ -307,12 +316,12 @@ class NewfstatatHandler(_NamespaceHandler):
 class StatxHandler(_NamespaceHandler):
     """statx(dirfd, pathname, flags, mask, statxbuf): write a struct statx."""
 
-    def handle(self, ctx: HandlerCtx) -> NotifAction:
+    async def handle(self, ctx: HandlerCtx) -> NotifAction:
         key = self._ns.key_for(ctx.read_path(arg=1))
         if key is None:
             return NotifAction.continue_()
         try:
-            meta = self._ns.head(key)              # S3 HeadObject
+            meta = await self._ns.head(key)        # S3 HeadObject (off-loop)
         except Exception as e:
             return NotifAction.errno(_errno_for(e))
         if not ctx.write(ctx.args[4], _pack_statx(meta)):  # args[4] = statxbuf

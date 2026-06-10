@@ -1,0 +1,11 @@
+prefix=@PREFIX@
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: sandlock
+Description: Lightweight Linux sandbox (sandlock-ffi C ABI)
+Version: @VERSION@
+Libs: -L${libdir} -Wl,-rpath,${libdir} -lsandlock_ffi
+Libs.private: -lpthread -ldl -lm
+Cflags: -I${includedir}

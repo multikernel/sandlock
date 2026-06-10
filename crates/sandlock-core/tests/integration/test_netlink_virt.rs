@@ -53,7 +53,7 @@ async fn loopback_bind_succeeds() {
     ), out = out.display());
 
     // port 0 in Landlock net rules means "allow any port"
-    let policy = base_policy().net_bind_port(0).build().unwrap();
+    let policy = base_policy().net_allow_bind_port(0).build().unwrap();
     let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
         .await.unwrap();
 

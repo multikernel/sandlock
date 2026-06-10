@@ -17,7 +17,7 @@ class TestDenyByDefault:
         assert policy.fs_writable == []
         assert "/tmp/ws" in policy.fs_readable
         assert policy.net_allow == []
-        assert policy.net_bind == []
+        assert policy.net_allow_bind == []
 
     def test_empty_capabilities(self):
         policy = policy_for_tool(workspace="/tmp/ws", capabilities={})

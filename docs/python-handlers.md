@@ -22,14 +22,19 @@ sb.run_with_handlers(
 ## Core types
 
 - `Handler` — base class. Subclass and override `handle(ctx) -> NotifAction`.
-  Set the class attribute `on_exception` (default `ExceptionPolicy.KILL`) to
-  choose what the supervisor does when the handler errors.
+  Define `handle` as `async def` to run it off the supervisor loop so it can
+  `await` slow work without stalling other trapped syscalls; see
+  [Deferred handlers](#deferred-handlers). Set the class attribute
+  `on_exception` (default `ExceptionPolicy.KILL`) to choose what the
+  supervisor does when the handler errors.
 - `HandlerCtx` — frozen dataclass with the notification fields (`id`, `pid`,
   `flags`, `syscall_nr`, `arch`, `instruction_pointer`, `args`) plus
   child-memory accessors.
 - `NotifAction` — frozen value-object. Construct via factory classmethods:
   `continue_()`, `errno(value)`, `returns(value)`, `hold()`,
-  `kill(sig, pgid)`, `inject_fd_send(srcfd, newfd_flags)`.
+  `kill(sig, pgid)`, `inject_fd_send(srcfd, newfd_flags)`,
+  `inject_bytes(data, *, seal=True, cloexec=True)` (see
+  [Inject synthetic content](#inject-synthetic-content)).
 - `ExceptionPolicy` — IntEnum: `KILL` (default), `DENY_EPERM`, `CONTINUE`,
   `DENY_EIO`.
 
@@ -183,6 +188,32 @@ class FakePid(Handler):
 sb.run_with_handlers(cmd, [("getpid", FakePid())])
 ```
 
+### Inject synthetic content
+
+`NotifAction.inject_bytes(data)` serves `data` to the guest as the fd returned
+by its `open`/`openat`, backed by an in-memory file. Use it instead of
+hand-rolling `os.memfd_create` + `os.write` + `os.lseek`: it builds the memfd,
+rewinds it, seals it read-only, and transfers fd ownership to the supervisor
+(the caller must NOT close it).
+
+```python
+from sandlock.handler import Handler, NotifAction, ExceptionPolicy
+
+class HostnameFile(Handler):
+    on_exception = ExceptionPolicy.KILL
+
+    def handle(self, ctx):
+        if ctx.read_path() == "/etc/hostname":
+            return NotifAction.inject_bytes(b"sandbox\n")
+        return NotifAction.continue_()
+```
+
+By default the fd is sealed read-only (the guest cannot modify or resize it)
+and `O_CLOEXEC` (the content does not leak into programs the guest later
+`exec`s). Pass `seal=False` for a writable fd, or `cloexec=False` to mirror a
+guest that opened the file without `O_CLOEXEC`. A rare allocation failure
+raises `OSError`, which the handler's `on_exception` policy then governs.
+
 ### Kill the child from a handler
 
 ```python
@@ -238,7 +269,10 @@ syscall list rather than against an empty dispatch table.
   `handle()` to be fast (sub-millisecond) and to protect any mutable
   handler state with your own synchronization. High-frequency
   interception (e.g. per-`SYS_openat` audit on a busy workload) will
-  serialize on the GIL and can stall the supervisor.
+  serialize on the GIL and can stall the supervisor. For a `handle()`
+  that must do slow work (a network call, a blocking read), define it as
+  `async def` so it runs off the loop instead; see
+  [Deferred handlers](#deferred-handlers).
 
 - **Interpreter finalization.** If `Py_FinalizeEx` runs while the
   sandbox is still alive (e.g. the main thread exits with handlers
@@ -257,6 +291,59 @@ syscall list rather than against an empty dispatch table.
   `Sandbox.run_with_handlers` from a thread that already runs a Tokio
   runtime — the FFI will panic, and the panic surfaces as a Python
   exception. Pure-Python use (the common case) is unaffected.
+
+## Deferred handlers
+
+By default `handle()` runs synchronously inside the supervisor's
+notification loop, so a slow callback stalls every other trapped syscall
+until it returns. Define `handle` as `async def` to run it off that loop
+instead: the coroutine is driven to completion on a worker thread, so it
+can `await` slow work without blocking the supervisor. That is the only
+change; you do not set any flag.
+
+```python
+class FetchHandler(Handler):
+    def __init__(self, backend):
+        self.backend = backend
+
+    async def handle(self, ctx):
+        key = ctx.read_path()              # read the path before the slow work
+        if key is None:
+            return NotifAction.continue_()
+        data = await self.backend.get(key)  # slow network GET, awaited off-loop
+        # inject_bytes builds the sealed memfd and transfers fd ownership to
+        # the supervisor (see "Inject synthetic content" above).
+        return NotifAction.inject_bytes(data)
+```
+
+Why it helps Python specifically: the coroutine runs on a worker thread,
+and CPython releases the GIL while it `await`s I/O, so multiple async
+handlers doing network work genuinely overlap while the supervisor loop
+stays free. It does not parallelize CPU-bound Python work (the GIL still
+serializes that); for that, push the hot path into a C extension that
+releases the GIL.
+
+`ctx` and its child-memory accessors (`read_cstr`, `read`, `write`) stay
+valid for the whole coroutine, so you can read paths and write results
+across `await` points.
+
+Contract (enforced by the supervisor):
+
+- **Terminal decision.** Deferral short-circuits the handler chain, so if
+  an async handler returns `continue_()` and other handlers are registered
+  on the same syscall, those later handlers do not run. Built-ins always
+  run first regardless.
+- **Refused on `execve`/`execveat` and fork-creating syscalls.** The
+  response cannot be moved off-loop there without skipping argv-safety
+  work, so such a call is denied with `EPERM`.
+- **Bounded.** Beyond an internal in-flight cap, further deferrals fail
+  fast with `EAGAIN` rather than queuing.
+
+Make `handle` async only when it must do slow work. For fast handlers
+(audit counters, path checks) a synchronous `handle` runs inline at lower
+latency. See
+[`extension-handlers.md`](extension-handlers.md#deferred-handlers) for the
+underlying Rust/C contract.
 
 ## Ownership rules
 

@@ -2,10 +2,19 @@
 //! handler module. No Rust-side dispatch logic lives here — only the
 //! data layout and the thin `extern "C-unwind"` wrappers around it.
 
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{IntoRawFd, RawFd};
 use std::slice;
 
-use sandlock_core::seccomp::notif::{read_child_cstr, read_child_mem, write_child_mem};
+use sandlock_core::seccomp::notif::{
+    content_memfd, read_child_cstr, read_child_mem, write_child_mem,
+};
+
+/// `flags` bit for [`sandlock_action_set_inject_bytes`]: leave the injected
+/// memfd writable (do not seal). Default (bit clear) seals it read-only.
+pub const SANDLOCK_INJECT_WRITABLE: u32 = 1 << 0;
+/// `flags` bit for [`sandlock_action_set_inject_bytes`]: do not set
+/// `O_CLOEXEC` on the child-side fd. Default (bit clear) sets `O_CLOEXEC`.
+pub const SANDLOCK_INJECT_NO_CLOEXEC: u32 = 1 << 1;
 
 /// Opaque child-memory accessor handed to a C handler callback.
 ///
@@ -22,7 +31,11 @@ pub struct sandlock_mem_handle_t {
 
 impl sandlock_mem_handle_t {
     pub(super) fn new(notif_fd: RawFd, notif_id: u64, pid: u32) -> Self {
-        Self { notif_fd, notif_id, pid }
+        Self {
+            notif_fd,
+            notif_id,
+            pid,
+        }
     }
 }
 
@@ -230,7 +243,9 @@ impl sandlock_action_out_t {
 /// no-op).
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_action_set_continue(out: *mut sandlock_action_out_t) {
-    if out.is_null() { return; }
+    if out.is_null() {
+        return;
+    }
     (*out).kind = sandlock_action_kind_t::Continue as u32;
 }
 
@@ -243,7 +258,9 @@ pub unsafe extern "C" fn sandlock_action_set_errno(
     out: *mut sandlock_action_out_t,
     errno_value: i32,
 ) {
-    if out.is_null() { return; }
+    if out.is_null() {
+        return;
+    }
     (*out).kind = sandlock_action_kind_t::Errno as u32;
     (*out).payload.errno_value = errno_value;
 }
@@ -257,7 +274,9 @@ pub unsafe extern "C" fn sandlock_action_set_return_value(
     out: *mut sandlock_action_out_t,
     value: i64,
 ) {
-    if out.is_null() { return; }
+    if out.is_null() {
+        return;
+    }
     (*out).kind = sandlock_action_kind_t::ReturnValue as u32;
     (*out).payload.return_value = value;
 }
@@ -282,9 +301,68 @@ pub unsafe extern "C" fn sandlock_action_set_inject_fd_send(
     srcfd: RawFd,
     newfd_flags: u32,
 ) {
-    if out.is_null() { return; }
+    if out.is_null() {
+        return;
+    }
     (*out).kind = sandlock_action_kind_t::InjectFdSend as u32;
     (*out).payload.inject_send = sandlock_action_inject_t { srcfd, newfd_flags };
+}
+
+/// Inject `len` bytes from `data` into the child as the syscall's returned
+/// fd, backed by an in-memory file created by the supervisor. The bytes are
+/// copied immediately, so `data` need not outlive the call.
+///
+/// `flags` is a bitmask of `SANDLOCK_INJECT_*`. With `flags == 0` the memfd is
+/// sealed read-only and the child-side fd is `O_CLOEXEC` — the safe default
+/// for synthetic file content (secrets, virtual files, fetched objects). On
+/// allocation failure the action is set to `Errno(EIO)`, so the callback's
+/// one-setter contract still holds and the child gets a definite response.
+///
+/// Unlike [`sandlock_action_set_inject_fd_send`], the caller owns no fd here:
+/// the supervisor creates, populates, and (on dispatch) closes the memfd.
+///
+/// # Safety
+/// `out` follows the same constraints as `sandlock_action_set_continue`.
+/// `data` must point to at least `len` readable bytes, or be null when
+/// `len == 0`.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_action_set_inject_bytes(
+    out: *mut sandlock_action_out_t,
+    data: *const u8,
+    len: usize,
+    flags: u32,
+) {
+    if out.is_null() {
+        return;
+    }
+
+    let seal = flags & SANDLOCK_INJECT_WRITABLE == 0;
+    let newfd_flags = if flags & SANDLOCK_INJECT_NO_CLOEXEC == 0 {
+        libc::O_CLOEXEC as u32
+    } else {
+        0
+    };
+
+    // Copy the caller's bytes now; `data` is only valid for this call.
+    let bytes: &[u8] = if data.is_null() || len == 0 {
+        &[]
+    } else {
+        slice::from_raw_parts(data, len)
+    };
+
+    match content_memfd(bytes, seal) {
+        Ok(fd) => {
+            (*out).kind = sandlock_action_kind_t::InjectFdSend as u32;
+            (*out).payload.inject_send = sandlock_action_inject_t {
+                srcfd: fd.into_raw_fd(),
+                newfd_flags,
+            };
+        }
+        Err(_) => {
+            (*out).kind = sandlock_action_kind_t::Errno as u32;
+            (*out).payload.errno_value = libc::EIO;
+        }
+    }
 }
 
 /// Hold the syscall pending until the supervisor explicitly releases it.
@@ -293,7 +371,9 @@ pub unsafe extern "C" fn sandlock_action_set_inject_fd_send(
 /// Same constraints as `sandlock_action_set_continue`.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_action_set_hold(out: *mut sandlock_action_out_t) {
-    if out.is_null() { return; }
+    if out.is_null() {
+        return;
+    }
     (*out).kind = sandlock_action_kind_t::Hold as u32;
 }
 
@@ -310,7 +390,9 @@ pub unsafe extern "C" fn sandlock_action_set_kill(
     sig: i32,
     pgid: i32,
 ) {
-    if out.is_null() { return; }
+    if out.is_null() {
+        return;
+    }
     (*out).kind = sandlock_action_kind_t::Kill as u32;
     (*out).payload.kill = sandlock_action_kill_t { sig, pgid };
 }
@@ -376,6 +458,12 @@ pub struct sandlock_handler_t {
     pub(super) ud: *mut std::ffi::c_void,
     pub(super) ud_drop: Option<sandlock_handler_ud_drop_t>,
     pub(super) on_exception: sandlock_exception_policy_t,
+    /// When true, the supervisor runs this handler's callback off the
+    /// notification loop (as a deferred future) instead of inline, so a
+    /// slow callback (network round-trip, blocking syscall) does not stall
+    /// every other trapped syscall. The container is an opaque box — C
+    /// never sees this field's layout — so adding it is not a C ABI break.
+    pub(super) deferred: bool,
 }
 
 // Safety:
@@ -423,11 +511,25 @@ impl Drop for sandlock_handler_t {
 /// and the run completes.
 /// If `on_exception` does not match a defined `sandlock_exception_policy_t`
 /// discriminant (0, 1, 2, or 3), the call returns null and no allocation occurs.
+// The two callback parameters are spelled inline rather than via the
+// `sandlock_handler_fn_t` / `sandlock_handler_ud_drop_t` aliases. A type alias
+// is the same type to Rust, so this is ABI-identical and the body is
+// unchanged, but cbindgen only flattens an `Option<fn>` into a nullable C
+// function pointer when the `fn` is written inline; `Option<NamedAlias>` is
+// emitted as an (uncallable) opaque by-value struct. The aliases remain in use
+// by the struct fields and the Rust tests.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_handler_new(
-    handler_fn: Option<sandlock_handler_fn_t>,
+    handler_fn: Option<
+        extern "C-unwind" fn(
+            ud: *mut std::ffi::c_void,
+            notif: *const crate::notif_repr::sandlock_notif_data_t,
+            mem: *mut sandlock_mem_handle_t,
+            out: *mut sandlock_action_out_t,
+        ) -> i32,
+    >,
     ud: *mut std::ffi::c_void,
-    ud_drop: Option<sandlock_handler_ud_drop_t>,
+    ud_drop: Option<extern "C-unwind" fn(ud: *mut std::ffi::c_void)>,
     on_exception: u32,
 ) -> *mut sandlock_handler_t {
     if handler_fn.is_none() {
@@ -448,8 +550,31 @@ pub unsafe extern "C" fn sandlock_handler_new(
         ud,
         ud_drop,
         on_exception,
+        deferred: false,
     });
     Box::into_raw(h)
+}
+
+/// Mark a handler as deferred: the supervisor will run its callback off the
+/// notification loop so a slow callback does not block other trapped
+/// syscalls. Must be called before the handler is registered with a run.
+///
+/// A deferred handler makes a *terminal* decision: deferral short-circuits
+/// the handler chain, so if a deferred handler would `Continue` and other
+/// user handlers are registered on the same syscall, those later handlers do
+/// not run. Builtins always run first regardless. Deferral is refused at
+/// dispatch time for syscalls whose Continue path needs the execve
+/// argv-safety freeze (`execve`/`execveat`) or fork creation-tracking.
+///
+/// # Safety
+/// `h` must be a non-null pointer returned by `sandlock_handler_new` that has
+/// not yet been registered with a run or freed.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_handler_set_deferred(h: *mut sandlock_handler_t, deferred: bool) {
+    if h.is_null() {
+        return;
+    }
+    (*h).deferred = deferred;
 }
 
 /// Free a handler container that has *not* been registered with a
@@ -469,7 +594,9 @@ pub unsafe extern "C" fn sandlock_handler_new(
 /// supervisor and has not already been freed.
 #[no_mangle]
 pub unsafe extern "C-unwind" fn sandlock_handler_free(h: *mut sandlock_handler_t) {
-    if h.is_null() { return; }
+    if h.is_null() {
+        return;
+    }
     drop(Box::from_raw(h));
 }
 
@@ -491,3 +618,76 @@ pub struct sandlock_handler_registration_t {
 // `Send` to allow the input array to be borrowed inside `unsafe`
 // contexts without per-call wrapper structs.
 unsafe impl Send for sandlock_handler_registration_t {}
+
+#[cfg(test)]
+mod inject_bytes_tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::unix::io::{FromRawFd, OwnedFd};
+
+    // Read an fd's full contents (from offset 0) and close it.
+    fn read_and_close(fd: RawFd) -> String {
+        let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mut s = String::new();
+        f.read_to_string(&mut s).unwrap();
+        s
+    }
+
+    #[test]
+    fn inject_bytes_default_is_sealed_cloexec_injectfdsend() {
+        let mut out = sandlock_action_out_t::zeroed();
+        let data = b"secret-token";
+        unsafe { sandlock_action_set_inject_bytes(&mut out, data.as_ptr(), data.len(), 0) };
+        assert_eq!(out.kind, sandlock_action_kind_t::InjectFdSend as u32);
+        let inject = unsafe { out.payload.inject_send };
+        assert_eq!(inject.newfd_flags, libc::O_CLOEXEC as u32);
+        let seals = unsafe { libc::fcntl(inject.srcfd, libc::F_GET_SEALS) };
+        assert!(seals & libc::F_SEAL_WRITE != 0, "default flags must seal");
+        assert_eq!(read_and_close(inject.srcfd), "secret-token");
+    }
+
+    #[test]
+    fn inject_bytes_writable_flag_skips_seal() {
+        let mut out = sandlock_action_out_t::zeroed();
+        let data = b"rw";
+        unsafe {
+            sandlock_action_set_inject_bytes(
+                &mut out,
+                data.as_ptr(),
+                data.len(),
+                SANDLOCK_INJECT_WRITABLE,
+            )
+        };
+        assert_eq!(out.kind, sandlock_action_kind_t::InjectFdSend as u32);
+        let inject = unsafe { out.payload.inject_send };
+        let seals = unsafe { libc::fcntl(inject.srcfd, libc::F_GET_SEALS) };
+        assert_eq!(seals & libc::F_SEAL_WRITE, 0, "WRITABLE must not seal");
+        drop(unsafe { OwnedFd::from_raw_fd(inject.srcfd) });
+    }
+
+    #[test]
+    fn inject_bytes_no_cloexec_flag_clears_newfd_flags() {
+        let mut out = sandlock_action_out_t::zeroed();
+        let data = b"x";
+        unsafe {
+            sandlock_action_set_inject_bytes(
+                &mut out,
+                data.as_ptr(),
+                data.len(),
+                SANDLOCK_INJECT_NO_CLOEXEC,
+            )
+        };
+        let inject = unsafe { out.payload.inject_send };
+        assert_eq!(inject.newfd_flags, 0);
+        drop(unsafe { OwnedFd::from_raw_fd(inject.srcfd) });
+    }
+
+    #[test]
+    fn inject_bytes_null_data_injects_empty_file() {
+        let mut out = sandlock_action_out_t::zeroed();
+        unsafe { sandlock_action_set_inject_bytes(&mut out, std::ptr::null(), 0, 0) };
+        assert_eq!(out.kind, sandlock_action_kind_t::InjectFdSend as u32);
+        let inject = unsafe { out.payload.inject_send };
+        assert_eq!(read_and_close(inject.srcfd), "");
+    }
+}

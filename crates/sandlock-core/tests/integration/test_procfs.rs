@@ -201,7 +201,7 @@ async fn test_proc_net_tcp_filtered() {
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
         .fs_read("/etc").fs_read("/proc").fs_read("/dev")
         .fs_write("/tmp")
-        .net_bind_port(port)
+        .net_allow_bind_port(port)
         .port_remap(true)
         .build()
         .unwrap();

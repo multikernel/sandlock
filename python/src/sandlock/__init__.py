@@ -9,6 +9,7 @@ from ._version import __version__
 from ._sdk import (
     Stage, Pipeline, Result, SyscallEvent, PolicyContext, Checkpoint,
     NamedStage, Gather, GatherPipeline,
+    Protection,
     landlock_abi_version, min_landlock_abi, confine,
 )
 from .inputs import inputs
@@ -48,6 +49,7 @@ __all__ = [
     "parse_ports",
     "Change",
     "DryRunResult",
+    "Protection",
     # Handler ABI
     "Handler",
     "NotifAction",

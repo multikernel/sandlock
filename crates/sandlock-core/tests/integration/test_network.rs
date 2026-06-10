@@ -330,7 +330,7 @@ async fn test_net_allow_permits_listed_endpoint() {
     let test_port: u16 = 19753;
     let policy = base_policy()
         .net_allow(format!("127.0.0.1:{}", test_port))
-        .net_bind_port(test_port)
+        .net_allow_bind_port(test_port)
         .port_remap(true)
         .build()
         .unwrap();
@@ -592,4 +592,67 @@ async fn test_net_allow_wildcard_host_only() {
 
     srv.join().unwrap();
     let _ = std::fs::remove_file(&out);
+}
+
+/// `--net-deny-bind` is default-allow: a denied TCP port fails to bind with
+/// EACCES, other TCP ports bind fine, and UDP on the denied port is
+/// unaffected (the deny is TCP-only, mirroring --net-allow-bind).
+#[tokio::test]
+async fn test_net_deny_bind_blocks_tcp_only() {
+    fn free_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+    let denied = free_port();
+    let mut allowed = free_port();
+    while allowed == denied {
+        allowed = free_port();
+    }
+    let out = temp_file("denybind");
+
+    // A `udp://*` egress rule lets the child create UDP sockets, so the
+    // TCP-only nature of the bind denylist can be observed below. (net_allow
+    // is egress-only and orthogonal to the bind denylist.)
+    let policy = base_policy()
+        .net_allow("udp://*")
+        .net_deny_bind_port(denied)
+        .build()
+        .unwrap();
+
+    let script = format!(concat!(
+        "import socket, json\n",
+        "res = {{}}\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+        "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
+        "try:\n",
+        "  s.bind(('127.0.0.1', {denied}))\n",
+        "  res['tcp_denied'] = 'bound'\n",
+        "except PermissionError:\n",
+        "  res['tcp_denied'] = 'eacces'\n",
+        "s.close()\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+        "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
+        "try:\n",
+        "  s.bind(('127.0.0.1', {allowed}))\n",
+        "  res['tcp_allowed'] = 'ok'\n",
+        "except OSError as e:\n",
+        "  res['tcp_allowed'] = 'err:%d' % e.errno\n",
+        "s.close()\n",
+        "u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
+        "try:\n",
+        "  u.bind(('127.0.0.1', {denied}))\n",
+        "  res['udp_denied'] = 'ok'\n",
+        "except OSError as e:\n",
+        "  res['udp_denied'] = 'err:%d' % e.errno\n",
+        "u.close()\n",
+        "open('{out}', 'w').write(json.dumps(res))\n",
+    ), denied = denied, allowed = allowed, out = out.display());
+
+    let result = policy.clone().with_name("test")
+        .run_interactive(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert!(content.contains("\"tcp_denied\": \"eacces\""), "denied TCP bind must fail with EACCES; got: {content}");
+    assert!(content.contains("\"tcp_allowed\": \"ok\""), "non-denied TCP bind must succeed; got: {content}");
+    assert!(content.contains("\"udp_denied\": \"ok\""), "UDP on the denied port must be allowed (TCP-only); got: {content}");
 }

@@ -39,7 +39,7 @@ sandbox = Sandbox(
     on_exit=BranchAction.COMMIT, on_error=BranchAction.ABORT,
 
     # [network]
-    net_bind=(), net_allow=(), port_remap=False,
+    net_allow_bind=(), net_allow=(), port_remap=False,
 
     # [http]
     http_ports=(), http_allow=(), http_deny=(),
@@ -64,10 +64,12 @@ sandbox = Sandbox(
 
 ```toml
 [config]
-http_ca    = "/path/to/ca.pem"
-http_key   = "/path/to/ca.key"
-fs_storage = "/var/lib/sandlock"
-workdir    = "/opt/project"
+http_ca         = "/path/to/ca.pem"
+http_key        = "/path/to/ca.key"
+http_inject_ca  = ["/etc/ssl/certs/ca-certificates.crt"]
+http_ca_out     = "/tmp/sandlock-ca.pem"
+fs_storage      = "/var/lib/sandlock"
+workdir         = "/opt/project"
 
 [determinism]
 random_seed         = 42
@@ -95,7 +97,7 @@ on_exit   = "commit"                  # "commit" | "abort" | "keep"
 on_error  = "abort"
 
 [network]
-bind       = [8080]
+allow_bind = [8080]
 allow      = ["api.example.com:443", "udp://1.1.1.1:53"]
 port_remap = false
 
@@ -127,14 +129,25 @@ Top-level configuration for the supervisor and COW workspace.
 | ------------ | ----------- | ------------- | ------- | ---------------------------------------------------------------------------------------- |
 | `http_ca`    | `http_ca`   | `str \| None` | `None`  | PEM CA certificate path for HTTPS MITM. When set, port `443` is added to `http_ports`.   |
 | `http_key`   | `http_key`  | `str \| None` | `None`  | PEM CA private key path. Required whenever `http_ca` is set.                             |
+| `http_inject_ca` | `http_inject_ca` | `list[str]` | `[]` | Trust bundle paths to splice the active MITM CA's public cert into at open time. Without `http_ca`, generates an ephemeral CA (private key in memory only, never on disk) and intercepts port `443`. Requires at least one `http_allow` / `http_deny` rule. |
+| `http_ca_out` | `http_ca_out` | `str \| None` | `None`  | Writes the active CA's public certificate (PEM) to this path; never the private key. Requires at least one `http_allow` / `http_deny` rule. |
 | `fs_storage` | `fs_storage`| `str \| None` | `None`  | Separate storage directory for the seccomp COW upper layer / deltas. |
 | `workdir`    | `workdir`   | `str \| None` | `None`  | COW root directory. Controls which directory COW tracks; does **not** set the child's working directory. |
 
-HTTPS interception is opt-in: without `http_ca`, port 443 is not
-intercepted, and `net_allow host:443` permits raw TLS to the host with
-no content inspection. When `http_ca` is set, the CA must be one the
-caller has generated and installed into the sandbox's trust store
-(typically `/etc/ssl/certs/`).
+HTTPS interception is opt-in: without `http_ca` or `http_inject_ca`,
+port 443 is not intercepted, and `net_allow host:443` permits raw TLS to
+the host with no content inspection. When `http_ca` is set, the CA must
+be one the caller has generated and installed into the sandbox's trust
+store (typically `/etc/ssl/certs/`). Alternatively, `http_inject_ca`
+generates an ephemeral CA (private key kept in memory, never written to
+disk) and splices its public cert into each named trust bundle at open
+time, so the workload trusts the proxy with no manual install. File
+injection covers tools that read a trust file from disk (curl, git,
+OpenSSL CLI, Go, Python stdlib ssl, and Python requests / httpx via
+certifi's `cacert.pem` if you name that path). Runtimes with a
+compiled-in CA list such as Node and Java are not reachable by file
+injection; for those use `http_ca_out` to export the public cert and
+point the runtime's own env var at it (e.g. `NODE_EXTRA_CA_CERTS`).
 
 ## `[determinism]`
 
@@ -202,7 +215,8 @@ Rule shapes:
 | Python       | TOML         | Type                    | Default | Description                                                                                                                                          |
 | ------------ | ------------ | ----------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `net_allow`  | `allow`      | `Sequence[str]`         | `()`    | Outbound endpoint allowlist. Empty list denies all outbound.                                                                                         |
-| `net_bind`   | `bind`       | `Sequence[int \| str]`  | `()`    | TCP ports the sandbox may bind. Each entry is a port or a `"lo-hi"` range. Landlock ABI v4+ (TCP only; UDP `bind()` is not separately gated).        |
+| `net_allow_bind`   | `allow_bind` | `Sequence[int \| str]`  | `()`    | TCP ports the sandbox may bind/listen on (default-deny allowlist). Each entry is a port or a `"lo-hi"` range. Landlock ABI v4+ (TCP only; UDP `bind()` is not separately gated). Mutually exclusive with `net_deny_bind`.        |
+| `net_deny_bind`    | `deny_bind`  | `Sequence[int \| str]`  | `()`    | TCP ports the sandbox may NOT bind (default-allow denylist; inverse of `net_allow_bind`). Same port syntax. Enforced on the on-behalf `bind()` path (Landlock `BIND_TCP` is relaxed). Mutually exclusive with `net_allow_bind`.        |
 | `port_remap` | `port_remap` | `bool`                  | `False` | Enable transparent TCP port virtualization. Each sandbox receives an independent virtual port space; conflicting binds are remapped to unique real ports via `pidfd_getfd`. |
 
 Hostnames are resolved once at sandbox creation and pinned via a
@@ -272,6 +286,62 @@ and have no TOML counterpart.
 | Field          | Type                  | Default | Description                                                                                                                                       |
 | -------------- | --------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `notif_policy` | `NotifPolicy \| None` | `None`  | Seccomp user-notification policy for `/proc` and `/sys` virtualization. Usually configured implicitly by the other fields; advanced use only.     |
+
+## Protection opt-out
+
+By default sandlock enforces every Landlock protection the host kernel
+supports and refuses to start when a required protection is
+unavailable. Two builder methods on `SandboxBuilder` let callers opt
+out of the strict default on a per-protection basis:
+
+- `allow_degraded(Protection::P)` — enforce `P` where the host kernel
+  supports it, silently skip it where it does not. Use this when
+  deploying across a mixed fleet of kernels where some lack the
+  protection.
+- `disable(Protection::P)` — never enforce `P`, even on a kernel that
+  supports it. Use this when the workload legitimately needs the
+  capability the protection blocks (for example signalling a sibling
+  process when `SignalScope` would otherwise prevent it).
+
+Calling neither method leaves the protection in its default `Strict`
+state. The two methods are last-wins per protection: a later call for
+the same `Protection` value supersedes the earlier one.
+
+`sandlock check` reports each protection's availability against the
+host's Landlock ABI; `Sandbox::active_protections()` returns the
+per-protection resolved status (`Active`, `Degraded`, `Disabled`, or
+`Unavailable`) of a constructed `Sandbox`.
+
+Each `Protection` has a minimum Landlock ABI floor:
+
+| `Protection`              | Landlock ABI floor |
+| ------------------------- | ------------------ |
+| `FsRefer`                 | v2                 |
+| `FsTruncate`              | v3                 |
+| `NetTcp`                  | v4                 |
+| `FsIoctlDev`              | v5                 |
+| `SignalScope`             | v6                 |
+| `AbstractUnixSocketScope` | v6                 |
+
+The protection policy is part of the checkpoint: a saved sandbox
+restores with the exact per-protection posture it was built with.
+
+Example:
+
+```rust
+use sandlock_core::{Protection, Sandbox};
+
+let sb = Sandbox::builder()
+    .fs_read("/data")
+    .fs_write("/tmp")
+    .allow_degraded(Protection::SignalScope)
+    .allow_degraded(Protection::AbstractUnixSocketScope)
+    .build()?;
+```
+
+The two `allow_degraded` calls let the sandbox build on Linux kernels
+below 6.12, where the v6 IPC scopes are unavailable. On a kernel that
+does support them, the scopes remain enforced.
 
 ## Enumerations
 

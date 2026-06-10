@@ -31,7 +31,9 @@ registry entry.
 
 from __future__ import annotations
 
+import asyncio
 import ctypes
+import inspect
 import threading
 from typing import Dict
 
@@ -125,6 +127,15 @@ def _trampoline_impl(ud, notif_ptr, mem_ptr, out_ptr) -> int:
     try:
         try:
             action = handler.handle(ctx)
+            if inspect.iscoroutine(action):
+                # `async def handle`: drive the coroutine to completion on
+                # this worker thread. Async handlers are always deferred (see
+                # sandbox._is_deferred_handler), so this runs off the
+                # supervisor loop and `await` does not stall other syscalls.
+                # The mem handle stays valid until the finally below, so
+                # child-memory access inside the coroutine works; awaits
+                # release the GIL, so concurrent async handlers overlap.
+                action = asyncio.run(action)
         except BaseException:
             # Any exception → defer to the configured on_exception policy.
             return -1

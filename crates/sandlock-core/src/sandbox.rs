@@ -10,7 +10,11 @@ use tokio::task::JoinHandle;
 use crate::context;
 use crate::error::SandboxError;
 pub use crate::http::{http_acl_check, normalize_path, prefix_or_exact_match, HttpRule};
-pub use crate::network::{NetAllow, Protocol};
+pub use crate::network::{IpCidr, NetAllow, NetDeny, NetRule, NetTarget, Protocol};
+use crate::protection::{Protection, ProtectionPolicy, ProtectionState, ProtectionStatus};
+
+mod builder;
+pub use builder::SandboxBuilder;
 
 /// A byte size value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,13 +112,17 @@ impl TryFrom<&Sandbox> for Confinement {
         if !sandbox.fs_denied.is_empty() { unsupported.push("fs_denied"); }
         if !sandbox.extra_deny_syscalls.is_empty() { unsupported.push("extra_deny_syscalls"); }
         if !sandbox.net_allow.is_empty() { unsupported.push("net_allow"); }
-        if !sandbox.net_bind.is_empty() { unsupported.push("net_bind"); }
+        if !sandbox.net_deny.is_empty() { unsupported.push("net_deny"); }
+        if !sandbox.net_allow_bind.is_empty() { unsupported.push("net_allow_bind"); }
+        if !sandbox.net_deny_bind.is_empty() { unsupported.push("net_deny_bind"); }
         if sandbox.allows_sysv_ipc() { unsupported.push("extra_allow_syscalls=[\"sysv_ipc\"]"); }
         if !sandbox.http_allow.is_empty() { unsupported.push("http_allow"); }
         if !sandbox.http_deny.is_empty() { unsupported.push("http_deny"); }
         if !sandbox.http_ports.is_empty() { unsupported.push("http_ports"); }
         if sandbox.http_ca.is_some() { unsupported.push("http_ca"); }
         if sandbox.http_key.is_some() { unsupported.push("http_key"); }
+        if !sandbox.http_inject_ca.is_empty() { unsupported.push("http_inject_ca"); }
+        if sandbox.http_ca_out.is_some() { unsupported.push("http_ca_out"); }
         if sandbox.max_memory.is_some() { unsupported.push("max_memory"); }
         if sandbox.max_processes != 64 { unsupported.push("max_processes"); }
         if sandbox.max_open_files.is_some() { unsupported.push("max_open_files"); }
@@ -186,7 +194,7 @@ struct Runtime {
     stdout_pipe: Option<std::os::fd::OwnedFd>,
     io_overrides: Option<(Option<i32>, Option<i32>, Option<i32>)>,
     extra_fds: Vec<(i32, i32)>,
-    http_acl_handle: Option<crate::http_acl::HttpAclProxyHandle>,
+    http_acl_handle: Option<crate::transparent_proxy::HttpAclProxyHandle>,
     #[allow(clippy::type_complexity)]
     on_bind: Option<Box<dyn Fn(&HashMap<u16, u16>) + Send + Sync>>,
     handlers: Vec<(i64, Arc<dyn crate::seccomp::dispatch::Handler>)>,
@@ -213,6 +221,18 @@ pub struct Sandbox {
     pub extra_deny_syscalls: Vec<String>,
     pub extra_allow_syscalls: Vec<String>,
 
+    /// Per-protection enforcement policy. Default
+    /// (`ProtectionPolicy::strict_all()`) preserves the historical hard
+    /// `MIN_ABI = 6` behaviour; `SandboxBuilder::allow_degraded` /
+    /// `::disable` deviate from strict-all per protection.
+    ///
+    /// Part of the checkpoint: a saved sandbox restores with its exact
+    /// protection posture. Without this, a sandbox built with a
+    /// `disable()` opt-out (required on, e.g., a v5 host that cannot
+    /// provide a v6 scope) would silently reset to `strict_all()` on
+    /// load and fail to restore.
+    pub protection_policy: ProtectionPolicy,
+
     // Network
     /// Outbound endpoint allowlist as a list of `(protocol, host?, ports)`
     /// rules. Each rule names a protocol (TCP/UDP/ICMP) and either a
@@ -237,7 +257,16 @@ pub struct Sandbox {
     /// remain reachable. HTTP rules with wildcard hosts auto-add
     /// `(Tcp, None, [80])` instead.
     pub net_allow: Vec<NetAllow>,
-    pub net_bind: Vec<u16>,
+    /// Parsed `--net-deny` rules (default-allow, IP/CIDR/port denylist).
+    /// Mutually exclusive with `net_allow`.
+    pub net_deny: Vec<NetDeny>,
+    /// `--net-allow-bind`: TCP ports the sandbox may bind (default-deny
+    /// allowlist, Landlock-enforced). Mutually exclusive with `net_deny_bind`.
+    pub net_allow_bind: Vec<u16>,
+    /// `--net-deny-bind`: TCP ports the sandbox may NOT bind (default-allow
+    /// denylist, enforced on the on-behalf `bind()` path). Mutually
+    /// exclusive with `net_allow_bind`.
+    pub net_deny_bind: Vec<u16>,
     // HTTP ACL
     pub http_allow: Vec<HttpRule>,
     pub http_deny: Vec<HttpRule>,
@@ -248,6 +277,11 @@ pub struct Sandbox {
     pub http_ca: Option<PathBuf>,
     /// PEM CA key for HTTPS MITM. Required when http_ca is set.
     pub http_key: Option<PathBuf>,
+    /// Trust-bundle paths to splice the MITM CA into (zero-config HTTPS).
+    pub http_inject_ca: Vec<PathBuf>,
+    /// Path to write the active MITM CA public cert (PEM) for external trust
+    /// wiring (e.g. NODE_EXTRA_CA_CERTS). Never writes the private key.
+    pub http_ca_out: Option<PathBuf>,
 
     // Resource limits
     pub max_memory: Option<ByteSize>,
@@ -353,13 +387,18 @@ impl Clone for Sandbox {
             fs_denied: self.fs_denied.clone(),
             extra_deny_syscalls: self.extra_deny_syscalls.clone(),
             extra_allow_syscalls: self.extra_allow_syscalls.clone(),
+            protection_policy: self.protection_policy.clone(),
             net_allow: self.net_allow.clone(),
-            net_bind: self.net_bind.clone(),
+            net_deny: self.net_deny.clone(),
+            net_allow_bind: self.net_allow_bind.clone(),
+            net_deny_bind: self.net_deny_bind.clone(),
             http_allow: self.http_allow.clone(),
             http_deny: self.http_deny.clone(),
             http_ports: self.http_ports.clone(),
             http_ca: self.http_ca.clone(),
             http_key: self.http_key.clone(),
+            http_inject_ca: self.http_inject_ca.clone(),
+            http_ca_out: self.http_ca_out.clone(),
             max_memory: self.max_memory,
             max_processes: self.max_processes,
             max_open_files: self.max_open_files,
@@ -415,6 +454,18 @@ impl Sandbox {
     /// stability. Idempotent: calling repeatedly is safe.
     pub fn validate(&self) -> Result<(), SandboxError> {
         Ok(())
+    }
+
+    /// Resolve the per-protection state against the host's current
+    /// Landlock ABI. Returns one entry per `Protection`. Useful for
+    /// post-`build()` posture inspection.
+    pub fn active_protections(&self) -> Result<Vec<(Protection, ProtectionStatus)>, crate::error::SandlockError> {
+        let host_abi = crate::landlock::abi_version().map_err(|e| {
+            crate::error::SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
+        })?;
+        Ok(Protection::all()
+            .map(|p| (p, ProtectionStatus::resolve(p, host_abi, &self.protection_policy)))
+            .collect())
     }
 
     // ================================================================
@@ -1027,6 +1078,15 @@ impl Sandbox {
         reducer.wait().await
     }
 
+    /// Whether named (pathname) `AF_UNIX` connects should be gated by the
+    /// fs-write grants (`has_unix_fs_gate`). Active whenever the sandbox
+    /// confines the filesystem; Landlock cannot gate unix-socket connect, so
+    /// the seccomp layer does. Single source of truth for both the
+    /// `NotifPolicy` flag and the `notif_syscalls` BPF set.
+    pub(crate) fn has_unix_fs_gate(&self) -> bool {
+        !self.fs_readable.is_empty() || !self.fs_writable.is_empty()
+    }
+
     /// Lazily initialize the runtime block.
     ///
     /// Called by lifecycle methods (`spawn`, `run`, `fork`, etc.) on first
@@ -1111,6 +1171,32 @@ impl Sandbox {
             return Err(SandboxRuntimeError::Child("empty command".into()).into());
         }
 
+        // Resolve the chroot root eagerly, before any fork or confinement work:
+        // a configured-but-missing chroot must be a hard error, never a silent
+        // drop to "no confinement".
+        let chroot_root = crate::chroot::resolve::resolve_chroot_root(self.chroot.as_deref())?;
+
+        // Each --http-inject-ca target must exist in the sandbox's view, or the
+        // CA cannot be spliced into it and TLS interception silently fails. A
+        // configured-but-missing trust bundle is a hard error, resolved through
+        // --fs-mount and chroot so the check matches the workload's view.
+        if !self.http_inject_ca.is_empty() {
+            let mounts = crate::chroot::resolve::resolve_chroot_mounts(&self.fs_mount);
+            for p in &self.http_inject_ca {
+                let host = resolve_sandbox_path_to_host(p, chroot_root.as_deref(), &mounts);
+                if !host.exists() {
+                    return Err(SandboxRuntimeError::Child(format!(
+                        "--http-inject-ca {:?} not found in the sandbox view (resolved to {:?}); \
+                         the CA cannot be injected into it. Point it at the trust bundle the \
+                         workload actually reads (e.g. /etc/ssl/certs/ca-certificates.crt, or \
+                         certifi's cacert.pem).",
+                        p, host
+                    ))
+                    .into());
+                }
+            }
+        }
+
         let c_cmd: Vec<CString> = cmd
             .iter()
             .map(|s| CString::new(*s).map_err(|_| SandboxRuntimeError::Child("invalid command string".into())))
@@ -1134,13 +1220,42 @@ impl Sandbox {
             &resolved_net_allow.concrete_host_entries,
         );
 
+        let mut ca_inject_pem: Option<std::sync::Arc<Vec<u8>>> = None;
         if !self.http_allow.is_empty() || !self.http_deny.is_empty() {
-            let handle = crate::http_acl::spawn_http_acl_proxy(
-                self.http_allow.clone(),
-                self.http_deny.clone(),
+            // Generate an ephemeral CA when injection is requested without BYO.
+            let generate = !self.http_inject_ca.is_empty();
+            let ca_material = crate::transparent_proxy::resolve_ca(
                 self.http_ca.as_deref(),
                 self.http_key.as_deref(),
-            ).await.map_err(SandboxRuntimeError::Io)?;
+                generate,
+            )
+            .map_err(SandboxRuntimeError::Io)?;
+
+            // Export the public cert if requested.
+            if let (Some(out), Some(cm)) = (self.http_ca_out.as_deref(), ca_material.as_ref()) {
+                std::fs::write(out, cm.cert_pem.as_bytes()).map_err(SandboxRuntimeError::Io)?;
+            }
+
+            // Keep the public cert for trust injection (only when paths declared).
+            if !self.http_inject_ca.is_empty() {
+                if let Some(cm) = ca_material.as_ref() {
+                    ca_inject_pem = Some(std::sync::Arc::new(cm.cert_pem.clone().into_bytes()));
+                }
+            }
+
+            let (cert_pem, key_pem) = match ca_material.as_ref() {
+                Some(cm) => (Some(cm.cert_pem.as_str()), Some(cm.key_pem.as_str())),
+                None => (None, None),
+            };
+
+            let handle = crate::transparent_proxy::spawn_transparent_proxy(
+                self.http_allow.clone(),
+                self.http_deny.clone(),
+                cert_pem,
+                key_pem,
+            )
+            .await
+            .map_err(SandboxRuntimeError::Io)?;
             self.rt_mut().http_acl_handle = Some(handle);
         }
 
@@ -1166,6 +1281,14 @@ impl Sandbox {
         } else {
             None
         };
+
+        let handler_syscalls: Vec<i64> = self.rt().handlers.iter().map(|(nr, _)| *nr).collect();
+        let resolved_sandbox_name = self.rt().name.clone();
+        let resolved = crate::resolved::ResolvedSandbox::from_sandbox(
+            self,
+            Some(resolved_sandbox_name.as_str()),
+            &handler_syscalls,
+        );
 
         let (stdout_r, stderr_r) = if capture {
             let mut stdout_fds = [0i32; 2];
@@ -1298,32 +1421,28 @@ impl Sandbox {
             let notif_policy = NotifPolicy {
                 max_memory_bytes: self.max_memory.map(|m| m.0).unwrap_or(0),
                 max_processes: self.max_processes,
-                has_memory_limit: self.max_memory.is_some(),
-                has_net_allowlist: !self.net_allow.is_empty()
-                    || self.policy_fn.is_some()
-                    || !self.http_allow.is_empty()
-                    || !self.http_deny.is_empty(),
-                has_random_seed: self.random_seed.is_some(),
-                has_time_start: self.time_start.is_some(),
-                argv_safety_required: self.policy_fn.is_some()
-                    || self.rt().handlers.iter().any(|h| {
-                        h.0 == libc::SYS_execve || h.0 == libc::SYS_execveat
-                    }),
+                has_memory_limit: resolved.features.memory_limit,
+                has_net_allowlist: resolved.features.network_destination_policy,
+                has_bind_denylist: resolved.features.bind_denylist,
+                has_unix_fs_gate: resolved.features.unix_fs_gate,
+                has_random_seed: resolved.features.random_seed,
+                has_time_start: resolved.features.time_start,
+                argv_safety_required: resolved.features.argv_safety_required,
                 time_offset: time_offset_val,
                 num_cpus: self.num_cpus,
-                port_remap: self.port_remap,
-                cow_enabled: self.workdir.is_some(),
-                chroot_root: self.chroot.as_ref().and_then(|p| std::fs::canonicalize(p).ok()),
+                port_remap: resolved.features.port_remap,
+                cow_enabled: resolved.features.cow,
+                chroot_root: chroot_root.clone(),
                 chroot_readable: self.fs_readable.clone(),
                 chroot_writable: self.fs_writable.clone(),
                 chroot_denied: self.fs_denied.clone(),
-                chroot_mounts: self.fs_mount.iter().map(|(vp, hp)| {
-                    (vp.clone(), std::fs::canonicalize(hp).unwrap_or_else(|_| hp.clone()))
-                }).collect(),
+                chroot_mounts: crate::chroot::resolve::resolve_chroot_mounts(&self.fs_mount),
                 deterministic_dirs: self.deterministic_dirs,
                 virtual_hostname: Some(rt_name),
-                has_http_acl: !self.http_allow.is_empty() || !self.http_deny.is_empty(),
+                has_http_acl: resolved.features.http_acl,
                 virtual_etc_hosts,
+                ca_inject_paths: self.http_inject_ca.clone(),
+                ca_inject_pem: ca_inject_pem.clone(),
             };
 
             use rand::SeedableRng;
@@ -1335,36 +1454,45 @@ impl Sandbox {
             let time_random_state = TimeRandomState::new(time_offset, random_state);
 
             let mut net_state = NetworkState::new();
-            let no_rules = self.net_allow.is_empty();
-            let policy_from = |resolved: &network::ResolvedNetAllow| {
-                if no_rules || resolved.any_ip_all_ports {
-                    crate::seccomp::notif::NetworkPolicy::Unrestricted
-                } else {
-                    use crate::seccomp::notif::PortAllow;
-                    let per_ip = resolved
-                        .per_ip
-                        .iter()
-                        .map(|(ip, ports)| {
-                            let allow = if resolved.per_ip_all_ports.contains(ip) {
-                                PortAllow::Any
-                            } else {
-                                PortAllow::Specific(ports.clone())
-                            };
-                            (*ip, allow)
-                        })
-                        .collect();
-                    crate::seccomp::notif::NetworkPolicy::AllowList {
-                        per_ip,
-                        any_ip_ports: resolved.any_ip_ports.clone(),
+            if !self.net_deny.is_empty() {
+                let resolved_deny = network::resolve_net_deny(&self.net_deny);
+                net_state.tcp_policy = resolved_deny.tcp;
+                net_state.udp_policy = resolved_deny.udp;
+                net_state.icmp_policy = resolved_deny.icmp;
+            } else {
+                let no_rules = self.net_allow.is_empty();
+                let policy_from = |resolved: &network::ResolvedNetAllow| {
+                    if no_rules || resolved.any_ip_all_ports {
+                        crate::seccomp::notif::NetworkPolicy::Unrestricted
+                    } else {
+                        use crate::seccomp::notif::PortAllow;
+                        let per_ip = resolved
+                            .per_ip
+                            .iter()
+                            .map(|(ip, ports)| {
+                                let allow = if resolved.per_ip_all_ports.contains(ip) {
+                                    PortAllow::Any
+                                } else {
+                                    PortAllow::Specific(ports.clone())
+                                };
+                                (*ip, allow)
+                            })
+                            .collect();
+                        crate::seccomp::notif::NetworkPolicy::AllowList {
+                            per_ip,
+                            cidrs: resolved.cidrs.clone(),
+                            any_ip_ports: resolved.any_ip_ports.clone(),
+                        }
                     }
-                }
-            };
-            net_state.tcp_policy = policy_from(&resolved_net_allow.tcp);
-            net_state.udp_policy = policy_from(&resolved_net_allow.udp);
-            net_state.icmp_policy = policy_from(&resolved_net_allow.icmp);
+                };
+                net_state.tcp_policy = policy_from(&resolved_net_allow.tcp);
+                net_state.udp_policy = policy_from(&resolved_net_allow.udp);
+                net_state.icmp_policy = policy_from(&resolved_net_allow.icmp);
+            }
             net_state.http_acl_addr = self.rt().http_acl_handle.as_ref().map(|h| h.addr);
             net_state.http_acl_ports = self.http_ports.iter().copied().collect();
             net_state.http_acl_orig_dest = self.rt().http_acl_handle.as_ref().map(|h| h.orig_dest.clone());
+            net_state.bind_deny_ports = self.net_deny_bind.iter().copied().collect();
             if let Some(cb) = self.rt_mut().on_bind.take() {
                 net_state.port_map.on_bind = Some(cb);
             }
@@ -1392,8 +1520,15 @@ impl Sandbox {
                 let mut allowed_ips: std::collections::HashSet<std::net::IpAddr> =
                     std::collections::HashSet::new();
                 for p in [&net_state.tcp_policy, &net_state.udp_policy, &net_state.icmp_policy] {
-                    if let crate::seccomp::notif::NetworkPolicy::AllowList { per_ip, .. } = p {
+                    if let crate::seccomp::notif::NetworkPolicy::AllowList { per_ip, cidrs, .. } = p {
                         allowed_ips.extend(per_ip.keys().copied());
+                        // IP literals resolve to single-host CIDRs (/32 or
+                        // /128); surface them as concrete allowed IPs too.
+                        for (net, _) in cidrs {
+                            if net.is_single_host() {
+                                allowed_ips.insert(net.addr);
+                            }
+                        }
                     }
                 }
                 let live = crate::policy_fn::LivePolicy {
@@ -1671,7 +1806,7 @@ fn validate_syscall_names(names: &[String]) -> Result<(), SandboxError> {
     let unknown: Vec<&str> = names
         .iter()
         .map(String::as_str)
-        .filter(|name| crate::context::syscall_name_to_nr(name).is_none())
+        .filter(|name| crate::seccomp::syscall::syscall_name_to_nr(name).is_none())
         .collect();
     if unknown.is_empty() {
         Ok(())
@@ -1683,705 +1818,69 @@ fn validate_syscall_names(names: &[String]) -> Result<(), SandboxError> {
     }
 }
 
-/// Fluent builder for `Sandbox`.
-///
-/// When the `cli` feature is enabled this struct also derives `clap::Args` so
-/// that the CLI can expose all per-field flags via `#[clap(flatten)]` without
-/// duplicating the flag declarations.
-#[derive(Default)]
-#[cfg_attr(feature = "cli", derive(clap::Args))]
-pub struct SandboxBuilder {
-    #[cfg_attr(feature = "cli", arg(short = 'r', long = "fs-read", value_name = "PATH"))]
-    pub fs_readable: Vec<PathBuf>,
-
-    #[cfg_attr(feature = "cli", arg(short = 'w', long = "fs-write", value_name = "PATH"))]
-    pub fs_writable: Vec<PathBuf>,
-
-    #[cfg_attr(feature = "cli", arg(long = "fs-deny", value_name = "PATH"))]
-    pub fs_denied: Vec<PathBuf>,
-
-    /// Extra syscall names to deny (in addition to Sandlock's default blocklist)
-    #[cfg_attr(feature = "cli", arg(long = "extra-deny-syscall", value_name = "NAME"))]
-    pub extra_deny_syscalls: Vec<String>,
-
-    /// Extra syscall group names to allow (e.g. sysv_ipc)
-    #[cfg_attr(feature = "cli", arg(long = "extra-allow-syscall", value_name = "NAME"))]
-    pub extra_allow_syscalls: Vec<String>,
-
-    /// Outbound endpoint allow rule. Repeatable. Each value is
-    /// `host:port[,port,...]` (IP-restricted), `:port` or `*:port`
-    /// (any IP), or `udp://...` / `icmp://...` for UDP/ICMP.
-    /// Examples: `api.openai.com:443`, `github.com:22,443`, `:8080`.
-    #[cfg_attr(feature = "cli", arg(long = "net-allow", value_name = "SPEC"))]
-    pub net_allow: Vec<String>,
-
-    #[cfg_attr(feature = "cli", arg(long = "net-bind"))]
-    pub net_bind: Vec<u16>,
-
-    #[cfg_attr(feature = "cli", arg(long = "http-allow", value_name = "RULE"))]
-    pub http_allow: Vec<String>,
-
-    #[cfg_attr(feature = "cli", arg(long = "http-deny", value_name = "RULE"))]
-    pub http_deny: Vec<String>,
-
-    /// TCP ports to intercept for HTTP ACL (default: 80, plus 443 with --http-ca)
-    #[cfg_attr(feature = "cli", arg(long = "http-port", value_name = "PORT"))]
-    pub http_ports: Vec<u16>,
-
-    /// PEM CA certificate for HTTPS MITM (enables port 443 interception)
-    #[cfg_attr(feature = "cli", arg(long = "http-ca", value_name = "PATH"))]
-    pub http_ca: Option<PathBuf>,
-
-    /// PEM CA private key for HTTPS MITM (required with --http-ca)
-    #[cfg_attr(feature = "cli", arg(long = "http-key", value_name = "PATH"))]
-    pub http_key: Option<PathBuf>,
-
-    // max_memory uses a string in the CLI (e.g. "512M"); not directly clap-friendly as ByteSize.
-    #[cfg_attr(feature = "cli", clap(skip))]
-    pub max_memory: Option<ByteSize>,
-
-    #[cfg_attr(feature = "cli", arg(short = 'P', long = "max-processes"))]
-    pub max_processes: Option<u32>,
-
-    #[cfg_attr(feature = "cli", arg(long = "max-open-files"))]
-    pub max_open_files: Option<u32>,
-
-    #[cfg_attr(feature = "cli", arg(short = 'c', long = "cpu"))]
-    pub max_cpu: Option<u8>,
-
-    #[cfg_attr(feature = "cli", arg(long = "random-seed"))]
-    pub random_seed: Option<u64>,
-
-    // time_start requires ISO 8601 string parsing; not directly clap-friendly as SystemTime.
-    #[cfg_attr(feature = "cli", clap(skip))]
-    pub time_start: Option<SystemTime>,
-
-    #[cfg_attr(feature = "cli", arg(long = "no-randomize-memory"))]
-    pub no_randomize_memory: bool,
-
-    #[cfg_attr(feature = "cli", arg(long = "no-huge-pages"))]
-    pub no_huge_pages: bool,
-
-    #[cfg_attr(feature = "cli", arg(long = "no-coredump"))]
-    pub no_coredump: bool,
-
-    #[cfg_attr(feature = "cli", arg(long = "deterministic-dirs"))]
-    pub deterministic_dirs: bool,
-
-    #[cfg_attr(feature = "cli", arg(long = "workdir"))]
-    pub workdir: Option<PathBuf>,
-
-    #[cfg_attr(feature = "cli", arg(long = "cwd"))]
-    pub cwd: Option<PathBuf>,
-
-    #[cfg_attr(feature = "cli", arg(long = "fs-storage", value_name = "PATH"))]
-    pub fs_storage: Option<PathBuf>,
-
-    // max_disk uses a string in the CLI (e.g. "10G"); not directly clap-friendly as ByteSize.
-    #[cfg_attr(feature = "cli", clap(skip))]
-    pub max_disk: Option<ByteSize>,
-
-    // on_exit/on_error are not exposed as CLI flags.
-    #[cfg_attr(feature = "cli", clap(skip))]
-    pub on_exit: Option<BranchAction>,
-
-    #[cfg_attr(feature = "cli", clap(skip))]
-    pub on_error: Option<BranchAction>,
-
-    // fs_mount requires VIRTUAL:HOST string splitting; not directly clap-friendly as Vec<(PathBuf,PathBuf)>.
-    #[cfg_attr(feature = "cli", clap(skip))]
-    pub fs_mount: Vec<(PathBuf, PathBuf)>,
-
-    #[cfg_attr(feature = "cli", arg(long = "chroot"))]
-    pub chroot: Option<PathBuf>,
-
-    #[cfg_attr(feature = "cli", arg(long = "clean-env"))]
-    pub clean_env: bool,
-
-    // env requires KEY=VALUE string splitting; not directly clap-friendly as HashMap.
-    #[cfg_attr(feature = "cli", clap(skip))]
-    pub env: HashMap<String, String>,
-
-    // gpu_devices in CLI uses Vec<u32> with value_delimiter; SandboxBuilder stores Option<Vec<u32>>.
-    #[cfg_attr(feature = "cli", clap(skip))]
-    pub gpu_devices: Option<Vec<u32>>,
-
-    // cpu_cores in CLI uses Vec<u32> with value_delimiter; SandboxBuilder stores Option<Vec<u32>>.
-    #[cfg_attr(feature = "cli", clap(skip))]
-    pub cpu_cores: Option<Vec<u32>>,
-
-    #[cfg_attr(feature = "cli", arg(long = "num-cpus"))]
-    pub num_cpus: Option<u32>,
-
-    #[cfg_attr(feature = "cli", arg(long = "port-remap"))]
-    pub port_remap: bool,
-
-    /// Skip the seccomp user-notification supervisor. The CLI exposes
-    /// its own `--no-supervisor` flag on `RunArgs` (which short-circuits
-    /// to a direct exec); this field is the API-level counterpart used
-    /// when the caller still wants the normal `Sandbox::run` lifecycle
-    /// but cannot install a listener (e.g. nested inside another
-    /// sandbox).
-    #[cfg_attr(feature = "cli", clap(skip))]
-    pub no_supervisor: bool,
-
-    #[cfg_attr(feature = "cli", arg(long = "uid"))]
-    pub uid: Option<u32>,
-
-    // Internal callback — never a CLI flag.
-    #[cfg_attr(feature = "cli", clap(skip))]
-    pub policy_fn: Option<crate::policy_fn::PolicyCallback>,
-
-    // Sandbox instance name — stored for transfer into the Sandbox at build time.
-    #[cfg_attr(feature = "cli", clap(skip))]
-    pub name: Option<String>,
-
-    // COW fork init function — runs once in the child before COW cloning.
-    #[cfg_attr(feature = "cli", clap(skip))]
-    pub(crate) init_fn: Option<Box<dyn FnOnce() + Send + 'static>>,
-
-    // COW fork work function — runs in each COW clone.
-    #[cfg_attr(feature = "cli", clap(skip))]
-    pub(crate) work_fn: Option<Arc<dyn Fn(u32) + Send + Sync + 'static>>,
-}
-
-impl std::fmt::Debug for SandboxBuilder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SandboxBuilder")
-            .field("fs_readable", &self.fs_readable)
-            .field("fs_writable", &self.fs_writable)
-            .field("max_memory", &self.max_memory)
-            .field("max_processes", &self.max_processes)
-            .field("policy_fn", &self.policy_fn.as_ref().map(|_| "<callback>"))
-            .finish_non_exhaustive()
-    }
-}
-
-impl Clone for SandboxBuilder {
-    /// Clone a `SandboxBuilder`. All config and callback fields are cloned.
-    /// `init_fn` (FnOnce) is dropped to `None` on the clone; `work_fn` clones
-    /// via Arc. If the clone also needs an init function, set it again with
-    /// `.init_fn(...)`.
-    fn clone(&self) -> Self {
-        Self {
-            fs_readable: self.fs_readable.clone(),
-            fs_writable: self.fs_writable.clone(),
-            fs_denied: self.fs_denied.clone(),
-            extra_deny_syscalls: self.extra_deny_syscalls.clone(),
-            extra_allow_syscalls: self.extra_allow_syscalls.clone(),
-            net_allow: self.net_allow.clone(),
-            net_bind: self.net_bind.clone(),
-            http_allow: self.http_allow.clone(),
-            http_deny: self.http_deny.clone(),
-            http_ports: self.http_ports.clone(),
-            http_ca: self.http_ca.clone(),
-            http_key: self.http_key.clone(),
-            max_memory: self.max_memory,
-            max_processes: self.max_processes,
-            max_open_files: self.max_open_files,
-            max_cpu: self.max_cpu,
-            random_seed: self.random_seed,
-            time_start: self.time_start,
-            no_randomize_memory: self.no_randomize_memory,
-            no_huge_pages: self.no_huge_pages,
-            no_coredump: self.no_coredump,
-            deterministic_dirs: self.deterministic_dirs,
-            workdir: self.workdir.clone(),
-            cwd: self.cwd.clone(),
-            fs_storage: self.fs_storage.clone(),
-            max_disk: self.max_disk,
-            on_exit: self.on_exit.clone(),
-            on_error: self.on_error.clone(),
-            fs_mount: self.fs_mount.clone(),
-            chroot: self.chroot.clone(),
-            clean_env: self.clean_env,
-            env: self.env.clone(),
-            gpu_devices: self.gpu_devices.clone(),
-            cpu_cores: self.cpu_cores.clone(),
-            num_cpus: self.num_cpus,
-            port_remap: self.port_remap,
-            no_supervisor: self.no_supervisor,
-            uid: self.uid,
-            policy_fn: self.policy_fn.clone(),
-            name: self.name.clone(),
-            // init_fn (FnOnce) cannot be cloned — drop to None.
-            init_fn: None,
-            // work_fn is Arc-wrapped — clone bumps the reference count.
-            work_fn: self.work_fn.clone(),
-        }
-    }
-}
-
-impl SandboxBuilder {
-    pub fn fs_write(mut self, path: impl Into<PathBuf>) -> Self {
-        self.fs_writable.push(path.into());
-        self
-    }
-
-    pub fn fs_read(mut self, path: impl Into<PathBuf>) -> Self {
-        self.fs_readable.push(path.into());
-        self
-    }
-
-    pub fn fs_read_if_exists(self, path: impl Into<PathBuf>) -> Self {
-        let path = path.into();
-        if path.exists() {
-            self.fs_read(path)
-        } else {
-            self
-        }
-    }
-
-    pub fn fs_deny(mut self, path: impl Into<PathBuf>) -> Self {
-        self.fs_denied.push(path.into());
-        self
-    }
-
-    pub fn extra_deny_syscalls(mut self, calls: Vec<String>) -> Self {
-        self.extra_deny_syscalls.extend(calls);
-        self
-    }
-
-    pub fn extra_allow_syscalls(mut self, names: Vec<String>) -> Self {
-        self.extra_allow_syscalls.extend(names);
-        self
-    }
-
-    /// Add a network endpoint rule. Spec is `host:port[,port,...]`,
-    /// `:port`, or `*:port`. Validated at `build()` time so callers
-    /// receive parse errors via the standard `SandboxBuilder` flow.
-    ///
-    /// Examples:
-    /// - `.net_allow("api.openai.com:443")` — HTTPS to OpenAI only
-    /// - `.net_allow("github.com:22,443")` — SSH and HTTPS to GitHub
-    /// - `.net_allow(":8080")` — any IP on port 8080
-    pub fn net_allow(mut self, spec: impl Into<String>) -> Self {
-        self.net_allow.push(spec.into());
-        self
-    }
-
-    pub fn net_bind_port(mut self, port: u16) -> Self {
-        self.net_bind.push(port);
-        self
-    }
-
-    pub fn http_allow(mut self, rule: &str) -> Self {
-        self.http_allow.push(rule.to_string());
-        self
-    }
-
-    pub fn http_deny(mut self, rule: &str) -> Self {
-        self.http_deny.push(rule.to_string());
-        self
-    }
-
-    pub fn http_port(mut self, port: u16) -> Self {
-        self.http_ports.push(port);
-        self
-    }
-
-    pub fn http_ca(mut self, path: impl Into<PathBuf>) -> Self {
-        self.http_ca = Some(path.into());
-        self
-    }
-
-    pub fn http_key(mut self, path: impl Into<PathBuf>) -> Self {
-        self.http_key = Some(path.into());
-        self
-    }
-
-    pub fn max_memory(mut self, size: ByteSize) -> Self {
-        self.max_memory = Some(size);
-        self
-    }
-
-    pub fn max_processes(mut self, n: u32) -> Self {
-        self.max_processes = Some(n);
-        self
-    }
-
-    pub fn max_open_files(mut self, n: u32) -> Self {
-        self.max_open_files = Some(n);
-        self
-    }
-
-    pub fn max_cpu(mut self, pct: u8) -> Self {
-        self.max_cpu = Some(pct);
-        self
-    }
-
-    pub fn random_seed(mut self, seed: u64) -> Self {
-        self.random_seed = Some(seed);
-        self
-    }
-
-    pub fn time_start(mut self, t: SystemTime) -> Self {
-        self.time_start = Some(t);
-        self
-    }
-
-    pub fn no_randomize_memory(mut self, v: bool) -> Self {
-        self.no_randomize_memory = v;
-        self
-    }
-
-    pub fn no_huge_pages(mut self, v: bool) -> Self {
-        self.no_huge_pages = v;
-        self
-    }
-
-    pub fn no_coredump(mut self, v: bool) -> Self {
-        self.no_coredump = v;
-        self
-    }
-
-    pub fn deterministic_dirs(mut self, v: bool) -> Self {
-        self.deterministic_dirs = v;
-        self
-    }
-
-    pub fn workdir(mut self, path: impl Into<PathBuf>) -> Self {
-        self.workdir = Some(path.into());
-        self
-    }
-
-    pub fn cwd(mut self, path: impl Into<PathBuf>) -> Self {
-        self.cwd = Some(path.into());
-        self
-    }
-
-    pub fn fs_storage(mut self, path: impl Into<PathBuf>) -> Self {
-        self.fs_storage = Some(path.into());
-        self
-    }
-
-    pub fn max_disk(mut self, size: ByteSize) -> Self {
-        self.max_disk = Some(size);
-        self
-    }
-
-    pub fn on_exit(mut self, action: BranchAction) -> Self {
-        self.on_exit = Some(action);
-        self
-    }
-
-    pub fn on_error(mut self, action: BranchAction) -> Self {
-        self.on_error = Some(action);
-        self
-    }
-
-    pub fn chroot(mut self, path: impl Into<PathBuf>) -> Self {
-        self.chroot = Some(path.into());
-        self
-    }
-
-    pub fn fs_mount(mut self, virtual_path: impl Into<PathBuf>, host_path: impl Into<PathBuf>) -> Self {
-        self.fs_mount.push((virtual_path.into(), host_path.into()));
-        self
-    }
-
-    pub fn clean_env(mut self, v: bool) -> Self {
-        self.clean_env = v;
-        self
-    }
-
-    pub fn env_var(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.env.insert(key.into(), value.into());
-        self
-    }
-
-
-    pub fn gpu_devices(mut self, devices: Vec<u32>) -> Self {
-        self.gpu_devices = Some(devices);
-        self
-    }
-
-    pub fn cpu_cores(mut self, cores: Vec<u32>) -> Self {
-        self.cpu_cores = Some(cores);
-        self
-    }
-
-    pub fn num_cpus(mut self, n: u32) -> Self {
-        self.num_cpus = Some(n);
-        self
-    }
-
-    pub fn port_remap(mut self, v: bool) -> Self {
-        self.port_remap = v;
-        self
-    }
-
-    /// Skip the seccomp user-notification supervisor. The sandbox keeps
-    /// Landlock and the kernel-level deny filter but loses every
-    /// supervisor-mediated feature (IP allowlist, resource limits, COW,
-    /// chroot mediation, /proc virtualization, custom handlers). The
-    /// kernel only permits one `SECCOMP_FILTER_FLAG_NEW_LISTENER` per
-    /// task, so set this when nesting `Sandbox::run` inside an already-
-    /// confined process; otherwise the inner seccomp install returns
-    /// `EBUSY`.
-    pub fn no_supervisor(mut self, v: bool) -> Self {
-        self.no_supervisor = v;
-        self
-    }
-
-    pub fn policy_fn(
-        mut self,
-        f: impl Fn(crate::policy_fn::SyscallEvent, &mut crate::policy_fn::PolicyContext) -> crate::policy_fn::Verdict + Send + Sync + 'static,
-    ) -> Self {
-        self.policy_fn = Some(std::sync::Arc::new(f));
-        self
-    }
-
-    pub fn uid(mut self, id: u32) -> Self {
-        self.uid = Some(id);
-        self
-    }
-
-    /// Set the sandbox instance name (exposed as the virtual hostname).
-    /// Auto-generated if not set.
-    pub fn name(mut self, name: impl Into<String>) -> Self {
-        self.name = Some(name.into());
-        self
-    }
-
-    /// Set the COW-fork init function.
-    ///
-    /// The init function runs once in the child process before any COW clones
-    /// are created. Required for `Sandbox::fork()`.
-    pub fn init_fn(mut self, f: impl FnOnce() + Send + 'static) -> Self {
-        self.init_fn = Some(Box::new(f));
-        self
-    }
-
-    /// Set the COW-fork work function.
-    ///
-    /// The work function runs in each COW clone (`fork(N)` produces N clones).
-    /// Required for `Sandbox::fork()`.
-    pub fn work_fn(mut self, f: impl Fn(u32) + Send + Sync + 'static) -> Self {
-        self.work_fn = Some(Arc::new(f));
-        self
-    }
-
-    /// Build a `Sandbox`, parsing all string fields and running per-field
-    /// validation, but **without** the cross-section checks that
-    /// `Sandbox::validate` performs. Use this in tests that deliberately
-    /// construct sandboxes violating cross-section invariants.
-    pub fn build_unchecked(self) -> Result<Sandbox, SandboxError> {
-        validate_syscall_names(&self.extra_deny_syscalls)?;
-
-        // Validate: max_cpu must be 1-100
-        if let Some(cpu) = self.max_cpu {
-            if cpu == 0 || cpu > 100 {
-                return Err(SandboxError::InvalidCpuPercent(cpu));
+/// Expand `--net-allow-bind` specs into a sorted, deduplicated port list.
+/// Each spec is a comma-separated list of single ports (`8080`) or inclusive
+/// `lo-hi` ranges (`8000-8010`). Mirrors the Python SDK's `parse_ports`.
+fn parse_bind_ports(specs: &[String], label: &str) -> Result<Vec<u16>, SandboxError> {
+    let mut ports: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+    for spec in specs {
+        for part in spec.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                return Err(SandboxError::Invalid(format!(
+                    "{}: empty port in `{}`",
+                    label, spec
+                )));
             }
-        }
-
-        // Validate: http_ca and http_key must both be set or both unset
-        if self.http_ca.is_some() != self.http_key.is_some() {
-            return Err(SandboxError::Invalid(
-                "--http-ca and --http-key must both be provided together".into(),
-            ));
-        }
-
-        // Parse HTTP rules (deferred from builder methods to propagate errors)
-        let http_allow: Vec<HttpRule> = self
-            .http_allow
-            .into_iter()
-            .map(|s| HttpRule::parse(&s))
-            .collect::<Result<_, _>>()?;
-        let http_deny: Vec<HttpRule> = self
-            .http_deny
-            .into_iter()
-            .map(|s| HttpRule::parse(&s))
-            .collect::<Result<_, _>>()?;
-
-        // Default HTTP intercept ports: 80 always, 443 when HTTPS CA is configured.
-        let http_ports = if self.http_ports.is_empty() && (!http_allow.is_empty() || !http_deny.is_empty()) {
-            let mut ports = vec![80];
-            if self.http_ca.is_some() {
-                ports.push(443);
-            }
-            ports
-        } else {
-            self.http_ports
-        };
-
-        // Parse user-supplied --net-allow specs.
-        let mut net_allow: Vec<NetAllow> = self
-            .net_allow
-            .into_iter()
-            .map(|s| NetAllow::parse(&s))
-            .collect::<Result<_, _>>()?;
-
-        // Auto-merge HTTP rules into the network allowlist so the proxy's
-        // intercept ports remain reachable. A rule with a concrete host
-        // tightens the IP allowlist (only that host on http_ports);
-        // wildcard hosts add a `:port` (any IP) rule. This mirrors the
-        // intent of the old `http_port → net_connect` merge but at the
-        // endpoint level so HTTP and net_allow stay aligned.
-        if !http_ports.is_empty() {
-            let mut wildcard_seen = false;
-            let mut concrete_hosts: Vec<String> = Vec::new();
-            for rule in http_allow.iter().chain(http_deny.iter()) {
-                if rule.host == "*" {
-                    wildcard_seen = true;
-                } else if !concrete_hosts.iter().any(|h| h.eq_ignore_ascii_case(&rule.host)) {
-                    concrete_hosts.push(rule.host.clone());
+            match part.split_once('-') {
+                Some((lo, hi)) => {
+                    let lo: u16 = lo.trim().parse().map_err(|_| {
+                        SandboxError::Invalid(format!("{}: invalid port range `{}`", label, part))
+                    })?;
+                    let hi: u16 = hi.trim().parse().map_err(|_| {
+                        SandboxError::Invalid(format!("{}: invalid port range `{}`", label, part))
+                    })?;
+                    if lo > hi {
+                        return Err(SandboxError::Invalid(format!(
+                            "{}: reversed port range `{}` (lo > hi)",
+                            label, part
+                        )));
+                    }
+                    ports.extend(lo..=hi);
+                }
+                None => {
+                    let p: u16 = part.parse().map_err(|_| {
+                        SandboxError::Invalid(format!("{}: invalid port `{}`", label, part))
+                    })?;
+                    ports.insert(p);
                 }
             }
-            if wildcard_seen || (http_allow.is_empty() && http_deny.is_empty()) {
-                // Fallback: explicit --http-port without rules, or wildcard rules.
-                net_allow.push(NetAllow {
-                    protocol: Protocol::Tcp,
-                    host: None,
-                    ports: http_ports.clone(),
-                    all_ports: false,
-                });
-            }
-            for h in concrete_hosts {
-                net_allow.push(NetAllow {
-                    protocol: Protocol::Tcp,
-                    host: Some(h),
-                    ports: http_ports.clone(),
-                    all_ports: false,
-                });
-            }
         }
-
-        Ok(Sandbox {
-            fs_writable: self.fs_writable,
-            fs_readable: self.fs_readable,
-            fs_denied: self.fs_denied,
-            extra_deny_syscalls: self.extra_deny_syscalls,
-            extra_allow_syscalls: self.extra_allow_syscalls,
-            net_allow,
-            net_bind: self.net_bind,
-            http_allow,
-            http_deny,
-            http_ports,
-            http_ca: self.http_ca,
-            http_key: self.http_key,
-            max_memory: self.max_memory,
-            max_processes: self.max_processes.unwrap_or(64),
-            max_open_files: self.max_open_files,
-            max_cpu: self.max_cpu,
-            random_seed: self.random_seed,
-            time_start: self.time_start,
-            no_randomize_memory: self.no_randomize_memory,
-            no_huge_pages: self.no_huge_pages,
-            no_coredump: self.no_coredump,
-            deterministic_dirs: self.deterministic_dirs,
-            workdir: self.workdir,
-            cwd: self.cwd,
-            fs_storage: self.fs_storage,
-            max_disk: self.max_disk,
-            on_exit: self.on_exit.unwrap_or_default(),
-            on_error: self.on_error.unwrap_or_default(),
-            fs_mount: self.fs_mount,
-            chroot: self.chroot,
-            clean_env: self.clean_env,
-            env: self.env,
-            gpu_devices: self.gpu_devices,
-            cpu_cores: self.cpu_cores,
-            num_cpus: self.num_cpus,
-            port_remap: self.port_remap,
-            no_supervisor: self.no_supervisor,
-            uid: self.uid,
-            policy_fn: self.policy_fn,
-            name: self.name,
-            init_fn: self.init_fn,
-            work_fn: self.work_fn,
-            runtime: None,
-        })
     }
+    Ok(ports.into_iter().collect())
+}
 
-    /// Build a `Sandbox`, parsing all string fields, running per-field validation,
-    /// and verifying cross-section invariants via `Sandbox::validate`.
-    pub fn build(self) -> Result<Sandbox, SandboxError> {
-        let p = self.build_unchecked()?;
-        p.validate()?;
-        Ok(p)
+/// Resolve a path as seen inside the sandbox to its host-side location, so its
+/// existence can be checked before spawn. Honors `--fs-mount` (virtual:host)
+/// mappings (which take precedence) and chroot. Used to validate
+/// `--http-inject-ca` targets.
+fn resolve_sandbox_path_to_host(
+    child_path: &std::path::Path,
+    chroot_root: Option<&std::path::Path>,
+    mounts: &[(std::path::PathBuf, std::path::PathBuf)],
+) -> std::path::PathBuf {
+    for (virt, host) in mounts {
+        if let Ok(rest) = child_path.strip_prefix(virt) {
+            return host.join(rest);
+        }
     }
+    if let Some(root) = chroot_root {
+        if let Ok(rest) = child_path.strip_prefix("/") {
+            return root.join(rest);
+        }
+    }
+    child_path.to_path_buf()
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // --- SandboxBuilder integration ---
-
-    #[test]
-    fn builder_http_rules() {
-        let policy = Sandbox::builder()
-            .http_allow("GET api.example.com/v1/*")
-            .http_deny("* */admin/*")
-            .build()
-            .unwrap();
-        assert_eq!(policy.http_allow.len(), 1);
-        assert_eq!(policy.http_deny.len(), 1);
-        assert_eq!(policy.http_allow[0].method, "GET");
-        assert_eq!(policy.http_deny[0].host, "*");
-    }
-
-    #[test]
-    fn builder_invalid_http_allow_returns_error() {
-        let result = Sandbox::builder()
-            .http_allow("GETexample.com")
-            .build();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn builder_invalid_http_deny_returns_error() {
-        let result = Sandbox::builder()
-            .http_deny("BADRULE")
-            .build();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn builder_http_ca_without_key_returns_error() {
-        let result = Sandbox::builder()
-            .http_ca("/tmp/ca.pem")
-            .build();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn builder_http_key_without_ca_returns_error() {
-        let result = Sandbox::builder()
-            .http_key("/tmp/key.pem")
-            .build();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn builder_http_ca_and_key_together_ok() {
-        let policy = Sandbox::builder()
-            .http_ca("/tmp/ca.pem")
-            .http_key("/tmp/key.pem")
-            .build()
-            .unwrap();
-        assert!(policy.http_ca.is_some());
-        assert!(policy.http_key.is_some());
-    }
-
-    #[test]
-    fn allows_sysv_ipc_reads_extra_allow_syscalls() {
-        let p = Sandbox::builder()
-            .extra_allow_syscalls(vec!["sysv_ipc".into()])
-            .build()
-            .unwrap();
-        assert!(p.allows_sysv_ipc());
-
-        let p2 = Sandbox::builder().build().unwrap();
-        assert!(!p2.allows_sysv_ipc());
-
-        let p3 = Sandbox::builder()
-            .extra_allow_syscalls(vec!["other_group".into()])
-            .build()
-            .unwrap();
-        assert!(!p3.allows_sysv_ipc());
-    }
-
-}
+mod tests;

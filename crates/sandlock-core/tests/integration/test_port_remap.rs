@@ -25,7 +25,7 @@ async fn test_port_remap_bind() {
     let out = temp_file("bind");
 
     let policy = base_policy()
-        .net_bind_port(port)
+        .net_allow_bind_port(port)
         .port_remap(true)
         .build()
         .unwrap();
@@ -55,7 +55,7 @@ async fn test_port_remap_loopback() {
     let out = temp_file("loopback");
 
     let policy = base_policy()
-        .net_bind_port(port)
+        .net_allow_bind_port(port)
         .net_allow(format!("127.0.0.1:{}", port))
         .port_remap(true)
         .build()
@@ -104,7 +104,7 @@ async fn test_port_remap_getsockname() {
     let out = temp_file("getsockname");
 
     let policy = base_policy()
-        .net_bind_port(port)
+        .net_allow_bind_port(port)
         .port_remap(true)
         .build()
         .unwrap();
@@ -136,7 +136,7 @@ async fn test_port_remap_conflict() {
     let out = temp_file("conflict");
 
     let policy = base_policy()
-        .net_bind_port(occupied_port)
+        .net_allow_bind_port(occupied_port)
         .port_remap(true)
         .build()
         .unwrap();
@@ -190,7 +190,7 @@ async fn test_port_remap_loopback_under_conflict() {
     let out = temp_file("loopback-conflict");
 
     let policy = base_policy()
-        .net_bind_port(occupied_port)
+        .net_allow_bind_port(occupied_port)
         .net_allow(format!("127.0.0.1:{}", occupied_port))
         .port_remap(true)
         .build()

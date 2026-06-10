@@ -164,7 +164,7 @@ pub(crate) async fn handle_cow_open(
 
     // open(path, flags, mode):         args[0]=path, args[1]=flags, args[2]=mode
     // openat(dirfd, path, flags, mode): args[0]=dirfd, args[1]=path, args[2]=flags, args[3]=mode
-    let (path_ptr, dirfd, flags, mode) = if Some(nr) == arch::SYS_OPEN {
+    let (path_ptr, dirfd, flags, mode) = if Some(nr) == arch::sys_open() {
         (notif.data.args[0], libc::AT_FDCWD as i64, notif.data.args[1], notif.data.args[2])
     } else {
         (notif.data.args[1], notif.data.args[0] as i64, notif.data.args[2], notif.data.args[3])
@@ -377,43 +377,43 @@ fn parse_cow_write(
     }
 
     // Legacy variants (path in args[0], no dirfd)
-    if Some(nr) == arch::SYS_UNLINK {
+    if Some(nr) == arch::sys_unlink() {
         return Some(CowWriteOp::Unlink {
             path: read_resolved(notif, 0, None, notif_fd, virtual_cwd)?,
             is_dir: false,
         });
     }
-    if Some(nr) == arch::SYS_RMDIR {
+    if Some(nr) == arch::sys_rmdir() {
         return Some(CowWriteOp::Unlink {
             path: read_resolved(notif, 0, None, notif_fd, virtual_cwd)?,
             is_dir: true,
         });
     }
-    if Some(nr) == arch::SYS_MKDIR {
+    if Some(nr) == arch::sys_mkdir() {
         return Some(CowWriteOp::Mkdir {
             path: read_resolved(notif, 0, None, notif_fd, virtual_cwd)?,
         });
     }
-    if Some(nr) == arch::SYS_RENAME {
+    if Some(nr) == arch::sys_rename() {
         let old_path = read_resolved(notif, 0, None, notif_fd, virtual_cwd)?;
         let new_path = read_resolved(notif, 1, None, notif_fd, virtual_cwd)?;
         return Some(CowWriteOp::Rename { old_path, new_path });
     }
-    if Some(nr) == arch::SYS_SYMLINK {
+    if Some(nr) == arch::sys_symlink() {
         let target = read_path(notif, notif.data.args[0], notif_fd)?;
         let linkpath = read_resolved(notif, 1, None, notif_fd, virtual_cwd)?;
         return Some(CowWriteOp::Symlink { target, linkpath });
     }
-    if Some(nr) == arch::SYS_LINK {
+    if Some(nr) == arch::sys_link() {
         let old_path = read_resolved(notif, 0, None, notif_fd, virtual_cwd)?;
         let new_path = read_resolved(notif, 1, None, notif_fd, virtual_cwd)?;
         return Some(CowWriteOp::Link { old_path, new_path });
     }
-    if Some(nr) == arch::SYS_CHMOD {
+    if Some(nr) == arch::sys_chmod() {
         let path = read_resolved(notif, 0, None, notif_fd, virtual_cwd)?;
         return Some(CowWriteOp::Chmod { path, mode: (notif.data.args[1] & 0o7777) as u32 });
     }
-    if Some(nr) == arch::SYS_CHOWN || Some(nr) == arch::SYS_LCHOWN {
+    if Some(nr) == arch::sys_chown() || Some(nr) == arch::sys_lchown() {
         let path = read_resolved(notif, 0, None, notif_fd, virtual_cwd)?;
         return Some(CowWriteOp::Chown { path, uid: notif.data.args[1] as u32, gid: notif.data.args[2] as u32 });
     }
@@ -590,9 +590,6 @@ pub(crate) async fn handle_cow_write(
 // access() handler — fake W_OK for COW-managed paths
 // ============================================================
 
-/// SYS_faccessat2 syscall number on x86_64 (439). Not always in libc crate.
-pub(crate) const SYS_FACCESSAT2: i64 = 439;
-
 /// Handle faccessat/faccessat2/access — return success for W_OK checks on
 /// COW-managed paths so programs that pre-check write permissions (like dpkg)
 /// don't fail before the COW layer can redirect their writes.
@@ -607,7 +604,7 @@ pub(crate) async fn handle_cow_access(
 
     // access(pathname, mode): args[0]=path, args[1]=mode
     // faccessat(dirfd, pathname, mode, flags): args[0]=dirfd, args[1]=path, args[2]=mode
-    let (path, mode) = if Some(nr) == arch::SYS_ACCESS {
+    let (path, mode) = if Some(nr) == arch::sys_access() {
         let p = match read_path(notif, notif.data.args[0], notif_fd) {
             Some(p) => resolve_at_path_with_virtual(
                 notif,
@@ -768,7 +765,7 @@ pub(crate) async fn handle_cow_stat(
     };
     drop(st);
 
-    if nr == libc::SYS_faccessat || nr == SYS_FACCESSAT2 {
+    if nr == libc::SYS_faccessat || nr == crate::arch::SYS_FACCESSAT2 {
         // For faccessat, just check if the file exists (we already resolved it)
         if real_path.exists() || real_path.is_symlink() {
             return NotifAction::ReturnValue(0);

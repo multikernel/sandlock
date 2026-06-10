@@ -99,6 +99,53 @@ class NotifAction:
             newfd_flags=newfd_flags,
         )
 
+    @classmethod
+    def inject_bytes(
+        cls,
+        data: bytes,
+        *,
+        seal: bool = True,
+        cloexec: bool = True,
+    ) -> NotifAction:
+        """Inject ``data`` into the child as the syscall's returned fd.
+
+        Builds an in-memory file (``memfd``) populated with ``data`` and
+        rewound to offset 0, then returns an inject-fd action for it. Use
+        this for synthetic file content (secrets, virtual files, fetched
+        objects) instead of hand-rolling ``os.memfd_create``.
+
+        By default the fd is sealed read-only/fixed-size so the guest cannot
+        modify or resize the content (pass ``seal=False`` for a writable fd),
+        and the child-side fd is ``O_CLOEXEC`` (pass ``cloexec=False`` to
+        clear it).
+
+        Like :meth:`inject_fd_send`, ownership of the created fd transfers to
+        the supervisor on dispatch; the caller must NOT close it. A rare
+        allocation failure raises :class:`OSError`, which the handler's
+        ``on_exception`` policy then governs.
+        """
+        import fcntl
+        import os
+
+        mfd_flags = os.MFD_CLOEXEC
+        if seal:
+            mfd_flags |= os.MFD_ALLOW_SEALING
+        fd = os.memfd_create("sandlock-content", mfd_flags)
+        try:
+            os.write(fd, data)
+            os.lseek(fd, 0, os.SEEK_SET)
+            if seal:
+                fcntl.fcntl(
+                    fd,
+                    fcntl.F_ADD_SEALS,
+                    fcntl.F_SEAL_SEAL | fcntl.F_SEAL_WRITE
+                    | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK,
+                )
+        except OSError:
+            os.close(fd)  # not yet handed off, so we still own it
+            raise
+        return cls.inject_fd_send(fd, newfd_flags=os.O_CLOEXEC if cloexec else 0)
+
 
 class ExceptionPolicy(enum.IntEnum):
     """Maps to sandlock_exception_policy_t in the C ABI.
@@ -136,12 +183,30 @@ class Handler:
     inside the supervisor's dispatch path while holding the GIL; a
     handler that blocks (a long sleep, a blocking I/O call, an infinite
     loop) stalls the supervisor and can wedge the entire run.
+
+    Deferral: define ``handle`` as ``async def`` to run it off the
+    supervisor's notification loop, so a slow handler (a network round-trip,
+    a blocking call) does not stall every other trapped syscall. The
+    coroutine is driven to completion on a worker thread, and for I/O-bound
+    work multiple async handlers overlap (the GIL is released during
+    blocking I/O). Trade-offs: an async handler makes a *terminal*
+    decision: deferral short-circuits the handler chain, so if it returns
+    ``continue_()`` and other handlers are registered on the same syscall,
+    those later handlers do not run. Deferral is refused for
+    ``execve``/``execveat`` and fork-creating syscalls (the response cannot
+    be moved off-loop without skipping argv-safety work); such a call is
+    denied with EPERM.
     """
 
     on_exception: ExceptionPolicy = ExceptionPolicy.KILL
 
     def handle(self, ctx: HandlerCtx) -> NotifAction:
         """Override in a subclass to inspect ``ctx`` and return a NotifAction.
+
+        May be defined as ``async def`` to run off the supervisor loop: its
+        coroutine is driven to completion on a worker thread, so it may
+        ``await`` slow work (network I/O, etc.) without stalling other
+        trapped syscalls, and concurrent async handlers overlap during I/O.
 
         Raising an exception triggers the configured ``on_exception``
         policy. Returning a non-NotifAction value is treated as an

@@ -57,3 +57,9 @@ mod test_http_acl;
 
 #[path = "integration/test_handlers.rs"]
 mod test_handlers;
+
+#[path = "integration/test_protection.rs"]
+mod test_protection;
+
+#[path = "integration/test_http_inject_ca.rs"]
+mod test_http_inject_ca;

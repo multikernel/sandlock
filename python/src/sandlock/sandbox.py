@@ -8,6 +8,7 @@ time; runtime state (``_native``, ``_handle``) is initialized lazily.
 
 from __future__ import annotations
 
+import inspect
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -57,8 +58,11 @@ _PORT_RANGE_RE = re.compile(r"^(\d+)(?:-(\d+))?$")
 def parse_ports(specs: Sequence[int | str]) -> list[int]:
     """Parse port specifications into a sorted list of unique port numbers.
 
-    Each spec is an int (single port) or a string like ``"80"``,
-    ``"8000-9000"``.  Raises ValueError on out-of-range or bad format.
+    Each spec is an int (single port) or a string holding a comma-separated
+    list of single ports / inclusive ``"lo-hi"`` ranges, e.g. ``"80"``,
+    ``"8000-9000"``, or ``"8080,9000-9005"`` (matching the CLI's
+    ``--net-allow-bind`` grammar).  Raises ValueError on out-of-range or bad
+    format.
     """
     ports: set[int] = set()
     for spec in specs:
@@ -67,14 +71,16 @@ def parse_ports(specs: Sequence[int | str]) -> list[int]:
                 raise ValueError(f"port out of range: {spec}")
             ports.add(spec)
             continue
-        m = _PORT_RANGE_RE.match(spec.strip())
-        if m is None:
-            raise ValueError(f"invalid port spec: {spec!r}")
-        lo = int(m.group(1))
-        hi = int(m.group(2)) if m.group(2) else lo
-        if lo > hi or not 0 <= lo <= 65535 or not 0 <= hi <= 65535:
-            raise ValueError(f"invalid port range: {spec!r}")
-        ports.update(range(lo, hi + 1))
+        for part in spec.split(","):
+            part = part.strip()
+            m = _PORT_RANGE_RE.match(part)
+            if m is None:
+                raise ValueError(f"invalid port spec: {part!r}")
+            lo = int(m.group(1))
+            hi = int(m.group(2)) if m.group(2) else lo
+            if lo > hi or not 0 <= lo <= 65535 or not 0 <= hi <= 65535:
+                raise ValueError(f"invalid port range: {part!r}")
+            ports.update(range(lo, hi + 1))
     return sorted(ports)
 
 
@@ -163,10 +169,20 @@ class Sandbox:
 
     Protocol gating falls out of rule presence: with no UDP/ICMP rules,
     UDP and ICMP socket creation are denied at the seccomp layer.
-    Hostnames are resolved at sandbox-creation time and pinned via a
-    synthetic ``/etc/hosts``. Empty = deny all outbound. HTTP rules with
-    concrete hosts auto-add a matching TCP entry on :attr:`http_ports`.
-    See README "Network Model" for details."""
+    A target may also be an IP, a CIDR range, or an IPv6 literal
+    (``"10.0.0.0/8:443"``, ``"[2606:4700::/32]:443"``), matched by
+    containment with no DNS. Hostnames are resolved at sandbox-creation
+    time and pinned via a synthetic ``/etc/hosts``. Empty = deny all
+    outbound. HTTP rules with concrete hosts auto-add a matching TCP entry
+    on :attr:`http_ports`. See README "Network Model" for details."""
+
+    net_deny: Sequence[str] = field(default_factory=list)
+    """Outbound endpoint denylist: default-allow networking, block these
+    targets. The inverse of :attr:`net_allow` and **mutually exclusive**
+    with it. Same grammar as ``net_allow`` except targets must be a literal
+    IP/CIDR or ``"*"`` (hostnames are rejected; use :attr:`http_deny` for
+    domains), e.g. ``["10.0.0.0/8", "169.254.169.254:80", "udp://*"]``.
+    Empty = no denylist. See README "Network Model" for details."""
 
     no_coredump: bool = False
     """Disable core dumps and restrict /proc/pid access from other
@@ -174,10 +190,17 @@ class Sandbox:
     leaking sandbox memory contents but breaks gdb/strace/perf."""
 
     # Network — bind allowlist (Landlock ABI v4+, TCP only)
-    net_bind: Sequence[int | str] = field(default_factory=list)
-    """TCP ports the sandbox may bind. Empty = deny all. Each entry is
-    a port number or a ``"lo-hi"`` range string. Landlock's port hooks
-    are TCP-only — UDP bind is not separately gated."""
+    net_allow_bind: Sequence[int | str] = field(default_factory=list)
+    """TCP ports the sandbox may bind (default-deny allowlist). Empty = deny
+    all. Each entry is a port number or a ``"lo-hi"`` range string (or a
+    comma-separated list). Landlock's port hooks are TCP-only — UDP bind is
+    not separately gated. Mutually exclusive with :attr:`net_deny_bind`."""
+
+    net_deny_bind: Sequence[int | str] = field(default_factory=list)
+    """TCP ports the sandbox may NOT bind (default-allow denylist; the
+    inverse of :attr:`net_allow_bind`, enforced on the on-behalf ``bind()``
+    path). Same port syntax. Empty = no bind denylist. Mutually exclusive
+    with :attr:`net_allow_bind`."""
 
     # HTTP ACL
     http_allow: Sequence[str] = field(default_factory=list)
@@ -198,6 +221,14 @@ class Sandbox:
 
     http_key: str | None = None
     """PEM CA private key path for HTTPS MITM. Required with http_ca."""
+
+    http_inject_ca: Sequence[str] = field(default_factory=list)
+    """Trust bundle paths to splice the MITM CA into. Without http_ca this
+    generates an ephemeral CA and intercepts port 443."""
+
+    http_ca_out: str | None = None
+    """Path to write the active MITM CA public certificate (PEM). Never the
+    private key. Useful for NODE_EXTRA_CA_CERTS and similar."""
 
     # Resource limits
     max_memory: str | int | None = None
@@ -325,6 +356,24 @@ class Sandbox:
     on_error: BranchAction = BranchAction.ABORT
     """Branch action on sandbox error/exception."""
 
+    # Landlock protection opt-out — relax strict enforcement for the
+    # named protections. See ``sandlock.Protection`` (the IntEnum mirror
+    # of the C ABI ``sandlock_protection_t``).
+    allow_degraded: Sequence[int] = field(default_factory=list)
+    """Protections that may degrade silently on kernels that don't
+    support them. Each entry is a :class:`sandlock.Protection` value.
+    On a capable kernel the protection is still enforced strictly; on
+    an older kernel it is skipped instead of failing the build.
+    Idempotent / last-wins with :attr:`disable` (the later assignment
+    for a given protection wins)."""
+
+    disable: Sequence[int] = field(default_factory=list)
+    """Protections that are never enforced, even on a host kernel that
+    supports them. Each entry is a :class:`sandlock.Protection` value.
+    Use this for a deliberate opt-out (e.g. to allow a workload to use
+    a protection-incompatible feature). Idempotent / last-wins with
+    :attr:`allow_degraded`."""
+
     # Runtime kwargs — not part of policy serialization.
     name: str | None = field(default=None, repr=False, metadata={"runtime": True})
     """Sandbox name (also exposed as the virtual hostname inside the sandbox).
@@ -377,8 +426,12 @@ class Sandbox:
     # ------------------------------------------------------------------
 
     def bind_ports(self) -> list[int]:
-        """Return parsed bind port list, or empty if unrestricted."""
-        return parse_ports(self.net_bind) if self.net_bind else []
+        """Return parsed allow-bind port list, or empty if unrestricted."""
+        return parse_ports(self.net_allow_bind) if self.net_allow_bind else []
+
+    def deny_bind_ports(self) -> list[int]:
+        """Return parsed deny-bind port list, or empty if none."""
+        return parse_ports(self.net_deny_bind) if self.net_deny_bind else []
 
     def memory_bytes(self) -> int | None:
         """Return max_memory as bytes, or None if unset."""
@@ -602,6 +655,10 @@ class Sandbox:
                         "sandlock_handler_new returned NULL for syscall "
                         f"{syscall_nr}"
                     )
+                # An async `handle` runs off the supervisor loop. Flag the
+                # container before it is handed to the run.
+                if _is_deferred_handler(handler):
+                    _lib.sandlock_handler_set_deferred(container, True)
                 regs[i].syscall_nr = int(syscall_nr)
                 regs[i].handler = container
                 # Ownership now lives in regs[i]; clear the pending ref so
@@ -1035,6 +1092,16 @@ def _encode(s: str) -> bytes:
     if b'\x00' in result:
         raise ValueError(f"NUL byte in string argument: {result!r}")
     return result
+
+
+def _is_deferred_handler(handler) -> bool:
+    """Whether a handler runs off the supervisor loop.
+
+    True when its ``handle`` is an ``async def`` (a coroutine function): the
+    coroutine is driven to completion on a worker thread, which would block
+    the supervisor loop if run inline, so it must be deferred.
+    """
+    return inspect.iscoroutinefunction(getattr(handler, "handle", None))
 
 
 def _resolve_syscall(key) -> int:

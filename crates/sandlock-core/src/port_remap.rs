@@ -159,6 +159,20 @@ pub(crate) async fn handle_bind(
         _ => return bind_verbatim(&dup_fd, &bytes, addr_len),
     };
 
+    // --net-deny-bind: reject binding a denied TCP port. Only TCP is gated
+    // (mirroring --net-allow-bind); UDP/other binds are unaffected. The
+    // SO_PROTOCOL probe is skipped entirely when the denylist is empty.
+    let denied = {
+        let ns = network.lock().await;
+        !ns.bind_deny_ports.is_empty() && ns.bind_deny_ports.contains(&virtual_port)
+    };
+    if denied
+        && crate::network::query_socket_protocol(dup_fd.as_raw_fd())
+            == Some(crate::network::Protocol::Tcp)
+    {
+        return NotifAction::Errno(libc::EACCES);
+    }
+
     // Pick a first-attempt port: cached real port if known, else the
     // virtual port itself. The cached real port keeps repeat binds of
     // the same virtual port consistent across the sandbox; the virtual

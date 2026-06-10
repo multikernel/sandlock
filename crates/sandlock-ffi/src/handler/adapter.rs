@@ -12,8 +12,8 @@ use sandlock_core::seccomp::dispatch::{Handler, HandlerCtx};
 use sandlock_core::seccomp::notif::NotifAction;
 
 use super::abi::{
-    sandlock_action_kind_t, sandlock_action_out_t, sandlock_exception_policy_t,
-    sandlock_handler_t, sandlock_mem_handle_t,
+    sandlock_action_kind_t, sandlock_action_out_t, sandlock_exception_policy_t, sandlock_handler_t,
+    sandlock_mem_handle_t,
 };
 
 /// Sentinel for "we cannot safely resolve a process-group id for the
@@ -57,7 +57,9 @@ impl FfiHandler {
     /// supervisor owns the container.
     pub unsafe fn from_raw(raw: *mut sandlock_handler_t) -> Self {
         assert!(!raw.is_null(), "FfiHandler::from_raw on null pointer");
-        Self { inner: Box::from_raw(raw) }
+        Self {
+            inner: Box::from_raw(raw),
+        }
     }
 
     fn exception_action(&self, child_pgid: i32) -> NotifAction {
@@ -73,7 +75,10 @@ impl FfiHandler {
                     // failed syscall.
                     NotifAction::Errno(libc::EPERM)
                 } else {
-                    NotifAction::Kill { sig: libc::SIGKILL, pgid: child_pgid }
+                    NotifAction::Kill {
+                        sig: libc::SIGKILL,
+                        pgid: child_pgid,
+                    }
                 }
             }
             sandlock_exception_policy_t::DenyEperm => NotifAction::Errno(libc::EPERM),
@@ -154,8 +159,15 @@ impl Handler for FfiHandler {
         let handler_fn = self.inner.handler_fn;
         let ud = UdPtr(self.inner.ud);
         let on_exception_fallback = self.exception_action(child_pgid);
+        let deferred = self.inner.deferred;
 
-        Box::pin(async move {
+        // The whole callback (including its slow work) runs on a blocking
+        // worker. When `deferred` is set we hand this future to the
+        // supervisor as `NotifAction::Defer` so it runs off the notification
+        // loop; otherwise the supervisor awaits it inline as before. The
+        // future is fully owned (`'static`) either way — nothing borrows
+        // `self`/`cx`.
+        let run = async move {
             let join = tokio::task::spawn_blocking(move || {
                 // Rust 2021 disjoint closure captures (RFC 2229) would
                 // otherwise capture `ud.0` (a bare `*mut c_void`, not
@@ -168,13 +180,14 @@ impl Handler for FfiHandler {
                 let mut mem = sandlock_mem_handle_t::new(notif_fd, notif_id, pid);
                 let mut out = sandlock_action_out_t::zeroed();
                 let rc = match handler_fn {
-                    Some(f) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                        || f(ud_raw, &notif_snap, &mut mem, &mut out),
-                    )),
+                    Some(f) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        f(ud_raw, &notif_snap, &mut mem, &mut out)
+                    })),
                     None => Ok(-1),
                 };
                 (rc, out)
-            }).await;
+            })
+            .await;
 
             let (rc_or_panic, out) = match join {
                 Ok(pair) => pair,
@@ -210,7 +223,15 @@ impl Handler for FfiHandler {
                     on_exception_fallback
                 }
             }
-        })
+        };
+
+        if deferred {
+            // Resolves immediately to Defer; the supervisor moves `run` onto
+            // a worker task and sends the response when it completes.
+            Box::pin(async move { NotifAction::defer(run) })
+        } else {
+            Box::pin(run)
+        }
     }
 }
 
@@ -306,7 +327,10 @@ fn translate_action(out: &sandlock_action_out_t, child_pgid: i32) -> Option<Noti
                     if child_pgid == UNSAFE_PGID {
                         return None;
                     }
-                    NotifAction::Kill { sig: out.payload.kill.sig, pgid: child_pgid }
+                    NotifAction::Kill {
+                        sig: out.payload.kill.sig,
+                        pgid: child_pgid,
+                    }
                 } else {
                     // Caller passed an explicit pgid. Defence in depth:
                     // refuse if it matches the supervisor's own group
@@ -319,7 +343,10 @@ fn translate_action(out: &sandlock_action_out_t, child_pgid: i32) -> Option<Noti
                     if user_pgid == supervisor_pgid {
                         return None;
                     }
-                    NotifAction::Kill { sig: out.payload.kill.sig, pgid: user_pgid }
+                    NotifAction::Kill {
+                        sig: out.payload.kill.sig,
+                        pgid: user_pgid,
+                    }
                 }
             }
             K::InjectFdSend => NotifAction::InjectFdSend {

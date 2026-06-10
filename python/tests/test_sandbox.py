@@ -89,6 +89,42 @@ class TestSandboxRun:
         assert not result.success
 
 
+class TestNetDeny:
+    """`net_deny` wired through the FFI: default-allow networking with an
+    IP/CIDR/port denylist, mutually exclusive with `net_allow`."""
+
+    def test_net_deny_builds_and_runs(self):
+        result = _policy(
+            net_deny=["10.0.0.0/8", "169.254.169.254:80", "udp://*"]
+        ).run(["echo", "ok"])
+        assert result.success
+        assert result.stdout.strip() == b"ok"
+
+    def test_net_allow_and_net_deny_mutually_exclusive(self):
+        with pytest.raises(RuntimeError, match="mutually exclusive"):
+            _policy(
+                net_allow=["github.com:443"], net_deny=["10.0.0.0/8"]
+            ).run(["echo", "ok"])
+
+
+class TestNetDenyBind:
+    """`net_deny_bind` wired through the FFI: default-allow bind with a TCP
+    port denylist, mutually exclusive with `net_allow_bind`."""
+
+    def test_net_deny_bind_builds_and_runs(self):
+        result = _policy(net_deny_bind=["8080,9000-9002", 443]).run(["echo", "ok"])
+        assert result.success
+        assert result.stdout.strip() == b"ok"
+
+    def test_deny_bind_ports_expands(self):
+        sb = _policy(net_deny_bind=["8080,9000-9002", 443])
+        assert sb.deny_bind_ports() == [443, 8080, 9000, 9001, 9002]
+
+    def test_allow_bind_and_deny_bind_mutually_exclusive(self):
+        with pytest.raises(RuntimeError, match="mutually exclusive"):
+            _policy(net_allow_bind=[8080], net_deny_bind=[9090]).run(["echo", "ok"])
+
+
 class TestSandlockRunCAbiMultiThreaded:
     """Regression for issue #47 covering only the C ABI ``sandlock_run`` path.
 
@@ -288,7 +324,7 @@ class TestPortRemap:
             "print(s.getsockname()[1]); "
             "s.close()"
         )
-        policy = _policy(port_remap=True, net_bind=[8080])
+        policy = _policy(port_remap=True, net_allow_bind=[8080])
 
         holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         holder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -358,7 +394,7 @@ class TestPortRemap:
             "print(json.dumps({'server_port': server_port, 'sent': total_sent, "
             "'received': len(received), 'data_ok': bytes(received) == payload}))"
         )
-        policy = _policy(port_remap=True, net_bind=[7070], net_allow=["127.0.0.1:7070"])
+        policy = _policy(port_remap=True, net_allow_bind=[7070], net_allow=["127.0.0.1:7070"])
         result = policy.run(["python3", "-c", code])
 
         assert result.success, f"Sandbox failed: {result}"

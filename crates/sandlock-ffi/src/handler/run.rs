@@ -26,10 +26,7 @@ const MAX_ARGV: u32 = 4096;
 /// for the registration array.
 const MAX_REGISTRATIONS: usize = 4096;
 
-fn argv_from_c(
-    argv: *const *const std::os::raw::c_char,
-    argc: u32,
-) -> Option<Vec<String>> {
+fn argv_from_c(argv: *const *const std::os::raw::c_char, argc: u32) -> Option<Vec<String>> {
     if argv.is_null() {
         return None;
     }
@@ -119,13 +116,15 @@ fn block_on_run(
     // `crate::runtime` for why this is `current_thread`. This path is
     // reached from `extern "C-unwind"` entry points, so user callback
     // panics are intentionally allowed to propagate.
-    crate::runtime::with_runtime_unwind(|rt| rt.block_on(async move {
-        if interactive {
-            sb.run_interactive_with_handlers(&cmd_refs, handlers).await
-        } else {
-            sb.run_with_handlers(&cmd_refs, handlers).await
-        }
-    }))
+    crate::runtime::with_runtime_unwind(|rt| {
+        rt.block_on(async move {
+            if interactive {
+                sb.run_interactive_with_handlers(&cmd_refs, handlers).await
+            } else {
+                sb.run_with_handlers(&cmd_refs, handlers).await
+            }
+        })
+    })
 }
 
 /// Run the policy with C handlers. Returns NULL on failure.
@@ -159,7 +158,15 @@ pub unsafe extern "C-unwind" fn sandlock_run_with_handlers(
     registrations: *const sandlock_handler_registration_t,
     nregistrations: usize,
 ) -> *mut crate::sandlock_result_t {
-    run_with_handlers_inner(policy, name, argv, argc, registrations, nregistrations, false)
+    run_with_handlers_inner(
+        policy,
+        name,
+        argv,
+        argc,
+        registrations,
+        nregistrations,
+        false,
+    )
 }
 
 /// Interactive-stdio variant of `sandlock_run_with_handlers`.
@@ -180,7 +187,15 @@ pub unsafe extern "C-unwind" fn sandlock_run_interactive_with_handlers(
     registrations: *const sandlock_handler_registration_t,
     nregistrations: usize,
 ) -> *mut crate::sandlock_result_t {
-    run_with_handlers_inner(policy, name, argv, argc, registrations, nregistrations, true)
+    run_with_handlers_inner(
+        policy,
+        name,
+        argv,
+        argc,
+        registrations,
+        nregistrations,
+        true,
+    )
 }
 
 /// Drops every non-null handler pointer in the registration array.
@@ -202,10 +217,7 @@ pub unsafe extern "C-unwind" fn sandlock_run_interactive_with_handlers(
 /// `sandlock_handler_registration_t` slots whose `handler` pointer is
 /// either null or comes from `sandlock_handler_new` and has not been
 /// freed by anyone else.
-unsafe fn release_registrations(
-    regs: *const sandlock_handler_registration_t,
-    nregs: usize,
-) {
+unsafe fn release_registrations(regs: *const sandlock_handler_registration_t, nregs: usize) {
     if regs.is_null() || nregs == 0 {
         return;
     }

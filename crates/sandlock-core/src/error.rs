@@ -27,6 +27,13 @@ pub enum SandboxError {
 
     #[error("confine() only accepts Landlock filesystem policy; unsupported fields: {0}")]
     UnsupportedForConfine(String),
+
+    #[error("chroot path {path} does not exist or is inaccessible: {source}")]
+    ChrootNotFound {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Errors from the sandbox process runtime (fork, confinement, child, etc.).
@@ -56,11 +63,17 @@ pub enum ConfinementError {
     #[error("landlock unavailable: {0}")]
     LandlockUnavailable(String),
 
-    #[error("landlock ABI v{required} required (kernel has v{actual}): {feature}")]
-    InsufficientAbi {
-        required: u32,
-        actual: u32,
-        feature: String,
+    /// A `Protection` in `ProtectionState::Strict` is unavailable
+    /// because the host kernel's Landlock ABI is below the
+    /// protection's `min_abi()`. Build (or `confine`) refuses to
+    /// proceed; the caller can resolve by setting that protection to
+    /// `Degradable` or `Disabled`, or by running on a kernel that
+    /// supports it.
+    #[error("required protection {protection:?} is not available: host Landlock ABI is v{host_abi}, requires v{required_abi}")]
+    ProtectionUnavailable {
+        protection: crate::protection::Protection,
+        required_abi: u32,
+        host_abi: u32,
     },
 
     #[error("landlock error: {0}")]

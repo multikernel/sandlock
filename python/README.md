@@ -111,7 +111,7 @@ with Sandbox(fs_readable=["/usr", "/lib"]) as sb:
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `net_allow` | `list[str]` | `[]` | Outbound endpoint rules. Bare `host:port` is TCP; protocol prefixes opt others in: `tcp://host:port`, `udp://host:port` (or `udp://*:*` for any UDP), `icmp://host` (or `icmp://*` for any ICMP echo via the kernel ping socket — gated by `net.ipv4.ping_group_range` on the host). Empty = deny all. Raw ICMP is not exposed. |
-| `net_bind` | `list[int \| str]` | `[]` | TCP ports the sandbox may bind (empty = deny all) |
+| `net_allow_bind` | `list[int \| str]` | `[]` | TCP ports the sandbox may bind (empty = deny all) |
 | `port_remap` | `bool` | `False` | Transparent TCP port virtualization |
 
 #### HTTP ACL
@@ -127,6 +127,8 @@ denied by default. Block rules are checked first and take precedence.
 | `http_ports` | `list[int]` | `[80]` | TCP ports to intercept (443 added when `http_ca` is set) |
 | `http_ca` | `str \| None` | `None` | CA certificate for HTTPS MITM |
 | `http_key` | `str \| None` | `None` | CA private key for HTTPS MITM |
+| `http_inject_ca` | `list[str]` | `[]` | Trust bundle paths to splice the active MITM CA's public cert into at open time. Without `http_ca`, generates an ephemeral CA (key in memory only) and intercepts port 443. Requires an `http_allow` / `http_deny` rule |
+| `http_ca_out` | `str \| None` | `None` | Writes the active CA's public certificate (PEM) to this path; never the private key. Requires an `http_allow` / `http_deny` rule |
 
 Rule format: `"METHOD host/path"` where method and host can be `*` for
 wildcard, and path supports trailing `*` for prefix matching. Paths are
@@ -233,6 +235,36 @@ Sandlock always applies its default syscall blocklist.
 | `max_disk` | `str \| None` | `None` | Disk quota for COW storage (e.g. `"1G"`) |
 | `on_exit` | `BranchAction` | `COMMIT` | `COMMIT`, `ABORT`, or `KEEP` |
 | `on_error` | `BranchAction` | `ABORT` | `COMMIT`, `ABORT`, or `KEEP` |
+
+#### Protection opt-out
+
+By default sandlock enforces every Landlock protection the host kernel
+supports and refuses to start when a required protection is
+unavailable. Two keyword arguments on `Sandbox` opt out of the strict
+default on a per-protection basis:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `allow_degraded` | `list[Protection]` | `[]` | Enforce each listed protection where the host kernel supports it, silently skip it where it does not. |
+| `disable` | `list[Protection]` | `[]` | Never enforce each listed protection, even on a kernel that supports it. |
+
+```python
+from sandlock import Sandbox, Protection
+
+sb = Sandbox(
+    fs_readable=["/data"],
+    fs_writable=["/tmp"],
+    allow_degraded=[Protection.SIGNAL_SCOPE, Protection.ABSTRACT_UNIX_SOCKET_SCOPE],
+)
+```
+
+The two `allow_degraded` entries let the sandbox build on Linux kernels
+below 6.12, where the v6 IPC scopes are unavailable; on a capable kernel
+the scopes remain enforced. The protection policy is persisted with a
+checkpoint, so a restored sandbox keeps the exact posture it was built
+with. See the "Protection opt-out" section of
+[`../docs/sandbox-reference.md`](../docs/sandbox-reference.md#protection-opt-out)
+for the per-protection ABI floors and the full semantics.
 
 #### `sandbox.run(cmd, timeout=None) -> Result`
 

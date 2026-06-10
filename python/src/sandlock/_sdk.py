@@ -8,6 +8,7 @@ import os
 import signal
 import sys
 from dataclasses import dataclass, field
+from enum import IntEnum
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -87,13 +88,17 @@ _b_max_processes = _builder_fn("sandlock_sandbox_builder_max_processes", ctypes.
 _b_max_cpu = _builder_fn("sandlock_sandbox_builder_max_cpu", ctypes.c_uint8)
 _b_num_cpus = _builder_fn("sandlock_sandbox_builder_num_cpus", ctypes.c_uint32)
 _b_net_allow = _builder_fn("sandlock_sandbox_builder_net_allow", ctypes.c_char_p)
-_b_net_bind_port = _builder_fn("sandlock_sandbox_builder_net_bind_port", ctypes.c_uint16)
+_b_net_deny = _builder_fn("sandlock_sandbox_builder_net_deny", ctypes.c_char_p)
+_b_net_allow_bind_port = _builder_fn("sandlock_sandbox_builder_net_allow_bind_port", ctypes.c_uint16)
+_b_net_deny_bind_port = _builder_fn("sandlock_sandbox_builder_net_deny_bind_port", ctypes.c_uint16)
 _b_port_remap = _builder_fn("sandlock_sandbox_builder_port_remap", ctypes.c_bool)
 _b_http_allow = _builder_fn("sandlock_sandbox_builder_http_allow", ctypes.c_char_p)
 _b_http_deny = _builder_fn("sandlock_sandbox_builder_http_deny", ctypes.c_char_p)
 _b_http_port = _builder_fn("sandlock_sandbox_builder_http_port", ctypes.c_uint16)
 _b_http_ca = _builder_fn("sandlock_sandbox_builder_http_ca", ctypes.c_char_p)
 _b_http_key = _builder_fn("sandlock_sandbox_builder_http_key", ctypes.c_char_p)
+_b_http_inject_ca = _builder_fn("sandlock_sandbox_builder_http_inject_ca", ctypes.c_char_p)
+_b_http_ca_out = _builder_fn("sandlock_sandbox_builder_http_ca_out", ctypes.c_char_p)
 _b_uid = _builder_fn("sandlock_sandbox_builder_uid", ctypes.c_uint32)
 _b_random_seed = _builder_fn("sandlock_sandbox_builder_random_seed", ctypes.c_uint64)
 _b_clean_env = _builder_fn("sandlock_sandbox_builder_clean_env", ctypes.c_bool)
@@ -107,6 +112,56 @@ _b_no_huge_pages = _builder_fn("sandlock_sandbox_builder_no_huge_pages", ctypes.
 _b_no_coredump = _builder_fn("sandlock_sandbox_builder_no_coredump", ctypes.c_bool)
 _b_deterministic_dirs = _builder_fn("sandlock_sandbox_builder_deterministic_dirs", ctypes.c_bool)
 _b_cpu_cores = _builder_fn("sandlock_sandbox_builder_cpu_cores", ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32)
+
+# Protection opt-out — mirror of the C ABI `sandlock_protection_t`.
+# Discriminant values must stay in sync with `sandlock_core::Protection`
+# and `sandlock_protection_t` in `crates/sandlock-ffi/include/sandlock.h`.
+class Protection(IntEnum):
+    """Per-protection Landlock feature identifier.
+
+    Pass values from this enum to ``Sandbox(allow_degraded=...)`` or
+    ``Sandbox(disable=...)`` to opt out of strict enforcement for the
+    named protection. See the C header for kernel ABI requirements.
+    """
+
+    FS_REFER = 0
+    FS_TRUNCATE = 1
+    NET_TCP = 2
+    FS_IOCTL_DEV = 3
+    SIGNAL_SCOPE = 4
+    ABSTRACT_UNIX_SOCKET_SCOPE = 5
+
+
+_lib.sandlock_protection_min_abi.restype = ctypes.c_uint32
+_lib.sandlock_protection_min_abi.argtypes = [ctypes.c_uint32]
+
+# Move-semantics setters: each returns the (possibly relocated) builder
+# pointer, mirroring the convention of the other `_builder_fn` setters.
+# The C ABI accepts the protection as a `uint32_t` so an out-of-range
+# value is rejected at the FFI boundary (no `#[repr(C)]` enum cast).
+_b_allow_degraded = _builder_fn(
+    "sandlock_sandbox_builder_allow_degraded", ctypes.c_uint32
+)
+_b_disable = _builder_fn(
+    "sandlock_sandbox_builder_disable", ctypes.c_uint32
+)
+
+
+def _validate_protection(p: int, *, field: str) -> int:
+    """Coerce a caller-supplied protection value to a known discriminant
+    or raise :class:`ValueError`. Centralises the range check so the FFI
+    is never invoked with an unknown integer (the Rust setters silently
+    no-op on bad input, which is the wrong UX for the Python caller —
+    we want a loud failure at the SDK boundary instead).
+    """
+    try:
+        return int(Protection(int(p)))
+    except (ValueError, TypeError) as e:
+        valid = ", ".join(f"{m.name}={int(m)}" for m in Protection)
+        raise ValueError(
+            f"{field}: {p!r} is not a known Protection discriminant "
+            f"(valid: {valid})"
+        ) from e
 
 # Policy callback (policy_fn).
 # Path strings absent (issue #27 — path-based control belongs in Landlock).
@@ -125,10 +180,20 @@ class _CEvent(ctypes.Structure):
     ]
 
 _c_ctx_p = ctypes.c_void_p
-_POLICY_FN_TYPE = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.POINTER(_CEvent), _c_ctx_p)
+_POLICY_FN_TYPE = ctypes.CFUNCTYPE(
+    ctypes.c_int32,
+    ctypes.POINTER(_CEvent),
+    _c_ctx_p,
+    ctypes.c_void_p,
+)
 
 _lib.sandlock_sandbox_builder_policy_fn.restype = _c_builder_p
-_lib.sandlock_sandbox_builder_policy_fn.argtypes = [_c_builder_p, _POLICY_FN_TYPE]
+_lib.sandlock_sandbox_builder_policy_fn.argtypes = [
+    _c_builder_p,
+    _POLICY_FN_TYPE,
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+]
 
 _lib.sandlock_ctx_restrict_network.restype = None
 _lib.sandlock_ctx_restrict_network.argtypes = [_c_ctx_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint32]
@@ -479,6 +544,9 @@ _lib.sandlock_handler_new.argtypes = [
 
 _lib.sandlock_handler_free.restype = None
 _lib.sandlock_handler_free.argtypes = [_c_handler_p]
+
+_lib.sandlock_handler_set_deferred.restype = None
+_lib.sandlock_handler_set_deferred.argtypes = [_c_handler_p, ctypes.c_bool]
 
 _lib.sandlock_run_with_handlers.restype = _c_result_p
 _lib.sandlock_run_with_handlers.argtypes = [
@@ -895,13 +963,15 @@ class _NativePolicy:
         "workdir", "cwd", "chroot", "fs_mount", "on_exit", "on_error",
         "max_memory", "max_disk", "max_processes", "max_cpu", "num_cpus",
         "cpu_cores", "gpu_devices",
-        "net_allow", "net_bind",
+        "net_allow", "net_deny", "net_allow_bind", "net_deny_bind",
         "port_remap",
         "http_allow", "http_deny", "http_ports", "http_ca", "http_key",
         "uid",
         "random_seed", "time_start", "clean_env", "env",
         "extra_deny_syscalls", "extra_allow_syscalls", "max_open_files",
         "no_randomize_memory", "no_huge_pages", "no_coredump", "deterministic_dirs",
+        # Landlock protection opt-out (see Protection IntEnum):
+        "allow_degraded", "disable",
         # Managed outside _build_from_policy:
         "notif_policy",
         # Runtime-only kwargs — not sent to FFI:
@@ -973,12 +1043,17 @@ class _NativePolicy:
 
         # net_allow: list of endpoint specs. Bare `host:port` means TCP;
         # `tcp://`/`udp://`/`icmp://` schemes opt other protocols in.
-        # Empty = deny all outbound. Validation of each spec happens in
-        # the native build().
+        # Empty = deny all outbound. net_deny is the inverse (default-allow
+        # denylist of IP/CIDR/port specs); the two are mutually exclusive.
+        # Validation of each spec happens in the native build().
         for spec in (policy.net_allow or []):
             b = _b_net_allow(b, _encode(str(spec)))
-        for port in parse_ports(policy.net_bind) if policy.net_bind else []:
-            b = _b_net_bind_port(b, port)
+        for spec in (policy.net_deny or []):
+            b = _b_net_deny(b, _encode(str(spec)))
+        for port in parse_ports(policy.net_allow_bind) if policy.net_allow_bind else []:
+            b = _b_net_allow_bind_port(b, port)
+        for port in parse_ports(policy.net_deny_bind) if policy.net_deny_bind else []:
+            b = _b_net_deny_bind_port(b, port)
 
         for rule in (policy.http_allow or []):
             b = _b_http_allow(b, _encode(str(rule)))
@@ -990,6 +1065,10 @@ class _NativePolicy:
             b = _b_http_ca(b, _encode(str(policy.http_ca)))
         if policy.http_key:
             b = _b_http_key(b, _encode(str(policy.http_key)))
+        for path in (policy.http_inject_ca or []):
+            b = _b_http_inject_ca(b, _encode(str(path)))
+        if policy.http_ca_out:
+            b = _b_http_ca_out(b, _encode(str(policy.http_ca_out)))
 
         if policy.port_remap:
             b = _b_port_remap(b, True)
@@ -1022,6 +1101,17 @@ class _NativePolicy:
             b = _b_no_coredump(b, True)
         if policy.deterministic_dirs:
             b = _b_deterministic_dirs(b, True)
+
+        # Landlock protection opt-out. The C ABI setters use move-semantics
+        # and return the (possibly relocated) builder pointer — mirror that
+        # by rebinding `b` on each call. Idempotent / last-wins: if the
+        # same Protection appears in both lists, the later call wins
+        # (matching the underlying `ProtectionPolicy::set` semantics).
+        for p in (policy.allow_degraded or ()):
+            b = _b_allow_degraded(b, _validate_protection(p, field="allow_degraded"))
+        for p in (policy.disable or ()):
+            b = _b_disable(b, _validate_protection(p, field="disable"))
+
         # Guard: warn if any dataclass field was set to a non-default value
         # but is not in _HANDLED_FIELDS (i.e. silently dropped).
         import dataclasses as _dc
@@ -1050,7 +1140,7 @@ class _NativePolicy:
         # Store callback reference to prevent GC
         c_callback = None
         if policy_fn is not None:
-            def _c_callback(event_p, ctx_p):
+            def _c_callback(event_p, ctx_p, _user_data):
                 ev = event_p.contents
                 py_argv = None
                 if ev.argv and ev.argc > 0:
@@ -1086,10 +1176,12 @@ class _NativePolicy:
                     return -2
                 if isinstance(result, int) and result > 0:
                     return result
-                return 0
+                # Unrecognized return values fail closed (deny) rather than
+                # silently allowing the syscall.
+                return -1
 
             c_callback = _POLICY_FN_TYPE(_c_callback)
-            b = _lib.sandlock_sandbox_builder_policy_fn(b, c_callback)
+            b = _lib.sandlock_sandbox_builder_policy_fn(b, c_callback, None, None)
 
         err = ctypes.c_int(0)
         err_msg = ctypes.c_char_p()

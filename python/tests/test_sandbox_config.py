@@ -76,7 +76,7 @@ class TestPolicy:
         assert p.fs_denied == []
         assert p.extra_deny_syscalls == []
         assert p.extra_allow_syscalls == []
-        assert p.net_bind == []
+        assert p.net_allow_bind == []
         assert p.net_allow == []
         assert p.max_memory is None
         assert p.max_processes == 64
@@ -147,6 +147,16 @@ class TestParsePorts:
     def test_mixed(self):
         assert parse_ports([80, "443", "8000-8002"]) == [80, 443, 8000, 8001, 8002]
 
+    def test_comma_in_string(self):
+        # A string element may hold a comma list / ranges, matching the CLI's
+        # --net-allow-bind grammar.
+        assert parse_ports(["8080,9090"]) == [8080, 9090]
+        assert parse_ports(["8080,9000-9002", 443]) == [443, 8080, 9000, 9001, 9002]
+
+    def test_comma_empty_part_rejected(self):
+        with pytest.raises(ValueError):
+            parse_ports(["8080,"])
+
     def test_dedup(self):
         assert parse_ports([80, "80", "79-81"]) == [79, 80, 81]
 
@@ -168,7 +178,7 @@ class TestParsePorts:
 
 class TestNetPolicy:
     def test_bind_ports(self):
-        p = Sandbox(net_bind=[80, "443", "8000-8002"])
+        p = Sandbox(net_allow_bind=[80, "443", "8000-8002"])
         assert p.bind_ports() == [80, 443, 8000, 8001, 8002]
 
     def test_unrestricted_by_default(self):
@@ -237,4 +247,16 @@ class TestNetAllow:
             "github.com:22,443",
             ":8080",
         ]
+
+
+class TestNetDeny:
+    """Endpoint denylist semantics for `net_deny` (default-allow, inverse of
+    `net_allow`, mutually exclusive with it). Targets are literal IP/CIDR."""
+
+    def test_default_is_empty(self):
+        assert Sandbox().net_deny == []
+
+    def test_specs_preserved_as_strings(self):
+        p = Sandbox(net_deny=["10.0.0.0/8", "169.254.169.254:80", "udp://*"])
+        assert list(p.net_deny) == ["10.0.0.0/8", "169.254.169.254:80", "udp://*"]
 

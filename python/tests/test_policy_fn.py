@@ -206,6 +206,16 @@ class TestPolicyFnVerdict:
         )
         assert result.success, "audit should allow the syscall"
 
+    def test_unrecognized_return_fails_closed(self):
+        """An unrecognized return value denies rather than silently allowing."""
+        def on_event(event, ctx):
+            if event.syscall in ("execve", "execveat"):
+                return "bogus"  # not a recognized verdict
+            return 0
+
+        result = _policy(policy_fn=on_event).run(["echo", "should-not-run"])
+        assert not result.success, "unrecognized verdict must fail closed (deny)"
+
     def test_deny_returns_true(self):
         """Return True to deny with EPERM (backward compat)."""
         def on_event(event, ctx):

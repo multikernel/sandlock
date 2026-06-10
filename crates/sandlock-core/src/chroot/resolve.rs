@@ -40,8 +40,8 @@ pub fn to_virtual_path(chroot_root: &Path, host_path: &Path) -> Option<PathBuf> 
 // openat2(RESOLVE_IN_ROOT) based resolution
 // ============================================================
 
-/// openat2 syscall number (same on x86_64 and aarch64).
-const SYS_OPENAT2: libc::c_long = 437;
+/// openat2 syscall number, sourced from the `syscalls` crate via `arch`.
+const SYS_OPENAT2: libc::c_long = crate::arch::SYS_OPENAT2;
 
 /// RESOLVE_IN_ROOT — treat the dirfd as the filesystem root for resolution.
 const RESOLVE_IN_ROOT: u64 = 0x10;
@@ -184,11 +184,101 @@ pub fn resolve_existing_in_root(chroot_root: &Path, child_path: &str) -> Option<
     }
 }
 
+/// Resolve the configured chroot root to a canonical, on-disk path.
+///
+/// `None` chroot yields `Ok(None)`. A configured chroot path that cannot be
+/// canonicalized (missing or inaccessible) is a hard error: silently dropping
+/// it would disable the seccomp-notify chroot mediation without telling the
+/// caller, leaving the workload effectively unconfined.
+pub fn resolve_chroot_root(
+    chroot: Option<&Path>,
+) -> Result<Option<PathBuf>, crate::error::SandboxError> {
+    match chroot {
+        Some(p) => match std::fs::canonicalize(p) {
+            Ok(resolved) => Ok(Some(resolved)),
+            Err(source) => Err(crate::error::SandboxError::ChrootNotFound {
+                path: p.to_path_buf(),
+                source,
+            }),
+        },
+        None => Ok(None),
+    }
+}
+
+/// Canonicalize the host source of each bind mount, preserving the virtual
+/// destination unchanged.
+///
+/// A host path that cannot be canonicalized falls back to the path as given:
+/// unlike the chroot root (which gates confinement), a mount source may be
+/// created later or resolved relative to another mount, so a missing source is
+/// not treated as fatal here.
+pub fn resolve_chroot_mounts(mounts: &[(PathBuf, PathBuf)]) -> Vec<(PathBuf, PathBuf)> {
+    mounts
+        .iter()
+        .map(|(virtual_path, host_path)| {
+            (
+                virtual_path.clone(),
+                std::fs::canonicalize(host_path).unwrap_or_else(|_| host_path.clone()),
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
+
+    #[test]
+    fn resolve_chroot_root_none_is_ok_none() {
+        assert!(resolve_chroot_root(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_chroot_root_existing_canonicalizes() {
+        // /tmp exists on every supported target.
+        let resolved = resolve_chroot_root(Some(Path::new("/tmp")))
+            .unwrap()
+            .expect("an existing chroot path should resolve to Some");
+        assert!(resolved.is_absolute());
+    }
+
+    #[test]
+    fn resolve_chroot_root_missing_path_errors() {
+        // A configured chroot that does not exist must error rather than
+        // silently disabling confinement. Regression: the old
+        // `canonicalize(p).ok()` swallowed this into `None`, turning off the
+        // seccomp-notify chroot mediation without telling the caller.
+        let err = resolve_chroot_root(Some(Path::new(
+            "/nonexistent/sandlock/rootfs/does-not-exist",
+        )))
+        .unwrap_err();
+        assert!(
+            matches!(err, crate::error::SandboxError::ChrootNotFound { .. }),
+            "expected ChrootNotFound, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_chroot_mounts_canonicalizes_existing_and_falls_back_on_missing() {
+        let dir = TempDir::new().unwrap();
+        let existing = dir.path().join("src");
+        std::fs::create_dir(&existing).unwrap();
+        let missing = PathBuf::from("/nonexistent/sandlock/mount-src");
+
+        let resolved = resolve_chroot_mounts(&[
+            (PathBuf::from("/data"), existing.clone()),
+            (PathBuf::from("/cache"), missing.clone()),
+        ]);
+
+        // Virtual destinations are preserved verbatim.
+        assert_eq!(resolved[0].0, PathBuf::from("/data"));
+        assert_eq!(resolved[1].0, PathBuf::from("/cache"));
+        // Existing source is canonicalized; missing source falls back as-is.
+        assert_eq!(resolved[0].1, existing.canonicalize().unwrap());
+        assert_eq!(resolved[1].1, missing);
+    }
 
     #[test]
     fn test_confine_absolute() {

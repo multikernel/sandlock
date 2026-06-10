@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,317 @@ use crate::sys::structs::{SeccompNotif, AF_INET, AF_INET6, ECONNREFUSED};
 /// Maximum buffer size for sendto/sendmsg on-behalf operations (64 MiB).
 /// Prevents a sandboxed process from triggering OOM in the supervisor.
 const MAX_SEND_BUF: usize = 64 << 20;
+
+/// An IPv4 or IPv6 address with a prefix length, used by `--net-deny`
+/// to match destination IPs by exact address (`/32`, `/128`) or by range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpCidr {
+    pub addr: IpAddr,
+    pub prefix_len: u8,
+}
+
+impl IpCidr {
+    /// Parse `addr` or `addr/prefix`. A bare address becomes a host route
+    /// (`/32` for IPv4, `/128` for IPv6). Hostnames are rejected: the
+    /// address part must parse as a literal IP.
+    pub fn parse(s: &str) -> Result<Self, SandboxError> {
+        let (addr_str, prefix) = match s.split_once('/') {
+            Some((a, p)) => {
+                let len: u8 = p.parse().map_err(|_| {
+                    SandboxError::Invalid(format!("invalid prefix length in `{}`", s))
+                })?;
+                (a, Some(len))
+            }
+            None => (s, None),
+        };
+        let addr: IpAddr = addr_str.parse().map_err(|_| {
+            SandboxError::Invalid(format!("`{}` is not a valid IP address", s))
+        })?;
+        let max = match addr {
+            IpAddr::V4(_) => 32u8,
+            IpAddr::V6(_) => 128u8,
+        };
+        let prefix_len = prefix.unwrap_or(max);
+        if prefix_len > max {
+            return Err(SandboxError::Invalid(format!(
+                "prefix /{} too large for {} in `{}`",
+                prefix_len,
+                if max == 32 { "IPv4" } else { "IPv6" },
+                s
+            )));
+        }
+        Ok(IpCidr { addr, prefix_len })
+    }
+
+    /// True iff this CIDR is a single host (`/32` IPv4 or `/128` IPv6),
+    /// i.e. it came from a bare IP literal rather than a range.
+    pub fn is_single_host(&self) -> bool {
+        match self.addr {
+            IpAddr::V4(_) => self.prefix_len == 32,
+            IpAddr::V6(_) => self.prefix_len == 128,
+        }
+    }
+
+    /// True iff `ip` falls within this network. Different address
+    /// families never match.
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self.addr, ip) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                if self.prefix_len == 0 {
+                    return true;
+                }
+                let mask = u32::MAX << (32 - self.prefix_len);
+                (u32::from(net) & mask) == (u32::from(ip) & mask)
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                if self.prefix_len == 0 {
+                    return true;
+                }
+                let mask = u128::MAX << (128 - self.prefix_len);
+                (u128::from(net) & mask) == (u128::from(ip) & mask)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Display for IpCidr {
+    /// A single host renders as the bare address (`1.2.3.4`, `::1`); a
+    /// range keeps its prefix (`10.0.0.0/8`). Inverse of [`IpCidr::parse`].
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_single_host() {
+            write!(f, "{}", self.addr)
+        } else {
+            write!(f, "{}/{}", self.addr, self.prefix_len)
+        }
+    }
+}
+
+/// What a `--net-allow` / `--net-deny` rule targets at the IP layer.
+///
+/// `Cidr` covers both a bare IP literal (stored as a `/32` or `/128`) and
+/// an explicit CIDR range. `Host` is a hostname resolved via DNS at sandbox
+/// start; it is only produced for `--net-allow` (deny rejects hostnames).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NetTarget {
+    /// Any destination IP (the `:port` / `*:port` / `*` form).
+    AnyIp,
+    /// A literal IP or CIDR range. Matched by containment, no DNS.
+    Cidr(IpCidr),
+    /// A hostname, resolved to IPs at sandbox start (allow-only).
+    Host(String),
+}
+
+/// A single `--net-allow` / `--net-deny` rule. Both flags share this
+/// representation and the same grammar; they differ only in whether
+/// hostnames are accepted (`--net-deny` rejects them) and in how the
+/// resolved rule is enforced (allowlist vs denylist).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NetRule {
+    /// L4 protocol this rule applies to.
+    #[serde(default = "default_protocol_tcp")]
+    pub protocol: Protocol,
+    /// What the rule targets at the IP layer.
+    pub target: NetTarget,
+    /// Permitted/denied ports. Empty when `all_ports` is true and always
+    /// empty for `Protocol::Icmp`.
+    pub ports: Vec<u16>,
+    /// "Any port" (bare target with no `:port`, or the `*` port token).
+    #[serde(default)]
+    pub all_ports: bool,
+}
+
+/// `--net-allow` and `--net-deny` rules are the same shape; the aliases
+/// document intent at call sites and field declarations.
+pub type NetAllow = NetRule;
+pub type NetDeny = NetRule;
+
+fn default_protocol_tcp() -> Protocol {
+    Protocol::Tcp
+}
+
+impl NetRule {
+    /// Parse a `--net-allow` spec into a rule. Hostnames are accepted and
+    /// resolved to IPs at sandbox start. Grammar (shared with `--net-deny`):
+    ///
+    /// - `host` / `<ip>` / `<cidr>` / `*` -- all ports (port optional; `*`
+    ///   targets any IP). TCP is the default scheme.
+    /// - `host:<port[,port,...]>` / `<ip>:<port>` / `<cidr>:*` / `:port`.
+    /// - `[<ipv6|ipv6cidr>]:<port>` -- bracketed IPv6 with a port (a bare
+    ///   `addr:port` string is itself a valid IPv6 address, so the port
+    ///   form needs brackets).
+    /// - `tcp://...` / `udp://...` / `icmp://...` schemes (icmp: no port).
+    pub fn parse_allow(spec: &str) -> Result<NetRule, SandboxError> {
+        Self::parse_spec(spec, "--net-allow", true)
+    }
+
+    /// Parse a `--net-deny` spec into a rule. Identical grammar to
+    /// [`parse_allow`](Self::parse_allow), except hostnames are rejected
+    /// (the target must be a literal IP/CIDR or `*`); use `--http-deny`
+    /// for domain blocking.
+    pub fn parse_deny(spec: &str) -> Result<NetDeny, SandboxError> {
+        Self::parse_spec(spec, "--net-deny", false)
+    }
+
+    /// Shared grammar for both flags. `label` selects the error prefix and
+    /// `allow_hosts` whether non-IP targets are accepted (allow) or
+    /// rejected (deny).
+    fn parse_spec(spec: &str, label: &str, allow_hosts: bool) -> Result<NetRule, SandboxError> {
+        let (protocol, rest) = match spec.split_once("://") {
+            Some((scheme, body)) => {
+                let proto = Protocol::parse(scheme).ok_or_else(|| {
+                    SandboxError::Invalid(format!(
+                        "{}: unknown scheme `{}://` in `{}` (expected tcp, udp, icmp)",
+                        label, scheme, spec
+                    ))
+                })?;
+                (proto, body)
+            }
+            None => (Protocol::Tcp, spec),
+        };
+
+        // ICMP carries no port: the whole body is the target.
+        if protocol == Protocol::Icmp {
+            if rest.is_empty() {
+                return Err(SandboxError::Invalid(format!(
+                    "{}: icmp rule needs a host/IP or `*`, got `{}`",
+                    label, spec
+                )));
+            }
+            // Reject an explicit port. IPv6 literals/CIDRs also contain
+            // `:`, so only flag a `:` that isn't part of a valid IP/CIDR.
+            if rest != "*" && IpCidr::parse(rest).is_err() && rest.contains(':') {
+                return Err(SandboxError::Invalid(format!(
+                    "{}: icmp rule takes no port, got `{}`",
+                    label, spec
+                )));
+            }
+            return Ok(NetRule {
+                protocol,
+                target: parse_target(rest, label, allow_hosts)?,
+                ports: Vec::new(),
+                all_ports: true,
+            });
+        }
+
+        // 1. Bracketed IPv6 with a port: `[addr]:ports`.
+        if let Some(stripped) = rest.strip_prefix('[') {
+            let (inside, port_part) = stripped.rsplit_once("]:").ok_or_else(|| {
+                SandboxError::Invalid(format!("{}: malformed bracketed address in `{}`", label, spec))
+            })?;
+            let (ports, all_ports) = parse_ports(port_part, label, spec)?;
+            return Ok(NetRule {
+                protocol,
+                target: NetTarget::Cidr(IpCidr::parse(inside)?),
+                ports,
+                all_ports,
+            });
+        }
+
+        // An empty body must not silently mean "everything"; require an
+        // explicit `*` for the any-IP target.
+        if rest.is_empty() {
+            return Err(SandboxError::Invalid(format!(
+                "{}: empty rule in `{}` (use `*` for any host)",
+                label, spec
+            )));
+        }
+
+        // 2. Whole body is an IP/CIDR with no port -> all ports. Trying
+        //    `IpCidr::parse` first is what makes bare IPv6 (`::1`) and IPv6
+        //    CIDRs (`fc00::/7`) work despite containing colons.
+        if let Ok(cidr) = IpCidr::parse(rest) {
+            return Ok(NetRule {
+                protocol,
+                target: NetTarget::Cidr(cidr),
+                ports: Vec::new(),
+                all_ports: true,
+            });
+        }
+
+        // 3. `target[:ports]` where target is an IP/CIDR, hostname, `*`, or
+        //    empty. The port suffix is optional: a target with no `:port`
+        //    covers all ports, mirroring the bare-target form above.
+        let (host_part, port_part) = match rest.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (rest, None),
+        };
+        let target = parse_target(host_part, label, allow_hosts)?;
+        let (ports, all_ports) = match port_part {
+            Some(p) => parse_ports(p, label, spec)?,
+            None => (Vec::new(), true),
+        };
+        Ok(NetRule {
+            protocol,
+            target,
+            ports,
+            all_ports,
+        })
+    }
+}
+
+/// Parse a rule target: `*` / empty -> any IP, an IP/CIDR literal ->
+/// `Cidr`, otherwise a hostname (`Host`) when `allow_hosts`, else an error.
+fn parse_target(s: &str, label: &str, allow_hosts: bool) -> Result<NetTarget, SandboxError> {
+    match s {
+        "" | "*" => Ok(NetTarget::AnyIp),
+        // A `/` signals CIDR intent: parse strictly so a bad prefix is a
+        // clear error rather than being misread as a hostname.
+        _ if s.contains('/') => Ok(NetTarget::Cidr(
+            IpCidr::parse(s).map_err(|e| SandboxError::Invalid(format!("{}: {}", label, e)))?,
+        )),
+        _ => {
+            if let Ok(cidr) = IpCidr::parse(s) {
+                Ok(NetTarget::Cidr(cidr))
+            } else if allow_hosts {
+                Ok(NetTarget::Host(s.to_string()))
+            } else {
+                Err(SandboxError::Invalid(format!(
+                    "{}: `{}` is not an IP or CIDR (hostnames are not allowed; \
+                     use --http-deny for domains)",
+                    label, s
+                )))
+            }
+        }
+    }
+}
+
+/// Parse a port suffix. `*` means all ports; mixing `*` with concrete
+/// ports, port 0, and an empty list are all rejected.
+fn parse_ports(s: &str, label: &str, full: &str) -> Result<(Vec<u16>, bool), SandboxError> {
+    let mut ports = Vec::new();
+    let mut saw_wildcard = false;
+    for p in s.split(',') {
+        let p = p.trim();
+        if p == "*" {
+            saw_wildcard = true;
+            continue;
+        }
+        let n: u16 = p.parse().map_err(|_| {
+            SandboxError::Invalid(format!("{}: invalid port `{}` in `{}`", label, p, full))
+        })?;
+        if n == 0 {
+            return Err(SandboxError::Invalid(format!(
+                "{}: port 0 is not valid in `{}`",
+                label, full
+            )));
+        }
+        ports.push(n);
+    }
+    if saw_wildcard && !ports.is_empty() {
+        return Err(SandboxError::Invalid(format!(
+            "{}: cannot mix `*` with concrete ports in `{}`",
+            label, full
+        )));
+    }
+    if !saw_wildcard && ports.is_empty() {
+        return Err(SandboxError::Invalid(format!(
+            "{}: at least one port required in `{}`",
+            label, full
+        )));
+    }
+    Ok((ports, saw_wildcard))
+}
 
 /// L4 protocol that a `NetAllow` rule applies to.
 ///
@@ -50,149 +361,6 @@ impl Protocol {
             "icmp" => Some(Protocol::Icmp),
             _ => None,
         }
-    }
-}
-
-/// A network endpoint allow rule.
-///
-/// Each rule permits one protocol's traffic to one host (or any IP, for
-/// the `:port` form) on a specific set of ports. Multiple rules are
-/// OR'd: traffic is permitted if any rule matches the protocol, the
-/// destination IP, and the destination port.
-///
-/// ICMP rules carry no port (ICMP has none); their `ports` is empty
-/// and `all_ports` is false.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct NetAllow {
-    /// L4 protocol this rule applies to.
-    #[serde(default = "default_protocol_tcp")]
-    pub protocol: Protocol,
-    /// Hostname; `None` means "any IP" (the `:port` form, or `icmp://*`).
-    pub host: Option<String>,
-    /// Permitted ports. Must be non-empty unless `all_ports` is true,
-    /// in which case it must be empty. Always empty for `Protocol::Icmp`.
-    pub ports: Vec<u16>,
-    /// "Any port" wildcard from the `*` token in port position. When
-    /// true, `ports` is empty; the rule permits every TCP/UDP port to
-    /// the host (or to any IP, when `host` is `None`).
-    #[serde(default)]
-    pub all_ports: bool,
-}
-
-fn default_protocol_tcp() -> Protocol {
-    Protocol::Tcp
-}
-
-impl NetAllow {
-    /// Parse a rule spec. Forms:
-    ///
-    /// - `host:port[,port,...]`, `:port`, `*:port`, `host:*`, `:*`, `*:*`
-    ///   — TCP (the default scheme).
-    /// - `tcp://...` — explicit TCP, same suffix grammar as the bare form.
-    /// - `udp://...` — UDP, same suffix grammar as the bare form.
-    /// - `icmp://host` or `icmp://*` — ICMP echo (kernel ping socket).
-    ///   No port field; `icmp://host:80` is rejected.
-    ///
-    /// `*` in port position means "any port" (the all-ports wildcard).
-    /// Mixing `*` with concrete ports (e.g. `host:80,*`) is rejected.
-    pub fn parse(s: &str) -> Result<Self, SandboxError> {
-        // Split off the optional scheme prefix `<proto>://`. If absent,
-        // default to TCP and the rest of the parser is unchanged.
-        let (protocol, rest) = match s.split_once("://") {
-            Some((scheme, body)) => {
-                let proto = Protocol::parse(scheme).ok_or_else(|| {
-                    SandboxError::Invalid(format!(
-                        "--net-allow: unknown scheme `{}://` in `{}` (expected tcp, udp, icmp)",
-                        scheme, s
-                    ))
-                })?;
-                (proto, body)
-            }
-            None => (Protocol::Tcp, s),
-        };
-
-        if protocol == Protocol::Icmp {
-            return Self::parse_icmp(rest, s);
-        }
-
-        let (host_part, port_part) = rest.rsplit_once(':').ok_or_else(|| {
-            SandboxError::Invalid(format!(
-                "--net-allow: expected `host:port` or `:port`, got `{}`",
-                s
-            ))
-        })?;
-        let host = match host_part {
-            "" | "*" => None,
-            h => Some(h.to_string()),
-        };
-
-        // Detect the wildcard token. We split on ',' first so a
-        // single `*` is a clean match — `*,80` is rejected explicitly
-        // below rather than letting `*` parse as port 0.
-        let mut ports = Vec::new();
-        let mut saw_wildcard = false;
-        for p in port_part.split(',') {
-            let p = p.trim();
-            if p == "*" {
-                saw_wildcard = true;
-                continue;
-            }
-            let n: u16 = p.parse().map_err(|_| {
-                SandboxError::Invalid(format!("--net-allow: invalid port `{}` in `{}`", p, s))
-            })?;
-            if n == 0 {
-                return Err(SandboxError::Invalid(format!(
-                    "--net-allow: port 0 is not valid in `{}`",
-                    s
-                )));
-            }
-            ports.push(n);
-        }
-        if saw_wildcard && !ports.is_empty() {
-            return Err(SandboxError::Invalid(format!(
-                "--net-allow: cannot mix `*` with concrete ports in `{}`",
-                s
-            )));
-        }
-        if !saw_wildcard && ports.is_empty() {
-            return Err(SandboxError::Invalid(format!(
-                "--net-allow: at least one port required in `{}`",
-                s
-            )));
-        }
-        Ok(NetAllow {
-            protocol,
-            host,
-            ports,
-            all_ports: saw_wildcard,
-        })
-    }
-
-    /// Parse the body of an `icmp://` rule. Accepts a host or `*` —
-    /// ICMP has no ports, so any `:` separator is rejected.
-    fn parse_icmp(body: &str, full: &str) -> Result<Self, SandboxError> {
-        if body.contains(':') {
-            return Err(SandboxError::Invalid(format!(
-                "--net-allow: icmp rules take no port, got `{}`",
-                full
-            )));
-        }
-        if body.is_empty() {
-            return Err(SandboxError::Invalid(format!(
-                "--net-allow: icmp rule needs a host or `*`, got `{}`",
-                full
-            )));
-        }
-        let host = match body {
-            "*" => None,
-            h => Some(h.to_string()),
-        };
-        Ok(NetAllow {
-            protocol: Protocol::Icmp,
-            host,
-            ports: Vec::new(),
-            all_ports: false,
-        })
     }
 }
 
@@ -265,7 +433,7 @@ fn set_port_in_sockaddr(bytes: &mut [u8], port: u16) {
 /// Returns `None` for protocols sandlock does not gate via `net_allow`
 /// (raw, SCTP, etc.) — the handler treats those as "no rule applies"
 /// which collapses to the default-deny path.
-fn query_socket_protocol(fd: RawFd) -> Option<Protocol> {
+pub(crate) fn query_socket_protocol(fd: RawFd) -> Option<Protocol> {
     let mut proto: libc::c_int = 0;
     let mut len: libc::socklen_t = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
     let rc = unsafe {
@@ -540,9 +708,356 @@ async fn connect_on_behalf(
         }
         // dup_fd dropped here, closing supervisor's copy
     } else {
-        // Non-IP family (AF_UNIX etc.) — allow through
-        NotifAction::Continue
+        // Non-IP family. A NAMED (pathname) AF_UNIX connect is a gap Landlock
+        // cannot close (it has no access right for unix-socket connect), so a
+        // netns-less sandbox could reach a host service socket and escape.
+        // Connecting is a WRITE on the socket inode (kernel: unix_find_other ->
+        // path_permission(MAY_WRITE)), so require the path to be covered by an
+        // fs-write grant, mirroring the kernel's own DAC; otherwise deny with
+        // EACCES. The decision is made on `addr_bytes` (our immune copy) and we
+        // never return Continue on the deny path, so it is TOCTOU-safe.
+        // Abstract sockets (no path) are handled by the Landlock abstract scope.
+        match named_unix_socket_path(&addr_bytes) {
+            Some(path) if ctx.policy.has_unix_fs_gate => {
+                if ctx.policy.chroot_root.is_some() {
+                    // Chroot mode: the child's paths are virtual, so a lexical
+                    // check against the (virtual) write grants is consistent,
+                    // and host socket paths are absent from the chroot view
+                    // anyway. Deny unless under a write grant.
+                    if path_under_any(&path, &ctx.policy.chroot_writable) {
+                        NotifAction::Continue
+                    } else {
+                        NotifAction::Errno(libc::EACCES)
+                    }
+                } else {
+                    // Non-chroot: resolve the symlink-followed real target and
+                    // connect on-behalf to the pinned inode, so a symlink inside
+                    // a granted dir cannot redirect to an ungranted socket.
+                    connect_named_unix_on_behalf(
+                        notif.pid,
+                        sockfd,
+                        &path,
+                        &ctx.policy.chroot_writable,
+                    )
+                }
+            }
+            // Abstract/unnamed socket, non-AF_UNIX family, or gate disabled.
+            _ => NotifAction::Continue,
+        }
     }
+}
+
+/// Resolve a named unix socket `sun_path` to its real, symlink-followed inode
+/// in the child's root view (`/proc/<pid>/root`) and verify that inode is under
+/// an fs-write grant. On success returns a pinned `O_PATH` fd to that exact
+/// inode; on failure returns the deny/refuse `NotifAction`. Callers must
+/// operate on the pinned fd via `/proc/self/fd` so the checked inode is the one
+/// acted on, immune to a path swap after the check (TOCTOU- and symlink-safe).
+fn resolve_named_unix_target(
+    child_pid: u32,
+    sun_path: &std::path::Path,
+    writable: &[std::path::PathBuf],
+) -> Result<OwnedFd, NotifAction> {
+    // Resolve in the child's mount/root view so its symlinks (not ours) decide
+    // the target. `O_PATH` follows symlinks to the real socket inode and pins
+    // it without performing any I/O on the socket.
+    let proc_path = format!("/proc/{}/root{}", child_pid, sun_path.display());
+    let c_proc = std::ffi::CString::new(proc_path)
+        .map_err(|_| NotifAction::Errno(libc::EACCES))?;
+    let pinned_raw = unsafe { libc::open(c_proc.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    if pinned_raw < 0 {
+        // Target missing or unreachable: refuse without leaking the reason.
+        return Err(NotifAction::Errno(ECONNREFUSED));
+    }
+    let pinned = unsafe { OwnedFd::from_raw_fd(pinned_raw) };
+
+    // Canonical path of the pinned inode in our mount namespace.
+    let real = std::fs::read_link(format!("/proc/self/fd/{}", pinned.as_raw_fd()))
+        .map_err(|_| NotifAction::Errno(libc::EACCES))?;
+    if real_path_under_any(&real, writable) {
+        Ok(pinned)
+    } else {
+        Err(NotifAction::Errno(libc::EACCES))
+    }
+}
+
+/// Build a `sockaddr_un` addressing `/proc/self/fd/<fd>`. The kernel resolves
+/// it to the exact pinned inode, so connecting/sending to it targets the inode
+/// we validated rather than re-resolving a path string. Returns `None` only if
+/// the rendered path would overflow `sun_path` (never, in practice).
+fn proc_self_fd_sockaddr(fd: RawFd) -> Option<(libc::sockaddr_un, libc::socklen_t)> {
+    let path = format!("/proc/self/fd/{}", fd);
+    let bytes = path.as_bytes();
+    let mut sun: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.len() >= sun.sun_path.len() {
+        return None;
+    }
+    sun.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (i, &b) in bytes.iter().enumerate() {
+        sun.sun_path[i] = b as libc::c_char;
+    }
+    let len = (std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1) as libc::socklen_t;
+    Some((sun, len))
+}
+
+/// On-behalf `connect()` for a NAMED `AF_UNIX` socket in non-chroot mode:
+/// resolve+verify the target, then connect the child's socket to the pinned
+/// inode through `/proc/self/fd`.
+fn connect_named_unix_on_behalf(
+    child_pid: u32,
+    sockfd: i32,
+    sun_path: &std::path::Path,
+    writable: &[std::path::PathBuf],
+) -> NotifAction {
+    let pinned = match resolve_named_unix_target(child_pid, sun_path, writable) {
+        Ok(fd) => fd,
+        Err(action) => return action,
+    };
+    let (sun, len) = match proc_self_fd_sockaddr(pinned.as_raw_fd()) {
+        Some(s) => s,
+        None => return NotifAction::Errno(libc::ENAMETOOLONG),
+    };
+    let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(child_pid, sockfd) {
+        Ok(fd) => fd,
+        Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
+    };
+    let ret = unsafe {
+        libc::connect(
+            dup_fd.as_raw_fd(),
+            &sun as *const libc::sockaddr_un as *const libc::sockaddr,
+            len,
+        )
+    };
+    if ret == 0 {
+        NotifAction::ReturnValue(0)
+    } else {
+        NotifAction::Errno(unsafe { *libc::__errno_location() })
+    }
+}
+
+/// On-behalf `sendto()` for a NAMED `AF_UNIX` datagram in non-chroot mode:
+/// resolve+verify the target, copy the child's data, then send to the pinned
+/// inode through `/proc/self/fd`.
+fn sendto_named_unix_on_behalf(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+    sockfd: i32,
+    buf_ptr: u64,
+    buf_len: usize,
+    flags: i32,
+    sun_path: &std::path::Path,
+    writable: &[std::path::PathBuf],
+) -> NotifAction {
+    let pinned = match resolve_named_unix_target(notif.pid, sun_path, writable) {
+        Ok(fd) => fd,
+        Err(action) => return action,
+    };
+    let (sun, len) = match proc_self_fd_sockaddr(pinned.as_raw_fd()) {
+        Some(s) => s,
+        None => return NotifAction::Errno(libc::ENAMETOOLONG),
+    };
+    let data = match read_child_mem(notif_fd, notif.id, notif.pid, buf_ptr, buf_len) {
+        Ok(b) => b,
+        Err(_) => return NotifAction::Errno(libc::EIO),
+    };
+    let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
+        Ok(fd) => fd,
+        Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
+    };
+    let ret = unsafe {
+        libc::sendto(
+            dup_fd.as_raw_fd(),
+            data.as_ptr() as *const libc::c_void,
+            data.len(),
+            flags,
+            &sun as *const libc::sockaddr_un as *const libc::sockaddr,
+            len,
+        )
+    };
+    if ret >= 0 {
+        NotifAction::ReturnValue(ret as i64)
+    } else {
+        NotifAction::Errno(unsafe { *libc::__errno_location() })
+    }
+}
+
+/// True if `real` (an already-canonical path) is at or under any of `prefixes`,
+/// canonicalizing each prefix so a symlinked grant path still matches.
+fn real_path_under_any(real: &std::path::Path, prefixes: &[std::path::PathBuf]) -> bool {
+    prefixes.iter().any(|p| {
+        let canon = std::fs::canonicalize(p);
+        real.starts_with(canon.as_deref().unwrap_or(p))
+    })
+}
+
+/// Apply the named-unix fs gate to a `sendmsg()` whose `msg_name` may address a
+/// unix socket. Returns `Some(action)` when the target is a named `AF_UNIX`
+/// socket (handled here), or `None` to fall through to the IP path (connected
+/// socket, IP family, abstract socket, or an unreadable header).
+fn unix_sendmsg_gate(
+    notif: &SeccompNotif,
+    ctx: &Arc<SupervisorCtx>,
+    notif_fd: RawFd,
+    sockfd: i32,
+    msghdr_ptr: u64,
+    flags: i32,
+) -> Option<NotifAction> {
+    let msghdr_bytes = read_child_mem(notif_fd, notif.id, notif.pid, msghdr_ptr, 56).ok()?;
+    if msghdr_bytes.len() < 56 {
+        return None;
+    }
+    let msg_name_ptr = u64::from_ne_bytes(msghdr_bytes[0..8].try_into().unwrap());
+    if msg_name_ptr == 0 {
+        return None; // connected socket: no address to gate
+    }
+    let msg_namelen = u32::from_ne_bytes(msghdr_bytes[8..12].try_into().unwrap());
+    let addr_bytes =
+        read_child_mem(notif_fd, notif.id, notif.pid, msg_name_ptr, msg_namelen as usize).ok()?;
+    // None unless this is a NAMED AF_UNIX target; IP/abstract fall through.
+    let path = named_unix_socket_path(&addr_bytes)?;
+
+    if ctx.policy.chroot_root.is_some() {
+        return Some(if path_under_any(&path, &ctx.policy.chroot_writable) {
+            NotifAction::Continue
+        } else {
+            NotifAction::Errno(libc::EACCES)
+        });
+    }
+    Some(sendmsg_named_unix_on_behalf(
+        notif,
+        notif_fd,
+        sockfd,
+        msghdr_ptr,
+        flags,
+        &path,
+        &ctx.policy.chroot_writable,
+    ))
+}
+
+/// On-behalf `sendmsg()` for a NAMED `AF_UNIX` datagram in non-chroot mode:
+/// resolve+verify the target, copy the message's iovecs and control data, then
+/// send to the pinned inode through `/proc/self/fd`.
+fn sendmsg_named_unix_on_behalf(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+    sockfd: i32,
+    msghdr_ptr: u64,
+    flags: i32,
+    sun_path: &std::path::Path,
+    writable: &[std::path::PathBuf],
+) -> NotifAction {
+    let pinned = match resolve_named_unix_target(notif.pid, sun_path, writable) {
+        Ok(fd) => fd,
+        Err(action) => return action,
+    };
+    let (sun, sun_len) = match proc_self_fd_sockaddr(pinned.as_raw_fd()) {
+        Some(s) => s,
+        None => return NotifAction::Errno(libc::ENAMETOOLONG),
+    };
+
+    let msghdr_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, msghdr_ptr, 56) {
+        Ok(b) if b.len() >= 56 => b,
+        _ => return NotifAction::Errno(libc::EFAULT),
+    };
+    let msg_iov_ptr = u64::from_ne_bytes(msghdr_bytes[16..24].try_into().unwrap());
+    let msg_iovlen = u64::from_ne_bytes(msghdr_bytes[24..32].try_into().unwrap());
+    let msg_control_ptr = u64::from_ne_bytes(msghdr_bytes[32..40].try_into().unwrap());
+    let msg_controllen = u64::from_ne_bytes(msghdr_bytes[40..48].try_into().unwrap());
+
+    let iovlen = (msg_iovlen as usize).min(1024);
+    let iov_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, msg_iov_ptr, iovlen * 16) {
+        Ok(b) => b,
+        Err(_) => return NotifAction::Errno(libc::EIO),
+    };
+    let mut data_bufs: Vec<Vec<u8>> = Vec::with_capacity(iovlen);
+    for i in 0..iovlen {
+        let off = i * 16;
+        if off + 16 > iov_bytes.len() {
+            break;
+        }
+        let base = u64::from_ne_bytes(iov_bytes[off..off + 8].try_into().unwrap());
+        let len = u64::from_ne_bytes(iov_bytes[off + 8..off + 16].try_into().unwrap()) as usize;
+        if len > MAX_SEND_BUF {
+            return NotifAction::Errno(libc::EMSGSIZE);
+        }
+        if base == 0 || len == 0 {
+            data_bufs.push(Vec::new());
+            continue;
+        }
+        match read_child_mem(notif_fd, notif.id, notif.pid, base, len) {
+            Ok(b) => data_bufs.push(b),
+            Err(_) => return NotifAction::Errno(libc::EIO),
+        }
+    }
+    let mut local_iovs: Vec<libc::iovec> = data_bufs
+        .iter()
+        .map(|b| libc::iovec {
+            iov_base: b.as_ptr() as *mut libc::c_void,
+            iov_len: b.len(),
+        })
+        .collect();
+
+    let control_buf = if msg_control_ptr != 0 && msg_controllen > 0 {
+        let len = (msg_controllen as usize).min(4096);
+        read_child_mem(notif_fd, notif.id, notif.pid, msg_control_ptr, len).ok()
+    } else {
+        None
+    };
+
+    let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
+        Ok(fd) => fd,
+        Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
+    };
+
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_name = &sun as *const libc::sockaddr_un as *mut libc::c_void;
+    msg.msg_namelen = sun_len;
+    msg.msg_iov = local_iovs.as_mut_ptr();
+    msg.msg_iovlen = local_iovs.len();
+    if let Some(ref ctrl) = control_buf {
+        msg.msg_control = ctrl.as_ptr() as *mut libc::c_void;
+        msg.msg_controllen = ctrl.len();
+    }
+    let ret = unsafe { libc::sendmsg(dup_fd.as_raw_fd(), &msg, flags) };
+    if ret >= 0 {
+        NotifAction::ReturnValue(ret as i64)
+    } else {
+        NotifAction::Errno(unsafe { *libc::__errno_location() })
+    }
+}
+
+/// Extract the filesystem path of a NAMED `AF_UNIX` connect target from a raw
+/// `sockaddr`. Returns `None` for abstract sockets (`sun_path[0] == 0`),
+/// unnamed sockets, or any non-`AF_UNIX` family (none of which the fs gate
+/// applies to).
+fn named_unix_socket_path(addr_bytes: &[u8]) -> Option<std::path::PathBuf> {
+    // sockaddr_un layout: u16 sun_family, then sun_path. Need the family plus
+    // at least one path byte.
+    if addr_bytes.len() < 3 {
+        return None;
+    }
+    let family = u16::from_ne_bytes([addr_bytes[0], addr_bytes[1]]);
+    if family != libc::AF_UNIX as u16 {
+        return None;
+    }
+    let sun_path = &addr_bytes[2..];
+    if sun_path[0] == 0 {
+        return None; // abstract namespace (Landlock scope handles it)
+    }
+    let end = sun_path.iter().position(|&b| b == 0).unwrap_or(sun_path.len());
+    let raw = &sun_path[..end];
+    if raw.is_empty() {
+        return None;
+    }
+    std::str::from_utf8(raw).ok().map(std::path::PathBuf::from)
+}
+
+/// True if `path`, lexically normalized (`.`/`..` resolved without touching the
+/// filesystem), is at or under any of the granted `prefixes`. Mirrors the
+/// prefix matching the chroot fs enforcement uses.
+fn path_under_any(path: &std::path::Path, prefixes: &[std::path::PathBuf]) -> bool {
+    let norm = crate::chroot::resolve::confine(&path.to_string_lossy());
+    prefixes.iter().any(|p| norm.starts_with(p))
 }
 
 // ============================================================
@@ -645,8 +1160,32 @@ async fn sendto_on_behalf(
             NotifAction::Errno(errno)
         }
     } else {
-        // Non-IP family (AF_UNIX etc.) — allow through
-        NotifAction::Continue
+        // Non-IP family. Gate a NAMED AF_UNIX datagram the same way as connect:
+        // sendto to a named socket is a WRITE on its inode, so deny unless the
+        // resolved real target is under an fs-write grant.
+        match named_unix_socket_path(&addr_bytes) {
+            Some(path) if ctx.policy.has_unix_fs_gate => {
+                if ctx.policy.chroot_root.is_some() {
+                    if path_under_any(&path, &ctx.policy.chroot_writable) {
+                        NotifAction::Continue
+                    } else {
+                        NotifAction::Errno(libc::EACCES)
+                    }
+                } else {
+                    sendto_named_unix_on_behalf(
+                        notif,
+                        notif_fd,
+                        sockfd,
+                        buf_ptr,
+                        buf_len,
+                        flags,
+                        &path,
+                        &ctx.policy.chroot_writable,
+                    )
+                }
+            }
+            _ => NotifAction::Continue,
+        }
     }
 }
 
@@ -669,6 +1208,15 @@ async fn sendmsg_on_behalf(
     let sockfd = args[0] as i32;
     let msghdr_ptr = args[1];
     let flags = args[2] as i32;
+
+    // Named-unix datagram gate. A named AF_UNIX `msg_name` is handled here; the
+    // IP path below only covers AF_INET/AF_INET6, and would pass a unix target
+    // straight through.
+    if ctx.policy.has_unix_fs_gate {
+        if let Some(action) = unix_sendmsg_gate(notif, ctx, notif_fd, sockfd, msghdr_ptr, flags) {
+            return action;
+        }
+    }
 
     // Pre-scan for Continue cases (connected socket / non-IP family).
     // Same TOCTOU-aware semantics as before: EFAULT on unreadable
@@ -1020,6 +1568,10 @@ pub struct ResolvedNetAllow {
     /// `PortAllow::Any` — the entry in `per_ip` is kept as a
     /// placeholder for diagnostic / `/etc/hosts` purposes.
     pub per_ip_all_ports: HashSet<IpAddr>,
+    /// IP/CIDR-literal targets, matched by containment with no DNS (an
+    /// exact IP literal is a `/32` or `/128`). Each carries the ports
+    /// permitted to that range (`PortAllow::Any` for all-ports rules).
+    pub cidrs: Vec<(IpCidr, crate::seccomp::notif::PortAllow)>,
     /// Ports permitted to any IP (the `:port` form).
     pub any_ip_ports: HashSet<u16>,
     /// Any-host any-port wildcard (`:*` / `*:*`, or `icmp://*`). When
@@ -1056,16 +1608,18 @@ pub struct ResolvedNetAllowSet {
 pub async fn resolve_net_allow(
     rules: &[NetAllow],
 ) -> io::Result<ResolvedNetAllowSet> {
+    use crate::seccomp::notif::PortAllow;
     let per_proto = |target: Protocol| async move {
         let mut per_ip: HashMap<IpAddr, HashSet<u16>> = HashMap::new();
         let mut per_ip_all_ports: HashSet<IpAddr> = HashSet::new();
+        let mut cidrs: Vec<(IpCidr, PortAllow)> = Vec::new();
         let mut any_ip_ports: HashSet<u16> = HashSet::new();
         let mut any_ip_all_ports = false;
         let mut local_etc_hosts = String::new();
 
         for rule in rules.iter().filter(|r| r.protocol == target) {
-            match &rule.host {
-                None => {
+            match &rule.target {
+                NetTarget::AnyIp => {
                     if rule.all_ports || target == Protocol::Icmp {
                         // ICMP rules never carry ports, so a wildcard-host
                         // ICMP rule (`icmp://*`) means "any destination."
@@ -1076,7 +1630,17 @@ pub async fn resolve_net_allow(
                         }
                     }
                 }
-                Some(host) => {
+                NetTarget::Cidr(c) => {
+                    // IP/CIDR literals are matched by containment with no
+                    // DNS, exactly like `--net-deny` targets.
+                    let pa = if rule.all_ports || target == Protocol::Icmp {
+                        PortAllow::Any
+                    } else {
+                        PortAllow::Specific(rule.ports.iter().copied().collect())
+                    };
+                    cidrs.push((*c, pa));
+                }
+                NetTarget::Host(host) => {
                     let addr = format!("{}:0", host);
                     let resolved = tokio::net::lookup_host(addr.as_str()).await.map_err(|e| {
                         io::Error::new(
@@ -1105,6 +1669,7 @@ pub async fn resolve_net_allow(
             ResolvedNetAllow {
                 per_ip,
                 per_ip_all_ports,
+                cidrs,
                 any_ip_ports,
                 any_ip_all_ports,
             },
@@ -1127,6 +1692,68 @@ pub async fn resolve_net_allow(
         icmp,
         concrete_host_entries,
     })
+}
+
+/// Per-protocol resolved deny policies, ready for `NetworkState`.
+pub struct ResolvedNetDenySet {
+    pub tcp: crate::seccomp::notif::NetworkPolicy,
+    pub udp: crate::seccomp::notif::NetworkPolicy,
+    pub icmp: crate::seccomp::notif::NetworkPolicy,
+}
+
+/// Resolve `--net-deny` rules into per-protocol `DenyList` policies.
+/// A protocol with no deny rules stays `Unrestricted` (allow-all).
+pub fn resolve_net_deny(rules: &[NetDeny]) -> ResolvedNetDenySet {
+    use crate::seccomp::notif::{NetworkPolicy, PortAllow};
+
+    let per_proto = |target: Protocol| -> NetworkPolicy {
+        let mut cidrs: Vec<(IpCidr, PortAllow)> = Vec::new();
+        let mut any_ip_ports: HashSet<u16> = HashSet::new();
+        let mut deny_all = false;
+        let mut saw_rule = false;
+
+        for rule in rules.iter().filter(|r| r.protocol == target) {
+            saw_rule = true;
+            match &rule.target {
+                NetTarget::AnyIp => {
+                    if rule.all_ports || target == Protocol::Icmp {
+                        deny_all = true;
+                    } else {
+                        for &p in &rule.ports {
+                            any_ip_ports.insert(p);
+                        }
+                    }
+                }
+                NetTarget::Cidr(c) => {
+                    let pa = if rule.all_ports || target == Protocol::Icmp {
+                        PortAllow::Any
+                    } else {
+                        PortAllow::Specific(rule.ports.iter().copied().collect())
+                    };
+                    cidrs.push((*c, pa));
+                }
+                // `--net-deny` rejects hostnames at parse time, so a deny
+                // rule never carries a `Host` target.
+                NetTarget::Host(_) => unreachable!("net-deny rejects hostnames"),
+            }
+        }
+
+        if !saw_rule {
+            NetworkPolicy::Unrestricted
+        } else {
+            NetworkPolicy::DenyList {
+                cidrs,
+                any_ip_ports,
+                deny_all,
+            }
+        }
+    };
+
+    ResolvedNetDenySet {
+        tcp: per_proto(Protocol::Tcp),
+        udp: per_proto(Protocol::Udp),
+        icmp: per_proto(Protocol::Icmp),
+    }
 }
 
 /// Compose the synthetic `/etc/hosts` served to the sandbox.
@@ -1200,53 +1827,53 @@ mod tests {
 
     #[test]
     fn netallow_parse_concrete_host_port() {
-        let r = NetAllow::parse("example.com:443").unwrap();
-        assert_eq!(r.host.as_deref(), Some("example.com"));
+        let r = NetRule::parse_allow("example.com:443").unwrap();
+        assert!(matches!(&r.target, NetTarget::Host(h) if h == "example.com"));
         assert_eq!(r.ports, vec![443]);
         assert!(!r.all_ports);
     }
 
     #[test]
     fn netallow_parse_any_host_port() {
-        let r = NetAllow::parse(":8080").unwrap();
-        assert_eq!(r.host, None);
+        let r = NetRule::parse_allow(":8080").unwrap();
+        assert_eq!(r.target, NetTarget::AnyIp);
         assert_eq!(r.ports, vec![8080]);
         assert!(!r.all_ports);
 
-        let r = NetAllow::parse("*:8080").unwrap();
-        assert_eq!(r.host, None);
+        let r = NetRule::parse_allow("*:8080").unwrap();
+        assert_eq!(r.target, NetTarget::AnyIp);
         assert_eq!(r.ports, vec![8080]);
         assert!(!r.all_ports);
     }
 
     #[test]
     fn netallow_parse_multiple_ports() {
-        let r = NetAllow::parse("github.com:22,80,443").unwrap();
-        assert_eq!(r.host.as_deref(), Some("github.com"));
+        let r = NetRule::parse_allow("github.com:22,80,443").unwrap();
+        assert!(matches!(&r.target, NetTarget::Host(h) if h == "github.com"));
         assert_eq!(r.ports, vec![22, 80, 443]);
         assert!(!r.all_ports);
     }
 
     #[test]
     fn netallow_parse_wildcard_any_host_any_port_colon() {
-        let r = NetAllow::parse(":*").unwrap();
-        assert_eq!(r.host, None);
+        let r = NetRule::parse_allow(":*").unwrap();
+        assert_eq!(r.target, NetTarget::AnyIp);
         assert!(r.ports.is_empty());
         assert!(r.all_ports);
     }
 
     #[test]
     fn netallow_parse_wildcard_any_host_any_port_star() {
-        let r = NetAllow::parse("*:*").unwrap();
-        assert_eq!(r.host, None);
+        let r = NetRule::parse_allow("*:*").unwrap();
+        assert_eq!(r.target, NetTarget::AnyIp);
         assert!(r.ports.is_empty());
         assert!(r.all_ports);
     }
 
     #[test]
     fn netallow_parse_wildcard_concrete_host_any_port() {
-        let r = NetAllow::parse("example.com:*").unwrap();
-        assert_eq!(r.host.as_deref(), Some("example.com"));
+        let r = NetRule::parse_allow("example.com:*").unwrap();
+        assert!(matches!(&r.target, NetTarget::Host(h) if h == "example.com"));
         assert!(r.ports.is_empty());
         assert!(r.all_ports);
     }
@@ -1256,35 +1883,94 @@ mod tests {
         // `host:80,*` and `host:*,80` are both ambiguous: the user
         // either meant "any port" (wildcard wins) or "ports 80 plus
         // some weird placeholder". Refuse and force a clean spec.
-        let err = NetAllow::parse("example.com:80,*").unwrap_err();
+        let err = NetRule::parse_allow("example.com:80,*").unwrap_err();
         assert!(format!("{}", err).contains("cannot mix"));
-        let err = NetAllow::parse("example.com:*,80").unwrap_err();
+        let err = NetRule::parse_allow("example.com:*,80").unwrap_err();
         assert!(format!("{}", err).contains("cannot mix"));
     }
 
     #[test]
     fn netallow_parse_rejects_port_zero() {
-        let err = NetAllow::parse("example.com:0").unwrap_err();
+        let err = NetRule::parse_allow("example.com:0").unwrap_err();
         assert!(format!("{}", err).contains("port 0"));
     }
 
     #[test]
     fn netallow_parse_rejects_empty_port() {
-        let err = NetAllow::parse("example.com:").unwrap_err();
+        let err = NetRule::parse_allow("example.com:").unwrap_err();
         assert!(format!("{}", err).contains("invalid port"));
     }
 
     #[test]
-    fn netallow_parse_rejects_no_colon() {
-        let err = NetAllow::parse("example.com").unwrap_err();
-        assert!(format!("{}", err).contains("expected"));
+    fn netallow_bare_host_is_all_ports() {
+        // No port suffix means "all ports" (port optional), symmetric
+        // with the `host:*` form.
+        let r = NetRule::parse_allow("example.com").unwrap();
+        assert!(matches!(&r.target, NetTarget::Host(h) if h == "example.com"));
+        assert!(r.all_ports);
+        assert!(r.ports.is_empty());
+    }
+
+    #[test]
+    fn netallow_bare_star_is_any_host_all_ports() {
+        let r = NetRule::parse_allow("*").unwrap();
+        assert_eq!(r.target, NetTarget::AnyIp);
+        assert!(r.all_ports);
+        assert!(r.ports.is_empty());
+    }
+
+    #[test]
+    fn netallow_empty_spec_rejected() {
+        assert!(NetRule::parse_allow("").is_err());
+        assert!(NetRule::parse_allow("tcp://").is_err());
+    }
+
+    #[test]
+    fn netallow_cidr_target_with_port() {
+        // CIDR ranges are now first-class in --net-allow (matched by
+        // containment, no DNS), symmetric with --net-deny.
+        let r = NetRule::parse_allow("10.0.0.0/8:80").unwrap();
+        assert!(matches!(&r.target, NetTarget::Cidr(c) if !c.is_single_host()));
+        assert_eq!(r.ports, vec![80]);
+        assert!(!r.all_ports);
+    }
+
+    #[test]
+    fn netallow_ipv6_literal_and_bracket() {
+        let lo: std::net::IpAddr = "::1".parse().unwrap();
+        // Bare IPv6 literal (previously mis-split on its colons).
+        let r = NetRule::parse_allow("::1").unwrap();
+        assert!(matches!(&r.target, NetTarget::Cidr(c) if c.addr == lo && c.is_single_host()));
+        assert!(r.all_ports);
+        // Bracketed IPv6 with a port.
+        let r = NetRule::parse_allow("[::1]:443").unwrap();
+        assert!(matches!(&r.target, NetTarget::Cidr(c) if c.addr == lo && c.is_single_host()));
+        assert_eq!(r.ports, vec![443]);
+        // IPv6 CIDR.
+        let r = NetRule::parse_allow("fc00::/7").unwrap();
+        assert!(matches!(&r.target, NetTarget::Cidr(c) if !c.is_single_host()));
+        assert!(r.all_ports);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_net_allow_cidr_no_dns() {
+        // A CIDR / IP-literal target resolves into `cidrs` directly, with
+        // no DNS lookup and no `per_ip` / `/etc/hosts` entry.
+        let rules = vec![
+            NetAllow { protocol: Protocol::Tcp, target: NetTarget::Cidr(IpCidr::parse("10.0.0.0/8").unwrap()), ports: vec![80], all_ports: false },
+            NetAllow { protocol: Protocol::Tcp, target: NetTarget::Cidr(IpCidr::parse("1.2.3.4").unwrap()), ports: vec![], all_ports: true },
+        ];
+        let resolved = resolve_net_allow(&rules).await.unwrap();
+        assert_eq!(resolved.tcp.cidrs.len(), 2);
+        assert!(resolved.tcp.per_ip.is_empty());
+        assert!(resolved.concrete_host_entries.is_empty());
     }
 
     #[test]
     fn netallow_parse_repeated_wildcard_is_idempotent() {
         // `*,*` collapses to a single wildcard — neither token contributes
         // a concrete port, so the rule remains "any port".
-        let r = NetAllow::parse(":*,*").unwrap();
+        let r = NetRule::parse_allow(":*,*").unwrap();
         assert!(r.all_ports);
         assert!(r.ports.is_empty());
     }
@@ -1293,51 +1979,54 @@ mod tests {
 
     #[test]
     fn netallow_bare_form_defaults_to_tcp() {
-        let r = NetAllow::parse("example.com:443").unwrap();
+        let r = NetRule::parse_allow("example.com:443").unwrap();
         assert_eq!(r.protocol, Protocol::Tcp);
     }
 
     #[test]
     fn netallow_explicit_tcp_scheme() {
-        let r = NetAllow::parse("tcp://example.com:443").unwrap();
+        let r = NetRule::parse_allow("tcp://example.com:443").unwrap();
         assert_eq!(r.protocol, Protocol::Tcp);
-        assert_eq!(r.host.as_deref(), Some("example.com"));
+        assert!(matches!(&r.target, NetTarget::Host(h) if h == "example.com"));
         assert_eq!(r.ports, vec![443]);
     }
 
     #[test]
     fn netallow_udp_scheme_with_host_port() {
-        let r = NetAllow::parse("udp://1.1.1.1:53").unwrap();
+        let r = NetRule::parse_allow("udp://1.1.1.1:53").unwrap();
         assert_eq!(r.protocol, Protocol::Udp);
-        assert_eq!(r.host.as_deref(), Some("1.1.1.1"));
+        // An IP literal becomes a single-host CIDR target (no DNS).
+        let one: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+        assert!(matches!(&r.target, NetTarget::Cidr(c) if c.addr == one && c.is_single_host()));
         assert_eq!(r.ports, vec![53]);
     }
 
     #[test]
     fn netallow_udp_wildcard_any_anywhere() {
         // The "any UDP" gate, equivalent to the old `allow_udp = true`.
-        let r = NetAllow::parse("udp://*:*").unwrap();
+        let r = NetRule::parse_allow("udp://*:*").unwrap();
         assert_eq!(r.protocol, Protocol::Udp);
-        assert_eq!(r.host, None);
+        assert_eq!(r.target, NetTarget::AnyIp);
         assert!(r.all_ports);
     }
 
     #[test]
     fn netallow_icmp_scheme_with_host() {
-        let r = NetAllow::parse("icmp://github.com").unwrap();
+        let r = NetRule::parse_allow("icmp://github.com").unwrap();
         assert_eq!(r.protocol, Protocol::Icmp);
-        assert_eq!(r.host.as_deref(), Some("github.com"));
+        assert!(matches!(&r.target, NetTarget::Host(h) if h == "github.com"));
         assert!(r.ports.is_empty());
-        assert!(!r.all_ports);
+        // ICMP carries no ports, so the rule is "all ports" by convention.
+        assert!(r.all_ports);
     }
 
     #[test]
     fn netallow_icmp_wildcard() {
         // The "any ICMP echo" gate, equivalent to the old
         // `allow_icmp = true` for the SOCK_DGRAM path.
-        let r = NetAllow::parse("icmp://*").unwrap();
+        let r = NetRule::parse_allow("icmp://*").unwrap();
         assert_eq!(r.protocol, Protocol::Icmp);
-        assert_eq!(r.host, None);
+        assert_eq!(r.target, NetTarget::AnyIp);
     }
 
     #[test]
@@ -1345,14 +2034,14 @@ mod tests {
         // ICMP has no port — `:port` is meaningless and refused
         // explicitly so users can't write a rule that doesn't do what
         // they think.
-        let err = NetAllow::parse("icmp://github.com:80").unwrap_err();
-        assert!(format!("{}", err).contains("icmp rules take no port"));
+        let err = NetRule::parse_allow("icmp://github.com:80").unwrap_err();
+        assert!(format!("{}", err).contains("icmp rule takes no port"));
     }
 
     #[test]
     fn netallow_icmp_rejects_empty_body() {
-        let err = NetAllow::parse("icmp://").unwrap_err();
-        assert!(format!("{}", err).contains("needs a host or `*`"));
+        let err = NetRule::parse_allow("icmp://").unwrap_err();
+        assert!(format!("{}", err).contains("needs a host/IP or `*`"));
     }
 
     #[test]
@@ -1360,7 +2049,7 @@ mod tests {
         // Including `icmp-raw` — sandlock does not expose raw ICMP, so
         // the scheme is unknown rather than a special-case error.
         for spec in ["sctp://host:1234", "icmp-raw://*"] {
-            let err = NetAllow::parse(spec).unwrap_err();
+            let err = NetRule::parse_allow(spec).unwrap_err();
             assert!(format!("{}", err).contains("unknown scheme"), "spec: {}", spec);
         }
     }
@@ -1380,7 +2069,7 @@ mod tests {
     async fn test_resolve_net_allow_concrete_host() {
         let rules = vec![NetAllow {
             protocol: Protocol::Tcp,
-            host: Some("localhost".to_string()),
+            target: NetTarget::Host("localhost".to_string()),
             ports: vec![80, 443],
             all_ports: false,
         }];
@@ -1402,7 +2091,7 @@ mod tests {
     async fn test_resolve_net_allow_any_ip() {
         let rules = vec![NetAllow {
             protocol: Protocol::Tcp,
-            host: None,
+            target: NetTarget::AnyIp,
             ports: vec![8080],
             all_ports: false,
         }];
@@ -1419,7 +2108,7 @@ mod tests {
         // `:*` — fully unrestricted egress, TCP-only.
         let rules = vec![NetAllow {
             protocol: Protocol::Tcp,
-            host: None,
+            target: NetTarget::AnyIp,
             ports: vec![],
             all_ports: true,
         }];
@@ -1438,7 +2127,7 @@ mod tests {
         // `localhost:*` — every port to localhost only, TCP.
         let rules = vec![NetAllow {
             protocol: Protocol::Tcp,
-            host: Some("localhost".to_string()),
+            target: NetTarget::Host("localhost".to_string()),
             ports: vec![],
             all_ports: true,
         }];
@@ -1463,13 +2152,13 @@ mod tests {
         let rules = vec![
             NetAllow {
                 protocol: Protocol::Tcp,
-                host: None,
+                target: NetTarget::AnyIp,
                 ports: vec![],
                 all_ports: true,
             },
             NetAllow {
                 protocol: Protocol::Tcp,
-                host: Some("localhost".to_string()),
+                target: NetTarget::Host("localhost".to_string()),
                 ports: vec![22],
                 all_ports: false,
             },
@@ -1490,13 +2179,13 @@ mod tests {
         let rules = vec![
             NetAllow {
                 protocol: Protocol::Tcp,
-                host: Some("localhost".to_string()),
+                target: NetTarget::Host("localhost".to_string()),
                 ports: vec![443],
                 all_ports: false,
             },
             NetAllow {
                 protocol: Protocol::Udp,
-                host: None,
+                target: NetTarget::AnyIp,
                 ports: vec![53],
                 all_ports: false,
             },
@@ -1524,7 +2213,7 @@ mod tests {
         // PortAllow::Any-style empty port set, plus per_ip_all_ports.
         let rules = vec![NetAllow {
             protocol: Protocol::Icmp,
-            host: Some("localhost".to_string()),
+            target: NetTarget::Host("localhost".to_string()),
             ports: vec![],
             all_ports: false,
         }];
@@ -1548,7 +2237,7 @@ mod tests {
         // `icmp://*` — any ICMP destination.
         let rules = vec![NetAllow {
             protocol: Protocol::Icmp,
-            host: None,
+            target: NetTarget::AnyIp,
             ports: vec![],
             all_ports: false,
         }];
@@ -1659,5 +2348,172 @@ mod tests {
             "v4 loopback should still be injected: {out}"
         );
         let _ = std::fs::remove_dir_all(&rootfs);
+    }
+
+    // --- IpCidr tests ---
+
+    #[test]
+    fn ipcidr_parse_bare_ipv4_is_host_route() {
+        let c = IpCidr::parse("1.2.3.4").unwrap();
+        assert_eq!(c.prefix_len, 32);
+        assert!(c.contains("1.2.3.4".parse().unwrap()));
+        assert!(!c.contains("1.2.3.5".parse().unwrap()));
+    }
+
+    #[test]
+    fn ipcidr_parse_ipv4_range_contains() {
+        let c = IpCidr::parse("10.0.0.0/8").unwrap();
+        assert!(c.contains("10.3.7.9".parse().unwrap()));
+        assert!(!c.contains("11.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn ipcidr_parse_ipv6_range_contains() {
+        let c = IpCidr::parse("fc00::/7").unwrap();
+        assert!(c.contains("fd00::1".parse().unwrap()));
+        assert!(!c.contains("2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn ipcidr_zero_prefix_matches_all_same_family() {
+        let c = IpCidr::parse("0.0.0.0/0").unwrap();
+        assert!(c.contains("8.8.8.8".parse().unwrap()));
+        assert!(!c.contains("::1".parse().unwrap())); // family mismatch
+    }
+
+    #[test]
+    fn ipcidr_rejects_hostname() {
+        assert!(IpCidr::parse("example.com").is_err());
+    }
+
+    #[test]
+    fn ipcidr_rejects_oversized_prefix() {
+        assert!(IpCidr::parse("10.0.0.0/33").is_err());
+        assert!(IpCidr::parse("fc00::/129").is_err());
+    }
+
+    // --- NetDeny::parse tests ---
+
+    #[test]
+    fn netdeny_bare_cidr_is_all_ports_tcp() {
+        let rule = NetRule::parse_deny("10.0.0.0/8").unwrap();
+        assert_eq!(rule.protocol, Protocol::Tcp);
+        assert!(matches!(rule.target, NetTarget::Cidr(_)));
+        assert!(rule.all_ports);
+    }
+
+    #[test]
+    fn netdeny_bare_ip_is_host_route_all_ports() {
+        let rule = NetRule::parse_deny("169.254.169.254").unwrap();
+        match &rule.target {
+            NetTarget::Cidr(c) => assert_eq!(c.prefix_len, 32),
+            _ => panic!("expected cidr"),
+        }
+        assert!(rule.all_ports);
+    }
+
+    #[test]
+    fn netdeny_cidr_with_port() {
+        let rule = NetRule::parse_deny("10.0.0.0/8:443").unwrap();
+        assert_eq!(rule.ports, vec![443]);
+        assert!(!rule.all_ports);
+    }
+
+    #[test]
+    fn netdeny_any_ip_port() {
+        let rule = NetRule::parse_deny(":25").unwrap();
+        assert!(matches!(rule.target, NetTarget::AnyIp));
+        assert_eq!(rule.ports, vec![25]);
+    }
+
+    #[test]
+    fn netdeny_udp_scheme() {
+        let rule = NetRule::parse_deny("udp://192.168.0.0/16:53").unwrap();
+        assert_eq!(rule.protocol, Protocol::Udp);
+        assert_eq!(rule.ports, vec![53]);
+    }
+
+    #[test]
+    fn netdeny_ipv6_bracket_port() {
+        let rule = NetRule::parse_deny("[::1]:443").unwrap();
+        assert_eq!(rule.ports, vec![443]);
+        match &rule.target {
+            NetTarget::Cidr(c) => assert_eq!(c.prefix_len, 128),
+            _ => panic!("expected cidr"),
+        }
+    }
+
+    #[test]
+    fn netdeny_rejects_hostname() {
+        assert!(NetRule::parse_deny("evil.com:443").is_err());
+        assert!(NetRule::parse_deny("evil.com").is_err());
+    }
+
+    #[test]
+    fn netdeny_bare_ipv6_address_all_ports() {
+        let rule = NetRule::parse_deny("::1").unwrap();
+        assert!(rule.all_ports);
+        match &rule.target {
+            NetTarget::Cidr(c) => assert_eq!(c.prefix_len, 128),
+            _ => panic!("expected cidr"),
+        }
+    }
+
+    #[test]
+    fn netdeny_bare_ipv6_cidr_all_ports() {
+        let rule = NetRule::parse_deny("fc00::/7").unwrap();
+        assert!(rule.all_ports);
+        let ula: std::net::IpAddr = "fd00::1".parse().unwrap();
+        assert!(matches!(&rule.target, NetTarget::Cidr(c) if c.contains(ula)));
+    }
+
+    #[test]
+    fn netdeny_empty_icmp_body_is_rejected() {
+        assert!(NetRule::parse_deny("icmp://").is_err());
+    }
+
+    #[test]
+    fn netdeny_bare_star_is_any_ip_all_ports() {
+        // `*` with no port is the any-IP, all-ports form (port optional,
+        // symmetric with a bare IP/CIDR).
+        let rule = NetRule::parse_deny("*").unwrap();
+        assert_eq!(rule.protocol, Protocol::Tcp);
+        assert!(matches!(rule.target, NetTarget::AnyIp));
+        assert!(rule.all_ports);
+        assert!(rule.ports.is_empty());
+    }
+
+    #[test]
+    fn netdeny_udp_bare_star_all_ports() {
+        let rule = NetRule::parse_deny("udp://*").unwrap();
+        assert_eq!(rule.protocol, Protocol::Udp);
+        assert!(matches!(rule.target, NetTarget::AnyIp));
+        assert!(rule.all_ports);
+    }
+
+    #[test]
+    fn netdeny_empty_spec_rejected() {
+        // An empty body must not silently mean "deny everything".
+        assert!(NetRule::parse_deny("").is_err());
+        assert!(NetRule::parse_deny("udp://").is_err());
+    }
+
+    // --- resolve_net_deny tests ---
+
+    #[test]
+    fn resolve_net_deny_groups_per_protocol() {
+        let rule = NetRule::parse_deny("10.0.0.0/8").unwrap();
+        let set = resolve_net_deny(std::slice::from_ref(&rule));
+        // TCP policy denies 10.x, UDP/ICMP unaffected (still allow-all).
+        assert!(!set.tcp.allows("10.0.0.1".parse().unwrap(), 443));
+        assert!(set.udp.allows("10.0.0.1".parse().unwrap(), 443));
+    }
+
+    #[test]
+    fn resolve_net_deny_any_ip_port() {
+        let rule = NetRule::parse_deny(":25").unwrap();
+        let set = resolve_net_deny(std::slice::from_ref(&rule));
+        assert!(!set.tcp.allows("8.8.8.8".parse().unwrap(), 25));
+        assert!(set.tcp.allows("8.8.8.8".parse().unwrap(), 80));
     }
 }
