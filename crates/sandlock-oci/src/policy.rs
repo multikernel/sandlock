@@ -136,18 +136,33 @@ impl OciPolicy {
                 if limit > 0 { Some(limit as u32) } else { None }
             });
 
+        // OCI `cpu.quota`/`cpu.period` express a CPU allowance in *cores*
+        // (quota/period can exceed 1.0 for a multi-core cap).  sandlock-core's
+        // `max_cpu` is a coarse global SIGSTOP/SIGCONT wall-clock duty cycle,
+        // not a bandwidth controller: it gates how much wall-clock time the
+        // whole process group may run, as a 1-100 value where 100 means "no
+        // limit".  A >= 1-core allowance can't be expressed as such a value, so
+        // map only a strict sub-core request (quota < period) here; a multi-core
+        // cap belongs on affinity (`cpu_cores`), not on this throttle.  Don't
+        // fake it by clamping to 100, which core reads as unlimited anyway.
         let max_cpu = spec.linux().as_ref()
             .and_then(|l| l.resources().clone())
             .and_then(|res| res.cpu().clone())
             .and_then(|cpu| {
                 let quota = cpu.quota()?;
                 let period = cpu.period()?;
-                if quota > 0 && period > 0 {
-                    let pct = ((quota as f64 / period as f64) * 100.0).min(100.0) as u8;
-                    if pct > 0 { Some(pct) } else { None }
-                } else {
-                    None
+                if quota <= 0 || period == 0 {
+                    return None;
                 }
+                let ratio = quota as f64 / period as f64;
+                if ratio >= 1.0 {
+                    // Multi-core / full-core caps are not enforceable by the
+                    // single-core throttle; don't pretend by emitting 100.
+                    return None;
+                }
+                // Floor to 1% so a tiny but non-zero request isn't truncated to
+                // 0 (which would drop to None == "no limit").
+                Some(((ratio * 100.0) as u8).max(1))
             });
 
         // OCI process.user → run-as identity (uid/gid, both required by the spec).
@@ -399,6 +414,60 @@ mod tests {
         assert!(policy.max_memory.is_none());
         assert!(policy.max_processes.is_none());
         assert!(policy.max_cpu.is_none());
+    }
+
+    /// Build a spec carrying `linux.resources.cpu.{quota,period}`.
+    fn spec_with_cpu(quota: i64, period: u64) -> Spec {
+        let json = serde_json::json!({
+            "ociVersion": "1.0.2",
+            "root": { "path": "rootfs", "readonly": false },
+            "process": { "user": { "uid": 0, "gid": 0 }, "cwd": "/", "args": ["sh"] },
+            "linux": { "resources": { "cpu": { "quota": quota, "period": period } } }
+        });
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn cpu_sub_core_maps_to_percentage() {
+        let dir = tempdir().unwrap();
+        let bundle = dir.path();
+        fs::create_dir_all(bundle.join("rootfs")).unwrap();
+        // Half a core → 50%.
+        let policy = OciPolicy::from_spec(&spec_with_cpu(50_000, 100_000), bundle, "t").unwrap();
+        assert_eq!(policy.max_cpu, Some(50));
+    }
+
+    #[test]
+    fn cpu_one_full_core_not_mapped_to_max_cpu() {
+        let dir = tempdir().unwrap();
+        let bundle = dir.path();
+        fs::create_dir_all(bundle.join("rootfs")).unwrap();
+        // Exactly one core is not a sub-core request; max_cpu's 1-100 value
+        // can't express it (100 reads as "no limit"), so it doesn't belong on
+        // this throttle. None here; a real cap would go on affinity.
+        let policy = OciPolicy::from_spec(&spec_with_cpu(100_000, 100_000), bundle, "t").unwrap();
+        assert_eq!(policy.max_cpu, None);
+    }
+
+    #[test]
+    fn cpu_multi_core_request_not_clamped_to_100() {
+        let dir = tempdir().unwrap();
+        let bundle = dir.path();
+        fs::create_dir_all(bundle.join("rootfs")).unwrap();
+        // A 2-core (200%) allowance must NOT silently collapse to max_cpu=100;
+        // it can't be expressed as a 1-100 value, so it stays off this knob.
+        let policy = OciPolicy::from_spec(&spec_with_cpu(200_000, 100_000), bundle, "t").unwrap();
+        assert_eq!(policy.max_cpu, None);
+    }
+
+    #[test]
+    fn cpu_tiny_fraction_floors_to_one() {
+        let dir = tempdir().unwrap();
+        let bundle = dir.path();
+        fs::create_dir_all(bundle.join("rootfs")).unwrap();
+        // 0.5% would truncate to 0; floor to 1 so the limit isn't dropped.
+        let policy = OciPolicy::from_spec(&spec_with_cpu(500, 100_000), bundle, "t").unwrap();
+        assert_eq!(policy.max_cpu, Some(1));
     }
 
     #[test]
