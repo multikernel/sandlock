@@ -48,6 +48,12 @@ pub struct OciPolicy {
     /// CPU percentage limit, 1-100 (optional).
     pub max_cpu: Option<u8>,
 
+    /// CPU affinity from OCI `cpu.cpus` (cpuset): the exact cores the sandbox
+    /// may run on, applied via sched_setaffinity in core.  An empty/malformed
+    /// cpuset maps to None (no pinning) rather than a partial set.
+    #[serde(default)]
+    pub cpu_cores: Option<Vec<u32>>,
+
     /// Host directories backing emulated tmpfs mounts.  Created before launch
     /// and removed with the sandbox state dir on `delete`.
     #[serde(default)]
@@ -165,6 +171,16 @@ impl OciPolicy {
                 Some(((ratio * 100.0) as u8).max(1))
             });
 
+        // OCI `cpu.cpus` is a cpuset string ("0-3,7") naming the exact cores
+        // the workload may run on.  It maps directly to core's `cpu_cores`
+        // (sched_setaffinity), an exact, non-approximate mapping, so unlike a
+        // multi-core quota it is genuine enforcement.
+        let cpu_cores = spec.linux().as_ref()
+            .and_then(|l| l.resources().clone())
+            .and_then(|res| res.cpu().clone())
+            .and_then(|cpu| cpu.cpus().clone())
+            .and_then(|cpus| parse_cpuset(&cpus));
+
         // OCI process.user → run-as identity (uid/gid, both required by the spec).
         let run_user = spec.process().as_ref().map(|p| {
             let u = p.user();
@@ -181,6 +197,7 @@ impl OciPolicy {
             max_memory,
             max_processes,
             max_cpu,
+            cpu_cores,
             scratch_dirs,
             run_user,
         })
@@ -230,6 +247,9 @@ impl OciPolicy {
         if let Some(cpu) = self.max_cpu {
             builder = builder.max_cpu(cpu);
         }
+        if let Some(ref cores) = self.cpu_cores {
+            builder = builder.cpu_cores(cores.clone());
+        }
 
         // OCI process.user: hand the requested identity to core unconditionally.
         // Core engages a user namespace only when it differs from the runtime's
@@ -239,6 +259,42 @@ impl OciPolicy {
         }
 
         builder.build_unchecked().map_err(Into::into)
+    }
+}
+
+/// Parse an OCI cpuset string into a sorted, de-duplicated list of CPU indices.
+///
+/// Accepts comma-separated indices and inclusive ranges, e.g. `"0-3,5,7-8"` →
+/// `[0,1,2,3,5,7,8]`.  Whitespace around tokens is ignored.  Returns `None` for
+/// an empty cpuset or on any malformed token (bad number, reversed range), so a
+/// broken cpuset drops to "no pinning" rather than applying a partial affinity.
+fn parse_cpuset(s: &str) -> Option<Vec<u32>> {
+    let mut cores = std::collections::BTreeSet::new();
+    for token in s.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        match token.split_once('-') {
+            Some((a, b)) => {
+                let start: u32 = a.trim().parse().ok()?;
+                let end: u32 = b.trim().parse().ok()?;
+                if end < start {
+                    return None;
+                }
+                for c in start..=end {
+                    cores.insert(c);
+                }
+            }
+            None => {
+                cores.insert(token.parse().ok()?);
+            }
+        }
+    }
+    if cores.is_empty() {
+        None
+    } else {
+        Some(cores.into_iter().collect())
     }
 }
 
@@ -468,6 +524,60 @@ mod tests {
         // 0.5% would truncate to 0; floor to 1 so the limit isn't dropped.
         let policy = OciPolicy::from_spec(&spec_with_cpu(500, 100_000), bundle, "t").unwrap();
         assert_eq!(policy.max_cpu, Some(1));
+    }
+
+    /// Build a spec carrying `linux.resources.cpu.cpus` (cpuset).
+    fn spec_with_cpuset(cpus: &str) -> Spec {
+        let json = serde_json::json!({
+            "ociVersion": "1.0.2",
+            "root": { "path": "rootfs", "readonly": false },
+            "process": { "user": { "uid": 0, "gid": 0 }, "cwd": "/", "args": ["sh"] },
+            "linux": { "resources": { "cpu": { "cpus": cpus } } }
+        });
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn parse_cpuset_indices_and_ranges() {
+        assert_eq!(parse_cpuset("0-3"), Some(vec![0, 1, 2, 3]));
+        assert_eq!(parse_cpuset("0,2,4"), Some(vec![0, 2, 4]));
+        assert_eq!(parse_cpuset("0-3,7"), Some(vec![0, 1, 2, 3, 7]));
+        assert_eq!(parse_cpuset("3-3"), Some(vec![3]));
+        // Whitespace tolerated; overlaps de-duplicated and sorted.
+        assert_eq!(parse_cpuset(" 1 , 0 , 0-1 "), Some(vec![0, 1]));
+    }
+
+    #[test]
+    fn parse_cpuset_rejects_malformed() {
+        assert_eq!(parse_cpuset(""), None);
+        assert_eq!(parse_cpuset("   "), None);
+        assert_eq!(parse_cpuset("x"), None);
+        assert_eq!(parse_cpuset("1-"), None);
+        assert_eq!(parse_cpuset("3-1"), None); // reversed range
+    }
+
+    #[test]
+    fn cpuset_maps_to_cpu_cores() {
+        let dir = tempdir().unwrap();
+        let bundle = dir.path();
+        fs::create_dir_all(bundle.join("rootfs")).unwrap();
+
+        let policy = OciPolicy::from_spec(&spec_with_cpuset("0-3,7"), bundle, "t").unwrap();
+        assert_eq!(policy.cpu_cores, Some(vec![0, 1, 2, 3, 7]));
+
+        // And it reaches the sandbox as a real affinity list.
+        let sandbox = policy.to_sandbox().unwrap();
+        assert_eq!(sandbox.cpu_cores, Some(vec![0, 1, 2, 3, 7]));
+    }
+
+    #[test]
+    fn no_cpuset_yields_no_cpu_cores() {
+        let dir = tempdir().unwrap();
+        let bundle = dir.path();
+        fs::create_dir_all(bundle.join("rootfs")).unwrap();
+        // minimal_spec sets no cpu.cpus.
+        let policy = OciPolicy::from_spec(&minimal_spec(), bundle, "t").unwrap();
+        assert_eq!(policy.cpu_cores, None);
     }
 
     #[test]
