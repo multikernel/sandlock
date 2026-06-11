@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import statistics
 import sys
 import threading
 import time
@@ -413,17 +414,46 @@ class TestCpuThrottle:
     )
 
     def test_throttle_slows_execution(self):
-        t0 = time.monotonic()
-        _policy().run(["python3", "-c", self._BURN_CODE])
-        base = time.monotonic() - t0
+        # A 50% CPU cap should roughly double the wall-clock time of a CPU-bound
+        # loop. Comparing raw wall-clock times directly is flaky for two reasons:
+        #   * Fixed interpreter-startup cost is added to both runs but is not
+        #     throttled like the sustained loop, biasing the ratio toward 1.0
+        #     (this is what makes a tight lower bound fail intermittently).
+        #   * Scheduler jitter and background load add per-run noise.
+        # Remove the startup bias by subtracting the cost of a no-op run, and
+        # damp the jitter with a median over a few samples. With both corrections
+        # the ratio reliably centers on ~2.0.
+        SAMPLES = 3
 
-        t0 = time.monotonic()
-        result = _policy(max_cpu=50).run(["python3", "-c", self._BURN_CODE])
-        throttled = time.monotonic() - t0
+        def timed(argv, *, max_cpu=None):
+            kwargs = {} if max_cpu is None else {"max_cpu": max_cpu}
+            t0 = time.monotonic()
+            result = _policy(**kwargs).run(argv)
+            assert result.success
+            return time.monotonic() - t0
 
-        assert result.success
-        ratio = throttled / base
-        assert 1.5 <= ratio <= 3.0, f"ratio={ratio:.1f}, expected ~2.0"
+        def median_time(argv, *, max_cpu=None):
+            return statistics.median(
+                timed(argv, max_cpu=max_cpu) for _ in range(SAMPLES)
+            )
+
+        burn = ["python3", "-c", self._BURN_CODE]
+        overhead = median_time(["python3", "-c", "pass"])
+        base = median_time(burn)
+        throttled = median_time(burn, max_cpu=50)
+
+        base_compute = base - overhead
+        throttled_compute = throttled - overhead
+        assert base_compute > 0, (
+            f"workload too short to measure (base={base:.3f}s "
+            f"overhead={overhead:.3f}s)"
+        )
+
+        ratio = throttled_compute / base_compute
+        assert 1.5 <= ratio <= 3.0, (
+            f"ratio={ratio:.2f}, expected ~2.0 "
+            f"(base={base:.3f}s throttled={throttled:.3f}s overhead={overhead:.3f}s)"
+        )
 
     def test_throttle_100_is_noop(self):
         result = _policy(max_cpu=100).run(["python3", "-c", self._BURN_CODE])
