@@ -17,7 +17,7 @@ name = "sandlock-oci"
 path = "src/main.rs"
 
 [dependencies]
-sandlock-core = { version = "0.8.1", path = "../sandlock-core" }
+sandlock-core = { version = "0.8.3", path = "../sandlock-core" }
 anyhow      = "1"
 clap        = { version = "4", features = ["derive"] }
 tokio       = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
