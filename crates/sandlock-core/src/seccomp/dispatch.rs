@@ -324,10 +324,11 @@ pub(crate) fn build_dispatch_table(
     }
 
     // ------------------------------------------------------------------
-    // Network (conditional on has_net_allowlist || has_http_acl ||
-    // has_unix_fs_gate; the last traps connect() to gate named unix sockets)
+    // Network (conditional on has_net_destination_policy || has_unix_fs_gate;
+    // the latter traps connect() to gate named unix sockets). has_http_acl is
+    // already subsumed by has_net_destination_policy, so it isn't listed.
     // ------------------------------------------------------------------
-    if policy.has_net_allowlist || policy.has_http_acl || policy.has_unix_fs_gate {
+    if policy.has_net_destination_policy || policy.has_unix_fs_gate {
         for &nr in &[
             libc::SYS_connect,
             libc::SYS_sendto,
@@ -669,7 +670,7 @@ pub(crate) fn build_dispatch_table(
     // ------------------------------------------------------------------
     // Bind — on-behalf
     // ------------------------------------------------------------------
-    if policy.port_remap || policy.has_net_allowlist || policy.has_bind_denylist {
+    if policy.port_remap || policy.has_net_destination_policy || policy.has_bind_denylist {
         let __sup = Arc::clone(ctx);
         table.register(libc::SYS_bind, move |cx: &HandlerCtx| {
             let notif = cx.notif;
@@ -1084,7 +1085,7 @@ mod handler_tests {
                 max_memory_bytes: 0,
                 max_processes: 0,
                 has_memory_limit: false,
-                has_net_allowlist: false,
+                has_net_destination_policy: false,
                 has_bind_denylist: false,
                 has_unix_fs_gate: false,
                 has_random_seed: false,

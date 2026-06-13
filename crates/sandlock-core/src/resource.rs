@@ -637,7 +637,7 @@ mod tests {
             max_memory_bytes: 0,
             max_processes: 0,
             has_memory_limit: false,
-            has_net_allowlist: false,
+            has_net_destination_policy: false,
             has_bind_denylist: false,
             has_unix_fs_gate: false,
             has_random_seed: false,

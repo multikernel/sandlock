@@ -1449,7 +1449,7 @@ impl Sandbox {
                 max_memory_bytes: self.max_memory.map(|m| m.0).unwrap_or(0),
                 max_processes: self.max_processes,
                 has_memory_limit: resolved.features.memory_limit,
-                has_net_allowlist: resolved.features.network_destination_policy,
+                has_net_destination_policy: resolved.features.network_destination_policy,
                 has_bind_denylist: resolved.features.bind_denylist,
                 has_unix_fs_gate: resolved.features.unix_fs_gate,
                 has_random_seed: resolved.features.random_seed,
