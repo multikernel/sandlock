@@ -151,14 +151,41 @@ class TestPolicyFnEvents:
 
 class TestPolicyFnRestrict:
     def test_restrict_network_on_execve(self):
-        """Restrict network after seeing execve."""
+        """restrict_network narrows outbound to the listed IPs after execve.
+
+        The old version called ``restrict_network([])`` — an empty list is a
+        no-op (the override is skipped when it lists no IPs) — and asserted only
+        that the program printed, so it verified nothing about the restriction.
+
+        Use two live loopback listeners on 127.0.0.1 and 127.0.0.2, both
+        allowlisted up front so either would connect. Restricting to
+        ``["127.0.0.1"]`` must then permit the first and deny the second
+        (ECONNREFUSED, errno 111). Without enforcement both would connect.
+        """
         def on_event(event, ctx):
             if event.syscall in ("execve", "execveat"):
-                ctx.restrict_network([])
+                ctx.restrict_network(["127.0.0.1"])
 
-        result = _policy(net_allow=["127.0.0.1:443"], policy_fn=on_event).run(["python3", "-c", "print('restricted')"])
-        assert result.success
-        assert b"restricted" in result.stdout
+        with _loopback_listener("127.0.0.1") as (h1, p1), \
+                _loopback_listener("127.0.0.2") as (h2, p2):
+            script = (
+                "import socket\n"
+                "def probe(ip, port):\n"
+                "    s = socket.socket(); s.settimeout(2)\n"
+                "    try:\n"
+                "        s.connect((ip, port)); return 'OK'\n"
+                "    except OSError as e: return 'ERR%d' % e.errno\n"
+                "    finally: s.close()\n"
+                f"print('allowed=' + probe('{h1}', {p1}), 'denied=' + probe('{h2}', {p2}))\n"
+            )
+            result = _policy(
+                net_allow=[f"{h1}:{p1}", f"{h2}:{p2}"], policy_fn=on_event
+            ).run([sys.executable, "-c", script])
+
+        out = result.stdout.decode()
+        assert result.success, result.error
+        assert "allowed=OK" in out, out          # listed IP still reachable
+        assert "denied=ERR111" in out, out        # non-listed IP refused
 
     def test_restrict_max_memory(self):
         """Restrict memory limit dynamically."""
