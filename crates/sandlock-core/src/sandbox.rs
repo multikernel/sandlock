@@ -632,7 +632,7 @@ impl Sandbox {
     /// Wait for the child process to exit.
     pub async fn wait(&mut self) -> Result<crate::result::RunResult, crate::error::SandlockError> {
         use crate::error::SandboxRuntimeError;
-        use crate::result::{ExitStatus, RunResult};
+        use crate::result::RunResult;
 
         let pid = self.rt().child_pid.ok_or(SandboxRuntimeError::NotRunning)?;
 
@@ -644,23 +644,18 @@ impl Sandbox {
             });
         }
 
-        let exit_status = tokio::task::spawn_blocking(move || -> ExitStatus {
-            let mut status: i32 = 0;
-            loop {
-                let ret = unsafe { libc::waitpid(pid, &mut status, 0) };
-                if ret < 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.raw_os_error() == Some(libc::EINTR) {
-                        continue;
-                    }
-                    return ExitStatus::Killed;
-                }
-                break;
-            }
-            sandbox_wait_status_to_exit(status)
-        })
-        .await
-        .unwrap_or(ExitStatus::Killed);
+        // Wait for the top-level child to exit. Prefer the child's pidfd via
+        // `AsyncFd`: pidfd readiness fires only on *exit*, so — unlike a
+        // `waitpid` loop — it never consumes the child's ptrace-stops, which
+        // the `policy_fn` fork-tracking worker reaps (`waitpid` with any flags
+        // reaps a tracee's ptrace-stops, so a concurrent `waitpid` here would
+        // race the worker for fork events and hang it). Mirrors
+        // `spawn_pid_watcher`. Falls back to a blocking `waitpid` only when no
+        // pidfd is available (kernel without `pidfd_open`).
+        let exit_status = match self.rt_mut().pidfd.take() {
+            Some(pidfd) => wait_child_exit_via_pidfd(pidfd, pid).await,
+            None => wait_child_exit_blocking(pid).await,
+        };
 
         self.rt_mut().state = RuntimeState::Stopped(exit_status.clone());
 
@@ -1449,7 +1444,7 @@ impl Sandbox {
                 max_memory_bytes: self.max_memory.map(|m| m.0).unwrap_or(0),
                 max_processes: self.max_processes,
                 has_memory_limit: resolved.features.memory_limit,
-                has_net_allowlist: resolved.features.network_destination_policy,
+                has_net_destination_policy: resolved.features.network_destination_policy,
                 has_bind_denylist: resolved.features.bind_denylist,
                 has_unix_fs_gate: resolved.features.unix_fs_gate,
                 has_random_seed: resolved.features.random_seed,
@@ -1800,6 +1795,70 @@ fn sandbox_wait_status_to_exit(status: i32) -> crate::result::ExitStatus {
     } else {
         ExitStatus::Killed
     }
+}
+
+/// Await the top-level child's exit via its `pidfd` (readable on exit only),
+/// then reap the status. Because it never calls `waitpid` until the child has
+/// already exited, it does not consume the child's ptrace-stops the way a
+/// `waitpid`-loop would — so it doesn't race the `policy_fn` fork-tracking
+/// worker. Falls back to the blocking waiter on any pidfd/`AsyncFd` error.
+async fn wait_child_exit_via_pidfd(
+    pidfd: std::os::unix::io::OwnedFd,
+    pid: libc::pid_t,
+) -> crate::result::ExitStatus {
+    use crate::result::ExitStatus;
+
+    let async_fd = match tokio::io::unix::AsyncFd::with_interest(
+        pidfd,
+        tokio::io::Interest::READABLE,
+    ) {
+        Ok(fd) => fd,
+        Err(_) => return wait_child_exit_blocking(pid).await,
+    };
+
+    loop {
+        // pidfd becomes readable when the process exits; no data is read.
+        let mut guard = match async_fd.readable().await {
+            Ok(g) => g,
+            Err(_) => return ExitStatus::Killed,
+        };
+        let mut status: i32 = 0;
+        // The child has exited and is reapable now, so this never blocks.
+        let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if r > 0 {
+            return sandbox_wait_status_to_exit(status);
+        }
+        if r == 0 {
+            // Spurious readiness (not yet reapable): clear and re-await.
+            guard.clear_ready();
+            continue;
+        }
+        // r < 0 (e.g. ECHILD): already reaped elsewhere. Status is unavailable.
+        return ExitStatus::Killed;
+    }
+}
+
+/// Blocking `waitpid` fallback for kernels without `pidfd_open`. Used only when
+/// no pidfd is available; on such kernels `policy_fn` fork-tracking is the only
+/// thing that could race it, and the lack of pidfd is itself rare.
+async fn wait_child_exit_blocking(pid: libc::pid_t) -> crate::result::ExitStatus {
+    use crate::result::ExitStatus;
+    tokio::task::spawn_blocking(move || -> ExitStatus {
+        let mut status: i32 = 0;
+        loop {
+            let ret = unsafe { libc::waitpid(pid, &mut status, 0) };
+            if ret < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return ExitStatus::Killed;
+            }
+            break;
+        }
+        sandbox_wait_status_to_exit(status)
+    })
+    .await
+    .unwrap_or(ExitStatus::Killed)
 }
 
 fn sandbox_collect_handlers<I, S, H>(

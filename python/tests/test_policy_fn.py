@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
+import socket
 import sys
 import threading
 
@@ -22,6 +24,25 @@ def _policy(**overrides):
     defaults = {"fs_readable": _PYTHON_READABLE, "fs_writable": ["/tmp"]}
     defaults.update(overrides)
     return Sandbox(**defaults)
+
+
+@contextlib.contextmanager
+def _loopback_listener(host="127.0.0.1"):
+    """Yield ``(host, port)`` for a live TCP listener on an ephemeral port.
+
+    A *live* listener is the baseline that makes a network deny-test
+    meaningful: a connect to it succeeds when allowed, so a failure can only
+    mean the sandbox denied it — as opposed to connecting to a dead port,
+    which fails with ``ECONNREFUSED`` regardless of any enforcement.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((host, 0))
+    s.listen(8)
+    try:
+        yield host, s.getsockname()[1]
+    finally:
+        s.close()
 
 
 # ---------------------------------------------------------------------------
@@ -130,35 +151,118 @@ class TestPolicyFnEvents:
 
 class TestPolicyFnRestrict:
     def test_restrict_network_on_execve(self):
-        """Restrict network after seeing execve."""
+        """restrict_network narrows outbound to the listed IPs after execve.
+
+        The old version called ``restrict_network([])`` — an empty list is a
+        no-op (the override is skipped when it lists no IPs) — and asserted only
+        that the program printed, so it verified nothing about the restriction.
+
+        Use two live loopback listeners on 127.0.0.1 and 127.0.0.2, both
+        allowlisted up front so either would connect. Restricting to
+        ``["127.0.0.1"]`` must then permit the first and deny the second
+        (ECONNREFUSED, errno 111). Without enforcement both would connect.
+        """
         def on_event(event, ctx):
             if event.syscall in ("execve", "execveat"):
-                ctx.restrict_network([])
+                ctx.restrict_network(["127.0.0.1"])
 
-        result = _policy(net_allow=["127.0.0.1:443"], policy_fn=on_event).run(["python3", "-c", "print('restricted')"])
-        assert result.success
-        assert b"restricted" in result.stdout
+        with _loopback_listener("127.0.0.1") as (h1, p1), \
+                _loopback_listener("127.0.0.2") as (h2, p2):
+            script = (
+                "import socket\n"
+                "def probe(ip, port):\n"
+                "    s = socket.socket(); s.settimeout(2)\n"
+                "    try:\n"
+                "        s.connect((ip, port)); return 'OK'\n"
+                "    except OSError as e: return 'ERR%d' % e.errno\n"
+                "    finally: s.close()\n"
+                f"print('allowed=' + probe('{h1}', {p1}), 'denied=' + probe('{h2}', {p2}))\n"
+            )
+            result = _policy(
+                net_allow=[f"{h1}:{p1}", f"{h2}:{p2}"], policy_fn=on_event
+            ).run([sys.executable, "-c", script])
+
+        out = result.stdout.decode()
+        assert result.success, result.error
+        assert "allowed=OK" in out, out          # listed IP still reachable
+        assert "denied=ERR111" in out, out        # non-listed IP refused
 
     def test_restrict_max_memory(self):
-        """Restrict memory limit dynamically."""
-        def on_event(event, ctx):
-            if event.syscall in ("execve", "execveat"):
-                ctx.restrict_max_memory(32 * 1024 * 1024)
+        """restrict_max_memory tightens the static ceiling and is enforced.
 
-        result = _policy(policy_fn=on_event).run(
-            ["echo", "ok"]
+        The old version restricted memory then ran ``echo`` and asserted
+        nothing, so it never exercised the limit. dynamic restriction works by
+        tightening a static ``max_memory`` ceiling: set a 256 MiB ceiling,
+        restrict to 64 MiB, then allocate 128 MiB. With enforcement the process
+        is killed; the un-restricted ceiling (control) allows the same 128 MiB,
+        proving the kill is due to the dynamic restriction, not the ceiling.
+        """
+        alloc_128mb = (
+            "print('STARTED', flush=True)\n"
+            "b = bytearray(128 * 1024 * 1024)\n"
+            "b[::4096] = b'\\x01' * (len(b) // 4096)\n"   # commit the pages
+            "print('ALLOC_OK')\n"
         )
-        # Should still run (echo uses very little memory)
+
+        def restrict_to_64mb(event, ctx):
+            if event.syscall in ("execve", "execveat"):
+                ctx.restrict_max_memory(64 * 1024 * 1024)
+            return 0
+
+        # Restricted: 128 MiB exceeds the tightened 64 MiB limit -> killed.
+        restricted = _policy(max_memory="256M", policy_fn=restrict_to_64mb).run(
+            [sys.executable, "-c", alloc_128mb], timeout=15
+        )
+        assert b"STARTED" in restricted.stdout, restricted.stdout
+        assert b"ALLOC_OK" not in restricted.stdout, restricted.stdout
+        assert not restricted.success, "128 MiB must exceed the 64 MiB dynamic limit"
+
+        # Control: same 128 MiB under the un-restricted 256 MiB ceiling -> OK.
+        baseline = _policy(max_memory="256M").run(
+            [sys.executable, "-c", alloc_128mb], timeout=15
+        )
+        assert b"ALLOC_OK" in baseline.stdout, baseline.stdout
+        assert baseline.success, baseline.error
 
     def test_restrict_max_processes(self):
-        """Restrict process limit dynamically."""
-        def on_event(event, ctx):
+        """restrict_max_processes tightens the concurrent-process limit, enforced.
+
+        The old version restricted the limit then ran ``echo`` and asserted
+        nothing. Restrict to 1 (only the running process), then fork: the fork
+        must be denied with EAGAIN (errno 11). The control run (no restriction)
+        forks successfully, proving the denial is due to the dynamic limit, not
+        the fork itself.
+        """
+        fork_once = (
+            "import os\n"
+            "print('STARTED', flush=True)\n"
+            "try:\n"
+            "    pid = os.fork()\n"
+            "    if pid == 0: os._exit(0)\n"
+            "    os.waitpid(pid, 0); print('FORK_OK')\n"
+            "except OSError as e: print('FORK_DENIED', e.errno)\n"
+        )
+
+        def restrict_to_1(event, ctx):
             if event.syscall in ("execve", "execveat"):
                 ctx.restrict_max_processes(1)
+            return 0
 
-        result = _policy(policy_fn=on_event).run(
-            ["echo", "ok"]
+        restricted = _policy(policy_fn=restrict_to_1).run(
+            [sys.executable, "-c", fork_once], timeout=15
         )
+        out = restricted.stdout.decode()
+        assert restricted.success, restricted.error
+        assert "STARTED" in out, out
+        assert "FORK_OK" not in out, out
+        assert "FORK_DENIED 11" in out, out          # EAGAIN from the limit
+
+        # Control: no restriction -> the same fork succeeds.
+        baseline = _policy(policy_fn=lambda e, ctx: 0).run(
+            [sys.executable, "-c", fork_once], timeout=15
+        )
+        assert baseline.success, baseline.error
+        assert "FORK_OK" in baseline.stdout.decode(), baseline.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -167,32 +271,37 @@ class TestPolicyFnRestrict:
 
 class TestPolicyFnVerdict:
     def test_deny_with_errno(self):
-        """Return a positive int to deny with that errno."""
-        import errno
-        import tempfile, os
+        """Returning a positive int denies with *that* errno — attributable to policy_fn.
 
-        out = os.path.join(tempfile.gettempdir(), f"sandlock-test-denywith-{os.getpid()}")
+        The previous version connected to 127.0.0.1:1, which is outside the
+        ``net_allow`` allowlist, so Landlock denies it with the same errno 13 —
+        the test passed even if the policy_fn errno path were broken. Target a
+        live listener on an *allowlisted* port instead: Landlock permits it and
+        the listener accepts it, so errno 13 can only come from the policy_fn.
+        """
+        import errno
 
         def on_event(event, ctx):
             if event.syscall == "connect":
                 return errno.EACCES  # 13
             return 0
 
-        result = _policy(net_allow=["127.0.0.1:443"], policy_fn=on_event).run(["python3", "-c",
-            f"import socket\n"
-            f"s = socket.socket(); s.settimeout(0.5)\n"
-            f"try:\n"
-            f"  s.connect(('127.0.0.1', 1))\n"
-            f"  open('{out}', 'w').write('CONNECTED')\n"
-            f"except OSError as e:\n"
-            f"  open('{out}', 'w').write(f'ERR:{{e.errno}}')\n"
-            f"s.close()\n"
-        ])
-        assert result.success
-        with open(out) as f:
-            content = f.read()
-        assert content == "ERR:13", f"expected EACCES (13), got: {content}"
-        os.unlink(out)
+        with _loopback_listener() as (host, port):
+            script = (
+                "import socket\n"
+                "s = socket.socket(); s.settimeout(2)\n"
+                "try:\n"
+                f"    s.connect(('{host}', {port})); print('CONNECTED')\n"
+                "except OSError as e: print('ERR:%d' % e.errno)\n"
+                "s.close()\n"
+            )
+            result = _policy(
+                net_allow=[f"{host}:{port}"], policy_fn=on_event
+            ).run([sys.executable, "-c", script])
+
+        out = result.stdout.decode().strip()
+        assert result.success, result.error
+        assert out == "ERR:13", f"expected policy_fn EACCES (13), got: {out!r}"
 
     def test_audit_allows(self):
         """Return 'audit' or -2 to allow but flag."""
@@ -217,18 +326,35 @@ class TestPolicyFnVerdict:
         assert not result.success, "unrecognized verdict must fail closed (deny)"
 
     def test_deny_returns_true(self):
-        """Return True to deny with EPERM (backward compat)."""
-        def on_event(event, ctx):
-            if event.syscall == "connect":
-                return True
-            return False
+        """Returning True denies connect with EPERM — and the process keeps running.
 
-        result = _policy(net_allow=["127.0.0.1:443"], policy_fn=on_event).run(["python3", "-c",
-            "import socket; s=socket.socket(); s.settimeout(0.5); "
-            "s.connect_ex(('127.0.0.1', 1)); s.close(); print('ok')"
-        ])
-        # connect was denied but process should still run
-        assert result.success
+        The target is a live listener on an allowlisted port, so without the
+        policy_fn deny the connect would *succeed*. EPERM (errno 1) therefore
+        proves the deny fired, and the trailing marker proves the deny did not
+        kill the process (the backward-compat contract).
+        """
+        def on_event(event, ctx):
+            # True only for connect (deny); allow everything else.
+            return event.syscall == "connect"
+
+        with _loopback_listener() as (host, port):
+            script = (
+                "import socket\n"
+                "s = socket.socket(); s.settimeout(2)\n"
+                "try:\n"
+                f"    s.connect(('{host}', {port})); print('ALLOWED')\n"
+                "except OSError as e: print('ERR', e.errno)\n"
+                "s.close(); print('SURVIVED')\n"
+            )
+            result = _policy(
+                net_allow=[f"{host}:{port}"], policy_fn=on_event
+            ).run([sys.executable, "-c", script])
+
+        out = result.stdout.decode()
+        assert "ALLOWED" not in out, out
+        assert "ERR 1" in out, out          # EPERM from the policy_fn deny
+        assert "SURVIVED" in out, out        # deny must not kill the process
+        assert result.success, result.error
 
     def test_deny_path_dynamic(self):
         """ctx.deny_path blocks file access."""
@@ -259,9 +385,35 @@ class TestPolicyFnVerdict:
 
 class TestPolicyFnPerPid:
     def test_restrict_pid_network(self):
-        """Per-PID network restriction."""
+        """restrict_pid_network narrows a specific pid's outbound to the listed IPs.
+
+        The old version restricted the pid then ran ``echo ok`` — it never made
+        a network call, so it could not observe any restriction. Mirror
+        test_restrict_network_on_execve with two live loopback listeners, both
+        allowlisted: restricting the exec'd pid to ["127.0.0.1"] must permit the
+        first and refuse the second (errno 111).
+        """
         def on_event(event, ctx):
             if event.syscall in ("execve", "execveat"):
                 ctx.restrict_pid_network(event.pid, ["127.0.0.1"])
 
-        result = _policy(net_allow=["127.0.0.1:443"], policy_fn=on_event).run(["echo", "ok"])
+        with _loopback_listener("127.0.0.1") as (h1, p1), \
+                _loopback_listener("127.0.0.2") as (h2, p2):
+            script = (
+                "import socket\n"
+                "def probe(ip, port):\n"
+                "    s = socket.socket(); s.settimeout(2)\n"
+                "    try:\n"
+                "        s.connect((ip, port)); return 'OK'\n"
+                "    except OSError as e: return 'ERR%d' % e.errno\n"
+                "    finally: s.close()\n"
+                f"print('allowed=' + probe('{h1}', {p1}), 'denied=' + probe('{h2}', {p2}))\n"
+            )
+            result = _policy(
+                net_allow=[f"{h1}:{p1}", f"{h2}:{p2}"], policy_fn=on_event
+            ).run([sys.executable, "-c", script])
+
+        out = result.stdout.decode()
+        assert result.success, result.error
+        assert "allowed=OK" in out, out
+        assert "denied=ERR111" in out, out

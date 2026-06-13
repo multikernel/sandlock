@@ -235,8 +235,12 @@ pub enum PortAllow {
 /// Global network policy for the sandbox.
 #[derive(Debug, Clone)]
 pub enum NetworkPolicy {
-    /// No IP-level restriction (no `--net-allow` configured and no
-    /// `policy_fn` override). The Landlock direct path enforces ports.
+    /// No IP-level restriction for this protocol. On the on-behalf path this
+    /// is only ever reached *with* a destination policy active (e.g. a `*:*` /
+    /// `:*` allow-all-ports rule), so here it means "allow any destination."
+    /// The empty-`net_allow` deny-all case never reaches this arm: with no
+    /// destination policy the connect is returned to the kernel and Landlock's
+    /// `CONNECT_TCP` deny-all governs it.
     Unrestricted,
     /// Endpoint-level allowlist: a connection is permitted iff the
     /// destination IP and port match at least one entry below.
@@ -404,10 +408,18 @@ pub struct NotifPolicy {
     pub max_memory_bytes: u64,
     pub max_processes: u32,
     pub has_memory_limit: bool,
-    pub has_net_allowlist: bool,
+    /// A **network destination policy** is active: a `net_allow` allowlist, a
+    /// `net_deny` denylist, an HTTP ACL, or a live `policy_fn` (i.e.
+    /// `network_destination_policy`). Despite the historical singular framing
+    /// this is *not* only an allowlist. When set, the on-behalf path is the
+    /// IP-level enforcer for connect/sendto/sendmsg and those handlers must
+    /// never `Continue`; when clear, the syscalls are trapped only to gate
+    /// named `AF_UNIX` sockets and IP destinations are returned to the kernel
+    /// so Landlock/BPF govern them.
+    pub has_net_destination_policy: bool,
     /// `--net-deny-bind` is active: trap `bind()` and register the on-behalf
     /// handler so denied TCP ports can be refused (independent of the
-    /// connect-side `has_net_allowlist`).
+    /// connect-side `has_net_destination_policy`).
     pub has_bind_denylist: bool,
     /// Named (pathname) `AF_UNIX` connect gate. When true, `connect()` to a
     /// named unix socket whose path is not covered by an fs-write grant is
@@ -450,6 +462,27 @@ pub struct NotifPolicy {
     /// Active MITM CA public cert (PEM bytes) to inject. `Some` only when
     /// HTTPS MITM is active (BYO or generated).
     pub ca_inject_pem: Option<std::sync::Arc<Vec<u8>>>,
+}
+
+impl NotifPolicy {
+    /// Whether an IP-family `connect()` must be handled on-behalf by the
+    /// supervisor, given the destination's loopback-ness.
+    ///
+    /// This is the connect-side form of the invariant the `sendto`/`sendmsg`
+    /// handlers already follow: with [`Self::has_net_destination_policy`] the
+    /// on-behalf path is the IP-level enforcer and must never `Continue`;
+    /// without it there is nothing to enforce and the syscall is returned to
+    /// the kernel. `connect()` adds one wrinkle over datagram sends —
+    /// `port_remap` rewrites the destination, but only for **loopback** — so
+    /// that is the sole extra reason to supervise an otherwise-unpoliced IP
+    /// connect. When this returns `false`, the connect was trapped purely to
+    /// gate named `AF_UNIX` sockets, and deferring to the kernel lets the
+    /// child's own Landlock `CONNECT_TCP` rules govern it (deny-all for an
+    /// empty `net_allow`); handling it on-behalf would run it in the
+    /// unconfined supervisor and bypass that decision.
+    pub(crate) fn ip_connect_supervised(&self, dest_is_loopback: bool) -> bool {
+        self.has_net_destination_policy || (self.port_remap && dest_is_loopback)
+    }
 }
 
 // ============================================================
@@ -1383,7 +1416,7 @@ async fn handle_notification(
     if matches!(action, NotifAction::Continue)
         && crate::resource::requires_process_creation_tracking(&notif, fd, policy)
     {
-        match crate::resource::prepare_process_creation_tracking(notif.pid as i32).await {
+        match crate::resource::prepare_process_creation_tracking(ctx, notif.pid as i32).await {
             Ok(trace) => {
                 creation_trace = Some(trace);
             }
@@ -1435,7 +1468,7 @@ async fn handle_notification(
 
     if let Some(trace) = creation_trace {
         if send_result.is_ok() {
-            match crate::resource::finish_process_creation_tracking(ctx, trace).await {
+            match crate::resource::finish_process_creation_tracking(trace).await {
                 Ok(true) => {}
                 Ok(false) => {
                     crate::resource::rollback_fork_count(&ctx.resource).await;

@@ -13,7 +13,6 @@
 // thread cannot mutate.
 
 use std::io;
-use std::mem;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -86,7 +85,7 @@ fn is_thread_create(notif: &SeccompNotif, notif_fd: RawFd) -> bool {
 pub(crate) async fn handle_fork(
     notif: &SeccompNotif,
     notif_fd: RawFd,
-    resource: &Arc<Mutex<ResourceState>>,
+    ctx: &Arc<SupervisorCtx>,
     _policy: &NotifPolicy,
 ) -> NotifAction {
     let nr = notif.data.nr as i64;
@@ -103,7 +102,18 @@ pub(crate) async fn handle_fork(
         return NotifAction::Continue;
     }
 
-    let mut rs = resource.lock().await;
+    // Effective process limit. A policy_fn can tighten the static limit at
+    // runtime (`restrict_max_processes`), so read the live value when a
+    // callback is active; otherwise use the static one. (Lock policy_fn before
+    // the resource lock to keep a consistent order.)
+    let live_max = {
+        let pfs = ctx.policy_fn.lock().await;
+        pfs.live_policy
+            .as_ref()
+            .and_then(|lp| lp.read().ok().map(|l| l.max_processes))
+    };
+
+    let mut rs = ctx.resource.lock().await;
 
     // Checkpoint/freeze: hold the fork notification.
     if rs.hold_forks {
@@ -112,7 +122,8 @@ pub(crate) async fn handle_fork(
     }
 
     // Enforce concurrent process limit.
-    if rs.proc_count >= rs.max_processes {
+    let limit = live_max.unwrap_or(rs.max_processes);
+    if rs.proc_count >= limit {
         return NotifAction::Errno(EAGAIN);
     }
 
@@ -186,20 +197,45 @@ pub(crate) async fn register_child_if_new(ctx: &Arc<SupervisorCtx>, pid: i32) {
     let _ = register_pid_if_new(ctx, pid);
 }
 
-/// One-shot ptrace attachment around a fork-like syscall. RAII guard:
-/// on drop, detaches the caller so the supervisor cannot leak a ptrace
-/// relationship if a code path between `prepare_*` and `finish_*`
-/// panics or returns early. Functions that complete the tracking and
-/// detach explicitly should still hand the trace to a consuming
-/// function (or let it fall out of scope) — duplicate `PTRACE_DETACH`
-/// is harmless (returns ESRCH and is ignored).
+/// Command sent to the per-trace ptrace worker after `prepare` returns.
+enum TraceCmd {
+    /// The seccomp `Continue` has been sent; resume and capture the fork event.
+    Proceed,
+    /// Tear down without proceeding (e.g. `send_response` failed).
+    Abort,
+}
+
+/// Handle to a one-shot ptrace fork-tracking session.
+///
+/// ptrace *commands* (`PTRACE_SEIZE`, `GETEVENTMSG`, `DETACH`, …) are
+/// per-tracer-thread — issuing one from a thread other than the one that
+/// `SEIZE`d fails with `ESRCH`. (Only `waitpid` may be called cross-thread.)
+/// So the whole command sequence — SEIZE, the post-`Continue` event wait, and
+/// the final `PTRACE_DETACH` — runs inside one `spawn_blocking` worker
+/// (`process_creation_worker`) pinned to a single thread. This handle only
+/// carries the channels driving that worker plus the tracee tid (used by
+/// `finish` to wake the worker's blocking wait on the failed-fork path); it
+/// owns no ptrace state, so dropping it never issues a cross-thread ptrace op.
 pub(crate) struct ProcessCreationTrace {
+    cmd_tx: std::sync::mpsc::SyncSender<TraceCmd>,
+    join: Option<tokio::task::JoinHandle<io::Result<bool>>>,
+    /// The traced (forking) task's tid — `finish`'s watchdog signals it.
     caller_tid: i32,
+    /// True once `finish`/`abort` has sent a command; gates the Drop fallback.
+    signaled: bool,
 }
 
 impl Drop for ProcessCreationTrace {
     fn drop(&mut self) {
-        detach_traced(self.caller_tid);
+        // If neither `finish` nor `abort` ran (early return / panic between
+        // `prepare` and `finish`), the worker is blocked waiting for a command.
+        // Tell it to abort so it detaches the tracee on its own thread and
+        // exits, rather than leaking a blocked blocking-pool thread.
+        if !self.signaled {
+            let _ = self.cmd_tx.send(TraceCmd::Abort);
+        }
+        // The dropped `join` handle detaches the worker task; it runs to
+        // completion (performing the ptrace detach on its owning thread).
     }
 }
 
@@ -230,68 +266,87 @@ pub(crate) fn requires_process_creation_tracking(
 
 /// Arm ptrace fork-event tracking on the syscall's calling task.
 ///
-/// The caller is stopped in seccomp user notification when this runs.
-/// After the supervisor sends `Continue`, the kernel executes the
-/// fork-like syscall and reports `PTRACE_EVENT_{FORK,VFORK,CLONE}`;
-/// the new child is born traced/stopped, so we can register it before
-/// detaching either task.
-///
-/// Runs the blocking `waitpid` on a tokio blocking-pool thread so the
-/// notification handler's worker is not stalled if the wait stretches.
+/// The caller is parked in the seccomp user-notification wait when this
+/// runs. Crucially, the tracee **cannot reach a ptrace-stop until the
+/// supervisor sends `Continue`** — so we must not `PTRACE_INTERRUPT`+wait
+/// here (that deadlocks). Instead `prepare` only performs `PTRACE_SEIZE`
+/// (which does not stop the tracee) on a dedicated worker thread, then
+/// returns once SEIZE is confirmed. The worker parks until `finish` (called
+/// after `Continue`) tells it to proceed, at which point it does the
+/// `INTERRUPT` + event loop + detach — all on that same thread, as ptrace
+/// requires.
 pub(crate) async fn prepare_process_creation_tracking(
+    ctx: &Arc<SupervisorCtx>,
     caller_tid: i32,
 ) -> io::Result<ProcessCreationTrace> {
-    tokio::task::spawn_blocking(move || prepare_process_creation_tracking_blocking(caller_tid))
-        .await
-        .map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("spawn_blocking join: {e}"))
-        })?
+    let ctx = Arc::clone(ctx);
+    // SEIZE result, reported back as an errno so `io::Error` need not cross
+    // the channel (it is not `Clone`/`Send`-friendly to reconstruct).
+    let (attached_tx, attached_rx) = tokio::sync::oneshot::channel::<Result<(), i32>>();
+    // Capacity 1: `finish`/`abort`/Drop send exactly one command; the send is
+    // non-blocking and the worker is always waiting to receive it.
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::sync_channel::<TraceCmd>(1);
+
+    let join = tokio::task::spawn_blocking(move || {
+        process_creation_worker(caller_tid, ctx, attached_tx, cmd_rx)
+    });
+
+    match attached_rx.await {
+        Ok(Ok(())) => Ok(ProcessCreationTrace { cmd_tx, join: Some(join), caller_tid, signaled: false }),
+        Ok(Err(errno)) => {
+            let _ = join.await;
+            Err(io::Error::from_raw_os_error(errno))
+        }
+        Err(_) => {
+            // Worker dropped the sender without reporting (panic). Reap it.
+            let _ = join.await;
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                "process-creation worker exited before SEIZE",
+            ))
+        }
+    }
 }
 
-fn prepare_process_creation_tracking_blocking(
+/// Owns the entire ptrace lifecycle for one fork-tracking session on a single
+/// thread. SEIZE happens before `Continue`; the `INTERRUPT` + event loop +
+/// detach happen after, once `cmd_rx` delivers `Proceed`.
+fn process_creation_worker(
     caller_tid: i32,
-) -> io::Result<ProcessCreationTrace> {
+    ctx: Arc<SupervisorCtx>,
+    attached_tx: tokio::sync::oneshot::Sender<Result<(), i32>>,
+    cmd_rx: std::sync::mpsc::Receiver<TraceCmd>,
+) -> io::Result<bool> {
+    // SEIZE (does NOT stop the tracee) before `Continue`, so the child is born
+    // traced/stopped once the fork runs. Because SEIZE itself never blocks on
+    // a stop, it is safe against the seccomp-notify wait the tracee sits in.
     let opts = (libc::PTRACE_O_TRACEFORK
         | libc::PTRACE_O_TRACEVFORK
         | libc::PTRACE_O_TRACECLONE
         | libc::PTRACE_O_TRACESYSGOOD) as libc::c_ulong;
-    let ret = unsafe {
-        libc::ptrace(
-            libc::PTRACE_SEIZE as libc::c_uint,
-            caller_tid,
-            0,
-            opts,
-        )
-    };
+    let ret = unsafe { libc::ptrace(libc::PTRACE_SEIZE as libc::c_uint, caller_tid, 0, opts) };
     if ret < 0 {
-        return Err(io::Error::last_os_error());
+        let errno = io::Error::last_os_error().raw_os_error().unwrap_or(libc::EPERM);
+        let _ = attached_tx.send(Err(errno));
+        return Err(io::Error::from_raw_os_error(errno));
+    }
+    let _ = attached_tx.send(Ok(()));
+
+    // Park until the orchestration confirms `Continue` was sent (Proceed) or
+    // asks us to tear down (Abort).
+    match cmd_rx.recv() {
+        Ok(TraceCmd::Proceed) => {}
+        Ok(TraceCmd::Abort) | Err(_) => {
+            detach_traced(caller_tid);
+            return Ok(false);
+        }
     }
 
-    // Arm the RAII guard the moment SEIZE succeeds: any early return
-    // from here to the end of this function detaches via Drop.
-    let trace = ProcessCreationTrace { caller_tid };
-
-    let ret = unsafe {
-        libc::ptrace(libc::PTRACE_INTERRUPT as libc::c_uint, caller_tid, 0, 0)
-    };
-    if ret < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    wait_for_ptrace_stop(caller_tid)?;
-
-    // Arm a syscall-exit stop as a fallback. A successful fork-like
-    // syscall reports PTRACE_EVENT_{FORK,VFORK,CLONE}; a failed one has
-    // no child event, but it still reaches syscall-exit so the
-    // supervisor will not block forever waiting for a child that was
-    // never created.
-    let ret = unsafe {
-        libc::ptrace(libc::PTRACE_SYSCALL as libc::c_uint, caller_tid, 0, 0)
-    };
-    if ret < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    Ok(trace)
+    // After `Continue`, watch for the fork-creation event (no INTERRUPT — see
+    // `run_creation_event_loop`).
+    let result = run_creation_event_loop(caller_tid, &ctx);
+    detach_traced(caller_tid);
+    result
 }
 
 fn detach_traced(tid: i32) {
@@ -321,21 +376,6 @@ fn wait_for_ptrace_stop(tid: i32) -> io::Result<libc::c_int> {
     Ok(status)
 }
 
-fn syscall_stop_kind(tid: i32) -> io::Result<u8> {
-    let mut info: libc::ptrace_syscall_info = unsafe { mem::zeroed() };
-    let ret = unsafe {
-        libc::ptrace(
-            libc::PTRACE_GET_SYSCALL_INFO as libc::c_uint,
-            tid,
-            mem::size_of::<libc::ptrace_syscall_info>(),
-            &mut info,
-        )
-    };
-    if ret < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(info.op)
-}
 
 #[cfg(test)]
 static CHILD_REGISTERED_HOOK: std::sync::Mutex<
@@ -351,88 +391,87 @@ fn child_registered_for_test(child_pid: i32) {
     }
 }
 
-/// Complete one-shot process-creation tracking after `Continue`.
-///
-/// Runs the blocking `waitpid` on a tokio blocking-pool thread so the
-/// notification handler's worker is not stalled.
-pub(crate) async fn finish_process_creation_tracking(
-    ctx: &Arc<SupervisorCtx>,
-    trace: ProcessCreationTrace,
-) -> io::Result<bool> {
-    let ctx = Arc::clone(ctx);
-    tokio::task::spawn_blocking(move || finish_process_creation_tracking_blocking(&ctx, trace))
-        .await
-        .map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("spawn_blocking join: {e}"))
-        })?
-}
+/// Signal `finish`'s watchdog sends to the tracee to wake this blocking wait
+/// when a fork created no child (a failed fork emits no ptrace event). SIGURG
+/// is effectively unused by normal programs and ignored by default, so it is a
+/// safe wake poke that we recognise and swallow.
+const FORK_WATCHDOG_SIGNAL: libc::c_int = libc::SIGURG;
 
-fn finish_process_creation_tracking_blocking(
-    ctx: &Arc<SupervisorCtx>,
-    trace: ProcessCreationTrace,
-) -> io::Result<bool> {
-    // Every early return below relies on `trace`'s Drop to detach the
-    // caller. The success path hands `trace` off to
-    // `finish_process_creation_event`, which keeps the same guarantee.
+/// Watch the SEIZE'd parent for the fork-creation event after `Continue`.
+///
+/// Resolves to `Ok(true)` when the fork created a child (registered before it
+/// can run user code) or `Ok(false)` when the fork-like syscall created none.
+/// The caller (`process_creation_worker`) detaches the tracee afterward.
+///
+/// We request only fork events (PTRACE_O_TRACEFORK family), not syscall
+/// tracing. A *successful* fork therefore stops the parent at
+/// `PTRACE_EVENT_{FORK,VFORK,CLONE}` synchronously with the fork — with both
+/// parent and child born stopped, so the child cannot run user code while we
+/// register it. A *failed* fork produces no ptrace stop at all, so this would
+/// block forever; `finish` bounds it by sending [`FORK_WATCHDOG_SIGNAL`] to the
+/// tracee after a deadline, which we observe here as a signal-delivery-stop and
+/// treat as "no child". (We do **not** `PTRACE_INTERRUPT` to force a stop —
+/// that races the fork and is unreliable; and we do not busy-poll.)
+fn run_creation_event_loop(caller_tid: i32, ctx: &Arc<SupervisorCtx>) -> io::Result<bool> {
     loop {
-        let status = wait_for_ptrace_stop(trace.caller_tid)?;
+        let mut status: libc::c_int = 0;
+        let r = unsafe { libc::waitpid(caller_tid, &mut status, libc::__WALL) };
+        if r < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(e);
+        }
+        if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+            // Tracee exited / was killed out from under us: no child to track.
+            return Ok(false);
+        }
+        if !libc::WIFSTOPPED(status) {
+            continue;
+        }
 
         let event = (status >> 16) & 0xffff;
-        let is_fork_event = event == libc::PTRACE_EVENT_FORK
+        if event == libc::PTRACE_EVENT_FORK
             || event == libc::PTRACE_EVENT_VFORK
-            || event == libc::PTRACE_EVENT_CLONE;
-        if is_fork_event {
-            return finish_process_creation_event(ctx, trace);
+            || event == libc::PTRACE_EVENT_CLONE
+        {
+            return handle_fork_event(caller_tid, ctx);
         }
 
         let stopsig = libc::WSTOPSIG(status);
-        if event == 0 && stopsig == (libc::SIGTRAP | 0x80) {
-            let op = syscall_stop_kind(trace.caller_tid)?;
-            match op {
-                libc::PTRACE_SYSCALL_INFO_ENTRY => {
-                    let ret = unsafe {
-                        libc::ptrace(
-                            libc::PTRACE_SYSCALL as libc::c_uint,
-                            trace.caller_tid,
-                            0,
-                            0,
-                        )
-                    };
-                    if ret < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    continue;
-                }
-                libc::PTRACE_SYSCALL_INFO_EXIT => {
-                    return Ok(false);
-                }
-                op => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("unexpected ptrace syscall stop kind: {op}"),
-                    ));
-                }
-            }
+        if stopsig == FORK_WATCHDOG_SIGNAL {
+            // `finish`'s watchdog fired: the fork-like syscall created no child
+            // (it returned without a fork event, e.g. EAGAIN/ENOMEM). Swallow
+            // the wake signal — the worker detaches the tracee next.
+            return Ok(false);
         }
 
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("unexpected ptrace event: {event}"),
-        ));
+        // Some other signal-delivery-stop in the window: forward the pending
+        // signal and keep waiting for the fork event.
+        let inject = if stopsig == libc::SIGTRAP { 0 } else { stopsig as libc::c_ulong };
+        ptrace_resume(caller_tid, libc::PTRACE_CONT, inject)?;
     }
 }
 
-fn finish_process_creation_event(
-    ctx: &Arc<SupervisorCtx>,
-    trace: ProcessCreationTrace,
-) -> io::Result<bool> {
-    // `trace` detaches the caller on drop; the explicit child-side
-    // detaches stay manual since the child is not held by the guard.
+/// `ptrace(request, tid, 0, data)` returning an error on failure.
+fn ptrace_resume(tid: i32, request: libc::c_uint, data: libc::c_ulong) -> io::Result<()> {
+    let ret = unsafe { libc::ptrace(request, tid, 0, data) };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// On a `PTRACE_EVENT_{FORK,VFORK,CLONE}`: read the new child's pid, register
+/// it in `ProcessIndex` (so the execve argv-freeze can enumerate it), then
+/// detach the child so it can run. Runs on the worker thread.
+fn handle_fork_event(caller_tid: i32, ctx: &Arc<SupervisorCtx>) -> io::Result<bool> {
     let mut child_pid: libc::c_ulong = 0;
     let ret = unsafe {
         libc::ptrace(
             libc::PTRACE_GETEVENTMSG as libc::c_uint,
-            trace.caller_tid,
+            caller_tid,
             0,
             &mut child_pid,
         )
@@ -453,37 +492,59 @@ fn finish_process_creation_event(
     #[cfg(test)]
     child_registered_for_test(child_pid);
 
-    // Wait for the child's birth-traced ptrace-stop, then detach so it
-    // can run. Result ignored: the child may have already proceeded
-    // (PTRACE_O_TRACEFORK leaves it stopped, but a racing exit is
-    // possible) — detach is harmless either way.
+    // The child is born stopped under PTRACE_O_TRACEFORK; wait for its
+    // birth-stop, then detach so it can run. Result ignored: a racing exit is
+    // possible and detach is harmless either way. The caller (parent) is
+    // detached by `process_creation_worker`.
     let _ = wait_for_ptrace_stop(child_pid);
     detach_traced(child_pid);
-    drop(trace);
     Ok(true)
 }
 
-/// Tear down a tracking session whose `Continue` was never sent
-/// (e.g., `send_response` failed). Runs the blocking `waitpid` on the
-/// tokio blocking pool.
-pub(crate) async fn abort_process_creation_tracking(trace: ProcessCreationTrace) {
-    let _ = tokio::task::spawn_blocking(move || abort_process_creation_tracking_blocking(trace))
-        .await;
+/// Complete one-shot process-creation tracking after `Continue`.
+///
+/// Signals the worker (started in `prepare`) to proceed, then awaits its
+/// result. All ptrace work happens on the worker's single thread; this only
+/// drives it and bounds the failed-fork case.
+pub(crate) async fn finish_process_creation_tracking(
+    mut trace: ProcessCreationTrace,
+) -> io::Result<bool> {
+    /// Upper bound on how long to wait for the fork event. The event is
+    /// delivered synchronously with the fork (sub-millisecond), so this only
+    /// elapses for a fork that created no child (e.g. EAGAIN/ENOMEM).
+    const FORK_EVENT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+    trace.signaled = true;
+    let caller_tid = trace.caller_tid;
+    // Send is non-blocking (capacity-1 channel, single sender) — the worker is
+    // parked waiting to receive, then blocks in `waitpid` for the fork event.
+    let _ = trace.cmd_tx.send(TraceCmd::Proceed);
+    let mut join = trace.join.take().expect("join handle present until finish/abort");
+
+    let join_err =
+        |e| io::Error::new(io::ErrorKind::Other, format!("spawn_blocking join: {e}"));
+
+    // Race the worker against a watchdog. The worker's `waitpid` is blocking, so
+    // a *failed* fork (no ptrace event) would hang it forever; on the deadline
+    // we poke the tracee so its `waitpid` returns and the worker reports "no
+    // child". `kill` does not need the tracer thread, so this is safe from here.
+    tokio::select! {
+        res = &mut join => res.map_err(join_err)?,
+        _ = tokio::time::sleep(FORK_EVENT_DEADLINE) => {
+            unsafe { libc::kill(caller_tid, FORK_WATCHDOG_SIGNAL); }
+            join.await.map_err(join_err)?
+        }
+    }
 }
 
-fn abort_process_creation_tracking_blocking(trace: ProcessCreationTrace) {
-    // INTERRUPT + wait so we can detach cleanly from a known state;
-    // the actual detach happens via `trace`'s Drop on scope exit.
-    let ret = unsafe {
-        libc::ptrace(
-            libc::PTRACE_INTERRUPT as libc::c_uint,
-            trace.caller_tid,
-            0,
-            0,
-        )
-    };
-    if ret == 0 {
-        let _ = wait_for_ptrace_stop(trace.caller_tid);
+/// Tear down a tracking session whose `Continue` was never sent (e.g.
+/// `send_response` failed). Signals the worker to abort; it detaches the
+/// tracee on its own thread.
+pub(crate) async fn abort_process_creation_tracking(mut trace: ProcessCreationTrace) {
+    trace.signaled = true;
+    let _ = trace.cmd_tx.send(TraceCmd::Abort);
+    if let Some(join) = trace.join.take() {
+        let _ = join.await;
     }
 }
 
@@ -518,7 +579,18 @@ pub(crate) async fn handle_memory(
 ) -> NotifAction {
     let nr = notif.data.nr as i64;
     let args = &notif.data.args;
-    let limit = policy.max_memory_bytes;
+    // Effective limit. A policy_fn can tighten the static ceiling at runtime
+    // (`restrict_max_memory`), so read the live value when a callback is
+    // active; otherwise use the static limit. The live value is seeded from
+    // the static `max_memory` ceiling, and this handler is only registered
+    // when that ceiling exists, so it is never the 0/unlimited sentinel.
+    let limit = {
+        let pfs = ctx.policy_fn.lock().await;
+        pfs.live_policy
+            .as_ref()
+            .and_then(|lp| lp.read().ok().map(|l| l.max_memory_bytes))
+            .unwrap_or(policy.max_memory_bytes)
+    };
 
     let mut st = ctx.resource.lock().await;
 
@@ -637,7 +709,7 @@ mod tests {
             max_memory_bytes: 0,
             max_processes: 0,
             has_memory_limit: false,
-            has_net_allowlist: false,
+            has_net_destination_policy: false,
             has_bind_denylist: false,
             has_unix_fs_gate: false,
             has_random_seed: false,
@@ -863,10 +935,12 @@ mod tests {
 
         let ctx = fake_supervisor_ctx(true);
         let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
+            // `enable_all` (not just io): `finish_process_creation_tracking`
+            // arms a `tokio::time` watchdog, which needs the time driver.
+            .enable_all()
             .build()
             .expect("tokio runtime");
-        let trace = match rt.block_on(prepare_process_creation_tracking(caller)) {
+        let trace = match rt.block_on(prepare_process_creation_tracking(&ctx, caller)) {
             Ok(trace) => trace,
             Err(e) if matches!(e.raw_os_error(), Some(libc::EPERM | libc::EACCES)) => {
                 eprintln!("skipping ptrace fork-event test: ptrace denied: {e}");
@@ -877,7 +951,7 @@ mod tests {
 
         flags.write(GO, 1);
         let created = rt
-            .block_on(finish_process_creation_tracking(&ctx, trace))
+            .block_on(finish_process_creation_tracking(trace))
             .expect("finish process-creation tracking");
         assert!(created, "fork/clone should produce a ptrace process-creation event");
 

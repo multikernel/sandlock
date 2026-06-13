@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
 import sys
 from types import SimpleNamespace
 
@@ -69,21 +70,36 @@ print("done")
 
     def test_no_network_blocks_connect(self, tmp_path):
         workspace = str(tmp_path)
-        script = """\
+        # A live loopback listener: if the sandbox failed to block egress the
+        # connect would SUCCEED, not merely fail with ECONNREFUSED to a dead
+        # port. That distinguishes a real Landlock deny (EACCES) from an
+        # incidental failure — without it this test passes even with zero
+        # network enforcement (the bug that let the on-behalf path bypass
+        # Landlock's CONNECT_TCP deny-all once any fs grant is present).
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        port = listener.getsockname()[1]
+        try:
+            script = f"""\
 import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(3)
 try:
-    s.settimeout(2)
-    s.connect(("127.0.0.1", 80))
-    print("connected")
-except (OSError, socket.timeout):
-    print("blocked")
+    s.connect(("127.0.0.1", {port}))
+    print("ALLOWED")
+except OSError as e:
+    print("ERR", e.errno)
 finally:
     s.close()
 """
-        result = _run_in_sandbox(None, script, workspace)
-        assert result.success
-        assert b"blocked" in result.stdout
+            result = _run_in_sandbox(None, script, workspace)
+            assert result.success
+            # errno 13 == EACCES: the kernel's Landlock CONNECT_TCP hook denied
+            # the connect before it could reach the listener.
+            assert b"ERR 13" in result.stdout, result.stdout
+        finally:
+            listener.close()
 
 
 class TestWorkspaceSharing:

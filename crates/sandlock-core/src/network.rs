@@ -495,6 +495,17 @@ async fn connect_on_behalf(
     // closed: the BPF should have prevented socket creation, so
     // reaching here with one is an unexpected case worth refusing.
     if let Some(ip) = parse_ip_from_sockaddr(&addr_bytes) {
+        // Same invariant as the sendto/sendmsg handlers above: `connect()` is
+        // trapped whenever the named-`AF_UNIX` gate is on (any fs grant), for
+        // every address family, but with no network destination policy there
+        // is nothing to enforce on an IP destination. Return it to the kernel
+        // so the child's own Landlock `CONNECT_TCP` rules govern it — handling
+        // it on-behalf in the unconfined supervisor would bypass that decision
+        // (an empty `net_allow` deny-all would silently permit egress). See
+        // `NotifPolicy::ip_connect_supervised`.
+        if !ctx.policy.ip_connect_supervised(ip.is_loopback()) {
+            return NotifAction::Continue;
+        }
         let dest_port = parse_port_from_sockaddr(&addr_bytes);
         let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
             Ok(fd) => fd,
@@ -1305,7 +1316,7 @@ async fn sendmsg_on_behalf(
     // connected (NULL) name for a denied address. Send on-behalf (including
     // connected sends) so the verdict is made on the immune copy. Without a
     // policy there is nothing to bypass, so the Continue fast path below stands.
-    let dest_policy = ctx.policy.has_net_allowlist;
+    let dest_policy = ctx.policy.has_net_destination_policy;
     if !dest_policy {
         // Pre-scan for Continue cases (connected socket / non-IP family).
         // EFAULT on unreadable msghdr (vs. Continue, which would let the kernel
@@ -1601,7 +1612,7 @@ async fn sendmmsg_on_behalf(
     // entry for a denied address after our prescan, bypassing the allowlist on
     // an unconnected datagram socket. On-behalf sends use the immune copy and
     // validate every IP destination, so the verdict is TOCTOU-free.
-    if ctx.policy.has_net_allowlist {
+    if ctx.policy.has_net_destination_policy {
         let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
             Ok(fd) => fd,
             Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
