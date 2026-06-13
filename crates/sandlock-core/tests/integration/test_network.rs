@@ -741,3 +741,55 @@ async fn test_net_deny_bind_blocks_tcp_only() {
     assert!(content.contains("\"tcp_allowed\": \"ok\""), "non-denied TCP bind must succeed; got: {content}");
     assert!(content.contains("\"udp_denied\": \"ok\""), "UDP on the denied port must be allowed (TCP-only); got: {content}");
 }
+
+/// Regression (deny-all bypass via the unix-socket connect gate): an empty
+/// `net_allow` must DENY outbound TCP even when filesystem grants are present.
+///
+/// Any fs grant turns on the named-`AF_UNIX` connect gate
+/// (`has_unix_fs_gate`), which traps `connect()` for *all* address families.
+/// A bug let the supervisor perform IP connects on-behalf in that case —
+/// running them in the (unconfined) supervisor and bypassing the child's
+/// Landlock `CONNECT_TCP` deny-all. With deny-all in force the child's
+/// `connect()` must fail with `EACCES` (errno 13) at the kernel, never reach
+/// the listener.
+///
+/// A live loopback listener is used so that IF the connect were wrongly
+/// allowed it would *succeed* (ALLOWED) rather than merely `ECONNREFUSED` to a
+/// dead port — making the assertion discriminate a true Landlock deny from an
+/// on-behalf connect that happened to fail.
+#[tokio::test]
+async fn test_empty_net_allow_denies_tcp_despite_fs_grants() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let out = temp_file("empty-deny-tcp");
+
+    // base_policy() grants fs reads -> has_unix_fs_gate is on. No `.net_allow`
+    // call: an empty allowlist means "deny all outbound".
+    let policy = base_policy().build().unwrap();
+
+    let script = format!(concat!(
+        "import socket\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+        "s.settimeout(3)\n",
+        "try:\n",
+        "  s.connect(('127.0.0.1', {port}))\n",
+        "  open('{out}', 'w').write('ALLOWED')\n",
+        "except OSError as e:\n",
+        "  open('{out}', 'w').write('ERR:%d' % e.errno)\n",
+        "s.close()\n",
+    ), port = port, out = out.display());
+
+    let result = policy.with_name("test")
+        .run_interactive(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+
+    let got = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    drop(listener);
+
+    assert_eq!(
+        got, "ERR:13",
+        "empty net_allow must deny TCP connect via Landlock (EACCES); got {got:?}"
+    );
+}

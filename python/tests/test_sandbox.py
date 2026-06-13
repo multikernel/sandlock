@@ -90,6 +90,41 @@ class TestSandboxRun:
         assert not result.success
 
 
+class TestNetAllowDenyAll:
+    """An empty `net_allow` denies all outbound — including when fs grants are
+    present, which turn on the named-`AF_UNIX` connect gate (`has_unix_fs_gate`)
+    and cause `connect()` to be trapped. Regression: the on-behalf connect path
+    used to perform IP connects in the (unconfined) supervisor in that case,
+    bypassing the child's Landlock `CONNECT_TCP` deny-all."""
+
+    def test_empty_net_allow_denies_tcp_despite_fs_grants(self):
+        # Live loopback listener: an *allowed* connect would succeed, so the
+        # assertion discriminates a real Landlock deny (EACCES) from an
+        # incidental ECONNREFUSED to a dead port.
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        port = listener.getsockname()[1]
+        try:
+            script = (
+                "import socket\n"
+                "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+                "s.settimeout(3)\n"
+                "try:\n"
+                f"    s.connect(('127.0.0.1', {port}))\n"
+                "    print('ALLOWED')\n"
+                "except OSError as e:\n"
+                "    print('ERR', e.errno)\n"
+            )
+            # _policy() grants system fs reads -> has_unix_fs_gate is on.
+            # net_allow=[] -> deny all outbound.
+            result = _policy(net_allow=[]).run([sys.executable, "-c", script])
+            assert result.success, result.code()
+            assert result.stdout.strip() == b"ERR 13", result.stdout
+        finally:
+            listener.close()
+
+
 class TestNetDeny:
     """`net_deny` wired through the FFI: default-allow networking with an
     IP/CIDR/port denylist, mutually exclusive with `net_allow`."""
