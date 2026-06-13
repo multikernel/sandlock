@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import socket
 import sys
 import tempfile
 from pathlib import Path
@@ -218,22 +219,39 @@ class TestXOA:
             assert b"Subject: hello" in result.stdout
 
     def test_xoa_executor_no_network(self):
-        """Executor cannot reach the network."""
-        executor_policy = _policy(net_allow=[])
+        """Executor (net_allow=[]) cannot reach the network.
 
-        result = (
-            _policy().cmd(
-                [sys.executable, "-c",
-                 "print('import socket; "
-                 "socket.create_connection((\"1.1.1.1\", 80), timeout=1)')"]
+        Verified against a live loopback listener so that an *allowed* connect
+        would succeed — the previous version connected to a fixed external host
+        with a malformed command and passed for plumbing reasons, masking
+        whether egress was actually blocked.
+        """
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        port = listener.getsockname()[1]
+        try:
+            # _policy() grants system fs reads -> the named-AF_UNIX connect gate
+            # is on, which is the exact condition under which the on-behalf path
+            # used to bypass Landlock. net_allow=[] must still deny-all.
+            executor_policy = _policy(net_allow=[])
+            script = (
+                "import socket\n"
+                "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+                "s.settimeout(3)\n"
+                "try:\n"
+                f"    s.connect(('127.0.0.1', {port}))\n"
+                "    print('ALLOWED')\n"
+                "except OSError as e:\n"
+                "    print('ERR', e.errno)\n"
             )
-            | executor_policy.cmd(
-                [sys.executable, "-c", "-"]
-            )
-        ).run()
+            result = executor_policy.run([sys.executable, "-c", script])
 
-        # Executor tried to connect but was blocked
-        assert not result.success
+            # The script itself runs fine; the connect is denied with EACCES (13).
+            assert result.success, result.code()
+            assert b"ERR 13" in result.stdout, result.stdout
+        finally:
+            listener.close()
 
 
 # --- Gather ---
