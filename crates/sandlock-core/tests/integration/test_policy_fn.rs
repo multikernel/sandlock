@@ -1,10 +1,22 @@
 use sandlock_core::{Sandbox};
 use sandlock_core::policy_fn::{Verdict, SyscallCategory};
+use sandlock_core::sandbox::ByteSize;
+use std::net::{IpAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 fn temp_file(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("sandlock-test-policyfn-{}-{}", name, std::process::id()))
+}
+
+/// A live TCP listener on `host:ephemeral`. Connecting to it *succeeds* when
+/// allowed, so a deny-test can tell a real block from a connection that would
+/// have failed anyway (e.g. ECONNREFUSED to a dead port).
+fn loopback_listener(host: &str) -> (TcpListener, u16) {
+    let l = TcpListener::bind((host, 0)).expect("bind loopback listener");
+    let port = l.local_addr().unwrap().port();
+    (l, port)
 }
 
 fn base_policy() -> sandlock_core::SandboxBuilder {
@@ -42,17 +54,21 @@ async fn test_policy_fn_receives_events_with_metadata() {
         "should include execve, got: {:?}", &captured[..captured.len().min(5)]);
 }
 
-/// Test that Verdict::Deny blocks a connect syscall.
+/// Verdict::Deny blocks a connect syscall (with EPERM), attributable to the
+/// callback. The previous version connected to a dead port (127.0.0.1:1) and
+/// accepted any error as "blocked", so it passed even if the deny did nothing.
+/// Target a live listener on an allowlisted port: Landlock permits it and the
+/// listener would accept it, so the EPERM can only come from the policy_fn.
 #[tokio::test]
 async fn test_policy_fn_deny_connect() {
     let out = temp_file("deny-connect");
+    let (_listener, port) = loopback_listener("127.0.0.1");
 
     let policy = base_policy()
-        .net_allow("127.0.0.1:443")
+        .net_allow(format!("127.0.0.1:{port}"))
         .policy_fn(move |event, _ctx| {
-            // Deny all connect attempts
             if event.syscall == "connect" {
-                return Verdict::Deny;
+                return Verdict::Deny; // EPERM
             }
             Verdict::Allow
         })
@@ -61,35 +77,43 @@ async fn test_policy_fn_deny_connect() {
 
     let script = format!(concat!(
         "import socket\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+        "s.settimeout(3)\n",
         "try:\n",
-        "  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "  s.settimeout(1)\n",
-        "  s.connect(('127.0.0.1', 1))\n",
-        "  s.close()\n",
+        "  s.connect(('127.0.0.1', {port}))\n",
         "  open('{out}', 'w').write('CONNECTED')\n",
-        "except (ConnectionRefusedError, PermissionError, OSError) as e:\n",
-        "  open('{out}', 'w').write(f'BLOCKED:{{e.errno}}')\n",
-    ), out = out.display());
+        "except OSError as e:\n",
+        "  open('{out}', 'w').write('BLOCKED:%d' % e.errno)\n",
+    ), port = port, out = out.display());
 
     let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success());
 
     let content = std::fs::read_to_string(&out).unwrap_or_default();
-    assert!(content.starts_with("BLOCKED"), "connect should be denied, got: {}", content);
-
     let _ = std::fs::remove_file(&out);
+    // EPERM (1) from the policy_fn deny — not a dead-port ECONNREFUSED.
+    assert_eq!(content, "BLOCKED:1", "connect should be denied by policy_fn (EPERM)");
 }
 
-/// Test restrict_network feedback loop — changes actually take effect.
+/// restrict_network narrows outbound to the listed IPs and is enforced. The
+/// previous version called `restrict_network(&[])` — an empty list is a no-op —
+/// and connected to a dead port, so it verified nothing. Use two live loopback
+/// listeners (127.0.0.1 and 127.0.0.2), both allowlisted up front so either
+/// would connect; restricting to ["127.0.0.1"] must then permit the first and
+/// refuse the second (ECONNREFUSED, errno 111).
 #[tokio::test]
 async fn test_policy_fn_restrict_network_takes_effect() {
     let out = temp_file("restrict-net-effect");
+    let (_l1, p1) = loopback_listener("127.0.0.1");
+    let (_l2, p2) = loopback_listener("127.0.0.2");
 
+    let allowed: Vec<IpAddr> = vec!["127.0.0.1".parse().unwrap()];
     let policy = base_policy()
-        .net_allow("127.0.0.1:443")
+        .net_allow(format!("127.0.0.1:{p1}"))
+        .net_allow(format!("127.0.0.2:{p2}"))
         .policy_fn(move |event, ctx| {
             if event.syscall == "execve" {
-                ctx.restrict_network(&[]); // block all
+                ctx.restrict_network(&allowed); // narrow to 127.0.0.1
             }
             Verdict::Allow
         })
@@ -98,30 +122,22 @@ async fn test_policy_fn_restrict_network_takes_effect() {
 
     let script = format!(concat!(
         "import socket\n",
-        "try:\n",
-        "  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "  s.settimeout(1)\n",
-        "  s.connect(('127.0.0.1', 1))\n",
-        "  s.close()\n",
-        "  open('{out}', 'w').write('CONNECTED')\n",
-        "except ConnectionRefusedError:\n",
-        "  open('{out}', 'w').write('REFUSED')\n",
-        "except (PermissionError, OSError) as e:\n",
-        "  open('{out}', 'w').write(f'BLOCKED:{{e.errno}}')\n",
-    ), out = out.display());
+        "def probe(ip, port):\n",
+        "    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(3)\n",
+        "    try:\n",
+        "        s.connect((ip, port)); return 'OK'\n",
+        "    except OSError as e: return 'ERR%d' % e.errno\n",
+        "    finally: s.close()\n",
+        "open('{out}', 'w').write('allowed=' + probe('127.0.0.1', {p1}) + ' denied=' + probe('127.0.0.2', {p2}))\n",
+    ), out = out.display(), p1 = p1, p2 = p2);
 
     let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success());
 
     let content = std::fs::read_to_string(&out).unwrap_or_default();
-    // After restrict_network([]), connect to 127.0.0.1 should be blocked
-    // May show as BLOCKED (EPERM) or REFUSED (ECONNREFUSED from our handler)
-    assert!(content.starts_with("BLOCKED") || content.starts_with("REFUSED"),
-        "network should be restricted, got: {}", content);
-    // It should NOT be CONNECTED
-    assert!(!content.starts_with("CONNECTED"), "network restrict should prevent connection");
-
     let _ = std::fs::remove_file(&out);
+    assert!(content.contains("allowed=OK"), "listed IP should still connect, got: {}", content);
+    assert!(content.contains("denied=ERR111"), "non-listed IP should be refused, got: {}", content);
 }
 
 /// Test deny_path blocks filesystem access dynamically.
@@ -395,17 +411,21 @@ async fn test_policy_fn_audit() {
     assert!(!captured.is_empty(), "should have audited file events");
 }
 
-/// Test that restrict_pid_network works even without net_allow_hosts.
-/// This verifies that policy_fn alone enables network syscall interception.
+/// restrict_pid_network blocks a pid's outbound even without a net_allow
+/// allowlist (policy_fn alone enables network interception). The previous
+/// version connected to a dead port and accepted any error, so it passed even
+/// if nothing was restricted. Target a *live* listener with no net_allow: the
+/// connect would succeed (network unrestricted by default under policy_fn), so
+/// the refusal can only come from restrict_pid_network([]).
 #[tokio::test]
 async fn test_policy_fn_restrict_pid_network_without_allowlist() {
-    // No net_allow_hosts — network should be unrestricted by default,
-    // but policy_fn can still restrict specific PIDs.
+    let out = temp_file("restrict-pid-net");
+    let (_listener, port) = loopback_listener("127.0.0.1");
+
+    // No net_allow: outbound is otherwise unrestricted; the callback restricts
+    // the exec'd pid's network to the empty set (deny all) on execve.
     let policy = base_policy()
         .policy_fn(move |event, ctx| {
-            // On any execve, restrict that PID's network to nothing.
-            // (Previously gated on path-substring; path strings were
-            // dropped from events for TOCTOU reasons — issue #27.)
             if event.syscall == "execve" {
                 ctx.restrict_pid_network(event.pid, &[]);
             }
@@ -414,36 +434,155 @@ async fn test_policy_fn_restrict_pid_network_without_allowlist() {
         .build()
         .unwrap();
 
-    // Create a script that attempts to connect to localhost
-    let script = temp_file("connect_test");
-    std::fs::write(&script, r#"#!/bin/sh
-exec python3 -c "
-import socket, sys
-try:
-    s = socket.create_connection(('127.0.0.1', 1), timeout=2)
-    s.close()
-except ConnectionRefusedError:
-    print('REFUSED')
-    sys.exit(0)
-except OSError as e:
-    print(f'BLOCKED: {e}')
-    sys.exit(0)
-print('CONNECTED')
-sys.exit(1)
-"
-"#).unwrap();
-    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let script = format!(concat!(
+        "import socket\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(3)\n",
+        "try:\n",
+        "  s.connect(('127.0.0.1', {port}))\n",
+        "  open('{out}', 'w').write('CONNECTED')\n",
+        "except OSError as e:\n",
+        "  open('{out}', 'w').write('ERR%d' % e.errno)\n",
+    ), port = port, out = out.display());
 
-    let result = policy.clone().with_name("test").run(&[script.to_str().unwrap()])
-        .await
-        .unwrap();
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success());
 
-    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or(b""));
-    // Connection should be refused (restricted by policy_fn)
-    assert!(
-        stdout.contains("REFUSED") || stdout.contains("BLOCKED"),
-        "Expected connection to be blocked, got: {}", stdout,
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    // The listener is live, so a successful connect would read "CONNECTED";
+    // ERR111 (ECONNREFUSED from the on-behalf deny) can only come from the
+    // per-pid restriction.
+    assert_eq!(content, "ERR111", "restrict_pid_network([]) must deny the connect");
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic resource-limit enforcement + fork-tracking regression
+// ---------------------------------------------------------------------------
+
+/// restrict_max_memory tightens the static ceiling and is enforced. Set a
+/// 256 MiB ceiling, restrict to 64 MiB on execve, then allocate 128 MiB: the
+/// process is killed. The control (same ceiling, no restriction) allocates the
+/// same 128 MiB fine — proving the kill is the dynamic limit, not the ceiling.
+#[tokio::test]
+async fn test_policy_fn_restrict_max_memory_enforced() {
+    let alloc_128 = concat!(
+        "import sys\n",
+        "print('STARTED', flush=True)\n",
+        "b = bytearray(128 * 1024 * 1024)\n",
+        "b[::4096] = b'\\x01' * (len(b) // 4096)\n",   // commit the pages
+        "print('ALLOC_OK')\n",
     );
 
-    let _ = std::fs::remove_file(&script);
+    let restricted = base_policy()
+        .max_memory(ByteSize::mib(256))
+        .policy_fn(|event, ctx| {
+            if event.syscall == "execve" {
+                ctx.restrict_max_memory(64 * 1024 * 1024);
+            }
+            Verdict::Allow
+        })
+        .build()
+        .unwrap()
+        .with_name("test")
+        .run(&["python3", "-c", alloc_128])
+        .await
+        .unwrap();
+    let out = String::from_utf8_lossy(restricted.stdout.as_deref().unwrap_or(b""));
+    assert!(out.contains("STARTED"), "should start, got: {}", out);
+    assert!(!out.contains("ALLOC_OK"), "128 MiB must exceed the 64 MiB dynamic limit, got: {}", out);
+    assert!(!restricted.success(), "process should be killed by the memory limit");
+
+    let baseline = base_policy()
+        .max_memory(ByteSize::mib(256))
+        .policy_fn(|_e, _c| Verdict::Allow)
+        .build()
+        .unwrap()
+        .with_name("test")
+        .run(&["python3", "-c", alloc_128])
+        .await
+        .unwrap();
+    let out = String::from_utf8_lossy(baseline.stdout.as_deref().unwrap_or(b""));
+    assert!(out.contains("ALLOC_OK"), "128 MiB under the 256 MiB ceiling should succeed, got: {}", out);
+    assert!(baseline.success());
+}
+
+/// restrict_max_processes tightens the concurrent-process limit and is
+/// enforced. Restrict to 1, then fork: the fork is denied with EAGAIN. The
+/// control (no restriction) forks successfully.
+#[tokio::test]
+async fn test_policy_fn_restrict_max_processes_enforced() {
+    let fork_once = concat!(
+        "import os\n",
+        "print('STARTED', flush=True)\n",
+        "try:\n",
+        "    pid = os.fork()\n",
+        "    if pid == 0: os._exit(0)\n",
+        "    os.waitpid(pid, 0); print('FORK_OK')\n",
+        "except OSError as e: print('FORK_DENIED', e.errno)\n",
+    );
+
+    let restricted = base_policy()
+        .policy_fn(|event, ctx| {
+            if event.syscall == "execve" {
+                ctx.restrict_max_processes(1);
+            }
+            Verdict::Allow
+        })
+        .build()
+        .unwrap()
+        .with_name("test")
+        .run(&["python3", "-c", fork_once])
+        .await
+        .unwrap();
+    let out = String::from_utf8_lossy(restricted.stdout.as_deref().unwrap_or(b""));
+    assert!(out.contains("STARTED"), "should start, got: {}", out);
+    assert!(!out.contains("FORK_OK"), "fork must be denied under the limit, got: {}", out);
+    assert!(out.contains("FORK_DENIED 11"), "fork should be denied with EAGAIN, got: {}", out);
+
+    let baseline = base_policy()
+        .policy_fn(|_e, _c| Verdict::Allow)
+        .build()
+        .unwrap()
+        .with_name("test")
+        .run(&["python3", "-c", fork_once])
+        .await
+        .unwrap();
+    let out = String::from_utf8_lossy(baseline.stdout.as_deref().unwrap_or(b""));
+    assert!(out.contains("FORK_OK"), "unrestricted fork should succeed, got: {}", out);
+}
+
+/// Regression: a workload that forks under an active policy_fn must not
+/// deadlock the supervisor's fork-event ptrace tracking. Fork many times in one
+/// run and require it to complete (bounded so a regression fails instead of
+/// hanging the suite forever).
+#[tokio::test]
+async fn test_policy_fn_fork_does_not_deadlock() {
+    let many_forks = concat!(
+        "import os\n",
+        "ok = 0\n",
+        "for _ in range(30):\n",
+        "    pid = os.fork()\n",
+        "    if pid == 0: os._exit(0)\n",
+        "    os.waitpid(pid, 0); ok += 1\n",
+        "print('FORKS_OK', ok)\n",
+    );
+
+    let mut sb = base_policy()
+        // count events so the fork path is exercised under an active callback
+        .policy_fn(|_e, _c| Verdict::Allow)
+        .build()
+        .unwrap()
+        .with_name("test");
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        sb.run(&["python3", "-c", many_forks]),
+    )
+    .await
+    .expect("policy_fn + fork() must not deadlock")
+    .unwrap();
+
+    assert!(result.success(), "run should complete");
+    let out = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or(b""));
+    assert!(out.contains("FORKS_OK 30"), "all 30 forks should complete, got: {}", out);
 }
