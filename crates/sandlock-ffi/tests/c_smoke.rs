@@ -12,6 +12,22 @@ fn c_smoke_compiles_and_runs() {
     } else {
         "release"
     };
+
+    // Cargo links integration tests against the crate's *rlib*, and does not
+    // treat the *cdylib* as a build prerequisite — so `cargo test` never
+    // (re)builds `libsandlock_ffi.so`. Build it ourselves so we always link the
+    // current artifact instead of a stale one left in `target/` (which fails
+    // with "undefined reference" when the symbol set has changed). `--lib`
+    // builds the cdylib/staticlib/rlib; the recursive `cargo` is safe because
+    // the outer build lock is released before tests run.
+    let mut build = Command::new(env!("CARGO"));
+    build.args(["build", "-p", "sandlock-ffi", "--lib"]);
+    if profile == "release" {
+        build.arg("--release");
+    }
+    let build_status = build.status().expect("invoke cargo build for cdylib");
+    assert!(build_status.success(), "failed to build sandlock-ffi cdylib");
+
     let target_dir = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
