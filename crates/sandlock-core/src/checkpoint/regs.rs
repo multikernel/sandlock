@@ -1,10 +1,9 @@
 use std::io;
 
 fn setregset(pid: i32, set: libc::c_int, bytes: &[u8]) -> io::Result<()> {
-    let mut buf = bytes.to_vec();
     let mut iov = libc::iovec {
-        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
-        iov_len: buf.len(),
+        iov_base: bytes.as_ptr() as *mut libc::c_void,
+        iov_len: bytes.len(),
     };
     let ret = unsafe {
         libc::ptrace(
@@ -20,6 +19,8 @@ fn setregset(pid: i32, set: libc::c_int, bytes: &[u8]) -> io::Result<()> {
 
 /// Set the general-purpose register file. `regs` is the Vec<u64> produced by
 /// capture::ptrace_getregs (architecture-specific width).
+// used by the restore path (added in a later change)
+#[allow(dead_code)]
 pub(crate) fn set_gp_regs(pid: i32, regs: &[u64]) -> io::Result<()> {
     const NT_PRSTATUS: libc::c_int = 1;
     let bytes: Vec<u8> = regs.iter().flat_map(|r| r.to_le_bytes()).collect();
