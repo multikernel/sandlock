@@ -36,6 +36,8 @@ pub enum SupervisorCmd {
     /// when the sandbox was never started).  The sandbox `Drop` kills the
     /// parked child.
     Shutdown,
+    /// Capture a checkpoint of the running child into `dir`.
+    Checkpoint { dir: String },
 }
 
 /// Responses from the Supervisor.
@@ -253,6 +255,20 @@ async fn supervisor_main(
                 let _ = stream.write_all(b"\n").await;
                 break LoopExit::Shutdown;
             }
+            SupervisorCmd::Checkpoint { dir } => {
+                let reply = match sandbox.checkpoint().await {
+                    Ok(mut cp) => {
+                        cp.name = id.to_string();
+                        match cp.save(std::path::Path::new(&dir)) {
+                            Ok(()) => serde_json::to_vec(&SupervisorReply::Ok).unwrap_or_default(),
+                            Err(e) => serde_json::to_vec(&SupervisorReply::Err { msg: e.to_string() }).unwrap_or_default(),
+                        }
+                    }
+                    Err(e) => serde_json::to_vec(&SupervisorReply::Err { msg: e.to_string() }).unwrap_or_default(),
+                };
+                let _ = stream.write_all(&reply).await;
+                let _ = stream.write_all(b"\n").await;
+            }
         }
     };
 
@@ -333,5 +349,15 @@ mod tests {
         let json = serde_json::to_string(&reply).unwrap();
         assert!(json.contains("err"));
         assert!(json.contains("test error"));
+    }
+
+    #[test]
+    fn supervisor_cmd_checkpoint_serde() {
+        let cmd = SupervisorCmd::Checkpoint { dir: "/tmp/img".into() };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("checkpoint"));
+        assert!(json.contains("/tmp/img"));
+        let back: SupervisorCmd = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, SupervisorCmd::Checkpoint { .. }));
     }
 }
