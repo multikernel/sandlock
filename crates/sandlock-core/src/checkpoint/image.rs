@@ -265,6 +265,7 @@ impl Checkpoint {
                 cwd: info.cwd,
                 exe: info.exe,
                 regs,
+                fpregs: Vec::new(),
                 memory_maps,
                 memory_data,
             },

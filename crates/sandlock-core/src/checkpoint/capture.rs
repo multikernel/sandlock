@@ -117,6 +117,39 @@ fn ptrace_getregs(pid: i32) -> io::Result<Vec<u64>> {
 }
 
 // ---------------------------------------------------------------------------
+// FPU/extended register capture via PTRACE_GETREGSET
+// ---------------------------------------------------------------------------
+
+fn ptrace_getregset_bytes(pid: i32, set: libc::c_int, max: usize) -> io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; max];
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+        iov_len: buf.len(),
+    };
+    let ret = unsafe {
+        libc::ptrace(
+            libc::PTRACE_GETREGSET,
+            pid,
+            set as usize as *mut libc::c_void,
+            &mut iov as *mut libc::iovec as *mut libc::c_void,
+        )
+    };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    buf.truncate(iov.iov_len);
+    Ok(buf)
+}
+
+fn ptrace_getfpregs(pid: i32) -> io::Result<Vec<u8>> {
+    // NT_PRFPREG = 2; NT_X86_XSTATE = 0x202. 8 KiB upper-bounds AVX-512 xstate.
+    #[cfg(target_arch = "x86_64")]
+    { ptrace_getregset_bytes(pid, 0x202, 8192).or_else(|_| ptrace_getregset_bytes(pid, 2, 512)) }
+    #[cfg(not(target_arch = "x86_64"))]
+    { ptrace_getregset_bytes(pid, 2, 4096) }
+}
+
+// ---------------------------------------------------------------------------
 // /proc parsing
 // ---------------------------------------------------------------------------
 
@@ -274,6 +307,9 @@ pub(crate) fn capture(pid: i32, policy: &Sandbox) -> Result<Checkpoint, Sandlock
         SandlockError::Runtime(SandboxRuntimeError::Child(format!("ptrace getregs: {}", e)))
     })?;
 
+    // Capture FPU/extended register state
+    let fpregs = ptrace_getfpregs(pid).unwrap_or_default();
+
     // Capture memory maps
     let maps =
         parse_proc_maps(pid).map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
@@ -307,6 +343,7 @@ pub(crate) fn capture(pid: i32, policy: &Sandbox) -> Result<Checkpoint, Sandlock
             cwd,
             exe,
             regs,
+            fpregs,
             memory_maps: maps,
             memory_data,
         },
@@ -368,6 +405,22 @@ mod tests {
             target_arch = "riscv64"
         ))]
         assert!(pc != 0, "captured program counter should be non-zero, got {:#x}", pc);
+    }
+
+    #[test]
+    fn ptrace_getfpregs_captures_nonempty_state() {
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id() as i32;
+        let res = (|| -> io::Result<Vec<u8>> {
+            ptrace_seize(pid)?;
+            let fp = ptrace_getfpregs(pid)?;
+            ptrace_detach(pid)?;
+            Ok(fp)
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let fp = res.expect("fpreg capture should succeed");
+        assert!(!fp.is_empty(), "captured FP/extended register blob should be non-empty");
     }
 
     /// Full capture -> save -> load roundtrip against a live child. `capture()`

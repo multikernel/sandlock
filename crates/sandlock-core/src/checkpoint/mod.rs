@@ -25,6 +25,7 @@ pub struct ProcessState {
     pub cwd: String,
     pub exe: String,
     pub regs: Vec<u64>,
+    pub fpregs: Vec<u8>,
     pub memory_maps: Vec<MemoryMap>,
     pub memory_data: Vec<MemorySegment>,
 }
