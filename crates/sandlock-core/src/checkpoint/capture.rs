@@ -455,6 +455,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(loaded.process_state.regs, cp.process_state.regs, "regs roundtrip");
+        assert_eq!(loaded.process_state.fpregs, cp.process_state.fpregs, "fpregs roundtrip");
         assert_eq!(
             loaded.process_state.memory_data.len(),
             cp.process_state.memory_data.len(),

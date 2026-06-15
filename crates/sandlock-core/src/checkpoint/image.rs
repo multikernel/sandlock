@@ -22,6 +22,8 @@ use crate::sandbox::Sandbox;
 //       └── memory/
 //           └── <index>.bin  # raw memory contents per segment
 
+const IMAGE_VERSION: u32 = 1;
+
 fn io_err(e: impl std::fmt::Display) -> SandlockError {
     SandlockError::Runtime(SandboxRuntimeError::Child(e.to_string()))
 }
@@ -42,6 +44,7 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, SandlockErr
 struct MetaJson {
     name: String,
     cow_snapshot: Option<String>,
+    version: u32,
 }
 
 /// JSON schema for process/info.json.
@@ -106,6 +109,7 @@ impl Checkpoint {
         write_json(&dir.join("meta.json"), &MetaJson {
             name: self.name.clone(),
             cow_snapshot: self.cow_snapshot.as_ref().map(|p| p.display().to_string()),
+            version: IMAGE_VERSION,
         })?;
 
         // policy.dat (bincode -- complex struct, not human-readable anyway)
@@ -166,7 +170,6 @@ impl Checkpoint {
         write_json(&proc_dir.join("memory_map.json"), &maps)?;
 
         // process/threads/0.bin -- main thread register state
-        // NOTE: process_state.fpregs is not yet written here; persistence is added in the next change.
         let threads_dir = proc_dir.join("threads");
         std::fs::create_dir(&threads_dir)
             .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
@@ -174,6 +177,9 @@ impl Checkpoint {
             .flat_map(|r| r.to_le_bytes())
             .collect();
         std::fs::write(threads_dir.join("0.bin"), &reg_bytes)
+            .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
+        // process/threads/fpregs.bin -- FPU/extended register state
+        std::fs::write(threads_dir.join("fpregs.bin"), &self.process_state.fpregs)
             .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
 
         // process/memory/<index>.bin -- 1:1 with memory_map.json entries
@@ -198,6 +204,12 @@ impl Checkpoint {
 
         // meta.json
         let meta: MetaJson = read_json(&dir.join("meta.json"))?;
+        if meta.version != IMAGE_VERSION {
+            return Err(SandlockError::Runtime(SandboxRuntimeError::Child(
+                format!("unsupported checkpoint image version {} (expected {})",
+                    meta.version, IMAGE_VERSION),
+            )));
+        }
 
         // policy.dat
         let policy_bytes = std::fs::read(dir.join("policy.dat"))
@@ -239,11 +251,14 @@ impl Checkpoint {
         }).collect();
 
         // process/threads/0.bin
-        let reg_bytes = std::fs::read(proc_dir.join("threads").join("0.bin"))
+        let threads_dir = proc_dir.join("threads");
+        let reg_bytes = std::fs::read(threads_dir.join("0.bin"))
             .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
         let regs: Vec<u64> = reg_bytes.chunks_exact(8)
             .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
+        // process/threads/fpregs.bin -- absent in older images, default to empty
+        let fpregs = std::fs::read(threads_dir.join("fpregs.bin")).unwrap_or_default();
 
         // process/memory/<i>.bin -- 1:1 with memory_map.json
         let mem_dir = proc_dir.join("memory");
@@ -266,8 +281,7 @@ impl Checkpoint {
                 cwd: info.cwd,
                 exe: info.exe,
                 regs,
-                // fpregs persistence is added in the next change; load defaults to empty for now.
-                fpregs: Vec::new(),
+                fpregs,
                 memory_maps,
                 memory_data,
             },
@@ -275,5 +289,23 @@ impl Checkpoint {
             cow_snapshot: meta.cow_snapshot.map(PathBuf::from),
             app_state,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Checkpoint;
+
+    #[test]
+    fn image_rejects_wrong_version() {
+        let dir = std::env::temp_dir().join(format!("sandlock-ver-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("process/threads")).unwrap();
+        std::fs::create_dir_all(dir.join("process/memory")).unwrap();
+        std::fs::write(dir.join("meta.json"),
+            br#"{"name":"x","cow_snapshot":null,"version":999}"#).unwrap();
+        let res = Checkpoint::load(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(res.is_err(), "loading an unknown image version must fail");
     }
 }
