@@ -320,8 +320,8 @@ fn write_child_mem(pid: i32, addr: u64, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// Bootstrap a permanent `syscall` trampoline in a free hole of the stopped
-/// child's address space. Finds an unused page, maps it `MAP_FIXED` as
-/// read/write/exec anonymous memory using the temporary plant-at-rip injector,
+/// child's address space. Finds an unused page, maps it `MAP_FIXED_NOREPLACE`
+/// as read/write/exec anonymous memory using the temporary plant-at-rip injector,
 /// writes a `syscall` instruction into it, and returns the page address. All
 /// later injections can run through this fixed gadget without ever clobbering
 /// the page that holds it (it lives in a gap the restored process never uses).
@@ -334,18 +334,21 @@ pub(crate) fn setup_trampoline(pid: i32, maps: &[MemoryMap]) -> io::Result<u64> 
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no free page for restore trampoline"))?;
 
     // mmap(addr, 4096, PROT_READ|PROT_WRITE|PROT_EXEC,
-    //      MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0). nr = 9 on x86_64.
+    //      MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE, -1, 0). nr = 9 on x86_64.
+    // MAP_FIXED_NOREPLACE returns -EEXIST if the address is already occupied,
+    // so the post-call check below is a genuine safety net rather than a
+    // tautology (MAP_FIXED always returns the requested address on success).
     let prot = (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u64;
-    let flags = (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED) as u64;
+    let flags = (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE) as u64;
     let ret = inject_syscall(pid, 9, [addr, 4096, prot, flags, (-1i64) as u64, 0])?;
 
-    // MAP_FIXED returns the requested address on success; anything else (in
-    // particular a negative -errno) means the mapping did not land where we need
-    // the trampoline to live.
+    // MAP_FIXED_NOREPLACE returns the requested address on success; a negative
+    // value (-EEXIST, -ENOMEM, ...) means the mapping failed, most likely
+    // because the address is already occupied.
     if ret < 0 || (ret as u64) != addr {
         return Err(io::Error::new(
             io::ErrorKind::Other,
-            format!("trampoline mmap returned {ret:#x}, expected {addr:#x}"),
+            format!("trampoline mmap at {addr:#x} failed or address occupied (ret={ret:#x})"),
         ));
     }
 
