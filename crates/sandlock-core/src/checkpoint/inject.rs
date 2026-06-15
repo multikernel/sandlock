@@ -319,11 +319,13 @@ pub(crate) fn write_child_mem(pid: i32, addr: u64, bytes: &[u8]) -> io::Result<(
 }
 
 /// Bootstrap a permanent `syscall` trampoline in a free hole of the stopped
-/// child's address space. Finds an unused page, maps it `MAP_FIXED_NOREPLACE`
+/// child's address space. Finds an unused page, maps it `MAP_FIXED`
 /// as read/write/exec anonymous memory using the temporary plant-at-rip injector,
 /// writes a `syscall` instruction into it, and returns the page address. All
 /// later injections can run through this fixed gadget without ever clobbering
 /// the page that holds it (it lives in a gap the restored process never uses).
+/// MAP_FIXED (not MAP_FIXED_NOREPLACE) is used deliberately to clobber any
+/// disposable inherited stub mappings that occupy the chosen hole.
 /// x86_64 only.
 // used by the restore path (added in a later change)
 #[allow(dead_code)]

@@ -41,18 +41,23 @@ pub(crate) fn build_memory_plan(
 
 /// Return true only for paths that refer to a reopenable regular file.
 /// memfd and "(deleted)" paths start with '/' but are not reopenable, so they
-/// are skipped.
+/// are skipped. Pseudo-filesystem paths (/proc/, /sys/, /dev/) are also skipped:
+/// they are ephemeral, may not exist at restore time, and cannot be
+/// transparently reopened in the new process.
 fn is_restorable_file_path(path: &str) -> bool {
     path.starts_with('/')
         && !path.starts_with("/memfd:")
         && !path.ends_with(" (deleted)")
+        && !path.starts_with("/proc/")
+        && !path.starts_with("/sys/")
+        && !path.starts_with("/dev/")
 }
 
 /// Split the saved fd table into transparently restorable regular files and a
 /// list of skipped non-regular fds (sockets, pipes, eventfd, ...). The skipped
 /// list is logged by the caller; those resources fall to the app_state hatch.
-/// memfd and "(deleted)" paths start with '/' but are not reopenable, so they
-/// are skipped.
+/// memfd, "(deleted)", and pseudo-filesystem (/proc/, /sys/, /dev/) paths start
+/// with '/' but are not transparently reopenable, so they are skipped.
 #[allow(dead_code)] // used by the restore path (added in a later change)
 pub(crate) fn build_fd_plan(fds: &[FdInfo]) -> (Vec<FdInfo>, Vec<String>) {
     let mut restorable = Vec::new();
@@ -288,14 +293,23 @@ mod tests {
             FdInfo { fd: 3, path: "/etc/hostname".into(), flags: 0, offset: 5 },
             FdInfo { fd: 6, path: "/tmp/gone (deleted)".into(), flags: 0, offset: 0 },
             FdInfo { fd: 7, path: "/memfd:scratch (deleted)".into(), flags: 0, offset: 0 },
+            FdInfo { fd: 8, path: "/proc/1234/maps".into(), flags: 0, offset: 0 },
+            FdInfo { fd: 9, path: "/dev/pts/3".into(), flags: 0, offset: 0 },
+            FdInfo { fd: 10, path: "/sys/kernel/x".into(), flags: 0, offset: 0 },
         ];
         let (restorable, skipped) = build_fd_plan(&fds);
         assert_eq!(restorable.len(), 1);
         assert_eq!(restorable[0].fd, 3);
-        assert!(restorable.iter().all(|f| f.fd != 6 && f.fd != 7),
-            "deleted and memfd fds must not appear in restorable");
+        assert!(restorable.iter().all(|f| f.fd != 6 && f.fd != 7 && f.fd != 8 && f.fd != 9 && f.fd != 10),
+            "deleted, memfd, and pseudo-filesystem fds must not appear in restorable");
         assert!(skipped.contains(&"/tmp/gone (deleted)".to_string()));
         assert!(skipped.contains(&"/memfd:scratch (deleted)".to_string()));
+        assert!(skipped.contains(&"/proc/1234/maps".to_string()),
+            "/proc/ paths must be skipped");
+        assert!(skipped.contains(&"/dev/pts/3".to_string()),
+            "/dev/ paths must be skipped");
+        assert!(skipped.contains(&"/sys/kernel/x".to_string()),
+            "/sys/ paths must be skipped");
     }
 
     #[test]
