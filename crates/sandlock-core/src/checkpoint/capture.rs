@@ -153,7 +153,7 @@ fn ptrace_getfpregs(pid: i32) -> io::Result<Vec<u8>> {
 // /proc parsing
 // ---------------------------------------------------------------------------
 
-fn parse_proc_maps(pid: i32) -> io::Result<Vec<MemoryMap>> {
+pub(crate) fn parse_proc_maps(pid: i32) -> io::Result<Vec<MemoryMap>> {
     let content = std::fs::read_to_string(format!("/proc/{}/maps", pid))?;
     let mut maps = Vec::new();
     for line in content.lines() {
