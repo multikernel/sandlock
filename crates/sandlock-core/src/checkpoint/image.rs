@@ -44,6 +44,7 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, SandlockErr
 struct MetaJson {
     name: String,
     cow_snapshot: Option<String>,
+    #[serde(default)]
     version: u32,
 }
 
@@ -257,7 +258,7 @@ impl Checkpoint {
         let regs: Vec<u64> = reg_bytes.chunks_exact(8)
             .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
-        // process/threads/fpregs.bin -- absent in older images, default to empty
+        // Read FP/extended registers; tolerate absence defensively.
         let fpregs = std::fs::read(threads_dir.join("fpregs.bin")).unwrap_or_default();
 
         // process/memory/<i>.bin -- 1:1 with memory_map.json
@@ -306,6 +307,7 @@ mod tests {
             br#"{"name":"x","cow_snapshot":null,"version":999}"#).unwrap();
         let res = Checkpoint::load(&dir);
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(res.is_err(), "loading an unknown image version must fail");
+        let msg = res.unwrap_err().to_string();
+        assert!(msg.contains("version"), "error should mention version, got: {msg}");
     }
 }
