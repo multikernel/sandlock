@@ -120,6 +120,15 @@ enum Command {
         #[arg(num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true)]
         _args: Vec<String>,
     },
+
+    /// Capture a checkpoint of a running sandbox to an image directory.
+    Checkpoint {
+        /// Sandbox/container ID.
+        id: String,
+        /// Directory to write the checkpoint image into.
+        #[arg(long = "image-path")]
+        image_path: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -193,6 +202,13 @@ fn main() -> Result<()> {
                 }
             }
             println!("Platform: {}", std::env::consts::ARCH);
+        }
+        Command::Checkpoint { id, image_path } => {
+            match supervisor::send_command(&id, supervisor::SupervisorCmd::Checkpoint { dir: image_path })? {
+                supervisor::SupervisorReply::Ok => {}
+                supervisor::SupervisorReply::Err { msg } => bail!("checkpoint failed: {}", msg),
+                other => bail!("unexpected supervisor reply: {:?}", other),
+            }
         }
     }
 
