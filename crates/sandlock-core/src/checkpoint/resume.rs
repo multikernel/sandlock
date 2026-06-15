@@ -89,6 +89,11 @@ fn prot_from_perms(perms: &str) -> libc::c_int {
 /// Leaves the child stopped with the saved registers loaded; the caller resumes
 /// it (PTRACE_CONT / detach). Returns the list of non-transparently-restored
 /// resource names (skipped fds) for the caller to log.
+/// On `Err`, the child is left half-built and still ptrace-stopped; the caller
+/// MUST kill and reap it.
+/// Limitation: file-backed regions are restored `MAP_PRIVATE` from the on-disk
+/// file, so a checkpointed `MAP_SHARED` mapping is restored as private
+/// (documented M1 limitation).
 // `restore_into` is only invoked from tests and (later) the OCI restore path
 // (Task 11), so it is dead code in a plain library build.
 #[allow(dead_code)]
@@ -103,6 +108,7 @@ pub(crate) fn restore_into(
     // x86_64 syscall numbers used by the rebuild.
     const MMAP: u64 = 9;
     const MPROTECT: u64 = 10;
+    const MUNMAP: u64 = 11;
     const OPEN: u64 = 2;
     const CLOSE: u64 = 3;
     const LSEEK: u64 = 8;
@@ -206,8 +212,9 @@ pub(crate) fn restore_into(
                 if r as u64 != *start {
                     return Err(err(format!("restore file mmap at {start:#x} -> {r:#x}")));
                 }
-                inject::inject_syscall_at(pid, tramp, CLOSE, [fd as u64, 0, 0, 0, 0, 0])
+                let cl = inject::inject_syscall_at(pid, tramp, CLOSE, [fd as u64, 0, 0, 0, 0, 0])
                     .map_err(|e| err(format!("restore close fd {fd}: {e}")))?;
+                if cl < 0 { return Err(err(format!("restore close fd {fd} -> {cl}"))); }
             }
         }
     }
@@ -215,11 +222,16 @@ pub(crate) fn restore_into(
     // Reopen transparently restorable fds at their saved numbers/offsets.
     for f in &restorable_fds {
         write_path(&f.path)?;
+        // Mask creation/truncation flags so the restored open cannot create,
+        // truncate, or fail-exclusive on the workload's real file. The kernel
+        // strips these in fdinfo, but mask defensively since O_TRUNC would be
+        // destructive.
+        let safe_flags = f.flags & !(libc::O_CREAT | libc::O_TRUNC | libc::O_EXCL);
         let opened = inject::inject_syscall_at(
             pid,
             tramp,
             OPEN,
-            [scratch, f.flags as u64, 0, 0, 0, 0],
+            [scratch, safe_flags as u64, 0, 0, 0, 0],
         )
         .map_err(|e| err(format!("restore fd open {}: {e}", f.path)))?;
         if opened < 0 {
@@ -229,10 +241,12 @@ pub(crate) fn restore_into(
             // dup2 may clobber an inherited stub fd at this number; that is
             // acceptable -- inherited stub fds are disposable. Documented M1
             // limitation, alongside the W^X trampoline constraint.
-            inject::inject_syscall_at(pid, tramp, DUP2, [opened as u64, f.fd as u64, 0, 0, 0, 0])
+            let d = inject::inject_syscall_at(pid, tramp, DUP2, [opened as u64, f.fd as u64, 0, 0, 0, 0])
                 .map_err(|e| err(format!("restore dup2 {opened}->{}: {e}", f.fd)))?;
-            inject::inject_syscall_at(pid, tramp, CLOSE, [opened as u64, 0, 0, 0, 0, 0])
+            if d < 0 { return Err(err(format!("restore dup2 {} -> {} failed: {d}", opened, f.fd))); }
+            let cl2 = inject::inject_syscall_at(pid, tramp, CLOSE, [opened as u64, 0, 0, 0, 0, 0])
                 .map_err(|e| err(format!("restore close dup src {opened}: {e}")))?;
+            if cl2 < 0 { return Err(err(format!("restore close dup src {opened} -> {cl2}"))); }
         }
         let ls = inject::inject_syscall_at(
             pid,
@@ -245,6 +259,18 @@ pub(crate) fn restore_into(
             return Err(err(format!("restore lseek fd {}", f.fd)));
         }
     }
+
+    // Unmap the RWX trampoline as the very last injected syscall, after all
+    // region and fd injections (which need it), and before the register restores
+    // (which use ptrace, not the trampoline). The `syscall` instruction at
+    // `tramp` is fetched and executed before the page is removed; after return,
+    // rip is restored to the stub's original rip (still mapped), and the
+    // following set_gp_regs points rip at the checkpoint's saved value. The
+    // unmapped page is therefore never executed again. This closes the W^X gap
+    // that would otherwise leave a writable+executable page in the restored process.
+    let mu = inject::inject_syscall_at(pid, tramp, MUNMAP, [tramp, 4096, 0, 0, 0, 0])
+        .map_err(|e| err(format!("restore munmap trampoline {tramp:#x}: {e}")))?;
+    if mu != 0 { return Err(err(format!("restore munmap trampoline {tramp:#x} -> {mu}"))); }
 
     // Registers last: load the saved FP then GP register files. After this the
     // child is stopped exactly at the checkpoint's execution point.
