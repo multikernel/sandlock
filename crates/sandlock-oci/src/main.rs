@@ -204,11 +204,7 @@ fn main() -> Result<()> {
             println!("Platform: {}", std::env::consts::ARCH);
         }
         Command::Checkpoint { id, image_path } => {
-            match supervisor::send_command(&id, supervisor::SupervisorCmd::Checkpoint { dir: image_path })? {
-                supervisor::SupervisorReply::Ok => {}
-                supervisor::SupervisorReply::Err { msg } => bail!("checkpoint failed: {}", msg),
-                other => bail!("unexpected supervisor reply: {:?}", other),
-            }
+            cmd_checkpoint(&id, &image_path)?;
         }
     }
 
@@ -481,6 +477,17 @@ fn cmd_delete(id: &str, force: bool) -> Result<()> {
     // Remove state directory.
     state.delete()?;
     Ok(())
+}
+
+/// `sandlock-oci checkpoint <id> --image-path <dir>`
+///
+/// Asks the Supervisor to snapshot the running sandbox into an image directory.
+fn cmd_checkpoint(id: &str, image_path: &str) -> Result<()> {
+    match supervisor::send_command(id, supervisor::SupervisorCmd::Checkpoint { dir: image_path.to_string() })? {
+        supervisor::SupervisorReply::Ok => Ok(()),
+        supervisor::SupervisorReply::Err { msg } => bail!("checkpoint failed: {}", msg),
+        other => bail!("unexpected supervisor reply: {:?}", other),
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
