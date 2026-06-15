@@ -5,6 +5,7 @@ use crate::sandbox::Sandbox;
 mod capture;
 mod image;
 mod regs;
+mod resume;
 
 pub(crate) use capture::capture;
 
