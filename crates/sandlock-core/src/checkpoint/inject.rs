@@ -140,6 +140,16 @@ pub(crate) fn inject_syscall(pid: i32, nr: u64, args: [u64; 6]) -> io::Result<i6
             return Err(io::Error::last_os_error());
         }
 
+        // WIFSTOPPED: low byte == 0x7f. WSTOPSIG: (status >> 8) & 0xff.
+        let stopped = (status & 0xff) == 0x7f;
+        let stopsig = (status >> 8) & 0xff;
+        if !stopped || stopsig != libc::SIGTRAP {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("injected syscall did not complete: status={status:#x}"),
+            ));
+        }
+
         let after = ptrace_getregs(pid)?;
         Ok(after.rax as i64)
     })();
