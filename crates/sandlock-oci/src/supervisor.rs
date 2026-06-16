@@ -297,6 +297,209 @@ async fn supervisor_main(
     Ok(())
 }
 
+/// Convert a `RunResult` (or wait error) into the on-disk `ExitInfo`.
+fn exit_info_from(
+    res: Result<sandlock_core::RunResult, sandlock_core::SandlockError>,
+) -> Option<crate::state::ExitInfo> {
+    use crate::state::ExitInfo;
+    use sandlock_core::ExitStatus;
+    match res {
+        Ok(r) => match r.exit_status {
+            ExitStatus::Code(code) => Some(ExitInfo { code: Some(code), signal: None }),
+            ExitStatus::Signal(sig) => Some(ExitInfo { code: None, signal: Some(sig) }),
+            ExitStatus::Killed => Some(ExitInfo { code: None, signal: Some(libc::SIGKILL) }),
+            ExitStatus::Timeout => Some(ExitInfo { code: Some(124), signal: None }),
+        },
+        Err(_) => None,
+    }
+}
+
+/// Run the supervisor in the **current process** for an OCI `restore`.
+///
+/// Unlike [`run_supervisor`], the policy comes from the checkpoint image (the
+/// saved `Sandbox`), not from an `OciPolicy`, and there is no separate `start`:
+/// `restore_interactive` both creates the child and resumes it, so the sandbox
+/// is `Running` the moment restore returns.
+pub fn run_supervisor_restore(id: &str, image_dir: &str, pid_write_fd: i32) -> Result<()> {
+    // Load the checkpoint image. On failure report back through the pid pipe so
+    // the CLI surfaces a clear error rather than a bare EOF.
+    let cp = match sandlock_core::Checkpoint::load(std::path::Path::new(image_dir)) {
+        Ok(c) => c,
+        Err(e) => {
+            pipe_write(pid_write_fd, &format!("ERR load checkpoint: {}", e));
+            return Err(anyhow::anyhow!("load checkpoint from {:?}: {}", image_dir, e));
+        }
+    };
+
+    // Build the Sandbox from the SAVED policy (cp.policy is a Sandbox with a
+    // manual Clone), not from an OciPolicy.
+    let mut sandbox = cp.policy.clone();
+    sandbox.set_name(id);
+
+    let sock_path = socket_path(id);
+    if sock_path.exists() {
+        std::fs::remove_file(&sock_path).ok();
+    }
+
+    // Same multi-threaded runtime requirement as run_supervisor.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime")?;
+
+    rt.block_on(supervisor_restore_main(id, sandbox, cp, sock_path, pid_write_fd))
+}
+
+/// Async body of [`run_supervisor_restore`].
+async fn supervisor_restore_main(
+    id: &str,
+    mut sandbox: sandlock_core::Sandbox,
+    cp: sandlock_core::Checkpoint,
+    sock_path: PathBuf,
+    pid_write_fd: i32,
+) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixListener;
+
+    // Bind the control socket BEFORE restore (mirrors create binding before
+    // create) so the CLI never races on socket availability.
+    let listener = match UnixListener::bind(&sock_path) {
+        Ok(l) => l,
+        Err(e) => {
+            pipe_write(pid_write_fd, &format!("ERR bind socket: {}", e));
+            anyhow::bail!("bind supervisor socket {:?}: {}", sock_path, e);
+        }
+    };
+
+    // Restore: forks the child under the saved policy, injects the checkpoint,
+    // and RESUMES it. The child is already running on return — there is no
+    // separate start step.
+    let skipped = match sandbox.restore_interactive(&cp).await {
+        Ok(s) => s,
+        Err(e) => {
+            pipe_write(pid_write_fd, &format!("ERR restore: {}", e));
+            return Err(anyhow::anyhow!("sandbox restore_interactive: {}", e));
+        }
+    };
+    for path in &skipped {
+        eprintln!("sandlock: not transparently restored: {}", path);
+    }
+
+    let child_pid = sandbox.pid().unwrap_or(0);
+
+    // Notify the CLI: `OK <pid>` on success.
+    pipe_write(pid_write_fd, &format!("OK {}", child_pid));
+
+    // Restore resumes the child immediately, so persist RUNNING right away
+    // (set_created records the PID, set_running flips the status).
+    {
+        let mut state = SandboxState::load(id)
+            .unwrap_or_else(|_| SandboxState::new(id, Path::new("/"), "1.0.2"));
+        state.set_created(child_pid);
+        state.set_running();
+        state.save().ok();
+    }
+
+    // Serve the control socket while the resumed child runs. There is no
+    // `Start` (the child is already running): a stray `Start` is an idempotent
+    // no-op. We interleave the accept-loop with `wait()` via `select!` so the
+    // child's exit is recorded while Ping/Checkpoint/Shutdown stay serviceable.
+    //
+    // Command handling that touches `sandbox` runs AFTER the `select!` returns
+    // (the competing `wait()` future is dropped first) to keep the borrows
+    // disjoint. When no command ever arrives, the very first `wait()` future
+    // runs to completion and records the exit via its pidfd.
+    let exit_info = loop {
+        enum Ev {
+            Exited(Result<sandlock_core::RunResult, sandlock_core::SandlockError>),
+            Conn(std::io::Result<(tokio::net::UnixStream, tokio::net::unix::SocketAddr)>),
+        }
+
+        let ev = tokio::select! {
+            res = sandbox.wait() => Ev::Exited(res),
+            conn = listener.accept() => Ev::Conn(conn),
+        };
+
+        match ev {
+            Ev::Exited(res) => break exit_info_from(res),
+            Ev::Conn(Err(_)) => {
+                // Listener broke: stop serving and just record the exit.
+                break exit_info_from(sandbox.wait().await);
+            }
+            Ev::Conn(Ok((mut stream, _))) => {
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    continue;
+                }
+                let incoming: SupervisorCmd = match serde_json::from_slice(&buf[..n]) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let reply =
+                            serde_json::to_vec(&SupervisorReply::Err { msg: e.to_string() })
+                                .unwrap_or_default();
+                        let _ = stream.write_all(&reply).await;
+                        let _ = stream.write_all(b"\n").await;
+                        continue;
+                    }
+                };
+
+                match incoming {
+                    SupervisorCmd::Ping => {
+                        let reply = serde_json::to_vec(&SupervisorReply::Pid { pid: child_pid })
+                            .unwrap_or_default();
+                        let _ = stream.write_all(&reply).await;
+                        let _ = stream.write_all(b"\n").await;
+                    }
+                    SupervisorCmd::Start => {
+                        // Restore already started the child: idempotent no-op.
+                        let reply = serde_json::to_vec(&SupervisorReply::Ok).unwrap_or_default();
+                        let _ = stream.write_all(&reply).await;
+                        let _ = stream.write_all(b"\n").await;
+                    }
+                    SupervisorCmd::Checkpoint { dir } => {
+                        let reply = match sandbox.checkpoint().await {
+                            Ok(mut cp) => {
+                                cp.name = id.to_string();
+                                match cp.save(std::path::Path::new(&dir)) {
+                                    Ok(()) => serde_json::to_vec(&SupervisorReply::Ok)
+                                        .unwrap_or_default(),
+                                    Err(e) => serde_json::to_vec(&SupervisorReply::Err {
+                                        msg: e.to_string(),
+                                    })
+                                    .unwrap_or_default(),
+                                }
+                            }
+                            Err(e) => serde_json::to_vec(&SupervisorReply::Err {
+                                msg: e.to_string(),
+                            })
+                            .unwrap_or_default(),
+                        };
+                        let _ = stream.write_all(&reply).await;
+                        let _ = stream.write_all(b"\n").await;
+                    }
+                    SupervisorCmd::Shutdown => {
+                        let reply = serde_json::to_vec(&SupervisorReply::Ok).unwrap_or_default();
+                        let _ = stream.write_all(&reply).await;
+                        let _ = stream.write_all(b"\n").await;
+                        // The restored child is running: kill and reap it so we
+                        // do not leak a process, then record the exit.
+                        let _ = sandbox.kill();
+                        break exit_info_from(sandbox.wait().await);
+                    }
+                }
+            }
+        }
+    };
+
+    if let Ok(mut s) = SandboxState::load(id) {
+        s.set_stopped(exit_info);
+        s.save().ok();
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

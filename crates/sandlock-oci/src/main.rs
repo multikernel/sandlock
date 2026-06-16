@@ -129,6 +129,18 @@ enum Command {
         #[arg(long = "image-path")]
         image_path: String,
     },
+
+    /// Restore a sandbox from a checkpoint image directory (resumes it running).
+    Restore {
+        /// Sandbox/container ID to create.
+        id: String,
+        /// Directory containing the checkpoint image.
+        #[arg(long = "image-path")]
+        image_path: String,
+        /// OCI bundle path (accepted for runc compatibility; may be unused).
+        #[arg(long = "bundle")]
+        bundle: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -205,6 +217,9 @@ fn main() -> Result<()> {
         }
         Command::Checkpoint { id, image_path } => {
             cmd_checkpoint(&id, &image_path)?;
+        }
+        Command::Restore { id, image_path, bundle: _ } => {
+            cmd_restore(&id, &image_path)?;
         }
     }
 
@@ -381,6 +396,127 @@ fn cmd_create(id: &str, bundle: &PathBuf, pid_file: Option<&std::path::Path>) ->
     if let Some(pf) = pid_file {
         std::fs::write(pf, child_pid.to_string())
             .with_context(|| format!("write pid file {:?}", pf))?;
+    }
+
+    Ok(())
+}
+
+/// `sandlock-oci restore <id> --image-path <dir>`
+///
+/// Mirrors [`cmd_create`]'s supervisor-spawn + pid-pipe handshake, but the
+/// policy and command come from the checkpoint image (not an OCI bundle), and
+/// there is no separate `start`: `run_supervisor_restore` both creates and
+/// resumes the child, so the sandbox is `Running` once the handshake succeeds.
+fn cmd_restore(id: &str, image_path: &str) -> Result<()> {
+    // Reject a re-used ID up front, exactly like `create`.
+    if SandboxState::load(id).is_ok() {
+        bail!("sandbox {} already exists", id);
+    }
+
+    // Persist an initial state so `state`/`delete` work even if the supervisor
+    // dies before it can write its own Running state. The supervisor overwrites
+    // this with Running once the child is resumed.
+    let state = SandboxState::new(id, std::path::Path::new("/"), "1.0.2");
+    state.save().with_context(|| format!("save state for sandbox {}", id))?;
+
+    // ── Pipe for synchronous PID notification ────────────────────────────────
+    let mut pid_pipe: [i32; 2] = [0; 2];
+    unsafe {
+        if libc::pipe2(pid_pipe.as_mut_ptr(), libc::O_CLOEXEC) < 0 {
+            bail!("pipe2 failed: {}", std::io::Error::last_os_error());
+        }
+    }
+    let read_fd = pid_pipe[0];
+    let write_fd = pid_pipe[1];
+
+    let image_path = image_path.to_string();
+
+    // ── Double-fork daemonization (identical to cmd_create) ──────────────────
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
+        bail!("fork failed: {}", std::io::Error::last_os_error());
+    }
+
+    if pid == 0 {
+        // ===== INTERMEDIATE CHILD =====
+        unsafe { libc::close(read_fd); }
+        unsafe { libc::setsid() };
+
+        let pid2 = unsafe { libc::fork() };
+        if pid2 < 0 {
+            unsafe {
+                libc::close(write_fd);
+                libc::_exit(1);
+            }
+        }
+        if pid2 != 0 {
+            unsafe {
+                libc::close(write_fd);
+                libc::_exit(0);
+            }
+        }
+
+        // ===== SUPERVISOR PROCESS (grandchild) =====
+        unsafe { libc::close(read_fd); }
+        unsafe { libc::chdir(b"/\0".as_ptr() as *const libc::c_char); }
+        unsafe {
+            let devnull = libc::open(
+                b"/dev/null\0".as_ptr() as *const libc::c_char,
+                libc::O_RDONLY,
+            );
+            if devnull >= 0 {
+                libc::dup2(devnull, 0);
+                if devnull > 0 {
+                    libc::close(devnull);
+                }
+            }
+        }
+
+        let _ = supervisor::run_supervisor_restore(id, &image_path, write_fd);
+        unsafe {
+            libc::close(write_fd);
+            libc::_exit(0);
+        }
+    }
+
+    // ===== ORIGINAL PROCESS (caller) =====
+    unsafe { libc::close(write_fd) };
+
+    let mut wstatus = 0i32;
+    unsafe { libc::waitpid(pid, &mut wstatus, 0) };
+
+    let child_pid = {
+        let mut buf = [0u8; 512];
+        let n = unsafe {
+            libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+        };
+        unsafe { libc::close(read_fd) };
+        if n <= 0 {
+            bail!("supervisor exited without reporting status (check system logs)");
+        }
+        let response = String::from_utf8_lossy(&buf[..n as usize]);
+        let response = response.trim();
+        if let Some(rest) = response.strip_prefix("OK ") {
+            rest.parse::<i32>()
+                .with_context(|| format!("invalid PID in supervisor response: {:?}", response))?
+        } else if let Some(msg) = response.strip_prefix("ERR ") {
+            bail!("sandbox restore failed: {}", msg);
+        } else {
+            bail!("unexpected supervisor response: {:?}", response);
+        }
+    };
+
+    // Restore resumes immediately: record Running with the real PID. This is
+    // authoritative regardless of how the supervisor's own state write races.
+    {
+        let mut state = SandboxState::load(id)?;
+        state.set_created(child_pid);
+        state.set_running();
+        state.save()?;
     }
 
     Ok(())
