@@ -16,13 +16,19 @@ use crate::sandbox::Sandbox;
 //   └── process/
 //       ├── info.json        # pid, cwd, exe
 //       ├── fds.json         # file descriptor table
-//       ├── memory_map.json  # region metadata
+//       ├── memory_map.json  # FULL region metadata (every mapping)
 //       ├── threads/
 //       │   └── 0.bin        # raw register bytes (main thread)
 //       └── memory/
-//           └── <index>.bin  # raw memory contents per segment
+//           └── <start_hex>.bin  # captured bytes for a region, keyed by its
+//                                # start address (only regions with data)
+//
+// `memory_map.json` lists *every* mapping (not just captured ones) so that
+// restore can `RemapFromFile` the file-backed regions (e.g. the executable
+// text) that were never captured into `memory/`. Each `memory/<start_hex>.bin`
+// is re-associated with its map entry by matching start address.
 
-const IMAGE_VERSION: u32 = 1;
+const IMAGE_VERSION: u32 = 2;
 
 fn io_err(e: impl std::fmt::Display) -> SandlockError {
     SandlockError::Runtime(SandboxRuntimeError::Child(e.to_string()))
@@ -145,28 +151,15 @@ impl Checkpoint {
         }).collect();
         write_json(&proc_dir.join("fds.json"), &fds)?;
 
-        // process/memory_map.json -- only captured segments (1:1 with memory/*.bin)
-        // Build map entries for each captured segment by matching start address
-        let maps: Vec<MemoryMapJson> = self.process_state.memory_data.iter().map(|seg| {
-            // Find the corresponding full map entry
-            let map = self.process_state.memory_maps.iter()
-                .find(|m| m.start == seg.start);
-            match map {
-                Some(m) => MemoryMapJson {
-                    start: m.start,
-                    end: m.end,
-                    perms: m.perms.clone(),
-                    offset: m.offset,
-                    path: m.path.clone(),
-                },
-                None => MemoryMapJson {
-                    start: seg.start,
-                    end: seg.start + seg.data.len() as u64,
-                    perms: "rw-p".to_string(),
-                    offset: 0,
-                    path: None,
-                },
-            }
+        // process/memory_map.json -- FULL region metadata (every mapping), so
+        // restore can RemapFromFile the file-backed regions (e.g. the
+        // executable text) that were never captured into memory_data.
+        let maps: Vec<MemoryMapJson> = self.process_state.memory_maps.iter().map(|m| MemoryMapJson {
+            start: m.start,
+            end: m.end,
+            perms: m.perms.clone(),
+            offset: m.offset,
+            path: m.path.clone(),
         }).collect();
         write_json(&proc_dir.join("memory_map.json"), &maps)?;
 
@@ -183,12 +176,14 @@ impl Checkpoint {
         std::fs::write(threads_dir.join("fpregs.bin"), &self.process_state.fpregs)
             .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
 
-        // process/memory/<index>.bin -- 1:1 with memory_map.json entries
+        // process/memory/<start_hex>.bin -- captured segment bytes, keyed by
+        // start address so load can re-associate each blob with its (full) map
+        // entry regardless of how many uncaptured maps sit between them.
         let mem_dir = proc_dir.join("memory");
         std::fs::create_dir(&mem_dir)
             .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
-        for (i, seg) in self.process_state.memory_data.iter().enumerate() {
-            std::fs::write(mem_dir.join(format!("{}.bin", i)), &seg.data)
+        for seg in self.process_state.memory_data.iter() {
+            std::fs::write(mem_dir.join(format!("{:x}.bin", seg.start)), &seg.data)
                 .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
         }
 
@@ -241,7 +236,7 @@ impl Checkpoint {
             offset: f.offset,
         }).collect();
 
-        // process/memory_map.json -- 1:1 with memory/<i>.bin
+        // process/memory_map.json -- FULL region list (every mapping).
         let maps_json: Vec<MemoryMapJson> = read_json(&proc_dir.join("memory_map.json"))?;
         let memory_maps: Vec<MemoryMap> = maps_json.iter().map(|m| MemoryMap {
             start: m.start,
@@ -261,17 +256,22 @@ impl Checkpoint {
         // Read FP/extended registers; tolerate absence defensively.
         let fpregs = std::fs::read(threads_dir.join("fpregs.bin")).unwrap_or_default();
 
-        // process/memory/<i>.bin -- 1:1 with memory_map.json
+        // process/memory/<start_hex>.bin -- captured segments only, matched to
+        // their map entry by start address. Maps without a blob (file-backed
+        // regions like the executable text) carry no data and are restored via
+        // RemapFromFile during resume.
         let mem_dir = proc_dir.join("memory");
         let mut memory_data = Vec::new();
-        for (i, map) in maps_json.iter().enumerate() {
-            let seg_path = mem_dir.join(format!("{}.bin", i));
-            let data = std::fs::read(&seg_path)
-                .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
-            memory_data.push(MemorySegment {
-                start: map.start,
-                data,
-            });
+        for map in &maps_json {
+            let seg_path = mem_dir.join(format!("{:x}.bin", map.start));
+            if seg_path.exists() {
+                let data = std::fs::read(&seg_path)
+                    .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
+                memory_data.push(MemorySegment {
+                    start: map.start,
+                    data,
+                });
+            }
         }
 
         Ok(Checkpoint {
