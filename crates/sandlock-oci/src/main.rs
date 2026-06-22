@@ -16,7 +16,8 @@
 //!
 //! ## Known limitations
 //!
-//! - `exec` is not implemented (required for `kubectl exec` / exec probes).
+//! - `exec` runs non-TTY only: `-t` / `--console-socket` are accepted for runc
+//!   compatibility but ignored (no PTY yet).
 
 mod fdpass;
 mod policy;
@@ -105,21 +106,42 @@ enum Command {
     /// Check kernel feature support (delegates to sandlock-core checks).
     Check,
 
-    /// Execute a process inside a running sandbox.
+    /// Execute a process inside a running container (non-TTY).
     ///
-    /// **Not yet implemented.** Required for `kubectl exec` and exec-based
-    /// liveness/readiness probes.  Tracked as a known limitation.
-    ///
-    /// All arguments are accepted without validation so that containerd/CRI-O
-    /// invocations (which pass flags like `--process`, `--detach`, `--pid-file`
-    /// *before* the sandbox-id) parse cleanly and receive a clear error.
+    /// Supports inline args (`exec <id> <cmd> [args...]`) and the process-spec
+    /// form (`exec --process spec.json <id>`). The exec'd process is spawned by
+    /// the container's supervisor under a clone of the container policy, so it
+    /// is confined identically to the container's main process. `-t` /
+    /// `--console-socket` are accepted for runc compatibility but ignored (no
+    /// PTY yet).
     Exec {
-        /// All exec arguments captured as-is (id, flags, command).
-        /// `allow_hyphen_values` + `trailing_var_arg` ensure that runc-style
-        /// flags preceding the sandbox-id do not trigger an "unexpected
-        /// argument" error.
-        #[arg(num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true)]
-        _args: Vec<String>,
+        /// Container identifier.
+        id: String,
+        /// Path to a process-spec JSON file (OCI `Process`). Takes precedence
+        /// over inline command args when provided.
+        #[arg(short = 'p', long = "process", value_name = "FILE")]
+        process: Option<PathBuf>,
+        /// Write the exec process PID to this file.
+        #[arg(long = "pid-file", value_name = "PATH")]
+        pid_file: Option<PathBuf>,
+        /// Detach: return after the process starts without waiting for exit.
+        #[arg(short = 'd', long)]
+        detach: bool,
+        /// Console socket for PTY exec (accepted, ignored: no PTY yet).
+        #[arg(long = "console-socket", value_name = "PATH")]
+        console_socket: Option<PathBuf>,
+        /// Allocate a pseudo-TTY (accepted, ignored: no PTY yet).
+        #[arg(short = 't', long)]
+        tty: bool,
+        /// Environment variable to set (KEY=VALUE). Repeatable.
+        #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// Working directory inside the container.
+        #[arg(long, value_name = "PATH")]
+        cwd: Option<PathBuf>,
+        /// Command and arguments to execute inside the container.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
     },
 
     /// Capture a checkpoint of a running sandbox to an image directory.
@@ -189,12 +211,26 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::Exec { _args: _ } => {
-            bail!(
-                "`exec` is not implemented in sandlock-oci. \
-                 It is required for kubectl exec and exec-based probes but has not \
-                 yet been built (tracked as a known limitation)."
-            );
+        Command::Exec {
+            id,
+            process,
+            pid_file,
+            detach,
+            console_socket: _,
+            tty: _,
+            env,
+            cwd,
+            command,
+        } => {
+            cmd_exec(
+                &id,
+                process.as_deref(),
+                pid_file.as_deref(),
+                detach,
+                &env,
+                cwd.as_deref(),
+                &command,
+            )?;
         }
         Command::Check => {
             match sandlock_core::landlock_abi_version() {
@@ -563,18 +599,26 @@ fn cmd_kill(id: &str, signal: &str, all: bool) -> Result<()> {
 
     let signum = parse_signal(signal)?;
 
-    let ret = if all {
-        // Kill the entire process group.
-        unsafe { libc::killpg(state.pid, signum) }
+    if all {
+        // For group-wide signals, ask the daemon to killpg so it uses the
+        // correct pgid (sandlock-init's pid, not the workload's). Fall back
+        // to a direct killpg if the daemon is unreachable (already exited).
+        let sent = supervisor::send_command(
+            id,
+            supervisor::SupervisorCmd::Signal { signum },
+        );
+        if sent.is_err() {
+            // Daemon gone: best-effort direct killpg on the recorded pid.
+            unsafe { libc::killpg(state.pid, signum) };
+        }
     } else {
-        unsafe { libc::kill(state.pid, signum) }
-    };
-
-    if ret < 0 {
-        let err = std::io::Error::last_os_error();
-        // ESRCH means the process is already gone — not an error.
-        if err.raw_os_error() != Some(libc::ESRCH) {
-            bail!("kill({}, {}): {}", state.pid, signal, err);
+        let ret = unsafe { libc::kill(state.pid, signum) };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            // ESRCH means the process is already gone -- not an error.
+            if err.raw_os_error() != Some(libc::ESRCH) {
+                bail!("kill({}, {}): {}", state.pid, signal, err);
+            }
         }
     }
     Ok(())
@@ -594,16 +638,22 @@ fn cmd_delete(id: &str, force: bool) -> Result<()> {
     }
 
     // If the supervisor is blocked waiting for `start`, send Shutdown so it
-    // exits cleanly rather than leaking a process.  Ignore send errors — the
+    // exits cleanly rather than leaking a process.  Ignore send errors: the
     // supervisor may have already exited or the socket may not exist yet.
     if matches!(state.status, Status::Creating | Status::Created) {
         let _ = supervisor::send_command(id, supervisor::SupervisorCmd::Shutdown);
     }
 
-    // Kill the sandbox process if it's still alive (Running + force, or any
-    // state where the child is alive).
-    if state.pid > 0 && state.is_alive() {
-        unsafe { libc::killpg(state.pid, libc::SIGKILL) };
+    // If running with --force, ask the daemon to shutdown (it sends Shutdown to
+    // sandlock-init, which killpg's its group and exits). This correctly targets
+    // the process group even when state.pid is the workload (not the pgid).
+    // Fall back to a direct killpg if the daemon is already gone.
+    if state.status == Status::Running && state.pid > 0 && state.is_alive() {
+        let sent = supervisor::send_command(id, supervisor::SupervisorCmd::Shutdown);
+        if sent.is_err() {
+            // Daemon already gone: kill whatever we can reach.
+            unsafe { libc::killpg(state.pid, libc::SIGKILL) };
+        }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
@@ -628,6 +678,164 @@ fn cmd_checkpoint(id: &str, image_path: &str) -> Result<()> {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Resolved request for an exec'd process: command, environment overrides, and
+/// optional working directory. Built from either a `--process` spec JSON or
+/// inline args, with `--env`/`--cwd` flags merged on top.
+#[derive(Debug)]
+struct ExecRequest {
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+    cwd: Option<String>,
+}
+
+/// Resolve the exec command/env/cwd from a process-spec file or inline args.
+/// `--env` entries merge over (and override) the spec's env; `--cwd` overrides
+/// the spec's cwd.
+fn resolve_exec_request(
+    process_file: Option<&std::path::Path>,
+    inline_args: &[String],
+    extra_env: &[String],
+    extra_cwd: Option<&std::path::Path>,
+) -> Result<ExecRequest> {
+    use std::collections::BTreeMap;
+
+    let (args, mut env_map, mut cwd): (Vec<String>, BTreeMap<String, String>, Option<String>) =
+        if let Some(pf) = process_file {
+            let raw = std::fs::read_to_string(pf)
+                .with_context(|| format!("read process spec {:?}", pf))?;
+            let proc: oci_spec::runtime::Process =
+                serde_json::from_str(&raw).context("parse process spec JSON")?;
+            let args = proc.args().as_ref().cloned().unwrap_or_default();
+            let env: BTreeMap<String, String> = proc
+                .env()
+                .as_ref()
+                .map(|e| {
+                    e.iter()
+                        .filter_map(|v| v.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let c = proc.cwd().to_string_lossy().to_string();
+            let cwd = if c.is_empty() { None } else { Some(c) };
+            (args, env, cwd)
+        } else {
+            (inline_args.to_vec(), BTreeMap::new(), None)
+        };
+
+    for kv in extra_env {
+        if let Some((k, v)) = kv.split_once('=') {
+            env_map.insert(k.to_string(), v.to_string());
+        }
+    }
+    if let Some(c) = extra_cwd {
+        cwd = Some(c.to_string_lossy().to_string());
+    }
+
+    if args.is_empty() {
+        bail!("exec requires a command; pass it after the container ID or use --process");
+    }
+
+    Ok(ExecRequest {
+        args,
+        env: env_map.into_iter().collect(),
+        cwd,
+    })
+}
+
+/// `sandlock-oci exec <id> [--process spec.json] [-- <cmd> [args...]]`
+///
+/// Connects to the container's supervisor, passes this process's stdio fds via
+/// SCM_RIGHTS, and asks the supervisor to spawn the command under a clone of the
+/// container policy. Attached (default): block until the exec'd process exits
+/// and exit with its status. `--detach`: return after it starts.
+fn cmd_exec(
+    id: &str,
+    process_file: Option<&std::path::Path>,
+    pid_file: Option<&std::path::Path>,
+    detach: bool,
+    extra_env: &[String],
+    extra_cwd: Option<&std::path::Path>,
+    inline_args: &[String],
+) -> Result<()> {
+    use std::io::BufRead;
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    let state = SandboxState::load(id).with_context(|| format!("no such container: {}", id))?;
+    if state.status != Status::Running {
+        bail!("container {} is not running (status: {})", id, state.status);
+    }
+
+    let req = resolve_exec_request(process_file, inline_args, extra_env, extra_cwd)?;
+
+    let cmd = supervisor::SupervisorCmd::Exec {
+        args: req.args,
+        env: req.env,
+        cwd: req.cwd,
+        detach,
+    };
+    let payload = serde_json::to_vec(&cmd).context("serialize exec command")?;
+
+    let sock = supervisor::socket_path(id);
+    let stream = UnixStream::connect(&sock)
+        .with_context(|| format!("connect to supervisor socket {:?}", sock))?;
+
+    // Pass our stdin/stdout/stderr to the supervisor alongside the command.
+    fdpass::send_with_fds(
+        &stream,
+        &payload,
+        &[
+            std::io::stdin().as_raw_fd(),
+            std::io::stdout().as_raw_fd(),
+            std::io::stderr().as_raw_fd(),
+        ],
+    )
+    .context("send exec command + stdio fds")?;
+
+    let mut reader = std::io::BufReader::new(&stream);
+
+    // First reply: Pid (or Err).
+    let mut line = String::new();
+    reader.read_line(&mut line).context("read exec pid reply")?;
+    let pid_reply: supervisor::SupervisorReply =
+        serde_json::from_str(line.trim()).context("parse exec pid reply")?;
+    let exec_pid = match pid_reply {
+        supervisor::SupervisorReply::Pid { pid } => pid,
+        supervisor::SupervisorReply::Err { msg } => bail!("exec failed: {}", msg),
+        other => bail!("unexpected exec reply: {:?}", other),
+    };
+
+    if let Some(pf) = pid_file {
+        std::fs::write(pf, exec_pid.to_string())
+            .with_context(|| format!("write pid file {:?}", pf))?;
+    }
+
+    if detach {
+        return Ok(());
+    }
+
+    // Second reply: Exit. Exit this CLI with the same status.
+    let mut line2 = String::new();
+    reader.read_line(&mut line2).context("read exec exit reply")?;
+    let exit_reply: supervisor::SupervisorReply =
+        serde_json::from_str(line2.trim()).context("parse exec exit reply")?;
+    match exit_reply {
+        supervisor::SupervisorReply::Exit { code, signal } => {
+            if let Some(c) = code {
+                std::process::exit(c);
+            }
+            if let Some(s) = signal {
+                std::process::exit(128 + s);
+            }
+            std::process::exit(0);
+        }
+        supervisor::SupervisorReply::Err { msg } => bail!("exec failed: {}", msg),
+        other => bail!("unexpected exec exit reply: {:?}", other),
+    }
+    // Every arm above diverges (process::exit or bail!), so the match types as
+    // `!` and is the function's tail expression: no trailing Ok(()) needed.
+}
 
 /// Parse a signal name (e.g. "SIGTERM", "TERM", "15") into a libc signal number.
 fn parse_signal(s: &str) -> Result<i32> {
@@ -673,5 +881,45 @@ mod tests {
     #[test]
     fn parse_signal_unknown_errors() {
         assert!(parse_signal("SIGNOTREAL").is_err());
+    }
+
+    #[test]
+    fn resolve_inline_args_with_env_and_cwd() {
+        let req = resolve_exec_request(
+            None,
+            &["sh".to_string(), "-c".to_string(), "echo hi".to_string()],
+            &["FOO=bar".to_string(), "BAZ=qux".to_string()],
+            Some(std::path::Path::new("/work")),
+        )
+        .unwrap();
+        assert_eq!(req.args, vec!["sh", "-c", "echo hi"]);
+        assert!(req.env.contains(&("FOO".to_string(), "bar".to_string())));
+        assert!(req.env.contains(&("BAZ".to_string(), "qux".to_string())));
+        assert_eq!(req.cwd.as_deref(), Some("/work"));
+    }
+
+    #[test]
+    fn resolve_empty_command_errors() {
+        let err = resolve_exec_request(None, &[], &[], None).unwrap_err();
+        assert!(err.to_string().contains("requires a command"));
+    }
+
+    #[test]
+    fn resolve_process_spec_json() {
+        let dir = std::env::temp_dir().join(format!("sl-exec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = dir.join("process.json");
+        std::fs::write(
+            &spec,
+            r#"{"user":{"uid":0,"gid":0},"args":["/bin/true"],"env":["A=1"],"cwd":"/srv"}"#,
+        )
+        .unwrap();
+        let req = resolve_exec_request(Some(&spec), &[], &["B=2".to_string()], None).unwrap();
+        assert_eq!(req.args, vec!["/bin/true"]);
+        // --env merges on top of the spec env.
+        assert!(req.env.contains(&("A".to_string(), "1".to_string())));
+        assert!(req.env.contains(&("B".to_string(), "2".to_string())));
+        assert_eq!(req.cwd.as_deref(), Some("/srv"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

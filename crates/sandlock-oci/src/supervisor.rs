@@ -208,6 +208,10 @@ pub enum SupervisorCmd {
         cwd: Option<String>,
         detach: bool,
     },
+    /// Deliver `signum` to the container's entire process group (the group
+    /// whose leader is sandlock-init). Used by `kill --all` and `delete
+    /// --force` so the CLI does not need to know the pgid directly.
+    Signal { signum: i32 },
 }
 
 /// Responses from the Supervisor.
@@ -527,6 +531,14 @@ async fn supervisor_main(
                 let _ = stream.write_all(&reply).await;
                 let _ = stream.write_all(b"\n").await;
             }
+            SupervisorCmd::Signal { .. } => {
+                let reply = serde_json::to_vec(&SupervisorReply::Err {
+                    msg: "container not running".into(),
+                })
+                .unwrap_or_default();
+                let _ = stream.write_all(&reply).await;
+                let _ = stream.write_all(b"\n").await;
+            }
         }
     }
 }
@@ -638,6 +650,22 @@ async fn serve_one_running_init(
             };
             let _ = stream.write_all(&reply).await;
             let _ = stream.write_all(b"\n").await;
+            RunningCmd::Continue
+        }
+        SupervisorCmd::Signal { signum } => {
+            // killpg targets the process GROUP, whose leader is sandlock-init.
+            // sandbox.pid() is that group-leader pid (set by setpgid(0,0) in core).
+            let init_pgid = sandbox.pid().unwrap_or(0) as i32;
+            if init_pgid > 0 {
+                unsafe { libc::killpg(init_pgid, signum) };
+                let reply = serde_json::to_vec(&SupervisorReply::Ok).unwrap_or_default();
+                let _ = stream.write_all(&reply).await;
+                let _ = stream.write_all(b"\n").await;
+            } else {
+                let reply = serde_json::to_vec(&SupervisorReply::Err { msg: "no container process group".into() }).unwrap_or_default();
+                let _ = stream.write_all(&reply).await;
+                let _ = stream.write_all(b"\n").await;
+            }
             RunningCmd::Continue
         }
         SupervisorCmd::Shutdown => {
@@ -825,6 +853,20 @@ async fn serve_one_running(
             .unwrap_or_default();
             let _ = stream.write_all(&reply).await;
             let _ = stream.write_all(b"\n").await;
+            RunningCmd::Continue
+        }
+        SupervisorCmd::Signal { signum } => {
+            // child_pid is the group leader's pid (== pgid) in the restore path.
+            if child_pid > 0 {
+                unsafe { libc::killpg(child_pid, signum) };
+                let reply = serde_json::to_vec(&SupervisorReply::Ok).unwrap_or_default();
+                let _ = stream.write_all(&reply).await;
+                let _ = stream.write_all(b"\n").await;
+            } else {
+                let reply = serde_json::to_vec(&SupervisorReply::Err { msg: "no container process group".into() }).unwrap_or_default();
+                let _ = stream.write_all(&reply).await;
+                let _ = stream.write_all(b"\n").await;
+            }
             RunningCmd::Continue
         }
         SupervisorCmd::Shutdown => {
@@ -1066,5 +1108,14 @@ mod tests {
         assert!(json.contains("/tmp/img"));
         let back: SupervisorCmd = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, SupervisorCmd::Checkpoint { .. }));
+    }
+
+    #[test]
+    fn supervisor_cmd_signal_serde() {
+        let cmd = SupervisorCmd::Signal { signum: libc::SIGKILL };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("signal"));
+        let back: SupervisorCmd = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, SupervisorCmd::Signal { signum: 9 }));
     }
 }
