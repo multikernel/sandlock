@@ -636,7 +636,10 @@ async fn serve_one_running_init(
             RunningCmd::Continue
         }
         SupervisorCmd::Checkpoint { dir } => {
-            let reply = match sandbox.checkpoint().await {
+            // Capture the WORKLOAD, not sandlock-init (which is the sandbox's
+            // direct child and would only snapshot the init process blocked in
+            // recvmsg).
+            let reply = match sandbox.checkpoint_pid(workload_pid).await {
                 Ok(mut cp) => {
                     cp.name = id.to_string();
                     match cp.save(std::path::Path::new(&dir)) {

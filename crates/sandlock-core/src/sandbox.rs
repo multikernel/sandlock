@@ -888,8 +888,20 @@ impl Sandbox {
         let pid = self.runtime.as_ref()
             .and_then(|rt| rt.child_pid)
             .ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
+        self.checkpoint_pid(pid).await
+    }
+
+    /// Capture a checkpoint targeting a specific pid instead of the sandbox's
+    /// direct child. The target must be a fork-descendant confined by the same
+    /// policy (e.g. the workload spawned by sandlock-init). `target_pid` must
+    /// be positive.
+    pub async fn checkpoint_pid(&self, target_pid: i32) -> Result<crate::checkpoint::Checkpoint, crate::error::SandlockError> {
+        use crate::error::{SandboxRuntimeError, SandlockError};
+        if target_pid <= 0 {
+            return Err(SandlockError::Runtime(SandboxRuntimeError::NotRunning));
+        }
         self.freeze().await?;
-        let cp = crate::checkpoint::capture(pid, self);
+        let cp = crate::checkpoint::capture(target_pid, self);
         self.thaw().await?;
         cp
     }
