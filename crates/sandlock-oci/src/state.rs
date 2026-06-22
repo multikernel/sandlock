@@ -156,14 +156,27 @@ impl SandboxState {
     }
 
     /// Persist state to disk. Creates the directory if needed.
+    ///
+    /// The write is atomic: serialize to a per-writer temp file, then `rename`
+    /// it over `state.json`. During `create`/`restore` the CLI and the detached
+    /// supervisor write `state.json` concurrently; a plain `write` (truncate then
+    /// write) would let the other process `load` a torn or empty file and fail to
+    /// parse it. `rename(2)` is atomic on the same filesystem, so a concurrent
+    /// reader always sees a complete file (the previous one or the new one).
     pub fn save(&self) -> Result<()> {
         let dir = self.state_dir();
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("create state dir {:?}", dir))?;
         let data = serde_json::to_string_pretty(self)
             .context("serialize sandbox state")?;
-        std::fs::write(self.state_file(), data)
-            .with_context(|| format!("write state to {:?}", self.state_file()))
+        // Temp and target share `dir` (same filesystem, so rename is atomic) and
+        // the temp name carries the writer's PID so concurrent writers in
+        // different processes never collide on it.
+        let tmp = dir.join(format!("state.json.{}.tmp", std::process::id()));
+        std::fs::write(&tmp, data)
+            .with_context(|| format!("write state to {:?}", tmp))?;
+        std::fs::rename(&tmp, self.state_file())
+            .with_context(|| format!("rename {:?} -> {:?}", tmp, self.state_file()))
     }
 
     /// Load state from disk.
