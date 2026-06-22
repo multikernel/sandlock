@@ -739,3 +739,102 @@ async fn oci_stop_collapses_process_group() {
         sample_a, sample_b
     );
 }
+/// End-to-end proof of `sandlock-oci exec`: create+start a long-lived container
+/// (`rootfs-helper spawn-loop`, whose parent pauses), then `exec` a second
+/// command (`rootfs-helper write`) that creates a sentinel file inside the
+/// container rootfs and exits 0. Verifies the exec CLI exits 0 (the supervisor's
+/// Pid + Exit relay works over SCM_RIGHTS) and that the exec'd process ran under
+/// the container's confinement (the sentinel lands inside the chroot). Landlock
+/// gated; rootfs-helper is portable C so there is no arch restriction.
+#[tokio::test(flavor = "multi_thread")]
+async fn oci_exec_runs_in_running_container() {
+    if sandlock_core::landlock_abi_version().is_err() {
+        eprintln!("skipping: Landlock unavailable on this host");
+        return;
+    }
+    let helper = rootfs_helper();
+    if !helper.exists() {
+        eprintln!("skipping: rootfs-helper not built (needs musl-gcc or cc -static)");
+        return;
+    }
+
+    let tmp = std::env::temp_dir().join(format!("sandlock-oci-exec-{}", std::process::id()));
+    fs::create_dir_all(&tmp).unwrap();
+    let bundle = tmp.join("bundle");
+    let rootfs = bundle.join("rootfs");
+    fs::create_dir_all(&rootfs).unwrap();
+    fs::copy(&helper, rootfs.join("rootfs-helper")).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(rootfs.join("rootfs-helper"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // Long-lived main process: forks a keepalive worker, parent pauses forever.
+    create_bundle(&bundle, &["/rootfs-helper", "spawn-loop", "/keepalive.cnt"]);
+
+    let root = tempdir().unwrap();
+    let root_s = root.path().to_str().unwrap().to_string();
+    let id = "oci-exec-e2e";
+
+    // create (daemonizes a supervisor that inherits stdio; redirect + .status()).
+    let create_log = tmp.join("create.log");
+    let create_status = Command::new(oci_bin())
+        .args(["--root", &root_s, "create", id, "-b", bundle.to_str().unwrap()])
+        .stdout(std::process::Stdio::from(fs::File::create(&create_log).unwrap()))
+        .stderr(std::process::Stdio::from(
+            fs::OpenOptions::new().append(true).open(&create_log).unwrap(),
+        ))
+        .status()
+        .expect("run create");
+    assert!(create_status.success(), "create failed: {}", fs::read_to_string(&create_log).unwrap_or_default());
+
+    let start_out = Command::new(oci_bin())
+        .args(["--root", &root_s, "start", id])
+        .output()
+        .expect("run start");
+    assert!(start_out.status.success(), "start failed: {}", String::from_utf8_lossy(&start_out.stderr));
+
+    // Wait until the container is genuinely running (keepalive counter advances).
+    let host_keepalive = rootfs.join("keepalive.cnt");
+    let host_keepalive_s = host_keepalive.to_str().unwrap().to_string();
+    let read_counter = |path: &str| -> Option<u64> {
+        fs::read_to_string(path).ok().and_then(|s| s.trim().parse::<u64>().ok())
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut running = false;
+    while std::time::Instant::now() < deadline {
+        if read_counter(&host_keepalive_s).map(|v| v > 2).unwrap_or(false) {
+            running = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(running, "container never started; create_log: {}", fs::read_to_string(&create_log).unwrap_or_default());
+
+    // exec a write command inside the running container (attached). Exits 0.
+    let exec_out = Command::new(oci_bin())
+        .args(["--root", &root_s, "exec", id, "/rootfs-helper", "write", "/exec.ok", "done"])
+        .output()
+        .expect("run exec");
+
+    let sentinel = rootfs.join("exec.ok");
+    let sentinel_exists = sentinel.exists();
+    let sentinel_body = fs::read_to_string(&sentinel).unwrap_or_default();
+
+    // clean up before asserting so a failure never leaks the container.
+    let _ = Command::new(oci_bin())
+        .args(["--root", &root_s, "delete", id, "--force"])
+        .output();
+    let _ = fs::remove_dir_all(&tmp);
+
+    assert!(
+        exec_out.status.success(),
+        "exec CLI must exit 0 (got {:?}); stderr: {}",
+        exec_out.status.code(),
+        String::from_utf8_lossy(&exec_out.stderr)
+    );
+    assert!(
+        sentinel_exists,
+        "exec'd process must run inside the container rootfs and create /exec.ok"
+    );
+    assert_eq!(sentinel_body.trim(), "done", "exec'd process wrote the sentinel content");
+}
