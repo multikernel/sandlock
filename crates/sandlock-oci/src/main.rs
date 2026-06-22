@@ -12,11 +12,13 @@
 //!   state  <id>              →  print state.json (reconciled against liveness)
 //!   kill   <id> <signal>     →  forward signal to Child PID
 //!   delete <id>              →  send Shutdown to Supervisor, cleanup state dir
+//!   exec   <id> <cmd>        →  Supervisor spawns a confined sibling (stdio via SCM_RIGHTS)
 //! ```
 //!
 //! ## Known limitations
 //!
-//! - `exec` is not implemented (required for `kubectl exec` / exec probes).
+//! - `exec` runs non-TTY only: `-t` / `--console-socket` are accepted for runc
+//!   compatibility but ignored (no PTY yet).
 
 mod fdpass;
 mod policy;
