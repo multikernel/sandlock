@@ -7,6 +7,7 @@ repository.workspace = true
 homepage.workspace = true
 description = "OCI runtime shim for sandlock — namespace-less, Landlock-based"
 readme = "../../README.md"
+build = "build.rs"
 
 [lib]
 name = "sandlock_oci"
@@ -18,6 +19,7 @@ path = "src/main.rs"
 
 [dependencies]
 sandlock-core = { version = "0.8.3", path = "../sandlock-core" }
+sandlock-init = { path = "../sandlock-init" }
 anyhow      = "1"
 clap        = { version = "4", features = ["derive"] }
 tokio       = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }

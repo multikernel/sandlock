@@ -18,6 +18,7 @@
 //!
 //! - `exec` is not implemented (required for `kubectl exec` / exec probes).
 
+mod fdpass;
 mod policy;
 mod spec;
 mod state;

@@ -15,11 +15,172 @@
 //! the sandbox's state directory.
 
 use anyhow::{Context, Result};
+use std::collections::HashMap;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
+use tokio::sync::oneshot;
+
+use sandlock_init::{Req, Resp, CONTROL_FD};
 
 use crate::policy::OciPolicy;
 use crate::state::SandboxState;
+
+/// The embedded static sandlock-init binary (built by build.rs). It runs as the
+/// confined PID-1 inside the sandbox and is launched from a memfd via the
+/// sandbox's `exec_fd` so no on-disk loader path is needed in the chroot.
+const SANDLOCK_INIT: &[u8] = include_bytes!(env!("SANDLOCK_INIT_BIN"));
+
+/// Write the init binary into a memfd; returns the owning fd. The child inherits
+/// it across fork and execs it via `execveat(exec_fd, "", AT_EMPTY_PATH)`.
+fn init_memfd() -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::io::IntoRawFd;
+    let name = std::ffi::CString::new("sandlock-init").unwrap();
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+    f.write_all(SANDLOCK_INIT)?;
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(f.into_raw_fd()) })
+}
+
+/// Demultiplexer for the single control channel to `sandlock-init`.
+///
+/// All replies (`Started`, `Exited`, `Err`) arrive on one socket and must be
+/// routed: a `Started`/`Err` is the immediate reply to the request just sent
+/// (requests are serialized by holding the writer lock across the await, so the
+/// correlation is unambiguous), while an `Exited{pid}` is routed to the waiter
+/// registered for that pid (an exec, or the main workload). An `Exited` that
+/// arrives before its waiter registers is buffered in `early_exits`.
+struct LinkState {
+    /// Sender for the reply to the in-flight request (a `Started` or `Err`).
+    pending: Option<oneshot::Sender<Resp>>,
+    /// Per-pid exit waiters (main workload + attached execs).
+    exit_waiters: HashMap<i32, oneshot::Sender<Resp>>,
+    /// Exits that arrived before a waiter registered.
+    early_exits: HashMap<i32, Resp>,
+}
+
+struct InitLink {
+    /// Write half (a dup of the control socket) used for blocking `sendmsg`.
+    writer: tokio::sync::Mutex<std::os::unix::net::UnixStream>,
+    state: StdMutex<LinkState>,
+}
+
+impl InitLink {
+    /// Build the link and spawn the background reader that routes replies.
+    fn new(
+        writer: std::os::unix::net::UnixStream,
+        reader: tokio::net::UnixStream,
+    ) -> Arc<Self> {
+        let link = Arc::new(InitLink {
+            writer: tokio::sync::Mutex::new(writer),
+            state: StdMutex::new(LinkState {
+                pending: None,
+                exit_waiters: HashMap::new(),
+                early_exits: HashMap::new(),
+            }),
+        });
+        let weak = link.clone();
+        tokio::spawn(async move { reader_task(weak, reader).await });
+        link
+    }
+
+    /// Send a request (optionally with SCM_RIGHTS `fds`) and return its
+    /// immediate `Started`/`Err` reply. The writer lock is held across the
+    /// await so requests are serialized and each reply pairs with its request.
+    async fn request(&self, req: &Req, fds: &[RawFd]) -> std::io::Result<Resp> {
+        let mut bytes = serde_json::to_vec(req)?;
+        bytes.push(b'\n');
+        let writer = self.writer.lock().await;
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut st = self.state.lock().unwrap();
+            st.pending = Some(tx);
+        }
+        crate::fdpass::send_with_fds(&writer, &bytes, fds)?;
+        // Hold the writer lock until the reply lands so a concurrent request
+        // cannot overwrite `pending` before this one is answered.
+        let resp = rx.await.map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "sandlock-init closed control channel")
+        })?;
+        drop(writer);
+        Ok(resp)
+    }
+
+    /// Register interest in the exit of `pid`. If the exit was already reported
+    /// (buffered), the receiver resolves immediately.
+    fn register_exit(&self, pid: i32) -> oneshot::Receiver<Resp> {
+        let (tx, rx) = oneshot::channel();
+        let mut st = self.state.lock().unwrap();
+        if let Some(resp) = st.early_exits.remove(&pid) {
+            let _ = tx.send(resp);
+        } else {
+            st.exit_waiters.insert(pid, tx);
+        }
+        rx
+    }
+
+    /// Send `Shutdown` to init. No reply is expected (init exits).
+    async fn shutdown(&self) {
+        if let Ok(mut bytes) = serde_json::to_vec(&Req::Shutdown) {
+            bytes.push(b'\n');
+            let writer = self.writer.lock().await;
+            let _ = crate::fdpass::send_with_fds(&writer, &bytes, &[]);
+        }
+    }
+}
+
+/// Background reader: parse newline-delimited `Resp` from init and route each.
+/// init never sends fds to the daemon, so a plain line reader is sufficient.
+async fn reader_task(link: Arc<InitLink>, reader: tokio::net::UnixStream) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut lines = BufReader::new(reader).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let resp: Resp = match serde_json::from_str(trimmed) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let mut st = link.state.lock().unwrap();
+        match resp {
+            Resp::Started { .. } | Resp::Err { .. } => {
+                if let Some(tx) = st.pending.take() {
+                    let _ = tx.send(resp);
+                }
+            }
+            Resp::Exited { pid, .. } => {
+                if let Some(tx) = st.exit_waiters.remove(&pid) {
+                    let _ = tx.send(resp);
+                } else {
+                    st.early_exits.insert(pid, resp);
+                }
+            }
+        }
+    }
+    // Channel closed: drop senders so any pending request/waiter unblocks with a
+    // RecvError rather than hanging forever.
+    let mut st = link.state.lock().unwrap();
+    st.pending.take();
+    st.exit_waiters.clear();
+}
+
+/// Map an init `Resp::Exited` (if any) to the on-disk `ExitInfo`.
+fn exit_info_from_resp(resp: Option<Resp>) -> Option<crate::state::ExitInfo> {
+    match resp {
+        Some(Resp::Exited { code, signal, .. }) => {
+            Some(crate::state::ExitInfo { code, signal })
+        }
+        _ => None,
+    }
+}
 
 /// Filename of the supervisor control socket inside the sandbox state dir.
 pub const SUPERVISOR_SOCKET: &str = "supervisor.sock";
@@ -38,6 +199,15 @@ pub enum SupervisorCmd {
     Shutdown,
     /// Capture a checkpoint of the running child into `dir`.
     Checkpoint { dir: String },
+    /// Run an additional process inside the running container. Carries 3
+    /// ancillary fds (stdin, stdout, stderr) over SCM_RIGHTS alongside this
+    /// JSON. `detach` means the CLI will not wait for an `Exit` reply.
+    Exec {
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+        cwd: Option<String>,
+        detach: bool,
+    },
 }
 
 /// Responses from the Supervisor.
@@ -47,6 +217,8 @@ pub enum SupervisorReply {
     Ok,
     Pid { pid: i32 },
     Err { msg: String },
+    /// Final status of an exec'd process (attached exec only).
+    Exit { code: Option<i32>, signal: Option<i32> },
 }
 
 /// Returns the path to the supervisor socket for the given sandbox ID.
@@ -134,6 +306,12 @@ fn pipe_write(fd: i32, line: &str) {
 }
 
 /// Async body of `run_supervisor`.
+///
+/// Instead of running the workload directly, this launches a confined
+/// `sandlock-init` (PID-1) from a memfd and relays OCI verbs to it over a
+/// control socket: the workload and any exec'd processes are forked by
+/// `sandlock-init` and so share the one sandbox (seccomp filter + Landlock
+/// ruleset + notify supervisor).
 async fn supervisor_main(
     id: &str,
     cmd: &[String],
@@ -154,33 +332,93 @@ async fn supervisor_main(
         }
     };
 
-    // OCI `create` — forks the child, installs the full sandlock policy
-    // (seccomp-notify + Landlock + resource limits + network ACL), and parks
-    // the child before execve using a pipe rather than SIGSTOP.
-    let cmd_refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
-    if let Err(e) = sandbox.create_interactive(&cmd_refs).await {
+    // Stage sandlock-init in a memfd and set up the control channel. The child
+    // end is mapped onto CONTROL_FD inside the confined process; the daemon
+    // keeps the other end to drive RunMain/RunExec/Shutdown.
+    let memfd = match init_memfd() {
+        Ok(m) => m,
+        Err(e) => {
+            pipe_write(pid_write_fd, &format!("ERR stage sandlock-init: {}", e));
+            anyhow::bail!("stage sandlock-init: {}", e);
+        }
+    };
+    let (daemon_ctl, child_ctl) = match std::os::unix::net::UnixStream::pair() {
+        Ok(p) => p,
+        Err(e) => {
+            pipe_write(pid_write_fd, &format!("ERR control socketpair: {}", e));
+            anyhow::bail!("control socketpair: {}", e);
+        }
+    };
+    sandbox.exec_fd = Some(memfd.as_raw_fd());
+    let extra_fds = vec![(CONTROL_FD, child_ctl.as_raw_fd())];
+
+    // OCI `create` of the CONFINED sandlock-init: forks the child, installs the
+    // full sandlock policy, maps CONTROL_FD, and parks before execve. argv is
+    // the init's own name; the real workload argv is delivered later by RunMain.
+    if let Err(e) = sandbox
+        .create_with_gather_io(&["sandlock-init"], None, None, None, extra_fds)
+        .await
+    {
         pipe_write(pid_write_fd, &format!("ERR create: {}", e));
-        return Err(anyhow::anyhow!("sandbox create_interactive: {}", e));
+        return Err(anyhow::anyhow!("sandbox create_with_gather_io: {}", e));
+    }
+    // The child inherited child_ctl at fork and dup'd it onto CONTROL_FD; drop
+    // the daemon's copy so it holds only daemon_ctl (and so EOF on daemon_ctl
+    // tracks init exiting). The memfd is kept open until the end of this
+    // function: the child execveat's it at start(), and the parent fd must stay
+    // open until the exec completes.
+    drop(child_ctl);
+
+    // Release sandlock-init to execve. It then blocks reading CONTROL_FD for the
+    // first request. This happens at create/supervisor time (not OCI start) so
+    // init is alive to receive RunMain when the OCI `start` arrives.
+    if let Err(e) = sandbox.start() {
+        pipe_write(pid_write_fd, &format!("ERR start init: {}", e));
+        return Err(anyhow::anyhow!("start sandlock-init: {}", e));
     }
 
-    let child_pid = sandbox.pid().unwrap_or(0) as i32;
+    let init_pid = sandbox.pid().unwrap_or(0) as i32;
 
-    // Notify the CLI: `OK <pid>` on success.  The CLI treats any non-OK
-    // response (or EOF) as a create failure, so this is the only success path.
-    pipe_write(pid_write_fd, &format!("OK {}", child_pid));
+    // Build the demuxing control link to sandlock-init. `daemon_ctl` is a std
+    // socket; a dup serves the blocking fd-passing writer while the original is
+    // converted to a nonblocking tokio socket for the async reader. set_nonblocking
+    // sets O_NONBLOCK on the shared open file description, but the writer only
+    // sends tiny control messages, so a nonblocking `sendmsg` never short-writes.
+    let writer = match daemon_ctl.try_clone() {
+        Ok(w) => w,
+        Err(e) => {
+            pipe_write(pid_write_fd, &format!("ERR dup control: {}", e));
+            anyhow::bail!("dup control socket: {}", e);
+        }
+    };
+    if let Err(e) = daemon_ctl.set_nonblocking(true) {
+        pipe_write(pid_write_fd, &format!("ERR control nonblock: {}", e));
+        anyhow::bail!("set control nonblocking: {}", e);
+    }
+    let reader = match tokio::net::UnixStream::from_std(daemon_ctl) {
+        Ok(r) => r,
+        Err(e) => {
+            pipe_write(pid_write_fd, &format!("ERR control tokio: {}", e));
+            anyhow::bail!("convert control socket to tokio: {}", e);
+        }
+    };
+    let link = InitLink::new(writer, reader);
 
-    // Persist Created state with the real child PID.
+    // Notify the CLI: `OK <pid>` on success. Before OCI `start` there is no
+    // workload yet, so the reported/recorded PID is sandlock-init's (the
+    // container PID-1); OCI `start` updates state.pid to the workload PID.
+    pipe_write(pid_write_fd, &format!("OK {}", init_pid));
+
     {
-        let mut state = SandboxState::load(id).unwrap_or_else(|_| {
-            SandboxState::new(id, Path::new("/"), "1.0.2")
-        });
-        state.set_created(child_pid);
+        let mut state = SandboxState::load(id)
+            .unwrap_or_else(|_| SandboxState::new(id, Path::new("/"), "1.0.2"));
+        state.set_created(init_pid);
         state.save().ok();
     }
 
-    // PRE-START accept-loop: serve CLI commands until `Start` (transition to
-    // the running-serve loop) or `Shutdown`/error (return so the Sandbox Drop
-    // kills and reaps the parked child).
+    // PRE-START accept-loop: serve CLI commands until `Start` (transition to the
+    // running-serve loop) or `Shutdown`/error (return so the Sandbox Drop kills
+    // and reaps init, which collapses the whole group).
     loop {
         let (mut stream, _) = match listener.accept().await {
             Ok(pair) => pair,
@@ -207,48 +445,61 @@ async fn supervisor_main(
         match incoming {
             SupervisorCmd::Ping => {
                 let reply =
-                    serde_json::to_vec(&SupervisorReply::Pid { pid: child_pid }).unwrap_or_default();
+                    serde_json::to_vec(&SupervisorReply::Pid { pid: init_pid }).unwrap_or_default();
                 let _ = stream.write_all(&reply).await;
                 let _ = stream.write_all(b"\n").await;
             }
             SupervisorCmd::Start => {
-                // OCI `start` — release the parked child to execve with the
-                // full sandlock policy already in place.
-                match sandbox.start() {
-                    Ok(()) => {
+                // OCI `start`: tell init to fork the workload. The reply pid is
+                // the workload PID (not init), which becomes state.pid.
+                let req = Req::RunMain {
+                    argv: cmd.to_vec(),
+                    env: vec![],
+                    cwd: None,
+                };
+                match link.request(&req, &[]).await {
+                    Ok(Resp::Started { pid }) => {
+                        let main_exit = link.register_exit(pid);
                         if let Ok(mut s) = SandboxState::load(id) {
+                            s.set_created(pid);
                             s.set_running();
                             s.save().ok();
                         }
                         let reply = serde_json::to_vec(&SupervisorReply::Ok).unwrap_or_default();
                         let _ = stream.write_all(&reply).await;
                         let _ = stream.write_all(b"\n").await;
-                        // Child is now running: keep serving the control socket
-                        // (so `checkpoint` works) until it exits or Shutdown.
+                        // Workload is running: keep serving the control socket
+                        // (Ping/Exec/Checkpoint) until it exits or Shutdown.
                         let exit_info =
-                            serve_running(id, &mut sandbox, &listener, child_pid).await;
+                            serve_running_init(id, &link, &mut sandbox, &listener, pid, main_exit)
+                                .await;
                         if let Ok(mut s) = SandboxState::load(id) {
                             s.set_stopped(exit_info);
                             s.save().ok();
                         }
                         return Ok(());
                     }
-                    Err(e) => {
-                        let reply = serde_json::to_vec(&SupervisorReply::Err { msg: e.to_string() })
+                    Ok(Resp::Err { msg }) => {
+                        let reply = serde_json::to_vec(&SupervisorReply::Err { msg })
                             .unwrap_or_default();
                         let _ = stream.write_all(&reply).await;
                         let _ = stream.write_all(b"\n").await;
-                        // start() failed with the child still parked: do NOT
-                        // wait() (it would block forever on a child that never
-                        // execve's).  Return so the Sandbox Drop kills and reaps
-                        // the parked child.
+                        return Ok(());
+                    }
+                    other => {
+                        let msg = format!("unexpected init reply to RunMain: {:?}", other);
+                        let reply = serde_json::to_vec(&SupervisorReply::Err { msg })
+                            .unwrap_or_default();
+                        let _ = stream.write_all(&reply).await;
+                        let _ = stream.write_all(b"\n").await;
                         return Ok(());
                     }
                 }
             }
             SupervisorCmd::Shutdown => {
-                // `delete` before `start` — acknowledge and exit.  The sandbox
-                // Drop will kill and reap the parked child.
+                // `delete` before `start`: tell init to exit, then return so
+                // the Sandbox Drop reaps it.
+                link.shutdown().await;
                 let reply = serde_json::to_vec(&SupervisorReply::Ok).unwrap_or_default();
                 let _ = stream.write_all(&reply).await;
                 let _ = stream.write_all(b"\n").await;
@@ -268,6 +519,205 @@ async fn supervisor_main(
                 let _ = stream.write_all(&reply).await;
                 let _ = stream.write_all(b"\n").await;
             }
+            SupervisorCmd::Exec { .. } => {
+                let reply = serde_json::to_vec(&SupervisorReply::Err {
+                    msg: "container is not running; start it before exec".into(),
+                })
+                .unwrap_or_default();
+                let _ = stream.write_all(&reply).await;
+                let _ = stream.write_all(b"\n").await;
+            }
+        }
+    }
+}
+
+/// Serve the control socket while the workload (forked by sandlock-init) runs,
+/// returning its recorded exit info once it exits or a Shutdown is received.
+///
+/// Exit is detected via the init control channel (`main_exit` resolves when init
+/// reports the workload's `Exited`), not a pidfd: init owns the workload and
+/// reports its status authoritatively. `sandbox` is kept alive (and is used for
+/// `checkpoint`) so the shared seccomp-notify supervisor keeps servicing the
+/// workload and any exec'd processes.
+async fn serve_running_init(
+    id: &str,
+    link: &Arc<InitLink>,
+    sandbox: &mut sandlock_core::Sandbox,
+    listener: &tokio::net::UnixListener,
+    workload_pid: i32,
+    mut main_exit: oneshot::Receiver<Resp>,
+) -> Option<crate::state::ExitInfo> {
+    loop {
+        tokio::select! {
+            res = &mut main_exit => {
+                // Workload exited; init kills the group and exits too. The
+                // Sandbox Drop reaps init.
+                return exit_info_from_resp(res.ok());
+            }
+            conn = listener.accept() => {
+                match conn {
+                    Ok((stream, _)) => {
+                        match serve_one_running_init(stream, link, sandbox, id, workload_pid).await {
+                            RunningCmd::Continue => {}
+                            RunningCmd::Shutdown => {
+                                link.shutdown().await;
+                                return None;
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Listener broke: fall back to waiting for the workload
+                        // exit so we still record a final state.
+                        return exit_info_from_resp((&mut main_exit).await.ok());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Handle one accepted connection while the container is RUNNING (init path).
+/// Reads the command via recvmsg so exec stdio fds arrive with the bytes.
+async fn serve_one_running_init(
+    mut stream: tokio::net::UnixStream,
+    link: &Arc<InitLink>,
+    sandbox: &mut sandlock_core::Sandbox,
+    id: &str,
+    workload_pid: i32,
+) -> RunningCmd {
+    use tokio::io::AsyncWriteExt;
+
+    let (buf, fds) = match crate::fdpass::recv_with_fds_async(&stream, 3).await {
+        Ok(pair) => pair,
+        Err(_) => return RunningCmd::Continue,
+    };
+    if buf.is_empty() {
+        return RunningCmd::Continue;
+    }
+    let incoming: SupervisorCmd = match serde_json::from_slice(&buf) {
+        Ok(c) => c,
+        Err(e) => {
+            let reply = serde_json::to_vec(&SupervisorReply::Err { msg: e.to_string() })
+                .unwrap_or_default();
+            let _ = stream.write_all(&reply).await;
+            let _ = stream.write_all(b"\n").await;
+            return RunningCmd::Continue;
+        }
+    };
+    match incoming {
+        SupervisorCmd::Ping => {
+            let reply =
+                serde_json::to_vec(&SupervisorReply::Pid { pid: workload_pid }).unwrap_or_default();
+            let _ = stream.write_all(&reply).await;
+            let _ = stream.write_all(b"\n").await;
+            RunningCmd::Continue
+        }
+        SupervisorCmd::Start => {
+            // Already running: idempotent no-op.
+            let reply = serde_json::to_vec(&SupervisorReply::Ok).unwrap_or_default();
+            let _ = stream.write_all(&reply).await;
+            let _ = stream.write_all(b"\n").await;
+            RunningCmd::Continue
+        }
+        SupervisorCmd::Exec { args, env, cwd, detach } => {
+            handle_exec(stream, link.clone(), args, env, cwd, detach, fds).await;
+            RunningCmd::Continue
+        }
+        SupervisorCmd::Checkpoint { dir } => {
+            let reply = match sandbox.checkpoint().await {
+                Ok(mut cp) => {
+                    cp.name = id.to_string();
+                    match cp.save(std::path::Path::new(&dir)) {
+                        Ok(()) => serde_json::to_vec(&SupervisorReply::Ok).unwrap_or_default(),
+                        Err(e) => serde_json::to_vec(&SupervisorReply::Err { msg: e.to_string() })
+                            .unwrap_or_default(),
+                    }
+                }
+                Err(e) => serde_json::to_vec(&SupervisorReply::Err { msg: e.to_string() })
+                    .unwrap_or_default(),
+            };
+            let _ = stream.write_all(&reply).await;
+            let _ = stream.write_all(b"\n").await;
+            RunningCmd::Continue
+        }
+        SupervisorCmd::Shutdown => {
+            let reply = serde_json::to_vec(&SupervisorReply::Ok).unwrap_or_default();
+            let _ = stream.write_all(&reply).await;
+            let _ = stream.write_all(b"\n").await;
+            RunningCmd::Shutdown
+        }
+    }
+}
+
+/// Forward an exec to sandlock-init: send `RunExec` + the 3 stdio fds, relay the
+/// `Started` pid back to the CLI as `Pid`, then (attached only) wait for the
+/// init `Exited` and relay it as `Exit`. The daemon's fd copies are dropped once
+/// init has dup'd them via SCM_RIGHTS.
+#[allow(clippy::too_many_arguments)]
+async fn handle_exec(
+    mut stream: tokio::net::UnixStream,
+    link: Arc<InitLink>,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+    cwd: Option<String>,
+    detach: bool,
+    fds: Vec<std::os::unix::io::OwnedFd>,
+) {
+    use tokio::io::AsyncWriteExt;
+
+    if fds.len() < 3 {
+        let reply = serde_json::to_vec(&SupervisorReply::Err {
+            msg: "exec requires 3 stdio fds".into(),
+        })
+        .unwrap_or_default();
+        let _ = stream.write_all(&reply).await;
+        let _ = stream.write_all(b"\n").await;
+        return;
+    }
+    if args.is_empty() {
+        let reply = serde_json::to_vec(&SupervisorReply::Err { msg: "exec: empty command".into() })
+            .unwrap_or_default();
+        let _ = stream.write_all(&reply).await;
+        let _ = stream.write_all(b"\n").await;
+        return;
+    }
+
+    let raw: Vec<RawFd> = fds.iter().map(|f| f.as_raw_fd()).collect();
+    let req = Req::RunExec { argv: args, env, cwd, detach };
+    let started = link.request(&req, &raw).await;
+    // init has now dup'd the fds (SCM_RIGHTS); drop the daemon's copies.
+    drop(fds);
+
+    match started {
+        Ok(Resp::Started { pid }) => {
+            let reply = serde_json::to_vec(&SupervisorReply::Pid { pid }).unwrap_or_default();
+            let _ = stream.write_all(&reply).await;
+            let _ = stream.write_all(b"\n").await;
+            if !detach {
+                // Register the waiter before yielding so a fast Exited is not
+                // missed, then relay it on a background task to keep the serve
+                // loop responsive.
+                let rx = link.register_exit(pid);
+                tokio::spawn(async move {
+                    if let Ok(Resp::Exited { code, signal, .. }) = rx.await {
+                        let reply = serde_json::to_vec(&SupervisorReply::Exit { code, signal })
+                            .unwrap_or_default();
+                        let _ = stream.write_all(&reply).await;
+                        let _ = stream.write_all(b"\n").await;
+                    }
+                });
+            }
+        }
+        Ok(Resp::Err { msg }) => {
+            let reply = serde_json::to_vec(&SupervisorReply::Err { msg }).unwrap_or_default();
+            let _ = stream.write_all(&reply).await;
+            let _ = stream.write_all(b"\n").await;
+        }
+        other => {
+            let msg = format!("unexpected init reply to RunExec: {:?}", other);
+            let reply = serde_json::to_vec(&SupervisorReply::Err { msg }).unwrap_or_default();
+            let _ = stream.write_all(&reply).await;
+            let _ = stream.write_all(b"\n").await;
         }
     }
 }
@@ -362,6 +812,17 @@ async fn serve_one_running(
                 Err(e) => serde_json::to_vec(&SupervisorReply::Err { msg: e.to_string() })
                     .unwrap_or_default(),
             };
+            let _ = stream.write_all(&reply).await;
+            let _ = stream.write_all(b"\n").await;
+            RunningCmd::Continue
+        }
+        SupervisorCmd::Exec { .. } => {
+            // exec inside a restored container is not supported (restore has no
+            // sandlock-init relay). Reject so the CLI surfaces a clear error.
+            let reply = serde_json::to_vec(&SupervisorReply::Err {
+                msg: "exec is not supported on a restored container".into(),
+            })
+            .unwrap_or_default();
             let _ = stream.write_all(&reply).await;
             let _ = stream.write_all(b"\n").await;
             RunningCmd::Continue

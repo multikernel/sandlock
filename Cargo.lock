@@ -1444,6 +1444,7 @@ dependencies = [
  "libc",
  "oci-spec",
  "sandlock-core",
+ "sandlock-init",
  "serde",
  "serde_json",
  "tempfile",
