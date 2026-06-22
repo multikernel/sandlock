@@ -43,7 +43,17 @@ fn spawn(argv: &[String], env: &[(String, String)], cwd: &Option<String>, stdio:
     let cargv: Vec<CString> = argv.iter().filter_map(|a| CString::new(a.as_str()).ok()).collect();
     let mut ptrs: Vec<*const libc::c_char> = cargv.iter().map(|c| c.as_ptr()).collect();
     ptrs.push(std::ptr::null());
-    unsafe { libc::execvp(ptrs[0], ptrs.as_ptr()); }
+    // Under chroot the sandlock seccomp exec handler rewrites the pathname in
+    // place (to /proc/self/fd/N for the injected binary fd). Pass a separate
+    // PATH_MAX buffer as the `file` argument so that rewrite cannot clobber
+    // argv[0], which busybox-style binaries use for applet detection. execvp
+    // still does PATH lookup for bare command names against this buffer.
+    if let Some(first) = cargv.first() {
+        let orig = first.as_bytes_with_nul();
+        let mut exec_path = vec![0u8; libc::PATH_MAX as usize];
+        exec_path[..orig.len()].copy_from_slice(orig);
+        unsafe { libc::execvp(exec_path.as_ptr() as *const libc::c_char, ptrs.as_ptr()); }
+    }
     unsafe { libc::_exit(127); }
 }
 
