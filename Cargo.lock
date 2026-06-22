@@ -1427,6 +1427,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandlock-init"
+version = "0.8.3"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "sandlock-oci"
 version = "0.8.3"
 dependencies = [
