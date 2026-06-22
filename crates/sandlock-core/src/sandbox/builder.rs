@@ -753,6 +753,7 @@ impl SandboxBuilder {
             on_error: self.on_error.unwrap_or_default(),
             fs_mount: self.fs_mount,
             chroot: self.chroot,
+            exec_fd: None,
             clean_env: self.clean_env,
             env: self.env,
             gpu_devices: self.gpu_devices,

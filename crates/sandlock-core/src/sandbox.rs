@@ -337,6 +337,13 @@ pub struct Sandbox {
 
     // Environment
     pub chroot: Option<PathBuf>,
+
+    /// When set, launch the confined child via `execveat(fd, "", AT_EMPTY_PATH)`
+    /// instead of resolving `argv[0]` by path. Used to run a binary (e.g.
+    /// `sandlock-init`) from a memfd that is not present in the rootfs.
+    #[serde(skip)]
+    pub exec_fd: Option<i32>,
+
     pub clean_env: bool,
     pub env: HashMap<String, String>,
     // Devices
@@ -444,6 +451,7 @@ impl Clone for Sandbox {
             on_error: self.on_error.clone(),
             fs_mount: self.fs_mount.clone(),
             chroot: self.chroot.clone(),
+            exec_fd: self.exec_fd,
             clean_env: self.clean_env,
             env: self.env.clone(),
             gpu_devices: self.gpu_devices.clone(),

@@ -5,6 +5,12 @@ use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
+// The C runtime environment vector; used by execveat so the confined child
+// inherits the environment that was set up in step 13.
+extern "C" {
+    static environ: *mut *mut libc::c_char;
+}
+
 use crate::resolved::ResolvedSandbox;
 use crate::sandbox::Sandbox;
 use crate::seccomp::bpf;
@@ -467,6 +473,9 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     if keep_fd >= 0 {
         fds_to_keep.push(keep_fd);
     }
+    if let Some(efd) = sandbox.exec_fd {
+        fds_to_keep.push(efd);
+    }
     close_fds_above(2, &fds_to_keep);
 
     // 13. Apply environment
@@ -497,6 +506,24 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         .map(|s| s.as_ptr())
         .chain(std::iter::once(std::ptr::null()))
         .collect();
+
+    if let Some(efd) = sandbox.exec_fd {
+        // Launch the binary held open at `efd` directly, bypassing path
+        // resolution (and any chroot rewrite). argv is still passed through;
+        // env was applied to `environ` above, so pass `environ` as envp.
+        let empty = b"\0";
+        unsafe {
+            libc::syscall(
+                libc::SYS_execveat,
+                efd as libc::c_long,
+                empty.as_ptr() as *const libc::c_char,
+                argv_ptrs.as_ptr(),
+                environ,
+                libc::AT_EMPTY_PATH as libc::c_long,
+            );
+        }
+        fail!(format!("execveat exec_fd {}", efd));
+    }
 
     if sandbox.chroot.is_some() {
         // With chroot the seccomp handler rewrites the filename to a host path
