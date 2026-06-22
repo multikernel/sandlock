@@ -634,6 +634,96 @@ fn rootfs_helper() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/rootfs-helper")
 }
 
+/// End-to-end proof that `sandlock-oci exec` runs an extra process inside the
+/// SAME single-init container as the main workload, confined by the shared
+/// sandbox (Landlock + seccomp-notify), and reports its exit status.
+///
+/// The main workload is a long-lived `rootfs-helper spawn-loop` that keeps the
+/// container running. Once the keepalive counter advances (proving the container
+/// is RUNNING), we `exec` a `rootfs-helper write /exec.ok done`: the exec'd
+/// process is forked by the container's `sandlock-init`, so it lands inside the
+/// chroot and writes the sentinel to `<rootfs>/exec.ok`. We assert the exec CLI
+/// exits 0 and the sentinel is present with the expected contents, then tear the
+/// container down with `delete --force`.
+#[tokio::test(flavor = "multi_thread")]
+async fn oci_exec_same_sandbox() {
+    if sandlock_core::landlock_abi_version().is_err() {
+        eprintln!("skipping: no Landlock");
+        return;
+    }
+    let helper = rootfs_helper();
+    if !helper.exists() {
+        eprintln!("skipping: no rootfs-helper");
+        return;
+    }
+
+    // bundle: rootfs with rootfs-helper; main process = spawn-loop (stays alive)
+    let tmp = std::env::temp_dir().join(format!("sandlock-oci-exec2-{}", std::process::id()));
+    fs::create_dir_all(&tmp).unwrap();
+    let bundle = tmp.join("bundle");
+    let rootfs = bundle.join("rootfs");
+    fs::create_dir_all(&rootfs).unwrap();
+    fs::copy(&helper, rootfs.join("rootfs-helper")).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(rootfs.join("rootfs-helper"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    create_bundle(&bundle, &["/rootfs-helper", "spawn-loop", "/keepalive.cnt"]);
+
+    let root = tempdir().unwrap();
+    let root_s = root.path().to_str().unwrap().to_string();
+    let id = "oci-exec2-e2e";
+
+    let create_log = tmp.join("create.log");
+    let cs = Command::new(oci_bin())
+        .args(["--root", &root_s, "create", id, "-b", bundle.to_str().unwrap()])
+        .stdout(std::process::Stdio::from(fs::File::create(&create_log).unwrap()))
+        .stderr(std::process::Stdio::from(
+            fs::OpenOptions::new().append(true).open(&create_log).unwrap(),
+        ))
+        .status()
+        .expect("create");
+    assert!(cs.success(), "create: {}", fs::read_to_string(&create_log).unwrap_or_default());
+    assert!(Command::new(oci_bin())
+        .args(["--root", &root_s, "start", id])
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    // container running once keepalive advances
+    let host_keepalive = rootfs.join("keepalive.cnt");
+    let read = |p: &std::path::Path| {
+        fs::read_to_string(p).ok().and_then(|s| s.trim().parse::<u64>().ok())
+    };
+    let dl = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut running = false;
+    while std::time::Instant::now() < dl {
+        if read(&host_keepalive).map(|v| v > 2).unwrap_or(false) {
+            running = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(running, "container never started: {}", fs::read_to_string(&create_log).unwrap_or_default());
+
+    // exec writes a sentinel inside the container rootfs and exits 0
+    let exec_out = Command::new(oci_bin())
+        .args(["--root", &root_s, "exec", id, "/rootfs-helper", "write", "/exec.ok", "done"])
+        .output()
+        .expect("exec");
+    let sentinel = rootfs.join("exec.ok");
+    let ok = sentinel.exists() && fs::read_to_string(&sentinel).unwrap_or_default().trim() == "done";
+
+    let _ = Command::new(oci_bin())
+        .args(["--root", &root_s, "delete", id, "--force"])
+        .output();
+    let _ = fs::remove_dir_all(&tmp);
+
+    assert!(exec_out.status.success(), "exec must exit 0: {}", String::from_utf8_lossy(&exec_out.stderr));
+    assert!(ok, "exec'd process must run inside the container rootfs and write /exec.ok=done");
+}
+
 /// Regression test for process-group collapse on container stop. sandlock has
 /// no PID namespace, so when the container's main process exits the supervisor
 /// must explicitly SIGKILL the process group; otherwise background children (or
