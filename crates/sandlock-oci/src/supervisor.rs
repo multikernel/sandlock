@@ -329,21 +329,27 @@ enum RunningCmd {
 }
 
 /// Handle a single accepted connection while the container is RUNNING. Serves
-/// Ping, Checkpoint, Start (idempotent no-op since already running), and
-/// Shutdown. Returns whether to keep serving or shut down.
+/// Ping, Checkpoint, Start (idempotent no-op since already running), Exec, and
+/// Shutdown. Takes the connection by value so the `Exec` arm can move it into a
+/// background task. Returns whether to keep serving or shut down.
 async fn serve_one_running(
-    stream: &mut tokio::net::UnixStream,
+    mut stream: tokio::net::UnixStream,
     sandbox: &mut sandlock_core::Sandbox,
     id: &str,
     child_pid: i32,
 ) -> RunningCmd {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut buf = vec![0u8; 4096];
-    let n = stream.read(&mut buf).await.unwrap_or(0);
-    if n == 0 {
+    use tokio::io::AsyncWriteExt;
+
+    // Read the command via recvmsg so any SCM_RIGHTS fds (exec stdio) are
+    // captured with the same call as the bytes. Non-exec commands carry none.
+    let (buf, fds) = match crate::fdpass::recv_with_fds_async(&stream, 3).await {
+        Ok(pair) => pair,
+        Err(_) => return RunningCmd::Continue,
+    };
+    if buf.is_empty() {
         return RunningCmd::Continue;
     }
-    let incoming: SupervisorCmd = match serde_json::from_slice(&buf[..n]) {
+    let incoming: SupervisorCmd = match serde_json::from_slice(&buf) {
         Ok(c) => c,
         Err(e) => {
             let reply = serde_json::to_vec(&SupervisorReply::Err { msg: e.to_string() })
@@ -366,6 +372,12 @@ async fn serve_one_running(
             let reply = serde_json::to_vec(&SupervisorReply::Ok).unwrap_or_default();
             let _ = stream.write_all(&reply).await;
             let _ = stream.write_all(b"\n").await;
+            RunningCmd::Continue
+        }
+        SupervisorCmd::Exec { args, env, cwd, detach } => {
+            // Moves `stream` into handle_exec (which spawns the wait task), so
+            // the serve loop is freed to keep watching init and other commands.
+            handle_exec(stream, &*sandbox, id, child_pid, args, env, cwd, detach, fds).await;
             RunningCmd::Continue
         }
         SupervisorCmd::Checkpoint { dir } => {
@@ -391,17 +403,113 @@ async fn serve_one_running(
             let _ = stream.write_all(b"\n").await;
             RunningCmd::Shutdown
         }
-        // Temporary: Task 4 replaces this with the real exec handler.
-        SupervisorCmd::Exec { .. } => {
-            let reply = serde_json::to_vec(&SupervisorReply::Err {
-                msg: "exec not wired yet".into(),
-            })
-            .unwrap_or_default();
-            let _ = stream.write_all(&reply).await;
-            let _ = stream.write_all(b"\n").await;
-            RunningCmd::Continue
-        }
     }
+}
+
+/// Spawn an exec'd process under a clone of the container policy, join it to the
+/// container's process group, reply `Pid`, then (attached only) wait for it and
+/// reply `Exit`. The passed `fds` are stdin/stdout/stderr from the CLI; they are
+/// dup'd into the child by `create_with_io` and dropped afterward.
+#[allow(clippy::too_many_arguments)]
+async fn handle_exec(
+    mut stream: tokio::net::UnixStream,
+    sandbox: &sandlock_core::Sandbox,
+    id: &str,
+    child_pid: i32,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+    cwd: Option<String>,
+    detach: bool,
+    fds: Vec<std::os::unix::io::OwnedFd>,
+) {
+    use std::os::unix::io::AsRawFd;
+    use tokio::io::AsyncWriteExt;
+
+    if fds.len() < 3 {
+        let reply = serde_json::to_vec(&SupervisorReply::Err {
+            msg: "exec requires 3 stdio fds".into(),
+        })
+        .unwrap_or_default();
+        let _ = stream.write_all(&reply).await;
+        let _ = stream.write_all(b"\n").await;
+        return;
+    }
+    if args.is_empty() {
+        let reply = serde_json::to_vec(&SupervisorReply::Err { msg: "exec: empty command".into() })
+            .unwrap_or_default();
+        let _ = stream.write_all(&reply).await;
+        let _ = stream.write_all(b"\n").await;
+        return;
+    }
+
+    // Clone the live container policy (config only; runtime resets to None) and
+    // apply the exec's env/cwd overrides on top.
+    let mut exec_sb = sandbox.clone();
+    exec_sb.set_name(format!("{}-exec", id));
+    if let Some(c) = cwd {
+        exec_sb.cwd = Some(std::path::PathBuf::from(c));
+    }
+    for (k, v) in env {
+        exec_sb.env.insert(k, v);
+    }
+
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (f0, f1, f2) = (fds[0].as_raw_fd(), fds[1].as_raw_fd(), fds[2].as_raw_fd());
+
+    if let Err(e) = exec_sb
+        .create_with_io(&arg_refs, Some(f0), Some(f1), Some(f2))
+        .await
+    {
+        let reply = serde_json::to_vec(&SupervisorReply::Err { msg: e.to_string() })
+            .unwrap_or_default();
+        let _ = stream.write_all(&reply).await;
+        let _ = stream.write_all(b"\n").await;
+        return;
+    }
+
+    let exec_pid = exec_sb.pid().unwrap_or(0);
+
+    // Join the container's process group so `kill --all` / `delete --force`
+    // (killpg on the init pid) reap this exec'd process. Valid: the child is
+    // parked pre-execve and shares the daemon's session. Best-effort.
+    if exec_pid > 0 && child_pid > 0 {
+        unsafe { libc::setpgid(exec_pid, child_pid) };
+    }
+
+    if let Err(e) = exec_sb.start() {
+        let reply = serde_json::to_vec(&SupervisorReply::Err { msg: e.to_string() })
+            .unwrap_or_default();
+        let _ = stream.write_all(&reply).await;
+        let _ = stream.write_all(b"\n").await;
+        return;
+    }
+
+    // Child now owns its dup'd stdio; the daemon's copies are no longer needed.
+    drop(fds);
+
+    // Report the pid immediately.
+    let reply = serde_json::to_vec(&SupervisorReply::Pid { pid: exec_pid }).unwrap_or_default();
+    let _ = stream.write_all(&reply).await;
+    let _ = stream.write_all(b"\n").await;
+
+    // Move the exec sandbox AND the connection into a background task so the
+    // daemon's serve loop is never blocked by the exec'd process's lifetime
+    // (init-exit detection and concurrent execs keep working). The task owns
+    // the sandbox so its seccomp-supervisor tasks stay alive until exit.
+    tokio::spawn(async move {
+        let result = exec_sb.wait().await;
+        if detach {
+            return; // reaped; the CLI already returned after Pid.
+        }
+        let (code, signal) = match exit_info_from(result) {
+            Some(ei) => (ei.code, ei.signal),
+            None => (None, None),
+        };
+        let reply =
+            serde_json::to_vec(&SupervisorReply::Exit { code, signal }).unwrap_or_default();
+        let _ = stream.write_all(&reply).await;
+        let _ = stream.write_all(b"\n").await;
+    });
 }
 
 /// Serve the control socket while the (already-running) child executes,
@@ -434,8 +542,8 @@ async fn serve_running(
             }
             conn = listener.accept() => {
                 match conn {
-                    Ok((mut stream, _)) => {
-                        match serve_one_running(&mut stream, sandbox, id, child_pid).await {
+                    Ok((stream, _)) => {
+                        match serve_one_running(stream, sandbox, id, child_pid).await {
                             RunningCmd::Continue => {}
                             RunningCmd::Shutdown => {
                                 let _ = sandbox.kill();

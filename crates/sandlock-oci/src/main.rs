@@ -18,6 +18,7 @@
 //!
 //! - `exec` is not implemented (required for `kubectl exec` / exec probes).
 
+mod fdpass;
 mod policy;
 mod spec;
 mod state;
@@ -727,17 +728,98 @@ fn resolve_exec_request(
     })
 }
 
-/// Filled in by Task 4.
+/// `sandlock-oci exec <id> [--process spec.json] [-- <cmd> [args...]]`
+///
+/// Connects to the container's supervisor, passes this process's stdio fds via
+/// SCM_RIGHTS, and asks the supervisor to spawn the command under a clone of the
+/// container policy. Attached (default): block until the exec'd process exits
+/// and exit with its status. `--detach`: return after it starts.
 fn cmd_exec(
-    _id: &str,
-    _process_file: Option<&std::path::Path>,
-    _pid_file: Option<&std::path::Path>,
-    _detach: bool,
-    _extra_env: &[String],
-    _extra_cwd: Option<&std::path::Path>,
-    _inline_args: &[String],
+    id: &str,
+    process_file: Option<&std::path::Path>,
+    pid_file: Option<&std::path::Path>,
+    detach: bool,
+    extra_env: &[String],
+    extra_cwd: Option<&std::path::Path>,
+    inline_args: &[String],
 ) -> Result<()> {
-    bail!("exec: not wired yet")
+    use std::io::BufRead;
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    let state = SandboxState::load(id).with_context(|| format!("no such container: {}", id))?;
+    if state.status != Status::Running {
+        bail!("container {} is not running (status: {})", id, state.status);
+    }
+
+    let req = resolve_exec_request(process_file, inline_args, extra_env, extra_cwd)?;
+
+    let cmd = supervisor::SupervisorCmd::Exec {
+        args: req.args,
+        env: req.env,
+        cwd: req.cwd,
+        detach,
+    };
+    let payload = serde_json::to_vec(&cmd).context("serialize exec command")?;
+
+    let sock = supervisor::socket_path(id);
+    let stream = UnixStream::connect(&sock)
+        .with_context(|| format!("connect to supervisor socket {:?}", sock))?;
+
+    // Pass our stdin/stdout/stderr to the supervisor alongside the command.
+    fdpass::send_with_fds(
+        &stream,
+        &payload,
+        &[
+            std::io::stdin().as_raw_fd(),
+            std::io::stdout().as_raw_fd(),
+            std::io::stderr().as_raw_fd(),
+        ],
+    )
+    .context("send exec command + stdio fds")?;
+
+    let mut reader = std::io::BufReader::new(&stream);
+
+    // First reply: Pid (or Err).
+    let mut line = String::new();
+    reader.read_line(&mut line).context("read exec pid reply")?;
+    let pid_reply: supervisor::SupervisorReply =
+        serde_json::from_str(line.trim()).context("parse exec pid reply")?;
+    let exec_pid = match pid_reply {
+        supervisor::SupervisorReply::Pid { pid } => pid,
+        supervisor::SupervisorReply::Err { msg } => bail!("exec failed: {}", msg),
+        other => bail!("unexpected exec reply: {:?}", other),
+    };
+
+    if let Some(pf) = pid_file {
+        std::fs::write(pf, exec_pid.to_string())
+            .with_context(|| format!("write pid file {:?}", pf))?;
+    }
+
+    if detach {
+        return Ok(());
+    }
+
+    // Second reply: Exit. Exit this CLI with the same status.
+    let mut line2 = String::new();
+    reader.read_line(&mut line2).context("read exec exit reply")?;
+    let exit_reply: supervisor::SupervisorReply =
+        serde_json::from_str(line2.trim()).context("parse exec exit reply")?;
+    match exit_reply {
+        supervisor::SupervisorReply::Exit { code, signal } => {
+            if let Some(c) = code {
+                std::process::exit(c);
+            }
+            if let Some(s) = signal {
+                std::process::exit(128 + s);
+            }
+            std::process::exit(0);
+        }
+        supervisor::SupervisorReply::Err { msg } => bail!("exec failed: {}", msg),
+        other => bail!("unexpected exec exit reply: {:?}", other),
+    }
+    // Every arm above diverges (process::exit or bail!), so the match types as
+    // `!` and is the function's tail expression: no trailing Ok(()) needed.
 }
 
 /// Parse a signal name (e.g. "SIGTERM", "TERM", "15") into a libc signal number.
