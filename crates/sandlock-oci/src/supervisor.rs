@@ -38,6 +38,15 @@ pub enum SupervisorCmd {
     Shutdown,
     /// Capture a checkpoint of the running child into `dir`.
     Checkpoint { dir: String },
+    /// Run an additional process inside the running container. Carries 3
+    /// ancillary fds (stdin, stdout, stderr) over SCM_RIGHTS alongside this
+    /// JSON. `detach` means the CLI will not wait for an `Exit` reply.
+    Exec {
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+        cwd: Option<String>,
+        detach: bool,
+    },
 }
 
 /// Responses from the Supervisor.
@@ -47,6 +56,8 @@ pub enum SupervisorReply {
     Ok,
     Pid { pid: i32 },
     Err { msg: String },
+    /// Final status of an exec'd process (attached exec only).
+    Exit { code: Option<i32>, signal: Option<i32> },
 }
 
 /// Returns the path to the supervisor socket for the given sandbox ID.
@@ -268,6 +279,14 @@ async fn supervisor_main(
                 let _ = stream.write_all(&reply).await;
                 let _ = stream.write_all(b"\n").await;
             }
+            SupervisorCmd::Exec { .. } => {
+                let reply = serde_json::to_vec(&SupervisorReply::Err {
+                    msg: "container is not running; start it before exec".into(),
+                })
+                .unwrap_or_default();
+                let _ = stream.write_all(&reply).await;
+                let _ = stream.write_all(b"\n").await;
+            }
         }
     }
 }
@@ -371,6 +390,16 @@ async fn serve_one_running(
             let _ = stream.write_all(&reply).await;
             let _ = stream.write_all(b"\n").await;
             RunningCmd::Shutdown
+        }
+        // Temporary: Task 4 replaces this with the real exec handler.
+        SupervisorCmd::Exec { .. } => {
+            let reply = serde_json::to_vec(&SupervisorReply::Err {
+                msg: "exec not wired yet".into(),
+            })
+            .unwrap_or_default();
+            let _ = stream.write_all(&reply).await;
+            let _ = stream.write_all(b"\n").await;
+            RunningCmd::Continue
         }
     }
 }
@@ -605,5 +634,29 @@ mod tests {
         assert!(json.contains("/tmp/img"));
         let back: SupervisorCmd = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, SupervisorCmd::Checkpoint { .. }));
+    }
+
+    #[test]
+    fn supervisor_cmd_exec_serde() {
+        let cmd = SupervisorCmd::Exec {
+            args: vec!["sh".into(), "-c".into(), "echo hi".into()],
+            env: vec![("FOO".into(), "bar".into())],
+            cwd: Some("/work".into()),
+            detach: false,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("exec"));
+        let back: SupervisorCmd = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, SupervisorCmd::Exec { .. }));
+    }
+
+    #[test]
+    fn supervisor_reply_exit_serde() {
+        let reply = SupervisorReply::Exit { code: Some(3), signal: None };
+        let json = serde_json::to_string(&reply).unwrap();
+        assert!(json.contains("exit"));
+        assert!(json.contains('3'));
+        let back: SupervisorReply = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, SupervisorReply::Exit { code: Some(3), .. }));
     }
 }
