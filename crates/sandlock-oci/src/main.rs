@@ -12,10 +12,13 @@
 //!   state  <id>              →  print state.json (reconciled against liveness)
 //!   kill   <id> <signal>     →  forward signal to Child PID
 //!   delete <id>              →  send Shutdown to Supervisor, cleanup state dir
+//!   exec   <id> <cmd>        →  daemon relays to sandlock-init, which fork-execs a sibling in the same sandbox
 //! ```
 //!
 //! ## Known limitations
 //!
+//! - The workload and all exec'd processes share one sandbox (one seccomp supervisor)
+//!   via an in-sandbox sandlock-init PID-1.
 //! - `exec` runs non-TTY only: `-t` / `--console-socket` are accepted for runc
 //!   compatibility but ignored (no PTY yet).
 
@@ -109,9 +112,9 @@ enum Command {
     /// Execute a process inside a running container (non-TTY).
     ///
     /// Supports inline args (`exec <id> <cmd> [args...]`) and the process-spec
-    /// form (`exec --process spec.json <id>`). The exec'd process is spawned by
-    /// the container's supervisor under a clone of the container policy, so it
-    /// is confined identically to the container's main process. `-t` /
+    /// form (`exec --process spec.json <id>`). The exec'd process is fork-exec'd
+    /// by the container's in-sandbox `sandlock-init`, so it shares the one
+    /// sandbox (and seccomp supervisor) with the container's main process. `-t` /
     /// `--console-socket` are accepted for runc compatibility but ignored (no
     /// PTY yet).
     Exec {
