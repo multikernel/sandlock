@@ -214,7 +214,6 @@ fn counter_source(out_path: &str) -> String {
 #define SYS_open 2
 #define SYS_nanosleep 35
 #define SYS_lseek 8
-#define SYS_ftruncate 77
 #define O_WRONLY 1
 #define O_CREAT 0100
 #define O_TRUNC 01000
@@ -230,12 +229,14 @@ void _start(void){{
   struct ts t; t.sec = 0; t.nsec = 20000000;
   for(;;){{
     i++;
-    int p = 0; unsigned long v = i; char tmp[24]; int k=0;
-    if(v==0){{ tmp[k++]='0'; }} while(v){{ tmp[k++]='0'+(v%10); v/=10; }}
-    while(k>0){{ buf[p++]=tmp[--k]; }} buf[p++]='\n';
+    // Publish the counter atomically: one fixed-width, zero-padded 21-byte
+    // overwrite (20 digits + newline) at offset 0, never truncating. A reader
+    // therefore always sees a complete, parseable value, never an empty file.
+    unsigned long v = i; int d;
+    for(d = 19; d >= 0; d--){{ buf[d] = '0' + (v % 10); v /= 10; }}
+    buf[20] = '\n';
     sys3(SYS_lseek, fd, 0, 0);
-    sys3(SYS_ftruncate, fd, 0, 0);
-    sys3(SYS_write, fd, (long)buf, p);
+    sys3(SYS_write, fd, (long)buf, 21);
     sys3(SYS_nanosleep, (long)&t, 0, 0);
   }}
 }}
