@@ -582,10 +582,28 @@ pub(crate) async fn handle_chroot_exec(
     // seccomp filter, Landlock ruleset, and chroot all persist across the exec,
     // so the sandbox stays intact. Allow the kernel to perform it as-is. This is
     // how the daemon launches its in-sandbox PID-1 (sandlock-init) from a memfd.
+    //
+    // AT_EMPTY_PATH only carries its fd-exec meaning when the pathname is also
+    // empty (first byte NUL). With a non-empty pathname the kernel ignores the
+    // flag and resolves the path normally, so a confined workload could pass
+    // AT_EMPTY_PATH with a real pathname such as "/bin/sh" and escape the chroot
+    // gate. Only Continue when we have confirmed the pathname is empty.
     if nr == libc::SYS_execveat
         && (notif.data.args[4] as i32) & libc::AT_EMPTY_PATH != 0
     {
-        return NotifAction::Continue;
+        let path_addr = notif.data.args[1];
+        // A null pointer or a leading NUL byte both mean an empty pathname.
+        let pathname_is_empty = if path_addr == 0 {
+            true
+        } else {
+            read_child_mem(notif_fd, notif.id, notif.pid, path_addr, 1)
+                .map(|b| b.first() == Some(&0u8))
+                .unwrap_or(false)
+        };
+        if pathname_is_empty {
+            return NotifAction::Continue;
+        }
+        // Non-empty pathname: fall through to the normal exec authorization path.
     }
 
     let (dirfd, path_ptr) = if nr == libc::SYS_execveat {
