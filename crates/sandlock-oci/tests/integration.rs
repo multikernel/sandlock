@@ -624,3 +624,117 @@ fn which(prog: &str) -> bool {
         std::env::split_paths(&paths).any(|d| d.join(prog).is_file())
     })
 }
+
+/// Path to the prebuilt static `rootfs-helper` (compiled by sandlock-core's
+/// build.rs). It is a self-contained, busybox-style binary the chroot
+/// integration tests drop into a rootfs; building `sandlock-oci` pulls in
+/// `sandlock-core`, so the binary is available here too.
+fn rootfs_helper() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/rootfs-helper")
+}
+
+/// Regression test for process-group collapse on container stop. sandlock has
+/// no PID namespace, so when the container's main process exits the supervisor
+/// must explicitly SIGKILL the process group; otherwise background children (or
+/// exec'd siblings) outlive the container with a dead supervisor.
+///
+/// The container's main process (`rootfs-helper spawn-loop`) forks a worker that
+/// advances `/child.cnt`, then `pause`s. We confirm the worker is running,
+/// `kill` the main process, and assert the worker stops advancing. Without the
+/// `reap_and_collapse` fix the orphaned worker keeps writing and this test fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn oci_stop_collapses_process_group() {
+    if sandlock_core::landlock_abi_version().is_err() {
+        eprintln!("skipping: Landlock unavailable on this host");
+        return;
+    }
+    let helper = rootfs_helper();
+    if !helper.exists() {
+        eprintln!("skipping: rootfs-helper not built (needs musl-gcc or cc -static)");
+        return;
+    }
+
+    let tmp = std::env::temp_dir().join(format!("sandlock-oci-pgroup-{}", std::process::id()));
+    fs::create_dir_all(&tmp).unwrap();
+
+    // The container chroots to rootfs, so the worker's in-sandbox path
+    // `/child.cnt` resolves to `rootfs/child.cnt` on the host. Drop the static
+    // rootfs-helper into the rootfs and run its `spawn-loop` worker.
+    let bundle = tmp.join("bundle");
+    let rootfs = bundle.join("rootfs");
+    fs::create_dir_all(&rootfs).unwrap();
+    fs::copy(&helper, rootfs.join("rootfs-helper")).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(rootfs.join("rootfs-helper"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    create_bundle(&bundle, &["/rootfs-helper", "spawn-loop", "/child.cnt"]);
+
+    let host_child = rootfs.join("child.cnt");
+    let host_child_s = host_child.to_str().unwrap().to_string();
+    let read_counter = |path: &str| -> Option<u64> {
+        fs::read_to_string(path).ok().and_then(|s| s.trim().parse::<u64>().ok())
+    };
+
+    let root = tempdir().unwrap();
+    let root_s = root.path().to_str().unwrap().to_string();
+    let id = "oci-pgroup-e2e";
+
+    // create (daemonizes a supervisor that inherits stdio; redirect + .status()).
+    let create_log = tmp.join("create.log");
+    let create_status = Command::new(oci_bin())
+        .args(["--root", &root_s, "create", id, "-b", bundle.to_str().unwrap()])
+        .stdout(std::process::Stdio::from(fs::File::create(&create_log).unwrap()))
+        .stderr(std::process::Stdio::from(
+            fs::OpenOptions::new().append(true).open(&create_log).unwrap(),
+        ))
+        .status()
+        .expect("run create");
+    assert!(create_status.success(), "create failed: {}", fs::read_to_string(&create_log).unwrap_or_default());
+
+    let start_out = Command::new(oci_bin())
+        .args(["--root", &root_s, "start", id])
+        .output()
+        .expect("run start");
+    assert!(start_out.status.success(), "start failed: {}", String::from_utf8_lossy(&start_out.stderr));
+
+    // Wait until the forked worker is genuinely running.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut worker_running = false;
+    while std::time::Instant::now() < deadline {
+        if read_counter(&host_child_s).map(|v| v > 2).unwrap_or(false) {
+            worker_running = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // Kill ONLY the main process (default SIGTERM to state.pid, not the group).
+    // The supervisor's group-collapse is what must take the worker down.
+    let kill_out = Command::new(oci_bin())
+        .args(["--root", &root_s, "kill", id, "SIGTERM"])
+        .output()
+        .expect("run kill");
+    let kill_ok = kill_out.status.success();
+
+    // Give the supervisor time to observe the exit and collapse the group.
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    let sample_a = read_counter(&host_child_s);
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let sample_b = read_counter(&host_child_s);
+
+    // clean up before asserting so a failure never leaks the worker.
+    let _ = Command::new(oci_bin())
+        .args(["--root", &root_s, "delete", id, "--force"])
+        .output();
+    let _ = fs::remove_dir_all(&tmp);
+
+    assert!(worker_running, "forked worker never started; create_log: {}", fs::read_to_string(&create_log).unwrap_or_default());
+    assert!(kill_ok, "kill failed: {}", String::from_utf8_lossy(&kill_out.stderr));
+    assert_eq!(
+        sample_a, sample_b,
+        "worker must stop advancing after the container's main process is killed \
+         (process group was not collapsed); samples {:?} -> {:?}",
+        sample_a, sample_b
+    );
+}

@@ -19,7 +19,9 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/types.h>
 #include <sys/xattr.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ── echo ───────────────────────────────────────────────────── */
@@ -545,6 +547,40 @@ static int cmd_legacy_chmod(int argc, char **argv) {
 }
 #endif
 
+/* ── spawn-loop (non-standard: fork a background worker, then pause) ──────── */
+/*
+ * Models a container whose main process spawns a long-lived background worker.
+ * The forked child opens <file> once and loops publishing an incrementing
+ * counter (single fixed-width 21-byte overwrite, never truncating, so a reader
+ * always sees a complete value); the parent blocks forever in pause(). Used by
+ * the OCI process-group-collapse test: when the container's main process is
+ * killed, the worker must be reaped with the group rather than left running.
+ */
+static int cmd_spawn_loop(int argc, char **argv) {
+    if (argc < 1) { fprintf(stderr, "spawn-loop: missing file operand\n"); return 1; }
+    const char *path = argv[0];
+    pid_t pid = fork();
+    if (pid < 0) { perror("spawn-loop: fork"); return 1; }
+    if (pid == 0) {
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) _exit(1);
+        unsigned long i = 0;
+        char buf[24];
+        struct timespec t = { 0, 20000000 };
+        for (;;) {
+            i++;
+            unsigned long v = i;
+            for (int d = 19; d >= 0; d--) { buf[d] = '0' + (v % 10); v /= 10; }
+            buf[20] = '\n';
+            lseek(fd, 0, SEEK_SET);
+            if (write(fd, buf, 21) < 0) _exit(1);
+            nanosleep(&t, NULL);
+        }
+    }
+    for (;;) pause();
+    return 0;
+}
+
 /* ── dispatch ───────────────────────────────────────────────── */
 
 static int dispatch(const char *cmd, int argc, char **argv) {
@@ -572,6 +608,7 @@ static int dispatch(const char *cmd, int argc, char **argv) {
     if (strcmp(cmd, "setxattr") == 0)       return cmd_setxattr(argc, argv);
     if (strcmp(cmd, "listxattr") == 0)      return cmd_listxattr(argc, argv);
     if (strcmp(cmd, "fstat-fd") == 0)      return cmd_fstat_fd(argc, argv);
+    if (strcmp(cmd, "spawn-loop") == 0)     return cmd_spawn_loop(argc, argv);
     if (strcmp(cmd, "true") == 0)           return 0;
     if (strcmp(cmd, "false") == 0)          return 1;
 

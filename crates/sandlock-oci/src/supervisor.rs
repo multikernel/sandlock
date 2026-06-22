@@ -391,7 +391,7 @@ async fn serve_running(
         Some(w) => w,
         None => {
             // Cannot watch concurrently: just wait for exit (no serving).
-            return exit_info_from(sandbox.wait().await);
+            return reap_and_collapse(sandbox, child_pid).await;
         }
     };
     loop {
@@ -401,7 +401,7 @@ async fn serve_running(
                 // way collect the status via the sandbox's own pidfd. We return
                 // immediately, so there is no need to clear readiness.
                 let _ = ready;
-                return exit_info_from(sandbox.wait().await);
+                return reap_and_collapse(sandbox, child_pid).await;
             }
             conn = listener.accept() => {
                 match conn {
@@ -414,11 +414,32 @@ async fn serve_running(
                             }
                         }
                     }
-                    Err(_) => return exit_info_from(sandbox.wait().await),
+                    Err(_) => return reap_and_collapse(sandbox, child_pid).await,
                 }
             }
         }
     }
+}
+
+/// Collect the main process's exit status, then collapse its process group.
+///
+/// sandlock uses no PID namespace, so when the container's main process exits
+/// the kernel does not tear down the processes it spawned (background children,
+/// and exec'd siblings sharing the group). Send SIGKILL to the whole group so
+/// nothing outlives the container with a now-dead supervisor. `child_pid` is the
+/// group's pgid (core does `setpgid(0, 0)` in the child); `killpg` reaches any
+/// remaining members and is a harmless `ESRCH` when the group is already empty.
+/// The `Shutdown` path does not call this because `sandbox.kill()` already
+/// SIGKILLs the same process group.
+async fn reap_and_collapse(
+    sandbox: &mut sandlock_core::Sandbox,
+    child_pid: i32,
+) -> Option<crate::state::ExitInfo> {
+    let info = exit_info_from(sandbox.wait().await);
+    if child_pid > 0 {
+        unsafe { libc::killpg(child_pid, libc::SIGKILL) };
+    }
+    info
 }
 
 /// Run the supervisor in the **current process** for an OCI `restore`.
