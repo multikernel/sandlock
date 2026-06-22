@@ -575,6 +575,19 @@ pub(crate) async fn handle_chroot_exec(
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
     let nr = notif.data.nr as i64;
+
+    // An execveat(fd, "", AT_EMPTY_PATH) execs an already-open fd directly. There
+    // is no pathname to confine, and the open that produced the fd was already
+    // confined to the chroot (or it is an anonymous memfd the process made). The
+    // seccomp filter, Landlock ruleset, and chroot all persist across the exec,
+    // so the sandbox stays intact. Allow the kernel to perform it as-is. This is
+    // how the daemon launches its in-sandbox PID-1 (sandlock-init) from a memfd.
+    if nr == libc::SYS_execveat
+        && (notif.data.args[4] as i32) & libc::AT_EMPTY_PATH != 0
+    {
+        return NotifAction::Continue;
+    }
+
     let (dirfd, path_ptr) = if nr == libc::SYS_execveat {
         (notif.data.args[0] as i64, notif.data.args[1])
     } else {
