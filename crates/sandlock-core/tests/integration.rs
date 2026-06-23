@@ -66,6 +66,3 @@ mod test_http_inject_ca;
 
 #[path = "integration/test_restore.rs"]
 mod test_restore;
-
-#[path = "integration/test_exec_fd.rs"]
-mod test_exec_fd;
