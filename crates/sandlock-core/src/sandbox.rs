@@ -344,6 +344,16 @@ pub struct Sandbox {
     #[serde(skip)]
     pub exec_fd: Option<i32>,
 
+    /// When set, the confined child runs this function in-process instead of
+    /// `execve`-ing a workload. Used to run an in-sandbox PID-1 (the OCI
+    /// `sandlock-init` control loop) without exec'ing a separate image: the
+    /// child is already a fork of the supervisor, so its code is mapped, and
+    /// because nothing is exec'd, Landlock has no execution to authorize. The
+    /// function must not return (it loops and `_exit`s); `confine_child` calls
+    /// `_exit(0)` if it does.
+    #[serde(skip)]
+    pub in_child_main: Option<fn()>,
+
     pub clean_env: bool,
     pub env: HashMap<String, String>,
     // Devices
@@ -452,6 +462,7 @@ impl Clone for Sandbox {
             fs_mount: self.fs_mount.clone(),
             chroot: self.chroot.clone(),
             exec_fd: self.exec_fd,
+            in_child_main: self.in_child_main,
             clean_env: self.clean_env,
             env: self.env.clone(),
             gpu_devices: self.gpu_devices.clone(),
@@ -853,6 +864,28 @@ impl Sandbox {
         self.rt_mut().io_overrides = Some((stdin_fd, stdout_fd, stderr_fd));
         self.rt_mut().extra_fds = extra_fds;
         self.do_create(cmd, false).await
+    }
+
+    /// Create a confined child that, instead of `execve`-ing a workload, runs
+    /// `entrypoint` in-process after confinement is installed. The child is a
+    /// `fork()` of this process, so `entrypoint`'s code is already mapped; no
+    /// image is exec'd, so Landlock has nothing to authorize for the child's own
+    /// startup. `extra_fds` maps caller fds onto fixed fd numbers in the child
+    /// (e.g. the control channel). Used to run the OCI in-sandbox PID-1.
+    ///
+    /// `name` is not exec'd; it sets the child's process name
+    /// (`/proc/<pid>/comm`). `start()` releases the parked child to run
+    /// `entrypoint`.
+    pub async fn create_with_in_child_main(
+        &mut self,
+        name: &str,
+        extra_fds: Vec<(i32, i32)>,
+        entrypoint: fn(),
+    ) -> Result<(), crate::error::SandlockError> {
+        self.ensure_runtime()?;
+        self.in_child_main = Some(entrypoint);
+        self.rt_mut().extra_fds = extra_fds;
+        self.do_create(&[name], false).await
     }
 
     /// Freeze the sandbox: hold fork notifications + SIGSTOP the process group.
@@ -1474,9 +1507,15 @@ impl Sandbox {
                 .collect();
 
             let sandbox_name = self.rt().name.clone();
+            // In-process entrypoint (OCI PID-1) names the process from cmd[0];
+            // otherwise execve the command.
+            let entry = match self.in_child_main {
+                Some(run) => context::ChildEntry::InProcess { name: c_cmd[0].as_c_str(), run },
+                None => context::ChildEntry::Exec(&c_cmd),
+            };
             context::confine_child(context::ChildSpawnArgs {
                 sandbox: self,
-                cmd: &c_cmd,
+                entry,
                 pipes: &pipes,
                 no_supervisor,
                 keep_fds: &gather_keep_fds,

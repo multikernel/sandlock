@@ -754,6 +754,7 @@ impl SandboxBuilder {
             fs_mount: self.fs_mount,
             chroot: self.chroot,
             exec_fd: None,
+            in_child_main: None,
             clean_env: self.clean_env,
             env: self.env,
             gpu_devices: self.gpu_devices,

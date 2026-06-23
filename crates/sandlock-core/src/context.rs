@@ -1,7 +1,7 @@
 // Fork + confinement sequence: child-side Landlock + seccomp application
 // and parent-child pipe synchronization.
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
@@ -199,9 +199,23 @@ fn write_id_maps(real_uid: u32, real_gid: u32, target_uid: u32, target_gid: u32)
 /// handlers).  Lifetimes tie everything to the parent's stack frame — the
 /// child never outlives the fork point because `confine_child` either execs
 /// or exits.
+/// The terminal action `confine_child` performs after confinement is installed.
+/// Exactly one of the two: there is no longer a "command plus optional override".
+pub(crate) enum ChildEntry<'a> {
+    /// `execve` this command (the normal path). argv[0] becomes the process name.
+    Exec(&'a [CString]),
+    /// Run this function in-process, with the process named `name`. Used for the
+    /// OCI in-sandbox PID-1: the child is a fork of the supervisor so the code is
+    /// already mapped, nothing is exec'd, and Landlock has no execve to
+    /// authorize. `run` must not return; `confine_child` `_exit(0)`s if it does.
+    InProcess { name: &'a CStr, run: fn() },
+}
+
 pub(crate) struct ChildSpawnArgs<'a> {
     pub sandbox: &'a Sandbox,
-    pub cmd: &'a [CString],
+    /// Terminal action after confinement: `execve` a command or run a fn
+    /// in-process. See [`ChildEntry`].
+    pub entry: ChildEntry<'a>,
     pub pipes: &'a PipePair,
     /// Skip the user-notification supervisor: child installs a kernel-only
     /// deny filter, parent reads `notif_fd_num = 0` and never starts a
@@ -221,14 +235,22 @@ pub(crate) struct ChildSpawnArgs<'a> {
     pub parent_pid: libc::pid_t,
 }
 
-/// Apply irreversible confinement (Landlock + seccomp) then exec the command.
+/// Set the calling thread/process name (`/proc/<pid>/comm`, shown by `ps`). The
+/// kernel truncates to 15 bytes + NUL. Used for the in-process PID-1, which has
+/// no `execve` to set its name from argv[0].
+fn set_proc_name(name: &CStr) {
+    unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr() as libc::c_ulong, 0, 0, 0) };
+}
+
+/// Apply irreversible confinement (Landlock + seccomp), then either `execve` the
+/// command or run an in-process entrypoint, per [`ChildEntry`].
 ///
-/// This function **never returns**: it calls `execvp` on success or
-/// `_exit(127)` on any error.
+/// This function **never returns**: on success it execs or runs the entrypoint
+/// (which `_exit`s); on any error it `_exit(127)`s.
 pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     let ChildSpawnArgs {
         sandbox,
-        cmd,
+        entry,
         pipes,
         no_supervisor,
         keep_fds,
@@ -498,6 +520,22 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         }
         // Empty list = all GPUs visible, don't set env vars
     }
+
+    // 14. Terminal action: run the in-process entrypoint, or fall through to
+    // execve the command. The in-process arm diverges (`_exit`), so the match
+    // yields the command slice only on the `Exec` path.
+    let cmd: &[CString] = match entry {
+        ChildEntry::InProcess { name, run } => {
+            // Name the PID-1 so ps / /proc/<pid>/comm read correctly: there is
+            // no execve here to set argv[0]. The child is a fork of the
+            // supervisor, so `run`'s code is already mapped; running it directly
+            // avoids an execve that Landlock would otherwise have to authorize.
+            set_proc_name(name);
+            run();
+            unsafe { libc::_exit(0) };
+        }
+        ChildEntry::Exec(cmd) => cmd,
+    };
 
     // 14. exec
     debug_assert!(!cmd.is_empty(), "cmd must not be empty");
