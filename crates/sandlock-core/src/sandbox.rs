@@ -435,6 +435,14 @@ pub struct Sandbox {
     #[serde(skip)]
     work_fn: Option<Arc<dyn Fn(u32) + Send + Sync + 'static>>,
 
+    // Audit callback for file-open syscalls; fires before internal handlers.
+    #[serde(skip)]
+    on_file_access: Option<Arc<dyn Fn(&std::path::Path, u64) + Send + Sync>>,
+
+    // Audit callback for network connect/sendto syscalls; fires before internal handlers.
+    #[serde(skip)]
+    on_net_connect: Option<Arc<dyn Fn(std::net::IpAddr, u16) + Send + Sync>>,
+
     // Heap-allocated runtime state; `None` when not started.
     #[serde(skip)]
     runtime: Option<Box<Runtime>>,
@@ -519,6 +527,9 @@ impl Clone for Sandbox {
             init_fn: None,
             // work_fn is Arc-wrapped — clone bumps the reference count.
             work_fn: self.work_fn.clone(),
+            // on_file_access is Arc-wrapped — clone bumps the reference count.
+            on_file_access: self.on_file_access.clone(),
+            on_net_connect: self.on_net_connect.clone(),
             // Runtime is NOT cloned — the clone starts with no runtime.
             runtime: None,
         }
@@ -1710,6 +1721,8 @@ impl Sandbox {
                 virtual_etc_hosts,
                 ca_inject_paths: self.http_inject_ca.clone(),
                 ca_inject_pem: ca_inject_pem.clone(),
+                audit_file_access: self.on_file_access.clone(),
+                audit_net_connect: self.on_net_connect.clone(),
             };
 
             use rand::SeedableRng;

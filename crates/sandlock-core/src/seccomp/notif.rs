@@ -777,6 +777,13 @@ pub struct NotifPolicy {
     /// Active MITM CA public cert (PEM bytes) to inject. `Some` only when
     /// HTTPS MITM is active (BYO or generated).
     pub ca_inject_pem: Option<std::sync::Arc<Vec<u8>>>,
+    /// Optional audit hook called for every file-open syscall before dispatch.
+    /// Receives the resolved absolute path and the open flags (`O_*`); flags
+    /// are `0` for execve/execveat and other non-open syscalls.
+    pub audit_file_access: Option<std::sync::Arc<dyn Fn(&std::path::Path, u64) + Send + Sync>>,
+    /// Optional audit hook called for every `connect`/`sendto` syscall before
+    /// dispatch. Receives the destination IP and port.
+    pub audit_net_connect: Option<std::sync::Arc<dyn Fn(std::net::IpAddr, u16) + Send + Sync>>,
 }
 
 impl NotifPolicy {
@@ -1688,6 +1695,34 @@ async fn handle_notification(
     if policy.has_time_start || policy.has_random_seed {
         let mut pfs = ctx.procfs.lock().await;
         maybe_patch_vdso(notif.pid as i32, &mut pfs, policy);
+    }
+
+    // Audit hook — fires before internal handlers so it sees every file open
+    // regardless of how the dispatch chain handles it.
+    if let Some(ref hook) = policy.audit_file_access {
+        let nr = notif.data.nr as i64;
+        if let Some(path) = resolve_path_for_notif(&notif, fd) {
+            let flags = if nr == libc::SYS_openat {
+                notif.data.args[2]
+            } else if Some(nr) == arch::sys_open() {
+                notif.data.args[1]
+            } else {
+                0
+            };
+            hook(std::path::Path::new(&path), flags);
+        }
+    }
+
+    // Network connect audit hook — fires before internal handlers.
+    if let Some(ref hook) = policy.audit_net_connect {
+        let nr = notif.data.nr as i64;
+        if nr == libc::SYS_connect || nr == libc::SYS_sendto {
+            let addr_ptr = notif.data.args[1];
+            let addr_len = notif.data.args[2] as usize;
+            if let (Some(ip), Some(port)) = read_sockaddr_for_event(&notif, addr_ptr, addr_len, fd) {
+                hook(ip, port);
+            }
+        }
     }
 
     // Check dynamic path denials before dispatch
