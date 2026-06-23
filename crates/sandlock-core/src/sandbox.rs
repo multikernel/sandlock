@@ -390,7 +390,7 @@ pub struct Sandbox {
 
     // Audit callback for file-open syscalls; fires before internal handlers.
     #[serde(skip)]
-    on_file_access: Option<Arc<dyn Fn(&std::path::Path, u64) + Send + Sync>>,
+    pub(crate) on_file_access: Option<Arc<dyn Fn(&std::path::Path, u64) + Send + Sync>>,
 
     // Audit callback for network connect/sendto syscalls; fires before internal handlers.
     #[serde(skip)]

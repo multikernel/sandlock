@@ -1640,24 +1640,49 @@ async fn handle_notification(
     // regardless of how the dispatch chain handles it.
     if let Some(ref hook) = policy.audit_file_access {
         let nr = notif.data.nr as i64;
-        if let Some(path) = resolve_path_for_notif(&notif, fd) {
-            let flags = if nr == libc::SYS_openat {
-                notif.data.args[2]
-            } else if Some(nr) == arch::sys_open() {
-                notif.data.args[1]
-            } else {
-                0
-            };
-            hook(std::path::Path::new(&path), flags);
+        let is_open = nr == libc::SYS_openat
+            || Some(nr) == arch::sys_open()
+            || nr == libc::SYS_execve
+            || nr == libc::SYS_execveat;
+        if is_open {
+            if let Some(path) = resolve_path_for_notif(&notif, fd) {
+                let flags = if nr == libc::SYS_openat {
+                    notif.data.args[2]
+                } else if Some(nr) == arch::sys_open() {
+                    notif.data.args[1]
+                } else {
+                    0 // execve/execveat — no open flags
+                };
+                hook(std::path::Path::new(&path), flags);
+            }
         }
     }
 
     // Network connect audit hook — fires before internal handlers.
     if let Some(ref hook) = policy.audit_net_connect {
         let nr = notif.data.nr as i64;
-        if nr == libc::SYS_connect || nr == libc::SYS_sendto {
-            let addr_ptr = notif.data.args[1];
-            let addr_len = notif.data.args[2] as usize;
+        // Extract (addr_ptr, addr_len) from the syscall args — each syscall lays them out differently.
+        let sockaddr = if nr == libc::SYS_connect {
+            // connect(sockfd, addr, addrlen)
+            Some((notif.data.args[1], notif.data.args[2] as usize))
+        } else if nr == libc::SYS_sendto {
+            // sendto(sockfd, buf, len, flags, addr, addrlen)
+            Some((notif.data.args[4], notif.data.args[5] as usize))
+        } else if nr == libc::SYS_sendmsg {
+            // sendmsg(sockfd, msghdr*, flags) — addr is msg_name inside the msghdr struct
+            let msghdr_ptr = notif.data.args[1];
+            read_child_mem(fd, notif.id, notif.pid, msghdr_ptr, 16)
+                .ok()
+                .filter(|b| b.len() >= 16)
+                .and_then(|b| {
+                    let msg_name = u64::from_ne_bytes(b[0..8].try_into().ok()?);
+                    let msg_namelen = u32::from_ne_bytes(b[8..12].try_into().ok()?) as usize;
+                    if msg_name != 0 && msg_namelen >= 4 { Some((msg_name, msg_namelen)) } else { None }
+                })
+        } else {
+            None
+        };
+        if let Some((addr_ptr, addr_len)) = sockaddr {
             if let (Some(ip), Some(port)) = read_sockaddr_for_event(&notif, addr_ptr, addr_len, fd) {
                 hook(ip, port);
             }
