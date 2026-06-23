@@ -281,7 +281,90 @@ fn test_cow_commit_runs_on_cli_exit() {
     assert_eq!(contents.trim(), "committed");
 }
 
-/// Regression: `--user N:N` maps the sandbox to UID `N` via an unprivileged
+/// `sandlock learn` must capture filesystem reads in the generated profile.
+/// Runs `cat /etc/hostname` and verifies `/etc/hostname` appears under `read`.
+#[test]
+fn test_learn_captures_fs_read() {
+    let output = sandlock_bin()
+        .args(["learn", "--", "cat", "/etc/hostname"])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("/etc/hostname"),
+        "expected /etc/hostname in learn output, got:\n{stdout}",
+    );
+}
+
+/// `sandlock learn` must classify file opens with write flags under `write`.
+/// Runs a shell that writes a temp file and verifies it appears under `write`.
+#[test]
+fn test_learn_captures_fs_write() {
+    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let path = tmp.path().to_str().unwrap().to_owned();
+    let cmd = format!("echo x > {path}");
+    let output = sandlock_bin()
+        .args(["learn", "--", "sh", "-c", &cmd])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&path),
+        "expected {path} in learn write output, got:\n{stdout}",
+    );
+    // Confirm it appears in write = [...], not read
+    let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("");
+    assert!(
+        write_line.contains(&path),
+        "expected {path} under write = [...], got: {write_line}",
+    );
+}
+
+/// `sandlock learn` must record observed TCP connections under `[network] allow`.
+/// Binds a real listener so the connect succeeds cleanly.
+#[test]
+fn test_learn_captures_net_connect() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // Accept one connection so the child doesn't hang waiting for handshake.
+    let _t = std::thread::spawn(move || { let _ = listener.accept(); });
+
+    let script = format!(
+        "import socket; s=socket.socket(); s.connect(('127.0.0.1',{port})); s.close()"
+    );
+    let output = sandlock_bin()
+        .args(["learn", "--", "python3", "-c", &script])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let expected = format!("127.0.0.1:{port}");
+    assert!(
+        stdout.contains(&expected),
+        "expected {expected} in network output, got:\n{stdout}",
+    );
+    let net_line = stdout.lines().find(|l| l.starts_with("allow = [")).unwrap_or("");
+    assert!(
+        net_line.contains(&expected),
+        "expected {expected} under [network] allow = [...], got: {net_line}",
+    );
+}
+
+/// `--user N:N` maps the sandbox to UID `N` via an unprivileged
 /// user namespace, even when the host UID is non-zero. This is the only
 /// remaining `CLONE_NEWUSER` site after the overlayfs backend removal;
 /// the test guards against accidentally tearing it out.
