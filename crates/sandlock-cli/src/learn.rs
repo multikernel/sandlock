@@ -1,15 +1,9 @@
-//! Implementation of `sandlock learn`.
+//! Implementation of `sandlock learn -o <output.toml>`.
 //!
-//! Runs a workload under fully-permissive Landlock (read-everything) and
-//! intercepts every file-open syscall via an audit hook registered directly
-//! in the sandlock-core supervisor. Emits a sandlock profile TOML readable
-//! by `sandlock run --profile-file`.
-//!
-//! Note: no path collapsing is applied — every individual file is listed.
-//! See issue #72 for the planned collapsing design.
+//! Runs a workload under observation and emits a sandlock profile TOML
+//! usable by `sandlock run -p`.
 
 use std::collections::BTreeSet;
-use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -28,22 +22,8 @@ fn is_write_open(flags: u64) -> bool {
     flags & (O_WRONLY | O_RDWR | O_CREAT) != 0
 }
 
-fn resolve_cmd(cmd: &str) -> PathBuf {
-    let p = if cmd.contains('/') {
-        PathBuf::from(cmd)
-    } else {
-        std::env::var("PATH")
-            .unwrap_or_default()
-            .split(':')
-            .map(|dir| PathBuf::from(dir).join(cmd))
-            .find(|p| p.exists())
-            .unwrap_or_else(|| PathBuf::from(cmd))
-    };
-    std::fs::canonicalize(&p).unwrap_or(p)
-}
-
 /// Read the ELF PT_INTERP segment of a binary and return the interpreter path.
-/// Returns `None` for statically linked binaries or non-ELF files.
+/// Returns `None` for statically linked binaries, non-ELF files, or ELF32 binaries.
 fn elf_interpreter(binary: &std::path::Path) -> Option<PathBuf> {
     let data = std::fs::read(binary).ok()?;
     // ELF magic: 0x7f 'E' 'L' 'F'
@@ -95,8 +75,12 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     let cmd_refs: Vec<&str> = args.cmd.iter().map(String::as_str).collect();
 
     // Fully permissive Landlock so nothing is blocked during observation.
-    // Any denial here would make the trace incomplete (workload crashes before
-    // reaching other files it needs). See issue #72 open question #1.
+    // workdir (COW overlay) lets writes go anywhere without touching the real filesystem.
+    let cow_dir = tempfile::Builder::new()
+        .prefix("sandlock-learn-")
+        .tempdir_in("/var/tmp")
+        .map_err(|e| anyhow!("failed to create COW tempdir: {e}"))?;
+
     let reads: Arc<Mutex<BTreeSet<PathBuf>>> = Arc::new(Mutex::new(BTreeSet::new()));
     let writes: Arc<Mutex<BTreeSet<PathBuf>>> = Arc::new(Mutex::new(BTreeSet::new()));
     let connects: Arc<Mutex<BTreeSet<String>>> = Arc::new(Mutex::new(BTreeSet::new()));
@@ -104,7 +88,7 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     let (reads_c, writes_c, connects_c) = (Arc::clone(&reads), Arc::clone(&writes), Arc::clone(&connects));
     let policy = Sandbox::builder()
         .fs_read("/")
-        .fs_write("/tmp")
+        .workdir(cow_dir.path())
         .on_file_access(move |path, flags| {
             if is_write_open(flags) {
                 writes_c.lock().unwrap().insert(path.to_path_buf());
@@ -128,32 +112,57 @@ pub async fn run(args: LearnArgs) -> Result<()> {
 
     eprintln!("sandlock learn: done (exit={:?})", result.code());
 
-    // The executed binary and its dynamic linker are loaded by the kernel during
-    // execve — they never appear in the audit hook trace. Add them explicitly.
-    let binary = resolve_cmd(&args.cmd[0]);
-    if let Some(interp) = elf_interpreter(&binary) {
-        reads.lock().unwrap().insert(interp);
+    // The dynamic linker is loaded entirely in kernel space
+    // during execve — no userspace syscall fires. Find the binary in the captured
+    // reads (by basename match) and parse its ELF PT_INTERP to add the linker.
+    let cmd_basename = std::path::Path::new(&args.cmd[0]).file_name();
+    let candidates: Vec<PathBuf> = reads.lock().unwrap().iter()
+        .filter(|p| p.file_name() == cmd_basename)
+        .cloned()
+        .collect();
+    for bin in candidates.iter().filter(|p| p.exists()) {
+        if let Some(interp) = elf_interpreter(bin) {
+            reads.lock().unwrap().insert(interp);
+            break;
+        }
     }
-    reads.lock().unwrap().insert(binary);
 
-    // Build the profile using the proper struct — same schema `sandlock run -p` reads.
+    // Build the profile.
     let mut profile_out = ProfileInput::default();
+    let cow_path = cow_dir.path().to_path_buf();
     profile_out.filesystem = FilesystemSection {
-        read: reads.lock().unwrap().iter().filter(|p| p.exists()).cloned().collect(),
-        write: writes.lock().unwrap().iter().filter(|p| p.exists()).cloned().collect(),
+        // Filter reads by existence to drop failed PATH-probe openats.
+        read: reads.lock().unwrap().iter()
+            .filter(|p| p.exists() && !p.starts_with(&cow_path))
+            .cloned()
+            .collect(),
+        // For writes: if the file exists, record the specific path (existing file modified).
+        // If it doesn't exist on the real FS (COW intercepted a create), record the parent
+        // directory instead — Landlock requires the path to exist, and the program needs
+        // write access to the directory to create new files inside it.
+        write: writes.lock().unwrap().iter()
+            .filter(|p| !p.starts_with(&cow_path))
+            .filter_map(|p| {
+                if p.exists() {
+                    Some(p.clone())
+                } else {
+                    p.parent().filter(|d| d.exists()).map(|d| d.to_path_buf())
+                }
+            })
+            .collect(),
         ..Default::default()
     };
     profile_out.network.allow = connects.lock().unwrap().iter().cloned().collect();
 
+    let cmd_comment = cmd_str.replace('\n', " ");
     let header = format!(
         "# generated by sandlock learn\n\
-         # command: {cmd_str}\n\
+         # command: {cmd_comment}\n\
          # note: raw observation — no path collapsing applied\n\
          #       every file is listed individually (see issue #72 for collapsing design)\n\n"
     );
     let body = profile_out.to_toml()
         .map_err(|e| anyhow!("failed to serialize profile: {e}"))?;
-    let body = strip_empty_sections(&body);
     let toml_out = format!("{header}{body}");
 
     match args.output {
@@ -168,40 +177,3 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     Ok(())
 }
 
-/// Strip TOML sections that contain only default/empty values.
-/// `toml::to_string` emits every field including defaults — this keeps
-/// the profile minimal and readable.
-fn strip_empty_sections(toml: &str) -> String {
-    let mut out = String::new();
-    let mut section: Vec<&str> = Vec::new();
-    let mut in_section = false;
-
-    for line in toml.lines() {
-        if line.starts_with('[') {
-            if in_section && section_has_content(&section) {
-                for l in &section { out.push_str(l); out.push('\n'); }
-            }
-            section = vec![line];
-            in_section = true;
-        } else if in_section {
-            section.push(line);
-        } else {
-            out.push_str(line); out.push('\n');
-        }
-    }
-    if in_section && section_has_content(&section) {
-        for l in &section { out.push_str(l); out.push('\n'); }
-    }
-    out
-}
-
-fn section_has_content(lines: &[&str]) -> bool {
-    lines.iter().skip(1).any(|l| {
-        let v = l.trim();
-        !v.is_empty()
-            && !v.ends_with("= []")
-            && !v.ends_with("= {}")
-            && !v.ends_with("= false")
-            && v != "[]"
-    })
-}
