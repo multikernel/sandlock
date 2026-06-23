@@ -137,6 +137,13 @@ pub struct LimitsSection {
 
 /// Convert a parsed `ProfileInput` into a `(Sandbox, ProgramSpec)` pair.
 ///
+impl ProfileInput {
+    /// Serialize the profile to a TOML string.
+    pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
+        toml::to_string(self)
+    }
+}
+
 /// Forwards each schema section's fields to the corresponding `SandboxBuilder`
 /// method calls. The two private helpers (`parse_branch_action`,
 /// `parse_mount_spec`) handle string-to-typed-value conversions for fields

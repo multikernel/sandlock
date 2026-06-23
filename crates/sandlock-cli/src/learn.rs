@@ -151,7 +151,7 @@ pub async fn run(args: LearnArgs) -> Result<()> {
          # note: raw observation — no path collapsing applied\n\
          #       every file is listed individually (see issue #72 for collapsing design)\n\n"
     );
-    let body = toml::to_string(&profile_out)
+    let body = profile_out.to_toml()
         .map_err(|e| anyhow!("failed to serialize profile: {e}"))?;
     let body = strip_empty_sections(&body);
     let toml_out = format!("{header}{body}");
