@@ -1,6 +1,6 @@
 use crate::sandbox::{ByteSize, Sandbox};
 use crate::error::SandlockError;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -14,7 +14,7 @@ pub struct ProgramSpec {
 }
 
 /// Top-level profile input. Each section maps to one schema section.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct ProfileInput {
     pub config: ConfigSection,
@@ -28,7 +28,7 @@ pub struct ProfileInput {
 }
 
 // Field names follow the schema vocabulary and match `Sandbox`'s field names 1:1.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct ConfigSection {
     pub http_ca: Option<PathBuf>,
@@ -39,7 +39,7 @@ pub struct ConfigSection {
     pub workdir: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct DeterminismSection {
     pub random_seed: Option<u64>,
@@ -49,7 +49,7 @@ pub struct DeterminismSection {
     pub no_randomize_memory: bool,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct ProgramSection {
     pub exec: Option<PathBuf>,
@@ -63,7 +63,7 @@ pub struct ProgramSection {
     pub no_huge_pages: bool,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct FilesystemSection {
     pub read: Vec<PathBuf>,
@@ -82,14 +82,14 @@ pub struct FilesystemSection {
 /// quoted string holding a comma list and/or `lo-hi` range (`"9000-9005"`).
 /// The untagged form lets a TOML array mix the two, e.g.
 /// `allow_bind = [8080, "9000-9005"]`.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum PortSpec {
     Port(u16),
     Spec(String),
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct NetworkSection {
     pub allow_bind: Vec<PortSpec>,
@@ -99,7 +99,7 @@ pub struct NetworkSection {
     pub port_remap: bool,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct HttpSection {
     pub ports: Vec<u16>,
@@ -107,7 +107,7 @@ pub struct HttpSection {
     pub deny: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct SyscallsSection {
     pub extra_allow: Vec<String>,
@@ -117,7 +117,7 @@ pub struct SyscallsSection {
 // Field names drop the `max_` prefix that `Sandbox` uses (`memory`, not
 // `max_memory`) — the section name `[limits]` makes the prefix redundant.
 // `parse_input` maps each of these to the corresponding `Sandbox::max_*` field.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct LimitsSection {
     /// `ByteSize` string, e.g. `"512M"` (suffixes K/M/G only; IEC `MiB`/`GiB`
