@@ -616,7 +616,7 @@ impl SandboxBuilder {
         self
     }
 
-    /// Register an audit callback that fires for every `connect`/`sendto` syscall
+    /// Register an audit callback that fires for every `connect`/`sendto`/`sendmsg` syscall
     /// before any internal handler runs. Receives the destination IP and port.
     pub fn on_net_connect(mut self, f: impl Fn(std::net::IpAddr, u16) + Send + Sync + 'static) -> Self {
         self.on_net_connect = Some(Arc::new(f));

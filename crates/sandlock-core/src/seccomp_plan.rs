@@ -358,8 +358,7 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
         nrs.extend(POLICY_EVENT_SYSCALLS);
     }
 
-    // Audit file-access hook: needs execve/execveat in notif so the hook fires
-    // for the executed binary (openat is already covered by procfs/hosts notif).
+    // Audit file-access hook: needs execve/execveat in notif so the hook fires for the executed binary.
     if features.audit_file_access {
         nrs.push(libc::SYS_execve);
         nrs.push(libc::SYS_execveat);
