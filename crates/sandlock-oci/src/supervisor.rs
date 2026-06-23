@@ -22,31 +22,10 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
 
-use sandlock_init::{Req, Resp, CONTROL_FD};
+use crate::init::{Req, Resp, CONTROL_FD};
 
 use crate::policy::OciPolicy;
 use crate::state::SandboxState;
-
-/// The embedded static sandlock-init binary (built by build.rs). It runs as the
-/// confined PID-1 inside the sandbox and is launched from a memfd via the
-/// sandbox's `exec_fd` so no on-disk loader path is needed in the chroot.
-const SANDLOCK_INIT: &[u8] = include_bytes!(env!("SANDLOCK_INIT_BIN"));
-
-/// Write the init binary into a memfd; returns the owning fd. The child inherits
-/// it across fork and execs it via `execveat(exec_fd, "", AT_EMPTY_PATH)`.
-fn init_memfd() -> std::io::Result<std::os::fd::OwnedFd> {
-    use std::io::Write;
-    use std::os::fd::FromRawFd;
-    use std::os::unix::io::IntoRawFd;
-    let name = std::ffi::CString::new("sandlock-init").unwrap();
-    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
-    f.write_all(SANDLOCK_INIT)?;
-    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(f.into_raw_fd()) })
-}
 
 /// Demultiplexer for the single control channel to `sandlock-init`.
 ///
@@ -312,10 +291,10 @@ fn pipe_write(fd: i32, line: &str) {
 /// Async body of `run_supervisor`.
 ///
 /// Instead of running the workload directly, this launches a confined
-/// `sandlock-init` (PID-1) from a memfd and relays OCI verbs to it over a
-/// control socket: the workload and any exec'd processes are forked by
-/// `sandlock-init` and so share the one sandbox (seccomp filter + Landlock
-/// ruleset + notify supervisor).
+/// `sandlock-init` (PID-1) that runs in-process in the forked child (no exec)
+/// and relays OCI verbs to it over a control socket: the workload and any
+/// exec'd processes are forked by `sandlock-init` and so share the one sandbox
+/// (seccomp filter + Landlock ruleset + notify supervisor).
 async fn supervisor_main(
     id: &str,
     cmd: &[String],
@@ -336,16 +315,9 @@ async fn supervisor_main(
         }
     };
 
-    // Stage sandlock-init in a memfd and set up the control channel. The child
-    // end is mapped onto CONTROL_FD inside the confined process; the daemon
-    // keeps the other end to drive RunMain/RunExec/Shutdown.
-    let memfd = match init_memfd() {
-        Ok(m) => m,
-        Err(e) => {
-            pipe_write(pid_write_fd, &format!("ERR stage sandlock-init: {}", e));
-            anyhow::bail!("stage sandlock-init: {}", e);
-        }
-    };
+    // Set up the control channel. The child end is mapped onto CONTROL_FD inside
+    // the confined process; the daemon keeps the other end to drive
+    // RunMain/RunExec/Shutdown.
     let (daemon_ctl, child_ctl) = match std::os::unix::net::UnixStream::pair() {
         Ok(p) => p,
         Err(e) => {
@@ -353,29 +325,29 @@ async fn supervisor_main(
             anyhow::bail!("control socketpair: {}", e);
         }
     };
-    sandbox.exec_fd = Some(memfd.as_raw_fd());
     let extra_fds = vec![(CONTROL_FD, child_ctl.as_raw_fd())];
 
     // OCI `create` of the CONFINED sandlock-init: forks the child, installs the
-    // full sandlock policy, maps CONTROL_FD, and parks before execve. argv is
-    // the init's own name; the real workload argv is delivered later by RunMain.
+    // full sandlock policy, maps CONTROL_FD, and parks. The child runs the
+    // in-process `run_init` control loop instead of exec'ing a separate binary:
+    // it is already a fork of this supervisor, so the init code is mapped, and
+    // because nothing is exec'd there is no execve for Landlock to authorize.
     if let Err(e) = sandbox
-        .create_with_gather_io(&["sandlock-init"], None, None, None, extra_fds)
+        .create_with_in_child_main("sandlock-init", extra_fds, crate::init::run_init)
         .await
     {
         pipe_write(pid_write_fd, &format!("ERR create: {}", e));
-        return Err(anyhow::anyhow!("sandbox create_with_gather_io: {}", e));
+        return Err(anyhow::anyhow!("sandbox create_with_in_child_main: {}", e));
     }
     // The child inherited child_ctl at fork and dup'd it onto CONTROL_FD; drop
     // the daemon's copy so it holds only daemon_ctl (and so EOF on daemon_ctl
-    // tracks init exiting). The memfd is kept open until the end of this
-    // function: the child execveat's it at start(), and the parent fd must stay
-    // open until the exec completes.
+    // tracks init exiting).
     drop(child_ctl);
 
-    // Release sandlock-init to execve. It then blocks reading CONTROL_FD for the
-    // first request. This happens at create/supervisor time (not OCI start) so
-    // init is alive to receive RunMain when the OCI `start` arrives.
+    // Release sandlock-init to run its control loop. It then blocks reading
+    // CONTROL_FD for the first request. This happens at create/supervisor time
+    // (not OCI start) so init is alive to receive RunMain when the OCI `start`
+    // arrives.
     if let Err(e) = sandbox.start() {
         pipe_write(pid_write_fd, &format!("ERR start init: {}", e));
         return Err(anyhow::anyhow!("start sandlock-init: {}", e));

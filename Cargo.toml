@@ -5,7 +5,6 @@ members = [
     "crates/sandlock-cli",
     "crates/sandlock-ffi",
     "crates/sandlock-oci",
-    "crates/sandlock-init",
 ]
 
 [workspace.package]

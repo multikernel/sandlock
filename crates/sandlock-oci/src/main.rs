@@ -23,6 +23,7 @@
 //!   compatibility but ignored (no PTY yet).
 
 mod fdpass;
+mod init;
 mod policy;
 mod spec;
 mod state;
