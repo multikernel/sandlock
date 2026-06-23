@@ -34,7 +34,7 @@ enum Command {
         #[command(subcommand)]
         action: ProfileAction,
     },
-    /// Observe a workload and emit a minimal sandlock profile
+    /// Observe a workload and emit a sandlock profile
     Learn(LearnArgs),
 }
 
