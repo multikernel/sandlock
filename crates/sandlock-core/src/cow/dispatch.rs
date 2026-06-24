@@ -150,6 +150,28 @@ fn map_cow_upper_path(cow: &SeccompCowBranch, path: &str) -> String {
 // openat handler
 // ============================================================
 
+/// Open `real_path` confined to its layer root, so a symlink or `..` in the
+/// child-controlled path cannot escape the upper/lower tree (issue #112).
+/// Picks the anchor root by prefix, then defers all resolution to the kernel
+/// via `openat2(RESOLVE_IN_ROOT)`.
+fn open_confined(
+    upper_root: &Path,
+    workdir_root: &Path,
+    real_path: &Path,
+    flags: i32,
+    mode: u32,
+) -> Result<RawFd, i32> {
+    let (root, rel) = if let Ok(rel) = real_path.strip_prefix(upper_root) {
+        (upper_root, rel)
+    } else if let Ok(rel) = real_path.strip_prefix(workdir_root) {
+        (workdir_root, rel)
+    } else {
+        return Err(libc::EACCES);
+    };
+    let rel = rel.to_str().ok_or(libc::EINVAL)?;
+    crate::sys::fs::openat2_in_root(root, rel, flags, mode)
+}
+
 /// Handle openat under workdir: redirect to COW upper/lower.
 /// openat(dirfd, pathname, flags, mode): args[0]=dirfd, args[1]=path, args[2]=flags
 pub(crate) async fn handle_cow_open(
@@ -182,12 +204,14 @@ pub(crate) async fn handle_cow_open(
     let mut path = resolve_at_path_with_virtual(notif, dirfd, &rel_path, virtual_cwd.as_deref());
 
     // Phase 1: determine plan under lock (no heavy I/O)
-    let plan = {
+    let (plan, upper_root, workdir_root) = {
         let mut st = cow_state.lock().await;
         let cow = match st.branch.as_mut() {
             Some(c) => c,
             None => return NotifAction::Continue,
         };
+        let upper_root = cow.upper_dir().to_path_buf();
+        let workdir_root = cow.workdir().to_path_buf();
 
         path = map_cow_upper_path(cow, &path);
         if !cow.matches(&path) {
@@ -206,12 +230,13 @@ pub(crate) async fn handle_cow_open(
             return NotifAction::Continue;
         }
 
-        match cow.prepare_open(&path, flags) {
+        let plan = match cow.prepare_open(&path, flags) {
             Ok(plan) => plan,
             Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
             Err(crate::error::BranchError::Exists) => return NotifAction::Errno(libc::EEXIST),
             Err(_) => return NotifAction::Continue,
-        }
+        };
+        (plan, upper_root, workdir_root)
     };
     // Lock is released here
 
@@ -219,11 +244,13 @@ pub(crate) async fn handle_cow_open(
     let real_path = match plan {
         CowOpenPlan::Skip => return NotifAction::Continue,
         CowOpenPlan::Resolved(p) | CowOpenPlan::UpperReady { upper: p } => p,
-        CowOpenPlan::NeedsCopy { upper, lower, file_size, rel_path: _rel } => {
+        CowOpenPlan::NeedsCopy { upper, lower: _lower, file_size, rel_path } => {
             // Do the potentially-expensive copy on a blocking thread
             let upper_clone = upper.clone();
+            let root = workdir_root.clone();
+            let rel = rel_path.clone();
             let copy_result = tokio::task::spawn_blocking(move || {
-                crate::cow::seccomp::SeccompCowBranch::execute_copy(&upper_clone, &lower)
+                crate::cow::seccomp::SeccompCowBranch::execute_copy(&root, &rel, &upper_clone)
             }).await;
 
             match copy_result {
@@ -244,19 +271,15 @@ pub(crate) async fn handle_cow_open(
     // Strip O_EXCL — the COW layer already verified exclusivity. Keeping it
     // would fail because we may have just copied the file into upper.
     let open_flags = (flags & !(libc::O_EXCL as u64)) as i32;
-    let c_path = match std::ffi::CString::new(real_path.to_str().unwrap_or("")) {
-        Ok(c) => c,
-        Err(_) => return NotifAction::Continue,
-    };
     // Honor the child's requested creation mode (masked to permission bits).
     // Hardcoding 0o666 dropped the execute bits, so a binary copied into the
     // workdir (e.g. `cp /bin/echo m`) landed in upper non-executable and
     // `./m` failed with EACCES. The kernel ignores mode unless O_CREAT is set.
     let create_mode = (mode & 0o7777) as libc::c_uint;
-    let fd = unsafe { libc::open(c_path.as_ptr(), open_flags, create_mode) };
-    if fd < 0 {
-        return NotifAction::Continue;
-    }
+    let fd = match open_confined(&upper_root, &workdir_root, &real_path, open_flags, create_mode) {
+        Ok(fd) => fd,
+        Err(_) => return NotifAction::Continue,
+    };
 
     // Preserve O_CLOEXEC from the original openat flags.
     let newfd_flags = if flags & libc::O_CLOEXEC as u64 != 0 {
@@ -473,13 +496,14 @@ fn cow_copy_rel<'a>(
 /// Returns the upper path on success, or rolls back quota on failure.
 async fn execute_deferred_copy(
     cow_state: &Arc<Mutex<CowState>>,
+    workdir_root: std::path::PathBuf,
+    rel: String,
     upper: std::path::PathBuf,
-    lower: std::path::PathBuf,
     file_size: u64,
 ) -> Option<std::path::PathBuf> {
     let upper_clone = upper.clone();
     let copy_result = tokio::task::spawn_blocking(move || {
-        crate::cow::seccomp::SeccompCowBranch::execute_copy(&upper_clone, &lower)
+        crate::cow::seccomp::SeccompCowBranch::execute_copy(&workdir_root, &rel, &upper_clone)
     }).await;
     match copy_result {
         Ok(Ok(())) => Some(upper),
@@ -514,7 +538,7 @@ pub(crate) async fn handle_cow_write(
     };
 
     // Phase 1: check if we need to pre-copy a file (under lock, no heavy I/O)
-    let copy_plan = {
+    let (copy_plan, copy_workdir, copy_rel) = {
         let mut st = cow_state.lock().await;
         let cow = match st.branch.as_mut() {
             Some(c) => c,
@@ -524,20 +548,21 @@ pub(crate) async fn handle_cow_write(
         op.remap_upper_paths(cow);
         match cow_copy_rel(&op, cow) {
             Some((_match_path, ref rel)) => {
+                let workdir = cow.workdir().to_path_buf();
                 match cow.prepare_copy(rel) {
-                    Ok(plan) => Some(plan),
+                    Ok(plan) => (Some(plan), workdir, rel.clone()),
                     Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
                     Err(_) => return NotifAction::Continue,
                 }
             }
-            None => None,
+            None => (None, std::path::PathBuf::new(), String::new()),
         }
     };
     // Lock is released here
 
     // Phase 2: execute the file copy outside the lock (if needed)
-    if let Some(crate::cow::seccomp::CowCopyPlan::NeedsCopy { upper, lower, file_size }) = copy_plan {
-        if execute_deferred_copy(cow_state, upper, lower, file_size).await.is_none() {
+    if let Some(crate::cow::seccomp::CowCopyPlan::NeedsCopy { upper, lower: _lower, file_size }) = copy_plan {
+        if execute_deferred_copy(cow_state, copy_workdir, copy_rel, upper, file_size).await.is_none() {
             return NotifAction::Continue;
         }
     }
@@ -921,35 +946,40 @@ pub(crate) async fn handle_cow_exec(
     };
     let resolved = resolve_at_path_with_virtual(notif, dirfd, &rel_path, virtual_cwd.as_deref());
 
-    let upper_path = {
+    let (upper_path, upper_root, workdir_root) = {
         let st = cow_state.lock().await;
         let cow = match st.branch.as_ref() {
             Some(c) => c,
             None => return NotifAction::Continue,
         };
+        let upper_root = cow.upper_dir().to_path_buf();
+        let workdir_root = cow.workdir().to_path_buf();
         let path = map_cow_upper_path(cow, &resolved);
         if !cow.has_changes() || !cow.matches(&path) {
             return NotifAction::Continue;
         }
-        match cow.handle_stat(&path) {
+        let real = match cow.handle_stat(&path) {
             // Only redirect when the binary lives in the upper layer.
             Some(real) if real.starts_with(cow.upper_dir()) => real,
             // Lower-layer (unmodified) binary — kernel resolves it fine.
             Some(_) => return NotifAction::Continue,
             // Deleted in the COW layer (or absent) — must not exec the lower file.
             None => return NotifAction::Errno(libc::ENOENT),
-        }
+        };
+        (real, upper_root, workdir_root)
     };
 
     // Open the upper binary and inject the fd into the child.
-    let c_path = match std::ffi::CString::new(upper_path.to_str().unwrap_or("")) {
-        Ok(c) => c,
-        Err(_) => return NotifAction::Continue,
+    let src_fd = match open_confined(
+        &upper_root,
+        &workdir_root,
+        &upper_path,
+        libc::O_RDONLY | libc::O_CLOEXEC,
+        0,
+    ) {
+        Ok(fd) => fd,
+        Err(_) => return NotifAction::Errno(libc::ENOENT),
     };
-    let src_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-    if src_fd < 0 {
-        return NotifAction::Errno(libc::ENOENT);
-    }
 
     let addfd = crate::sys::structs::SeccompNotifAddfd {
         id: notif.id,
@@ -1189,12 +1219,14 @@ pub(crate) async fn handle_cow_chdir(
         virtual_cwd.as_deref(),
     );
 
-    let (abs_path, upper_path) = {
+    let (abs_path, upper_path, upper_root, workdir_root) = {
         let st = cow_state.lock().await;
         let cow = match st.branch.as_ref() {
             Some(c) => c,
             None => return NotifAction::Continue,
         };
+        let upper_root = cow.upper_dir().to_path_buf();
+        let workdir_root = cow.workdir().to_path_buf();
         let abs_path = map_cow_upper_path(cow, &resolved);
         if !cow.matches(&abs_path) {
             return NotifAction::Continue;
@@ -1204,7 +1236,7 @@ pub(crate) async fn handle_cow_chdir(
             None => return NotifAction::Continue,
         };
         let upper_path = cow.upper_dir().join(&rel);
-        (abs_path, upper_path)
+        (abs_path, upper_path, upper_root, workdir_root)
     };
 
     // If the directory exists on the real filesystem, let the kernel handle it.
@@ -1218,16 +1250,16 @@ pub(crate) async fn handle_cow_chdir(
     }
 
     // Open the upper directory and inject fd into the child.
-    let c_path = match std::ffi::CString::new(upper_path.to_str().unwrap_or("")) {
-        Ok(c) => c,
-        Err(_) => return NotifAction::Continue,
+    let src_fd = match open_confined(
+        &upper_root,
+        &workdir_root,
+        &upper_path,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        0,
+    ) {
+        Ok(fd) => fd,
+        Err(_) => return NotifAction::Errno(libc::ENOENT),
     };
-    let src_fd = unsafe {
-        libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
-    };
-    if src_fd < 0 {
-        return NotifAction::Errno(libc::ENOENT);
-    }
 
     let addfd = crate::sys::structs::SeccompNotifAddfd {
         id: notif.id,
@@ -1319,4 +1351,80 @@ pub(crate) async fn handle_cow_getcwd(
         return NotifAction::Continue;
     }
     NotifAction::ReturnValue(write_buf.len() as i64)
+}
+
+#[cfg(test)]
+mod confine_tests {
+    use super::open_confined;
+    use std::os::unix::fs::symlink;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    fn read_fd_path(fd: i32) -> std::path::PathBuf {
+        std::fs::read_link(format!("/proc/self/fd/{}", fd)).unwrap()
+    }
+
+    #[test]
+    fn serves_in_tree_file() {
+        let upper = TempDir::new().unwrap();
+        let lower = TempDir::new().unwrap();
+        std::fs::write(lower.path().join("ok.txt"), "data").unwrap();
+        let real = lower.path().join("ok.txt");
+        match open_confined(upper.path(), lower.path(), &real, libc::O_RDONLY, 0) {
+            Ok(fd) => {
+                assert_eq!(std::fs::read_to_string(format!("/proc/self/fd/{}", fd)).unwrap(), "data");
+                unsafe { libc::close(fd) };
+            }
+            Err(libc::ENOSYS) => {}
+            Err(e) => panic!("unexpected error: {}", e),
+        }
+    }
+
+    #[test]
+    fn blocks_final_component_symlink_escape() {
+        let upper = TempDir::new().unwrap();
+        let lower = TempDir::new().unwrap();
+        // workdir/link -> /etc/passwd
+        symlink("/etc/passwd", lower.path().join("link")).unwrap();
+        let real = lower.path().join("link");
+        match open_confined(upper.path(), lower.path(), &real, libc::O_RDONLY, 0) {
+            // Confined: /etc/passwd resolves under <lower>/etc/passwd, absent.
+            Err(libc::ENOENT) | Err(libc::ENOSYS) => {}
+            Ok(fd) => {
+                let resolved = read_fd_path(fd);
+                unsafe { libc::close(fd) };
+                assert!(resolved.starts_with(lower.path()), "escaped: {:?}", resolved);
+            }
+            Err(e) => panic!("unexpected error: {}", e),
+        }
+    }
+
+    #[test]
+    fn blocks_intermediate_component_symlink_escape() {
+        let upper = TempDir::new().unwrap();
+        let lower = TempDir::new().unwrap();
+        // workdir/evil -> /etc, child opens evil/passwd
+        symlink("/etc", lower.path().join("evil")).unwrap();
+        let real = lower.path().join("evil/passwd");
+        match open_confined(upper.path(), lower.path(), &real, libc::O_RDONLY, 0) {
+            Err(libc::ENOENT) | Err(libc::ENOSYS) => {}
+            Ok(fd) => {
+                let resolved = read_fd_path(fd);
+                unsafe { libc::close(fd) };
+                assert!(resolved.starts_with(lower.path()), "escaped: {:?}", resolved);
+            }
+            Err(e) => panic!("unexpected error: {}", e),
+        }
+    }
+
+    #[test]
+    fn refuses_path_under_neither_root() {
+        let upper = TempDir::new().unwrap();
+        let lower = TempDir::new().unwrap();
+        let real = Path::new("/etc/passwd");
+        assert_eq!(
+            open_confined(upper.path(), lower.path(), real, libc::O_RDONLY, 0),
+            Err(libc::EACCES)
+        );
+    }
 }
