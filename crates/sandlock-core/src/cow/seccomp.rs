@@ -283,6 +283,9 @@ impl SeccompCowBranch {
                 fs::File::create(upper)?;
                 return Ok(());
             }
+            // On a kernel without openat2 (ENOSYS) the copy fails and the caller
+            // rolls back / returns Continue; the child then hits Landlock, which
+            // is the backstop. Do not "fix" this with an unconfined fs::copy.
             Err(e) => return Err(std::io::Error::from_raw_os_error(e)),
         };
 
@@ -795,6 +798,21 @@ impl SeccompCowBranch {
             if entry.file_type().is_dir() {
                 fs::create_dir_all(&dest)
                     .map_err(|e| BranchError::Operation(format!("mkdir: {}", e)))?;
+            } else if entry.file_type().is_symlink() {
+                // Recreate the symlink verbatim. fs::copy would follow it and
+                // read the target outside any root or Landlock (issue #112),
+                // and dereferencing would also lose the link in the workdir.
+                if let Some(parent) = dest.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let target = fs::read_link(entry.path())
+                    .map_err(|e| BranchError::Operation(format!("readlink: {}", e)))?;
+                if dest.exists() || dest.is_symlink() {
+                    let _ = fs::remove_file(&dest);
+                }
+                std::os::unix::fs::symlink(&target, &dest)
+                    .map_err(|e| BranchError::Operation(format!("symlink: {}", e)))?;
+                synced_dirs.insert(dest.parent().unwrap().to_path_buf());
             } else {
                 if let Some(parent) = dest.parent() {
                     let _ = fs::create_dir_all(parent);
@@ -1509,5 +1527,31 @@ mod tests {
             SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         let upper = branch.ensure_cow_copy("existing.txt").unwrap();
         assert_eq!(std::fs::read_to_string(&upper).unwrap(), "hello");
+    }
+
+    #[test]
+    fn commit_does_not_dereference_escaping_symlink() {
+        // A pre-existing workdir symlink with an absolute target gets copied
+        // verbatim into upper by prepare_copy; commit() must recreate it as a
+        // symlink, never read the target's content (issue #112, commit path).
+        let (workdir, storage) = setup_workdir();
+        std::os::unix::fs::symlink("/etc/group", workdir.path().join("secret")).unwrap();
+        let mut branch =
+            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        // Trigger copy-up of the symlink into upper.
+        let upper = branch.ensure_cow_copy("secret").unwrap();
+        assert!(upper.is_symlink(), "precondition: upper holds a verbatim symlink");
+
+        branch.commit().unwrap();
+
+        let committed = workdir.path().join("secret");
+        assert!(
+            committed.is_symlink(),
+            "commit dereferenced the symlink instead of recreating it"
+        );
+        assert_eq!(std::fs::read_link(&committed).unwrap(), std::path::Path::new("/etc/group"));
+        // The workdir entry must not have become a regular file holding the host content.
+        let meta = std::fs::symlink_metadata(&committed).unwrap();
+        assert!(meta.file_type().is_symlink());
     }
 }
