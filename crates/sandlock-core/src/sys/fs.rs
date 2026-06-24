@@ -130,6 +130,11 @@ pub(crate) fn statx_in_root(
     mask: u32,
     buf: &mut [u8],
 ) -> Result<(), i32> {
+    // The kernel writes sizeof(struct statx) = 256 bytes; refuse a short buffer
+    // rather than risk a heap overflow if a future caller passes a smaller one.
+    if buf.len() < 256 {
+        return Err(libc::EINVAL);
+    }
     let follow = (flags & libc::AT_SYMLINK_NOFOLLOW) == 0;
     let fd = opath_in_root(root, path, follow)?;
     // statx the handle itself via AT_EMPTY_PATH; follow/nofollow is already

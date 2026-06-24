@@ -377,10 +377,11 @@ impl SeccompCowBranch {
 
         // O_EXCL: fail if file already exists (in upper or lower)
         if flags & O_CREAT != 0 && flags & O_EXCL != 0 {
-            let upper_file = self.upper.join(&rel);
-            let lower_file = self.workdir.join(&rel);
-            if upper_file.exists() || upper_file.is_symlink()
-                || lower_file.exists() || lower_file.is_symlink()
+            // Confined existence check: a symlinked parent component must not
+            // let this probe follow out of the tree, which would turn O_EXCL
+            // into a host-file existence oracle (issue #112).
+            if crate::sys::fs::statat_in_root(&self.upper, &rel, false).is_ok()
+                || crate::sys::fs::statat_in_root(&self.workdir, &rel, false).is_ok()
             {
                 return Err(BranchError::Exists);
             }
@@ -441,10 +442,11 @@ impl SeccompCowBranch {
 
         // O_EXCL: fail if file already exists
         if flags & O_CREAT != 0 && flags & O_EXCL != 0 {
-            let upper_file = self.upper.join(&rel);
-            let lower_file = self.workdir.join(&rel);
-            if upper_file.exists() || upper_file.is_symlink()
-                || lower_file.exists() || lower_file.is_symlink()
+            // Confined existence check: a symlinked parent component must not
+            // let this probe follow out of the tree, which would turn O_EXCL
+            // into a host-file existence oracle (issue #112).
+            if crate::sys::fs::statat_in_root(&self.upper, &rel, false).is_ok()
+                || crate::sys::fs::statat_in_root(&self.workdir, &rel, false).is_ok()
             {
                 return Err(BranchError::Exists);
             }
@@ -1581,6 +1583,24 @@ mod tests {
         assert_eq!(
             std::fs::read_link(&upper).unwrap(),
             std::path::Path::new("existing.txt")
+        );
+    }
+
+    #[test]
+    fn o_excl_does_not_probe_through_symlinked_parent() {
+        // workdir/evil -> /etc ; open("evil/group", O_CREAT|O_EXCL) must not
+        // report EEXIST based on the host /etc/group: the existence probe is
+        // confined, so it cannot become a host-file oracle (issue #112).
+        let (workdir, storage) = setup_workdir();
+        std::os::unix::fs::symlink("/etc", workdir.path().join("evil")).unwrap();
+        let mut branch =
+            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let wd = workdir.path().canonicalize().unwrap();
+        let path = format!("{}/evil/group", wd.display());
+        let flags = (libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY) as u64;
+        assert!(
+            !matches!(branch.prepare_open(&path, flags), Err(BranchError::Exists)),
+            "O_EXCL followed a symlinked parent into the host /etc/group"
         );
     }
 }
