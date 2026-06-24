@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
 
 use crate::error::BranchError;
@@ -21,6 +21,11 @@ const O_APPEND: u64 = libc::O_APPEND as u64;
 const O_EXCL: u64 = libc::O_EXCL as u64;
 const O_DIRECTORY: u64 = libc::O_DIRECTORY as u64;
 const WRITE_FLAGS: u64 = O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND;
+
+/// Parent of a relative path, or None if it has no parent component.
+fn parent_rel(rel: &str) -> Option<&str> {
+    rel.trim_end_matches('/').rfind('/').map(|i| &rel[..i])
+}
 
 /// Plan for a COW copy — returned by `prepare_copy()` to separate metadata
 /// updates (under lock) from potentially expensive file I/O (outside lock).
@@ -215,9 +220,8 @@ impl SeccompCowBranch {
             return Ok(CowCopyPlan::Ready(upper_file));
         }
 
-        if let Some(parent) = upper_file.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| BranchError::Operation(format!("create parent: {}", e)))?;
+        if let Some(p) = parent_rel(rel_path) {
+            let _ = crate::sys::fs::mkdirp_in_root(&self.upper, p, 0o755);
         }
 
         // Classify the lower entry confined to the workdir root, so a symlinked
@@ -240,7 +244,7 @@ impl SeccompCowBranch {
             let target = crate::sys::fs::readlink_in_root(&self.workdir, rel_path)
                 .map_err(|e| BranchError::Operation(format!("readlink: {}", e)))?;
             let target = std::path::PathBuf::from(std::ffi::OsString::from_vec(target));
-            std::os::unix::fs::symlink(&target, &upper_file)
+            crate::sys::fs::symlinkat_in_root(&self.upper, rel_path, &target.to_string_lossy())
                 .map_err(|e| BranchError::Operation(format!("symlink: {}", e)))?;
             self.disk_used += 256;
             return Ok(CowCopyPlan::Ready(upper_file));
@@ -249,12 +253,9 @@ impl SeccompCowBranch {
         // Directory — create immediately (no data copy)
         if kind == libc::S_IFDIR {
             self.check_quota(4096)?;
-            fs::create_dir_all(&upper_file)
+            crate::sys::fs::mkdirp_in_root(&self.upper, rel_path, st.st_mode & 0o7777)
                 .map_err(|e| BranchError::Operation(format!("create dir: {}", e)))?;
-            let _ = fs::set_permissions(
-                &upper_file,
-                std::fs::Permissions::from_mode(st.st_mode & 0o7777),
-            );
+            let _ = crate::sys::fs::chmod_in_root(&self.upper, rel_path, st.st_mode & 0o7777);
             self.disk_used += 4096;
             return Ok(CowCopyPlan::Ready(upper_file));
         }
@@ -276,14 +277,23 @@ impl SeccompCowBranch {
     /// async dispatch (via `spawn_blocking`).
     pub fn execute_copy(
         workdir_root: &Path,
+        upper_root: &Path,
         rel: &str,
-        upper: &Path,
     ) -> Result<(), std::io::Error> {
-        use std::os::unix::io::FromRawFd;
+        let create_dest = || -> Result<fs::File, std::io::Error> {
+            let fd = crate::sys::fs::openat2_in_root(
+                upper_root,
+                rel,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+            .map_err(std::io::Error::from_raw_os_error)?;
+            Ok(unsafe { fs::File::from_raw_fd(fd) })
+        };
 
         // Read the lower source confined to the workdir root: a symlink or
         // `..` in `rel` cannot escape the tree (issue #112).
-        let fd = match crate::sys::fs::openat2_in_root(
+        let src_fd = match crate::sys::fs::openat2_in_root(
             workdir_root,
             rel,
             libc::O_RDONLY | libc::O_CLOEXEC,
@@ -294,7 +304,7 @@ impl SeccompCowBranch {
             // child an empty COW file so writes proceed, never leaking the
             // escape target.
             Err(libc::EACCES) | Err(libc::ENOENT) => {
-                fs::File::create(upper)?;
+                create_dest()?;
                 return Ok(());
             }
             // On a kernel without openat2 (ENOSYS) the copy fails and the caller
@@ -303,11 +313,11 @@ impl SeccompCowBranch {
             Err(e) => return Err(std::io::Error::from_raw_os_error(e)),
         };
 
-        let mut src = unsafe { fs::File::from_raw_fd(fd) };
-        let mut dst = fs::File::create(upper)?;
+        let mut src = unsafe { fs::File::from_raw_fd(src_fd) };
+        let mut dst = create_dest()?;
         std::io::copy(&mut src, &mut dst)?;
         if let Ok(meta) = src.metadata() {
-            let _ = fs::set_permissions(upper, meta.permissions());
+            let _ = dst.set_permissions(meta.permissions());
         }
         Ok(())
     }
@@ -318,7 +328,7 @@ impl SeccompCowBranch {
         match self.prepare_copy(rel_path)? {
             CowCopyPlan::Ready(upper) => Ok(upper),
             CowCopyPlan::NeedsCopy { upper, lower: _lower, file_size } => {
-                match Self::execute_copy(&self.workdir, rel_path, &upper) {
+                match Self::execute_copy(&self.workdir, &self.upper, rel_path) {
                     Ok(()) => Ok(upper),
                     Err(e) => {
                         self.rollback_copy(file_size);
@@ -522,9 +532,9 @@ impl SeccompCowBranch {
 
         if upper_file.exists() || upper_file.is_symlink() {
             if is_dir {
-                let _ = fs::remove_dir_all(&upper_file);
+                let _ = crate::sys::fs::remove_dir_all_in_root(&self.upper, &rel);
             } else {
-                let _ = fs::remove_file(&upper_file);
+                let _ = crate::sys::fs::unlinkat_in_root(&self.upper, &rel, false);
             }
             self.recalc_disk_used();
         }
@@ -548,8 +558,7 @@ impl SeccompCowBranch {
         self.check_quota(4096)?; // directory metadata
         self.deleted.remove(&rel);
         self.has_changes = true;
-        let upper_dir = self.upper.join(&rel);
-        let ok = fs::create_dir_all(&upper_dir).is_ok();
+        let ok = crate::sys::fs::mkdirp_in_root(&self.upper, &rel, 0o755).is_ok();
         if ok {
             self.disk_used += 4096;
         }
@@ -568,12 +577,11 @@ impl SeccompCowBranch {
             Some(r) => r,
             None => return Ok(false),
         };
-        let old_upper = self.ensure_cow_copy(&old_rel)?;
-        let new_upper = self.upper.join(&new_rel);
-        if let Some(parent) = new_upper.parent() {
-            let _ = fs::create_dir_all(parent);
+        let _old_upper = self.ensure_cow_copy(&old_rel)?;
+        if let Some(p) = parent_rel(&new_rel) {
+            let _ = crate::sys::fs::mkdirp_in_root(&self.upper, p, 0o755);
         }
-        if fs::rename(&old_upper, &new_upper).is_err() {
+        if crate::sys::fs::renameat_in_root(&self.upper, &old_rel, &new_rel).is_err() {
             return Ok(false);
         }
         let lower_old = self.workdir.join(&old_rel);
@@ -611,11 +619,10 @@ impl SeccompCowBranch {
         self.check_quota(256)?;
         self.deleted.remove(&rel);
         self.has_changes = true;
-        let upper_link = self.upper.join(&rel);
-        if let Some(parent) = upper_link.parent() {
-            let _ = fs::create_dir_all(parent);
+        if let Some(p) = parent_rel(&rel) {
+            let _ = crate::sys::fs::mkdirp_in_root(&self.upper, p, 0o755);
         }
-        let ok = std::os::unix::fs::symlink(target, &upper_link).is_ok();
+        let ok = crate::sys::fs::symlinkat_in_root(&self.upper, &rel, target).is_ok();
         if ok {
             self.disk_used += 256;
         }
@@ -634,12 +641,11 @@ impl SeccompCowBranch {
             Some(r) => r,
             None => return Ok(false),
         };
-        let old_upper = self.ensure_cow_copy(&old_rel)?;
-        let new_upper = self.upper.join(&new_rel);
-        if let Some(parent) = new_upper.parent() {
-            let _ = fs::create_dir_all(parent);
+        let _ = self.ensure_cow_copy(&old_rel)?;
+        if let Some(p) = parent_rel(&new_rel) {
+            let _ = crate::sys::fs::mkdirp_in_root(&self.upper, p, 0o755);
         }
-        Ok(fs::hard_link(&old_upper, &new_upper).is_ok())
+        Ok(crate::sys::fs::linkat_in_root(&self.upper, &old_rel, &new_rel).is_ok())
     }
 
     /// Handle fchmodat.
@@ -650,9 +656,8 @@ impl SeccompCowBranch {
             Some(r) => r,
             None => return Ok(false),
         };
-        let upper = self.ensure_cow_copy(&rel)?;
-        use std::os::unix::fs::PermissionsExt;
-        Ok(fs::set_permissions(&upper, fs::Permissions::from_mode(mode)).is_ok())
+        let _ = self.ensure_cow_copy(&rel)?;
+        Ok(crate::sys::fs::chmod_in_root(&self.upper, &rel, mode).is_ok())
     }
 
     /// Handle fchownat.
@@ -663,14 +668,11 @@ impl SeccompCowBranch {
             Some(r) => r,
             None => return Ok(false),
         };
-        let upper = self.ensure_cow_copy(&rel)?;
+        let _ = self.ensure_cow_copy(&rel)?;
         // Best-effort: try the real chown but succeed either way — the
         // supervisor typically lacks CAP_CHOWN so this will fail, but
         // in COW/dry-run mode the ownership doesn't matter.
-        unsafe {
-            let c_path = std::ffi::CString::new(upper.to_str().unwrap_or("")).unwrap();
-            libc::chown(c_path.as_ptr(), uid, gid);
-        }
+        let _ = crate::sys::fs::chown_in_root(&self.upper, &rel, uid, gid);
         Ok(true)
     }
 
@@ -683,16 +685,22 @@ impl SeccompCowBranch {
             None => return Ok(false),
         };
         let new_len = length as u64;
-        let upper = self.ensure_cow_copy(&rel)?;
-        let old_len = upper.metadata().map(|m| m.len()).unwrap_or(0);
+        let _ = self.ensure_cow_copy(&rel)?;
+        let old_len = crate::sys::fs::statat_in_root(&self.upper, &rel, true)
+            .map(|st| st.st_size as u64)
+            .unwrap_or(0);
         if new_len > old_len {
             self.check_quota(new_len - old_len)?;
         }
-        let file = match fs::OpenOptions::new().write(true).open(&upper) {
-            Ok(f) => f,
+        let fd = match crate::sys::fs::openat2_in_root(
+            &self.upper, &rel,
+            libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0,
+        ) {
+            Ok(fd) => fd,
             Err(_) => return Ok(false),
         };
-        let ok = file.set_len(new_len).is_ok();
+        let ok = unsafe { libc::ftruncate(fd, new_len as libc::off_t) } == 0;
+        unsafe { libc::close(fd) };
         if ok {
             if new_len > old_len {
                 self.disk_used += new_len - old_len;
@@ -798,9 +806,9 @@ impl SeccompCowBranch {
         for rel_path in &self.deleted {
             let dest = self.workdir.join(rel_path);
             if dest.is_dir() {
-                let _ = fs::remove_dir_all(&dest);
+                let _ = crate::sys::fs::remove_dir_all_in_root(&self.workdir, rel_path);
             } else if dest.exists() || dest.is_symlink() {
-                let _ = fs::remove_file(&dest);
+                let _ = crate::sys::fs::unlinkat_in_root(&self.workdir, rel_path, false);
             }
         }
 
@@ -809,30 +817,47 @@ impl SeccompCowBranch {
         for entry in walkdir::WalkDir::new(&self.upper).min_depth(1) {
             let entry = entry.map_err(|e| BranchError::Operation(format!("walk: {}", e)))?;
             let rel = entry.path().strip_prefix(&self.upper).unwrap();
+            let rel_str = match rel.to_str() {
+                Some(s) => s,
+                None => continue,
+            };
             let dest = self.workdir.join(rel);
             if entry.file_type().is_dir() {
-                fs::create_dir_all(&dest)
+                crate::sys::fs::mkdirp_in_root(&self.workdir, rel_str, 0o755)
                     .map_err(|e| BranchError::Operation(format!("mkdir: {}", e)))?;
             } else if entry.file_type().is_symlink() {
                 // Recreate the symlink verbatim. fs::copy would follow it and
                 // read the target outside any root or Landlock (issue #112),
                 // and dereferencing would also lose the link in the workdir.
-                if let Some(parent) = dest.parent() {
-                    let _ = fs::create_dir_all(parent);
+                if let Some(p) = parent_rel(rel_str) {
+                    let _ = crate::sys::fs::mkdirp_in_root(&self.workdir, p, 0o755);
                 }
                 let target = fs::read_link(entry.path())
                     .map_err(|e| BranchError::Operation(format!("readlink: {}", e)))?;
-                if dest.exists() || dest.is_symlink() {
-                    let _ = fs::remove_file(&dest);
-                }
-                std::os::unix::fs::symlink(&target, &dest)
-                    .map_err(|e| BranchError::Operation(format!("symlink: {}", e)))?;
+                let _ = crate::sys::fs::unlinkat_in_root(&self.workdir, rel_str, false);
+                crate::sys::fs::symlinkat_in_root(
+                    &self.workdir,
+                    rel_str,
+                    &target.to_string_lossy(),
+                )
+                .map_err(|e| BranchError::Operation(format!("symlink: {}", e)))?;
                 synced_dirs.insert(dest.parent().unwrap().to_path_buf());
             } else {
-                if let Some(parent) = dest.parent() {
-                    let _ = fs::create_dir_all(parent);
+                if let Some(p) = parent_rel(rel_str) {
+                    let _ = crate::sys::fs::mkdirp_in_root(&self.workdir, p, 0o755);
                 }
-                fs::copy(entry.path(), &dest)
+                // Source is the upper entry (supervisor-owned real path, safe to read directly).
+                let mut src = fs::File::open(entry.path())
+                    .map_err(|e| BranchError::Operation(format!("copy: {}", e)))?;
+                let dst_fd = crate::sys::fs::openat2_in_root(
+                    &self.workdir,
+                    rel_str,
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    0o644,
+                )
+                .map_err(|e| BranchError::Operation(format!("copy: {}", e)))?;
+                let mut dst = unsafe { fs::File::from_raw_fd(dst_fd) };
+                std::io::copy(&mut src, &mut dst)
                     .map_err(|e| BranchError::Operation(format!("copy: {}", e)))?;
                 synced_dirs.insert(dest.parent().unwrap().to_path_buf());
             }
@@ -1601,6 +1626,37 @@ mod tests {
         assert!(
             !matches!(branch.prepare_open(&path, flags), Err(BranchError::Exists)),
             "O_EXCL followed a symlinked parent into the host /etc/group"
+        );
+    }
+
+    #[test]
+    fn upper_write_does_not_escape_through_symlink() {
+        // workdir/evil -> /etc (absolute symlink). Copy it up verbatim into
+        // upper so upper/evil is also an absolute symlink. Then invoke
+        // handle_mkdir with a path that would go through that symlink.
+        // The confined mkdirp_in_root must clamp the walk to the upper root
+        // and never create /etc/sandlock_escape_dir on the host.
+        let (workdir, storage) = setup_workdir();
+        std::os::unix::fs::symlink("/etc", workdir.path().join("evil")).unwrap();
+        let mut branch =
+            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+
+        // Copy up the symlink so upper/evil -> /etc verbatim.
+        branch.ensure_cow_copy("evil").unwrap();
+        assert!(
+            branch.upper_dir().join("evil").is_symlink(),
+            "precondition: upper/evil must be a verbatim symlink"
+        );
+
+        // Attempt to mkdir via the symlinked parent component.
+        let wd = workdir.path().canonicalize().unwrap();
+        let escape_path = format!("{}/evil/sandlock_escape_dir", wd.display());
+        let _ = branch.handle_mkdir(&escape_path);
+
+        // The confined write must not have escaped.
+        assert!(
+            !std::path::Path::new("/etc/sandlock_escape_dir").exists(),
+            "upper write escaped through symlinked parent into /etc"
         );
     }
 }

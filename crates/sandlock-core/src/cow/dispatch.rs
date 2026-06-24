@@ -259,11 +259,11 @@ pub(crate) async fn handle_cow_open(
         CowOpenPlan::Resolved(p) | CowOpenPlan::UpperReady { upper: p } => p,
         CowOpenPlan::NeedsCopy { upper, lower: _lower, file_size, rel_path } => {
             // Do the potentially-expensive copy on a blocking thread
-            let upper_clone = upper.clone();
             let root = workdir_root.clone();
+            let uroot = upper_root.clone();
             let rel = rel_path.clone();
             let copy_result = tokio::task::spawn_blocking(move || {
-                crate::cow::seccomp::SeccompCowBranch::execute_copy(&root, &rel, &upper_clone)
+                crate::cow::seccomp::SeccompCowBranch::execute_copy(&root, &uroot, &rel)
             }).await;
 
             match copy_result {
@@ -510,13 +510,13 @@ fn cow_copy_rel<'a>(
 async fn execute_deferred_copy(
     cow_state: &Arc<Mutex<CowState>>,
     workdir_root: std::path::PathBuf,
+    upper_root: std::path::PathBuf,
     rel: String,
     upper: std::path::PathBuf,
     file_size: u64,
 ) -> Option<std::path::PathBuf> {
-    let upper_clone = upper.clone();
     let copy_result = tokio::task::spawn_blocking(move || {
-        crate::cow::seccomp::SeccompCowBranch::execute_copy(&workdir_root, &rel, &upper_clone)
+        crate::cow::seccomp::SeccompCowBranch::execute_copy(&workdir_root, &upper_root, &rel)
     }).await;
     match copy_result {
         Ok(Ok(())) => Some(upper),
@@ -575,7 +575,17 @@ pub(crate) async fn handle_cow_write(
 
     // Phase 2: execute the file copy outside the lock (if needed)
     if let Some(crate::cow::seccomp::CowCopyPlan::NeedsCopy { upper, lower: _lower, file_size }) = copy_plan {
-        if execute_deferred_copy(cow_state, copy_workdir, copy_rel, upper, file_size).await.is_none() {
+        // copy_workdir is workdir_root; we need upper_root for the dest side.
+        // Re-acquire it briefly: execute_deferred_copy needs both roots.
+        let uroot = {
+            let st = cow_state.lock().await;
+            st.branch.as_ref().map(|c| c.upper_dir().to_path_buf())
+        };
+        let uroot = match uroot {
+            Some(p) => p,
+            None => return NotifAction::Continue,
+        };
+        if execute_deferred_copy(cow_state, copy_workdir, uroot, copy_rel, upper, file_size).await.is_none() {
             return NotifAction::Continue;
         }
     }
