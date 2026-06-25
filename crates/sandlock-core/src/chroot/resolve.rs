@@ -1,6 +1,6 @@
-use std::ffi::CString;
-use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
+
+use crate::sys::fs::openat2_in_root;
 
 /// Collapse `..` components clamping at `/` (pivot_root semantics).
 /// Always returns an absolute path under `/`.
@@ -34,86 +34,6 @@ pub fn to_virtual_path(chroot_root: &Path, host_path: &Path) -> Option<PathBuf> 
         .strip_prefix(chroot_root)
         .ok()
         .map(|rel| PathBuf::from("/").join(rel))
-}
-
-// ============================================================
-// openat2(RESOLVE_IN_ROOT) based resolution
-// ============================================================
-
-/// openat2 syscall number, sourced from the `syscalls` crate via `arch`.
-const SYS_OPENAT2: libc::c_long = crate::arch::SYS_OPENAT2;
-
-/// RESOLVE_IN_ROOT — treat the dirfd as the filesystem root for resolution.
-const RESOLVE_IN_ROOT: u64 = 0x10;
-
-/// Kernel `struct open_how` for openat2().
-#[repr(C)]
-struct OpenHow {
-    flags: u64,
-    mode: u64,
-    resolve: u64,
-}
-
-fn last_errno(fallback: i32) -> i32 {
-    std::io::Error::last_os_error()
-        .raw_os_error()
-        .unwrap_or(fallback)
-}
-
-/// Open a path confined within `chroot_root` using `openat2(RESOLVE_IN_ROOT)`.
-///
-/// The kernel handles symlink resolution, `..` traversal, and prevents
-/// escapes above the root — eliminating TOCTOU races and edge cases
-/// inherent in userspace path walking.
-pub fn openat2_in_root(
-    chroot_root: &Path,
-    path: &str,
-    flags: i32,
-    mode: u32,
-) -> Result<RawFd, i32> {
-    let c_root =
-        CString::new(chroot_root.to_str().unwrap_or("")).map_err(|_| libc::EINVAL)?;
-    let root_fd = unsafe {
-        libc::open(
-            c_root.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
-    if root_fd < 0 {
-        return Err(last_errno(libc::EIO));
-    }
-
-    let rel_path = path.strip_prefix('/').unwrap_or(path);
-    // Empty path means the root itself — use "."
-    let rel_path = if rel_path.is_empty() { "." } else { rel_path };
-    let c_path = CString::new(rel_path).map_err(|_| {
-        unsafe { libc::close(root_fd) };
-        libc::EINVAL
-    })?;
-
-    let how = OpenHow {
-        flags: flags as u64,
-        mode: mode as u64,
-        resolve: RESOLVE_IN_ROOT,
-    };
-
-    let fd = unsafe {
-        libc::syscall(
-            SYS_OPENAT2,
-            root_fd,
-            c_path.as_ptr(),
-            &how as *const OpenHow,
-            std::mem::size_of::<OpenHow>(),
-        )
-    } as i32;
-
-    unsafe { libc::close(root_fd) };
-
-    if fd < 0 {
-        Err(last_errno(libc::ENOENT))
-    } else {
-        Ok(fd)
-    }
 }
 
 /// Resolve a virtual path within the chroot using `openat2(RESOLVE_IN_ROOT)`.

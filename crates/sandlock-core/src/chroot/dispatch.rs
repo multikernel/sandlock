@@ -47,7 +47,8 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::chroot::resolve::{confine, openat2_in_root, resolve_existing_in_root, resolve_in_root, to_virtual_path};
+use crate::chroot::resolve::{confine, resolve_existing_in_root, resolve_in_root, to_virtual_path};
+use crate::sys::fs::openat2_in_root;
 use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction};
 use crate::seccomp::state::{ChrootState, CowState};
 use crate::sys::structs::{SeccompNotif, SeccompNotifAddfd, SECCOMP_IOCTL_NOTIF_ADDFD};
