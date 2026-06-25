@@ -1558,3 +1558,59 @@ async fn test_deny_carveout_on_behalf_open_preserves_io() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn test_deny_openat2_does_not_bypass() {
+    // Issue #111 follow-up: openat2 must be trapped and subject to the deny
+    // just like openat. A program calling openat2 directly (glibc normally
+    // does not) must not escape a deny carve-out, and openat2 of an allowed
+    // sibling must still work. SYS_openat2 = 437 (x86_64 test host).
+    let dir = temp_file("deny-openat2-dir");
+    let _ = std::fs::create_dir_all(&dir);
+    let ok = dir.join("ok.txt");
+    let secret = dir.join("secret.txt");
+    std::fs::write(&ok, "ok-data").unwrap();
+    std::fs::write(&secret, "secret-data").unwrap();
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_read(dir.to_str().unwrap())
+        .fs_deny(secret.to_str().unwrap())
+        .fs_write("/tmp")
+        .build()
+        .unwrap();
+
+    // raw openat2(AT_FDCWD, path, &open_how{O_RDONLY,0,0}, 24)
+    let script = format!(
+        "import ctypes, struct, sys\n\
+         libc = ctypes.CDLL(None, use_errno=True)\n\
+         def openat2(p):\n\
+         \x20   how = struct.pack('QQQ', 0, 0, 0)\n\
+         \x20   buf = ctypes.create_string_buffer(how, len(how))\n\
+         \x20   return libc.syscall(437, -100, ctypes.c_char_p(p.encode()), buf, ctypes.c_size_t(len(how)))\n\
+         secret = openat2('{}')\n\
+         allowed = openat2('{}')\n\
+         sys.exit(0 if (secret < 0 and allowed >= 0) else 1)\n",
+        secret.display(),
+        ok.display(),
+    );
+
+    let r = policy
+        .clone()
+        .with_name("t")
+        .run(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(
+        r.success(),
+        "openat2 must be denied for the carve-out and allowed for the sibling"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

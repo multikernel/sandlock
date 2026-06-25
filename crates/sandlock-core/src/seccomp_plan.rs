@@ -234,6 +234,7 @@ fn chroot_path_syscalls() -> Vec<i64> {
 fn fs_denied_path_syscalls() -> Vec<i64> {
     let mut v = vec![
         libc::SYS_openat,
+        arch::SYS_OPENAT2,
         libc::SYS_execve,
         libc::SYS_execveat,
         libc::SYS_linkat,
@@ -255,6 +256,7 @@ fn fs_denied_path_syscalls() -> Vec<i64> {
 
 const POLICY_EVENT_SYSCALLS: &[i64] = &[
     libc::SYS_openat,
+    arch::SYS_OPENAT2,
     libc::SYS_connect,
     libc::SYS_sendto,
     libc::SYS_bind,

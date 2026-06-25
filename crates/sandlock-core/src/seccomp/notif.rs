@@ -470,21 +470,48 @@ fn deny_open_verdict(
     if allowed { None } else { Some(libc::EACCES) }
 }
 
-/// openat/open argument layout, normalized across the two spellings.
+/// open/openat/openat2 argument layout, normalized across the spellings.
 struct OpenArgs {
     dirfd: i64,
     path_ptr: u64,
     flags: u64,
     mode: u64,
+    /// `openat2` `resolve` flags (`RESOLVE_*`); 0 for `open`/`openat`.
+    resolve: u64,
 }
 
-fn decode_open_args(notif: &SeccompNotif) -> OpenArgs {
+/// Decode the open arguments. `openat2` carries flags/mode/resolve inside a
+/// `struct open_how` in child memory, so its decode reads child memory and
+/// can fail; `None` means "could not decode" and the caller soft-falls-through
+/// (the kernel's own re-read fails the same way).
+fn decode_open_args(notif: &SeccompNotif, notif_fd: RawFd) -> Option<OpenArgs> {
     let a = &notif.data.args;
-    if notif.data.nr as i64 == libc::SYS_openat {
-        OpenArgs { dirfd: a[0] as i64, path_ptr: a[1], flags: a[2], mode: a[3] }
+    let nr = notif.data.nr as i64;
+    if nr == libc::SYS_openat {
+        Some(OpenArgs { dirfd: a[0] as i64, path_ptr: a[1], flags: a[2], mode: a[3], resolve: 0 })
+    } else if nr == arch::SYS_OPENAT2 {
+        // openat2(dirfd, pathname, struct open_how *how, size_t size),
+        // open_how = { u64 flags, u64 mode, u64 resolve }.
+        let how_ptr = a[2];
+        let want = (a[3] as usize).min(std::mem::size_of::<OpenHow>());
+        if how_ptr == 0 || want < 16 {
+            return None; // need at least flags + mode
+        }
+        let bytes = read_child_mem(notif_fd, notif.id, notif.pid, how_ptr, want).ok()?;
+        if bytes.len() < 16 {
+            return None;
+        }
+        let flags = u64::from_ne_bytes(bytes[0..8].try_into().ok()?);
+        let mode = u64::from_ne_bytes(bytes[8..16].try_into().ok()?);
+        let resolve = if bytes.len() >= 24 {
+            u64::from_ne_bytes(bytes[16..24].try_into().ok()?)
+        } else {
+            0
+        };
+        Some(OpenArgs { dirfd: a[0] as i64, path_ptr: a[1], flags, mode, resolve })
     } else {
         // legacy open(path, flags, mode) — AT_FDCWD implied.
-        OpenArgs { dirfd: libc::AT_FDCWD as i64, path_ptr: a[0], flags: a[1], mode: a[2] }
+        Some(OpenArgs { dirfd: libc::AT_FDCWD as i64, path_ptr: a[0], flags: a[1], mode: a[2], resolve: 0 })
     }
 }
 
@@ -543,6 +570,7 @@ fn create_new_on_behalf(
     path: &str,
     flags: u64,
     mode: u64,
+    resolve: u64,
     policy: &NotifPolicy,
     pfs: &super::state::PolicyFnState,
 ) -> NotifAction {
@@ -565,7 +593,7 @@ fn create_new_on_behalf(
         &c_parent,
         (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
         0,
-        RESOLVE_NO_MAGICLINKS,
+        RESOLVE_NO_MAGICLINKS | resolve,
     ) {
         Ok(f) => f,
         Err(e) => return NotifAction::Errno(e),
@@ -605,7 +633,11 @@ fn on_behalf_open_for_deny(
         return NotifAction::Continue;
     }
 
-    let OpenArgs { dirfd, path_ptr, flags, mode } = decode_open_args(notif);
+    let OpenArgs { dirfd, path_ptr, flags, mode, resolve } =
+        match decode_open_args(notif, notif_fd) {
+            Some(a) => a,
+            None => return NotifAction::Continue, // kernel's re-read fails the same way
+        };
 
     let path = match read_child_cstr(notif_fd, notif.id, notif.pid, path_ptr, 4096) {
         Some(p) => p,
@@ -621,12 +653,12 @@ fn on_behalf_open_for_deny(
     };
 
     // Side-effect-free probe; mirror the child's no-follow intent for the
-    // final component.
+    // final component and any `openat2` RESOLVE_* flags it requested.
     let probe_flags = (libc::O_PATH | libc::O_CLOEXEC) as u64 | (flags & libc::O_NOFOLLOW as u64);
-    match openat2_at(base.as_raw_fd(), &c_path, probe_flags, 0, RESOLVE_NO_MAGICLINKS) {
+    match openat2_at(base.as_raw_fd(), &c_path, probe_flags, 0, RESOLVE_NO_MAGICLINKS | resolve) {
         Ok(probe) => reopen_existing_on_behalf(probe, flags, policy, pfs),
         Err(errno) if errno == libc::ENOENT && (flags & libc::O_CREAT as u64) != 0 => {
-            create_new_on_behalf(&base, &path, flags, mode, policy, pfs)
+            create_new_on_behalf(&base, &path, flags, mode, resolve, policy, pfs)
         }
         Err(errno) => NotifAction::Errno(errno),
     }
@@ -1255,8 +1287,9 @@ fn resolve_at_path_for_event(notif: &SeccompNotif, dirfd: i64, path: &str) -> Op
 fn resolve_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Option<String> {
     let nr = notif.data.nr as i64;
     match nr {
-        n if n == libc::SYS_openat => {
-            // openat(dirfd, pathname, flags, mode)
+        n if n == libc::SYS_openat || n == arch::SYS_OPENAT2 => {
+            // openat(dirfd, pathname, flags, mode) and
+            // openat2(dirfd, pathname, how, size) share (dirfd, pathname).
             let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
             resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
         }
@@ -1588,7 +1621,7 @@ async fn handle_notification(
     let mut action = {
         let nr = notif.data.nr as i64;
         let mut path_check_nrs = vec![
-            libc::SYS_openat, libc::SYS_execve, libc::SYS_execveat,
+            libc::SYS_openat, arch::SYS_OPENAT2, libc::SYS_execve, libc::SYS_execveat,
             libc::SYS_linkat, libc::SYS_renameat2, libc::SYS_symlinkat,
         ];
         path_check_nrs.extend([
@@ -1614,8 +1647,9 @@ async fn handle_notification(
                 // inode and inject the fd so the kernel never re-resolves.
                 // Other path syscalls keep the best-effort precheck above
                 // (documented follow-up — they return no fd to inject).
-                let is_openat_family =
-                    nr == libc::SYS_openat || Some(nr) == arch::sys_open();
+                let is_openat_family = nr == libc::SYS_openat
+                    || nr == arch::SYS_OPENAT2
+                    || Some(nr) == arch::sys_open();
                 if matches!(action, NotifAction::Continue) && is_openat_family && has_denied {
                     let pfs = ctx.policy_fn.lock().await;
                     on_behalf_open_for_deny(&notif, policy, &pfs, fd)
