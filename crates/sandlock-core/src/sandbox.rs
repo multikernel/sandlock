@@ -1659,10 +1659,10 @@ impl Sandbox {
 
             let mut policy_fn_state = PolicyFnState::new();
 
-            if let Ok(mut denied) = policy_fn_state.denied_paths.write() {
-                for path in &self.fs_denied {
-                    denied.insert(path.to_string_lossy().into_owned());
-                }
+            for path in &self.fs_denied {
+                // Captures the path prefix and the file's inode identity, so
+                // the deny survives hardlinks/renames to a non-denied name.
+                policy_fn_state.denied.deny(&path.to_string_lossy());
             }
 
             if let Some(ref callback) = self.policy_fn {
@@ -1687,11 +1687,11 @@ impl Sandbox {
                 };
                 let ceiling = live.clone();
                 let live = std::sync::Arc::new(std::sync::RwLock::new(live));
-                let denied_paths = policy_fn_state.denied_paths.clone();
+                let denied = policy_fn_state.denied.clone();
                 let pid_overrides = net_state.pid_ip_overrides.clone();
                 policy_fn_state.live_policy = Some(live.clone());
                 let tx = crate::policy_fn::spawn_policy_fn(
-                    callback.clone(), live, ceiling, pid_overrides, denied_paths,
+                    callback.clone(), live, ceiling, pid_overrides, denied,
                 );
                 policy_fn_state.event_tx = Some(tx);
             }

@@ -147,7 +147,7 @@ pub struct PolicyContext {
     ceiling: LivePolicy,
     restricted: HashSet<&'static str>,
     pid_overrides: Arc<RwLock<HashMap<u32, HashSet<IpAddr>>>>,
-    denied_paths: Arc<RwLock<HashSet<String>>>,
+    denied: Arc<crate::seccomp::state::DeniedSet>,
 }
 
 impl PolicyContext {
@@ -155,14 +155,14 @@ impl PolicyContext {
         live: Arc<RwLock<LivePolicy>>,
         ceiling: LivePolicy,
         pid_overrides: Arc<RwLock<HashMap<u32, HashSet<IpAddr>>>>,
-        denied_paths: Arc<RwLock<HashSet<String>>>,
+        denied: Arc<crate::seccomp::state::DeniedSet>,
     ) -> Self {
         Self {
             live,
             ceiling,
             restricted: HashSet::new(),
             pid_overrides,
-            denied_paths,
+            denied,
         }
     }
 
@@ -246,16 +246,16 @@ impl PolicyContext {
     // ---- Filesystem restriction ----
 
     /// Deny access to a path (and all children). Checked by the supervisor
-    /// on openat/stat/access syscalls. Takes effect immediately.
+    /// on openat/stat/access syscalls. Takes effect immediately. The file's
+    /// inode identity is captured too, so the deny survives hardlinks and
+    /// renames to a non-denied name.
     pub fn deny_path(&self, path: &str) {
-        let mut denied = self.denied_paths.write().unwrap();
-        denied.insert(path.to_string());
+        self.denied.deny(path);
     }
 
     /// Remove a previously denied path.
     pub fn allow_path(&self, path: &str) {
-        let mut denied = self.denied_paths.write().unwrap();
-        denied.remove(path);
+        self.denied.allow(path);
     }
 
     // ---- Internal ----
@@ -337,14 +337,14 @@ pub(crate) fn spawn_policy_fn(
     live: Arc<RwLock<LivePolicy>>,
     ceiling: LivePolicy,
     pid_overrides: Arc<RwLock<HashMap<u32, HashSet<IpAddr>>>>,
-    denied_paths: Arc<RwLock<HashSet<String>>>,
+    denied: Arc<crate::seccomp::state::DeniedSet>,
 ) -> tokio::sync::mpsc::UnboundedSender<PolicyEvent> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PolicyEvent>();
 
     std::thread::Builder::new()
         .name("sandlock-policy-fn".to_string())
         .spawn(move || {
-            let mut ctx = PolicyContext::new(live, ceiling, pid_overrides, denied_paths);
+            let mut ctx = PolicyContext::new(live, ceiling, pid_overrides, denied);
 
             while let Some(pe) = rx.blocking_recv() {
                 let verdict = callback(pe.event, &mut ctx);
@@ -389,8 +389,8 @@ mod tests {
         }));
         let ceiling = test_live();
         let pid_overrides = Arc::new(RwLock::new(HashMap::new()));
-        let denied_paths = Arc::new(RwLock::new(HashSet::new()));
-        let mut ctx = PolicyContext::new(live.clone(), ceiling, pid_overrides, denied_paths);
+        let denied = Arc::new(crate::seccomp::state::DeniedSet::default());
+        let mut ctx = PolicyContext::new(live.clone(), ceiling, pid_overrides, denied);
 
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
         ctx.grant_network(&[ip]).unwrap();
@@ -406,8 +406,8 @@ mod tests {
         }));
         let ceiling = test_live();
         let pid_overrides = Arc::new(RwLock::new(HashMap::new()));
-        let denied_paths = Arc::new(RwLock::new(HashSet::new()));
-        let mut ctx = PolicyContext::new(live.clone(), ceiling, pid_overrides, denied_paths);
+        let denied = Arc::new(crate::seccomp::state::DeniedSet::default());
+        let mut ctx = PolicyContext::new(live.clone(), ceiling, pid_overrides, denied);
 
         // Try to grant an IP not in ceiling — should be silently ignored
         let foreign: IpAddr = "8.8.8.8".parse().unwrap();
@@ -420,8 +420,8 @@ mod tests {
         let live = Arc::new(RwLock::new(test_live()));
         let ceiling = test_live();
         let pid_overrides = Arc::new(RwLock::new(HashMap::new()));
-        let denied_paths = Arc::new(RwLock::new(HashSet::new()));
-        let mut ctx = PolicyContext::new(live, ceiling, pid_overrides, denied_paths);
+        let denied = Arc::new(crate::seccomp::state::DeniedSet::default());
+        let mut ctx = PolicyContext::new(live, ceiling, pid_overrides, denied);
 
         ctx.restrict_network(&[]);
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
@@ -433,8 +433,8 @@ mod tests {
         let live = Arc::new(RwLock::new(test_live()));
         let ceiling = test_live();
         let pid_overrides = Arc::new(RwLock::new(HashMap::new()));
-        let denied_paths = Arc::new(RwLock::new(HashSet::new()));
-        let mut ctx = PolicyContext::new(live.clone(), ceiling, pid_overrides, denied_paths);
+        let denied = Arc::new(crate::seccomp::state::DeniedSet::default());
+        let mut ctx = PolicyContext::new(live.clone(), ceiling, pid_overrides, denied);
 
         ctx.restrict_max_memory(256 * 1024 * 1024);
         assert_eq!(live.read().unwrap().max_memory_bytes, 256 * 1024 * 1024);
@@ -445,8 +445,8 @@ mod tests {
         let live = Arc::new(RwLock::new(test_live()));
         let ceiling = test_live();
         let pid_overrides = Arc::new(RwLock::new(HashMap::new()));
-        let denied_paths = Arc::new(RwLock::new(HashSet::new()));
-        let ctx = PolicyContext::new(live, ceiling, pid_overrides.clone(), denied_paths);
+        let denied = Arc::new(crate::seccomp::state::DeniedSet::default());
+        let ctx = PolicyContext::new(live, ceiling, pid_overrides.clone(), denied);
 
         let localhost: IpAddr = "127.0.0.1".parse().unwrap();
         ctx.restrict_pid_network(1234, &[localhost]);
@@ -462,8 +462,8 @@ mod tests {
         let live = Arc::new(RwLock::new(test_live()));
         let ceiling = test_live();
         let pid_overrides = Arc::new(RwLock::new(HashMap::new()));
-        let denied_paths = Arc::new(RwLock::new(HashSet::new()));
-        let ctx = PolicyContext::new(live, ceiling, pid_overrides.clone(), denied_paths);
+        let denied = Arc::new(crate::seccomp::state::DeniedSet::default());
+        let ctx = PolicyContext::new(live, ceiling, pid_overrides.clone(), denied);
 
         let localhost: IpAddr = "127.0.0.1".parse().unwrap();
         ctx.restrict_pid_network(1234, &[localhost]);

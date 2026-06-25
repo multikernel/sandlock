@@ -370,6 +370,16 @@ fn is_denied_with_symlink_resolve(
         if policy_fn_state.is_path_denied(&real.to_string_lossy()) {
             return true;
         }
+        // Identity check: catches a denied file reached via a hardlink or a
+        // pre-existing alias, where the resolved path itself is not denied
+        // but the file identity is. Best-effort here (path-based precheck);
+        // the race-free authority is the fd identity check in the on-behalf
+        // open.
+        if let Some(id) = super::state::file_id_of_path(&real.to_string_lossy()) {
+            if policy_fn_state.is_id_denied(&id) {
+                return true;
+            }
+        }
     }
     false
 }
@@ -436,6 +446,7 @@ fn open_base_dir(pid: u32, dirfd: i64) -> Result<OwnedFd, i32> {
 fn realpath_of_fd(fd: RawFd) -> Option<std::path::PathBuf> {
     std::fs::read_link(format!("/proc/self/fd/{}", fd)).ok()
 }
+
 
 fn path_under_any(path: &std::path::Path, list: &[std::path::PathBuf]) -> bool {
     list.iter().any(|p| path.starts_with(p))
@@ -550,6 +561,15 @@ fn reopen_existing_on_behalf(
     };
     if let Some(errno) = deny_open_verdict(&realpath, flags, policy, pfs) {
         return NotifAction::Errno(errno);
+    }
+    // Identity check on the pinned file: a denied file reached via a hardlink,
+    // a rename to a non-denied name, or a pre-existing alias has a realpath
+    // that is not denied, but its handle identity is. Race-free — this is the
+    // exact file the child will receive.
+    if let Some(id) = super::state::file_id_of_fd(probe.as_raw_fd()) {
+        if pfs.is_id_denied(&id) {
+            return NotifAction::Errno(libc::EACCES);
+        }
     }
     // Resolution-only flags are stripped from the reopen.
     let reopen_flags =

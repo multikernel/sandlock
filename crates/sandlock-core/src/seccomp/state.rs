@@ -402,6 +402,115 @@ impl TimeRandomState {
 }
 
 // ============================================================
+// DeniedSet — denied paths plus captured file identities
+// ============================================================
+
+/// The filesystem deny set: path prefixes plus the file-handle identities
+/// captured when each path was denied.
+///
+/// The path set is the primary, race-free boundary enforced at `open`. The
+/// identity set makes the deny robust against namespace games (hardlinks,
+/// renames, and pre-existing aliases): a [`FileId`] is the kernel file handle,
+/// which encodes the inode and a generation number, so it travels with the
+/// file's identity rather than the name used to reach it and is immune to
+/// inode reuse. An open is denied if the opened file's identity matches, no
+/// matter which path led to it. With `AT_HANDLE_FID` the kernel encodes an
+/// identity FID for essentially every filesystem (generic inode FID where
+/// NFS-export ops are absent); the rare path that still fails captures no
+/// identity and relies on the always-on path prefix.
+#[derive(Default)]
+pub struct DeniedSet {
+    paths: std::sync::RwLock<HashSet<String>>,
+    ids: std::sync::RwLock<HashSet<FileId>>,
+}
+
+/// A file's stable identity: its kernel file handle, keyed by the superblock
+/// device so identical handles from different filesystems cannot collide.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct FileId {
+    dev: u64,
+    handle_type: i32,
+    handle: Vec<u8>,
+}
+
+/// Identity of a path, following symlinks (the open will resolve to the same
+/// target). `None` if it cannot be resolved or no handle can be encoded. The
+/// `(handle_type, handle)` FID comes from [`crate::sys::fs::file_handle`]; it is
+/// keyed by the superblock `dev` so handles from different filesystems cannot
+/// collide.
+pub(crate) fn file_id_of_path(path: &str) -> Option<FileId> {
+    use std::os::unix::fs::MetadataExt;
+    let dev = std::fs::metadata(path).ok()?.dev();
+    let c = std::ffi::CString::new(path).ok()?;
+    let (handle_type, handle) =
+        crate::sys::fs::file_handle(libc::AT_FDCWD, &c, libc::AT_SYMLINK_FOLLOW)?;
+    Some(FileId { dev, handle_type, handle })
+}
+
+/// Identity of an open fd.
+pub(crate) fn file_id_of_fd(fd: std::os::unix::io::RawFd) -> Option<FileId> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return None;
+    }
+    let empty = std::ffi::CString::new("").ok()?;
+    let (handle_type, handle) = crate::sys::fs::file_handle(fd, &empty, libc::AT_EMPTY_PATH)?;
+    Some(FileId { dev: st.st_dev as u64, handle_type, handle })
+}
+
+impl DeniedSet {
+    /// Deny `path` (and its subtree, by prefix). Also captures the file's
+    /// handle identity if it exists now, so the deny still applies after the
+    /// file is hardlinked or renamed to a non-denied name.
+    pub fn deny(&self, path: &str) {
+        if let Ok(mut p) = self.paths.write() {
+            p.insert(path.to_string());
+        }
+        if let Some(id) = file_id_of_path(path) {
+            if let Ok(mut i) = self.ids.write() {
+                i.insert(id);
+            }
+        }
+    }
+
+    /// Stop denying `path`, dropping its captured identity too (best-effort:
+    /// only if the path still resolves). A leftover identity would only ever
+    /// over-deny, which is fail-safe.
+    pub fn allow(&self, path: &str) {
+        if let Ok(mut p) = self.paths.write() {
+            p.remove(path);
+        }
+        if let Some(id) = file_id_of_path(path) {
+            if let Ok(mut i) = self.ids.write() {
+                i.remove(&id);
+            }
+        }
+    }
+
+    /// True if `path` is at or beneath a denied path (lexical prefix).
+    pub fn is_path_denied(&self, path: &str) -> bool {
+        self.paths.read().map_or(false, |denied| {
+            let path = std::path::Path::new(path);
+            denied
+                .iter()
+                .any(|d| path.starts_with(std::path::Path::new(d)))
+        })
+    }
+
+    /// True if `id` is a denied file identity (catches hardlinks, renames, and
+    /// pre-existing aliases regardless of the path used).
+    pub(crate) fn is_id_denied(&self, id: &FileId) -> bool {
+        self.ids.read().map_or(false, |s| s.contains(id))
+    }
+
+    /// Whether any deny rule is in effect.
+    pub fn is_empty(&self) -> bool {
+        self.paths.read().map_or(true, |p| p.is_empty())
+            && self.ids.read().map_or(true, |i| i.is_empty())
+    }
+}
+
+// ============================================================
 // PolicyFnState — dynamic policy callback state
 // ============================================================
 
@@ -411,8 +520,8 @@ pub struct PolicyFnState {
     pub event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::policy_fn::PolicyEvent>>,
     /// Shared live policy for dynamic updates (None if no policy_fn).
     pub live_policy: Option<std::sync::Arc<std::sync::RwLock<crate::policy_fn::LivePolicy>>>,
-    /// Dynamically denied paths from policy_fn.
-    pub denied_paths: std::sync::Arc<std::sync::RwLock<HashSet<String>>>,
+    /// Dynamically denied paths and inode identities from policy_fn / fs_deny.
+    pub denied: std::sync::Arc<DeniedSet>,
 }
 
 impl PolicyFnState {
@@ -420,28 +529,25 @@ impl PolicyFnState {
         Self {
             event_tx: None,
             live_policy: None,
-            denied_paths: std::sync::Arc::new(std::sync::RwLock::new(HashSet::new())),
+            denied: std::sync::Arc::new(DeniedSet::default()),
         }
     }
 
-    /// Check if a path is dynamically denied.
+    /// Check if a path is at or beneath a denied path.
     pub fn is_path_denied(&self, path: &str) -> bool {
-        if let Ok(denied) = self.denied_paths.read() {
-            let path = std::path::Path::new(path);
-            denied.iter().any(|d| path.starts_with(std::path::Path::new(d)))
-        } else {
-            false
-        }
+        self.denied.is_path_denied(path)
+    }
+
+    /// Check if an opened file's handle identity is denied.
+    pub(crate) fn is_id_denied(&self, id: &FileId) -> bool {
+        self.denied.is_id_denied(id)
     }
 
     /// Whether any deny rule is currently in effect. Cheap gate for the
     /// race-free on-behalf open path: with no denies there is no carve-out
     /// to protect and opens are left to the kernel and Landlock.
     pub fn has_denied_paths(&self) -> bool {
-        self.denied_paths
-            .read()
-            .map(|d| !d.is_empty())
-            .unwrap_or(false)
+        !self.denied.is_empty()
     }
 }
 

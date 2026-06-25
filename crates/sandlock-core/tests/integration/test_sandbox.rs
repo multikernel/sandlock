@@ -295,6 +295,40 @@ async fn test_denied_path_hardlink_blocked() {
     );
 }
 
+/// A pre-existing hardlink (an alias name for the denied inode, created before
+/// the sandbox starts) must not be readable. This is the non-racy bypass that
+/// only inode-identity deny closes: the alias path is not denied, but its inode
+/// is the denied file's inode.
+#[tokio::test]
+async fn test_denied_path_preexisting_hardlink_blocked() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let secret = tmp.path().join("secret.txt");
+    std::fs::write(&secret, "TOP_SECRET").unwrap();
+    // Alias under a non-denied name, created before the sandbox.
+    let alias = tmp.path().join("alias.txt");
+    std::fs::hard_link(&secret, &alias).unwrap();
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
+        .fs_read("/bin").fs_read("/proc").fs_read("/etc")
+        .fs_read(tmp.path())
+        .fs_deny(&secret) // deny only the "secret.txt" name
+        .build()
+        .unwrap();
+
+    // Read via the alias name — not denied by path, but the same inode.
+    let result = policy
+        .clone()
+        .with_name("test")
+        .run(&["cat", alias.to_str().unwrap()])
+        .await
+        .unwrap();
+    assert!(
+        result.stdout_str().map_or(true, |s| !s.contains("TOP_SECRET")),
+        "pre-existing hardlink bypass: read denied file's bytes via an alias name"
+    );
+}
+
 #[tokio::test]
 async fn test_denied_path_rename_blocked() {
     let tmp = tempfile::TempDir::new().unwrap();
