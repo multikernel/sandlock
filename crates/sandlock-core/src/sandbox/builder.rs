@@ -198,6 +198,10 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", clap(skip))]
     pub(crate) on_file_access: Option<Arc<dyn Fn(&std::path::Path, u64) + Send + Sync + 'static>>,
 
+    // Audit callback for execve/execveat syscalls.
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub(crate) on_execve: Option<Arc<dyn Fn(&std::path::Path) + Send + Sync + 'static>>,
+
     // Audit callback for network connect/sendto syscalls.
     #[cfg_attr(feature = "cli", clap(skip))]
     pub(crate) on_net_connect: Option<Arc<dyn Fn(std::net::IpAddr, u16) + Send + Sync + 'static>>,
@@ -273,6 +277,7 @@ impl Clone for SandboxBuilder {
             work_fn: self.work_fn.clone(),
             // on_file_access is Arc-wrapped; clone bumps the reference count.
             on_file_access: self.on_file_access.clone(),
+            on_execve: self.on_execve.clone(),
             on_net_connect: self.on_net_connect.clone(),
         }
     }
@@ -607,12 +612,19 @@ impl SandboxBuilder {
         self
     }
 
-    /// Register an audit callback that fires for every file-open syscall
-    /// (`openat`, `open`, `execve`, etc.) before any internal handler runs.
-    /// Receives the resolved absolute path and the open flags (`O_*`); flags
-    /// are `0` for execve and other non-open syscalls.
+    /// Register an audit callback that fires for every `openat`/`open` syscall
+    /// before any internal handler runs. Receives the resolved absolute path and
+    /// the open flags (`O_*`).
     pub fn on_file_access(mut self, f: impl Fn(&std::path::Path, u64) + Send + Sync + 'static) -> Self {
         self.on_file_access = Some(Arc::new(f));
+        self
+    }
+
+    /// Register an audit callback that fires for every `execve`/`execveat` syscall
+    /// before any internal handler runs. Receives the resolved absolute path of the
+    /// binary being executed.
+    pub fn on_execve(mut self, f: impl Fn(&std::path::Path) + Send + Sync + 'static) -> Self {
+        self.on_execve = Some(Arc::new(f));
         self
     }
 
@@ -794,6 +806,7 @@ impl SandboxBuilder {
             init_fn: self.init_fn,
             work_fn: self.work_fn,
             on_file_access: self.on_file_access,
+            on_execve: self.on_execve,
             on_net_connect: self.on_net_connect,
             runtime: None,
         })
