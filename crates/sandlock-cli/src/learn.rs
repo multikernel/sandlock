@@ -83,9 +83,13 @@ pub async fn run(args: LearnArgs) -> Result<()> {
 
     let reads: Arc<Mutex<BTreeSet<PathBuf>>> = Arc::new(Mutex::new(BTreeSet::new()));
     let writes: Arc<Mutex<BTreeSet<PathBuf>>> = Arc::new(Mutex::new(BTreeSet::new()));
+    let execs: Arc<Mutex<BTreeSet<PathBuf>>> = Arc::new(Mutex::new(BTreeSet::new()));
     let connects: Arc<Mutex<BTreeSet<String>>> = Arc::new(Mutex::new(BTreeSet::new()));
 
-    let (reads_c, writes_c, connects_c) = (Arc::clone(&reads), Arc::clone(&writes), Arc::clone(&connects));
+    let (reads_c, writes_c, execs_c, connects_c) = (
+        Arc::clone(&reads), Arc::clone(&writes),
+        Arc::clone(&execs), Arc::clone(&connects),
+    );
     let policy = Sandbox::builder()
         .fs_read("/")
         .workdir(cow_dir.path())
@@ -95,6 +99,9 @@ pub async fn run(args: LearnArgs) -> Result<()> {
             } else {
                 reads_c.lock().unwrap().insert(path.to_path_buf());
             }
+        })
+        .on_execve(move |path| {
+            execs_c.lock().unwrap().insert(path.to_path_buf());
         })
         .on_net_connect(move |ip, port| {
             connects_c.lock().unwrap().insert(format!("tcp://{ip}:{port}"));
@@ -112,18 +119,12 @@ pub async fn run(args: LearnArgs) -> Result<()> {
 
     eprintln!("sandlock learn: done (exit={:?})", result.code());
 
-    // The dynamic linker is loaded entirely in kernel space
-    // during execve, no userspace syscall fires. Find the binary in the captured
-    // reads (by basename match) and parse its ELF PT_INTERP to add the linker.
-    let cmd_basename = std::path::Path::new(&args.cmd[0]).file_name();
-    let candidates: Vec<PathBuf> = reads.lock().unwrap().iter()
-        .filter(|p| p.file_name() == cmd_basename)
-        .cloned()
-        .collect();
-    for bin in candidates.iter().filter(|p| p.exists()) {
+    // The dynamic linker is loaded entirely in kernel space during execve,
+    // no userspace syscall fires for it. Use ELF PT_INTERP as a workaround
+    // until a /proc/<pid>/maps-based approach is implemented.
+    for bin in execs.lock().unwrap().iter() {
         if let Some(interp) = elf_interpreter(bin) {
             reads.lock().unwrap().insert(interp);
-            break;
         }
     }
 
@@ -132,9 +133,13 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     let cow_path = cow_dir.path().to_path_buf();
     profile_out.filesystem = FilesystemSection {
         // Filter reads by existence to drop failed PATH-probe openats.
+        // Executed binaries are merged into read
         read: reads.lock().unwrap().iter()
+            .chain(execs.lock().unwrap().iter())
             .filter(|p| p.exists() && !p.starts_with(&cow_path))
             .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
             .collect(),
         // For writes: if the file exists, record the specific path (existing file modified).
         // If it doesn't exist on the real FS (COW intercepted a create), record the parent
