@@ -474,6 +474,69 @@ pub(crate) fn chown_in_root(root: &Path, rel: &str, uid: u32, gid: u32) -> Resul
     }
 }
 
+// ============================================================
+// File-handle identity (non-chroot fs-deny path)
+// ============================================================
+
+/// `AT_HANDLE_FID` (Linux 6.5+): request an identity-only file handle that
+/// "may not be usable with open_by_handle_at". Not in libc 0.2.x. The kernel
+/// can encode this for essentially every filesystem, including those without
+/// NFS-export ops (it falls back to a generic inode FID).
+const AT_HANDLE_FID: libc::c_int = 0x200;
+
+/// Encode a file's stable identity via `name_to_handle_at`: returns
+/// `(handle_type, handle_bytes)`, a token that travels with the file's inode
+/// (plus a generation number) rather than the path used to reach it.
+/// `dirfd`/`path`/`base_flags` follow the syscall: `(AT_FDCWD, path,
+/// AT_SYMLINK_FOLLOW)` for a path, or `(fd, "", AT_EMPTY_PATH)` for an fd.
+///
+/// Prefers `AT_HANDLE_FID` for the widest filesystem coverage; on a pre-6.5
+/// kernel that flag is rejected with `EINVAL`, so we retry without it (a plain
+/// decodeable handle, supported by every export-capable filesystem). `None` if
+/// no handle can be encoded — the caller then relies on a path-based fallback.
+pub(crate) fn file_handle(
+    dirfd: RawFd,
+    path: &std::ffi::CStr,
+    base_flags: libc::c_int,
+) -> Option<(i32, Vec<u8>)> {
+    match encode_fh(dirfd, path, base_flags | AT_HANDLE_FID) {
+        Ok(h) => Some(h),
+        Err(libc::EINVAL) => encode_fh(dirfd, path, base_flags).ok(),
+        Err(_) => None,
+    }
+}
+
+fn encode_fh(dirfd: RawFd, path: &std::ffi::CStr, flags: libc::c_int) -> Result<(i32, Vec<u8>), i32> {
+    // `struct file_handle` is variable length; keep the header and a
+    // MAX_HANDLE_SZ payload contiguous and 4-byte aligned (c_uint first).
+    #[repr(C)]
+    struct HandleBuf {
+        handle_bytes: u32,
+        handle_type: i32,
+        f_handle: [u8; libc::MAX_HANDLE_SZ as usize],
+    }
+    let mut hb = HandleBuf {
+        handle_bytes: libc::MAX_HANDLE_SZ as u32,
+        handle_type: 0,
+        f_handle: [0u8; libc::MAX_HANDLE_SZ as usize],
+    };
+    let mut mount_id: libc::c_int = 0;
+    let r = unsafe {
+        libc::name_to_handle_at(
+            dirfd,
+            path.as_ptr(),
+            &mut hb as *mut HandleBuf as *mut libc::file_handle,
+            &mut mount_id,
+            flags,
+        )
+    };
+    if r != 0 {
+        return Err(last_errno(libc::EIO));
+    }
+    let n = (hb.handle_bytes as usize).min(libc::MAX_HANDLE_SZ as usize);
+    Ok((hb.handle_type, hb.f_handle[..n].to_vec()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

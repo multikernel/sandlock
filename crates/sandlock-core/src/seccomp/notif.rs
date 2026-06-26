@@ -370,8 +370,318 @@ fn is_denied_with_symlink_resolve(
         if policy_fn_state.is_path_denied(&real.to_string_lossy()) {
             return true;
         }
+        // Identity check: catches a denied file reached via a hardlink or a
+        // pre-existing alias, where the resolved path itself is not denied
+        // but the file identity is. Best-effort here (path-based precheck);
+        // the race-free authority is the fd identity check in the on-behalf
+        // open.
+        if let Some(id) = super::state::file_id_of_path(&real.to_string_lossy()) {
+            if policy_fn_state.is_id_denied(&id) {
+                return true;
+            }
+        }
     }
     false
+}
+
+/// `RESOLVE_NO_MAGICLINKS` — forbid `/proc` magic-link redirection during
+/// on-behalf resolution while still following ordinary symlinks the way the
+/// child's own open would.
+const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+
+/// Kernel `struct open_how` for `openat2`.
+#[repr(C)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
+fn last_errno(fallback: i32) -> i32 {
+    io::Error::last_os_error().raw_os_error().unwrap_or(fallback)
+}
+
+/// `openat2` relative to `dirfd`. Returns an owned fd or the errno.
+fn openat2_at(dirfd: RawFd, path: &std::ffi::CStr, flags: u64, mode: u64, resolve: u64)
+    -> Result<OwnedFd, i32>
+{
+    use std::os::unix::io::FromRawFd;
+    let how = OpenHow { flags, mode, resolve };
+    let fd = unsafe {
+        libc::syscall(
+            arch::SYS_OPENAT2,
+            dirfd,
+            path.as_ptr(),
+            &how as *const OpenHow,
+            std::mem::size_of::<OpenHow>(),
+        )
+    } as i32;
+    if fd < 0 {
+        Err(last_errno(libc::ENOENT))
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+}
+
+/// Capture an `O_PATH` fd to the directory the child's open resolves against,
+/// taken from the child's own view so a concurrent `chdir`/dirfd swap cannot
+/// move the resolution base after we read it.
+fn open_base_dir(pid: u32, dirfd: i64) -> Result<OwnedFd, i32> {
+    use std::os::unix::io::FromRawFd;
+    if dirfd as i32 == libc::AT_FDCWD {
+        let cwd = std::ffi::CString::new(format!("/proc/{}/cwd", pid)).map_err(|_| libc::EINVAL)?;
+        let fd = unsafe {
+            libc::open(cwd.as_ptr(), libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        };
+        if fd < 0 {
+            return Err(last_errno(libc::EACCES));
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    } else {
+        dup_fd_from_pid(pid, dirfd as i32).map_err(|_| libc::EBADF)
+    }
+}
+
+/// Real path of an open fd via its `/proc/self/fd` magic link.
+fn realpath_of_fd(fd: RawFd) -> Option<std::path::PathBuf> {
+    std::fs::read_link(format!("/proc/self/fd/{}", fd)).ok()
+}
+
+
+fn path_under_any(path: &std::path::Path, list: &[std::path::PathBuf]) -> bool {
+    list.iter().any(|p| path.starts_with(p))
+}
+
+/// Decide whether `realpath` may be opened with `flags` under the deny set
+/// and the (conservative) grant lists. Returns `Some(errno)` to refuse,
+/// `None` to allow. Never over-allows relative to the configured grants: a
+/// path outside every grant is refused, so this can only be stricter than
+/// Landlock, never looser (an over-deny is a functional gap, an over-allow
+/// would be an escape).
+fn deny_open_verdict(
+    realpath: &std::path::Path,
+    flags: u64,
+    policy: &NotifPolicy,
+    pfs: &super::state::PolicyFnState,
+) -> Option<i32> {
+    if pfs.is_path_denied(&realpath.to_string_lossy()) {
+        return Some(libc::EACCES);
+    }
+    let acc = flags as i32 & libc::O_ACCMODE;
+    let is_write = acc == libc::O_WRONLY
+        || acc == libc::O_RDWR
+        || (flags & libc::O_TRUNC as u64) != 0
+        || (flags & libc::O_CREAT as u64) != 0;
+    let allowed = if is_write {
+        path_under_any(realpath, &policy.chroot_writable)
+    } else {
+        path_under_any(realpath, &policy.chroot_readable)
+            || path_under_any(realpath, &policy.chroot_writable)
+    };
+    if allowed { None } else { Some(libc::EACCES) }
+}
+
+/// open/openat/openat2 argument layout, normalized across the spellings.
+struct OpenArgs {
+    dirfd: i64,
+    path_ptr: u64,
+    flags: u64,
+    mode: u64,
+    /// `openat2` `resolve` flags (`RESOLVE_*`); 0 for `open`/`openat`.
+    resolve: u64,
+}
+
+/// Decode the open arguments. `openat2` carries flags/mode/resolve inside a
+/// `struct open_how` in child memory, so its decode reads child memory and
+/// can fail; `None` means "could not decode" and the caller soft-falls-through
+/// (the kernel's own re-read fails the same way).
+fn decode_open_args(notif: &SeccompNotif, notif_fd: RawFd) -> Option<OpenArgs> {
+    let a = &notif.data.args;
+    let nr = notif.data.nr as i64;
+    if nr == libc::SYS_openat {
+        Some(OpenArgs { dirfd: a[0] as i64, path_ptr: a[1], flags: a[2], mode: a[3], resolve: 0 })
+    } else if nr == arch::SYS_OPENAT2 {
+        // openat2(dirfd, pathname, struct open_how *how, size_t size),
+        // open_how = { u64 flags, u64 mode, u64 resolve }.
+        let how_ptr = a[2];
+        let want = (a[3] as usize).min(std::mem::size_of::<OpenHow>());
+        if how_ptr == 0 || want < 16 {
+            return None; // need at least flags + mode
+        }
+        let bytes = read_child_mem(notif_fd, notif.id, notif.pid, how_ptr, want).ok()?;
+        if bytes.len() < 16 {
+            return None;
+        }
+        let flags = u64::from_ne_bytes(bytes[0..8].try_into().ok()?);
+        let mode = u64::from_ne_bytes(bytes[8..16].try_into().ok()?);
+        let resolve = if bytes.len() >= 24 {
+            u64::from_ne_bytes(bytes[16..24].try_into().ok()?)
+        } else {
+            0
+        };
+        Some(OpenArgs { dirfd: a[0] as i64, path_ptr: a[1], flags, mode, resolve })
+    } else {
+        // legacy open(path, flags, mode) — AT_FDCWD implied.
+        Some(OpenArgs { dirfd: libc::AT_FDCWD as i64, path_ptr: a[0], flags: a[1], mode: a[2], resolve: 0 })
+    }
+}
+
+/// Wrap a freshly opened raw fd into an `InjectFdSend`, honoring the child's
+/// `O_CLOEXEC` request. Ownership of `raw_fd` moves into the action.
+fn inject_open_result(raw_fd: i32, flags: u64) -> NotifAction {
+    use std::os::unix::io::FromRawFd;
+    if raw_fd < 0 {
+        return NotifAction::Errno(last_errno(libc::EACCES));
+    }
+    let owned = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let newfd_flags = if flags & libc::O_CLOEXEC as u64 != 0 {
+        libc::O_CLOEXEC as u32
+    } else {
+        0
+    };
+    NotifAction::InjectFdSend { srcfd: owned, newfd_flags }
+}
+
+/// Existing-file branch: vet the pinned inode behind `probe`, then reopen it
+/// race-free via its `/proc/self/fd` magic link with the child's real access
+/// mode (binds to the inode, not the original path).
+fn reopen_existing_on_behalf(
+    probe: OwnedFd,
+    flags: u64,
+    policy: &NotifPolicy,
+    pfs: &super::state::PolicyFnState,
+) -> NotifAction {
+    // File exists. Refuse O_CREAT|O_EXCL the way the kernel would.
+    if (flags & libc::O_CREAT as u64) != 0 && (flags & libc::O_EXCL as u64) != 0 {
+        return NotifAction::Errno(libc::EEXIST);
+    }
+    let realpath = match realpath_of_fd(probe.as_raw_fd()) {
+        Some(p) => p,
+        None => return NotifAction::Errno(libc::EACCES),
+    };
+    if let Some(errno) = deny_open_verdict(&realpath, flags, policy, pfs) {
+        return NotifAction::Errno(errno);
+    }
+    // Identity check on the pinned file: a denied file reached via a hardlink,
+    // a rename to a non-denied name, or a pre-existing alias has a realpath
+    // that is not denied, but its handle identity is. Race-free — this is the
+    // exact file the child will receive.
+    if let Some(id) = super::state::file_id_of_fd(probe.as_raw_fd()) {
+        if pfs.is_id_denied(&id) {
+            return NotifAction::Errno(libc::EACCES);
+        }
+    }
+    // Resolution-only flags are stripped from the reopen.
+    let reopen_flags =
+        flags as i32 & !(libc::O_CREAT | libc::O_EXCL | libc::O_PATH | libc::O_NOFOLLOW);
+    let proc_path = match std::ffi::CString::new(format!("/proc/self/fd/{}", probe.as_raw_fd())) {
+        Ok(c) => c,
+        Err(_) => return NotifAction::Errno(libc::EIO),
+    };
+    let fd = unsafe { libc::open(proc_path.as_ptr(), reopen_flags) };
+    inject_open_result(fd, flags)
+}
+
+/// O_CREAT branch: resolve the parent directory race-free, vet the would-be
+/// target, then create the leaf inside that pinned parent (the dir inode is
+/// fixed, only the leaf name is appended).
+fn create_new_on_behalf(
+    base: &OwnedFd,
+    path: &str,
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+    policy: &NotifPolicy,
+    pfs: &super::state::PolicyFnState,
+) -> NotifAction {
+    let p = std::path::Path::new(path);
+    let file_name = match p.file_name() {
+        Some(f) => f,
+        None => return NotifAction::Errno(libc::ENOENT),
+    };
+    let parent = p.parent().unwrap_or(std::path::Path::new("."));
+    let parent_str = match parent.to_str() {
+        Some("") | None => ".",
+        Some(s) => s,
+    };
+    let c_parent = match std::ffi::CString::new(parent_str) {
+        Ok(c) => c,
+        Err(_) => return NotifAction::Errno(libc::EINVAL),
+    };
+    let parent_fd = match openat2_at(
+        base.as_raw_fd(),
+        &c_parent,
+        (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+        0,
+        RESOLVE_NO_MAGICLINKS | resolve,
+    ) {
+        Ok(f) => f,
+        Err(e) => return NotifAction::Errno(e),
+    };
+    let parent_real = match realpath_of_fd(parent_fd.as_raw_fd()) {
+        Some(p) => p,
+        None => return NotifAction::Errno(libc::EACCES),
+    };
+    if let Some(errno) = deny_open_verdict(&parent_real.join(file_name), flags, policy, pfs) {
+        return NotifAction::Errno(errno);
+    }
+    let c_name = match std::ffi::CString::new(file_name.as_encoded_bytes()) {
+        Ok(c) => c,
+        Err(_) => return NotifAction::Errno(libc::EINVAL),
+    };
+    let create_flags = flags as i32 & !(libc::O_PATH | libc::O_NOFOLLOW);
+    let fd = unsafe { libc::openat(parent_fd.as_raw_fd(), c_name.as_ptr(), create_flags, mode) };
+    inject_open_result(fd, flags)
+}
+
+/// Perform `openat`/`open` on behalf of the child, race-free, when a deny is
+/// active. Resolves once (pinning the inode), enforces deny + grant on the
+/// pinned target, then hands the child an fd to that exact inode via
+/// `InjectFdSend`. Returns `Continue` only when no allow/deny decision was
+/// made on content we resolved (unreadable path / no allowlist configured),
+/// matching the precheck's existing soft fall-through.
+fn on_behalf_open_for_deny(
+    notif: &SeccompNotif,
+    policy: &NotifPolicy,
+    pfs: &super::state::PolicyFnState,
+    notif_fd: RawFd,
+) -> NotifAction {
+    // No allowlist configured (Landlock is not allowlisting the filesystem):
+    // there is no grant to check against, so taking over the open could only
+    // wrongly deny. Leave it to the existing precheck/kernel path.
+    if policy.chroot_readable.is_empty() && policy.chroot_writable.is_empty() {
+        return NotifAction::Continue;
+    }
+
+    let OpenArgs { dirfd, path_ptr, flags, mode, resolve } =
+        match decode_open_args(notif, notif_fd) {
+            Some(a) => a,
+            None => return NotifAction::Continue, // kernel's re-read fails the same way
+        };
+
+    let path = match read_child_cstr(notif_fd, notif.id, notif.pid, path_ptr, 4096) {
+        Some(p) => p,
+        None => return NotifAction::Continue, // kernel's re-read fails the same way
+    };
+    let c_path = match std::ffi::CString::new(path.clone()) {
+        Ok(c) => c,
+        Err(_) => return NotifAction::Errno(libc::EINVAL),
+    };
+    let base = match open_base_dir(notif.pid, dirfd) {
+        Ok(b) => b,
+        Err(e) => return NotifAction::Errno(e),
+    };
+
+    // Side-effect-free probe; mirror the child's no-follow intent for the
+    // final component and any `openat2` RESOLVE_* flags it requested.
+    let probe_flags = (libc::O_PATH | libc::O_CLOEXEC) as u64 | (flags & libc::O_NOFOLLOW as u64);
+    match openat2_at(base.as_raw_fd(), &c_path, probe_flags, 0, RESOLVE_NO_MAGICLINKS | resolve) {
+        Ok(probe) => reopen_existing_on_behalf(probe, flags, policy, pfs),
+        Err(errno) if errno == libc::ENOENT && (flags & libc::O_CREAT as u64) != 0 => {
+            create_new_on_behalf(&base, &path, flags, mode, resolve, policy, pfs)
+        }
+        Err(errno) => NotifAction::Errno(errno),
+    }
 }
 
 /// Read the thread-group leader (Tgid) of a thread from `/proc/<tid>/status`.
@@ -997,8 +1307,9 @@ fn resolve_at_path_for_event(notif: &SeccompNotif, dirfd: i64, path: &str) -> Op
 fn resolve_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Option<String> {
     let nr = notif.data.nr as i64;
     match nr {
-        n if n == libc::SYS_openat => {
-            // openat(dirfd, pathname, flags, mode)
+        n if n == libc::SYS_openat || n == arch::SYS_OPENAT2 => {
+            // openat(dirfd, pathname, flags, mode) and
+            // openat2(dirfd, pathname, how, size) share (dirfd, pathname).
             let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
             resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
         }
@@ -1022,13 +1333,10 @@ fn resolve_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Option<Strin
             let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
             resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
         }
-        // symlinkat(target, newdirfd, linkpath)
-        // The target string is what the symlink points to; deny if it names a denied path.
-        n if n == libc::SYS_symlinkat => {
-            let target = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
-            // target may be absolute or relative to the process cwd
-            resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &target)
-        }
+        // symlinkat/symlink intentionally omitted: creating a symlink does
+        // not access its target, so there is nothing to gate here. Any later
+        // open through the symlink resolves to the real target and is denied
+        // race-free on the open path (issue #111). See `on_behalf_open_for_deny`.
         // link(oldpath, newpath) — legacy, AT_FDCWD implied for both
         n if Some(n) == arch::sys_link() => {
             let path = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
@@ -1038,11 +1346,6 @@ fn resolve_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Option<Strin
         n if Some(n) == arch::sys_rename() => {
             let path = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
             resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
-        }
-        // symlink(target, linkpath) — legacy
-        n if Some(n) == arch::sys_symlink() => {
-            let target = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
-            resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &target)
         }
         _ => None,
     }
@@ -1329,12 +1632,15 @@ async fn handle_notification(
     // Check dynamic path denials before dispatch
     let mut action = {
         let nr = notif.data.nr as i64;
+        // symlinkat/symlink are not gated: creating a symlink does not access
+        // its target (any open through it is denied race-free on the open
+        // path). See `resolve_path_for_notif`.
         let mut path_check_nrs = vec![
-            libc::SYS_openat, libc::SYS_execve, libc::SYS_execveat,
-            libc::SYS_linkat, libc::SYS_renameat2, libc::SYS_symlinkat,
+            libc::SYS_openat, arch::SYS_OPENAT2, libc::SYS_execve, libc::SYS_execveat,
+            libc::SYS_linkat, libc::SYS_renameat2,
         ];
         path_check_nrs.extend([
-            arch::sys_open(), arch::sys_link(), arch::sys_rename(), arch::sys_symlink(),
+            arch::sys_open(), arch::sys_link(), arch::sys_rename(),
         ].into_iter().flatten());
         let should_precheck_denied = policy.chroot_root.is_none()
             && path_check_nrs.contains(&nr);
@@ -1343,8 +1649,28 @@ async fn handle_notification(
             if is_path_denied_for_notif(&pfs, &notif, fd) {
                 NotifAction::Errno(libc::EACCES)
             } else {
+                let has_denied = pfs.has_denied_paths();
                 drop(pfs);
-                dispatch_table.dispatch(notif, fd).await
+                // Let normal dispatch run first so /proc virtualization and
+                // other handlers still win for their paths.
+                let action = dispatch_table.dispatch(notif, fd).await;
+                // A bare `Continue` for openat/open is the racy window: the
+                // supervisor's resolution said "not denied", but the kernel
+                // re-resolves after Continue and a racing thread can swap a
+                // symlink to reach a denied carve-out inside a granted tree
+                // (issue #111). Run the open on-behalf against the pinned
+                // inode and inject the fd so the kernel never re-resolves.
+                // Other path syscalls keep the best-effort precheck above
+                // (documented follow-up — they return no fd to inject).
+                let is_openat_family = nr == libc::SYS_openat
+                    || nr == arch::SYS_OPENAT2
+                    || Some(nr) == arch::sys_open();
+                if matches!(action, NotifAction::Continue) && is_openat_family && has_denied {
+                    let pfs = ctx.policy_fn.lock().await;
+                    on_behalf_open_for_deny(&notif, policy, &pfs, fd)
+                } else {
+                    action
+                }
             }
         } else {
             dispatch_table.dispatch(notif, fd).await
