@@ -1176,6 +1176,34 @@ fn send_response(fd: RawFd, id: u64, action: NotifAction) -> io::Result<()> {
 }
 
 // ============================================================
+// Maps reading after exec
+// ============================================================
+
+/// Read the dynamic linker path from /proc/<pid>/maps after execve completes.
+/// The linker is loaded by the kernel in kernel space during execve. After exec, it appears as a file-backed mapping whose name
+/// contains "/ld-" (the standard naming convention).
+fn read_linker_from_maps(pid: i32) -> Option<std::path::PathBuf> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(format!("/proc/{}/maps", pid)).ok()?;
+    for line in std::io::BufReader::new(file).lines() {
+        let line = line.ok()?;
+        // Format: "addr-addr perms offset dev inode pathname"
+        let pathname = line.splitn(6, ' ').nth(5).map(str::trim).unwrap_or("");
+        if !pathname.is_empty() && !pathname.starts_with('[') {
+            let p = std::path::Path::new(pathname);
+            if p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("ld-"))
+                .unwrap_or(false)
+            {
+                return Some(p.to_path_buf());
+            }
+        }
+    }
+    None
+}
+
+// ============================================================
 // vDSO re-patching after exec
 // ============================================================
 
@@ -1638,6 +1666,23 @@ async fn handle_notification(
         maybe_patch_vdso(notif.pid as i32, &mut pfs, policy);
     }
 
+    // If the previous notification from this pid was an execve, exec has now
+    // completed and /proc/<pid>/maps reflects the new image. Read the dynamic
+    // linker path from maps and fire the audit_execve hook for it — the linker
+    // is loaded by the kernel in kernel space so no openat ever fires for it.
+    if let Some(ref hook) = policy.audit_execve {
+        if let Some((_, state)) = ctx.processes.entry_for(notif.pid as i32) {
+            let mut st = state.lock().await;
+            if st.pending_exec_maps_read {
+                st.pending_exec_maps_read = false;
+                drop(st);
+                if let Some(linker) = read_linker_from_maps(notif.pid as i32) {
+                    hook(&linker);
+                }
+            }
+        }
+    }
+
     // File-open audit hook — fires for openat/open before internal handlers.
     if let Some(ref hook) = policy.audit_file_access {
         let nr = notif.data.nr as i64;
@@ -1655,11 +1700,16 @@ async fn handle_notification(
     }
 
     // Execve audit hook — fires for execve/execveat before internal handlers.
+    // Also sets pending_exec_maps_read so the dynamic linker is captured on
+    // the next notification, after exec completes and maps reflects the new image.
     if let Some(ref hook) = policy.audit_execve {
         let nr = notif.data.nr as i64;
         if nr == libc::SYS_execve || nr == libc::SYS_execveat {
             if let Some(path) = resolve_path_for_notif(&notif, fd) {
                 hook(std::path::Path::new(&path));
+                if let Some((_, state)) = ctx.processes.entry_for(notif.pid as i32) {
+                    state.lock().await.pending_exec_maps_read = true;
+                }
             }
         }
     }
