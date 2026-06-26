@@ -22,49 +22,6 @@ fn is_write_open(flags: u64) -> bool {
     flags & (O_WRONLY | O_RDWR | O_CREAT) != 0
 }
 
-/// Read the ELF PT_INTERP segment of a binary and return the interpreter path.
-/// Returns `None` for statically linked binaries, non-ELF files, or ELF32 binaries.
-fn elf_interpreter(binary: &std::path::Path) -> Option<PathBuf> {
-    let data = std::fs::read(binary).ok()?;
-    // ELF magic: 0x7f 'E' 'L' 'F'
-    if data.get(..4) != Some(b"\x7fELF") {
-        return None;
-    }
-    // ELF64 only: class byte at offset 4 must be 2.
-    if data.get(4).copied() != Some(2) {
-        return None;
-    }
-    // Endianness byte at offset 5: 1 = little, 2 = big.
-    let le = data.get(5).copied()? == 1;
-    let read_u16 = |off: usize| -> Option<u16> {
-        let b = data.get(off..off + 2)?;
-        Some(if le { u16::from_le_bytes(b.try_into().ok()?) } else { u16::from_be_bytes(b.try_into().ok()?) })
-    };
-    let read_u64 = |off: usize| -> Option<u64> {
-        let b = data.get(off..off + 8)?;
-        Some(if le { u64::from_le_bytes(b.try_into().ok()?) } else { u64::from_be_bytes(b.try_into().ok()?) })
-    };
-    // ELF64 header: phoff at 0x20, phentsize at 0x36, phnum at 0x38.
-    let phoff = read_u64(0x20)? as usize;
-    let phentsize = read_u16(0x36)? as usize;
-    let phnum = read_u16(0x38)? as usize;
-    // PT_INTERP = 3
-    for i in 0..phnum {
-        let ph = phoff + i * phentsize;
-        let p_type = data.get(ph..ph + 4)?;
-        let p_type = if le { u32::from_le_bytes(p_type.try_into().ok()?) } else { u32::from_be_bytes(p_type.try_into().ok()?) };
-        if p_type == 3 {
-            // p_offset at ph+8, p_filesz at ph+32 in ELF64
-            let offset = read_u64(ph + 8)? as usize;
-            let filesz = read_u64(ph + 32)? as usize;
-            let interp = data.get(offset..offset + filesz)?;
-            // Strip trailing null byte
-            let interp = interp.split(|&b| b == 0).next()?;
-            return Some(PathBuf::from(std::str::from_utf8(interp).ok()?));
-        }
-    }
-    None
-}
 
 pub async fn run(args: LearnArgs) -> Result<()> {
     if args.cmd.is_empty() {
@@ -118,15 +75,6 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         .map_err(|e| anyhow!("sandbox error: {e}"))?;
 
     eprintln!("sandlock learn: done (exit={:?})", result.code());
-
-    // The dynamic linker is loaded entirely in kernel space during execve,
-    // no userspace syscall fires for it. Use ELF PT_INTERP as a workaround
-    // until a /proc/<pid>/maps-based approach is implemented.
-    for bin in execs.lock().unwrap().iter() {
-        if let Some(interp) = elf_interpreter(bin) {
-            reads.lock().unwrap().insert(interp);
-        }
-    }
 
     // Build the profile.
     let mut profile_out = ProfileInput::default();
