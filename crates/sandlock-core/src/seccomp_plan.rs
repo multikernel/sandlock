@@ -358,11 +358,12 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
         nrs.extend(POLICY_EVENT_SYSCALLS);
     }
 
-    // Audit file-access hook: needs execve/execveat in notif so the hook fires for the executed binary.
     if features.audit_file_access {
+        nrs.push_optional(arch::sys_open());
+    }
+    if features.audit_execve || features.audit_file_access {
         nrs.push(libc::SYS_execve);
         nrs.push(libc::SYS_execveat);
-        nrs.push_optional(arch::sys_open());
     }
 
     // Port remapping

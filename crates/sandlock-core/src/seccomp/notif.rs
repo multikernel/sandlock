@@ -777,11 +777,13 @@ pub struct NotifPolicy {
     /// Active MITM CA public cert (PEM bytes) to inject. `Some` only when
     /// HTTPS MITM is active (BYO or generated).
     pub ca_inject_pem: Option<std::sync::Arc<Vec<u8>>>,
-    /// Optional audit hook called for every file-open syscall before dispatch.
-    /// Receives the resolved absolute path and the open flags (`O_*`); flags
-    /// are `0` for execve/execveat and other non-open syscalls.
+    /// Optional audit hook called for every `openat`/`open` syscall before dispatch.
+    /// Receives the resolved absolute path and the open flags (`O_*`).
     pub audit_file_access: Option<std::sync::Arc<dyn Fn(&std::path::Path, u64) + Send + Sync>>,
-    /// Optional audit hook called for every `connect`/`sendto` syscall before
+    /// Optional audit hook called for every `execve`/`execveat` syscall before dispatch.
+    /// Receives the resolved absolute path of the binary being executed.
+    pub audit_execve: Option<std::sync::Arc<dyn Fn(&std::path::Path) + Send + Sync>>,
+    /// Optional audit hook called for every `connect`/`sendto`/`sendmsg` syscall before
     /// dispatch. Receives the destination IP and port.
     pub audit_net_connect: Option<std::sync::Arc<dyn Fn(std::net::IpAddr, u16) + Send + Sync>>,
 }
@@ -1697,24 +1699,28 @@ async fn handle_notification(
         maybe_patch_vdso(notif.pid as i32, &mut pfs, policy);
     }
 
-    // Audit hook — fires before internal handlers so it sees every file open
-    // regardless of how the dispatch chain handles it.
+    // File-open audit hook — fires for openat/open before internal handlers.
     if let Some(ref hook) = policy.audit_file_access {
         let nr = notif.data.nr as i64;
-        let is_open = nr == libc::SYS_openat
-            || Some(nr) == arch::sys_open()
-            || nr == libc::SYS_execve
-            || nr == libc::SYS_execveat;
+        let is_open = nr == libc::SYS_openat || Some(nr) == arch::sys_open();
         if is_open {
             if let Some(path) = resolve_path_for_notif(&notif, fd) {
                 let flags = if nr == libc::SYS_openat {
                     notif.data.args[2]
-                } else if Some(nr) == arch::sys_open() {
-                    notif.data.args[1]
                 } else {
-                    0 // execve/execveat — no open flags
+                    notif.data.args[1]
                 };
                 hook(std::path::Path::new(&path), flags);
+            }
+        }
+    }
+
+    // Execve audit hook — fires for execve/execveat before internal handlers.
+    if let Some(ref hook) = policy.audit_execve {
+        let nr = notif.data.nr as i64;
+        if nr == libc::SYS_execve || nr == libc::SYS_execveat {
+            if let Some(path) = resolve_path_for_notif(&notif, fd) {
+                hook(std::path::Path::new(&path));
             }
         }
     }

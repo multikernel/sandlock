@@ -1142,6 +1142,7 @@ mod handler_tests {
                 ca_inject_paths: Vec::new(),
                 ca_inject_pem: None,
                 audit_file_access: None,
+                audit_execve: None,
                 audit_net_connect: None,
             }),
             child_pidfd: None,
