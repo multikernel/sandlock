@@ -196,6 +196,28 @@ fn read_path(notif: &SeccompNotif, addr: u64, notif_fd: RawFd) -> Option<String>
     String::from_utf8(result).ok()
 }
 
+/// Rewrite the magic `/proc/self` and `/proc/thread-self` symlinks to the
+/// caller's real PID.  Under chroot, `/proc` is serviced by an on-behalf
+/// `openat2` in the *supervisor*, so the kernel would otherwise resolve `self`
+/// to the supervisor instead of the workload — both wrong (every
+/// `/proc/self/*` would reflect `sandlock-oci`) and a way to reach a non-sandbox
+/// process the numeric per-PID filter never sees.  Rewriting to `/proc/<pid>`
+/// (the workload PID seccomp reports) makes `self` resolve to the real caller
+/// and re-subjects it to the per-PID check.
+fn canon_proc_self(virtual_path: &str, pid: u32) -> String {
+    for magic in ["/proc/self", "/proc/thread-self"] {
+        if virtual_path == magic {
+            return format!("/proc/{}", pid);
+        }
+        if let Some(rest) = virtual_path.strip_prefix(magic) {
+            if rest.starts_with('/') {
+                return format!("/proc/{}{}", pid, rest);
+            }
+        }
+    }
+    virtual_path.to_string()
+}
+
 /// Build the full virtual path from dirfd + relative path.
 fn build_virtual_path(
     notif: &SeccompNotif,
@@ -203,8 +225,8 @@ fn build_virtual_path(
     path: &str,
     ctx: &ChrootCtx<'_>,
 ) -> Option<String> {
-    if Path::new(path).is_absolute() {
-        Some(path.to_string())
+    let vpath = if Path::new(path).is_absolute() {
+        path.to_string()
     } else {
         let dirfd32 = dirfd as i32;
         let base_host = if dirfd32 == libc::AT_FDCWD {
@@ -214,8 +236,9 @@ fn build_virtual_path(
         };
         let base_virtual = ctx.host_to_virtual(&base_host)?;
         let combined = base_virtual.join(path);
-        Some(combined.to_string_lossy().to_string())
-    }
+        combined.to_string_lossy().to_string()
+    };
+    Some(canon_proc_self(&vpath, notif.pid))
 }
 
 /// Resolve a child path to (host_path, virtual_path) within the chroot.
@@ -1964,4 +1987,28 @@ pub(crate) async fn handle_chroot_legacy_chown(
     ]);
     synth.data.nr = libc::SYS_fchownat as i32;
     handle_chroot_write(&synth, chroot_state, cow_state, notif_fd, ctx).await
+}
+
+#[cfg(test)]
+mod self_rewrite_tests {
+    use super::canon_proc_self;
+
+    #[test]
+    fn rewrites_self_and_thread_self_to_pid() {
+        assert_eq!(canon_proc_self("/proc/self", 42), "/proc/42");
+        assert_eq!(canon_proc_self("/proc/self/status", 42), "/proc/42/status");
+        assert_eq!(canon_proc_self("/proc/self/fd/3", 42), "/proc/42/fd/3");
+        assert_eq!(canon_proc_self("/proc/thread-self", 42), "/proc/42");
+        assert_eq!(canon_proc_self("/proc/thread-self/maps", 42), "/proc/42/maps");
+    }
+
+    #[test]
+    fn leaves_other_paths_untouched() {
+        // Numeric PIDs, non-self /proc paths, and "selfish" lookalikes must not
+        // be rewritten.
+        assert_eq!(canon_proc_self("/proc/7/status", 42), "/proc/7/status");
+        assert_eq!(canon_proc_self("/proc/cpuinfo", 42), "/proc/cpuinfo");
+        assert_eq!(canon_proc_self("/proc/selfish", 42), "/proc/selfish");
+        assert_eq!(canon_proc_self("/etc/passwd", 42), "/etc/passwd");
+    }
 }
