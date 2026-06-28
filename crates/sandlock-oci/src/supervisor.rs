@@ -260,7 +260,7 @@ pub fn run_supervisor(
     cmd: &[String],
     policy: OciPolicy,
     pid_write_fd: i32,
-) -> Result<()> {
+) -> Result<Option<crate::state::ExitInfo>> {
     if cmd.is_empty() {
         anyhow::bail!("OCI spec error: process.args is empty");
     }
@@ -316,7 +316,7 @@ async fn supervisor_main(
     mut sandbox: sandlock_core::Sandbox,
     sock_path: PathBuf,
     pid_write_fd: i32,
-) -> Result<()> {
+) -> Result<Option<crate::state::ExitInfo>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixListener;
 
@@ -405,7 +405,10 @@ async fn supervisor_main(
     // Notify the CLI: `OK <pid>` on success. Before OCI `start` there is no
     // workload yet, so the reported/recorded PID is sandlock-init's (the
     // container PID-1); OCI `start` updates state.pid to the workload PID.
-    pipe_write(pid_write_fd, &format!("OK {}", init_pid));
+    // Report two pids: the supervisor daemon's own pid (this process, which is
+    // the containerd shim's child and what the shim reaps to detect exit) and
+    // sandlock-init's pid (the OCI container init, recorded as state.pid).
+    pipe_write(pid_write_fd, &format!("OK {} {}", std::process::id(), init_pid));
 
     {
         let mut state = SandboxState::load(id)
@@ -420,7 +423,7 @@ async fn supervisor_main(
     loop {
         let (mut stream, _) = match listener.accept().await {
             Ok(pair) => pair,
-            Err(_) => return Ok(()),
+            Err(_) => return Ok(None),
         };
 
         let mut buf = vec![0u8; 4096];
@@ -472,17 +475,17 @@ async fn supervisor_main(
                             serve_running_init(id, &link, &mut sandbox, &listener, pid, main_exit)
                                 .await;
                         if let Ok(mut s) = SandboxState::load(id) {
-                            s.set_stopped(exit_info);
+                            s.set_stopped(exit_info.clone());
                             s.save().ok();
                         }
-                        return Ok(());
+                        return Ok(exit_info);
                     }
                     Ok(Resp::Err { msg }) => {
                         let reply = serde_json::to_vec(&SupervisorReply::Err { msg })
                             .unwrap_or_default();
                         let _ = stream.write_all(&reply).await;
                         let _ = stream.write_all(b"\n").await;
-                        return Ok(());
+                        return Ok(None);
                     }
                     other => {
                         let msg = format!("unexpected init reply to RunMain: {:?}", other);
@@ -490,7 +493,7 @@ async fn supervisor_main(
                             .unwrap_or_default();
                         let _ = stream.write_all(&reply).await;
                         let _ = stream.write_all(b"\n").await;
-                        return Ok(());
+                        return Ok(None);
                     }
                 }
             }
@@ -501,7 +504,7 @@ async fn supervisor_main(
                 let reply = serde_json::to_vec(&SupervisorReply::Ok).unwrap_or_default();
                 let _ = stream.write_all(&reply).await;
                 let _ = stream.write_all(b"\n").await;
-                return Ok(());
+                return Ok(None);
             }
             SupervisorCmd::Checkpoint { dir } => {
                 let reply = match sandbox.checkpoint().await {
