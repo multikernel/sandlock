@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use sandlock_core::pipeline::Stage;
 use sandlock_core::sandbox::{BranchAction, ByteSize, SandboxBuilder};
-use sandlock_core::{Protection, RunResult, Sandbox};
+use sandlock_core::{Protection, RunResult, Sandbox, StdioMode};
 
 pub mod handler;
 pub mod notif_repr;
@@ -1098,6 +1098,141 @@ pub unsafe extern "C" fn sandlock_create_for_run(
     sandlock_create_with_runtime(policy, name, argv, argc, build_runtime)
 }
 
+/// Map a raw `StdioMode` discriminant (0=inherit, 1=piped, 2=null) to the enum.
+/// Returns `None` for any other value so callers can reject it loudly.
+fn stdio_mode_from_raw(v: u32) -> Option<StdioMode> {
+    match v {
+        0 => Some(StdioMode::Inherit),
+        1 => Some(StdioMode::Piped),
+        2 => Some(StdioMode::Null),
+        _ => None,
+    }
+}
+
+/// Write `fd` through `out` if non-null; otherwise close it (a piped stream
+/// whose fd the caller did not ask for must not leak).
+unsafe fn write_or_close_fd(out: *mut c_int, fd: c_int) {
+    if out.is_null() {
+        if fd >= 0 {
+            libc::close(fd);
+        }
+    } else {
+        *out = fd;
+    }
+}
+
+/// Spawn a confined process with per-stream stdio wiring and return a live
+/// handle (the streaming counterpart of `sandlock_create` + `sandlock_start`).
+///
+/// `stdin_mode`/`stdout_mode`/`stderr_mode` are `StdioMode` discriminants
+/// (0=inherit, 1=piped, 2=null). For each stream set to *piped*, the matching
+/// `out_*_fd` receives an owned fd the caller must `close()`; for inherit/null
+/// it receives -1. Pass null for an `out_*_fd` to discard that fd (it is closed
+/// rather than leaked). Returns null on error (unknown mode, build/fork
+/// failure) with every `out_*_fd` left -1.
+///
+/// The handle uses a multi-threaded runtime so the seccomp supervisor keeps
+/// pumping while the caller does blocking IO on the returned fds. Wait for the
+/// process with `sandlock_handle_wait`, terminate with `sandlock_handle_kill`,
+/// and release with `sandlock_handle_free`.
+///
+/// Deadlock warning: a piped fd is yours once returned — `close()` a piped
+/// `out_stdin_fd` *before* `sandlock_handle_wait`, or a child that reads to EOF
+/// (e.g. `cat`) never exits and the wait blocks forever. Likewise drain a piped
+/// `out_stdout_fd`/`out_stderr_fd` before waiting: a child that fills the pipe
+/// buffer blocks on write and never reaches exit.
+///
+/// # Safety
+/// As `sandlock_create`; `out_*_fd` must each be null or a valid `*mut c_int`.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_popen(
+    policy: *const sandlock_sandbox_t,
+    name: *const c_char,
+    argv: *const *const c_char,
+    argc: c_uint,
+    stdin_mode: u32,
+    stdout_mode: u32,
+    stderr_mode: u32,
+    out_stdin_fd: *mut c_int,
+    out_stdout_fd: *mut c_int,
+    out_stderr_fd: *mut c_int,
+) -> *mut sandlock_handle_t {
+    use std::os::fd::IntoRawFd;
+
+    if !out_stdin_fd.is_null() {
+        *out_stdin_fd = -1;
+    }
+    if !out_stdout_fd.is_null() {
+        *out_stdout_fd = -1;
+    }
+    if !out_stderr_fd.is_null() {
+        *out_stderr_fd = -1;
+    }
+
+    if policy.is_null() || argv.is_null() {
+        return ptr::null_mut();
+    }
+    let (stdin, stdout, stderr) = match (
+        stdio_mode_from_raw(stdin_mode),
+        stdio_mode_from_raw(stdout_mode),
+        stdio_mode_from_raw(stderr_mode),
+    ) {
+        (Some(a), Some(b), Some(c)) => (a, b, c),
+        _ => {
+            // Fail loud, not into an indistinguishable NULL: name the offending
+            // discriminant(s) so the binding author sees why the handle is null.
+            eprintln!(
+                "sandlock: sandlock_popen rejected an unknown StdioMode \
+                 (stdin={stdin_mode}, stdout={stdout_mode}, stderr={stderr_mode}); \
+                 valid values are 0=inherit, 1=piped, 2=null"
+            );
+            return ptr::null_mut();
+        }
+    };
+    let policy = &(*policy)._private;
+    let name = match optional_name(name) {
+        Ok(name) => name,
+        Err(_) => return ptr::null_mut(),
+    };
+    let args = read_argv(argv, argc);
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+    let rt = match build_live_runtime() {
+        Some(rt) => rt,
+        None => return ptr::null_mut(),
+    };
+    let mut sb = match name {
+        Some(ref n) => policy.clone().with_name(n.clone()),
+        None => policy.clone(),
+    };
+
+    // popen returns a Process borrowing `sb`; take the owned fds and let it drop
+    // so `sb` can move into the handle. The process keeps running (owned by `sb`).
+    // Return OwnedFds (not raw ints) from the future: on the Err/None branch
+    // below they drop-close themselves instead of leaking a dangling raw fd.
+    let owned = block_on_runtime(&rt, async {
+        let mut proc = sb.popen(&arg_refs, stdin, stdout, stderr).await?;
+        Ok::<_, sandlock_core::SandlockError>((
+            proc.take_stdin(),
+            proc.take_stdout(),
+            proc.take_stderr(),
+        ))
+    });
+    let (in_fd, out_fd, err_fd) = match owned {
+        Some(Ok(t)) => t,
+        _ => return ptr::null_mut(),
+    };
+    // Convert to raw only on the infallible side of the match.
+    write_or_close_fd(out_stdin_fd, in_fd.map(|f| f.into_raw_fd()).unwrap_or(-1));
+    write_or_close_fd(out_stdout_fd, out_fd.map(|f| f.into_raw_fd()).unwrap_or(-1));
+    write_or_close_fd(out_stderr_fd, err_fd.map(|f| f.into_raw_fd()).unwrap_or(-1));
+
+    Box::into_raw(Box::new(sandlock_handle_t {
+        sandbox: sb,
+        runtime: rt,
+    }))
+}
+
 /// Release a previously `sandlock_create`d child to execve. Returns 0 on
 /// success, -1 on error.
 ///
@@ -1127,10 +1262,33 @@ pub unsafe extern "C" fn sandlock_handle_pid(h: *const sandlock_handle_t) -> i32
     (*h).sandbox.pid().unwrap_or(0)
 }
 
-/// Wait for the sandbox to exit. Returns a result handle with stdout/stderr.
+/// Send SIGKILL to the handle's entire process group. Idempotent: a process
+/// that already exited is not an error. Returns 0 on success, -1 on error.
+/// The handle remains valid; call `sandlock_handle_wait` to collect the exit
+/// status and `sandlock_handle_free` to release it.
 ///
 /// # Safety
-/// `h` must be a valid handle from `sandlock_create`.
+/// `h` must be a valid handle from `sandlock_create` / `sandlock_popen`.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_handle_kill(h: *mut sandlock_handle_t) -> c_int {
+    if h.is_null() {
+        return -1;
+    }
+    let h = &mut *h;
+    if h.sandbox.kill().is_err() {
+        return -1;
+    }
+    0
+}
+
+/// Wait for the sandbox to exit. Returns a result handle with stdout/stderr.
+///
+/// For a `sandlock_popen` handle, close a piped `out_stdin_fd` and drain any
+/// piped `out_stdout_fd`/`out_stderr_fd` *before* calling this, or a child that
+/// reads to EOF or fills a pipe buffer never exits and this blocks forever.
+///
+/// # Safety
+/// `h` must be a valid handle from `sandlock_create` / `sandlock_popen`.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_handle_wait(h: *mut sandlock_handle_t) -> *mut sandlock_result_t {
     if h.is_null() {
@@ -1211,7 +1369,7 @@ pub unsafe extern "C" fn sandlock_handle_port_mappings(h: *const sandlock_handle
 /// Free a sandbox handle. Kills the process if still running.
 ///
 /// # Safety
-/// `h` must be null or a valid handle from `sandlock_create`.
+/// `h` must be null or a valid handle from `sandlock_create` / `sandlock_popen`.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_handle_free(h: *mut sandlock_handle_t) {
     if !h.is_null() {
