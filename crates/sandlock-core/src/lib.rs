@@ -35,7 +35,7 @@ pub use error::SandlockError;
 pub use sys::structs::{SeccompData, SeccompNotif};
 pub use checkpoint::Checkpoint;
 pub use protection::{Protection, ProtectionState, ProtectionPolicy, ProtectionStatus};
-pub use sandbox::{Confinement, ConfinementBuilder, Sandbox, SandboxBuilder};
+pub use sandbox::{Confinement, ConfinementBuilder, Process, Sandbox, SandboxBuilder, StdioMode};
 pub use result::{RunResult, ExitStatus};
 pub use pipeline::{Stage, Pipeline, Gather};
 pub use dry_run::{Change, ChangeKind, DryRunResult};

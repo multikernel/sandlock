@@ -245,3 +245,33 @@ fn net_deny_resolves_to_denylist_policies() {
     assert!(!set.tcp.allows("10.0.0.5".parse().unwrap(), 443));
     assert!(set.tcp.allows("8.8.8.8".parse().unwrap(), 443));
 }
+
+// Keystone of the popen child-side fd wiring: relocate_high must move a pipe
+// end to a fd >= 3 (disjoint from the 0/1/2 stdio targets) so dup2 onto a
+// target can never alias or clobber it — the regression that lost a stream
+// when a pipe end was allocated onto a std fd. Lock the invariant here; the
+// full closed-std-fd trigger is not deterministically reproducible (the
+// control PipePair claims the low fds first), so the value is this unit check
+// plus the end-to-end popen tests exercising the relocate path.
+#[test]
+fn relocate_high_moves_fd_above_stdio_range() {
+    use std::os::fd::AsRawFd;
+    let f = std::fs::File::open("/dev/null").unwrap();
+    let src = f.as_raw_fd();
+    let hi = unsafe { relocate_high(src) };
+    assert!(hi >= 3, "relocated fd must be >= 3 (disjoint from 0/1/2), got {hi}");
+    assert_ne!(hi, src, "relocate must produce a new fd");
+
+    // It is a dup of the same description, not a fresh open.
+    let mut a: libc::stat = unsafe { std::mem::zeroed() };
+    let mut b: libc::stat = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::fstat(src, &mut a) }, 0);
+    assert_eq!(unsafe { libc::fstat(hi, &mut b) }, 0);
+    assert_eq!((a.st_dev, a.st_ino), (b.st_dev, b.st_ino));
+
+    // And it carries CLOEXEC (F_DUPFD_CLOEXEC), so it won't leak past execve.
+    let flags = unsafe { libc::fcntl(hi, libc::F_GETFD) };
+    assert!(flags >= 0 && (flags & libc::FD_CLOEXEC) != 0, "relocated fd must be CLOEXEC");
+
+    unsafe { libc::close(hi) };
+}
