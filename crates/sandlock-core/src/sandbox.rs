@@ -201,6 +201,47 @@ pub enum BranchAction {
 // Runtime — private heap-allocated state, present only while running
 // ============================================================
 
+/// How one of a child's standard streams (stdin/stdout/stderr) is wired.
+///
+/// `Inherit` shares the supervisor's own fd (the child writes to the same
+/// terminal/file the parent has). `Piped` creates a pipe whose caller-side end
+/// is handed out via [`Process`] so the caller can stream to/from the live
+/// process. `Null` connects the stream to `/dev/null`.
+///
+/// The discriminants are a stable contract: the FFI/Python bindings pass them
+/// as a `u32`, so they are pinned with `#[repr(u32)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum StdioMode {
+    /// Inherit the supervisor's corresponding fd.
+    Inherit = 0,
+    /// Connect to a pipe; the caller owns the other end (see [`Process`]).
+    Piped = 1,
+    /// Connect to `/dev/null`.
+    Null = 2,
+}
+
+/// Per-stream stdio wiring for a child process.
+#[derive(Debug, Clone, Copy)]
+struct StdioSpec {
+    stdin: StdioMode,
+    stdout: StdioMode,
+    stderr: StdioMode,
+}
+
+impl StdioSpec {
+    /// Capture mode used by `run`/`spawn`: stdin inherited, stdout/stderr piped
+    /// and drained into the `RunResult` by `wait`.
+    fn capture() -> Self {
+        StdioSpec { stdin: StdioMode::Inherit, stdout: StdioMode::Piped, stderr: StdioMode::Piped }
+    }
+
+    /// Interactive mode: every stream inherits the supervisor's fd.
+    fn inherit() -> Self {
+        StdioSpec { stdin: StdioMode::Inherit, stdout: StdioMode::Inherit, stderr: StdioMode::Inherit }
+    }
+}
+
 /// Private runtime state.  Only allocated after `start()` / `run()` is
 /// called; `None` for config-only `Sandbox` instances.
 struct Runtime {
@@ -213,6 +254,9 @@ struct Runtime {
     loadavg_handle: Option<JoinHandle<()>>,
     _stdout_read: Option<std::os::fd::OwnedFd>,
     _stderr_read: Option<std::os::fd::OwnedFd>,
+    // Parent-held write end of a piped stdin (popen). The caller takes it via
+    // `Process::take_stdin`; closing it signals EOF to the child.
+    _stdin_write: Option<std::os::fd::OwnedFd>,
     seccomp_cow: Option<crate::cow::seccomp::SeccompCowBranch>,
     supervisor_resource: Option<Arc<tokio::sync::Mutex<crate::seccomp::state::ResourceState>>>,
     supervisor_cow: Option<Arc<tokio::sync::Mutex<crate::seccomp::state::CowState>>>,
@@ -660,6 +704,11 @@ impl Sandbox {
             });
         }
 
+        // Deliver EOF to a piped stdin the caller never took: otherwise a child
+        // that reads stdin (e.g. `cat`) blocks forever and this wait never
+        // returns. A taken stdin is already None here (the caller owns it).
+        drop(self.rt_mut()._stdin_write.take());
+
         // Wait for the top-level child to exit. Prefer the child's pidfd via
         // `AsyncFd`: pidfd readiness fires only on *exit*, so — unlike a
         // `waitpid` loop — it never consumes the child's ptrace-stops, which
@@ -728,6 +777,39 @@ impl Sandbox {
         self.create_interactive(cmd).await?;
         self.start()?;
         self.wait_until_exec().await
+    }
+
+    /// Spawn `cmd` with per-stream stdio wiring and return a live [`Process`].
+    ///
+    /// Unlike `run` (which buffers stdout/stderr into a `RunResult` only after
+    /// the process exits), `popen` hands the caller the pipe end of every
+    /// [`StdioMode::Piped`] stream so it can drive the process's stdio while it
+    /// is alive — MCP/LSP servers, REPLs, any request/response protocol over
+    /// stdio. The child is released to `execve` before this returns and runs
+    /// under the full confinement. It is owned by this `Sandbox`: dropping the
+    /// `Sandbox` (or calling [`Sandbox::kill`] / [`Process::kill`]) sends SIGKILL
+    /// to its process group and reaps it.
+    ///
+    /// Note: the seccomp-notify supervisor runs as a task on the async runtime,
+    /// and a confined child only makes progress while that supervisor is pumped.
+    /// Do not block the runtime's executor on a piped stream — read/write the
+    /// `Process` fds from a separate thread (or async IO), and run on a
+    /// multi-threaded runtime. A blocking pipe read on a single-threaded runtime
+    /// starves the supervisor and deadlocks the child.
+    pub async fn popen(
+        &mut self,
+        cmd: &[&str],
+        stdin: StdioMode,
+        stdout: StdioMode,
+        stderr: StdioMode,
+    ) -> Result<Process<'_>, crate::error::SandlockError> {
+        self.do_create_stdio(cmd, StdioSpec { stdin, stdout, stderr }).await?;
+        // No wait_until_exec here: a streaming caller does not need the child to
+        // have reached user code (a reader naturally blocks until bytes arrive),
+        // and the exec poll would spuriously time out on a process that exits
+        // before it is observed. `start` releases the child to execve.
+        self.start()?;
+        Ok(Process { sandbox: self })
     }
 
     /// Restore a checkpoint into a fresh, fully-sandboxed process.
@@ -1161,6 +1243,7 @@ impl Sandbox {
                 loadavg_handle: None,
                 _stdout_read: None,
                 _stderr_read: None,
+                _stdin_write: None,
                 seccomp_cow: None,
                 supervisor_resource: None,
                 supervisor_cow: None,
@@ -1254,6 +1337,7 @@ impl Sandbox {
             loadavg_handle: None,
             _stdout_read: None,
             _stderr_read: None,
+            _stdin_write: None,
             seccomp_cow: None,
             supervisor_resource: None,
             supervisor_cow: None,
@@ -1296,7 +1380,14 @@ impl Sandbox {
     // ready_r read, awaiting do_start to release it to execve).
     // ================================================================
 
+    /// Thin compatibility wrapper: `capture` selects between the capture stdio
+    /// spec (stdin inherited, stdout/stderr piped-and-drained) and full inherit.
     async fn do_create(&mut self, cmd: &[&str], capture: bool) -> Result<(), crate::error::SandlockError> {
+        let stdio = if capture { StdioSpec::capture() } else { StdioSpec::inherit() };
+        self.do_create_stdio(cmd, stdio).await
+    }
+
+    async fn do_create_stdio(&mut self, cmd: &[&str], stdio: StdioSpec) -> Result<(), crate::error::SandlockError> {
         use std::ffi::CString;
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use crate::error::SandboxRuntimeError;
@@ -1437,31 +1528,25 @@ impl Sandbox {
             &handler_syscalls,
         );
 
-        let (stdout_r, stderr_r) = if capture {
-            let mut stdout_fds = [0i32; 2];
-            let mut stderr_fds = [0i32; 2];
-            if unsafe { libc::pipe2(stdout_fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
-                return Err(SandboxRuntimeError::Io(std::io::Error::last_os_error()).into());
-            }
-            if unsafe { libc::pipe2(stderr_fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
-                unsafe {
-                    libc::close(stdout_fds[0]);
-                    libc::close(stdout_fds[1]);
-                }
-                return Err(SandboxRuntimeError::Io(std::io::Error::last_os_error()).into());
-            }
-            (
-                Some((
-                    unsafe { OwnedFd::from_raw_fd(stdout_fds[0]) },
-                    unsafe { OwnedFd::from_raw_fd(stdout_fds[1]) },
-                )),
-                Some((
-                    unsafe { OwnedFd::from_raw_fd(stderr_fds[0]) },
-                    unsafe { OwnedFd::from_raw_fd(stderr_fds[1]) },
-                )),
-            )
+        // Per-stream stdio wiring. Each Piped stream gets a CLOEXEC pipe whose
+        // parent-side end we keep: the caller writes the child's stdin and reads
+        // its stdout/stderr (see `popen` / `Process`). `pipe2` returns
+        // (read=fds[0], write=fds[1]); for stdin the child reads, so the parent
+        // keeps the write end, and vice-versa for stdout/stderr.
+        let stdin_p = if stdio.stdin == StdioMode::Piped {
+            Some(make_cloexec_pipe().map_err(SandboxRuntimeError::Io)?)
         } else {
-            (None, None)
+            None
+        };
+        let stdout_p = if stdio.stdout == StdioMode::Piped {
+            Some(make_cloexec_pipe().map_err(SandboxRuntimeError::Io)?)
+        } else {
+            None
+        };
+        let stderr_p = if stdio.stderr == StdioMode::Piped {
+            Some(make_cloexec_pipe().map_err(SandboxRuntimeError::Io)?)
+        } else {
+            None
         };
 
         // Capture our PID before fork so the child can detect parent death
@@ -1487,14 +1572,41 @@ impl Sandbox {
                 unsafe { libc::dup2(source_fd, target_fd) };
             }
 
-            if let Some((_, ref stdout_w)) = stdout_r {
-                unsafe { libc::dup2(stdout_w.as_raw_fd(), 1) };
+            // Wire stdin/stdout/stderr per their modes. This is a post-fork path
+            // with a real class of fd hazards: when the supervisor was started
+            // with a std fd (0/1/2) closed, `pipe2` can allocate a pipe end onto
+            // that very fd, so a naive `dup2(end, std)` either aliases the target
+            // or a sibling stream's later dup2 clobbers an end still needed, and a
+            // raw-fd snapshot taken before the dup2s goes stale. To make wiring
+            // order-independent, first relocate each Piped source to a fresh high
+            // fd (>= 3, disjoint from the 0/1/2 targets), then dup2 it down.
+            //
+            // The original OwnedFd ends are O_CLOEXEC, so they close on their own
+            // at execve; `mem::forget` them so their Drop cannot close a fd number
+            // we have since reassigned to 0/1/2.
+            let safe_in = if stdio.stdin == StdioMode::Piped {
+                stdin_p.as_ref().map(|(r, _)| unsafe { relocate_high(r.as_raw_fd()) })
+            } else {
+                None
+            };
+            let safe_out = if stdio.stdout == StdioMode::Piped {
+                stdout_p.as_ref().map(|(_, w)| unsafe { relocate_high(w.as_raw_fd()) })
+            } else {
+                None
+            };
+            let safe_err = if stdio.stderr == StdioMode::Piped {
+                stderr_p.as_ref().map(|(_, w)| unsafe { relocate_high(w.as_raw_fd()) })
+            } else {
+                None
+            };
+            std::mem::forget(stdin_p);
+            std::mem::forget(stdout_p);
+            std::mem::forget(stderr_p);
+            unsafe {
+                wire_child_stdio(stdio.stdin, 0, safe_in, libc::O_RDONLY);
+                wire_child_stdio(stdio.stdout, 1, safe_out, libc::O_WRONLY);
+                wire_child_stdio(stdio.stderr, 2, safe_err, libc::O_WRONLY);
             }
-            if let Some((_, ref stderr_w)) = stderr_r {
-                unsafe { libc::dup2(stderr_w.as_raw_fd(), 2) };
-            }
-            drop(stdout_r);
-            drop(stderr_r);
 
             let gather_keep_fds: Vec<i32> = extra_fds_copy.iter().map(|&(target, _)| target).collect();
 
@@ -1526,8 +1638,9 @@ impl Sandbox {
         drop(pipes.notif_w);
         drop(pipes.ready_r);
 
-        self.rt_mut()._stdout_read = stdout_r.map(|(r, _w)| r);
-        self.rt_mut()._stderr_read = stderr_r.map(|(r, _w)| r);
+        self.rt_mut()._stdin_write = stdin_p.map(|(_r, w)| w);
+        self.rt_mut()._stdout_read = stdout_p.map(|(r, _w)| r);
+        self.rt_mut()._stderr_read = stderr_p.map(|(r, _w)| r);
 
         self.rt_mut().child_pid = Some(pid);
         // State remains `Created` until `do_start` writes ready_w to release
@@ -1806,6 +1919,76 @@ impl Sandbox {
 }
 
 // ================================================================
+// ================================================================
+// Process — a live process with caller-owned stdio (popen)
+// ================================================================
+
+/// A live sandboxed process with caller-owned stdio streams, returned by
+/// [`Sandbox::popen`].
+///
+/// `take_stdin` / `take_stdout` / `take_stderr` move out the pipe end of each
+/// stream opened with [`StdioMode::Piped`] (each available once); the caller
+/// reads/writes those while the process runs. Unlike `std::process::Child`,
+/// this *borrows* the originating [`Sandbox`] rather than owning the process:
+/// the process is killed and reaped when that `Sandbox` is dropped, or eagerly
+/// via [`Process::kill`].
+///
+/// A `Process` that is dropped without [`Process::wait`] leaves the child
+/// running until the `Sandbox` is dropped — call `wait` (or `kill`) to end it.
+#[must_use = "a Process is a live confined child; call wait() (or kill()) or it runs until the Sandbox is dropped"]
+pub struct Process<'a> {
+    sandbox: &'a mut Sandbox,
+}
+
+impl Process<'_> {
+    /// Take the write end of a `Piped` stdin. The caller writes the child's
+    /// input; closing this fd signals EOF. `None` if stdin was not piped or was
+    /// already taken.
+    ///
+    /// Deadlock warning (as with `std::process::Child`): if you take stdin you
+    /// own it — drop/close it before [`Process::wait`], or a child that reads to
+    /// EOF (e.g. `cat`) never exits and `wait` blocks forever. (An *untaken*
+    /// piped stdin is closed by `wait` for you.)
+    pub fn take_stdin(&mut self) -> Option<std::os::fd::OwnedFd> {
+        self.sandbox.rt_mut()._stdin_write.take()
+    }
+
+    /// Take the read end of a `Piped` stdout. `None` if stdout was not piped or
+    /// was already taken.
+    pub fn take_stdout(&mut self) -> Option<std::os::fd::OwnedFd> {
+        self.sandbox.rt_mut()._stdout_read.take()
+    }
+
+    /// Take the read end of a `Piped` stderr. `None` if stderr was not piped or
+    /// was already taken.
+    pub fn take_stderr(&mut self) -> Option<std::os::fd::OwnedFd> {
+        self.sandbox.rt_mut()._stderr_read.take()
+    }
+
+    /// The child PID, or `None` if not spawned. Remains `Some` after the child
+    /// exits (until the `Sandbox` is dropped).
+    pub fn pid(&self) -> Option<i32> {
+        self.sandbox.pid()
+    }
+
+    /// Send SIGKILL to the child's *entire process group* (every process the
+    /// workload spawned, not just the top-level child). Idempotent — a process
+    /// that already exited is not an error.
+    pub fn kill(&mut self) -> Result<(), crate::error::SandlockError> {
+        self.sandbox.kill()
+    }
+
+    /// Wait for the child to exit. Any `Piped` stdout/stderr the caller did not
+    /// take is drained into the returned `RunResult`; taken streams are `None`
+    /// because the caller owns them. An untaken piped stdin is closed here so the
+    /// child sees EOF; a *taken* stdin the caller must close itself first (see
+    /// [`Process::take_stdin`]) or this blocks forever.
+    pub async fn wait(self) -> Result<crate::result::RunResult, crate::error::SandlockError> {
+        self.sandbox.wait().await
+    }
+}
+
+// ================================================================
 // Drop for Sandbox — kills and reaps child if still running
 // ================================================================
 
@@ -1900,6 +2083,86 @@ fn sandbox_read_exact(fd: i32, buf: &mut [u8]) {
         let r = unsafe { libc::read(fd, buf[off..].as_mut_ptr() as *mut _, buf.len() - off) };
         if r <= 0 { break; }
         off += r as usize;
+    }
+}
+
+/// Create a `O_CLOEXEC` pipe, returning `(read_end, write_end)` as owned fds.
+/// `pipe2` yields `fds[0]` = read, `fds[1]` = write.
+fn make_cloexec_pipe() -> Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd), std::io::Error> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let mut fds = [0i32; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+}
+
+/// Duplicate `src` to a fresh fd `>= 3` with `O_CLOEXEC`, in the forked child.
+/// Used to move a pipe end out of the 0/1/2 target range before wiring so that
+/// `dup2(_, std)` can never alias the target or clobber a sibling stream's end.
+/// Best-effort: returns the original `src` if the dup fails (caller still wires
+/// it; a failure here only degrades to the legacy hazard, never a leak).
+///
+/// # Safety
+/// Must run in the forked child; `src` must be a valid fd.
+unsafe fn relocate_high(src: i32) -> i32 {
+    let hi = libc::fcntl(src, libc::F_DUPFD_CLOEXEC, 3);
+    if hi >= 0 {
+        hi
+    } else {
+        src
+    }
+}
+
+/// Wire one of the child's std fds (`target` = 0/1/2) according to `mode`, in
+/// the forked child just before execve. Single audited path for all three
+/// streams (async-signal-safe: only open/dup2/close/fcntl).
+///
+/// For `Piped`, `pipe_src` is a relocated high fd (see `relocate_high`), so
+/// `src != target` in the normal case and `dup2` clears `O_CLOEXEC` on the
+/// target (it survives execve); the relocated copy is then closed. The
+/// `src == target` arm is only reached if relocation failed (fd exhaustion).
+///
+/// # Safety
+/// Must run in the forked child before execve; `pipe_src` (if any) must be a
+/// valid fd. `devnull_flags` is `O_RDONLY` for stdin, `O_WRONLY` for stdout/err.
+unsafe fn wire_child_stdio(mode: StdioMode, target: i32, pipe_src: Option<i32>, devnull_flags: i32) {
+    match mode {
+        StdioMode::Inherit => {}
+        StdioMode::Piped => {
+            if let Some(src) = pipe_src {
+                if src == target {
+                    // Relocation failed and the end sits on `target`; dup2 would
+                    // no-op and leave O_CLOEXEC set, so clear it so the fd
+                    // survives execve. Do not close it — it *is* the target.
+                    let flags = libc::fcntl(target, libc::F_GETFD);
+                    if flags >= 0 {
+                        libc::fcntl(target, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+                    }
+                } else if libc::dup2(src, target) < 0 {
+                    // Fail closed (mirror Null): never leave the supervisor's fd.
+                    libc::close(target);
+                    libc::close(src);
+                } else {
+                    libc::close(src);
+                }
+            }
+        }
+        StdioMode::Null => {
+            // Opened without O_CLOEXEC so it survives execve.
+            let fd = libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, devnull_flags);
+            if fd < 0 {
+                // Fail closed: workload gets EBADF, never the supervisor's fd.
+                libc::close(target);
+            } else if fd == target {
+                // /dev/null landed on the (previously closed) target — done.
+            } else if libc::dup2(fd, target) < 0 {
+                libc::close(target);
+                libc::close(fd);
+            } else {
+                libc::close(fd);
+            }
+        }
     }
 }
 
