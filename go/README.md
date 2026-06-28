@@ -5,8 +5,9 @@ lightweight Linux process sandbox built on Landlock, seccomp-bpf, and seccomp
 user notification. No root, no Docker, no namespaces.
 
 The bindings bind the sandlock C ABI (`libsandlock_ffi`) via cgo, mirroring the
-Python SDK's `Sandbox` surface. **Linux only**; the runtime requires Linux
-6.12+ (Landlock ABI v6).
+Python SDK's `Sandbox` surface. **Linux only**; by default the runtime requires
+Linux 6.12+ (Landlock ABI v6), but the `AllowDegraded` / `Disable` fields let a
+sandbox run on older kernels by degrading or disabling the v6-only protections.
 
 ```go
 import sandlock "github.com/multikernel/sandlock/go"

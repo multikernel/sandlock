@@ -242,6 +242,14 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 		b = C.sandlock_sandbox_builder_port_remap(b, cbool(true))
 	}
 
+	// Protection opt-out (Landlock per-protection posture).
+	for _, p := range s.AllowDegraded {
+		b = C.sandlock_sandbox_builder_allow_degraded(b, C.uint32_t(p))
+	}
+	for _, p := range s.Disable {
+		b = C.sandlock_sandbox_builder_disable(b, C.uint32_t(p))
+	}
+
 	// HTTP ACL.
 	for _, r := range s.HTTPAllow {
 		str(func(b *C.sandlock_builder_t, c *C.char) *C.sandlock_builder_t {
@@ -753,6 +761,13 @@ func LandlockABIVersion() int { return int(C.sandlock_landlock_abi_version()) }
 
 // MinLandlockABI returns the minimum Landlock ABI version this build requires.
 func MinLandlockABI() int { return int(C.sandlock_min_landlock_abi()) }
+
+// ProtectionMinABI returns the minimum Landlock ABI version the host kernel
+// must support for the given protection to be available, or 0 for an unknown
+// protection value.
+func ProtectionMinABI(p Protection) int {
+	return int(C.sandlock_protection_min_abi(C.uint32_t(p)))
+}
 
 // SyscallNr resolves a syscall name (e.g. "openat") to its kernel syscall
 // number for the host architecture. It returns an error for names sandlock

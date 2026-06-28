@@ -3,8 +3,10 @@
 // notification. It binds the sandlock C ABI (libsandlock_ffi) via cgo and
 // mirrors the Python SDK's Sandbox surface.
 //
-// The bindings are Linux-only. The runtime requires Linux 6.12+ (Landlock
-// ABI v6); see the project README for the full kernel feature matrix.
+// The bindings are Linux-only. By default the runtime requires Linux 6.12+
+// (Landlock ABI v6); use the AllowDegraded or Disable fields to run on older
+// kernels by degrading or disabling the v6-only protections. See the project
+// README for the full kernel feature matrix.
 //
 // # Building
 //
@@ -150,6 +152,20 @@ type PolicyContext struct {
 // activity, so captured state should be synchronized when mutated.
 type PolicyFunc func(event SyscallEvent, ctx *PolicyContext) PolicyDecision
 
+// Protection identifies a single Landlock protection whose enforcement
+// posture can be opted out of via the Sandbox AllowDegraded / Disable fields.
+// The values match the sandlock C ABI discriminants.
+type Protection uint32
+
+const (
+	ProtectionFSRefer                 Protection = 0 // file reparenting (Landlock ABI v2)
+	ProtectionFSTruncate              Protection = 1 // truncate(2) (ABI v3)
+	ProtectionNetTCP                  Protection = 2 // TCP bind/connect (ABI v4)
+	ProtectionFSIoctlDev              Protection = 3 // device ioctl(2) (ABI v5)
+	ProtectionSignalScope             Protection = 4 // signal scoping (ABI v6)
+	ProtectionAbstractUnixSocketScope Protection = 5 // abstract UNIX socket scoping (ABI v6)
+)
+
 // Sandbox holds the policy configuration for confining a process. Every field
 // is optional; an unset field means "no restriction" unless documented
 // otherwise. sandlock's default syscall blocklist is always applied.
@@ -171,6 +187,20 @@ type Sandbox struct {
 	// FSMount maps virtual paths inside the chroot to host directories,
 	// like a bind mount without kernel mounts or root.
 	FSMount map[string]string
+
+	// Protection opt-out (Landlock per-protection posture).
+	//
+	// By default every protection is enforced strictly, which requires the
+	// host kernel to support it (the highest floor is ABI v6); on an older
+	// kernel a strict protection it cannot satisfy makes the build fail.
+	// AllowDegraded marks protections to enforce where the host supports them
+	// and silently skip otherwise; Disable turns them off entirely. Together
+	// they let a sandbox run on a kernel below the default v6 floor.
+	//
+	// A protection listed in both fields is disabled: Disable is applied
+	// last and takes precedence.
+	AllowDegraded []Protection
+	Disable       []Protection
 
 	// Network.
 	//

@@ -251,3 +251,63 @@ func TestConfineRejectsSupervisorConfig(t *testing.T) {
 		t.Logf("Confine rejected with: %v", err)
 	}
 }
+
+func TestProtectionMinABI(t *testing.T) {
+	// Also pins the Protection discriminants: a wrong value would resolve to a
+	// different protection (or 0 for unknown) and fail these expectations.
+	cases := []struct {
+		p    sandlock.Protection
+		want int
+	}{
+		{sandlock.ProtectionFSRefer, 2},
+		{sandlock.ProtectionFSTruncate, 3},
+		{sandlock.ProtectionNetTCP, 4},
+		{sandlock.ProtectionFSIoctlDev, 5},
+		{sandlock.ProtectionSignalScope, 6},
+		{sandlock.ProtectionAbstractUnixSocketScope, 6},
+	}
+	for _, c := range cases {
+		if got := sandlock.ProtectionMinABI(c.p); got != c.want {
+			t.Errorf("ProtectionMinABI(%d) = %d, want %d", c.p, got, c.want)
+		}
+	}
+}
+
+// TestRunDegradedBelowV6 exercises the Protection opt-out end to end: a
+// fully-degradable policy must build and confine on any Landlock-capable
+// kernel, degrading the protections the host cannot provide instead of failing
+// the build the way the default strict posture does below ABI v6. It runs on
+// the low-ABI CI image where the strict suite is skipped.
+func TestRunDegradedBelowV6(t *testing.T) {
+	if sandlock.LandlockABIVersion() < 1 {
+		t.Skip("Landlock unavailable on this host")
+	}
+	// Negative control: below the v6 floor the default strict policy must fail
+	// to build, so the degraded run's success is attributable to the opt-out
+	// rather than to the protections being satisfiable on this host anyway.
+	// On a v6+ host strict would succeed, so the contrast only applies below v6.
+	if sandlock.LandlockABIVersion() < 6 {
+		strict := &sandlock.Sandbox{FSReadable: rootfs}
+		if _, err := strict.Run(context.Background(), "echo", "ok"); err == nil {
+			t.Fatalf("default strict policy unexpectedly succeeded on Landlock ABI v%d (< v6); the degraded assertion would prove nothing", sandlock.LandlockABIVersion())
+		}
+	}
+	sb := &sandlock.Sandbox{
+		FSReadable: rootfs,
+		AllowDegraded: []sandlock.Protection{
+			sandlock.ProtectionFSRefer,
+			sandlock.ProtectionFSTruncate,
+			sandlock.ProtectionNetTCP,
+			sandlock.ProtectionFSIoctlDev,
+			sandlock.ProtectionSignalScope,
+			sandlock.ProtectionAbstractUnixSocketScope,
+		},
+	}
+	res, err := sb.Run(context.Background(), "echo", "ok")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !res.Success || strings.TrimSpace(string(res.Stdout)) != "ok" {
+		t.Fatalf("degraded run failed: exit=%d stdout=%q stderr=%q", res.ExitCode, res.Stdout, res.Stderr)
+	}
+}
