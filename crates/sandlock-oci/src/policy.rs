@@ -67,6 +67,103 @@ pub struct OciPolicy {
     /// `builder.user(...)`; core decides whether a user namespace is actually
     /// needed (it self-skips when the identity already matches the runtime).
     pub run_user: Option<RunAs>,
+
+    // Networking + HTTP ACL, sourced from `io.sandlock.*` OCI annotations (the
+    // runtime spec has no native field for these). Multi-value lists use `;` as
+    // the separator. Enforcement is the same seccomp-notif machinery the
+    // supervisor already runs for filesystem/proc interception.
+    /// Outbound allowlist (`io.sandlock.network.allow`).
+    #[serde(default)]
+    pub net_allow: Vec<String>,
+    /// Outbound denylist (`io.sandlock.network.deny`).
+    #[serde(default)]
+    pub net_deny: Vec<String>,
+    /// Bind allowlist port specs (`io.sandlock.network.allow_bind`).
+    #[serde(default)]
+    pub net_allow_bind: Vec<String>,
+    /// Bind denylist port specs (`io.sandlock.network.deny_bind`).
+    #[serde(default)]
+    pub net_deny_bind: Vec<String>,
+    /// Transparent port remapping for multi-sandbox isolation
+    /// (`io.sandlock.network.port_remap`). Defaults to on so container
+    /// servers can bind; the annotation is an explicit opt-out.
+    #[serde(default = "default_port_remap")]
+    pub port_remap: bool,
+    /// HTTP ACL allow rules (`io.sandlock.http.allow`).
+    #[serde(default)]
+    pub http_allow: Vec<String>,
+    /// HTTP ACL deny rules (`io.sandlock.http.deny`).
+    #[serde(default)]
+    pub http_deny: Vec<String>,
+    /// TCP ports to intercept for the HTTP ACL (`io.sandlock.http.ports`).
+    #[serde(default)]
+    pub http_ports: Vec<u16>,
+    /// Host-side PEM CA cert for HTTPS MITM (`io.sandlock.config.http_ca`), bundle-relative.
+    #[serde(default)]
+    pub http_ca: Option<PathBuf>,
+    /// Host-side PEM CA key for HTTPS MITM (`io.sandlock.config.http_key`), bundle-relative.
+    #[serde(default)]
+    pub http_key: Option<PathBuf>,
+    /// Sandbox-virtual trust bundles to splice the MITM CA into (`io.sandlock.config.http_inject_ca`).
+    #[serde(default)]
+    pub http_inject_ca: Vec<PathBuf>,
+    /// Host-side path to write the active MITM CA cert (`io.sandlock.config.http_ca_out`), bundle-relative.
+    #[serde(default)]
+    pub http_ca_out: Option<PathBuf>,
+}
+
+/// Annotation key prefix for sandlock-specific OCI configuration.
+const SANDLOCK_ANN_PREFIX: &str = "io.sandlock.";
+
+/// Look up a `io.sandlock.<key>` annotation value.
+fn annotation<'a>(
+    annotations: Option<&'a HashMap<String, String>>,
+    key: &str,
+) -> Option<&'a str> {
+    annotations
+        .and_then(|m| m.get(&format!("{SANDLOCK_ANN_PREFIX}{key}")))
+        .map(String::as_str)
+}
+
+/// Split a `;`-separated annotation list into trimmed, non-empty items.
+///
+/// `;` is the separator (not `,`) because `,` is significant *inside* net specs
+/// (`github.com:22,443` is two ports on one host) and HTTP rules contain spaces,
+/// so `;` is the only delimiter unambiguous across every grammar.
+fn annotation_list(value: Option<&str>) -> Vec<String> {
+    value
+        .map(|s| {
+            s.split(';')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Serde default for [`OciPolicy::port_remap`]: on, matching `from_spec`.
+fn default_port_remap() -> bool {
+    true
+}
+
+/// Parse a boolean annotation: `true`/`1`/`yes`/`on` (case-insensitive) are true.
+fn annotation_bool(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("true" | "1" | "yes" | "on")
+    )
+}
+
+/// Resolve a host-side annotation path: absolute paths as-is, relative ones
+/// against the OCI bundle directory so CA material can travel with the bundle.
+fn resolve_host_path(bundle: &Path, value: &str) -> PathBuf {
+    let p = PathBuf::from(value);
+    if p.is_absolute() {
+        p
+    } else {
+        bundle.join(p)
+    }
 }
 
 impl OciPolicy {
@@ -192,6 +289,49 @@ impl OciPolicy {
             RunAs { uid: u.uid(), gid: u.gid() }
         });
 
+        // Networking + HTTP ACL from `io.sandlock.*` annotations. The OCI runtime
+        // spec carries no native outbound allow/deny or transparent-proxy config,
+        // so it travels in annotations; `;` separates multi-value lists.
+        let ann = spec.annotations().as_ref();
+        let net_allow = annotation_list(annotation(ann, "network.allow"));
+        let net_deny = annotation_list(annotation(ann, "network.deny"));
+        let net_allow_bind = annotation_list(annotation(ann, "network.allow_bind"));
+        let net_deny_bind = annotation_list(annotation(ann, "network.deny_bind"));
+        // Container workloads legitimately run servers (nginx, etc.). sandlock
+        // gates bind() by default-deny (Landlock BIND_TCP), so without port
+        // remapping an in-container server fails bind() with EACCES and the
+        // container exits, which in turn hangs any readiness/verification exec
+        // that waits on it. Remapped binds are emulated on-behalf and succeed,
+        // using the requested port when free and a fresh host port only on
+        // conflict, so co-located sandboxes never collide on a host port.
+        // Default on; `io.sandlock.network.port_remap: "false"` opts out.
+        let port_remap =
+            annotation(ann, "network.port_remap").is_none_or(|v| annotation_bool(Some(v)));
+        let http_allow = annotation_list(annotation(ann, "http.allow"));
+        let http_deny = annotation_list(annotation(ann, "http.deny"));
+        let http_ports = annotation_list(annotation(ann, "http.ports"))
+            .iter()
+            .map(|s| {
+                s.parse::<u16>().map_err(|_| {
+                    anyhow::anyhow!(
+                        "invalid io.sandlock.http.ports entry {:?}: expected a port number",
+                        s
+                    )
+                })
+            })
+            .collect::<Result<Vec<u16>>>()?;
+        // CA cert/key/output are host-side files the supervisor reads or writes,
+        // so resolve them relative to the bundle. The inject targets are
+        // sandbox-virtual paths (e.g. /etc/ssl/certs/ca-certificates.crt) that
+        // core resolves through the chroot/mounts, so pass them through as-is.
+        let http_ca = annotation(ann, "config.http_ca").map(|p| resolve_host_path(bundle, p));
+        let http_key = annotation(ann, "config.http_key").map(|p| resolve_host_path(bundle, p));
+        let http_ca_out = annotation(ann, "config.http_ca_out").map(|p| resolve_host_path(bundle, p));
+        let http_inject_ca = annotation_list(annotation(ann, "config.http_inject_ca"))
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+
         Ok(OciPolicy {
             rootfs,
             fs_read,
@@ -206,6 +346,18 @@ impl OciPolicy {
             cpu_cores,
             scratch_dirs,
             run_user,
+            net_allow,
+            net_deny,
+            net_allow_bind,
+            net_deny_bind,
+            port_remap,
+            http_allow,
+            http_deny,
+            http_ports,
+            http_ca,
+            http_key,
+            http_inject_ca,
+            http_ca_out,
         })
     }
 
@@ -268,14 +420,45 @@ impl OciPolicy {
             builder = builder.user(ru.uid, ru.gid);
         }
 
-        // Container workloads legitimately run servers (nginx, etc.). sandlock
-        // gates bind() by default-deny (Landlock BIND_TCP), so without this an
-        // in-container server fails bind() with EACCES and the container exits,
-        // which in turn hangs any readiness/verification exec that waits on it.
-        // Enable port remapping: binds are emulated on-behalf and succeed,
-        // using the requested port when free and a fresh host port only on
-        // conflict, so co-located sandboxes never collide on a host port.
-        builder = builder.port_remap(true);
+        // Networking + HTTP ACL. Each is a no-op when its annotation was absent.
+        // The network seccomp handlers register automatically once the policy
+        // carries destination/bind rules, so no OCI-side enforcement is needed.
+        for spec in &self.net_allow {
+            builder = builder.net_allow(spec.clone());
+        }
+        for spec in &self.net_deny {
+            builder = builder.net_deny(spec.clone());
+        }
+        for spec in &self.net_allow_bind {
+            builder = builder.net_allow_bind(spec.clone());
+        }
+        for spec in &self.net_deny_bind {
+            builder = builder.net_deny_bind(spec.clone());
+        }
+        if self.port_remap {
+            builder = builder.port_remap(true);
+        }
+        for rule in &self.http_allow {
+            builder = builder.http_allow(rule);
+        }
+        for rule in &self.http_deny {
+            builder = builder.http_deny(rule);
+        }
+        for port in &self.http_ports {
+            builder = builder.http_port(*port);
+        }
+        if let Some(ref ca) = self.http_ca {
+            builder = builder.http_ca(ca);
+        }
+        if let Some(ref key) = self.http_key {
+            builder = builder.http_key(key);
+        }
+        for path in &self.http_inject_ca {
+            builder = builder.http_inject_ca(path);
+        }
+        if let Some(ref out) = self.http_ca_out {
+            builder = builder.http_ca_out(out);
+        }
 
         builder.build_unchecked().map_err(Into::into)
     }
@@ -479,6 +662,119 @@ mod tests {
             )
             .build()
             .unwrap()
+    }
+
+    fn spec_with_annotations(pairs: &[(&str, &str)]) -> Spec {
+        let mut annotations = HashMap::new();
+        for (k, v) in pairs {
+            annotations.insert(k.to_string(), v.to_string());
+        }
+        SpecBuilder::default()
+            .version("1.0.2")
+            .root(RootBuilder::default().path("rootfs").readonly(false).build().unwrap())
+            .annotations(annotations)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn from_spec_parses_network_annotations() {
+        let dir = tempdir().unwrap();
+        let bundle = dir.path();
+        fs::create_dir_all(bundle.join("rootfs")).unwrap();
+
+        let spec = spec_with_annotations(&[
+            ("io.sandlock.network.allow", "api.openai.com:443; github.com:22,443"),
+            ("io.sandlock.network.deny", "10.0.0.0/8"),
+            ("io.sandlock.network.allow_bind", "8080,9000-9005"),
+            ("io.sandlock.network.deny_bind", "22"),
+            ("io.sandlock.network.port_remap", "true"),
+        ]);
+        let policy = OciPolicy::from_spec(&spec, bundle, "test").unwrap();
+
+        // `;` separates rules; `,` stays inside a single rule.
+        assert_eq!(policy.net_allow, vec!["api.openai.com:443", "github.com:22,443"]);
+        assert_eq!(policy.net_deny, vec!["10.0.0.0/8"]);
+        assert_eq!(policy.net_allow_bind, vec!["8080,9000-9005"]);
+        assert_eq!(policy.net_deny_bind, vec!["22"]);
+        assert!(policy.port_remap);
+    }
+
+    #[test]
+    fn from_spec_parses_http_annotations_and_resolves_paths() {
+        let dir = tempdir().unwrap();
+        let bundle = dir.path();
+        fs::create_dir_all(bundle.join("rootfs")).unwrap();
+
+        let spec = spec_with_annotations(&[
+            ("io.sandlock.http.allow", "GET api.internal/v1/*; POST api.internal/submit"),
+            ("io.sandlock.http.deny", "* */admin/*"),
+            ("io.sandlock.http.ports", "80;8080"),
+            ("io.sandlock.config.http_ca", "ca.pem"),
+            ("io.sandlock.config.http_key", "/abs/key.pem"),
+            ("io.sandlock.config.http_inject_ca", "/etc/ssl/certs/ca-certificates.crt"),
+        ]);
+        let policy = OciPolicy::from_spec(&spec, bundle, "test").unwrap();
+
+        assert_eq!(policy.http_allow, vec!["GET api.internal/v1/*", "POST api.internal/submit"]);
+        assert_eq!(policy.http_deny, vec!["* */admin/*"]);
+        assert_eq!(policy.http_ports, vec![80, 8080]);
+        // Relative host path resolves against the bundle; absolute stays as-is.
+        assert_eq!(policy.http_ca, Some(bundle.join("ca.pem")));
+        assert_eq!(policy.http_key, Some(PathBuf::from("/abs/key.pem")));
+        // Inject targets are sandbox-virtual, passed through unchanged.
+        assert_eq!(policy.http_inject_ca, vec![PathBuf::from("/etc/ssl/certs/ca-certificates.crt")]);
+    }
+
+    #[test]
+    fn from_spec_rejects_malformed_http_port() {
+        let dir = tempdir().unwrap();
+        let bundle = dir.path();
+        fs::create_dir_all(bundle.join("rootfs")).unwrap();
+        let spec = spec_with_annotations(&[("io.sandlock.http.ports", "not-a-port")]);
+        assert!(OciPolicy::from_spec(&spec, bundle, "test").is_err());
+    }
+
+    #[test]
+    fn from_spec_without_network_annotations_is_empty() {
+        let dir = tempdir().unwrap();
+        let bundle = dir.path();
+        fs::create_dir_all(bundle.join("rootfs")).unwrap();
+        let policy = OciPolicy::from_spec(&minimal_spec(), bundle, "test").unwrap();
+        assert!(policy.net_allow.is_empty());
+        assert!(policy.net_deny.is_empty());
+        // Port remapping stays on by default so container servers can bind.
+        assert!(policy.port_remap);
+        assert!(policy.http_ports.is_empty());
+        assert!(policy.http_ca.is_none());
+    }
+
+    #[test]
+    fn port_remap_annotation_opts_out() {
+        let dir = tempdir().unwrap();
+        let bundle = dir.path();
+        fs::create_dir_all(bundle.join("rootfs")).unwrap();
+        let spec = spec_with_annotations(&[("io.sandlock.network.port_remap", "false")]);
+        let policy = OciPolicy::from_spec(&spec, bundle, "test").unwrap();
+        assert!(!policy.port_remap);
+        let sandbox = policy.to_sandbox().unwrap();
+        assert!(!sandbox.port_remap);
+    }
+
+    #[test]
+    fn to_sandbox_wires_network_policy() {
+        let dir = tempdir().unwrap();
+        let bundle = dir.path();
+        fs::create_dir_all(bundle.join("rootfs")).unwrap();
+        let spec = spec_with_annotations(&[
+            ("io.sandlock.network.allow", "api.openai.com:443"),
+            ("io.sandlock.network.port_remap", "true"),
+        ]);
+        let policy = OciPolicy::from_spec(&spec, bundle, "test").unwrap();
+        let sandbox = policy.to_sandbox().unwrap();
+        // The builder parsed the allow spec into a rule, and the bool passed through.
+        assert!(!sandbox.net_allow.is_empty());
+        assert!(sandbox.port_remap);
     }
 
     #[test]
