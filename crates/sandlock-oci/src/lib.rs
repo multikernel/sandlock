@@ -18,4 +18,4 @@ pub mod supervisor;
 
 pub use policy::OciPolicy;
 pub use state::{SandboxState, ExitInfo, Status};
-pub use supervisor::{SupervisorCmd, SupervisorReply, SUPERVISOR_SOCKET};
+pub use supervisor::{SupervisorCmd, SupervisorReply};

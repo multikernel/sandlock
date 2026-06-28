@@ -34,6 +34,14 @@ use clap::{Parser, Subcommand};
 use state::{SandboxState, Status};
 use std::path::PathBuf;
 
+/// Format for the runc-compatible `--log` file. runc defaults to `text`; the
+/// containerd shim passes `json`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum LogFormat {
+    Text,
+    Json,
+}
+
 #[derive(Parser)]
 #[command(
     name = "sandlock-oci",
@@ -48,6 +56,29 @@ struct Cli {
     /// and `/run/sandlock-oci` for root.
     #[arg(long, global = true)]
     root: Option<PathBuf>,
+
+    /// Path to append fatal errors to (runc-compatible; read by the
+    /// containerd shim to surface the failure reason).
+    #[arg(long, global = true)]
+    log: Option<PathBuf>,
+
+    /// Format for the --log file. runc defaults to "text"; the containerd
+    /// shim passes "json".
+    #[arg(long = "log-format", global = true, value_enum, default_value = "text")]
+    log_format: LogFormat,
+
+    /// Accepted for runc compatibility; no-op (no logging framework yet).
+    #[arg(long, global = true)]
+    debug: bool,
+
+    /// Accepted for runc compatibility; ignored (sandlock is cgroup-less).
+    #[arg(long = "systemd-cgroup", global = true)]
+    systemd_cgroup: bool,
+
+    /// Accepted for runc compatibility; ignored. Both `--rootless` and
+    /// `--rootless=true|false` are allowed.
+    #[arg(long, global = true, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    rootless: Option<bool>,
 
     #[command(subcommand)]
     command: Command,
@@ -69,6 +100,12 @@ enum Command {
         /// Console socket path (ignored — sandlock doesn't use PTYs by default).
         #[arg(long = "console-socket")]
         console_socket: Option<PathBuf>,
+        /// Accepted for runc compatibility; ignored (sandlock does not pivot_root).
+        #[arg(long = "no-pivot")]
+        no_pivot: bool,
+        /// Accepted for runc compatibility; ignored (no session keyring).
+        #[arg(long = "no-new-keyring")]
+        no_new_keyring: bool,
     },
 
     /// Start a previously created sandbox.
@@ -167,18 +204,53 @@ enum Command {
         /// OCI bundle path (accepted for runc compatibility; may be unused).
         #[arg(long = "bundle")]
         bundle: Option<String>,
+        /// Accepted for runc compatibility; ignored (sandlock does not pivot_root).
+        #[arg(long = "no-pivot")]
+        no_pivot: bool,
+        /// Accepted for runc compatibility; ignored (no session keyring).
+        #[arg(long = "no-new-keyring")]
+        no_new_keyring: bool,
     },
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
+/// Append a fatal error to the runc-compatible `--log` file so containerd can
+/// surface the real failure reason. Never panics: if the file cannot be opened
+/// the error is dropped here (it is still printed to stderr by the caller).
+fn write_error_log(path: &std::path::Path, format: LogFormat, err: &anyhow::Error) {
+    use std::io::Write;
+    // `{:#}` renders the full anyhow context chain on one line.
+    let msg = format!("{:#}", err);
+    let line = match format {
+        // serde_json handles correct escaping of arbitrary message text.
+        LogFormat::Json => serde_json::json!({ "level": "error", "msg": msg }).to_string(),
+        LogFormat::Text => msg,
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{}", line);
+    }
+}
 
+fn main() {
+    let cli = Cli::parse();
+    // Capture the log destination before `cli.command` is consumed by `run`.
+    let log = cli.log.clone();
+    let log_format = cli.log_format;
+    if let Err(err) = run(cli) {
+        if let Some(path) = log.as_deref() {
+            write_error_log(path, log_format, &err);
+        }
+        eprintln!("Error: {:#}", err);
+        std::process::exit(1);
+    }
+}
+
+fn run(cli: Cli) -> Result<()> {
     // Resolve the state-dir root once, before any state I/O or fork, so the
     // supervisor child inherits the same location.
     state::init_state_dir(cli.root.as_deref().and_then(|p| p.to_str()));
 
     match cli.command {
-        Command::Create { id, bundle, pid_file, console_socket: _ } => {
+        Command::Create { id, bundle, pid_file, console_socket: _, no_pivot: _, no_new_keyring: _ } => {
             cmd_create(&id, &bundle, pid_file.as_deref())?;
         }
         Command::Start { id } => {
@@ -259,12 +331,44 @@ fn main() -> Result<()> {
         Command::Checkpoint { id, image_path } => {
             cmd_checkpoint(&id, &image_path)?;
         }
-        Command::Restore { id, image_path, bundle: _ } => {
+        Command::Restore { id, image_path, bundle: _, no_pivot: _, no_new_keyring: _ } => {
             cmd_restore(&id, &image_path)?;
         }
     }
 
     Ok(())
+}
+
+/// How the supervisor daemon should terminate so a reaping containerd shim sees
+/// a wait-status that mirrors the workload.
+#[derive(Debug, PartialEq, Eq)]
+enum ExitAction {
+    /// Exit with this code (workload exited normally).
+    Code(i32),
+    /// Re-raise this signal on self (workload was killed by it) so the shim sees
+    /// WIFSIGNALED and reports 128+signal, matching runc.
+    Raise(i32),
+}
+
+fn supervisor_exit_action(info: Option<state::ExitInfo>) -> ExitAction {
+    match info {
+        Some(state::ExitInfo { code: Some(c), .. }) => ExitAction::Code(c),
+        Some(state::ExitInfo { signal: Some(s), .. }) => ExitAction::Raise(s),
+        _ => ExitAction::Code(0),
+    }
+}
+
+/// Terminate the supervisor daemon with the workload's status. Diverges.
+fn supervisor_exit(info: Option<state::ExitInfo>) -> ! {
+    match supervisor_exit_action(info) {
+        ExitAction::Code(c) => unsafe { libc::_exit(c) },
+        ExitAction::Raise(s) => unsafe {
+            libc::signal(s as libc::c_int, libc::SIG_DFL);
+            libc::raise(s as libc::c_int);
+            // raise should not return for a default-action signal; fall back.
+            libc::_exit(128 + s)
+        },
+    }
 }
 
 /// `sandlock-oci create <id> -b <bundle>`
@@ -383,11 +487,13 @@ fn cmd_create(id: &str, bundle: &PathBuf, pid_file: Option<&std::path::Path>) ->
             }
         }
 
-        let _ = supervisor::run_supervisor(id, &cmd_args, policy, write_fd);
-        unsafe {
-            libc::close(write_fd);
-            libc::_exit(0);
-        }
+        let exit_info = supervisor::run_supervisor(id, &cmd_args, policy, write_fd)
+            .ok()
+            .flatten();
+        unsafe { libc::close(write_fd) };
+        // Exit with the workload's status so a reaping containerd shim reports
+        // the right container exit code/signal.
+        supervisor_exit(exit_info);
     }
 
     // ===== ORIGINAL PROCESS (caller) =====
@@ -405,7 +511,7 @@ fn cmd_create(id: &str, bundle: &PathBuf, pid_file: Option<&std::path::Path>) ->
     //   `OK <pid>\n`   — sandbox created, <pid> is the sandbox's init PID
     //   `ERR <msg>\n`  — setup failed; the sandbox was never created
     //   (EOF)          — supervisor crashed before writing; treated as error
-    let child_pid = {
+    let (supervisor_pid, init_pid) = {
         let mut buf = [0u8; 512];
         let n = unsafe {
             libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
@@ -417,8 +523,13 @@ fn cmd_create(id: &str, bundle: &PathBuf, pid_file: Option<&std::path::Path>) ->
         let response = String::from_utf8_lossy(&buf[..n as usize]);
         let response = response.trim();
         if let Some(rest) = response.strip_prefix("OK ") {
-            rest.parse::<i32>()
-                .with_context(|| format!("invalid PID in supervisor response: {:?}", response))?
+            let mut parts = rest.split_whitespace();
+            let sup = parts.next().and_then(|s| s.parse::<i32>().ok());
+            let init = parts.next().and_then(|s| s.parse::<i32>().ok());
+            match (sup, init) {
+                (Some(sup), Some(init)) => (sup, init),
+                _ => bail!("invalid PIDs in supervisor response: {:?}", response),
+            }
         } else if let Some(msg) = response.strip_prefix("ERR ") {
             bail!("sandbox create failed: {}", msg);
         } else {
@@ -426,16 +537,19 @@ fn cmd_create(id: &str, bundle: &PathBuf, pid_file: Option<&std::path::Path>) ->
         }
     };
 
-    // Update the state file with the actual PID.
+    // state.pid is the OCI container init (sandlock-init); `start` later updates
+    // it to the workload pid.
     {
         let mut state = SandboxState::load(id)?;
-        state.set_created(child_pid);
+        state.set_created(init_pid);
         state.save()?;
     }
 
-    // Write pid-file if requested (CRI-O / containerd expect this).
+    // The pid-file gets the SUPERVISOR pid: that is the process the containerd
+    // shim reaps to detect container exit (the supervisor is the shim's child
+    // and exits with the workload's status).
     if let Some(pf) = pid_file {
-        std::fs::write(pf, child_pid.to_string())
+        std::fs::write(pf, supervisor_pid.to_string())
             .with_context(|| format!("write pid file {:?}", pf))?;
     }
 
@@ -777,7 +891,10 @@ fn cmd_exec(
         args: req.args,
         env: req.env,
         cwd: req.cwd,
-        detach,
+        // Always ask the supervisor to report the exec'd process's exit. The
+        // caller's `--detach` (set by the containerd shim) is handled locally
+        // by the exec proxy below, which still needs that exit status.
+        detach: false,
     };
     let payload = serde_json::to_vec(&cmd).context("serialize exec command")?;
 
@@ -810,13 +927,78 @@ fn cmd_exec(
         other => bail!("unexpected exec reply: {:?}", other),
     };
 
+    if detach {
+        // Detached exec (containerd: `exec --detach --pid-file`). The shim
+        // expects this CLI to return promptly and reaps the pid-file pid for
+        // exit. The exec'd process is sandlock-init's child, which the shim
+        // cannot reap; so fork a proxy whose pid goes in the pid-file. When this
+        // CLI returns, the proxy reparents to the shim (the subreaper), and the
+        // proxy exits with the exec'd process's status, so the shim reaps a
+        // matching wait-status. This is the exec-path analog of the create-path
+        // supervisor that the shim already reaps.
+        let mut rdy = [0i32; 2];
+        if unsafe { libc::pipe2(rdy.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            bail!("pipe2 for exec proxy failed: {}", std::io::Error::last_os_error());
+        }
+        let (rdy_r, rdy_w) = (rdy[0], rdy[1]);
+        let kid = unsafe { libc::fork() };
+        if kid < 0 {
+            bail!("fork exec proxy failed: {}", std::io::Error::last_os_error());
+        }
+        if kid == 0 {
+            // ===== EXEC PROXY =====
+            unsafe { libc::close(rdy_r) };
+            // Drop the shim's exec stdio so we do not pin those streams open;
+            // the exec'd process holds its own dup'd copies (via SCM_RIGHTS), so
+            // the shim still sees EOF when that process exits.
+            unsafe {
+                let n = libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_RDWR);
+                if n >= 0 {
+                    libc::dup2(n, 0);
+                    libc::dup2(n, 1);
+                    libc::dup2(n, 2);
+                    if n > 2 {
+                        libc::close(n);
+                    }
+                }
+            }
+            // The pid the shim will reap is THIS proxy.
+            if let Some(pf) = pid_file {
+                let _ = std::fs::write(pf, std::process::id().to_string());
+            }
+            // Tell the parent the pid-file is written; it can now return.
+            unsafe {
+                libc::write(rdy_w, b"x".as_ptr() as *const libc::c_void, 1);
+                libc::close(rdy_w);
+            }
+            // Block until the exec'd process exits, then exit with its status.
+            let mut line2 = String::new();
+            if reader.read_line(&mut line2).is_ok() {
+                if let Ok(supervisor::SupervisorReply::Exit { code, signal }) =
+                    serde_json::from_str::<supervisor::SupervisorReply>(line2.trim())
+                {
+                    supervisor_exit(Some(state::ExitInfo { code, signal }));
+                }
+            }
+            // Lost the channel before an Exit arrived: report a generic failure
+            // so the shim does not hang.
+            unsafe { libc::_exit(255) };
+        }
+        // ===== PARENT: wait until the proxy has written the pid-file, return =====
+        unsafe { libc::close(rdy_w) };
+        let mut b = [0u8; 1];
+        unsafe {
+            libc::read(rdy_r, b.as_mut_ptr() as *mut libc::c_void, 1);
+            libc::close(rdy_r);
+        }
+        return Ok(());
+    }
+
+    // Attached: this CLI is the handle the caller waits on. Record the exec'd
+    // pid and block until it exits.
     if let Some(pf) = pid_file {
         std::fs::write(pf, exec_pid.to_string())
             .with_context(|| format!("write pid file {:?}", pf))?;
-    }
-
-    if detach {
-        return Ok(());
     }
 
     // Second reply: Exit. Exit this CLI with the same status.
@@ -868,6 +1050,85 @@ fn parse_signal(s: &str) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn accepts_runc_create_globals() {
+        let cli = Cli::try_parse_from([
+            "sandlock-oci", "--root", "/r", "--log", "/l", "--log-format", "json",
+            "--systemd-cgroup", "--debug",
+            "create", "--bundle", "/b", "--pid-file", "/p",
+            "--no-pivot", "--no-new-keyring", "id",
+        ])
+        .expect("should parse runc-style create invocation");
+        assert!(matches!(cli.command, Command::Create { .. }));
+        assert_eq!(cli.log.as_deref(), Some(std::path::Path::new("/l")));
+        assert_eq!(cli.log_format, LogFormat::Json);
+    }
+
+    #[test]
+    fn accepts_globals_on_other_subcommands() {
+        let subs: [&[&str]; 4] = [
+            &["state", "id"],
+            &["start", "id"],
+            &["kill", "id", "SIGKILL"],
+            &["delete", "--force", "id"],
+        ];
+        for sub in subs {
+            let mut argv = vec![
+                "sandlock-oci", "--root", "/r", "--log", "/l",
+                "--log-format", "json", "--systemd-cgroup",
+            ];
+            argv.extend_from_slice(sub);
+            Cli::try_parse_from(&argv)
+                .unwrap_or_else(|e| panic!("failed to parse {:?}: {e}", argv));
+        }
+    }
+
+    #[test]
+    fn rootless_both_forms_parse() {
+        let bare = Cli::try_parse_from(["sandlock-oci", "--rootless", "list"]).unwrap();
+        assert_eq!(bare.rootless, Some(true));
+        let explicit =
+            Cli::try_parse_from(["sandlock-oci", "--rootless=false", "list"]).unwrap();
+        assert_eq!(explicit.rootless, Some(false));
+    }
+
+    #[test]
+    fn supervisor_exit_action_maps_status() {
+        assert_eq!(
+            supervisor_exit_action(Some(state::ExitInfo { code: Some(7), signal: None })),
+            ExitAction::Code(7)
+        );
+        assert_eq!(
+            supervisor_exit_action(Some(state::ExitInfo { code: None, signal: Some(libc::SIGSEGV) })),
+            ExitAction::Raise(libc::SIGSEGV)
+        );
+        assert_eq!(supervisor_exit_action(None), ExitAction::Code(0));
+    }
+
+    #[test]
+    fn error_log_json_is_parseable_with_msg() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.json");
+        let err = anyhow::anyhow!("boom").context("creating sandbox");
+        write_error_log(&path, LogFormat::Json, &err);
+        let content = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(v["level"], "error");
+        let msg = v["msg"].as_str().unwrap();
+        assert!(msg.contains("creating sandbox"), "msg was: {msg}");
+        assert!(msg.contains("boom"), "msg was: {msg}");
+    }
+
+    #[test]
+    fn error_log_text_is_plain_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.txt");
+        write_error_log(&path, LogFormat::Text, &anyhow::anyhow!("plain failure"));
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content.trim(), "plain failure");
+    }
 
     #[test]
     fn parse_signal_numeric() {

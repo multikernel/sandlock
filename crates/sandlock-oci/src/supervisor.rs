@@ -161,9 +161,6 @@ fn exit_info_from_resp(resp: Option<Resp>) -> Option<crate::state::ExitInfo> {
     }
 }
 
-/// Filename of the supervisor control socket inside the sandbox state dir.
-pub const SUPERVISOR_SOCKET: &str = "supervisor.sock";
-
 /// Commands the CLI sends to the Supervisor over the Unix socket.
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "cmd", rename_all = "lowercase")]
@@ -204,11 +201,29 @@ pub enum SupervisorReply {
     Exit { code: Option<i32>, signal: Option<i32> },
 }
 
+/// Deterministic 64-bit FNV-1a hash of `id` as 16 lowercase hex chars.
+///
+/// Keeps the supervisor socket path short enough for `sockaddr_un.sun_path`
+/// (108 bytes incl. NUL) even when the runtime root and container id are long
+/// (containerd passes a 64-char id under /run/containerd/runc/<ns>). Only needs
+/// to be stable within a single binary: bind and connect run the same build.
+fn fnv1a_hex(id: &str) -> String {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = OFFSET;
+    for b in id.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(PRIME);
+    }
+    format!("{:016x}", h)
+}
+
 /// Returns the path to the supervisor socket for the given sandbox ID.
+///
+/// Lives directly under the state dir as `<fnv16(id)>.sock` (not under the
+/// per-id state subdir) so the path stays well under the `sun_path` limit.
 pub fn socket_path(id: &str) -> PathBuf {
-    PathBuf::from(crate::state::state_dir())
-        .join(id)
-        .join(SUPERVISOR_SOCKET)
+    PathBuf::from(crate::state::state_dir()).join(format!("{}.sock", fnv1a_hex(id)))
 }
 
 /// Send a command to a running supervisor and return its reply (blocking).
@@ -245,7 +260,7 @@ pub fn run_supervisor(
     cmd: &[String],
     policy: OciPolicy,
     pid_write_fd: i32,
-) -> Result<()> {
+) -> Result<Option<crate::state::ExitInfo>> {
     if cmd.is_empty() {
         anyhow::bail!("OCI spec error: process.args is empty");
     }
@@ -301,7 +316,7 @@ async fn supervisor_main(
     mut sandbox: sandlock_core::Sandbox,
     sock_path: PathBuf,
     pid_write_fd: i32,
-) -> Result<()> {
+) -> Result<Option<crate::state::ExitInfo>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixListener;
 
@@ -314,6 +329,13 @@ async fn supervisor_main(
             anyhow::bail!("bind supervisor socket {:?}: {}", sock_path, e);
         }
     };
+
+    // Restrict connects to the owner (root, same as the runtime). Best-effort:
+    // the path-length fix is what matters; a chmod failure must not abort create.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o700));
+    }
 
     // Set up the control channel. The child end is mapped onto CONTROL_FD inside
     // the confined process; the daemon keeps the other end to drive
@@ -383,7 +405,10 @@ async fn supervisor_main(
     // Notify the CLI: `OK <pid>` on success. Before OCI `start` there is no
     // workload yet, so the reported/recorded PID is sandlock-init's (the
     // container PID-1); OCI `start` updates state.pid to the workload PID.
-    pipe_write(pid_write_fd, &format!("OK {}", init_pid));
+    // Report two pids: the supervisor daemon's own pid (this process, which is
+    // the containerd shim's child and what the shim reaps to detect exit) and
+    // sandlock-init's pid (the OCI container init, recorded as state.pid).
+    pipe_write(pid_write_fd, &format!("OK {} {}", std::process::id(), init_pid));
 
     {
         let mut state = SandboxState::load(id)
@@ -398,7 +423,7 @@ async fn supervisor_main(
     loop {
         let (mut stream, _) = match listener.accept().await {
             Ok(pair) => pair,
-            Err(_) => return Ok(()),
+            Err(_) => return Ok(None),
         };
 
         let mut buf = vec![0u8; 4096];
@@ -450,17 +475,17 @@ async fn supervisor_main(
                             serve_running_init(id, &link, &mut sandbox, &listener, pid, main_exit)
                                 .await;
                         if let Ok(mut s) = SandboxState::load(id) {
-                            s.set_stopped(exit_info);
+                            s.set_stopped(exit_info.clone());
                             s.save().ok();
                         }
-                        return Ok(());
+                        return Ok(exit_info);
                     }
                     Ok(Resp::Err { msg }) => {
                         let reply = serde_json::to_vec(&SupervisorReply::Err { msg })
                             .unwrap_or_default();
                         let _ = stream.write_all(&reply).await;
                         let _ = stream.write_all(b"\n").await;
-                        return Ok(());
+                        return Ok(None);
                     }
                     other => {
                         let msg = format!("unexpected init reply to RunMain: {:?}", other);
@@ -468,7 +493,7 @@ async fn supervisor_main(
                             .unwrap_or_default();
                         let _ = stream.write_all(&reply).await;
                         let _ = stream.write_all(b"\n").await;
-                        return Ok(());
+                        return Ok(None);
                     }
                 }
             }
@@ -479,7 +504,7 @@ async fn supervisor_main(
                 let reply = serde_json::to_vec(&SupervisorReply::Ok).unwrap_or_default();
                 let _ = stream.write_all(&reply).await;
                 let _ = stream.write_all(b"\n").await;
-                return Ok(());
+                return Ok(None);
             }
             SupervisorCmd::Checkpoint { dir } => {
                 let reply = match sandbox.checkpoint().await {
@@ -976,6 +1001,13 @@ async fn supervisor_restore_main(
         }
     };
 
+    // Restrict connects to the owner (root, same as the runtime). Best-effort:
+    // the path-length fix is what matters; a chmod failure must not abort restore.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o700));
+    }
+
     // Restore: forks the child under the saved policy, injects the checkpoint,
     // and RESUMES it. The child is already running on return — there is no
     // separate start step.
@@ -1026,10 +1058,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn socket_path_is_under_state_dir() {
+    fn socket_path_uses_short_hashed_name_under_state_dir() {
         let p = socket_path("my-sandbox");
-        assert!(p.to_str().unwrap().contains("my-sandbox"));
-        assert!(p.to_str().unwrap().contains("supervisor.sock"));
+        let s = p.to_str().unwrap();
+        assert!(s.starts_with(&crate::state::state_dir()));
+        assert!(s.ends_with(".sock"));
+        // file name is 16 hex chars + ".sock" = 21 bytes, never the raw id.
+        assert_eq!(p.file_name().unwrap().to_str().unwrap().len(), 21);
+        assert!(!s.contains("my-sandbox"));
+    }
+
+    #[test]
+    fn socket_filename_keeps_path_under_sun_len_for_cri_root() {
+        // containerd's runc-v2 shim passes this root plus a 64-char id.
+        let cri_root = "/run/containerd/runc/k8s.io";
+        let id = "a".repeat(64);
+        let full = format!("{}/{}.sock", cri_root, fnv1a_hex(&id));
+        assert!(full.len() < 108, "socket path too long: {} bytes", full.len());
+    }
+
+    #[test]
+    fn fnv1a_hex_is_deterministic_and_distinct() {
+        assert_eq!(fnv1a_hex("abc"), fnv1a_hex("abc"));
+        assert_ne!(fnv1a_hex("abc"), fnv1a_hex("abd"));
+        assert_eq!(fnv1a_hex("abc").len(), 16);
+        assert!(fnv1a_hex("abc").chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
