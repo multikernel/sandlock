@@ -34,6 +34,14 @@ use clap::{Parser, Subcommand};
 use state::{SandboxState, Status};
 use std::path::PathBuf;
 
+/// Format for the runc-compatible `--log` file. runc defaults to `text`; the
+/// containerd shim passes `json`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum LogFormat {
+    Text,
+    Json,
+}
+
 #[derive(Parser)]
 #[command(
     name = "sandlock-oci",
@@ -48,6 +56,29 @@ struct Cli {
     /// and `/run/sandlock-oci` for root.
     #[arg(long, global = true)]
     root: Option<PathBuf>,
+
+    /// Path to append fatal errors to (runc-compatible; read by the
+    /// containerd shim to surface the failure reason).
+    #[arg(long, global = true)]
+    log: Option<PathBuf>,
+
+    /// Format for the --log file. runc defaults to "text"; the containerd
+    /// shim passes "json".
+    #[arg(long = "log-format", global = true, value_enum, default_value = "text")]
+    log_format: LogFormat,
+
+    /// Accepted for runc compatibility; no-op (no logging framework yet).
+    #[arg(long, global = true)]
+    debug: bool,
+
+    /// Accepted for runc compatibility; ignored (sandlock is cgroup-less).
+    #[arg(long = "systemd-cgroup", global = true)]
+    systemd_cgroup: bool,
+
+    /// Accepted for runc compatibility; ignored. Both `--rootless` and
+    /// `--rootless=true|false` are allowed.
+    #[arg(long, global = true, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    rootless: Option<bool>,
 
     #[command(subcommand)]
     command: Command,
@@ -69,6 +100,12 @@ enum Command {
         /// Console socket path (ignored — sandlock doesn't use PTYs by default).
         #[arg(long = "console-socket")]
         console_socket: Option<PathBuf>,
+        /// Accepted for runc compatibility; ignored (sandlock does not pivot_root).
+        #[arg(long = "no-pivot")]
+        no_pivot: bool,
+        /// Accepted for runc compatibility; ignored (no session keyring).
+        #[arg(long = "no-new-keyring")]
+        no_new_keyring: bool,
     },
 
     /// Start a previously created sandbox.
@@ -167,6 +204,12 @@ enum Command {
         /// OCI bundle path (accepted for runc compatibility; may be unused).
         #[arg(long = "bundle")]
         bundle: Option<String>,
+        /// Accepted for runc compatibility; ignored (sandlock does not pivot_root).
+        #[arg(long = "no-pivot")]
+        no_pivot: bool,
+        /// Accepted for runc compatibility; ignored (no session keyring).
+        #[arg(long = "no-new-keyring")]
+        no_new_keyring: bool,
     },
 }
 
@@ -178,7 +221,7 @@ fn main() -> Result<()> {
     state::init_state_dir(cli.root.as_deref().and_then(|p| p.to_str()));
 
     match cli.command {
-        Command::Create { id, bundle, pid_file, console_socket: _ } => {
+        Command::Create { id, bundle, pid_file, console_socket: _, no_pivot: _, no_new_keyring: _ } => {
             cmd_create(&id, &bundle, pid_file.as_deref())?;
         }
         Command::Start { id } => {
@@ -259,7 +302,7 @@ fn main() -> Result<()> {
         Command::Checkpoint { id, image_path } => {
             cmd_checkpoint(&id, &image_path)?;
         }
-        Command::Restore { id, image_path, bundle: _ } => {
+        Command::Restore { id, image_path, bundle: _, no_pivot: _, no_new_keyring: _ } => {
             cmd_restore(&id, &image_path)?;
         }
     }
@@ -868,6 +911,49 @@ fn parse_signal(s: &str) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn accepts_runc_create_globals() {
+        let cli = Cli::try_parse_from([
+            "sandlock-oci", "--root", "/r", "--log", "/l", "--log-format", "json",
+            "--systemd-cgroup", "--debug",
+            "create", "--bundle", "/b", "--pid-file", "/p",
+            "--no-pivot", "--no-new-keyring", "id",
+        ])
+        .expect("should parse runc-style create invocation");
+        assert!(matches!(cli.command, Command::Create { .. }));
+        assert_eq!(cli.log.as_deref(), Some(std::path::Path::new("/l")));
+        assert_eq!(cli.log_format, LogFormat::Json);
+    }
+
+    #[test]
+    fn accepts_globals_on_other_subcommands() {
+        let subs: [&[&str]; 4] = [
+            &["state", "id"],
+            &["start", "id"],
+            &["kill", "id", "SIGKILL"],
+            &["delete", "--force", "id"],
+        ];
+        for sub in subs {
+            let mut argv = vec![
+                "sandlock-oci", "--root", "/r", "--log", "/l",
+                "--log-format", "json", "--systemd-cgroup",
+            ];
+            argv.extend_from_slice(sub);
+            Cli::try_parse_from(&argv)
+                .unwrap_or_else(|e| panic!("failed to parse {:?}: {e}", argv));
+        }
+    }
+
+    #[test]
+    fn rootless_both_forms_parse() {
+        let bare = Cli::try_parse_from(["sandlock-oci", "--rootless", "list"]).unwrap();
+        assert_eq!(bare.rootless, Some(true));
+        let explicit =
+            Cli::try_parse_from(["sandlock-oci", "--rootless=false", "list"]).unwrap();
+        assert_eq!(explicit.rootless, Some(false));
+    }
 
     #[test]
     fn parse_signal_numeric() {
