@@ -202,6 +202,19 @@ fn detect_fstype(path: &std::path::Path) -> &'static str {
     }
 }
 
+/// Whether the chroot rootfs should be reported read-only in the synthesized
+/// mount tables. Only meaningful under a chroot, where the rootfs is presented
+/// as its own mount: it is read-only unless `/` was granted write (a read-write
+/// OCI rootfs or `--fs-write /`). Without a chroot, the root is the host's real
+/// (read-write) `/`, restricted by Landlock rather than a read-only mount.
+fn root_is_read_only(policy: &NotifPolicy) -> bool {
+    policy.chroot_root.is_some()
+        && !policy
+            .chroot_writable
+            .iter()
+            .any(|p| p.as_path() == std::path::Path::new("/"))
+}
+
 /// Generate a virtual /proc/mounts showing only the sandbox's own mounts.
 ///
 /// Produces standard `/proc/mounts` format: `device mountpoint type options dump pass`
@@ -210,20 +223,28 @@ fn detect_fstype(path: &std::path::Path) -> &'static str {
 pub(crate) fn generate_proc_mounts(
     chroot_root: Option<&std::path::Path>,
     chroot_mounts: &[(std::path::PathBuf, std::path::PathBuf)],
+    chroot_mount_ro: &[std::path::PathBuf],
+    root_ro: bool,
 ) -> Vec<u8> {
     let mut buf = String::new();
 
     if let Some(root) = chroot_root {
         let fstype = detect_fstype(root);
-        buf.push_str(&format!("sandlock / {} rw,relatime 0 0\n", fstype));
+        let opts = if root_ro { "ro,relatime" } else { "rw,relatime" };
+        buf.push_str(&format!("sandlock / {} {} 0 0\n", fstype, opts));
     } else {
-        buf.push_str("rootfs / rootfs rw 0 0\n");
+        buf.push_str(&format!("rootfs / rootfs {} 0 0\n", if root_ro { "ro" } else { "rw" }));
     }
 
     for (virtual_path, host_path) in chroot_mounts {
         let vp = virtual_path.to_string_lossy();
         let fstype = detect_fstype(host_path);
-        buf.push_str(&format!("sandlock {} {} rw,relatime 0 0\n", vp, fstype));
+        let opts = if chroot_mount_ro.iter().any(|d| d == virtual_path) {
+            "ro,relatime"
+        } else {
+            "rw,relatime"
+        };
+        buf.push_str(&format!("sandlock {} {} {} 0 0\n", vp, fstype, opts));
     }
 
     buf.into_bytes()
@@ -236,18 +257,21 @@ pub(crate) fn generate_proc_mounts(
 pub(crate) fn generate_proc_mountinfo(
     chroot_root: Option<&std::path::Path>,
     chroot_mounts: &[(std::path::PathBuf, std::path::PathBuf)],
+    chroot_mount_ro: &[std::path::PathBuf],
+    root_ro: bool,
 ) -> Vec<u8> {
     let mut buf = String::new();
     let mut mount_id: u32 = 20;
+    let (root_opts, root_super) = if root_ro { ("ro,relatime", "ro") } else { ("rw,relatime", "rw") };
 
     if let Some(root) = chroot_root {
         let fstype = detect_fstype(root);
         buf.push_str(&format!(
-            "{} 1 8:1 / / rw,relatime - {} sandlock rw\n", mount_id, fstype
+            "{} 1 8:1 / / {} - {} sandlock {}\n", mount_id, root_opts, fstype, root_super
         ));
     } else {
         buf.push_str(&format!(
-            "{} 1 0:1 / / rw - rootfs rootfs rw\n", mount_id
+            "{} 1 0:1 / / {} - rootfs rootfs {}\n", mount_id, root_super, root_super
         ));
     }
     mount_id += 1;
@@ -255,8 +279,13 @@ pub(crate) fn generate_proc_mountinfo(
     for (virtual_path, host_path) in chroot_mounts {
         let vp = virtual_path.to_string_lossy();
         let fstype = detect_fstype(host_path);
+        let (opts, sup) = if chroot_mount_ro.iter().any(|d| d == virtual_path) {
+            ("ro,relatime", "ro")
+        } else {
+            ("rw,relatime", "rw")
+        };
         buf.push_str(&format!(
-            "{} 20 8:1 / {} rw,relatime - {} sandlock rw\n", mount_id, vp, fstype
+            "{} 20 8:1 / {} {} - {} sandlock {}\n", mount_id, vp, opts, fstype, sup
         ));
         mount_id += 1;
     }
@@ -461,6 +490,8 @@ pub(crate) async fn handle_proc_open(
         let content = generate_proc_mounts(
             policy.chroot_root.as_deref(),
             &policy.chroot_mounts,
+            &policy.chroot_mount_ro,
+            root_is_read_only(policy),
         );
         return inject_memfd(&content);
     }
@@ -470,6 +501,8 @@ pub(crate) async fn handle_proc_open(
         let content = generate_proc_mountinfo(
             policy.chroot_root.as_deref(),
             &policy.chroot_mounts,
+            &policy.chroot_mount_ro,
+            root_is_read_only(policy),
         );
         return inject_memfd(&content);
     }
@@ -1156,7 +1189,8 @@ mod tests {
             (std::path::PathBuf::from("/work"), tmp.clone()),
             (std::path::PathBuf::from("/data"), tmp.clone()),
         ];
-        let content = generate_proc_mounts(Some(tmp.as_path()), &mounts);
+        let ro = vec![std::path::PathBuf::from("/data")];
+        let content = generate_proc_mounts(Some(tmp.as_path()), &mounts, &ro, false);
         let text = String::from_utf8(content).unwrap();
         // Root entry with detected fstype (not hardcoded ext4)
         assert!(text.starts_with("sandlock / "), "Should start with root entry, got: {}", text);
@@ -1167,12 +1201,24 @@ mod tests {
         // Fstype should be detected, not "unknown" (tmp is on a real fs)
         let root_line = text.lines().next().unwrap();
         assert!(!root_line.contains("unknown"), "root fstype should be detected, got: {}", root_line);
+        // Options reflect read-only: /data is ro, /work and root are rw.
+        assert!(text.lines().any(|l| l.starts_with("sandlock / ") && l.contains(" rw,relatime ")));
+        assert!(text.lines().any(|l| l.starts_with("sandlock /work ") && l.contains(" rw,relatime ")));
+        assert!(text.lines().any(|l| l.starts_with("sandlock /data ") && l.contains(" ro,relatime ")));
+    }
+
+    #[test]
+    fn test_generate_proc_mounts_read_only_root() {
+        let tmp = std::env::temp_dir();
+        let content = generate_proc_mounts(Some(tmp.as_path()), &[], &[], true);
+        let text = String::from_utf8(content).unwrap();
+        assert!(text.lines().next().unwrap().contains(" ro,relatime "), "got: {}", text);
     }
 
     #[test]
     fn test_generate_proc_mounts_no_chroot() {
         let mounts: Vec<(std::path::PathBuf, std::path::PathBuf)> = vec![];
-        let content = generate_proc_mounts(None, &mounts);
+        let content = generate_proc_mounts(None, &mounts, &[], false);
         let text = String::from_utf8(content).unwrap();
         assert!(text.contains("rootfs / rootfs rw 0 0"));
         assert_eq!(text.lines().count(), 1);
@@ -1184,7 +1230,7 @@ mod tests {
         let mounts = vec![
             (std::path::PathBuf::from("/work"), tmp.clone()),
         ];
-        let content = generate_proc_mountinfo(Some(tmp.as_path()), &mounts);
+        let content = generate_proc_mountinfo(Some(tmp.as_path()), &mounts, &[], false);
         let text = String::from_utf8(content).unwrap();
         assert!(text.contains("/ / rw,relatime -"));
         assert!(text.contains("/ /work rw,relatime -"));
@@ -1195,7 +1241,7 @@ mod tests {
     #[test]
     fn test_generate_proc_mountinfo_no_chroot() {
         let mounts: Vec<(std::path::PathBuf, std::path::PathBuf)> = vec![];
-        let content = generate_proc_mountinfo(None, &mounts);
+        let content = generate_proc_mountinfo(None, &mounts, &[], false);
         let text = String::from_utf8(content).unwrap();
         assert!(text.contains("/ / rw - rootfs rootfs rw"));
         assert_eq!(text.lines().count(), 1);
