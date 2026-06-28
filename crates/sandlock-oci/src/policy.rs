@@ -33,6 +33,10 @@ pub struct OciPolicy {
     /// Explicit bind mounts: (dest_inside_rootfs, host_source_path).
     pub fs_mount: Vec<(PathBuf, PathBuf)>,
 
+    /// Destinations (subset of `fs_mount`) mounted read-only: the host procfs
+    /// mount and `ro` bind mounts. Writes are denied even with a writable root.
+    pub fs_mount_ro: Vec<PathBuf>,
+
     /// Initial working directory (relative to rootfs if set).
     pub cwd: Option<PathBuf>,
 
@@ -81,6 +85,7 @@ impl OciPolicy {
         let mut fs_read = Vec::new();
         let mut fs_write = Vec::new();
         let mut fs_mount = Vec::new();
+        let mut fs_mount_ro = Vec::new();
         let mut scratch_dirs = Vec::new();
 
         if rootfs.is_some() {
@@ -100,7 +105,7 @@ impl OciPolicy {
         if let Some(mounts) = spec.mounts() {
             map_mounts(
                 mounts, bundle, &rootfs, id,
-                &mut fs_mount, &mut fs_read, &mut fs_write, &mut scratch_dirs,
+                &mut fs_mount, &mut fs_mount_ro, &mut fs_read, &mut fs_write, &mut scratch_dirs,
             );
         }
 
@@ -192,6 +197,7 @@ impl OciPolicy {
             fs_read,
             fs_write,
             fs_mount,
+            fs_mount_ro,
             cwd,
             env,
             max_memory,
@@ -224,7 +230,11 @@ impl OciPolicy {
             builder = builder.fs_write(path);
         }
         for (virt, host) in &self.fs_mount {
-            builder = builder.fs_mount(virt, host);
+            if self.fs_mount_ro.iter().any(|d| d == virt) {
+                builder = builder.fs_mount_ro(virt, host);
+            } else {
+                builder = builder.fs_mount(virt, host);
+            }
         }
 
         if let Some(ref cwd) = self.cwd {
@@ -330,9 +340,12 @@ fn rootfs_path(spec: &Spec, bundle: &Path) -> Result<Option<PathBuf>> {
 /// - **tmpfs** writable scratch (`/tmp`, `/run`, `/dev/shm`, …): backed by a
 ///   host directory under the sandbox state dir and bind-mounted read-write,
 ///   so it works on a read-only root and stays isolated from the rootfs.
-/// - **tmpfs at `/dev`, proc, sysfs**: passed through read-only so sandlock's
-///   `/dev` interception and `/proc` virtualization service them; an empty
-///   backing dir would shadow `/dev/null`, `/proc/*`, etc.
+/// - **proc**: `fs_mount(dest, /proc)` — the host procfs, so the sandbox gets a
+///   full `/proc` like a container; the seccomp `/proc` handler synthesizes the
+///   limit-aware files on top and blocks foreign PIDs / sensitive paths.
+/// - **tmpfs at `/dev`, sysfs**: passed through read-only so sandlock's `/dev`
+///   interception services them; an empty backing dir would shadow `/dev/null`,
+///   `/sys/*`, etc.
 /// - **devpts/mqueue/cgroup**: skipped (no safe namespace-less equivalent).
 fn map_mounts(
     mounts: &[oci_spec::runtime::Mount],
@@ -340,6 +353,7 @@ fn map_mounts(
     rootfs: &Option<PathBuf>,
     id: &str,
     fs_mount: &mut Vec<(PathBuf, PathBuf)>,
+    fs_mount_ro: &mut Vec<PathBuf>,
     fs_read: &mut Vec<PathBuf>,
     fs_write: &mut Vec<PathBuf>,
     scratch_dirs: &mut Vec<PathBuf>,
@@ -349,9 +363,22 @@ fn map_mounts(
         let mount_type = mount.typ().as_deref().unwrap_or("bind");
 
         match mount_type {
-            // Kernel interfaces: pass the host's through read-only.  sandlock
-            // virtualizes /proc and intercepts /dev/{null,urandom,random,…}.
-            "proc" => fs_read.push(PathBuf::from("/proc")),
+            // /proc: mount the host procfs READ-ONLY at the requested
+            // destination so the sandbox gets a full /proc (version, stat,
+            // self/*, <pid>/*, the directory listing, …) like a real container;
+            // an empty rootfs /proc would otherwise leave it bare.  The seccomp
+            // /proc handler runs before this chroot mount, so it still (a)
+            // synthesizes the cgroup/limit-aware files (meminfo, loadavg,
+            // mounts, net/*) on top, and (b) blocks foreign PIDs and sensitive
+            // paths.  Read-only is essential: a writable host procfs would let
+            // the sandbox write host-global controls like /proc/sys/* and
+            // /proc/sysrq-trigger (a host-escape vector).
+            "proc" => {
+                fs_mount.push((dest.to_path_buf(), PathBuf::from("/proc")));
+                fs_mount_ro.push(dest.to_path_buf());
+            }
+            // sysfs: pass the host's through read-only; sandlock's sensitive-path
+            // filter still gates it.
             "sysfs" => fs_read.push(PathBuf::from("/sys")),
 
             "tmpfs" => {
@@ -399,6 +426,7 @@ fn map_mounts(
                         fs_mount.push((dest.to_path_buf(), src));
                         if read_only {
                             fs_read.push(dest.to_path_buf());
+                            fs_mount_ro.push(dest.to_path_buf());
                         } else {
                             fs_write.push(dest.to_path_buf());
                         }
@@ -644,8 +672,16 @@ mod tests {
         assert!(policy.scratch_dirs.iter().any(|d| d.ends_with("ctr1/tmpfs/tmp")));
         assert!(policy.fs_write.contains(&PathBuf::from("/tmp")));
 
-        // /proc and /dev are passed through read-only, not emulated.
-        assert!(policy.fs_read.contains(&PathBuf::from("/proc")));
+        // /proc mounts the host procfs so the sandbox gets a full /proc; the
+        // seccomp /proc handler synthesizes the limit-aware files on top.
+        assert!(policy
+            .fs_mount
+            .iter()
+            .any(|(d, h)| d == Path::new("/proc") && h == Path::new("/proc")));
+        // ...and it is read-only, so the sandbox can't write host-global
+        // controls like /proc/sys/* through the mount.
+        assert!(policy.fs_mount_ro.contains(&PathBuf::from("/proc")));
+        // /dev is passed through read-only, not emulated.
         assert!(policy.fs_read.contains(&PathBuf::from("/dev")));
         assert!(!policy.fs_mount.iter().any(|(d, _)| d == Path::new("/dev")));
     }
