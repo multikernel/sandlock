@@ -196,6 +196,44 @@ async fn test_chroot_getcwd() {
     cleanup_rootfs(&rootfs);
 }
 
+/// chdir into a same-path mount (/proc) from a READ-ONLY path buffer must
+/// succeed. Regression for the busybox-`top` EFAULT: rewriting the child's
+/// path argument to /proc/self/fd/N faults when the path lives in read-only
+/// memory (a .rodata literal). The handler instead lets the kernel run the
+/// original chdir unchanged when the on-behalf-resolved directory is identical
+/// to the requested path, which holds for the /proc mount.
+#[tokio::test]
+async fn test_chroot_chdir_proc_readonly_buffer() {
+    let rootfs = build_test_rootfs("chdir-proc-ro");
+
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_mount("/proc", "/proc")
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .with_name("test")
+        .run(&["rootfs-helper", "chdir", "/proc"])
+        .await;
+    match result {
+        Ok(r) => {
+            assert!(
+                r.success(),
+                "chdir(/proc) from a read-only buffer should succeed, stderr: {}",
+                r.stderr_str().unwrap_or("")
+            );
+            // cwd must be /proc (getcwd may render the mount root with a
+            // trailing slash; the meaningful assertion is that we landed there).
+            let cwd = r.stdout_str().unwrap_or("").trim().trim_end_matches('/').to_string();
+            assert_eq!(cwd, "OK /proc", "cwd after chdir should be /proc");
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
 /// echo hello > /tmp/test.txt && cat /tmp/test.txt works, file appears in rootfs/tmp
 #[tokio::test]
 async fn test_chroot_write_file() {

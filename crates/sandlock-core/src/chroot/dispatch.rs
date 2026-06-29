@@ -1531,7 +1531,8 @@ pub(crate) async fn handle_chroot_chdir(
     };
 
     // Build the full virtual path from AT_FDCWD + path.
-    let full_path = if Path::new(&path).is_absolute() {
+    let was_absolute = Path::new(&path).is_absolute();
+    let full_path = if was_absolute {
         path
     } else {
         match std::fs::read_link(format!("/proc/{}/cwd", notif.pid)) {
@@ -1559,6 +1560,29 @@ pub(crate) async fn handle_chroot_chdir(
         Ok(fd) => fd,
         Err(errno) => return NotifAction::Errno(errno),
     };
+
+    // Native-chdir fast path. The child runs in the host filesystem (sandlock
+    // does not chroot(2); it confines via on-behalf openat2 + Landlock), so an
+    // absolute chdir resolves against the real host root. When the on-behalf
+    // resolved directory's real host path is identical to the path the child
+    // asked for (the common case for same-path mounts like /proc and /sys), a
+    // raw chdir reaches the exact same directory. Let the kernel run the
+    // original syscall unchanged instead of rewriting the argument to the
+    // longer /proc/self/fd/N: that rewrite goes through process_vm_writev,
+    // which fails with EFAULT when the child passed a read-only string literal
+    // (e.g. busybox `top`'s chdir("/proc")), killing the process. Confinement
+    // is preserved: every subsequent open/stat/getdents is independently
+    // re-resolved on-behalf, and the equality check only holds when no symlink
+    // redirection occurred during the confined open.
+    if was_absolute
+        && std::fs::read_link(format!("/proc/self/fd/{}", src_fd))
+            .ok()
+            .as_deref()
+            == Some(Path::new(&full_path))
+    {
+        unsafe { libc::close(src_fd) };
+        return NotifAction::Continue;
+    }
 
     // Inject fd into child and rewrite path to /proc/self/fd/N.
     let addfd = SeccompNotifAddfd {

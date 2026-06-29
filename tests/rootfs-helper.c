@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -581,9 +582,39 @@ static int cmd_spawn_loop(int argc, char **argv) {
     return 0;
 }
 
+/* ── chdir (non-standard: chdir from a READ-ONLY path buffer) ─── */
+/*
+ * Copies the target path onto a freshly mmap'd page, flips it to PROT_READ,
+ * then chdir()s through that read-only pointer. This reproduces how real
+ * programs (e.g. busybox `top`'s chdir("/proc")) pass a .rodata string
+ * literal: the chroot chdir handler must not assume the child's path buffer
+ * is writable, since rewriting it in place would fault. On success prints the
+ * resulting cwd so the caller can confirm the directory actually changed.
+ */
+static int cmd_chdir(int argc, char **argv) {
+    if (argc < 1) { fprintf(stderr, "chdir: missing operand\n"); return 1; }
+    size_t n = strlen(argv[0]) + 1;
+    long pg = sysconf(_SC_PAGESIZE);
+    size_t maplen = ((n + pg - 1) / pg) * pg;
+    char *ro = mmap(NULL, maplen, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (ro == MAP_FAILED) { perror("chdir: mmap"); return 1; }
+    memcpy(ro, argv[0], n);
+    if (mprotect(ro, maplen, PROT_READ) != 0) { perror("chdir: mprotect"); return 1; }
+    if (chdir(ro) != 0) {
+        fprintf(stderr, "chdir: %s: %s\n", argv[0], strerror(errno));
+        return 1;
+    }
+    char buf[4096];
+    if (!getcwd(buf, sizeof(buf))) { perror("chdir: getcwd"); return 1; }
+    printf("OK %s\n", buf);
+    return 0;
+}
+
 /* ── dispatch ───────────────────────────────────────────────── */
 
 static int dispatch(const char *cmd, int argc, char **argv) {
+    if (strcmp(cmd, "chdir") == 0)          return cmd_chdir(argc, argv);
     if (strcmp(cmd, "echo") == 0)           return cmd_echo(argc, argv);
     if (strcmp(cmd, "cat") == 0)            return cmd_cat(argc, argv);
     if (strcmp(cmd, "ls") == 0)             return cmd_ls(argc, argv);
