@@ -436,26 +436,149 @@ pub(crate) async fn handle_chroot_open(
         }
     }
 
-    // Open directly via openat2(RESOLVE_IN_ROOT) — single atomic open
-    // confined to the chroot root (or mount target), no resolve-then-reopen TOCTOU gap.
-    let vp_str = virtual_path.to_string_lossy();
-    let mode = if is_write { 0o666 } else { 0 };
-    let (resolve_root, resolve_path) = if let Some((mt, sub)) = ctx.mount_target(&virtual_path) {
-        (mt.to_path_buf(), sub)
-    } else {
-        (ctx.root.to_path_buf(), vp_str.to_string())
-    };
-    let fd = match openat2_in_root(&resolve_root, &resolve_path, flags as i32, mode) {
-        Ok(fd) => fd,
-        Err(errno) => return NotifAction::Errno(errno),
-    };
+    // Resolve the path to an fd to hand the child: either a freshly opened tree
+    // file or a dup of one of the child's own fds (a magic link). See
+    // `open_in_namespace`.
+    //
+    // openat2 rejects a non-zero mode unless O_CREAT/O_TMPFILE is set (stricter
+    // than openat), so only supply a creation mode when the child asks to create.
+    // O_TMPFILE is a composite (__O_TMPFILE | O_DIRECTORY), so it must be matched
+    // as a full mask, not with a bitwise-and that any O_DIRECTORY open would trip.
+    let flags_i = flags as i32;
+    let creates = flags_i & libc::O_CREAT != 0 || flags_i & libc::O_TMPFILE == libc::O_TMPFILE;
+    let mode = if creates { 0o666 } else { 0 };
     let newfd_flags = if flags & libc::O_CLOEXEC as u64 != 0 {
         libc::O_CLOEXEC as u32
     } else {
         0
     };
-    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    NotifAction::InjectFdSend { srcfd: owned, newfd_flags }
+    match open_in_namespace(ctx, notif.pid, &virtual_path, flags as i32, mode) {
+        Ok(srcfd) => NotifAction::InjectFdSend { srcfd, newfd_flags },
+        Err(errno) => NotifAction::Errno(errno),
+    }
+}
+
+/// Open `virtual_path` within the child's virtual namespace, returning an fd to
+/// inject into the child.
+///
+/// A path names one of two things:
+///
+/// 1. A **tree object** reachable by walking the rootfs (or a mount target).
+///    `openat2(RESOLVE_IN_ROOT)` opens these atomically and confined, with no
+///    resolve-then-reopen TOCTOU gap. This is the overwhelmingly common case.
+///
+/// 2. An **fd reference** such as `/proc/self/fd/N` (named directly, or reached
+///    through a symlink chain like `/dev/stderr -> /proc/self/fd/N` that
+///    container images use for logging). This is not a filesystem object at
+///    all; it names an entry in the child's *own* fd table, which the child
+///    already holds. `openat2(RESOLVE_IN_ROOT)` rightly declines to fabricate
+///    it (a magic link points outside the root by definition), so we serve it
+///    by dup'ing the child's fd. No new access: the open was already authorized
+///    by the caller and the child already owns the fd.
+///
+/// openat2 success proves category 1 (it refuses magic links), so we only look
+/// for category 2 when it can't complete: EXDEV when the magic link sits in the
+/// same root, ENOENT/ENOTDIR when it points into another mount (e.g.
+/// `/dev/stderr -> /proc/...` resolved within the `/dev` mount). The fd walk is
+/// authoritative and returns None for genuine misses, so non-magic paths
+/// propagate their original errno unchanged.
+fn open_in_namespace(
+    ctx: &ChrootCtx<'_>,
+    child_pid: u32,
+    virtual_path: &Path,
+    flags: i32,
+    mode: u32,
+) -> Result<OwnedFd, i32> {
+    let vp_str = virtual_path.to_string_lossy();
+
+    // Category 2, named directly: skip the open and dup straight away.
+    if let Some(child_fd) = magic_self_fd(&vp_str, child_pid) {
+        return crate::seccomp::notif::dup_fd_from_pid(child_pid, child_fd)
+            .map_err(|_| libc::EBADF);
+    }
+
+    let (root, sub) = match ctx.mount_target(virtual_path) {
+        Some((mt, sub)) => (mt.to_path_buf(), sub),
+        None => (ctx.root.to_path_buf(), vp_str.to_string()),
+    };
+    match openat2_in_root(&root, &sub, flags, mode) {
+        // Category 1.
+        Ok(fd) => Ok(unsafe { OwnedFd::from_raw_fd(fd) }),
+        // Category 2, reached through symlinks.
+        Err(errno) if matches!(errno, libc::EXDEV | libc::ENOENT | libc::ENOTDIR) => {
+            match resolve_self_fd_magic(ctx, child_pid, &vp_str) {
+                Some(child_fd) => crate::seccomp::notif::dup_fd_from_pid(child_pid, child_fd)
+                    .map_err(|_| errno),
+                None => Err(errno),
+            }
+        }
+        Err(errno) => Err(errno),
+    }
+}
+
+/// If `path` is a self-referential `/proc/.../fd/N` magic link for the calling
+/// child (`/proc/self`, `/proc/thread-self`, or `/proc/<child_pid>`), return the
+/// child fd `N`. The fd component must be a bare number (no trailing path).
+fn magic_self_fd(path: &str, child_pid: u32) -> Option<i32> {
+    let (who, fd_part) = path.strip_prefix("/proc/")?.split_once("/fd/")?;
+    let is_self =
+        who == "self" || who == "thread-self" || who.parse::<u32>().ok() == Some(child_pid);
+    if !is_self || fd_part.contains('/') {
+        return None;
+    }
+    fd_part.parse::<i32>().ok()
+}
+
+/// Read the symlink target at `virtual_path`, resolved within the chroot/mounts,
+/// without following the final component. Returns None if it is not a symlink.
+fn read_symlink_in_root(ctx: &ChrootCtx<'_>, virtual_path: &str) -> Option<String> {
+    let confined = crate::chroot::resolve::confine(virtual_path);
+    let (root, sub) = if let Some((mt, sub)) = ctx.mount_target(&confined) {
+        (mt.to_path_buf(), sub)
+    } else {
+        (ctx.root.to_path_buf(), confined.to_string_lossy().into_owned())
+    };
+    let fd = openat2_in_root(
+        &root,
+        &sub,
+        libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    )
+    .ok()?;
+    let mut buf = [0u8; 4096];
+    let n = unsafe {
+        libc::readlinkat(
+            fd,
+            c"".as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+        )
+    };
+    unsafe { libc::close(fd) };
+    if n <= 0 {
+        return None; // EINVAL (not a symlink) or read error
+    }
+    Some(String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+}
+
+/// Walk the symlink chain at `virtual_path` (confined to the chroot/mounts)
+/// looking for a terminating self-fd magic link; return the child fd it names.
+fn resolve_self_fd_magic(ctx: &ChrootCtx<'_>, child_pid: u32, virtual_path: &str) -> Option<i32> {
+    let mut cur = virtual_path.to_string();
+    for _ in 0..40 {
+        if let Some(fd) = magic_self_fd(&cur, child_pid) {
+            return Some(fd);
+        }
+        let target = read_symlink_in_root(ctx, &cur)?;
+        let next = if Path::new(&target).is_absolute() {
+            target
+        } else {
+            let parent = Path::new(&cur).parent().unwrap_or_else(|| Path::new("/"));
+            parent.join(&target).to_string_lossy().into_owned()
+        };
+        cur = crate::chroot::resolve::confine(&next).to_string_lossy().into_owned();
+    }
+    None
 }
 
 // ============================================================

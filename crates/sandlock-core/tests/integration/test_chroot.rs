@@ -279,6 +279,51 @@ async fn test_chroot_proc_dirfd_relative_is_virtualized() {
     cleanup_rootfs(&rootfs);
 }
 
+/// A path that resolves (through symlinks) to a `/proc/self/fd/N` magic link
+/// must open as a dup of the child's own fd, not fail. Regression: container
+/// images wire logging through `error.log -> /dev/stderr -> /proc/self/fd/2`;
+/// openat2(RESOLVE_IN_ROOT) refuses to traverse the magic link out of the
+/// resolve root (EXDEV directly, or ENOENT when it points into another mount),
+/// so the open handler must recognize the fd reference and hand back a dup of
+/// the child's stderr. Before the fix this open failed and killed servers like
+/// nginx at startup.
+#[tokio::test]
+async fn test_chroot_magic_fd_symlink_resolves_to_child_fd() {
+    let rootfs = build_test_rootfs("magic-fd-link");
+    std::os::unix::fs::symlink("/dev/stderr", rootfs.join("tmp/errlog")).unwrap();
+
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_mount("/proc", "/proc")
+        .fs_mount("/dev", "/dev")
+        .fs_write("/tmp")
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .with_name("test")
+        .run(&["rootfs-helper", "write-fd-link", "/tmp/errlog", "MAGIC_MARKER"])
+        .await;
+    match result {
+        Ok(r) => {
+            assert!(
+                r.success(),
+                "open of errlog -> /dev/stderr -> /proc/self/fd/2 must succeed, stderr: {}",
+                r.stderr_str().unwrap_or("")
+            );
+            // The write lands on the child's own stderr via the magic link.
+            assert!(
+                r.stderr_str().unwrap_or("").contains("MAGIC_MARKER"),
+                "marker must reach the child's stderr through the magic link, stderr: {:?}",
+                r.stderr_str()
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
 /// echo hello > /tmp/test.txt && cat /tmp/test.txt works, file appears in rootfs/tmp
 #[tokio::test]
 async fn test_chroot_write_file() {

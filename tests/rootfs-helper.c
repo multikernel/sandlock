@@ -634,11 +634,34 @@ static int cmd_proc_dirfd(int argc, char **argv) {
     return 0;
 }
 
+/* ── write-fd-link (open a path that resolves to a magic fd link) ─ */
+/*
+ * Open <path> for writing and write <text> to it. Used to exercise paths that
+ * resolve (directly or through symlinks) to a `/proc/self/fd/N` magic link, as
+ * container images do with `error.log -> /dev/stderr`. openat2(RESOLVE_IN_ROOT)
+ * cannot traverse such a link, so the chroot open handler must recognize the fd
+ * reference and hand back a dup of the child's own fd instead of failing.
+ */
+static int cmd_write_fd_link(int argc, char **argv) {
+    if (argc < 2) { fprintf(stderr, "write-fd-link: need <path> <text>\n"); return 1; }
+    int fd = open(argv[0], O_WRONLY | O_APPEND);
+    if (fd < 0) {
+        fprintf(stderr, "write-fd-link: open %s: %s\n", argv[0], strerror(errno));
+        return 1;
+    }
+    ssize_t n = write(fd, argv[1], strlen(argv[1]));
+    if (n < 0) { fprintf(stderr, "write-fd-link: write: %s\n", strerror(errno)); return 1; }
+    close(fd);
+    fprintf(stdout, "wrote %zd bytes\n", n);
+    return 0;
+}
+
 /* ── dispatch ───────────────────────────────────────────────── */
 
 static int dispatch(const char *cmd, int argc, char **argv) {
     if (strcmp(cmd, "chdir") == 0)          return cmd_chdir(argc, argv);
     if (strcmp(cmd, "proc-dirfd") == 0)     return cmd_proc_dirfd(argc, argv);
+    if (strcmp(cmd, "write-fd-link") == 0)  return cmd_write_fd_link(argc, argv);
     if (strcmp(cmd, "echo") == 0)           return cmd_echo(argc, argv);
     if (strcmp(cmd, "cat") == 0)            return cmd_cat(argc, argv);
     if (strcmp(cmd, "ls") == 0)             return cmd_ls(argc, argv);
