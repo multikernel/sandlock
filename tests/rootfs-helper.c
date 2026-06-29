@@ -611,6 +611,37 @@ static int cmd_chdir(int argc, char **argv) {
     return 0;
 }
 
+/* ── chdir-self (chdir into a /proc/self path, confirm it is OUR dir) ─ */
+/*
+ * chdir(argv[0]) (e.g. "/proc/self"), then getcwd() and check its final
+ * component equals our own getpid(). This proves "self" resolved to the CHILD,
+ * not the supervisor that services /proc on-behalf: if it mis-resolved, the cwd
+ * would render as the supervisor's /proc/<pid> and the basename would not match
+ * our pid. Robust to the exec-via-/proc/self/fd/N comm artifact and to pid
+ * namespaces (getcwd and getpid share the child's own view). Prints "OK <cwd>"
+ * on match, "MISMATCH ..." otherwise (returns 0 either way so the caller can
+ * assert on stdout).
+ */
+static int cmd_chdir_self(int argc, char **argv) {
+    if (argc < 1) { fprintf(stderr, "chdir-self: missing operand\n"); return 1; }
+    if (chdir(argv[0]) != 0) {
+        fprintf(stderr, "chdir-self: chdir %s: %s\n", argv[0], strerror(errno));
+        return 1;
+    }
+    char buf[4096];
+    if (!getcwd(buf, sizeof(buf))) { perror("chdir-self: getcwd"); return 1; }
+    const char *slash = strrchr(buf, '/');
+    const char *base = slash ? slash + 1 : buf;
+    char expect[32];
+    snprintf(expect, sizeof(expect), "%d", getpid());
+    if (strcmp(base, expect) == 0) {
+        printf("OK %s\n", buf);
+    } else {
+        printf("MISMATCH cwd=%s pid=%s\n", buf, expect);
+    }
+    return 0;
+}
+
 /* ── proc-dirfd (non-standard: read /proc/<name> via a proc dirfd) ─ */
 /*
  * Opens /proc as a directory, then openat()s <name> RELATIVE to that fd and
@@ -660,6 +691,7 @@ static int cmd_write_fd_link(int argc, char **argv) {
 
 static int dispatch(const char *cmd, int argc, char **argv) {
     if (strcmp(cmd, "chdir") == 0)          return cmd_chdir(argc, argv);
+    if (strcmp(cmd, "chdir-self") == 0)     return cmd_chdir_self(argc, argv);
     if (strcmp(cmd, "proc-dirfd") == 0)     return cmd_proc_dirfd(argc, argv);
     if (strcmp(cmd, "write-fd-link") == 0)  return cmd_write_fd_link(argc, argv);
     if (strcmp(cmd, "echo") == 0)           return cmd_echo(argc, argv);

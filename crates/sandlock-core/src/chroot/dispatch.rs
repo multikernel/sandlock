@@ -1640,7 +1640,7 @@ pub(crate) async fn handle_chroot_chdir(
 
     // Build the full virtual path from AT_FDCWD + path.
     let was_absolute = Path::new(&path).is_absolute();
-    let full_path = if was_absolute {
+    let virtual_path = if was_absolute {
         path
     } else {
         match std::fs::read_link(format!("/proc/{}/cwd", notif.pid)) {
@@ -1651,6 +1651,17 @@ pub(crate) async fn handle_chroot_chdir(
             Err(_) => return NotifAction::Errno(libc::EACCES),
         }
     };
+    // Canonicalize /proc/self and /proc/thread-self to the child's own PID,
+    // exactly as the open path does (build_virtual_path). The on-behalf
+    // openat2 below runs in the supervisor task, so the kernel would resolve a
+    // literal "self" against the supervisor and point the child's cwd at a
+    // non-sandbox process's /proc/<pid> dir. Rewriting to the numeric child PID
+    // makes "self" resolve to the real caller and keeps every /proc spelling
+    // subject to the same numeric per-PID filter. For a same-path /proc mount
+    // this also lets the native-chdir fast path below fire: the resolved fd's
+    // host path then equals full_path, so the kernel re-runs the original
+    // "/proc/self" in the child's context (where it resolves correctly).
+    let full_path = canon_proc_self(&virtual_path, notif.pid);
 
     // Open directly via openat2(RESOLVE_IN_ROOT), routing to mount target if applicable.
     let confined = confine(&full_path);

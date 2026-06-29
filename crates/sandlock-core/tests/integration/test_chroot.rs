@@ -234,6 +234,50 @@ async fn test_chroot_chdir_proc_readonly_buffer() {
     cleanup_rootfs(&rootfs);
 }
 
+/// chdir("/proc/self") must land on the CHILD's own /proc/<pid> dir, not the
+/// supervisor's. sandlock services /proc via an on-behalf openat2 in the
+/// supervisor task, so a literal "self" would resolve against the supervisor.
+/// The chdir handler canonicalizes /proc/self to the child's numeric PID (same
+/// as the open path), so getcwd() after the chdir renders the child's own
+/// /proc/<pid> and its basename matches the child's getpid(). Before the fix the
+/// cwd pointed at the supervisor's /proc/<pid> and the basename mismatched.
+#[tokio::test]
+async fn test_chroot_chdir_proc_self_resolves_to_child() {
+    let rootfs = build_test_rootfs("chdir-proc-self");
+
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_mount("/proc", "/proc")
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .with_name("test")
+        .run(&["rootfs-helper", "chdir-self", "/proc/self"])
+        .await;
+    match result {
+        Ok(r) => {
+            assert!(
+                r.success(),
+                "chdir(/proc/self) should succeed, stderr: {}",
+                r.stderr_str().unwrap_or("")
+            );
+            // The helper checks getcwd()'s basename == its own getpid(); "OK"
+            // means "self" resolved to the child's own /proc/<pid>, not the
+            // supervisor's.
+            let out = r.stdout_str().unwrap_or("").trim().to_string();
+            assert!(
+                out.starts_with("OK /proc/"),
+                "self must resolve to the child's own /proc/<pid>, got: {:?}",
+                out
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
 /// A dirfd-relative /proc read under a chroot with NO /proc mount must still
 /// hit the synthesis shim. Regression: resolve_open_target took the proc
 /// dirfd's real symlink target (`<chroot>/proc`) as the base, so
