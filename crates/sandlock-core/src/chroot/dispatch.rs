@@ -49,7 +49,7 @@ use tokio::sync::Mutex;
 
 use crate::chroot::resolve::{confine, resolve_existing_in_root, resolve_in_root};
 use crate::sys::fs::openat2_in_root;
-use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction};
+use crate::seccomp::notif::{read_child_mem, write_child_mem, write_child_mem_force, NotifAction};
 use crate::seccomp::state::{ChrootState, CowState};
 use crate::sys::structs::{SeccompNotif, SeccompNotifAddfd, SECCOMP_IOCTL_NOTIF_ADDFD};
 
@@ -868,8 +868,12 @@ pub(crate) async fn handle_chroot_exec(
         return NotifAction::Errno(libc::EIO);
     }
 
+    // Force-write past read-only page protections: the child commonly passes a
+    // .rodata path literal to execve, which process_vm_writev can't overwrite.
+    // No length guard needed — execve replaces the address space on success, so
+    // a write past the original buffer is harmless.
     let fd_path = format!("/proc/self/fd/{}\0", child_fd);
-    if write_child_mem(notif_fd, notif.id, notif.pid, path_ptr, fd_path.as_bytes()).is_err() {
+    if write_child_mem_force(notif_fd, notif.id, notif.pid, path_ptr, fd_path.as_bytes()).is_err() {
         return NotifAction::Errno(libc::EFAULT);
     }
 
@@ -1637,6 +1641,9 @@ pub(crate) async fn handle_chroot_chdir(
         Some(p) => p,
         None => return NotifAction::Continue,
     };
+    // Bytes the child mapped for the path argument (string + NUL): the upper
+    // bound for an in-place rewrite that must not overflow into adjacent memory.
+    let orig_path_buf_len = path.len() + 1;
 
     // Build the full virtual path from AT_FDCWD + path.
     let was_absolute = Path::new(&path).is_absolute();
@@ -1725,7 +1732,17 @@ pub(crate) async fn handle_chroot_chdir(
     }
 
     let fd_path = format!("/proc/self/fd/{}\0", child_fd);
-    if write_child_mem(notif_fd, notif.id, notif.pid, path_ptr, fd_path.as_bytes()).is_err() {
+    // chdir leaves the process running, so the rewrite must not overflow the
+    // child's path buffer into adjacent memory. Only force-write when the
+    // redirect fits; otherwise the original (short) buffer can't be redirected.
+    // src_fd is already closed (above); the injected child fd is O_CLOEXEC and
+    // is reclaimed on the child's next exec/exit.
+    if orig_path_buf_len < fd_path.len() {
+        return NotifAction::Errno(libc::ENAMETOOLONG);
+    }
+    // Force-write past read-only page protections (a .rodata chdir literal that
+    // process_vm_writev can't overwrite).
+    if write_child_mem_force(notif_fd, notif.id, notif.pid, path_ptr, fd_path.as_bytes()).is_err() {
         return NotifAction::Errno(libc::EFAULT);
     }
 
