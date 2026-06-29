@@ -376,14 +376,19 @@ pub(crate) fn build_dispatch_table(
     if policy.has_random_seed {
         for nr in open_family_syscalls() {
             let __sup = Arc::clone(ctx);
+            let policy_rand = Arc::clone(policy);
             table.register(nr, move |cx: &HandlerCtx| {
                 let notif = cx.notif;
                 let sup = Arc::clone(&__sup);
+                let policy = Arc::clone(&policy_rand);
                 let notif_fd = cx.notif_fd;
                 async move {
                     let mut tr = sup.time_random.lock().await;
                     if let Some(ref mut rng) = tr.random_state {
-                        if let Some(action) = crate::random::handle_random_open(&notif, rng, notif_fd) {
+                        if let Some(action) = crate::random::handle_random_open(
+                            &notif, rng, notif_fd,
+                            policy.chroot_root.as_deref(), &policy.chroot_mounts,
+                        ) {
                             return action;
                         }
                     }
@@ -430,12 +435,17 @@ pub(crate) fn build_dispatch_table(
         let etc_hosts = policy.virtual_etc_hosts.clone();
         for nr in open_family_syscalls() {
             let etc_hosts = etc_hosts.clone();
+            let policy_hosts = Arc::clone(policy);
             table.register(nr, move |cx: &HandlerCtx| {
                 let notif = cx.notif;
                 let notif_fd = cx.notif_fd;
                 let etc_hosts = etc_hosts.clone();
+                let policy = Arc::clone(&policy_hosts);
                 async move {
-                    if let Some(action) = crate::procfs::handle_etc_hosts_open(&notif, &etc_hosts, notif_fd) {
+                    if let Some(action) = crate::procfs::handle_etc_hosts_open(
+                        &notif, &etc_hosts, notif_fd,
+                        policy.chroot_root.as_deref(), &policy.chroot_mounts,
+                    ) {
                         action
                     } else {
                         NotifAction::Continue
@@ -457,14 +467,17 @@ pub(crate) fn build_dispatch_table(
             for nr in open_family_syscalls() {
                 let ca_pem = std::sync::Arc::clone(&ca_pem);
                 let inject_paths = std::sync::Arc::clone(&inject_paths);
+                let policy_ca = Arc::clone(policy);
                 table.register(nr, move |cx: &HandlerCtx| {
                     let notif = cx.notif;
                     let notif_fd = cx.notif_fd;
                     let ca_pem = std::sync::Arc::clone(&ca_pem);
                     let inject_paths = std::sync::Arc::clone(&inject_paths);
+                    let policy = Arc::clone(&policy_ca);
                     async move {
                         crate::ca_inject::handle_ca_inject_open(
                             &notif, &inject_paths, &ca_pem, notif_fd,
+                            policy.chroot_root.as_deref(), &policy.chroot_mounts,
                         )
                         .unwrap_or(NotifAction::Continue)
                     }
@@ -571,12 +584,17 @@ pub(crate) fn build_dispatch_table(
         });
         for nr in open_family_syscalls() {
             let hostname = hostname_for_open.clone();
+            let policy_hostname = Arc::clone(policy);
             table.register(nr, move |cx: &HandlerCtx| {
                 let notif = cx.notif;
                 let notif_fd = cx.notif_fd;
                 let hostname = hostname.clone();
+                let policy = Arc::clone(&policy_hostname);
                 async move {
-                    if let Some(action) = crate::procfs::handle_hostname_open(&notif, &hostname, notif_fd) {
+                    if let Some(action) = crate::procfs::handle_hostname_open(
+                        &notif, &hostname, notif_fd,
+                        policy.chroot_root.as_deref(), &policy.chroot_mounts,
+                    ) {
                         action
                     } else {
                         NotifAction::Continue

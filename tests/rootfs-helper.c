@@ -611,10 +611,34 @@ static int cmd_chdir(int argc, char **argv) {
     return 0;
 }
 
+/* ── proc-dirfd (non-standard: read /proc/<name> via a proc dirfd) ─ */
+/*
+ * Opens /proc as a directory, then openat()s <name> RELATIVE to that fd and
+ * dumps it. This is the dirfd-relative spelling of a /proc access: the open
+ * shims must resolve it to the virtual /proc path (not the real
+ * <chroot>/proc) so virtualization/synthesis applies the same as an absolute
+ * open. Prints the file contents on success.
+ */
+static int cmd_proc_dirfd(int argc, char **argv) {
+    if (argc < 1) { fprintf(stderr, "proc-dirfd: missing operand\n"); return 1; }
+    int dfd = open("/proc", O_RDONLY | O_DIRECTORY);
+    if (dfd < 0) { fprintf(stderr, "proc-dirfd: open /proc: %s\n", strerror(errno)); return 1; }
+    int fd = openat(dfd, argv[0], O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "proc-dirfd: openat %s: %s\n", argv[0], strerror(errno)); return 1; }
+    char buf[8192];
+    ssize_t n = read(fd, buf, sizeof(buf));
+    if (n < 0) { fprintf(stderr, "proc-dirfd: read: %s\n", strerror(errno)); return 1; }
+    write(STDOUT_FILENO, buf, n);
+    close(fd);
+    close(dfd);
+    return 0;
+}
+
 /* ── dispatch ───────────────────────────────────────────────── */
 
 static int dispatch(const char *cmd, int argc, char **argv) {
     if (strcmp(cmd, "chdir") == 0)          return cmd_chdir(argc, argv);
+    if (strcmp(cmd, "proc-dirfd") == 0)     return cmd_proc_dirfd(argc, argv);
     if (strcmp(cmd, "echo") == 0)           return cmd_echo(argc, argv);
     if (strcmp(cmd, "cat") == 0)            return cmd_cat(argc, argv);
     if (strcmp(cmd, "ls") == 0)             return cmd_ls(argc, argv);

@@ -47,7 +47,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::chroot::resolve::{confine, resolve_existing_in_root, resolve_in_root, to_virtual_path};
+use crate::chroot::resolve::{confine, resolve_existing_in_root, resolve_in_root};
 use crate::sys::fs::openat2_in_root;
 use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction};
 use crate::seccomp::state::{ChrootState, CowState};
@@ -165,22 +165,7 @@ impl ChrootCtx<'_> {
     /// Inverse: given a host path, return the virtual path.
     /// Checks mount targets first, then falls back to chroot root.
     fn host_to_virtual(&self, host_path: &Path) -> Option<PathBuf> {
-        // Check mounts first (longest prefix match)
-        let mut best: Option<(&Path, &Path, usize)> = None;
-        for (vp, hp) in self.mounts {
-            if host_path.starts_with(hp) {
-                let len = hp.as_os_str().len();
-                if best.is_none() || len > best.unwrap().2 {
-                    best = Some((vp.as_path(), hp.as_path(), len));
-                }
-            }
-        }
-        if let Some((mount_vp, mount_hp, _)) = best {
-            let rel = host_path.strip_prefix(mount_hp).ok()?;
-            return Some(mount_vp.join(rel));
-        }
-        // Fall back to chroot root
-        to_virtual_path(self.root, host_path)
+        crate::chroot::resolve::host_to_virtual(self.root, self.mounts, host_path)
     }
 }
 

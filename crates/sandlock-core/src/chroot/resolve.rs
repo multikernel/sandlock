@@ -36,6 +36,28 @@ pub fn to_virtual_path(chroot_root: &Path, host_path: &Path) -> Option<PathBuf> 
         .map(|rel| PathBuf::from("/").join(rel))
 }
 
+/// Inverse of mount/chroot resolution: map a real host path back to the
+/// sandbox's virtual path.
+///
+/// The chroot root is just the virtual `/` mount, so this is a single
+/// most-specific-prefix lookup over `{ "/" => chroot_root } ∪ mounts` —
+/// the same rule the kernel uses to pick among overlapping mounts. Returns
+/// None when the host path is under neither the root nor any mount.
+pub fn host_to_virtual(
+    chroot_root: &Path,
+    mounts: &[(PathBuf, PathBuf)],
+    host_path: &Path,
+) -> Option<PathBuf> {
+    std::iter::once((Path::new("/"), chroot_root))
+        .chain(mounts.iter().map(|(v, h)| (v.as_path(), h.as_path())))
+        .filter(|(_, source)| host_path.starts_with(source))
+        .max_by_key(|(_, source)| source.as_os_str().len())
+        .map(|(virtual_base, source)| {
+            // strip_prefix cannot fail: the filter above already matched it.
+            virtual_base.join(host_path.strip_prefix(source).expect("prefix matched"))
+        })
+}
+
 /// Resolve a virtual path within the chroot using `openat2(RESOLVE_IN_ROOT)`.
 ///
 /// The kernel resolves all symlinks and `..` components, keeping the result

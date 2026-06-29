@@ -412,7 +412,12 @@ pub(crate) async fn handle_proc_open(
     // sensitive-path deny, the per-PID filter, and the virtualization
     // string-matches below all see the same canonical form regardless of
     // how the caller spelled it (dirfd-relative, `..`-laden, etc.).
-    let resolved = match resolve_open_target(notif, notif_fd) {
+    let resolved = match resolve_open_target(
+        notif,
+        notif_fd,
+        policy.chroot_root.as_deref(),
+        &policy.chroot_mounts,
+    ) {
         Some(p) => p,
         None => return NotifAction::Continue,
     };
@@ -600,8 +605,10 @@ pub(crate) fn handle_hostname_open(
     notif: &SeccompNotif,
     hostname: &str,
     notif_fd: RawFd,
+    chroot_root: Option<&std::path::Path>,
+    chroot_mounts: &[(std::path::PathBuf, std::path::PathBuf)],
 ) -> Option<NotifAction> {
-    let resolved = resolve_open_target(notif, notif_fd)?;
+    let resolved = resolve_open_target(notif, notif_fd, chroot_root, chroot_mounts)?;
     if resolved != std::path::Path::new("/etc/hostname") {
         return None;
     }
@@ -620,8 +627,10 @@ pub(crate) fn handle_etc_hosts_open(
     notif: &SeccompNotif,
     etc_hosts_content: &str,
     notif_fd: RawFd,
+    chroot_root: Option<&std::path::Path>,
+    chroot_mounts: &[(std::path::PathBuf, std::path::PathBuf)],
 ) -> Option<NotifAction> {
-    let resolved = resolve_open_target(notif, notif_fd)?;
+    let resolved = resolve_open_target(notif, notif_fd, chroot_root, chroot_mounts)?;
     if resolved != std::path::Path::new("/etc/hosts") {
         return None;
     }
@@ -646,6 +655,8 @@ pub(crate) fn handle_etc_hosts_open(
 pub(crate) fn resolve_open_target(
     notif: &SeccompNotif,
     notif_fd: RawFd,
+    chroot_root: Option<&std::path::Path>,
+    chroot_mounts: &[(std::path::PathBuf, std::path::PathBuf)],
 ) -> Option<std::path::PathBuf> {
     let nr = notif.data.nr as i64;
     let (dirfd, path_ptr): (i64, u64) = if Some(nr) == crate::arch::sys_open() {
@@ -659,7 +670,7 @@ pub(crate) fn resolve_open_target(
         return None;
     };
     let path = read_path(notif, path_ptr, notif_fd)?;
-    resolve_to_normalized_absolute(notif.pid, dirfd, &path)
+    resolve_to_normalized_absolute(notif.pid, dirfd, &path, chroot_root, chroot_mounts)
 }
 
 /// Lexical normalization of `(pid, dirfd, path)`:
@@ -677,6 +688,8 @@ fn resolve_to_normalized_absolute(
     pid: u32,
     dirfd: i64,
     path: &str,
+    chroot_root: Option<&std::path::Path>,
+    chroot_mounts: &[(std::path::PathBuf, std::path::PathBuf)],
 ) -> Option<std::path::PathBuf> {
     use std::path::{Component, Path, PathBuf};
 
@@ -687,6 +700,18 @@ fn resolve_to_normalized_absolute(
             std::fs::read_link(format!("/proc/{}/cwd", pid)).ok()?
         } else {
             std::fs::read_link(format!("/proc/{}/fd/{}", pid, dirfd as i32)).ok()?
+        };
+        // The dirfd/cwd symlink target is the *real* host directory. Under
+        // chroot, sandlock services /proc, /etc and /dev via on-behalf opens,
+        // so that target is e.g. `<chroot>/proc` while the child's absolute
+        // spelling of the same file is `/proc/...`. Map the base back into the
+        // sandbox's virtual namespace so relative and absolute spellings
+        // resolve identically and the open-family shims (proc synthesis,
+        // /etc/hosts, /etc/hostname, random seed, CA inject) match either way.
+        let base = match chroot_root {
+            Some(root) => crate::chroot::resolve::host_to_virtual(root, chroot_mounts, &base)
+                .unwrap_or(base),
+            None => base,
         };
         base.join(path)
     };

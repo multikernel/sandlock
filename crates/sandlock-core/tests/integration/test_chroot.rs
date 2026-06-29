@@ -234,6 +234,51 @@ async fn test_chroot_chdir_proc_readonly_buffer() {
     cleanup_rootfs(&rootfs);
 }
 
+/// A dirfd-relative /proc read under a chroot with NO /proc mount must still
+/// hit the synthesis shim. Regression: resolve_open_target took the proc
+/// dirfd's real symlink target (`<chroot>/proc`) as the base, so
+/// `openat(open("/proc"), "meminfo")` normalized to `<chroot>/proc/meminfo` and
+/// missed the `== "/proc/meminfo"` synthesis match, falling through to the
+/// chroot handler which ENOENT'd on the empty rootfs procfs, while the absolute
+/// spelling was synthesized. The resolver now maps the dirfd base back into the
+/// virtual namespace so both spellings synthesize identically.
+#[tokio::test]
+async fn test_chroot_proc_dirfd_relative_is_virtualized() {
+    let rootfs = build_test_rootfs("proc-dirfd");
+
+    // No fs_mount for /proc: it is the empty rootfs dir, so the file can only
+    // come from synthesis. max_memory engages the /proc/meminfo shim.
+    let policy = minimal_exec_policy(&rootfs)
+        .max_memory(sandlock_core::sandbox::ByteSize::mib(256))
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .with_name("test")
+        .run(&["rootfs-helper", "proc-dirfd", "meminfo"])
+        .await;
+    match result {
+        Ok(r) => {
+            assert!(
+                r.success(),
+                "dirfd-relative /proc/meminfo must be synthesized (not ENOENT), stderr: {}",
+                r.stderr_str().unwrap_or("")
+            );
+            let out = r.stdout_str().unwrap_or("");
+            assert!(out.contains("MemTotal"), "expected synthesized meminfo, got: {:?}", out);
+            assert!(
+                out.contains("262144"),
+                "expected virtual 256MiB MemTotal (262144 kB), got: {:?}",
+                out
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
 /// echo hello > /tmp/test.txt && cat /tmp/test.txt works, file appears in rootfs/tmp
 #[tokio::test]
 async fn test_chroot_write_file() {
