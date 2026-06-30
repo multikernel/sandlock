@@ -177,13 +177,34 @@ jobs:
       - name: Publish crates
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        # Order matters: dependents publish after their dependencies. core
-        # goes first; oci depends on core, so it follows.
+          # Force HTTP/1.1. crates.io intermittently returns "[16] Error in the
+          # HTTP2 framing layer" during cargo's post-upload index poll, which
+          # aborts the publish mid-sequence and leaves a partial release.
+          CARGO_HTTP_MULTIPLEXING: "false"
+        # Order matters: dependents publish after their dependencies. core goes
+        # first; ffi/cli/oci depend on core, so they follow. Each publish
+        # tolerates an already-uploaded version, so a transient flake (or a
+        # re-run after one) skips the crates that already landed instead of
+        # failing the whole job.
         run: |
-          cargo publish -p sandlock-core
-          cargo publish -p sandlock-ffi
-          cargo publish -p sandlock-cli
-          cargo publish -p sandlock-oci
+          set -euo pipefail
+          publish() {
+            local crate="$1" out
+            if out=$(cargo publish -p "$crate" 2>&1); then
+              echo "$out"
+              return 0
+            fi
+            echo "$out"
+            if echo "$out" | grep -qiE 'already (uploaded|exists)|is already uploaded'; then
+              echo "::notice::$crate is already published at this version; skipping"
+              return 0
+            fi
+            return 1
+          }
+          publish sandlock-core
+          publish sandlock-ffi
+          publish sandlock-cli
+          publish sandlock-oci
 
   # Publish Python package to PyPI
   publish-pypi:
