@@ -334,6 +334,9 @@ pub struct Sandbox {
 
     // Mount mappings: (virtual_path_inside_chroot, host_path_on_disk)
     pub fs_mount: Vec<(PathBuf, PathBuf)>,
+    // Virtual paths (a subset of fs_mount destinations) mounted read-only:
+    // reads allowed, writes denied even on a writable rootfs.
+    pub fs_mount_ro: Vec<PathBuf>,
 
     // Environment
     pub chroot: Option<PathBuf>,
@@ -454,6 +457,7 @@ impl Clone for Sandbox {
             on_exit: self.on_exit.clone(),
             on_error: self.on_error.clone(),
             fs_mount: self.fs_mount.clone(),
+            fs_mount_ro: self.fs_mount_ro.clone(),
             chroot: self.chroot.clone(),
             in_child_main: self.in_child_main,
             clean_env: self.clean_env,
@@ -1586,6 +1590,7 @@ impl Sandbox {
                 chroot_writable: self.fs_writable.clone(),
                 chroot_denied: self.fs_denied.clone(),
                 chroot_mounts: crate::chroot::resolve::resolve_chroot_mounts(&self.fs_mount),
+                chroot_mount_ro: self.fs_mount_ro.clone(),
                 deterministic_dirs: self.deterministic_dirs,
                 virtual_hostname: Some(rt_name),
                 has_http_acl: resolved.features.http_acl,

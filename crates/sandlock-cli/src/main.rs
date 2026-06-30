@@ -56,8 +56,9 @@ struct RunArgs {
     #[arg(long)]
     time_start: Option<String>,
 
-    /// Mount a host path inside the sandbox (e.g. --fs-mount /work:/host/path)
-    #[arg(long = "fs-mount", value_name = "VIRTUAL:HOST")]
+    /// Mount a host path inside the sandbox; append :ro for read-only
+    /// (e.g. --fs-mount /work:/host/path or --fs-mount /work:/host/path:ro)
+    #[arg(long = "fs-mount", value_name = "VIRTUAL:HOST[:ro]")]
     fs_mount: Vec<String>,
 
     /// COW branch action on normal sandbox exit: commit | abort | keep
@@ -382,7 +383,13 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         // Filesystem extras
         if let Some(ref path) = base.chroot { b = b.chroot(path); }
         if let Some(ref path) = base.fs_storage { b = b.fs_storage(path); }
-        for (virt, host) in &base.fs_mount { b = b.fs_mount(virt, host); }
+        for (virt, host) in &base.fs_mount {
+            if base.fs_mount_ro.iter().any(|d| d == virt) {
+                b = b.fs_mount_ro(virt, host);
+            } else {
+                b = b.fs_mount(virt, host);
+            }
+        }
         b = b.on_exit(base.on_exit.clone());
         b = b.on_error(base.on_error.clone());
         b = b.deterministic_dirs(base.deterministic_dirs);
@@ -451,9 +458,12 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         builder = builder.on_error(parse_branch_action("--on-error", s)?);
     }
     for spec in &args.fs_mount {
-        let (virt, host) = spec.split_once(':')
-            .ok_or_else(|| anyhow!("--fs-mount requires VIRTUAL:HOST, got: {}", spec))?;
-        builder = builder.fs_mount(virt, host);
+        let (virt, host, read_only) = profile::parse_mount_spec(spec)?;
+        builder = if read_only {
+            builder.fs_mount_ro(virt, host)
+        } else {
+            builder.fs_mount(virt, host)
+        };
     }
     if !args.cpu_cores.is_empty() { builder = builder.cpu_cores(args.cpu_cores.clone()); }
     if !args.gpu_devices.is_empty() { builder = builder.gpu_devices(args.gpu_devices.clone()); }

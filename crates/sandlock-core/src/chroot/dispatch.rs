@@ -47,9 +47,9 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::chroot::resolve::{confine, resolve_existing_in_root, resolve_in_root, to_virtual_path};
+use crate::chroot::resolve::{confine, resolve_existing_in_root, resolve_in_root};
 use crate::sys::fs::openat2_in_root;
-use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction};
+use crate::seccomp::notif::{read_child_mem, write_child_mem, write_child_mem_force, NotifAction};
 use crate::seccomp::state::{ChrootState, CowState};
 use crate::sys::structs::{SeccompNotif, SeccompNotifAddfd, SECCOMP_IOCTL_NOTIF_ADDFD};
 
@@ -64,6 +64,8 @@ pub(crate) struct ChrootCtx<'a> {
     pub writable: &'a [PathBuf],
     pub denied: &'a [PathBuf],
     pub mounts: &'a [(PathBuf, PathBuf)],
+    /// Virtual paths of read-only mounts: reads allowed, writes denied.
+    pub mount_ro: &'a [PathBuf],
 }
 
 impl ChrootCtx<'_> {
@@ -87,9 +89,21 @@ impl ChrootCtx<'_> {
             || self.writable.iter().any(|p| virtual_path.starts_with(p) || p.starts_with(virtual_path))
     }
 
+    /// Check if a virtual path falls under a read-only mount.
+    fn is_mount_ro(&self, virtual_path: &Path) -> bool {
+        self.mount_ro.iter().any(|vp| virtual_path.starts_with(vp))
+    }
+
     /// Check if `virtual_path` is allowed for writing.
     fn can_write(&self, virtual_path: &Path) -> bool {
         if self.is_denied(virtual_path) {
+            return false;
+        }
+        // Read-only mounts deny writes even though they are mounted (and so
+        // readable). Checked before the is_mounted allow so a read-only mount
+        // (e.g. the host procfs) can't be made writable by a broad writable
+        // prefix such as a read-write rootfs granting "/".
+        if self.is_mount_ro(virtual_path) {
             return false;
         }
         if self.is_mounted(virtual_path) {
@@ -151,22 +165,7 @@ impl ChrootCtx<'_> {
     /// Inverse: given a host path, return the virtual path.
     /// Checks mount targets first, then falls back to chroot root.
     fn host_to_virtual(&self, host_path: &Path) -> Option<PathBuf> {
-        // Check mounts first (longest prefix match)
-        let mut best: Option<(&Path, &Path, usize)> = None;
-        for (vp, hp) in self.mounts {
-            if host_path.starts_with(hp) {
-                let len = hp.as_os_str().len();
-                if best.is_none() || len > best.unwrap().2 {
-                    best = Some((vp.as_path(), hp.as_path(), len));
-                }
-            }
-        }
-        if let Some((mount_vp, mount_hp, _)) = best {
-            let rel = host_path.strip_prefix(mount_hp).ok()?;
-            return Some(mount_vp.join(rel));
-        }
-        // Fall back to chroot root
-        to_virtual_path(self.root, host_path)
+        crate::chroot::resolve::host_to_virtual(self.root, self.mounts, host_path)
     }
 }
 
@@ -196,6 +195,28 @@ fn read_path(notif: &SeccompNotif, addr: u64, notif_fd: RawFd) -> Option<String>
     String::from_utf8(result).ok()
 }
 
+/// Rewrite the magic `/proc/self` and `/proc/thread-self` symlinks to the
+/// caller's real PID.  Under chroot, `/proc` is serviced by an on-behalf
+/// `openat2` in the *supervisor*, so the kernel would otherwise resolve `self`
+/// to the supervisor instead of the workload — both wrong (every
+/// `/proc/self/*` would reflect `sandlock-oci`) and a way to reach a non-sandbox
+/// process the numeric per-PID filter never sees.  Rewriting to `/proc/<pid>`
+/// (the workload PID seccomp reports) makes `self` resolve to the real caller
+/// and re-subjects it to the per-PID check.
+fn canon_proc_self(virtual_path: &str, pid: u32) -> String {
+    for magic in ["/proc/self", "/proc/thread-self"] {
+        if virtual_path == magic {
+            return format!("/proc/{}", pid);
+        }
+        if let Some(rest) = virtual_path.strip_prefix(magic) {
+            if rest.starts_with('/') {
+                return format!("/proc/{}{}", pid, rest);
+            }
+        }
+    }
+    virtual_path.to_string()
+}
+
 /// Build the full virtual path from dirfd + relative path.
 fn build_virtual_path(
     notif: &SeccompNotif,
@@ -203,8 +224,8 @@ fn build_virtual_path(
     path: &str,
     ctx: &ChrootCtx<'_>,
 ) -> Option<String> {
-    if Path::new(path).is_absolute() {
-        Some(path.to_string())
+    let vpath = if Path::new(path).is_absolute() {
+        path.to_string()
     } else {
         let dirfd32 = dirfd as i32;
         let base_host = if dirfd32 == libc::AT_FDCWD {
@@ -214,8 +235,9 @@ fn build_virtual_path(
         };
         let base_virtual = ctx.host_to_virtual(&base_host)?;
         let combined = base_virtual.join(path);
-        Some(combined.to_string_lossy().to_string())
-    }
+        combined.to_string_lossy().to_string()
+    };
+    Some(canon_proc_self(&vpath, notif.pid))
 }
 
 /// Resolve a child path to (host_path, virtual_path) within the chroot.
@@ -414,26 +436,149 @@ pub(crate) async fn handle_chroot_open(
         }
     }
 
-    // Open directly via openat2(RESOLVE_IN_ROOT) — single atomic open
-    // confined to the chroot root (or mount target), no resolve-then-reopen TOCTOU gap.
-    let vp_str = virtual_path.to_string_lossy();
-    let mode = if is_write { 0o666 } else { 0 };
-    let (resolve_root, resolve_path) = if let Some((mt, sub)) = ctx.mount_target(&virtual_path) {
-        (mt.to_path_buf(), sub)
-    } else {
-        (ctx.root.to_path_buf(), vp_str.to_string())
-    };
-    let fd = match openat2_in_root(&resolve_root, &resolve_path, flags as i32, mode) {
-        Ok(fd) => fd,
-        Err(errno) => return NotifAction::Errno(errno),
-    };
+    // Resolve the path to an fd to hand the child: either a freshly opened tree
+    // file or a dup of one of the child's own fds (a magic link). See
+    // `open_in_namespace`.
+    //
+    // openat2 rejects a non-zero mode unless O_CREAT/O_TMPFILE is set (stricter
+    // than openat), so only supply a creation mode when the child asks to create.
+    // O_TMPFILE is a composite (__O_TMPFILE | O_DIRECTORY), so it must be matched
+    // as a full mask, not with a bitwise-and that any O_DIRECTORY open would trip.
+    let flags_i = flags as i32;
+    let creates = flags_i & libc::O_CREAT != 0 || flags_i & libc::O_TMPFILE == libc::O_TMPFILE;
+    let mode = if creates { 0o666 } else { 0 };
     let newfd_flags = if flags & libc::O_CLOEXEC as u64 != 0 {
         libc::O_CLOEXEC as u32
     } else {
         0
     };
-    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    NotifAction::InjectFdSend { srcfd: owned, newfd_flags }
+    match open_in_namespace(ctx, notif.pid, &virtual_path, flags as i32, mode) {
+        Ok(srcfd) => NotifAction::InjectFdSend { srcfd, newfd_flags },
+        Err(errno) => NotifAction::Errno(errno),
+    }
+}
+
+/// Open `virtual_path` within the child's virtual namespace, returning an fd to
+/// inject into the child.
+///
+/// A path names one of two things:
+///
+/// 1. A **tree object** reachable by walking the rootfs (or a mount target).
+///    `openat2(RESOLVE_IN_ROOT)` opens these atomically and confined, with no
+///    resolve-then-reopen TOCTOU gap. This is the overwhelmingly common case.
+///
+/// 2. An **fd reference** such as `/proc/self/fd/N` (named directly, or reached
+///    through a symlink chain like `/dev/stderr -> /proc/self/fd/N` that
+///    container images use for logging). This is not a filesystem object at
+///    all; it names an entry in the child's *own* fd table, which the child
+///    already holds. `openat2(RESOLVE_IN_ROOT)` rightly declines to fabricate
+///    it (a magic link points outside the root by definition), so we serve it
+///    by dup'ing the child's fd. No new access: the open was already authorized
+///    by the caller and the child already owns the fd.
+///
+/// openat2 success proves category 1 (it refuses magic links), so we only look
+/// for category 2 when it can't complete: EXDEV when the magic link sits in the
+/// same root, ENOENT/ENOTDIR when it points into another mount (e.g.
+/// `/dev/stderr -> /proc/...` resolved within the `/dev` mount). The fd walk is
+/// authoritative and returns None for genuine misses, so non-magic paths
+/// propagate their original errno unchanged.
+fn open_in_namespace(
+    ctx: &ChrootCtx<'_>,
+    child_pid: u32,
+    virtual_path: &Path,
+    flags: i32,
+    mode: u32,
+) -> Result<OwnedFd, i32> {
+    let vp_str = virtual_path.to_string_lossy();
+
+    // Category 2, named directly: skip the open and dup straight away.
+    if let Some(child_fd) = magic_self_fd(&vp_str, child_pid) {
+        return crate::seccomp::notif::dup_fd_from_pid(child_pid, child_fd)
+            .map_err(|_| libc::EBADF);
+    }
+
+    let (root, sub) = match ctx.mount_target(virtual_path) {
+        Some((mt, sub)) => (mt.to_path_buf(), sub),
+        None => (ctx.root.to_path_buf(), vp_str.to_string()),
+    };
+    match openat2_in_root(&root, &sub, flags, mode) {
+        // Category 1.
+        Ok(fd) => Ok(unsafe { OwnedFd::from_raw_fd(fd) }),
+        // Category 2, reached through symlinks.
+        Err(errno) if matches!(errno, libc::EXDEV | libc::ENOENT | libc::ENOTDIR) => {
+            match resolve_self_fd_magic(ctx, child_pid, &vp_str) {
+                Some(child_fd) => crate::seccomp::notif::dup_fd_from_pid(child_pid, child_fd)
+                    .map_err(|_| errno),
+                None => Err(errno),
+            }
+        }
+        Err(errno) => Err(errno),
+    }
+}
+
+/// If `path` is a self-referential `/proc/.../fd/N` magic link for the calling
+/// child (`/proc/self`, `/proc/thread-self`, or `/proc/<child_pid>`), return the
+/// child fd `N`. The fd component must be a bare number (no trailing path).
+fn magic_self_fd(path: &str, child_pid: u32) -> Option<i32> {
+    let (who, fd_part) = path.strip_prefix("/proc/")?.split_once("/fd/")?;
+    let is_self =
+        who == "self" || who == "thread-self" || who.parse::<u32>().ok() == Some(child_pid);
+    if !is_self || fd_part.contains('/') {
+        return None;
+    }
+    fd_part.parse::<i32>().ok()
+}
+
+/// Read the symlink target at `virtual_path`, resolved within the chroot/mounts,
+/// without following the final component. Returns None if it is not a symlink.
+fn read_symlink_in_root(ctx: &ChrootCtx<'_>, virtual_path: &str) -> Option<String> {
+    let confined = crate::chroot::resolve::confine(virtual_path);
+    let (root, sub) = if let Some((mt, sub)) = ctx.mount_target(&confined) {
+        (mt.to_path_buf(), sub)
+    } else {
+        (ctx.root.to_path_buf(), confined.to_string_lossy().into_owned())
+    };
+    let fd = openat2_in_root(
+        &root,
+        &sub,
+        libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    )
+    .ok()?;
+    let mut buf = [0u8; 4096];
+    let n = unsafe {
+        libc::readlinkat(
+            fd,
+            c"".as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+        )
+    };
+    unsafe { libc::close(fd) };
+    if n <= 0 {
+        return None; // EINVAL (not a symlink) or read error
+    }
+    Some(String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+}
+
+/// Walk the symlink chain at `virtual_path` (confined to the chroot/mounts)
+/// looking for a terminating self-fd magic link; return the child fd it names.
+fn resolve_self_fd_magic(ctx: &ChrootCtx<'_>, child_pid: u32, virtual_path: &str) -> Option<i32> {
+    let mut cur = virtual_path.to_string();
+    for _ in 0..40 {
+        if let Some(fd) = magic_self_fd(&cur, child_pid) {
+            return Some(fd);
+        }
+        let target = read_symlink_in_root(ctx, &cur)?;
+        let next = if Path::new(&target).is_absolute() {
+            target
+        } else {
+            let parent = Path::new(&cur).parent().unwrap_or_else(|| Path::new("/"));
+            parent.join(&target).to_string_lossy().into_owned()
+        };
+        cur = crate::chroot::resolve::confine(&next).to_string_lossy().into_owned();
+    }
+    None
 }
 
 // ============================================================
@@ -723,8 +868,12 @@ pub(crate) async fn handle_chroot_exec(
         return NotifAction::Errno(libc::EIO);
     }
 
+    // Force-write past read-only page protections: the child commonly passes a
+    // .rodata path literal to execve, which process_vm_writev can't overwrite.
+    // No length guard needed — execve replaces the address space on success, so
+    // a write past the original buffer is harmless.
     let fd_path = format!("/proc/self/fd/{}\0", child_fd);
-    if write_child_mem(notif_fd, notif.id, notif.pid, path_ptr, fd_path.as_bytes()).is_err() {
+    if write_child_mem_force(notif_fd, notif.id, notif.pid, path_ptr, fd_path.as_bytes()).is_err() {
         return NotifAction::Errno(libc::EFAULT);
     }
 
@@ -1492,9 +1641,13 @@ pub(crate) async fn handle_chroot_chdir(
         Some(p) => p,
         None => return NotifAction::Continue,
     };
+    // Bytes the child mapped for the path argument (string + NUL): the upper
+    // bound for an in-place rewrite that must not overflow into adjacent memory.
+    let orig_path_buf_len = path.len() + 1;
 
     // Build the full virtual path from AT_FDCWD + path.
-    let full_path = if Path::new(&path).is_absolute() {
+    let was_absolute = Path::new(&path).is_absolute();
+    let virtual_path = if was_absolute {
         path
     } else {
         match std::fs::read_link(format!("/proc/{}/cwd", notif.pid)) {
@@ -1505,6 +1658,17 @@ pub(crate) async fn handle_chroot_chdir(
             Err(_) => return NotifAction::Errno(libc::EACCES),
         }
     };
+    // Canonicalize /proc/self and /proc/thread-self to the child's own PID,
+    // exactly as the open path does (build_virtual_path). The on-behalf
+    // openat2 below runs in the supervisor task, so the kernel would resolve a
+    // literal "self" against the supervisor and point the child's cwd at a
+    // non-sandbox process's /proc/<pid> dir. Rewriting to the numeric child PID
+    // makes "self" resolve to the real caller and keeps every /proc spelling
+    // subject to the same numeric per-PID filter. For a same-path /proc mount
+    // this also lets the native-chdir fast path below fire: the resolved fd's
+    // host path then equals full_path, so the kernel re-runs the original
+    // "/proc/self" in the child's context (where it resolves correctly).
+    let full_path = canon_proc_self(&virtual_path, notif.pid);
 
     // Open directly via openat2(RESOLVE_IN_ROOT), routing to mount target if applicable.
     let confined = confine(&full_path);
@@ -1522,6 +1686,29 @@ pub(crate) async fn handle_chroot_chdir(
         Ok(fd) => fd,
         Err(errno) => return NotifAction::Errno(errno),
     };
+
+    // Native-chdir fast path. The child runs in the host filesystem (sandlock
+    // does not chroot(2); it confines via on-behalf openat2 + Landlock), so an
+    // absolute chdir resolves against the real host root. When the on-behalf
+    // resolved directory's real host path is identical to the path the child
+    // asked for (the common case for same-path mounts like /proc and /sys), a
+    // raw chdir reaches the exact same directory. Let the kernel run the
+    // original syscall unchanged instead of rewriting the argument to the
+    // longer /proc/self/fd/N: that rewrite goes through process_vm_writev,
+    // which fails with EFAULT when the child passed a read-only string literal
+    // (e.g. busybox `top`'s chdir("/proc")), killing the process. Confinement
+    // is preserved: every subsequent open/stat/getdents is independently
+    // re-resolved on-behalf, and the equality check only holds when no symlink
+    // redirection occurred during the confined open.
+    if was_absolute
+        && std::fs::read_link(format!("/proc/self/fd/{}", src_fd))
+            .ok()
+            .as_deref()
+            == Some(Path::new(&full_path))
+    {
+        unsafe { libc::close(src_fd) };
+        return NotifAction::Continue;
+    }
 
     // Inject fd into child and rewrite path to /proc/self/fd/N.
     let addfd = SeccompNotifAddfd {
@@ -1545,7 +1732,17 @@ pub(crate) async fn handle_chroot_chdir(
     }
 
     let fd_path = format!("/proc/self/fd/{}\0", child_fd);
-    if write_child_mem(notif_fd, notif.id, notif.pid, path_ptr, fd_path.as_bytes()).is_err() {
+    // chdir leaves the process running, so the rewrite must not overflow the
+    // child's path buffer into adjacent memory. Only force-write when the
+    // redirect fits; otherwise the original (short) buffer can't be redirected.
+    // src_fd is already closed (above); the injected child fd is O_CLOEXEC and
+    // is reclaimed on the child's next exec/exit.
+    if orig_path_buf_len < fd_path.len() {
+        return NotifAction::Errno(libc::ENAMETOOLONG);
+    }
+    // Force-write past read-only page protections (a .rodata chdir literal that
+    // process_vm_writev can't overwrite).
+    if write_child_mem_force(notif_fd, notif.id, notif.pid, path_ptr, fd_path.as_bytes()).is_err() {
         return NotifAction::Errno(libc::EFAULT);
     }
 
@@ -1964,4 +2161,72 @@ pub(crate) async fn handle_chroot_legacy_chown(
     ]);
     synth.data.nr = libc::SYS_fchownat as i32;
     handle_chroot_write(&synth, chroot_state, cow_state, notif_fd, ctx).await
+}
+
+#[cfg(test)]
+mod self_rewrite_tests {
+    use super::canon_proc_self;
+
+    #[test]
+    fn rewrites_self_and_thread_self_to_pid() {
+        assert_eq!(canon_proc_self("/proc/self", 42), "/proc/42");
+        assert_eq!(canon_proc_self("/proc/self/status", 42), "/proc/42/status");
+        assert_eq!(canon_proc_self("/proc/self/fd/3", 42), "/proc/42/fd/3");
+        assert_eq!(canon_proc_self("/proc/thread-self", 42), "/proc/42");
+        assert_eq!(canon_proc_self("/proc/thread-self/maps", 42), "/proc/42/maps");
+    }
+
+    #[test]
+    fn leaves_other_paths_untouched() {
+        // Numeric PIDs, non-self /proc paths, and "selfish" lookalikes must not
+        // be rewritten.
+        assert_eq!(canon_proc_self("/proc/7/status", 42), "/proc/7/status");
+        assert_eq!(canon_proc_self("/proc/cpuinfo", 42), "/proc/cpuinfo");
+        assert_eq!(canon_proc_self("/proc/selfish", 42), "/proc/selfish");
+        assert_eq!(canon_proc_self("/etc/passwd", 42), "/etc/passwd");
+    }
+}
+
+#[cfg(test)]
+mod mount_ro_tests {
+    use super::ChrootCtx;
+    use std::path::{Path, PathBuf};
+
+    fn ctx<'a>(
+        mounts: &'a [(PathBuf, PathBuf)],
+        mount_ro: &'a [PathBuf],
+        writable: &'a [PathBuf],
+    ) -> ChrootCtx<'a> {
+        ChrootCtx {
+            root: Path::new("/rootfs"),
+            readable: &[],
+            writable,
+            denied: &[],
+            mounts,
+            mount_ro,
+        }
+    }
+
+    #[test]
+    fn read_only_mount_denies_writes_but_allows_reads() {
+        let mounts = vec![(PathBuf::from("/proc"), PathBuf::from("/proc"))];
+        let ro = vec![PathBuf::from("/proc")];
+        // Even with a writable rootfs ("/" granted), the read-only /proc mount
+        // must still deny writes — this is the host-escape guard.
+        let writable = vec![PathBuf::from("/")];
+        let c = ctx(&mounts, &ro, &writable);
+        assert!(c.can_read(Path::new("/proc/version")));
+        assert!(!c.can_write(Path::new("/proc/sys/kernel/core_pattern")));
+        assert!(!c.can_write(Path::new("/proc/self/oom_score_adj")));
+    }
+
+    #[test]
+    fn writable_mount_still_allows_writes() {
+        let mounts = vec![(PathBuf::from("/data"), PathBuf::from("/host/data"))];
+        let ro: Vec<PathBuf> = vec![];
+        let writable = vec![PathBuf::from("/data")];
+        let c = ctx(&mounts, &ro, &writable);
+        assert!(c.can_read(Path::new("/data/file")));
+        assert!(c.can_write(Path::new("/data/file")));
+    }
 }

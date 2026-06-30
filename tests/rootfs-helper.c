@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -581,9 +582,118 @@ static int cmd_spawn_loop(int argc, char **argv) {
     return 0;
 }
 
+/* ── chdir (non-standard: chdir from a READ-ONLY path buffer) ─── */
+/*
+ * Copies the target path onto a freshly mmap'd page, flips it to PROT_READ,
+ * then chdir()s through that read-only pointer. This reproduces how real
+ * programs (e.g. busybox `top`'s chdir("/proc")) pass a .rodata string
+ * literal: the chroot chdir handler must not assume the child's path buffer
+ * is writable, since rewriting it in place would fault. On success prints the
+ * resulting cwd so the caller can confirm the directory actually changed.
+ */
+static int cmd_chdir(int argc, char **argv) {
+    if (argc < 1) { fprintf(stderr, "chdir: missing operand\n"); return 1; }
+    size_t n = strlen(argv[0]) + 1;
+    long pg = sysconf(_SC_PAGESIZE);
+    size_t maplen = ((n + pg - 1) / pg) * pg;
+    char *ro = mmap(NULL, maplen, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (ro == MAP_FAILED) { perror("chdir: mmap"); return 1; }
+    memcpy(ro, argv[0], n);
+    if (mprotect(ro, maplen, PROT_READ) != 0) { perror("chdir: mprotect"); return 1; }
+    if (chdir(ro) != 0) {
+        fprintf(stderr, "chdir: %s: %s\n", argv[0], strerror(errno));
+        return 1;
+    }
+    char buf[4096];
+    if (!getcwd(buf, sizeof(buf))) { perror("chdir: getcwd"); return 1; }
+    printf("OK %s\n", buf);
+    return 0;
+}
+
+/* ── chdir-self (chdir into a /proc/self path, confirm it is OUR dir) ─ */
+/*
+ * chdir(argv[0]) (e.g. "/proc/self"), then getcwd() and check its final
+ * component equals our own getpid(). This proves "self" resolved to the CHILD,
+ * not the supervisor that services /proc on-behalf: if it mis-resolved, the cwd
+ * would render as the supervisor's /proc/<pid> and the basename would not match
+ * our pid. Robust to the exec-via-/proc/self/fd/N comm artifact and to pid
+ * namespaces (getcwd and getpid share the child's own view). Prints "OK <cwd>"
+ * on match, "MISMATCH ..." otherwise (returns 0 either way so the caller can
+ * assert on stdout).
+ */
+static int cmd_chdir_self(int argc, char **argv) {
+    if (argc < 1) { fprintf(stderr, "chdir-self: missing operand\n"); return 1; }
+    if (chdir(argv[0]) != 0) {
+        fprintf(stderr, "chdir-self: chdir %s: %s\n", argv[0], strerror(errno));
+        return 1;
+    }
+    char buf[4096];
+    if (!getcwd(buf, sizeof(buf))) { perror("chdir-self: getcwd"); return 1; }
+    const char *slash = strrchr(buf, '/');
+    const char *base = slash ? slash + 1 : buf;
+    char expect[32];
+    snprintf(expect, sizeof(expect), "%d", getpid());
+    if (strcmp(base, expect) == 0) {
+        printf("OK %s\n", buf);
+    } else {
+        printf("MISMATCH cwd=%s pid=%s\n", buf, expect);
+    }
+    return 0;
+}
+
+/* ── proc-dirfd (non-standard: read /proc/<name> via a proc dirfd) ─ */
+/*
+ * Opens /proc as a directory, then openat()s <name> RELATIVE to that fd and
+ * dumps it. This is the dirfd-relative spelling of a /proc access: the open
+ * shims must resolve it to the virtual /proc path (not the real
+ * <chroot>/proc) so virtualization/synthesis applies the same as an absolute
+ * open. Prints the file contents on success.
+ */
+static int cmd_proc_dirfd(int argc, char **argv) {
+    if (argc < 1) { fprintf(stderr, "proc-dirfd: missing operand\n"); return 1; }
+    int dfd = open("/proc", O_RDONLY | O_DIRECTORY);
+    if (dfd < 0) { fprintf(stderr, "proc-dirfd: open /proc: %s\n", strerror(errno)); return 1; }
+    int fd = openat(dfd, argv[0], O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "proc-dirfd: openat %s: %s\n", argv[0], strerror(errno)); return 1; }
+    char buf[8192];
+    ssize_t n = read(fd, buf, sizeof(buf));
+    if (n < 0) { fprintf(stderr, "proc-dirfd: read: %s\n", strerror(errno)); return 1; }
+    write(STDOUT_FILENO, buf, n);
+    close(fd);
+    close(dfd);
+    return 0;
+}
+
+/* ── write-fd-link (open a path that resolves to a magic fd link) ─ */
+/*
+ * Open <path> for writing and write <text> to it. Used to exercise paths that
+ * resolve (directly or through symlinks) to a `/proc/self/fd/N` magic link, as
+ * container images do with `error.log -> /dev/stderr`. openat2(RESOLVE_IN_ROOT)
+ * cannot traverse such a link, so the chroot open handler must recognize the fd
+ * reference and hand back a dup of the child's own fd instead of failing.
+ */
+static int cmd_write_fd_link(int argc, char **argv) {
+    if (argc < 2) { fprintf(stderr, "write-fd-link: need <path> <text>\n"); return 1; }
+    int fd = open(argv[0], O_WRONLY | O_APPEND);
+    if (fd < 0) {
+        fprintf(stderr, "write-fd-link: open %s: %s\n", argv[0], strerror(errno));
+        return 1;
+    }
+    ssize_t n = write(fd, argv[1], strlen(argv[1]));
+    if (n < 0) { fprintf(stderr, "write-fd-link: write: %s\n", strerror(errno)); return 1; }
+    close(fd);
+    fprintf(stdout, "wrote %zd bytes\n", n);
+    return 0;
+}
+
 /* ── dispatch ───────────────────────────────────────────────── */
 
 static int dispatch(const char *cmd, int argc, char **argv) {
+    if (strcmp(cmd, "chdir") == 0)          return cmd_chdir(argc, argv);
+    if (strcmp(cmd, "chdir-self") == 0)     return cmd_chdir_self(argc, argv);
+    if (strcmp(cmd, "proc-dirfd") == 0)     return cmd_proc_dirfd(argc, argv);
+    if (strcmp(cmd, "write-fd-link") == 0)  return cmd_write_fd_link(argc, argv);
     if (strcmp(cmd, "echo") == 0)           return cmd_echo(argc, argv);
     if (strcmp(cmd, "cat") == 0)            return cmd_cat(argc, argv);
     if (strcmp(cmd, "ls") == 0)             return cmd_ls(argc, argv);

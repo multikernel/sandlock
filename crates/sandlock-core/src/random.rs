@@ -56,11 +56,13 @@ pub(crate) fn handle_random_open(
     notif: &SeccompNotif,
     rng: &mut ChaCha8Rng,
     notif_fd: RawFd,
+    chroot_root: Option<&std::path::Path>,
+    chroot_mounts: &[(std::path::PathBuf, std::path::PathBuf)],
 ) -> Option<NotifAction> {
     // Resolve the open path so dirfd-relative or non-canonical spellings
     // (`/dev/../dev/urandom`, `openat(open("/dev"), "urandom", ...)`)
     // can't sidestep the seed and read real kernel entropy.
-    let resolved = crate::procfs::resolve_open_target(notif, notif_fd)?;
+    let resolved = crate::procfs::resolve_open_target(notif, notif_fd, chroot_root, chroot_mounts)?;
     let path = resolved.to_str()?;
     if path != "/dev/urandom" && path != "/dev/random" {
         return None;

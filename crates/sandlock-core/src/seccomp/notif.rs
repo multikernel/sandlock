@@ -759,6 +759,11 @@ pub struct NotifPolicy {
     pub chroot_denied: Vec<std::path::PathBuf>,
     /// Mount mappings: (virtual_path, host_path) pairs.
     pub chroot_mounts: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+    /// Virtual paths of mounts that are read-only: writes are denied even
+    /// though the path is mounted (and therefore readable). Used for the host
+    /// procfs mount and OCI `ro` bind mounts so a writable rootfs cannot make
+    /// e.g. `/proc/sys/*` writable.
+    pub chroot_mount_ro: Vec<std::path::PathBuf>,
     pub deterministic_dirs: bool,
     pub virtual_hostname: Option<String>,
     pub has_http_acl: bool,
@@ -1112,6 +1117,62 @@ pub fn write_child_mem(
     id_valid(notif_fd, id).map_err(NotifError::Ioctl)?;
     write_child_mem_vm(pid, addr, data)?;
     id_valid(notif_fd, id).map_err(NotifError::Ioctl)?;
+    Ok(())
+}
+
+/// Write bytes to a child, forcing past read-only page protections.
+///
+/// [`write_child_mem`] uses `process_vm_writev`, which honors the target VMA's
+/// protection bits and so returns `EFAULT` when the destination page is
+/// read-only — e.g. a `.rodata` path literal a program hands to
+/// `chdir`/`execve`. This variant writes through `/proc/<pid>/mem`, whose writes
+/// use `FOLL_FORCE` and therefore copy-on-write past a read-only mapping (the
+/// same mechanism a debugger uses to plant a breakpoint in read-only `.text`).
+/// It handles writable and read-only destinations through one path, so the
+/// argument-rewrite sites need no `EFAULT` fallback.
+///
+/// Use ONLY for rewriting an *input* path argument the child owns that the
+/// kernel re-reads under `SECCOMP_USER_NOTIF_FLAG_CONTINUE` (the `chdir`/`execve`
+/// path rewrites). Do NOT use it for syscall *output* buffers (`stat`,
+/// `getdents`, `getcwd`, `readlink`, the `getsockname`/`recvfrom` source
+/// address): if a child supplies a read-only output buffer the real syscall
+/// would `EFAULT`, and faithful emulation must too — keep those on
+/// [`write_child_mem`]. (`bind`/`connect` need nothing here: they are emulated
+/// on-behalf on a duped fd and never rewrite the child's sockaddr.)
+///
+/// Opening `/proc/<pid>/mem` for write needs `PTRACE_MODE_ATTACH_FSCREDS` over
+/// the child (no actual attach or stop): satisfied by the supervisor as the
+/// child's same-uid parent under the common Yama scopes. Returns `Err` (so the
+/// caller can still surface `EFAULT`) if the `mem` file can't be opened or
+/// written — it never silently no-ops. TOCTOU-safe: brackets the write with
+/// `id_valid` like [`write_child_mem`].
+pub fn write_child_mem_force(
+    notif_fd: RawFd,
+    id: u64,
+    pid: u32,
+    addr: u64,
+    data: &[u8],
+) -> Result<(), NotifError> {
+    id_valid(notif_fd, id).map_err(NotifError::Ioctl)?;
+    write_child_mem_proc(pid, addr, data)?;
+    id_valid(notif_fd, id).map_err(NotifError::Ioctl)?;
+    Ok(())
+}
+
+/// Write bytes to a process's memory via `/proc/<pid>/mem` (open + `pwrite`).
+///
+/// Inner helper for [`write_child_mem_force`]; the file offset is the target
+/// virtual address. Writes here use `FOLL_FORCE`, so they copy-on-write past a
+/// read-only destination page where [`write_child_mem_vm`] (`process_vm_writev`)
+/// returns `EFAULT`.
+fn write_child_mem_proc(pid: u32, addr: u64, data: &[u8]) -> Result<(), NotifError> {
+    use std::os::unix::fs::FileExt;
+    let mem = std::fs::OpenOptions::new()
+        .write(true)
+        .open(format!("/proc/{}/mem", pid))
+        .map_err(NotifError::ChildMemoryWrite)?;
+    mem.write_all_at(data, addr)
+        .map_err(NotifError::ChildMemoryWrite)?;
     Ok(())
 }
 
@@ -2260,6 +2321,57 @@ mod tests {
         let result = write_child_mem_vm(pid, addr, &payload);
         assert!(result.is_ok());
         assert_eq!(data, 0x1234567890ABCDEF);
+    }
+
+    /// The force-write path (`/proc/<pid>/mem`, FOLL_FORCE) must overwrite a
+    /// read-only page where `process_vm_writev` (`write_child_mem_vm`) refuses.
+    /// A read-only private page stands in for the `.rodata` path literal a child
+    /// hands to chdir/execve — the exact case the chroot/cow rewrite sites hit.
+    #[test]
+    fn write_child_mem_proc_forces_past_readonly_page() {
+        const PAGE: usize = 4096;
+        let orig = b"/some/rodata/path\0";
+        let newb = b"/proc/self/fd/7\0\0"; // fits within the page, near orig's len
+
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                PAGE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(addr, libc::MAP_FAILED, "mmap failed");
+        unsafe { std::ptr::copy_nonoverlapping(orig.as_ptr(), addr as *mut u8, orig.len()) };
+
+        // Flip the page read-only: a normal store would now SIGSEGV, and
+        // process_vm_writev honors the protection and fails.
+        assert_eq!(
+            unsafe { libc::mprotect(addr, PAGE, libc::PROT_READ) },
+            0,
+            "mprotect PROT_READ failed"
+        );
+
+        let pid = std::process::id();
+        let uaddr = addr as u64;
+
+        assert!(
+            write_child_mem_vm(pid, uaddr, newb).is_err(),
+            "process_vm_writev must fail on a read-only page"
+        );
+
+        // FOLL_FORCE via /proc/<pid>/mem copies-on-write past the RO page.
+        write_child_mem_proc(pid, uaddr, newb)
+            .expect("force-write through /proc/pid/mem must succeed on a read-only page");
+
+        // The write landed at the target address (page is still RO-mapped, so a
+        // plain read is fine and reflects the COW'd contents).
+        let got = unsafe { std::slice::from_raw_parts(addr as *const u8, newb.len()) };
+        assert_eq!(got, newb, "forced write must be visible at the target address");
+
+        unsafe { libc::munmap(addr, PAGE) };
     }
 
     #[test]

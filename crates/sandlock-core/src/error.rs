@@ -100,6 +100,9 @@ pub enum NotifError {
     #[error("child memory read failed: {0}")]
     ChildMemoryRead(#[source] std::io::Error),
 
+    #[error("child memory write failed: {0}")]
+    ChildMemoryWrite(#[source] std::io::Error),
+
     #[error("notification ioctl failed: {0}")]
     Ioctl(#[source] std::io::Error),
 }

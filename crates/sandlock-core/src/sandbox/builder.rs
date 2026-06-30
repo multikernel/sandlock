@@ -136,6 +136,10 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", clap(skip))]
     pub fs_mount: Vec<(PathBuf, PathBuf)>,
 
+    // Virtual paths (subset of fs_mount destinations) mounted read-only.
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub fs_mount_ro: Vec<PathBuf>,
+
     #[cfg_attr(feature = "cli", arg(long = "chroot"))]
     pub chroot: Option<PathBuf>,
 
@@ -247,6 +251,7 @@ impl Clone for SandboxBuilder {
             on_exit: self.on_exit.clone(),
             on_error: self.on_error.clone(),
             fs_mount: self.fs_mount.clone(),
+            fs_mount_ro: self.fs_mount_ro.clone(),
             chroot: self.chroot.clone(),
             clean_env: self.clean_env,
             env: self.env.clone(),
@@ -507,6 +512,15 @@ impl SandboxBuilder {
         self
     }
 
+    /// Add a read-only mount: the host path is visible at `virtual_path` for
+    /// reading, but writes through it are denied (e.g. the host procfs mount).
+    pub fn fs_mount_ro(mut self, virtual_path: impl Into<PathBuf>, host_path: impl Into<PathBuf>) -> Self {
+        let virtual_path = virtual_path.into();
+        self.fs_mount.push((virtual_path.clone(), host_path.into()));
+        self.fs_mount_ro.push(virtual_path);
+        self
+    }
+
     pub fn clean_env(mut self, v: bool) -> Self {
         self.clean_env = v;
         self
@@ -752,6 +766,7 @@ impl SandboxBuilder {
             on_exit: self.on_exit.unwrap_or_default(),
             on_error: self.on_error.unwrap_or_default(),
             fs_mount: self.fs_mount,
+            fs_mount_ro: self.fs_mount_ro,
             chroot: self.chroot,
             in_child_main: None,
             clean_env: self.clean_env,

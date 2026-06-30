@@ -34,7 +34,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::arch;
 use crate::cow::seccomp::SeccompCowBranch;
 use crate::procfs::{build_dirent64, DT_DIR, DT_LNK, DT_REG};
-use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction};
+use crate::seccomp::notif::{read_child_mem, write_child_mem, write_child_mem_force, NotifAction};
 use crate::seccomp::state::{CowState, PerProcessState, ProcessIndex};
 use crate::sys::structs::SeccompNotif;
 
@@ -1015,8 +1015,11 @@ pub(crate) async fn handle_cow_exec(
     // injected fd. execve replaces the whole address space on success, so
     // (unlike chdir) writing past the original buffer is harmless — the
     // only memory the kernel still reads is argv/envp, which sit elsewhere.
+    // Force-write past read-only protections (a .rodata exec path literal). No
+    // length guard: execve replaces the address space on success (see above), so
+    // a write past the original buffer is harmless.
     let fd_path = format!("/proc/self/fd/{}\0", child_fd);
-    if write_child_mem(notif_fd, notif.id, notif.pid, path_ptr, fd_path.as_bytes()).is_err() {
+    if write_child_mem_force(notif_fd, notif.id, notif.pid, path_ptr, fd_path.as_bytes()).is_err() {
         return NotifAction::Errno(libc::EFAULT);
     }
 
@@ -1300,7 +1303,9 @@ pub(crate) async fn handle_cow_chdir(
         // fd has O_CLOEXEC so it will be cleaned up on exit/exec.
         return NotifAction::Errno(libc::ENOENT);
     }
-    if write_child_mem(notif_fd, notif.id, notif.pid, path_ptr, fd_path.as_bytes()).is_err() {
+    // Force-write past read-only protections (a .rodata chdir path literal).
+    // The fit guard above keeps the redirect from overflowing the buffer.
+    if write_child_mem_force(notif_fd, notif.id, notif.pid, path_ptr, fd_path.as_bytes()).is_err() {
         return NotifAction::Errno(libc::EFAULT);
     }
 

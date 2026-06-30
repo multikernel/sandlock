@@ -180,8 +180,8 @@ pub fn parse_input(input: ProfileInput) -> Result<(Sandbox, ProgramSpec), Sandlo
     for p in input.filesystem.deny.iter()  { b = b.fs_deny(p); }
     if let Some(c) = input.filesystem.chroot         { b = b.chroot(c); }
     for spec in input.filesystem.mount.iter() {
-        let (virt, host) = parse_mount_spec(spec)?;
-        b = b.fs_mount(virt, host);
+        let (virt, host, read_only) = parse_mount_spec(spec)?;
+        b = if read_only { b.fs_mount_ro(virt, host) } else { b.fs_mount(virt, host) };
     }
     if let Some(s) = input.filesystem.on_exit.as_deref()  { b = b.on_exit(parse_branch_action(s)?); }
     if let Some(s) = input.filesystem.on_error.as_deref() { b = b.on_error(parse_branch_action(s)?); }
@@ -250,17 +250,27 @@ fn parse_branch_action(s: &str) -> Result<crate::sandbox::BranchAction, Sandlock
 }
 
 /// Parses a `"VIRTUAL:HOST"` mount spec string into a `(virtual, host)` pair.
-fn parse_mount_spec(s: &str) -> Result<(PathBuf, PathBuf), SandlockError> {
+/// Parse a `VIRTUAL:HOST` mount spec, with an optional trailing `:ro` (or the
+/// default `:rw`) selecting a read-only mount. Returns
+/// `(virtual_path, host_path, read_only)`.
+pub fn parse_mount_spec(s: &str) -> Result<(PathBuf, PathBuf, bool), SandlockError> {
     use crate::error::SandboxError;
-    let (virt, host) = s.split_once(':').ok_or_else(|| SandlockError::Sandbox(SandboxError::Invalid(
-        format!("invalid mount spec {s:?}; expected \"VIRTUAL:HOST\""),
+    let (body, read_only) = if let Some(b) = s.strip_suffix(":ro") {
+        (b, true)
+    } else if let Some(b) = s.strip_suffix(":rw") {
+        (b, false)
+    } else {
+        (s, false)
+    };
+    let (virt, host) = body.split_once(':').ok_or_else(|| SandlockError::Sandbox(SandboxError::Invalid(
+        format!("invalid mount spec {s:?}; expected \"VIRTUAL:HOST[:ro]\""),
     )))?;
     if virt.is_empty() || host.is_empty() {
         return Err(SandlockError::Sandbox(SandboxError::Invalid(
             format!("invalid mount spec {s:?}; both VIRTUAL and HOST must be non-empty"),
         )));
     }
-    Ok((PathBuf::from(virt), PathBuf::from(host)))
+    Ok((PathBuf::from(virt), PathBuf::from(host), read_only))
 }
 
 /// Parses an RFC3339 timestamp string into `SystemTime`.
@@ -398,6 +408,20 @@ mod tests {
         let (policy, _spec) = parse_input(input).unwrap();
         assert!(policy.allows_sysv_ipc());
         assert_eq!(policy.extra_deny_syscalls, vec!["ptrace".to_string()]);
+    }
+
+    #[test]
+    fn parse_mount_spec_ro_suffix() {
+        let (v, h, ro) = parse_mount_spec("/work:/host").unwrap();
+        assert_eq!((v.to_str().unwrap(), h.to_str().unwrap(), ro), ("/work", "/host", false));
+        let (_, _, ro) = parse_mount_spec("/work:/host:rw").unwrap();
+        assert!(!ro);
+        let (v, h, ro) = parse_mount_spec("/work:/host:ro").unwrap();
+        assert_eq!((v.to_str().unwrap(), h.to_str().unwrap(), ro), ("/work", "/host", true));
+        // a host path containing colons still parses; only a trailing :ro/:rw is an option
+        let (_, h, ro) = parse_mount_spec("/v:/a:b:ro").unwrap();
+        assert_eq!((h.to_str().unwrap(), ro), ("/a:b", true));
+        assert!(parse_mount_spec("nocolon").is_err());
     }
 
     #[test]

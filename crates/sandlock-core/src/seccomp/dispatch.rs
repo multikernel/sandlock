@@ -376,14 +376,19 @@ pub(crate) fn build_dispatch_table(
     if policy.has_random_seed {
         for nr in open_family_syscalls() {
             let __sup = Arc::clone(ctx);
+            let policy_rand = Arc::clone(policy);
             table.register(nr, move |cx: &HandlerCtx| {
                 let notif = cx.notif;
                 let sup = Arc::clone(&__sup);
+                let policy = Arc::clone(&policy_rand);
                 let notif_fd = cx.notif_fd;
                 async move {
                     let mut tr = sup.time_random.lock().await;
                     if let Some(ref mut rng) = tr.random_state {
-                        if let Some(action) = crate::random::handle_random_open(&notif, rng, notif_fd) {
+                        if let Some(action) = crate::random::handle_random_open(
+                            &notif, rng, notif_fd,
+                            policy.chroot_root.as_deref(), &policy.chroot_mounts,
+                        ) {
                             return action;
                         }
                     }
@@ -430,12 +435,17 @@ pub(crate) fn build_dispatch_table(
         let etc_hosts = policy.virtual_etc_hosts.clone();
         for nr in open_family_syscalls() {
             let etc_hosts = etc_hosts.clone();
+            let policy_hosts = Arc::clone(policy);
             table.register(nr, move |cx: &HandlerCtx| {
                 let notif = cx.notif;
                 let notif_fd = cx.notif_fd;
                 let etc_hosts = etc_hosts.clone();
+                let policy = Arc::clone(&policy_hosts);
                 async move {
-                    if let Some(action) = crate::procfs::handle_etc_hosts_open(&notif, &etc_hosts, notif_fd) {
+                    if let Some(action) = crate::procfs::handle_etc_hosts_open(
+                        &notif, &etc_hosts, notif_fd,
+                        policy.chroot_root.as_deref(), &policy.chroot_mounts,
+                    ) {
                         action
                     } else {
                         NotifAction::Continue
@@ -457,14 +467,17 @@ pub(crate) fn build_dispatch_table(
             for nr in open_family_syscalls() {
                 let ca_pem = std::sync::Arc::clone(&ca_pem);
                 let inject_paths = std::sync::Arc::clone(&inject_paths);
+                let policy_ca = Arc::clone(policy);
                 table.register(nr, move |cx: &HandlerCtx| {
                     let notif = cx.notif;
                     let notif_fd = cx.notif_fd;
                     let ca_pem = std::sync::Arc::clone(&ca_pem);
                     let inject_paths = std::sync::Arc::clone(&inject_paths);
+                    let policy = Arc::clone(&policy_ca);
                     async move {
                         crate::ca_inject::handle_ca_inject_open(
                             &notif, &inject_paths, &ca_pem, notif_fd,
+                            policy.chroot_root.as_deref(), &policy.chroot_mounts,
                         )
                         .unwrap_or(NotifAction::Continue)
                     }
@@ -474,23 +487,14 @@ pub(crate) fn build_dispatch_table(
     }
 
     // ------------------------------------------------------------------
-    // Chroot path interception (before COW)
-    // ------------------------------------------------------------------
-    if policy.chroot_root.is_some() {
-        register_chroot_handlers(&mut table, policy, ctx);
-    }
-
-    // ------------------------------------------------------------------
-    // COW filesystem interception
-    // ------------------------------------------------------------------
-    if policy.cow_enabled {
-        register_cow_handlers(&mut table, ctx);
-    }
-
-    // ------------------------------------------------------------------
-    // /proc virtualization (always on). The handler does both
-    // sensitive-path blocking and per-PID filtering, both of which are
-    // security boundaries, so it has to catch every open-family spelling.
+    // /proc file virtualization (always on). Registered BEFORE chroot/COW so a
+    // synthesized /proc memfd wins over a real open of <chroot>/proc/* (the
+    // empty rootfs procfs) — mirroring the /etc/hosts and CA handlers above.
+    // The handler also does sensitive-path blocking and per-PID filtering
+    // (security boundaries), so it must run first and catch every open-family
+    // spelling. NOTE: only the open-family handler moves here; the getdents
+    // directory-listing handler stays after chroot (below) so a chrooted /proc
+    // dir fd lists the empty rootfs procfs rather than the host's entries.
     // ------------------------------------------------------------------
     for nr in open_family_syscalls() {
         let policy_for_proc_open = Arc::clone(policy);
@@ -509,6 +513,27 @@ pub(crate) fn build_dispatch_table(
             }
         });
     }
+
+    // ------------------------------------------------------------------
+    // Chroot path interception (before COW)
+    // ------------------------------------------------------------------
+    if policy.chroot_root.is_some() {
+        register_chroot_handlers(&mut table, policy, ctx);
+    }
+
+    // ------------------------------------------------------------------
+    // COW filesystem interception
+    // ------------------------------------------------------------------
+    if policy.cow_enabled {
+        register_cow_handlers(&mut table, ctx);
+    }
+
+    // ------------------------------------------------------------------
+    // /proc directory-listing PID filter. Stays after chroot/COW: under chroot
+    // the /proc dir fd resolves to the empty rootfs procfs, so the listing is
+    // empty rather than leaking the host's /proc entry names (which are not all
+    // synthesized and would dangle on access).
+    // ------------------------------------------------------------------
     let mut getdents_nrs = vec![libc::SYS_getdents64];
     if let Some(getdents) = arch::sys_getdents() {
         getdents_nrs.push(getdents);
@@ -559,12 +584,17 @@ pub(crate) fn build_dispatch_table(
         });
         for nr in open_family_syscalls() {
             let hostname = hostname_for_open.clone();
+            let policy_hostname = Arc::clone(policy);
             table.register(nr, move |cx: &HandlerCtx| {
                 let notif = cx.notif;
                 let notif_fd = cx.notif_fd;
                 let hostname = hostname.clone();
+                let policy = Arc::clone(&policy_hostname);
                 async move {
-                    if let Some(action) = crate::procfs::handle_hostname_open(&notif, &hostname, notif_fd) {
+                    if let Some(action) = crate::procfs::handle_hostname_open(
+                        &notif, &hostname, notif_fd,
+                        policy.chroot_root.as_deref(), &policy.chroot_mounts,
+                    ) {
                         action
                     } else {
                         NotifAction::Continue
@@ -741,6 +771,7 @@ fn register_chroot_handlers(
                         writable: &policy.chroot_writable,
                         denied: &policy.chroot_denied,
                         mounts: &policy.chroot_mounts,
+                        mount_ro: &policy.chroot_mount_ro,
                     };
                     $handler(&notif, &chroot_state, &cow_state, notif_fd, &chroot_ctx).await
                 }
@@ -768,6 +799,7 @@ fn register_chroot_handlers(
                         writable: &policy.chroot_writable,
                         denied: &policy.chroot_denied,
                         mounts: &policy.chroot_mounts,
+                        mount_ro: &policy.chroot_mount_ro,
                     };
                     $handler(&notif, &chroot_state, &cow_state, notif_fd, &chroot_ctx).await
                 }
@@ -847,6 +879,7 @@ fn register_chroot_handlers(
                     writable: &policy.chroot_writable,
                     denied: &policy.chroot_denied,
                     mounts: &policy.chroot_mounts,
+                    mount_ro: &policy.chroot_mount_ro,
                 };
                 crate::chroot::dispatch::handle_chroot_legacy_chown(&notif, &sup.chroot, &sup.cow, notif_fd, &chroot_ctx, false).await
             }
@@ -869,6 +902,7 @@ fn register_chroot_handlers(
                     writable: &policy.chroot_writable,
                     denied: &policy.chroot_denied,
                     mounts: &policy.chroot_mounts,
+                    mount_ro: &policy.chroot_mount_ro,
                 };
                 crate::chroot::dispatch::handle_chroot_legacy_chown(&notif, &sup.chroot, &sup.cow, notif_fd, &chroot_ctx, true).await
             }
@@ -1100,6 +1134,7 @@ mod handler_tests {
                 chroot_writable: Vec::new(),
                 chroot_denied: Vec::new(),
                 chroot_mounts: Vec::new(),
+                chroot_mount_ro: Vec::new(),
                 deterministic_dirs: false,
                 virtual_hostname: None,
                 has_http_acl: false,
