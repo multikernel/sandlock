@@ -5,8 +5,8 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "OCI runtime shim for sandlock — namespace-less, Landlock-based"
-readme = "../../README.md"
+description = "OCI runtime shim for sandlock: namespace-less, Landlock-based"
+readme = "README.md"
 
 [lib]
 name = "sandlock_oci"
