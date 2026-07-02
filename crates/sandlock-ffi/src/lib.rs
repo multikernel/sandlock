@@ -1021,6 +1021,41 @@ pub struct sandlock_handle_t {
     runtime: tokio::runtime::Runtime,
 }
 
+/// Shared entry-point prologue for the create/popen family: validate the
+/// pointers, parse the optional name and argv, build the requested runtime,
+/// and apply the name to a cloned policy. Returns the owned
+/// `(Sandbox, Runtime, args)` triple, or `None` on any invalid input or
+/// runtime-build failure (callers map `None` to a null handle).
+///
+/// The tail stays with each caller: `sandlock_create*` drive `sb.create()`,
+/// `sandlock_popen` drives `sb.popen()` + fd hand-off. Factoring the prologue
+/// here keeps null/name/argv/runtime handling from drifting between them.
+///
+/// # Safety
+/// `policy` must be a valid policy pointer. `name` may be NULL to
+/// auto-generate a sandbox name, or a valid NUL-terminated string.
+/// `argv` must point to `argc` C strings.
+unsafe fn prepare(
+    policy: *const sandlock_sandbox_t,
+    name: *const c_char,
+    argv: *const *const c_char,
+    argc: c_uint,
+    build_rt: fn() -> Option<tokio::runtime::Runtime>,
+) -> Option<(Sandbox, tokio::runtime::Runtime, Vec<String>)> {
+    if policy.is_null() || argv.is_null() {
+        return None;
+    }
+    let policy = &(*policy)._private;
+    let name = optional_name(name).ok()?;
+    let args = read_argv(argv, argc);
+    let rt = build_rt()?;
+    let sb = match name {
+        Some(ref n) => policy.clone().with_name(n.clone()),
+        None => policy.clone(),
+    };
+    Some((sb, rt, args))
+}
+
 /// Fork the child and install policy; the child is parked between policy
 /// install and execve. Returns a live handle. Call `sandlock_start` to
 /// release the child to execve.
@@ -1036,26 +1071,11 @@ unsafe fn sandlock_create_with_runtime(
     argc: c_uint,
     build_rt: fn() -> Option<tokio::runtime::Runtime>,
 ) -> *mut sandlock_handle_t {
-    if policy.is_null() || argv.is_null() {
-        return ptr::null_mut();
-    }
-    let policy = &(*policy)._private;
-    let name = match optional_name(name) {
-        Ok(name) => name,
-        Err(_) => return ptr::null_mut(),
-    };
-    let args = read_argv(argv, argc);
-    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-
-    let rt = match build_rt() {
-        Some(rt) => rt,
+    let (mut sb, rt, args) = match prepare(policy, name, argv, argc, build_rt) {
+        Some(t) => t,
         None => return ptr::null_mut(),
     };
-
-    let mut sb = match name {
-        Some(ref n) => policy.clone().with_name(n.clone()),
-        None => policy.clone(),
-    };
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
     if !matches!(block_on_runtime(&rt, sb.create(&arg_refs)), Some(Ok(()))) {
         return ptr::null_mut();
@@ -1169,9 +1189,6 @@ pub unsafe extern "C" fn sandlock_popen(
         *out_stderr_fd = -1;
     }
 
-    if policy.is_null() || argv.is_null() {
-        return ptr::null_mut();
-    }
     let (stdin, stdout, stderr) = match (
         stdio_mode_from_raw(stdin_mode),
         stdio_mode_from_raw(stdout_mode),
@@ -1189,22 +1206,14 @@ pub unsafe extern "C" fn sandlock_popen(
             return ptr::null_mut();
         }
     };
-    let policy = &(*policy)._private;
-    let name = match optional_name(name) {
-        Ok(name) => name,
-        Err(_) => return ptr::null_mut(),
-    };
-    let args = read_argv(argv, argc);
-    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-
-    let rt = match build_live_runtime() {
-        Some(rt) => rt,
+    // Shared prologue (null/name/argv/runtime) via `prepare`; popen keeps its own
+    // `sb.popen()` + fd-handoff tail. build_live_runtime: the multi-threaded
+    // runtime keeps the seccomp supervisor pumping during the caller's blocking IO.
+    let (mut sb, rt, args) = match prepare(policy, name, argv, argc, build_live_runtime) {
+        Some(t) => t,
         None => return ptr::null_mut(),
     };
-    let mut sb = match name {
-        Some(ref n) => policy.clone().with_name(n.clone()),
-        None => policy.clone(),
-    };
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
     // popen returns a Process borrowing `sb`; take the owned fds and let it drop
     // so `sb` can move into the handle. The process keeps running (owned by `sb`).
