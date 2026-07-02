@@ -119,6 +119,7 @@ func (s *Sandbox) Run(ctx context.Context, cmd ...string) (*Result, error)
 func (s *Sandbox) RunInteractive(ctx context.Context, cmd ...string) (int, error)
 func (s *Sandbox) DryRun(ctx context.Context, cmd ...string) (*DryRunResult, error)
 func (s *Sandbox) Spawn(cmd ...string) (*Process, error)
+func (s *Sandbox) Popen(stdio Stdio, cmd ...string) (*Process, error)
 ```
 
 - **Run** captures stdout/stderr and waits. A `ctx` deadline kills the process
@@ -129,6 +130,22 @@ func (s *Sandbox) Spawn(cmd ...string) (*Process, error)
   filesystem `Changes` it would have made, and discards them. Requires
   `Workdir`.
 - **Spawn** starts a process without waiting, returning a `*Process`.
+- **Popen** is the streaming counterpart of Spawn: each stream set to
+  `StdioPiped` is handed back on the `*Process` as an `*os.File`
+  (`Stdin`/`Stdout`/`Stderr`) you read/write while the child runs. The zero
+  `Stdio` inherits all three (identical to Spawn). Close a piped `Stdin` before
+  `Wait` (or let `Wait` close it for you) so a reader child sees EOF; drain a
+  piped `Stdout`/`Stderr` before `Wait`, or `Kill` from another goroutine to
+  interrupt a blocked `Wait`.
+
+```go
+p, _ := sb.Popen(sandlock.Stdio{Stdin: sandlock.StdioPiped, Stdout: sandlock.StdioPiped}, "cat")
+defer p.Close()
+p.Stdin.Write([]byte("hi\n"))
+p.Stdin.Close()                 // EOF so cat exits
+out, _ := io.ReadAll(p.Stdout)  // "hi\n"
+res, _ := p.Wait()
+```
 
 ### Dynamic policy callbacks
 
@@ -177,7 +194,12 @@ func (p *Process) Pause() error           // SIGSTOP to the process group
 func (p *Process) Resume() error          // SIGCONT
 func (p *Process) Kill() error            // SIGKILL
 func (p *Process) Ports() (map[int]int, error) // virtual→real, with PortRemap
-func (p *Process) Close() error           // release the handle (kills if running)
+func (p *Process) Close() error           // release the handle (kills if running), close piped streams
+
+// Popen only: caller-owned pipe ends, non-nil per stream wired StdioPiped.
+p.Stdin  // *os.File
+p.Stdout // *os.File
+p.Stderr // *os.File
 ```
 
 ### Confine the current process

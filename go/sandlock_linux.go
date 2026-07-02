@@ -22,6 +22,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -799,6 +800,13 @@ type Process struct {
 	h       *C.sandlock_handle_t
 	pid     int
 	waiting bool // a Wait owns the handle; other handle ops must defer to it
+
+	// Caller-owned stdio for a process started by Popen. Each is non-nil only
+	// for a stream wired StdioPiped; it owns the pipe fd (closing the file
+	// closes the fd). Nil for Spawn'd processes and for inherit/null streams.
+	Stdin  *os.File
+	Stdout *os.File
+	Stderr *os.File
 }
 
 // Spawn forks the sandboxed child, installs the policy, and releases it to
@@ -838,10 +846,78 @@ func (s *Sandbox) Spawn(cmd ...string) (*Process, error) {
 	return p, nil
 }
 
+// fdFile wraps an fd owned by the caller (handed back by sandlock_popen) as an
+// *os.File that closes the fd when closed or finalized, or nil for the -1
+// sentinel of an inherit/null stream.
+func fdFile(fd C.int, name string) *os.File {
+	if fd < 0 {
+		return nil
+	}
+	return os.NewFile(uintptr(fd), name)
+}
+
+// Popen forks the sandboxed child with per-stream stdio and returns a live
+// Process without waiting — the streaming counterpart of Spawn. For each stream
+// set to StdioPiped, the matching Process field (Stdin/Stdout/Stderr) is an
+// *os.File the caller reads/writes while the child runs; inherit/null streams
+// leave it nil. The zero Stdio inherits all three (identical to Spawn).
+//
+// Deadlock warning (as with os/exec pipes): a piped Stdin is yours — close it
+// before Wait, or a child that reads to EOF (e.g. cat) never exits and Wait
+// blocks. Likewise drain a piped Stdout/Stderr before Wait, or a child that
+// fills the pipe buffer blocks on write. As an escape hatch, Kill from another
+// goroutine interrupts a blocked Wait; Close reaps the child and closes the
+// streams. Wait closes a still-open piped Stdin for you to deliver EOF.
+func (s *Sandbox) Popen(stdio Stdio, cmd ...string) (*Process, error) {
+	if len(cmd) == 0 {
+		return nil, fmt.Errorf("sandlock: empty command")
+	}
+	for _, m := range []StdioMode{stdio.Stdin, stdio.Stdout, stdio.Stderr} {
+		if m > StdioNull {
+			return nil, fmt.Errorf("sandlock: invalid StdioMode %d", uint32(m))
+		}
+	}
+	policyPtr, err := s.buildPolicy()
+	if err != nil {
+		return nil, err
+	}
+	defer C.sandlock_sandbox_free(policyPtr)
+
+	argv, err := cArgv(cmd)
+	if err != nil {
+		return nil, err
+	}
+	defer freeArgv(argv)
+	ap, ac := argvPtr(argv)
+	name := s.cName()
+	defer freeName(name)
+
+	fdIn, fdOut, fdErr := C.int(-1), C.int(-1), C.int(-1)
+	h := C.sandlock_popen(
+		policyPtr, name, ap, ac,
+		C.uint32_t(stdio.Stdin), C.uint32_t(stdio.Stdout), C.uint32_t(stdio.Stderr),
+		&fdIn, &fdOut, &fdErr,
+	)
+	if h == nil {
+		return nil, fmt.Errorf("sandlock: popen failed")
+	}
+	p := &Process{
+		h:      h,
+		pid:    int(C.sandlock_handle_pid(h)),
+		Stdin:  fdFile(fdIn, "sandlock-stdin"),
+		Stdout: fdFile(fdOut, "sandlock-stdout"),
+		Stderr: fdFile(fdErr, "sandlock-stderr"),
+	}
+	runtime.SetFinalizer(p, (*Process).finalize)
+	return p, nil
+}
+
 // finalize is the SetFinalizer cleanup for a Process abandoned without
 // Wait/Close. It can only run once the Process is unreachable, which implies
 // no Wait is in flight (a blocked Wait keeps the Process reachable), so the
-// handle is not concurrently borrowed and is safe to free here.
+// handle is not concurrently borrowed and is safe to free here. The piped
+// streams are intentionally left alone: once the Process is unreachable so are
+// they, and each *os.File's own finalizer closes its fd — no fd leaks.
 func (p *Process) finalize() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -869,6 +945,9 @@ func (p *Process) Pid() int {
 // Pause/Resume), which signal the process group by PID, can run concurrently
 // and interrupt it. The waiting flag reserves exclusive use of the handle for
 // the duration, so no other handle operation aliases it.
+//
+// Wait closes a still-open piped Stdin to deliver EOF, so do not write to Stdin
+// from another goroutine while Wait runs — the write would race a closing fd.
 func (p *Process) Wait() (*Result, error) {
 	p.mu.Lock()
 	if p.h == nil || p.waiting {
@@ -876,8 +955,15 @@ func (p *Process) Wait() (*Result, error) {
 		return nil, ErrNotRunning
 	}
 	h := p.h
+	stdin := p.Stdin
 	p.waiting = true
 	p.mu.Unlock()
+
+	// Deliver EOF to a still-open piped stdin so a reader child (e.g. cat) can
+	// exit; otherwise the native wait blocks forever. Harmless if already closed.
+	if stdin != nil {
+		_ = stdin.Close()
+	}
 
 	r := C.sandlock_handle_wait(h)
 
@@ -957,6 +1043,13 @@ func (p *Process) Ports() (map[int]int, error) {
 func (p *Process) Close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// Release caller-owned pipe fds regardless of handle state: a Close after
+	// Wait still needs to close the piped stdout/stderr the caller drained.
+	for _, f := range []*os.File{p.Stdin, p.Stdout, p.Stderr} {
+		if f != nil {
+			_ = f.Close()
+		}
+	}
 	if p.h == nil {
 		return nil
 	}
