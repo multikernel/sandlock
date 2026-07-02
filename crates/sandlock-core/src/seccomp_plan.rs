@@ -358,6 +358,14 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
         nrs.extend(POLICY_EVENT_SYSCALLS);
     }
 
+    if features.audit_file_access {
+        nrs.push_optional(arch::sys_open());
+    }
+    if features.audit_execve || features.audit_file_access {
+        nrs.push(libc::SYS_execve);
+        nrs.push(libc::SYS_execveat);
+    }
+
     // Port remapping
     if features.port_remap {
         nrs.extend(PORT_REMAP_SYSCALLS);

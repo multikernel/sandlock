@@ -114,6 +114,9 @@ pub struct PerProcessState {
     /// /proc directory dirent cache. Keyed by (child fd, target
     /// path); same drain-on-EOF semantics as cow_dir_cache.
     pub procfs_dir_cache: HashMap<(u32, String), Vec<Vec<u8>>>,
+    /// Set when the process called execve; cleared on the next notification
+    /// after exec completes, when /proc/<pid>/maps reflects the new image.
+    pub pending_exec_maps_read: bool,
 }
 
 // ============================================================

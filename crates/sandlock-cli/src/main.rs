@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 mod network_registry;
+mod learn;
 
 #[derive(Parser)]
 #[command(name = "sandlock", about = "Lightweight process sandbox", version)]
@@ -33,6 +34,8 @@ enum Command {
         #[command(subcommand)]
         action: ProfileAction,
     },
+    /// Observe a workload and emit a sandlock profile
+    Learn(LearnArgs),
 }
 
 /// Arguments for the `run` subcommand.
@@ -200,6 +203,18 @@ enum ProfileAction {
     Delete { name: String },
 }
 
+/// Arguments for the `learn` subcommand.
+#[derive(clap::Args)]
+struct LearnArgs {
+    /// Write observed profile to this file (default: print to stdout)
+    #[arg(short = 'o', long, value_name = "PATH")]
+    output: Option<PathBuf>,
+
+    /// Command to observe (everything after --)
+    #[arg(last = true, required = true)]
+    cmd: Vec<String>,
+}
+
 #[derive(serde::Serialize)]
 struct SandboxStatus {
     exit_code: i32,
@@ -301,6 +316,10 @@ async fn main() -> Result<()> {
                 }
             }
             println!("  Platform: {}", std::env::consts::ARCH);
+        }
+
+        Command::Learn(args) => {
+            learn::run(args).await?;
         }
 
         Command::Profile { action } => {

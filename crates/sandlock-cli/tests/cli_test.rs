@@ -281,7 +281,208 @@ fn test_cow_commit_runs_on_cli_exit() {
     assert_eq!(contents.trim(), "committed");
 }
 
-/// Regression: `--user N:N` maps the sandbox to UID `N` via an unprivileged
+/// `sandlock learn` must capture filesystem reads in the generated profile.
+/// Runs `cat /etc/hostname` and verifies `/etc/hostname` appears under `read`.
+#[test]
+fn test_learn_captures_fs_read() {
+    let output = sandlock_bin()
+        .args(["learn", "--", "cat", "/etc/hostname"])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("/etc/hostname"),
+        "expected /etc/hostname in learn output, got:\n{stdout}",
+    );
+}
+
+/// End-to-end: `sandlock learn` generates a profile, `sandlock run` uses it.
+/// Verifies the full round-trip works for a simple read-only workload.
+#[test]
+fn test_learn_then_run() {
+    let profile = tempfile::NamedTempFile::new().expect("tempfile");
+    let profile_path = profile.path().to_str().unwrap().to_owned();
+
+    let learn = sandlock_bin()
+        .args(["learn", "-o", &profile_path, "--", "cat", "/etc/hostname"])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(
+        learn.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&learn.stderr),
+    );
+
+    let run = sandlock_bin()
+        .args(["run", "--profile-file", &profile_path, "--", "cat", "/etc/hostname"])
+        .output()
+        .expect("failed to run sandlock run");
+    assert!(
+        run.status.success(),
+        "sandlock run with learned profile failed: stderr={}",
+        String::from_utf8_lossy(&run.stderr),
+    );
+    assert!(
+        !String::from_utf8_lossy(&run.stdout).trim().is_empty(),
+        "expected output from cat /etc/hostname",
+    );
+}
+
+/// `sandlock learn` must classify file opens with write flags under `write`.
+/// Runs a shell that writes a temp file and verifies it appears under `write`.
+#[test]
+fn test_learn_captures_fs_write() {
+    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let path = tmp.path().to_str().unwrap().to_owned();
+    let cmd = format!("echo x > {path}");
+    let output = sandlock_bin()
+        .args(["learn", "--", "sh", "-c", &cmd])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&path),
+        "expected {path} in learn write output, got:\n{stdout}",
+    );
+    // Confirm it appears in write = [...], not read
+    let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("");
+    assert!(
+        write_line.contains(&path),
+        "expected {path} under write = [...], got: {write_line}",
+    );
+}
+
+/// New file creates must be collapsed to the parent directory in the profile.
+/// The specific file path is useless to Landlock (it doesn't exist yet);
+/// the parent dir is what `sandlock run` needs to create new files.
+/// COW must also confirm the real filesystem is not touched during learn.
+#[test]
+fn test_learn_new_file_collapses_to_parent() {
+    let path = "/var/tmp/sandlock-learn-write-test.txt";
+    let output = sandlock_bin()
+        .args(["learn", "--", "sh", "-c", &format!("echo x > {path}")])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // New-file creates are collapsed to the parent directory (file didn't exist on real FS).
+    let parent = std::path::Path::new(path).parent().unwrap().to_str().unwrap();
+    let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("");
+    assert!(
+        write_line.contains(parent),
+        "expected parent dir {parent} under write = [...], got: {write_line}",
+    );
+    // COW must have intercepted the write, real file must not exist.
+    assert!(
+        !std::path::Path::new(path).exists(),
+        "real filesystem was modified, COW isolation failed",
+    );
+}
+
+/// End-to-end write round-trip: learn captures write path, run actually writes the file.
+/// During learn, COW intercepts the write (file not created on real FS).
+/// During run, the profile grants write access to parent dir, so the file is created for real.
+#[test]
+fn test_learn_then_run_write() {
+    let profile = tempfile::NamedTempFile::new().expect("tempfile");
+    let profile_path = profile.path().to_str().unwrap().to_owned();
+    let write_path = "/var/tmp/sandlock-learn-run-write-test.txt";
+    let _ = std::fs::remove_file(write_path); // clean state
+
+    // No pre-creation needed: learn collapses new-file creates to the parent directory,
+    // so sandlock run gets write access to the directory and can create the file.
+    let learn = sandlock_bin()
+        .args(["learn", "-o", &profile_path, "--", "sh", "-c", &format!("echo hello > {write_path}")])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(learn.status.success() || learn.status.code() == Some(2),
+        "learn failed unexpectedly: {}", String::from_utf8_lossy(&learn.stderr));
+    assert!(!std::path::Path::new(write_path).exists(), "COW isolation failed during learn");
+
+    let run = sandlock_bin()
+        .args(["run", "--profile-file", &profile_path, "--", "sh", "-c", &format!("echo hello > {write_path}")])
+        .output()
+        .expect("failed to run sandlock run");
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    assert_eq!(std::fs::read_to_string(write_path).unwrap_or_default().trim(), "hello", "file not written during run");
+    let _ = std::fs::remove_file(write_path);
+}
+
+
+/// `sandlock learn` must record observed TCP connections under `[network] allow`.
+/// Binds a real listener so the connect succeeds cleanly.
+#[test]
+fn test_learn_captures_net_connect() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // Accept one connection so the child doesn't hang waiting for handshake.
+    let _t = std::thread::spawn(move || { let _ = listener.accept(); });
+
+    let script = format!(
+        "import socket; s=socket.socket(); s.connect(('127.0.0.1',{port})); s.close()"
+    );
+    let output = sandlock_bin()
+        .args(["learn", "--", "python3", "-c", &script])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let expected = format!("127.0.0.1:{port}");
+    assert!(
+        stdout.contains(&expected),
+        "expected {expected} in network output, got:\n{stdout}",
+    );
+    let net_line = stdout.lines().find(|l| l.starts_with("allow = [")).unwrap_or("");
+    assert!(
+        net_line.contains(&expected),
+        "expected {expected} under [network] allow = [...], got: {net_line}",
+    );
+}
+
+/// End-to-end network round-trip: learn captures a TCP connection, run allows it.
+/// A single listener accepts two connections, one from learn, one from run.
+#[test]
+fn test_learn_then_run_network() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || { let _ = listener.accept(); let _ = listener.accept(); });
+
+    let profile = tempfile::NamedTempFile::new().expect("tempfile");
+    let profile_path = profile.path().to_str().unwrap().to_owned();
+    let script = format!("import socket; s=socket.socket(); s.connect(('127.0.0.1',{port})); s.close()");
+
+    let learn = sandlock_bin()
+        .args(["learn", "-o", &profile_path, "--", "python3", "-c", &script])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(learn.status.success(), "learn failed: {}", String::from_utf8_lossy(&learn.stderr));
+
+    let run = sandlock_bin()
+        .args(["run", "--profile-file", &profile_path, "--", "python3", "-c", &script])
+        .output()
+        .expect("failed to run sandlock run");
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+}
+
+/// `--user N:N` maps the sandbox to UID `N` via an unprivileged
 /// user namespace, even when the host UID is non-zero. This is the only
 /// remaining `CLONE_NEWUSER` site after the overlayfs backend removal;
 /// the test guards against accidentally tearing it out.

@@ -197,6 +197,18 @@ pub struct SandboxBuilder {
     // COW fork work function: runs in each COW clone.
     #[cfg_attr(feature = "cli", clap(skip))]
     pub(crate) work_fn: Option<Arc<dyn Fn(u32) + Send + Sync + 'static>>,
+
+    // Audit callback for file-open syscalls.
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub(crate) on_file_access: Option<Arc<dyn Fn(&std::path::Path, u64) + Send + Sync + 'static>>,
+
+    // Audit callback for execve/execveat syscalls.
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub(crate) on_execve: Option<Arc<dyn Fn(&std::path::Path) + Send + Sync + 'static>>,
+
+    // Audit callback for network connect/sendto syscalls.
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub(crate) on_net_connect: Option<Arc<dyn Fn(std::net::IpAddr, u16) + Send + Sync + 'static>>,
 }
 
 impl std::fmt::Debug for SandboxBuilder {
@@ -268,6 +280,10 @@ impl Clone for SandboxBuilder {
             init_fn: None,
             // work_fn is Arc-wrapped; clone bumps the reference count.
             work_fn: self.work_fn.clone(),
+            // on_file_access is Arc-wrapped; clone bumps the reference count.
+            on_file_access: self.on_file_access.clone(),
+            on_execve: self.on_execve.clone(),
+            on_net_connect: self.on_net_connect.clone(),
         }
     }
 }
@@ -610,6 +626,29 @@ impl SandboxBuilder {
         self
     }
 
+    /// Register an audit callback that fires for every `openat`/`open` syscall
+    /// before any internal handler runs. Receives the resolved absolute path and
+    /// the open flags (`O_*`).
+    pub fn on_file_access(mut self, f: impl Fn(&std::path::Path, u64) + Send + Sync + 'static) -> Self {
+        self.on_file_access = Some(Arc::new(f));
+        self
+    }
+
+    /// Register an audit callback that fires for every `execve`/`execveat` syscall
+    /// before any internal handler runs. Receives the resolved absolute path of the
+    /// binary being executed.
+    pub fn on_execve(mut self, f: impl Fn(&std::path::Path) + Send + Sync + 'static) -> Self {
+        self.on_execve = Some(Arc::new(f));
+        self
+    }
+
+    /// Register an audit callback that fires for every `connect`/`sendto`/`sendmsg` syscall
+    /// before any internal handler runs. Receives the destination IP and port.
+    pub fn on_net_connect(mut self, f: impl Fn(std::net::IpAddr, u16) + Send + Sync + 'static) -> Self {
+        self.on_net_connect = Some(Arc::new(f));
+        self
+    }
+
     /// Build a `Sandbox`, parsing all string fields and running per-field
     /// validation, but **without** the cross-section checks that
     /// `Sandbox::validate` performs. Use this in tests that deliberately
@@ -781,6 +820,9 @@ impl SandboxBuilder {
             name: self.name,
             init_fn: self.init_fn,
             work_fn: self.work_fn,
+            on_file_access: self.on_file_access,
+            on_execve: self.on_execve,
+            on_net_connect: self.on_net_connect,
             runtime: None,
         })
     }
