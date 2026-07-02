@@ -685,6 +685,42 @@ sandlock_handle_t *sandlock_create_for_run(const sandlock_sandbox_t *policy,
                                            unsigned int argc);
 
 /**
+ * Spawn a confined process with per-stream stdio wiring and return a live
+ * handle (the streaming counterpart of `sandlock_create` + `sandlock_start`).
+ *
+ * `stdin_mode`/`stdout_mode`/`stderr_mode` are `StdioMode` discriminants
+ * (0=inherit, 1=piped, 2=null). For each stream set to *piped*, the matching
+ * `out_*_fd` receives an owned fd the caller must `close()`; for inherit/null
+ * it receives -1. Pass null for an `out_*_fd` to discard that fd (it is closed
+ * rather than leaked). Returns null on error (unknown mode, build/fork
+ * failure) with every `out_*_fd` left -1.
+ *
+ * The handle uses a multi-threaded runtime so the seccomp supervisor keeps
+ * pumping while the caller does blocking IO on the returned fds. Wait for the
+ * process with `sandlock_handle_wait`, terminate with `sandlock_handle_kill`,
+ * and release with `sandlock_handle_free`.
+ *
+ * Deadlock warning: a piped fd is yours once returned — `close()` a piped
+ * `out_stdin_fd` *before* `sandlock_handle_wait`, or a child that reads to EOF
+ * (e.g. `cat`) never exits and the wait blocks forever. Likewise drain a piped
+ * `out_stdout_fd`/`out_stderr_fd` before waiting: a child that fills the pipe
+ * buffer blocks on write and never reaches exit.
+ *
+ * # Safety
+ * As `sandlock_create`; `out_*_fd` must each be null or a valid `*mut c_int`.
+ */
+sandlock_handle_t *sandlock_popen(const sandlock_sandbox_t *policy,
+                                  const char *name,
+                                  const char *const *argv,
+                                  unsigned int argc,
+                                  uint32_t stdin_mode,
+                                  uint32_t stdout_mode,
+                                  uint32_t stderr_mode,
+                                  int *out_stdin_fd,
+                                  int *out_stdout_fd,
+                                  int *out_stderr_fd);
+
+/**
  * Release a previously `sandlock_create`d child to execve. Returns 0 on
  * success, -1 on error.
  *
@@ -702,10 +738,25 @@ int sandlock_start(sandlock_handle_t *h);
 int32_t sandlock_handle_pid(const sandlock_handle_t *h);
 
 /**
- * Wait for the sandbox to exit. Returns a result handle with stdout/stderr.
+ * Send SIGKILL to the handle's entire process group. Idempotent: a process
+ * that already exited is not an error. Returns 0 on success, -1 on error.
+ * The handle remains valid; call `sandlock_handle_wait` to collect the exit
+ * status and `sandlock_handle_free` to release it.
  *
  * # Safety
- * `h` must be a valid handle from `sandlock_create`.
+ * `h` must be a valid handle from `sandlock_create` / `sandlock_popen`.
+ */
+int sandlock_handle_kill(sandlock_handle_t *h);
+
+/**
+ * Wait for the sandbox to exit. Returns a result handle with stdout/stderr.
+ *
+ * For a `sandlock_popen` handle, close a piped `out_stdin_fd` and drain any
+ * piped `out_stdout_fd`/`out_stderr_fd` *before* calling this, or a child that
+ * reads to EOF or fills a pipe buffer never exits and this blocks forever.
+ *
+ * # Safety
+ * `h` must be a valid handle from `sandlock_create` / `sandlock_popen`.
  */
 sandlock_result_t *sandlock_handle_wait(sandlock_handle_t *h);
 
@@ -733,7 +784,7 @@ char *sandlock_handle_port_mappings(const sandlock_handle_t *h);
  * Free a sandbox handle. Kills the process if still running.
  *
  * # Safety
- * `h` must be null or a valid handle from `sandlock_create`.
+ * `h` must be null or a valid handle from `sandlock_create` / `sandlock_popen`.
  */
 void sandlock_handle_free(sandlock_handle_t *h);
 
