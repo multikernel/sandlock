@@ -136,7 +136,10 @@ func (s *Sandbox) Popen(stdio Stdio, cmd ...string) (*Process, error)
   `Stdio` inherits all three (identical to Spawn). Close a piped `Stdin` before
   `Wait` (or let `Wait` close it for you) so a reader child sees EOF; drain a
   piped `Stdout`/`Stderr` before `Wait`, or `Kill` from another goroutine to
-  interrupt a blocked `Wait`.
+  interrupt a blocked `Wait`. `Wait` returns a `Result` with the exit status
+  only — a Popen'd process sends piped output to the `Stdout`/`Stderr` fields
+  (inherited/null streams go to the parent fd or `/dev/null`), so (unlike `Run`)
+  `Result.Stdout`/`Result.Stderr` are always empty.
 
 ```go
 p, _ := sb.Popen(sandlock.Stdio{Stdin: sandlock.StdioPiped, Stdout: sandlock.StdioPiped}, "cat")

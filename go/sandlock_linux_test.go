@@ -356,6 +356,49 @@ func TestPopenNullStdoutNoStream(t *testing.T) {
 	}
 }
 
+func TestPopenZeroStdioInheritsAllLikeSpawn(t *testing.T) {
+	// The zero Stdio value must wire all three streams as StdioInherit (the ABI
+	// default StdioInherit == 0), identical to Spawn: no caller stream is handed
+	// back and the child runs to success. Pins the zero-value contract the type
+	// doc, the Popen doc, and the README all state but nothing exercised.
+	requireLandlock(t)
+	sb := &sandlock.Sandbox{FSReadable: rootfs}
+	p, err := sb.Popen(sandlock.Stdio{}, "true")
+	if err != nil {
+		t.Fatalf("Popen: %v", err)
+	}
+	defer p.Close()
+	if p.Stdin != nil || p.Stdout != nil || p.Stderr != nil {
+		t.Fatalf("zero Stdio must inherit all three; got streams stdin=%v stdout=%v stderr=%v",
+			p.Stdin != nil, p.Stdout != nil, p.Stderr != nil)
+	}
+	res, err := p.Wait()
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if !res.Success || res.ExitCode != 0 {
+		t.Fatalf("want success exit 0, got success=%v exit=%d", res.Success, res.ExitCode)
+	}
+}
+
+func TestPopenKillAfterWaitIsNil(t *testing.T) {
+	// Kill on an already-reaped Process must be nil (not ErrNotRunning), matching
+	// the FFI (returns 0) and Python (no-op): a "Kill from another goroutine"
+	// firing just as Wait reaps the child must not surface a spurious error.
+	requireLandlock(t)
+	sb := &sandlock.Sandbox{FSReadable: rootfs}
+	p, err := sb.Popen(sandlock.Stdio{}, "true")
+	if err != nil {
+		t.Fatalf("Popen: %v", err)
+	}
+	if _, err := p.Wait(); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if err := p.Kill(); err != nil {
+		t.Fatalf("Kill after Wait must return nil, got %v", err)
+	}
+}
+
 func TestPopenInvalidStdioMode(t *testing.T) {
 	// An out-of-range discriminant is rejected before the child is spawned, so
 	// this needs no Landlock.

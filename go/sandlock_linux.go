@@ -938,8 +938,14 @@ func (p *Process) Pid() int {
 	return p.pid
 }
 
-// Wait blocks until the process exits, returns its captured Result, and
-// releases the handle. After Wait the Process is no longer running.
+// Wait blocks until the process exits, returns its Result, and releases the
+// handle. After Wait the Process is no longer running.
+//
+// The Result carries the exit status only. Unlike Run, a Popen'd process sends
+// any StdioPiped output to the caller through the Stdout/Stderr fields (and
+// StdioInherit/StdioNull output to the inherited fd or /dev/null), so it is
+// never captured into Result.Stdout/Result.Stderr — read piped bytes off
+// p.Stdout/p.Stderr, not off the Result.
 //
 // The blocking native wait runs without holding the mutex so that Kill (and
 // Pause/Resume), which signal the process group by PID, can run concurrently
@@ -997,11 +1003,29 @@ func (p *Process) Pause() error { return p.signal(syscall.SIGSTOP) }
 // Resume sends SIGCONT to the sandbox process group.
 func (p *Process) Resume() error { return p.signal(syscall.SIGCONT) }
 
-// Kill sends SIGKILL to the sandbox process group.
+// Kill sends SIGKILL to the sandbox process group. It is idempotent: a process
+// that already exited (ESRCH) or was already reaped by Wait (ErrNotRunning) is
+// not an error — killing it is a no-op success, matching the FFI
+// (sandlock_handle_kill returns 0) and the Python binding (silent no-op after
+// wait()). This keeps the "Kill from another goroutine" escape hatch race-free:
+// a Kill that fires just as Wait reaps the child still returns nil.
 func (p *Process) Kill() error {
 	err := p.signal(syscall.SIGKILL)
 	if err == syscall.ESRCH {
-		return nil
+		return nil // child already exited (still unreaped) — no-op
+	}
+	if err == ErrNotRunning {
+		// signal() returns ErrNotRunning for two causes: the handle was already
+		// reaped by Wait (h == nil) — an idempotent no-op — or a live handle with
+		// no pid. Only the reaped case is a success; a missing pid is a genuine
+		// error we must surface (and must never turn into killpg(-0), which would
+		// signal our own process group).
+		p.mu.Lock()
+		reaped := p.h == nil
+		p.mu.Unlock()
+		if reaped {
+			return nil
+		}
 	}
 	return err
 }
