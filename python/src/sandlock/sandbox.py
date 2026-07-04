@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import inspect
 import re
+import weakref
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Callable, Mapping, Sequence
@@ -419,6 +420,9 @@ class Sandbox:
         # Runtime state — not dataclass fields, not serialized
         self._native = None   # _NativePolicy created lazily on first use
         self._handle = None   # live sandbox handle during start()/run()
+        self._process = None  # weakref to the live popen() Process; it OWNS its
+                              # own handle (see `_popen_process`), this is only a
+                              # non-owning busy marker
 
     def _resolve_name(self) -> str:
         """Resolve sandbox name: explicit > auto-generated."""
@@ -485,10 +489,60 @@ class Sandbox:
     # Context manager
     # ------------------------------------------------------------------
 
+    def _popen_process(self):
+        """The live :meth:`popen` :class:`Process`, or ``None``. Held *weakly*:
+        this is only a busy marker, so abandoning the ``Process`` still lets its
+        ``__del__`` reap the child rather than the sandbox pinning it alive."""
+        ref = self._process
+        return ref() if ref is not None else None
+
+    def _live_handle(self):
+        """The handle owning the currently running child, from either source:
+        the ``create``/``start``/``run``/``spawn`` lifecycle (``self._handle``) or
+        a :meth:`popen` :class:`Process` (which owns its handle). Returns ``None``
+        when nothing is running. This is the single source of truth for "busy"."""
+        if self._handle is not None:
+            return self._handle
+        proc = self._popen_process()
+        if proc is not None and proc._handle is not None:
+            return proc._handle
+        return None
+
+    def _check_not_running(self) -> None:
+        """Raise if any child is live, so a second lifecycle call can't leak the
+        first handle or alias a running popen() child."""
+        if self._live_handle() is not None:
+            raise RuntimeError("sandbox is already running")
+
+    def _reject_if_popen(self) -> None:
+        """Raise if the live child is driven by a :meth:`popen` :class:`Process`.
+        The sandbox's own lifecycle methods (``wait``/``pause``/``resume``/``kill``)
+        must not touch a handle the ``Process`` owns — freeing or signalling it
+        behind the ``Process``'s back is exactly the aliasing this split avoids."""
+        proc = self._popen_process()
+        if proc is not None and proc._handle is not None:
+            raise RuntimeError(
+                "this sandbox is running a process started with popen(); manage it "
+                "through the returned Process (proc.wait() / proc.kill()), not the "
+                "sandbox"
+            )
+
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # Reap a still-running popen() Process (it owns its own handle) so leaving
+        # the sandbox context never strands a confined child.
+        proc = self._popen_process()
+        if proc is not None and proc._handle is not None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                proc.wait()
+            except Exception:
+                pass
         if self._handle is not None:
             from ._sdk import _lib
             try:
@@ -504,16 +558,19 @@ class Sandbox:
 
     @property
     def pid(self) -> int | None:
-        """Child PID while running, None otherwise."""
-        if self._handle is None:
+        """Child PID while running, None otherwise. Reflects a running child from
+        either the sandbox lifecycle or a live :meth:`popen` :class:`Process`."""
+        handle = self._live_handle()
+        if handle is None:
             return None
         from ._sdk import _lib
-        return _lib.sandlock_handle_pid(self._handle) or None
+        return _lib.sandlock_handle_pid(handle) or None
 
     @property
     def is_running(self) -> bool:
-        """True if a process is currently running in this sandbox."""
-        return self._handle is not None
+        """True if a process is currently running in this sandbox (lifecycle or
+        a live :meth:`popen` :class:`Process`)."""
+        return self._live_handle() is not None
 
     # ------------------------------------------------------------------
     # Execution methods
@@ -536,8 +593,7 @@ class Sandbox:
         """
         from ._sdk import _lib, _make_argv, _read_result_bytes, Result
 
-        if self._handle is not None:
-            raise RuntimeError("sandbox is already running")
+        self._check_not_running()
 
         native = self._ensure_native()
         argv, argc = _make_argv(list(cmd))
@@ -558,7 +614,9 @@ class Sandbox:
             return Result(success=False, exit_code=-1, error="sandlock_start failed")
 
         try:
-            timeout_ms = int(timeout * 1000) if timeout else 0
+            # None -> wait forever (0). A finite timeout clamps up to 1ms so
+            # timeout=0 / sub-ms don't collapse to 0 (= wait forever).
+            timeout_ms = max(1, int(timeout * 1000)) if timeout is not None else 0
             result_p = _lib.sandlock_handle_wait_timeout(self._handle, timeout_ms)
         finally:
             _lib.sandlock_handle_free(self._handle)
@@ -631,8 +689,7 @@ class Sandbox:
             Result,
         )
 
-        if self._handle is not None:
-            raise RuntimeError("sandbox is already running")
+        self._check_not_running()
 
         # Resolve syscall keys (str name -> host-arch number, int as is)
         # up front: an unknown name fails loudly here, before any native
@@ -775,8 +832,7 @@ class Sandbox:
         """
         from ._sdk import _lib, _make_argv
 
-        if self._handle is not None:
-            raise RuntimeError("sandbox is already running")
+        self._check_not_running()
 
         native = self._ensure_native()
         argv, argc = _make_argv(list(cmd))
@@ -821,10 +877,13 @@ class Sandbox:
         """Wait for the running process to finish and return its Result.
 
         Raises:
-            RuntimeError: If the sandbox is not running.
+            RuntimeError: If the sandbox is not running, or if it is running a
+                :meth:`popen` :class:`Process` (wait on that Process instead —
+                freeing its handle here would break it).
         """
         from ._sdk import _lib, _read_result_bytes, Result
 
+        self._reject_if_popen()
         if self._handle is None:
             raise RuntimeError("sandbox is not running")
 
@@ -889,8 +948,7 @@ class Sandbox:
         import ctypes
         from ._sdk import _lib, _make_argv
 
-        if self._handle is not None:
-            raise RuntimeError("sandbox is already running")
+        self._check_not_running()
 
         # Normalize/validate up front: StdioMode(x) accepts a StdioMode or its int
         # discriminant and raises ValueError on anything else, so a bad mode fails
@@ -904,7 +962,11 @@ class Sandbox:
         fd_in = ctypes.c_int(-1)
         fd_out = ctypes.c_int(-1)
         fd_err = ctypes.c_int(-1)
-        self._handle = _lib.sandlock_popen(
+        # The handle is owned by the returned Process, not the Sandbox: it is
+        # never stored in self._handle. self._process (set below) is the busy
+        # marker (`_live_handle`), so a stale Process can never alias a later
+        # child through the sandbox.
+        handle = _lib.sandlock_popen(
             native.ptr,
             _encode(resolved_name),
             argv,
@@ -916,18 +978,19 @@ class Sandbox:
             ctypes.byref(fd_out),
             ctypes.byref(fd_err),
         )
-        if not self._handle:
+        if not handle:
             raise RuntimeError("sandlock_popen failed")
 
         try:
-            return Process(self, fd_in.value, fd_out.value, fd_err.value)
+            proc = Process(self, handle, fd_in.value, fd_out.value, fd_err.value)
         except BaseException:
             # Wrapping the fds failed after the child was spawned. Process.__init__
             # already closed any fds it opened; free the handle (which reaps the
-            # child) and clear it so the Sandbox is left clean.
-            _lib.sandlock_handle_free(self._handle)
-            self._handle = None
+            # child) so the Sandbox is left clean and reusable.
+            _lib.sandlock_handle_free(handle)
             raise
+        self._process = weakref.ref(proc)
+        return proc
 
     def dry_run(self, cmd: Sequence[str], timeout: float | None = None) -> "DryRunResult":
         """Dry-run: run a command, collect filesystem changes, then discard.
@@ -1096,8 +1159,12 @@ class Sandbox:
     # ------------------------------------------------------------------
 
     def pause(self) -> None:
-        """Send SIGSTOP to the sandbox process group."""
+        """Send SIGSTOP to the sandbox process group.
+
+        Raises RuntimeError if a :meth:`popen` Process owns the child (manage it
+        through the Process)."""
         import signal
+        self._reject_if_popen()
         pid = self.pid
         if pid is None:
             raise RuntimeError("sandbox is not running")
@@ -1105,8 +1172,11 @@ class Sandbox:
         os.killpg(pid, signal.SIGSTOP)
 
     def resume(self) -> None:
-        """Send SIGCONT to the sandbox process group."""
+        """Send SIGCONT to the sandbox process group.
+
+        Raises RuntimeError if a :meth:`popen` Process owns the child."""
         import signal
+        self._reject_if_popen()
         pid = self.pid
         if pid is None:
             raise RuntimeError("sandbox is not running")
@@ -1114,8 +1184,12 @@ class Sandbox:
         os.killpg(pid, signal.SIGCONT)
 
     def kill(self) -> None:
-        """Send SIGKILL to the sandbox process group."""
+        """Send SIGKILL to the sandbox process group.
+
+        Raises RuntimeError if a :meth:`popen` Process owns the child (call
+        ``proc.kill()`` instead)."""
         import signal
+        self._reject_if_popen()
         pid = self.pid
         if pid is None:
             raise RuntimeError("sandbox is not running")
@@ -1130,12 +1204,14 @@ class Sandbox:
 
         Only contains entries where the real port differs from the virtual
         port (i.e., where a remap occurred). Empty if port_remap is disabled
-        or no ports have been remapped. Requires the sandbox to be running.
+        or no ports have been remapped. Works for a running child from either
+        the lifecycle or a live :meth:`popen` :class:`Process`.
         """
-        if self._handle is None:
+        handle = self._live_handle()
+        if handle is None:
             return {}
         from ._sdk import _lib
-        c_str = _lib.sandlock_handle_port_mappings(self._handle)
+        c_str = _lib.sandlock_handle_port_mappings(handle)
         if not c_str:
             return {}
         try:
@@ -1262,10 +1338,22 @@ class Process:
             result = proc.wait()
     """
 
-    def __init__(self, sandbox: "Sandbox", stdin_fd: int, stdout_fd: int, stderr_fd: int):
+    def __init__(self, sandbox: "Sandbox", handle, stdin_fd: int, stdout_fd: int, stderr_fd: int):
         import os
+        import threading
+        from ._sdk import _lib
 
         self._sandbox = sandbox
+        # _lock guards _handle (and the _waiting reservation) so kill()/pid on
+        # one thread can't observe or act on a handle wait() is freeing on
+        # another — the "kill from another thread while wait() blocks" pattern.
+        self._lock = threading.Lock()
+        self._waiting = False
+        # The handle and pid are set only AFTER the fds are wrapped below: if an
+        # fdopen raises, this Process never takes ownership, so popen()'s caller
+        # frees the handle exactly once (no double free via __del__).
+        self._handle = None
+        self._pid = -1
         self._result = None
         self.stdin = self.stdout = self.stderr = None
         # os.fdopen takes ownership of each fd: closing the stream closes the fd,
@@ -1293,22 +1381,43 @@ class Process:
                         pass
             raise
         self.stdin, self.stdout, self.stderr = opened
+        # Take ownership now that construction can no longer fail. Cache the pid
+        # so kill()/pid never dereference the handle (avoiding a race with a
+        # concurrent wait() free) — they signal by pid, like the sandbox and the
+        # Go binding.
+        self._pid = _lib.sandlock_handle_pid(handle) or -1
+        self._handle = handle
 
     @property
     def pid(self) -> int | None:
-        """The child PID while running, else ``None``."""
-        return self._sandbox.pid
+        """The child PID while running, else ``None`` (after :meth:`wait`)."""
+        with self._lock:
+            return self._pid if self._handle is not None and self._pid > 0 else None
 
     def kill(self) -> None:
-        """SIGKILL the child's entire process group. Idempotent: a process that
-        already exited is not an error. The handle stays valid -- call
-        :meth:`wait` afterwards to collect the (non-success) exit status."""
-        from ._sdk import _lib
+        """SIGKILL the child's entire process group by pid (like the sandbox and
+        the Go binding), so a kill from another thread is safe while :meth:`wait`
+        blocks on the handle. Idempotent: a child that already exited is not an
+        error, and after :meth:`wait` has reaped it this is a no-op.
 
-        handle = self._sandbox._handle
-        if handle is None:
-            return
-        _lib.sandlock_handle_kill(handle)
+        Raises:
+            RuntimeError: If the process has no pid (never a valid popen child).
+            OSError: If the kill genuinely fails (e.g. EPERM) — a
+                ``ProcessLookupError`` (already-exited group) is swallowed.
+        """
+        import os
+        import signal
+
+        with self._lock:
+            if self._handle is None:
+                return  # already reaped by wait() — no-op
+            if self._pid <= 0:
+                raise RuntimeError("process has no pid")
+            pid = self._pid
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass  # the group already exited — idempotent no-op
 
     def wait(self, timeout: float | None = None) -> "Result":
         """Wait for the child to exit and return its :class:`Result`.
@@ -1331,11 +1440,18 @@ class Process:
         """
         from ._sdk import _lib, Result
 
-        handle = self._sandbox._handle
-        if handle is None:
-            if self._result is not None:
-                return self._result
-            raise RuntimeError("process is not running")
+        # Reserve the handle under the lock so a concurrent kill()/pid sees a
+        # consistent state, then run the blocking wait WITHOUT the lock so kill()
+        # (which signals by pid, not through the handle) can interrupt it.
+        with self._lock:
+            handle = self._handle
+            if handle is None:
+                if self._result is not None:
+                    return self._result
+                raise RuntimeError("process is not running")
+            if self._waiting:
+                raise RuntimeError("wait already in progress")
+            self._waiting = True
 
         # Deliver EOF to a still-open piped stdin so a reader child can exit and
         # the wait below does not block forever.
@@ -1346,11 +1462,21 @@ class Process:
                 pass
 
         try:
-            timeout_ms = int(timeout * 1000) if timeout else 0
+            # None -> wait forever (the FFI treats 0 as "no timeout"). A finite
+            # timeout maps to milliseconds, clamped up to 1ms so timeout=0 and
+            # sub-millisecond values don't collapse to 0 and wait forever — the
+            # opposite of the caller's intent.
+            timeout_ms = max(1, int(timeout * 1000)) if timeout is not None else 0
             result_p = _lib.sandlock_handle_wait_timeout(handle, timeout_ms)
         finally:
-            _lib.sandlock_handle_free(handle)
-            self._sandbox._handle = None
+            with self._lock:
+                _lib.sandlock_handle_free(handle)
+                self._handle = None
+                self._waiting = False
+            # Release the sandbox's busy marker so it can be reused. Guard that it
+            # still points at us (the weakref may already be dead during __del__).
+            if self._sandbox._popen_process() is self:
+                self._sandbox._process = None
 
         if not result_p:
             self._result = Result(
@@ -1372,7 +1498,7 @@ class Process:
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         # Terminate and reap a still-running child so no confined process is left
         # behind, then close every stream we own.
-        if self._sandbox._handle is not None:
+        if self._handle is not None:
             try:
                 self.kill()
             except Exception:
@@ -1396,7 +1522,7 @@ class Process:
         # run during interpreter shutdown when imports/globals are gone — so this
         # is strictly best-effort inside a broad guard.
         try:
-            if getattr(self, "_sandbox", None) is None or self._sandbox._handle is None:
+            if getattr(self, "_handle", None) is None:
                 return
             import warnings
 

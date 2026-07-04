@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 
 import pytest
 
@@ -222,6 +223,90 @@ def test_popen_stdout_and_stderr_both_piped():
     assert proc.stdout.read() == b"out\n"
     assert proc.stderr.read() == b"err\n"
     assert proc.wait().success
+
+
+def test_kill_from_another_thread_interrupts_blocked_wait():
+    # The documented pattern: wait() blocks in one thread while kill() fires from
+    # another. kill() signals by pid (not through the handle), so it interrupts
+    # the blocked wait without racing wait()'s handle free. Watchdog so a
+    # deadlock/hang surfaces as a failure, not a stuck job.
+    proc = _policy().popen(["sleep", "100"])
+
+    box = {}
+
+    def _run():
+        box["result"] = proc.wait()  # no timeout: only kill() can end this
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    time.sleep(0.3)  # let wait() reach the blocking native wait
+    proc.kill()
+    t.join(timeout=5)
+    if t.is_alive():
+        pytest.fail("kill() from another thread did not interrupt a blocked wait()")
+
+    assert not box["result"].success, "a killed process is not success"
+
+
+def test_stale_process_does_not_alias_reused_sandbox():
+    # The load-bearing invariant of Process owning its handle: after a Process is
+    # waited and the sandbox reused, the stale Process's kill()/wait() must not
+    # touch the NEW child. Previously both resolved sandbox._handle at call time,
+    # so p1.kill() would SIGKILL p2 and a stale p1.wait() would reap it.
+    sandbox = _policy()
+    p1 = sandbox.popen(["echo", "one"], stdout=StdioMode.PIPED)
+    assert p1.stdout.read() == b"one\n"
+    p1.wait()  # frees p1's handle, releases the sandbox
+
+    p2 = sandbox.popen(["sleep", "100"])
+    try:
+        assert sandbox.is_running
+        p1.kill()  # no-op on the reaped p1 — must NOT kill p2
+        p1.wait()  # cached result — must NOT reap p2
+        assert sandbox.is_running, "stale p1 must not have reaped p2"
+        assert p2.pid is not None, "p2 must still be alive"
+    finally:
+        p2.kill()
+        p2.wait()
+    assert not sandbox.is_running
+
+
+def test_sandbox_lifecycle_methods_reject_popen_process():
+    # While a popen() Process owns the handle, the sandbox's own lifecycle
+    # methods must fail loudly instead of half-working / freeing behind its back.
+    sandbox = _policy()
+    proc = sandbox.popen(["sleep", "100"])
+    try:
+        for op in (sandbox.wait, sandbox.kill, sandbox.pause, sandbox.resume):
+            with pytest.raises(RuntimeError):
+                op()
+        # The Process still works after the rejected sandbox-level calls.
+        assert proc.pid is not None
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_wait_timeout_zero_does_not_wait_forever():
+    # timeout=0 (and sub-millisecond values) must not collapse to "wait forever";
+    # they return promptly with a non-success (killed) result. Watchdog so a
+    # regression surfaces as a failure, not a hang.
+    proc = _policy().popen(["sleep", "100"])
+
+    box = {}
+
+    def _run():
+        box["result"] = proc.wait(timeout=0)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=10)
+    if t.is_alive():
+        proc.kill()
+        t.join(timeout=5)
+        pytest.fail("wait(timeout=0) hung — 0 collapsed to wait-forever")
+
+    assert not box["result"].success
 
 
 def test_abandoned_process_is_reaped_by_del():
