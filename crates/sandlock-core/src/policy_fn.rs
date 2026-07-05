@@ -105,6 +105,14 @@ pub struct SyscallEvent {
     pub argv: Option<Vec<String>>,
     /// Whether the supervisor denied this syscall.
     pub denied: bool,
+    /// Resolved absolute path for file syscalls (openat, execve/execveat).
+    /// Read from the kernel's fd table via `/proc/<pid>/fd/<fd>` after the
+    /// supervisor's on-behalf open — not from child user memory — so it is
+    /// TOCTOU-safe. `None` for non-file syscalls or when resolution fails.
+    pub path: Option<std::path::PathBuf>,
+    /// Open flags for openat (the `flags` argument, e.g. `O_RDONLY`,
+    /// `O_WRONLY`, `O_CREAT`). `None` for non-openat syscalls.
+    pub flags: Option<u64>,
 }
 
 impl SyscallEvent {
@@ -483,6 +491,8 @@ mod tests {
             size: None,
             argv: Some(vec!["python3".into(), "-c".into(), "print(1)".into()]),
             denied: false,
+            path: None,
+            flags: None,
         };
         assert!(event.argv_contains("python3"));
         assert!(event.argv_contains("-c"));
@@ -502,6 +512,8 @@ mod tests {
             size: None,
             argv: None,
             denied: false,
+            path: None,
+            flags: None,
         };
         assert!(!event.argv_contains("anything"));
     }

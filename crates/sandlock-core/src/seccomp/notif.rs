@@ -777,15 +777,6 @@ pub struct NotifPolicy {
     /// Active MITM CA public cert (PEM bytes) to inject. `Some` only when
     /// HTTPS MITM is active (BYO or generated).
     pub ca_inject_pem: Option<std::sync::Arc<Vec<u8>>>,
-    /// Optional audit hook called for every `openat`/`open` syscall before dispatch.
-    /// Receives the resolved absolute path and the open flags (`O_*`).
-    pub audit_file_access: Option<std::sync::Arc<dyn Fn(&std::path::Path, u64) + Send + Sync>>,
-    /// Optional audit hook called for every `execve`/`execveat` syscall before dispatch.
-    /// Receives the resolved absolute path of the binary being executed.
-    pub audit_execve: Option<std::sync::Arc<dyn Fn(&std::path::Path) + Send + Sync>>,
-    /// Optional audit hook called for every `connect`/`sendto`/`sendmsg` syscall before
-    /// dispatch. Receives the destination IP and port.
-    pub audit_net_connect: Option<std::sync::Arc<dyn Fn(std::net::IpAddr, u16) + Send + Sync>>,
 }
 
 impl NotifPolicy {
@@ -1243,26 +1234,6 @@ fn send_response(fd: RawFd, id: u64, action: NotifAction) -> io::Result<()> {
 /// Read the dynamic linker path from /proc/<pid>/maps after execve completes.
 /// The linker is loaded by the kernel in kernel space during execve. After exec, it appears as a file-backed mapping whose name
 /// contains "/ld-" (the standard naming convention).
-fn read_linker_from_maps(pid: i32) -> Option<std::path::PathBuf> {
-    use std::io::BufRead;
-    let file = std::fs::File::open(format!("/proc/{}/maps", pid)).ok()?;
-    for line in std::io::BufReader::new(file).lines() {
-        let line = line.ok()?;
-        // Format: "addr-addr perms offset dev inode pathname"
-        let pathname = line.splitn(6, ' ').nth(5).map(str::trim).unwrap_or("");
-        if !pathname.is_empty() && !pathname.starts_with('[') {
-            let p = std::path::Path::new(pathname);
-            if p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.starts_with("ld-"))
-                .unwrap_or(false)
-            {
-                return Some(p.to_path_buf());
-            }
-        }
-    }
-    None
-}
 
 // ============================================================
 // vDSO re-patching after exec
@@ -1588,6 +1559,8 @@ async fn emit_policy_event(
     let mut port = None;
     let mut size = None;
     let mut argv = None;
+    let mut path = None;
+    let mut flags = None;
 
     if !denied && (nr == libc::SYS_execve || nr == libc::SYS_execveat) {
         // execve(pathname, argv, envp):       args[1] = argv ptr
@@ -1598,6 +1571,9 @@ async fn emit_policy_event(
             notif.data.args[1]
         };
         argv = read_argv_for_event(notif, argv_ptr, notif_fd);
+        // Binary path: resolved via procfs (TOCTOU-safe, not from child memory).
+        path = resolve_path_for_notif(notif, notif_fd)
+            .map(std::path::PathBuf::from);
     }
 
     if nr == libc::SYS_connect || nr == libc::SYS_sendto || nr == libc::SYS_bind {
@@ -1614,6 +1590,20 @@ async fn emit_policy_event(
         size = Some(notif.data.args[1]);
     }
 
+    // openat(dirfd, pathname, flags, mode): resolved path + flags.
+    // Path is read via /proc/<pid>/fd after the on-behalf open — TOCTOU-safe.
+    // openat2 uses struct open_how* for flags so flags is left None there.
+    if nr == libc::SYS_openat || Some(nr) == arch::sys_open() {
+        path = resolve_path_for_notif(notif, notif_fd)
+            .map(std::path::PathBuf::from);
+        // openat: args[2] = flags; open: args[1] = flags
+        flags = Some(if nr == libc::SYS_openat {
+            notif.data.args[2]
+        } else {
+            notif.data.args[1]
+        });
+    }
+
     let event = crate::policy_fn::SyscallEvent {
         syscall: name.to_string(),
         category,
@@ -1624,6 +1614,8 @@ async fn emit_policy_event(
         size,
         argv,
         denied,
+        path,
+        flags,
     };
 
     // Hold syscalls where the callback's verdict matters.
@@ -1725,85 +1717,6 @@ async fn handle_notification(
     if policy.has_time_start || policy.has_random_seed {
         let mut pfs = ctx.procfs.lock().await;
         maybe_patch_vdso(notif.pid as i32, &mut pfs, policy);
-    }
-
-    // If the previous notification from this pid was an execve, exec has now
-    // completed and /proc/<pid>/maps reflects the new image. Read the dynamic
-    // linker path from maps and fire the audit_execve hook for it — the linker
-    // is loaded by the kernel in kernel space so no openat ever fires for it.
-    if let Some(ref hook) = policy.audit_execve {
-        if let Some((_, state)) = ctx.processes.entry_for(notif.pid as i32) {
-            let mut st = state.lock().await;
-            if st.pending_exec_maps_read {
-                st.pending_exec_maps_read = false;
-                drop(st);
-                if let Some(linker) = read_linker_from_maps(notif.pid as i32) {
-                    hook(&linker);
-                }
-            }
-        }
-    }
-
-    // File-open audit hook — fires for openat/open before internal handlers.
-    if let Some(ref hook) = policy.audit_file_access {
-        let nr = notif.data.nr as i64;
-        let is_open = nr == libc::SYS_openat || Some(nr) == arch::sys_open();
-        if is_open {
-            if let Some(path) = resolve_path_for_notif(&notif, fd) {
-                let flags = if nr == libc::SYS_openat {
-                    notif.data.args[2]
-                } else {
-                    notif.data.args[1]
-                };
-                hook(std::path::Path::new(&path), flags);
-            }
-        }
-    }
-
-    // Execve audit hook — fires for execve/execveat before internal handlers.
-    // Also sets pending_exec_maps_read so the dynamic linker is captured on
-    // the next notification, after exec completes and maps reflects the new image.
-    if let Some(ref hook) = policy.audit_execve {
-        let nr = notif.data.nr as i64;
-        if nr == libc::SYS_execve || nr == libc::SYS_execveat {
-            if let Some(path) = resolve_path_for_notif(&notif, fd) {
-                hook(std::path::Path::new(&path));
-                if let Some((_, state)) = ctx.processes.entry_for(notif.pid as i32) {
-                    state.lock().await.pending_exec_maps_read = true;
-                }
-            }
-        }
-    }
-
-    // Network connect audit hook — fires before internal handlers.
-    if let Some(ref hook) = policy.audit_net_connect {
-        let nr = notif.data.nr as i64;
-        // Extract (addr_ptr, addr_len) from the syscall args — each syscall lays them out differently.
-        let sockaddr = if nr == libc::SYS_connect {
-            // connect(sockfd, addr, addrlen)
-            Some((notif.data.args[1], notif.data.args[2] as usize))
-        } else if nr == libc::SYS_sendto {
-            // sendto(sockfd, buf, len, flags, addr, addrlen)
-            Some((notif.data.args[4], notif.data.args[5] as usize))
-        } else if nr == libc::SYS_sendmsg {
-            // sendmsg(sockfd, msghdr*, flags) — addr is msg_name inside the msghdr struct
-            let msghdr_ptr = notif.data.args[1];
-            read_child_mem(fd, notif.id, notif.pid, msghdr_ptr, 16)
-                .ok()
-                .filter(|b| b.len() >= 16)
-                .and_then(|b| {
-                    let msg_name = u64::from_ne_bytes(b[0..8].try_into().ok()?);
-                    let msg_namelen = u32::from_ne_bytes(b[8..12].try_into().ok()?) as usize;
-                    if msg_name != 0 && msg_namelen >= 4 { Some((msg_name, msg_namelen)) } else { None }
-                })
-        } else {
-            None
-        };
-        if let Some((addr_ptr, addr_len)) = sockaddr {
-            if let (Some(ip), Some(port)) = read_sockaddr_for_event(&notif, addr_ptr, addr_len, fd) {
-                hook(ip, port);
-            }
-        }
     }
 
     // Check dynamic path denials before dispatch

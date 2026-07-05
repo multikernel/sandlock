@@ -3,12 +3,13 @@
 //! Runs a workload under observation and emits a sandlock profile TOML
 //! usable by `sandlock run -p`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{anyhow, Result};
+use sandlock_core::policy_fn::{SyscallEvent, Verdict};
 use sandlock_core::profile::{FilesystemSection, ProfileInput};
 use sandlock_core::Sandbox;
 
@@ -21,6 +22,93 @@ const O_CREAT: u64 = 0o100;
 
 fn is_write_open(flags: u64) -> bool {
     flags & (O_WRONLY | O_RDWR | O_CREAT) != 0
+}
+
+/// Read the dynamic linker path from `/proc/<pid>/maps`. The kernel loads it
+/// during execve (bypassing seccomp), so this is the way to discover it
+/// after the execve completes and `/proc/<pid>/maps` reflects the new binary.
+fn read_linker_from_maps(pid: u32) -> Option<PathBuf> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(format!("/proc/{pid}/maps")).ok()?;
+    for line in std::io::BufReader::new(file).lines() {
+        let line = line.ok()?;
+        // Format: "addr-addr perms offset dev inode pathname"
+        let pathname = line.splitn(6, ' ').nth(5).map(str::trim).unwrap_or("");
+        if !pathname.is_empty() && !pathname.starts_with('[') {
+            let p = std::path::Path::new(pathname);
+            if p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("ld-"))
+                .unwrap_or(false)
+            {
+                return Some(p.to_path_buf());
+            }
+        }
+    }
+    None
+}
+
+/// Accumulated observations from the policy_fn callback during learn.
+#[derive(Clone)]
+struct LearnObserver {
+    reads: Arc<Mutex<BTreeSet<PathBuf>>>,
+    writes: Arc<Mutex<BTreeSet<PathBuf>>>,
+    connects: Arc<Mutex<BTreeSet<String>>>,
+    /// PIDs that just completed an execve — on the NEXT event from that PID,
+    /// /proc/<pid>/maps will reflect the new binary's dynamic linker.
+    pending_maps: Arc<Mutex<HashSet<u32>>>,
+}
+
+impl LearnObserver {
+    fn new() -> Self {
+        Self {
+            reads: Arc::new(Mutex::new(BTreeSet::new())),
+            writes: Arc::new(Mutex::new(BTreeSet::new())),
+            connects: Arc::new(Mutex::new(BTreeSet::new())),
+            pending_maps: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    /// The policy_fn callback: classifies each intercepted syscall into
+    /// reads, writes, or connects for profile generation.
+    fn on_event(&self, event: SyscallEvent) -> Verdict {
+        // After an execve, the NEXT event from that PID fires once the
+        // new binary is running — /proc/<pid>/maps now shows the dynamic
+        // linker loaded by the kernel (which bypassed seccomp).
+        if self.pending_maps.lock().unwrap().remove(&event.pid) {
+            if let Some(linker) = read_linker_from_maps(event.pid) {
+                self.reads.lock().unwrap().insert(linker);
+            }
+        }
+
+        match event.syscall.as_str() {
+            "openat" | "open" => {
+                if let Some(path) = event.path {
+                    if let Some(fl) = event.flags {
+                        if is_write_open(fl) {
+                            self.writes.lock().unwrap().insert(path);
+                        } else {
+                            self.reads.lock().unwrap().insert(path);
+                        }
+                    }
+                }
+            }
+            "execve" | "execveat" => {
+                if let Some(path) = event.path {
+                    self.reads.lock().unwrap().insert(path);
+                }
+                // Mark PID: read maps on next event after execve completes.
+                self.pending_maps.lock().unwrap().insert(event.pid);
+            }
+            "connect" | "sendto" => {
+                if let (Some(ip), Some(port)) = (event.host, event.port) {
+                    self.connects.lock().unwrap().insert(format!("tcp://{ip}:{port}"));
+                }
+            }
+            _ => {}
+        }
+        Verdict::Allow
+    }
 }
 
 
@@ -39,31 +127,12 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         .tempdir_in("/var/tmp")
         .map_err(|e| anyhow!("failed to create COW tempdir: {e}"))?;
 
-    let reads: Arc<Mutex<BTreeSet<PathBuf>>> = Arc::new(Mutex::new(BTreeSet::new()));
-    let writes: Arc<Mutex<BTreeSet<PathBuf>>> = Arc::new(Mutex::new(BTreeSet::new()));
-    let execs: Arc<Mutex<BTreeSet<PathBuf>>> = Arc::new(Mutex::new(BTreeSet::new()));
-    let connects: Arc<Mutex<BTreeSet<String>>> = Arc::new(Mutex::new(BTreeSet::new()));
-
-    let (reads_c, writes_c, execs_c, connects_c) = (
-        Arc::clone(&reads), Arc::clone(&writes),
-        Arc::clone(&execs), Arc::clone(&connects),
-    );
+    let observer = LearnObserver::new();
+    let observer_cb = observer.clone();
     let policy = Sandbox::builder()
         .fs_read("/")
         .workdir(cow_dir.path())
-        .on_file_access(move |path, flags| {
-            if is_write_open(flags) {
-                writes_c.lock().unwrap().insert(path.to_path_buf());
-            } else {
-                reads_c.lock().unwrap().insert(path.to_path_buf());
-            }
-        })
-        .on_execve(move |path| {
-            execs_c.lock().unwrap().insert(path.to_path_buf());
-        })
-        .on_net_connect(move |ip, port| {
-            connects_c.lock().unwrap().insert(format!("tcp://{ip}:{port}"));
-        })
+        .policy_fn(move |event, _ctx| observer_cb.on_event(event))
         .build()
         .map_err(|e| anyhow!("failed to build sandbox policy: {e}"))?;
 
@@ -133,19 +202,16 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     let cow_path = cow_dir.path().to_path_buf();
     profile_out.filesystem = FilesystemSection {
         // Filter reads by existence to drop failed PATH-probe openats.
-        // Executed binaries are merged into read
-        read: reads.lock().unwrap().iter()
-            .chain(execs.lock().unwrap().iter())
+        // Executed binaries are merged into read.
+        read: observer.reads.lock().unwrap().iter()
             .filter(|p| p.exists() && !p.starts_with(&cow_path))
             .cloned()
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
             .collect(),
         // For writes: if the file exists, record the specific path (existing file modified).
         // If it doesn't exist on the real FS (COW intercepted a create), record the parent
         // directory instead, Landlock requires the path to exist, and the program needs
         // write access to the directory to create new files inside it.
-        write: writes.lock().unwrap().iter()
+        write: observer.writes.lock().unwrap().iter()
             .filter(|p| !p.starts_with(&cow_path))
             .filter_map(|p| {
                 if p.exists() {
@@ -157,7 +223,7 @@ pub async fn run(args: LearnArgs) -> Result<()> {
             .collect(),
         ..Default::default()
     };
-    profile_out.network.allow = connects.lock().unwrap().iter().cloned().collect();
+    profile_out.network.allow = observer.connects.lock().unwrap().iter().cloned().collect();
 
     // Fill limits with observed peaks + headroom so the profile is usable with sandlock run.
     if peak_rss_kb > 0 {
@@ -192,4 +258,3 @@ pub async fn run(args: LearnArgs) -> Result<()> {
 
     Ok(())
 }
-
