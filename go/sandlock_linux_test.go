@@ -4,7 +4,10 @@ package sandlock_test
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -220,6 +223,318 @@ func TestProcessKillInterruptsWait(t *testing.T) {
 		// Wait returned promptly after the kill, as intended.
 	case <-time.After(5 * time.Second):
 		t.Fatal("Kill did not interrupt a blocked Wait within 5s")
+	}
+}
+
+// --- streaming-stdio popen (RFC #67), mirrors the FFI/Python popen suites ---
+
+func TestPopenStreamsStdout(t *testing.T) {
+	requireLandlock(t)
+	sb := &sandlock.Sandbox{FSReadable: rootfs}
+	p, err := sb.Popen(sandlock.Stdio{Stdout: sandlock.StdioPiped}, "echo", "go-hi")
+	if err != nil {
+		t.Fatalf("Popen: %v", err)
+	}
+	defer p.Close()
+	if p.Stdin != nil || p.Stderr != nil {
+		t.Fatalf("inherited streams must be nil (stdin=%v stderr=%v)", p.Stdin, p.Stderr)
+	}
+	if p.Stdout == nil {
+		t.Fatal("piped stdout must be non-nil")
+	}
+	out, err := io.ReadAll(p.Stdout)
+	if err != nil {
+		t.Fatalf("read stdout: %v", err)
+	}
+	if string(out) != "go-hi\n" {
+		t.Fatalf("stdout = %q, want %q", out, "go-hi\n")
+	}
+	res, err := p.Wait()
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if !res.Success || res.ExitCode != 0 {
+		t.Fatalf("want success exit 0, got success=%v exit=%d", res.Success, res.ExitCode)
+	}
+}
+
+func TestPopenStdinStdoutRoundtrip(t *testing.T) {
+	requireLandlock(t)
+	sb := &sandlock.Sandbox{FSReadable: rootfs}
+	p, err := sb.Popen(sandlock.Stdio{Stdin: sandlock.StdioPiped, Stdout: sandlock.StdioPiped}, "cat")
+	if err != nil {
+		t.Fatalf("Popen: %v", err)
+	}
+	defer p.Close()
+	if _, err := p.Stdin.Write([]byte("ping\n")); err != nil {
+		t.Fatalf("write stdin: %v", err)
+	}
+	p.Stdin.Close() // EOF so cat exits
+	out, err := io.ReadAll(p.Stdout)
+	if err != nil {
+		t.Fatalf("read stdout: %v", err)
+	}
+	if string(out) != "ping\n" {
+		t.Fatalf("roundtrip = %q, want %q", out, "ping\n")
+	}
+	if res, _ := p.Wait(); !res.Success {
+		t.Fatalf("cat should succeed, got %+v", res)
+	}
+}
+
+func TestPopenWaitClosesUnclosedStdin(t *testing.T) {
+	// cat reads stdin to EOF. If the caller pipes stdin but never closes it,
+	// Wait must close it to deliver EOF — else cat blocks forever and Wait hangs.
+	// Run under a watchdog so a regression surfaces as a failure, not a hung job.
+	requireLandlock(t)
+	sb := &sandlock.Sandbox{FSReadable: rootfs}
+	p, err := sb.Popen(sandlock.Stdio{Stdin: sandlock.StdioPiped, Stdout: sandlock.StdioPiped}, "cat")
+	if err != nil {
+		t.Fatalf("Popen: %v", err)
+	}
+	defer p.Close()
+	if _, err := p.Stdin.Write([]byte("data\n")); err != nil {
+		t.Fatalf("write stdin: %v", err)
+	}
+	// Deliberately do NOT close stdin — Wait is responsible for the EOF. Drain
+	// stdout concurrently so a full pipe can never be the reason cat blocks.
+	go io.ReadAll(p.Stdout)
+
+	done := make(chan *sandlock.Result, 1)
+	go func() {
+		res, _ := p.Wait()
+		done <- res
+	}()
+	select {
+	case res := <-done:
+		if res == nil || !res.Success {
+			t.Fatalf("wait result not success: %+v", res)
+		}
+	case <-time.After(10 * time.Second):
+		p.Kill()
+		t.Fatal("Wait did not close unclosed piped stdin → cat blocked forever")
+	}
+}
+
+func TestPopenStdoutAndStderrBothPiped(t *testing.T) {
+	requireLandlock(t)
+	sb := &sandlock.Sandbox{FSReadable: rootfs}
+	p, err := sb.Popen(
+		sandlock.Stdio{Stdout: sandlock.StdioPiped, Stderr: sandlock.StdioPiped},
+		"sh", "-c", "echo out; echo err 1>&2",
+	)
+	if err != nil {
+		t.Fatalf("Popen: %v", err)
+	}
+	defer p.Close()
+	out, _ := io.ReadAll(p.Stdout)
+	errb, _ := io.ReadAll(p.Stderr)
+	if string(out) != "out\n" {
+		t.Fatalf("stdout = %q, want %q", out, "out\n")
+	}
+	if string(errb) != "err\n" {
+		t.Fatalf("stderr = %q, want %q", errb, "err\n")
+	}
+	if res, _ := p.Wait(); !res.Success {
+		t.Fatalf("want success, got %+v", res)
+	}
+}
+
+func TestPopenNullStdoutNoStream(t *testing.T) {
+	requireLandlock(t)
+	sb := &sandlock.Sandbox{FSReadable: rootfs}
+	p, err := sb.Popen(sandlock.Stdio{Stdout: sandlock.StdioNull}, "echo", "discarded")
+	if err != nil {
+		t.Fatalf("Popen: %v", err)
+	}
+	defer p.Close()
+	if p.Stdout != nil {
+		t.Fatal("null stdout must yield no caller stream")
+	}
+	if res, _ := p.Wait(); res.ExitCode != 0 {
+		t.Fatalf("want exit 0, got %d", res.ExitCode)
+	}
+}
+
+func TestPopenZeroStdioInheritsAllLikeSpawn(t *testing.T) {
+	// The zero Stdio value must wire all three streams as StdioInherit (the ABI
+	// default StdioInherit == 0), identical to Spawn: no caller stream is handed
+	// back and the child runs to success. Pins the zero-value contract the type
+	// doc, the Popen doc, and the README all state but nothing exercised.
+	requireLandlock(t)
+	sb := &sandlock.Sandbox{FSReadable: rootfs}
+	p, err := sb.Popen(sandlock.Stdio{}, "true")
+	if err != nil {
+		t.Fatalf("Popen: %v", err)
+	}
+	defer p.Close()
+	if p.Stdin != nil || p.Stdout != nil || p.Stderr != nil {
+		t.Fatalf("zero Stdio must inherit all three; got streams stdin=%v stdout=%v stderr=%v",
+			p.Stdin != nil, p.Stdout != nil, p.Stderr != nil)
+	}
+	res, err := p.Wait()
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if !res.Success || res.ExitCode != 0 {
+		t.Fatalf("want success exit 0, got success=%v exit=%d", res.Success, res.ExitCode)
+	}
+}
+
+func TestPopenKillAfterWaitIsNil(t *testing.T) {
+	// Kill on an already-reaped Process must be nil (not ErrNotRunning), matching
+	// the FFI (returns 0) and Python (no-op): a "Kill from another goroutine"
+	// firing just as Wait reaps the child must not surface a spurious error.
+	requireLandlock(t)
+	sb := &sandlock.Sandbox{FSReadable: rootfs}
+	p, err := sb.Popen(sandlock.Stdio{}, "true")
+	if err != nil {
+		t.Fatalf("Popen: %v", err)
+	}
+	if _, err := p.Wait(); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if err := p.Kill(); err != nil {
+		t.Fatalf("Kill after Wait must return nil, got %v", err)
+	}
+}
+
+func TestPopenInvalidStdioMode(t *testing.T) {
+	// An out-of-range discriminant is rejected before the child is spawned, so
+	// this needs no Landlock.
+	sb := &sandlock.Sandbox{FSReadable: rootfs}
+	if _, err := sb.Popen(sandlock.Stdio{Stdout: sandlock.StdioMode(99)}, "echo", "x"); err == nil {
+		t.Fatal("an out-of-range StdioMode must be rejected")
+	}
+}
+
+func TestPopenKillInterruptsWait(t *testing.T) {
+	// A piped stdout we never drain would block Wait on a child that never exits;
+	// Kill from another goroutine must interrupt it (the Go escape hatch that
+	// makes a wait-timeout unnecessary here).
+	requireLandlock(t)
+	sb := &sandlock.Sandbox{FSReadable: rootfs}
+	p, err := sb.Popen(sandlock.Stdio{Stdout: sandlock.StdioPiped}, "sleep", "60")
+	if err != nil {
+		t.Fatalf("Popen: %v", err)
+	}
+	defer p.Close()
+	done := make(chan error, 1)
+	go func() {
+		_, werr := p.Wait()
+		done <- werr
+	}()
+	if err := p.Kill(); err != nil {
+		t.Fatalf("Kill: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Kill did not interrupt a blocked Wait within 5s")
+	}
+}
+
+func TestPopenCloseClosesStreamsAndReaps(t *testing.T) {
+	requireLandlock(t)
+	sb := &sandlock.Sandbox{FSReadable: rootfs}
+	p, err := sb.Popen(sandlock.Stdio{Stdout: sandlock.StdioPiped}, "sleep", "60")
+	if err != nil {
+		t.Fatalf("Popen: %v", err)
+	}
+	stdout := p.Stdout
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// Close must close the piped stream: a further read fails on the closed fd.
+	if _, err := stdout.Read(make([]byte, 1)); err == nil {
+		t.Fatal("Close must close the piped stdout stream")
+	}
+	// Close is idempotent.
+	if err := p.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}
+
+// procDead reports whether pid names no live process: its /proc entry is gone
+// (reaped) or its state is zombie/dead. Robust to the reap-vs-zombie race a
+// plain kill(pid, 0) would be sensitive to.
+func procDead(pid int) bool {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return true // no /proc entry → reaped
+	}
+	// "pid (comm) STATE ..." — comm may contain spaces/parens, so the state is
+	// the character two positions after the final ')'.
+	s := string(data)
+	j := strings.LastIndexByte(s, ')')
+	if j < 0 || j+2 >= len(s) {
+		return true
+	}
+	switch s[j+2] {
+	case 'Z', 'X', 'x': // zombie / dead
+		return true
+	}
+	return false
+}
+
+func TestPopenFinalizerReapsAbandonedProcess(t *testing.T) {
+	// A Process dropped without Wait/Close must not leak: the finalizer kills the
+	// child's process group and frees the handle. Capture the pid in a scope that
+	// drops the Process, then force GC and confirm the child is gone.
+	requireLandlock(t)
+	pid := func() int {
+		sb := &sandlock.Sandbox{FSReadable: rootfs}
+		p, err := sb.Popen(sandlock.Stdio{Stdout: sandlock.StdioPiped}, "sleep", "60")
+		if err != nil {
+			t.Fatalf("Popen: %v", err)
+		}
+		return p.Pid() // p becomes unreachable when this closure returns
+	}()
+	if pid <= 0 {
+		t.Fatalf("no pid, got %d", pid)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		runtime.GC()
+		if procDead(pid) {
+			return // finalizer reaped the abandoned child
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("abandoned Popen child (pid %d) was not reaped by the finalizer", pid)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func TestPopenCloseAfterWaitClosesLeftoverStream(t *testing.T) {
+	requireLandlock(t)
+	sb := &sandlock.Sandbox{FSReadable: rootfs}
+	p, err := sb.Popen(sandlock.Stdio{Stdout: sandlock.StdioPiped}, "echo", "leftover")
+	if err != nil {
+		t.Fatalf("Popen: %v", err)
+	}
+	stdout := p.Stdout
+
+	// Wait without draining first (small output fits the pipe buffer); the stream
+	// stays open so the caller can still read the buffered output afterward.
+	if res, _ := p.Wait(); !res.Success {
+		t.Fatalf("want success, got %+v", res)
+	}
+	got, err := io.ReadAll(stdout)
+	if err != nil {
+		t.Fatalf("read after wait: %v", err)
+	}
+	if string(got) != "leftover\n" {
+		t.Fatalf("post-wait read = %q, want %q", got, "leftover\n")
+	}
+
+	// Close after Wait must still release the leftover piped stream.
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := stdout.Read(make([]byte, 1)); err == nil {
+		t.Fatal("Close after Wait must close the leftover piped stream")
 	}
 }
 

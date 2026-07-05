@@ -285,6 +285,29 @@ type Result struct {
 	Stderr   []byte // captured standard error
 }
 
+// StdioMode selects how one of a Popen'd process's standard streams is wired.
+// The values are the stable ABI discriminants shared with the C/Rust core.
+type StdioMode uint32
+
+const (
+	// StdioInherit shares the parent's fd (the child writes to the same
+	// terminal/file). It is the zero value, so an unset stream inherits.
+	StdioInherit StdioMode = 0
+	// StdioPiped connects the stream to a pipe; Popen hands the caller the
+	// owning end as an *os.File on the returned Process.
+	StdioPiped StdioMode = 1
+	// StdioNull connects the stream to /dev/null.
+	StdioNull StdioMode = 2
+)
+
+// Stdio selects the wiring of a Popen'd process's three standard streams. The
+// zero value wires all three as StdioInherit, matching Spawn.
+type Stdio struct {
+	Stdin  StdioMode
+	Stdout StdioMode
+	Stderr StdioMode
+}
+
 // ChangeKind classifies a filesystem change observed during a dry run.
 type ChangeKind byte
 
