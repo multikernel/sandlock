@@ -317,6 +317,22 @@ _lib.sandlock_handle_free.argtypes = [_c_handle_p]
 _lib.sandlock_handle_port_mappings.restype = ctypes.c_char_p
 _lib.sandlock_handle_port_mappings.argtypes = [_c_handle_p]
 
+# Streaming-stdio popen (RFC #67): create+start a live handle with per-stream
+# StdioMode; each piped stream's owned fd is returned through its out pointer.
+_lib.sandlock_popen.restype = _c_handle_p
+_lib.sandlock_popen.argtypes = [
+    _c_policy_p,
+    ctypes.c_char_p,
+    ctypes.POINTER(ctypes.c_char_p),
+    ctypes.c_uint,
+    ctypes.c_uint32,  # stdin_mode
+    ctypes.c_uint32,  # stdout_mode
+    ctypes.c_uint32,  # stderr_mode
+    ctypes.POINTER(ctypes.c_int),  # out_stdin_fd
+    ctypes.POINTER(ctypes.c_int),  # out_stdout_fd
+    ctypes.POINTER(ctypes.c_int),  # out_stderr_fd
+]
+
 # Result
 _lib.sandlock_result_exit_code.restype = ctypes.c_int
 _lib.sandlock_result_exit_code.argtypes = [_c_result_p]

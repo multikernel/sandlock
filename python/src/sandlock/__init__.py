@@ -14,7 +14,9 @@ from ._sdk import (
 )
 from .inputs import inputs
 from .handler import Handler, NotifAction, HandlerCtx, ExceptionPolicy
-from .sandbox import Sandbox, BranchAction, parse_ports, Change, DryRunResult
+from .sandbox import (
+    Sandbox, BranchAction, parse_ports, Change, DryRunResult, StdioMode, Process,
+)
 from ._profile import load_profile, list_profiles
 from .exceptions import (
     SandlockError,
@@ -49,6 +51,8 @@ __all__ = [
     "parse_ports",
     "Change",
     "DryRunResult",
+    "StdioMode",
+    "Process",
     "Protection",
     # Handler ABI
     "Handler",
