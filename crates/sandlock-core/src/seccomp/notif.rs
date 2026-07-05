@@ -1228,14 +1228,6 @@ fn send_response(fd: RawFd, id: u64, action: NotifAction) -> io::Result<()> {
 }
 
 // ============================================================
-// Maps reading after exec
-// ============================================================
-
-/// Read the dynamic linker path from /proc/<pid>/maps after execve completes.
-/// The linker is loaded by the kernel in kernel space during execve. After exec, it appears as a file-backed mapping whose name
-/// contains "/ld-" (the standard naming convention).
-
-// ============================================================
 // vDSO re-patching after exec
 // ============================================================
 
