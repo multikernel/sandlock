@@ -21,6 +21,7 @@ pub(crate) const MAX_SEND_BUF: usize = 64 << 20;
 /// ≈ 1 KiB, so 16 KiB is far above any legitimate use while bounding supervisor
 /// memory per trapped send).
 const MAX_CONTROL_BUF: usize = 16 << 10;
+
 // ============================================================
 // parse_ip_from_sockaddr — parse IP from a sockaddr byte buffer
 // ============================================================
@@ -79,6 +80,7 @@ pub(crate) fn set_port_in_sockaddr(bytes: &mut [u8], port: u16) {
         bytes[3] = port_bytes[1];
     }
 }
+
 /// Rewrite the `SCM_RIGHTS` file descriptors in a copied control buffer from
 /// the child's fd numbers to supervisor fd numbers, rejecting identity cmsgs.
 ///
@@ -143,8 +145,9 @@ fn translate_scm_rights(child_pid: u32, control: &[u8]) -> Result<(Vec<u8>, Vec<
     }
     Ok((out, held))
 }
+
 /// Copy (and, for a unix socket, translate) the control buffer of an on-behalf
-/// send. Shared by `send_msghdr_on_behalf` and `send_named_unix_msghdr`.
+/// send. Both sendmsg paths reach it through [`materialize_msg`].
 ///
 /// Returns `(control_bytes, held_fds)` — the fds keep the translated
 /// `SCM_RIGHTS` files open across the send. Fails closed: oversized control →
@@ -152,7 +155,7 @@ fn translate_scm_rights(child_pid: u32, control: &[u8]) -> Result<(Vec<u8>, Vec<
 /// caller's cmsgs). For a unix socket, `SCM_RIGHTS` fds are translated and
 /// `SCM_CREDENTIALS` is rejected; a non-unix socket's control passes through
 /// verbatim.
-pub(crate) fn materialize_control(
+fn materialize_control(
     notif: &SeccompNotif,
     notif_fd: RawFd,
     msg_control_ptr: u64,
@@ -176,6 +179,7 @@ pub(crate) fn materialize_control(
         Ok((Some(raw), Vec::new()))
     }
 }
+
 /// Extract the filesystem path of a NAMED `AF_UNIX` connect target from a raw
 /// `sockaddr`. Returns `None` for abstract sockets (`sun_path[0] == 0`),
 /// unnamed sockets, or any non-`AF_UNIX` family (none of which the fs gate
@@ -201,6 +205,108 @@ pub(crate) fn named_unix_socket_path(addr_bytes: &[u8]) -> Option<std::path::Pat
     }
     std::str::from_utf8(raw).ok().map(std::path::PathBuf::from)
 }
+
+/// `struct msghdr` size on LP64 Linux (x86_64 / aarch64 / riscv64): four
+/// 8-byte pointer/length fields, one (u32 + pad) `msg_namelen`, and the
+/// trailing (i32 + pad) `msg_flags` = 56 bytes.
+pub(crate) const MSGHDR_SIZE: usize = 56;
+
+/// One `struct msghdr` copied out of child memory. The single place the LP64
+/// field offsets are known; every consumer of a child msghdr goes through
+/// [`ChildMsghdr::read`] instead of hand-indexing raw bytes. (`msg_flags` is
+/// output-only on the send side, so it is not carried.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ChildMsghdr {
+    pub(crate) name_ptr: u64,
+    pub(crate) namelen: u32,
+    pub(crate) iov_ptr: u64,
+    pub(crate) iovlen: u64,
+    pub(crate) control_ptr: u64,
+    pub(crate) controllen: u64,
+}
+
+impl ChildMsghdr {
+    /// Parse a raw msghdr image. `None` if the buffer is short.
+    pub(crate) fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < MSGHDR_SIZE {
+            return None;
+        }
+        Some(ChildMsghdr {
+            name_ptr: u64::from_ne_bytes(bytes[0..8].try_into().unwrap()),
+            namelen: u32::from_ne_bytes(bytes[8..12].try_into().unwrap()),
+            iov_ptr: u64::from_ne_bytes(bytes[16..24].try_into().unwrap()),
+            iovlen: u64::from_ne_bytes(bytes[24..32].try_into().unwrap()),
+            control_ptr: u64::from_ne_bytes(bytes[32..40].try_into().unwrap()),
+            controllen: u64::from_ne_bytes(bytes[40..48].try_into().unwrap()),
+        })
+    }
+
+    /// Copy one msghdr out of child memory. `EFAULT` on an unreadable or
+    /// short read, matching the kernel's errno for a bad `msghdr` pointer.
+    pub(crate) fn read(notif: &SeccompNotif, notif_fd: RawFd, ptr: u64) -> Result<Self, i32> {
+        match read_child_mem(notif_fd, notif.id, notif.pid, ptr, MSGHDR_SIZE) {
+            Ok(b) => Self::parse(&b).ok_or(libc::EFAULT),
+            Err(_) => Err(libc::EFAULT),
+        }
+    }
+
+    /// True when the message carries no destination (connected-socket send):
+    /// a null or zero-length `msg_name`.
+    pub(crate) fn connected(&self) -> bool {
+        self.name_ptr == 0 || self.namelen == 0
+    }
+}
+
+/// `struct mmsghdr` on LP64: the 56-byte msghdr + 4-byte `msg_len` result +
+/// 4 bytes tail padding = 64 bytes, `msg_len` at offset 56.
+const MMSGHDR_SIZE: usize = 64;
+const MSG_LEN_OFFSET: usize = 56;
+
+/// Address of `sendmmsg` entry `i` in the child's `msgvec` array. The entry's
+/// `msghdr` is the first field of `struct mmsghdr`, so this address is also
+/// what [`ChildMsghdr::read`] takes for the entry.
+pub(crate) fn mmsg_entry_ptr(msgvec_ptr: u64, i: usize) -> u64 {
+    msgvec_ptr + (i * MMSGHDR_SIZE) as u64
+}
+
+/// Address of the `msg_len` result field inside the entry at `entry_ptr`.
+pub(crate) fn mmsg_msglen_addr(entry_ptr: u64) -> u64 {
+    entry_ptr + MSG_LEN_OFFSET as u64
+}
+
+/// Materialize phase for one msghdr: flatten the iovec payload and copy (and,
+/// for a unix socket, translate) the control buffer, producing an owned
+/// [`MaterializedMsg`] with no references to child state. `addr` is the
+/// already-validated destination bytes (empty = connected send); `pinned`
+/// keeps a named-unix target inode alive for the send's lifetime.
+pub(crate) fn materialize_msg(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+    hdr: &ChildMsghdr,
+    addr: Vec<u8>,
+    translate_unix_control: bool,
+    pinned: Option<OwnedFd>,
+) -> Result<MaterializedMsg, i32> {
+    let iovlen = (hdr.iovlen as usize).min(1024);
+    let iov_bytes = read_child_mem(notif_fd, notif.id, notif.pid, hdr.iov_ptr, iovlen * 16)
+        .map_err(|_| libc::EIO)?;
+    let data = flatten_iovecs(notif, notif_fd, &iov_bytes, iovlen)?;
+    let (control, scm_fds) = materialize_control(
+        notif,
+        notif_fd,
+        hdr.control_ptr,
+        hdr.controllen,
+        translate_unix_control,
+    )?;
+    Ok(MaterializedMsg {
+        data,
+        control,
+        addr,
+        _scm_fds: scm_fds,
+        _pinned: pinned,
+    })
+}
+
 /// A fully-materialized on-behalf send. Owns the (flattened) iovec payload, the
 /// translated control buffer (with its `SCM_RIGHTS` fds and any named-unix inode
 /// pin kept alive), and the destination sockaddr (empty = connected). Owning
@@ -214,11 +320,12 @@ pub(crate) struct MaterializedMsg {
     pub(crate) _scm_fds: Vec<OwnedFd>,
     pub(crate) _pinned: Option<OwnedFd>,
 }
+
 /// Read a child's iovec array (`iov_bytes` = the raw `struct iovec[]`) and
 /// concatenate the referenced buffers into one owned payload, capped at
 /// `MAX_SEND_BUF` total so a hostile child can't OOM the supervisor. A null
 /// base or zero length contributes nothing (matching the prior per-iovec copy).
-pub(crate) fn flatten_iovecs(
+fn flatten_iovecs(
     notif: &SeccompNotif,
     notif_fd: RawFd,
     iov_bytes: &[u8],
@@ -244,6 +351,7 @@ pub(crate) fn flatten_iovecs(
     }
     Ok(data)
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,5 +406,46 @@ mod tests {
         assert_eq!(out, buf);
         assert!(fds.is_empty());
     }
-}
 
+    // --- ChildMsghdr tests (LP64 msghdr layout, child-controlled) ---
+
+    #[test]
+    fn child_msghdr_parses_lp64_fields() {
+        let mut b = vec![0u8; MSGHDR_SIZE];
+        b[0..8].copy_from_slice(&0x1111u64.to_ne_bytes());
+        b[8..12].copy_from_slice(&7u32.to_ne_bytes());
+        b[16..24].copy_from_slice(&0x2222u64.to_ne_bytes());
+        b[24..32].copy_from_slice(&3u64.to_ne_bytes());
+        b[32..40].copy_from_slice(&0x3333u64.to_ne_bytes());
+        b[40..48].copy_from_slice(&64u64.to_ne_bytes());
+        let h = ChildMsghdr::parse(&b).unwrap();
+        assert_eq!(
+            (h.name_ptr, h.namelen, h.iov_ptr, h.iovlen, h.control_ptr, h.controllen),
+            (0x1111, 7, 0x2222, 3, 0x3333, 64)
+        );
+        assert!(!h.connected());
+    }
+
+    #[test]
+    fn child_msghdr_rejects_short_buffer() {
+        assert!(ChildMsghdr::parse(&[0u8; MSGHDR_SIZE - 1]).is_none());
+    }
+
+    #[test]
+    fn child_msghdr_connected_on_null_or_empty_name() {
+        // Null msg_name.
+        let b = vec![0u8; MSGHDR_SIZE];
+        assert!(ChildMsghdr::parse(&b).unwrap().connected());
+        // Non-null msg_name with zero msg_namelen.
+        let mut b2 = vec![0u8; MSGHDR_SIZE];
+        b2[0..8].copy_from_slice(&0x1111u64.to_ne_bytes());
+        assert!(ChildMsghdr::parse(&b2).unwrap().connected());
+    }
+
+    #[test]
+    fn mmsg_addressing_helpers() {
+        assert_eq!(mmsg_entry_ptr(0x1000, 0), 0x1000);
+        assert_eq!(mmsg_entry_ptr(0x1000, 2), 0x1000 + 2 * MMSGHDR_SIZE as u64);
+        assert_eq!(mmsg_msglen_addr(0x1000), 0x1000 + MSG_LEN_OFFSET as u64);
+    }
+}

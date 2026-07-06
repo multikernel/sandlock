@@ -24,6 +24,7 @@ pub(crate) fn wants_blocking(fd: RawFd, send_flags: i32) -> bool {
     let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     fl >= 0 && (fl & libc::O_NONBLOCK) == 0
 }
+
 /// One `sendmsg` of `m` starting at byte `offset`. The destination address and
 /// control ancillary are attached only at `offset == 0`: `SCM_RIGHTS` transmits
 /// exactly once, and a stream continuation carries no new address. Returns the
@@ -48,6 +49,7 @@ pub(crate) fn send_materialized_at(fd: RawFd, m: &MaterializedMsg, offset: usize
     msg.msg_iovlen = 1;
     unsafe { libc::sendmsg(fd, &msg, flags) }
 }
+
 /// Resolve a materialized send to a terminal action. The first attempt is
 /// non-blocking (`MSG_DONTWAIT`) on the seccomp loop, so it never blocks there.
 /// A non-blocking child gets whatever that one attempt returns (short count or
@@ -75,6 +77,7 @@ pub(crate) fn resolve_send(dup_fd: OwnedFd, m: MaterializedMsg, flags: i32, chil
     }
     NotifAction::Errno(err)
 }
+
 /// Byte-level completion core: await writability on the dup'd fd through the
 /// Tokio IO driver's epoll (never blocking a worker thread) and push the rest of
 /// the message, advancing `offset` past each partial send, until the whole
@@ -113,6 +116,7 @@ async fn push_until_done(
         return if offset > 0 { Ok(offset) } else { Err(err) };
     }
 }
+
 /// Deferred tail of [`resolve_send`] for a single message: complete the send and
 /// return the byte count (matching a blocking send of N returning N; a partial
 /// stream then error returns the partial count).
@@ -122,6 +126,7 @@ async fn defer_send(dup_fd: OwnedFd, m: MaterializedMsg, flags: i32, offset: usi
         Err(e) => NotifAction::Errno(e),
     }
 }
+
 /// Deferred tail shared by the three `sendmmsg` batch loops. Completes entry
 /// `prior_count` (which either would-block entirely, offset 0, or partially sent
 /// a stream, offset > 0) off the loop, then reports the *message* count — not a

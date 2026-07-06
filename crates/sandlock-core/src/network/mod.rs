@@ -20,8 +20,9 @@ mod child_abi;
 mod send_engine;
 
 use child_abi::{
-    flatten_iovecs, materialize_control, named_unix_socket_path, parse_ip_from_sockaddr,
-    parse_port_from_sockaddr, set_port_in_sockaddr, MaterializedMsg, MAX_SEND_BUF,
+    materialize_msg, mmsg_entry_ptr, mmsg_msglen_addr, named_unix_socket_path,
+    parse_ip_from_sockaddr, parse_port_from_sockaddr, set_port_in_sockaddr, ChildMsghdr,
+    MaterializedMsg, MAX_SEND_BUF,
 };
 use send_engine::{complete_batch_entry, resolve_send, send_materialized_at, wants_blocking};
 
@@ -882,17 +883,12 @@ fn unix_sendmsg_gate(
     msghdr_ptr: u64,
     flags: i32,
 ) -> Option<NotifAction> {
-    let msghdr_bytes = read_child_mem(notif_fd, notif.id, notif.pid, msghdr_ptr, 56).ok()?;
-    if msghdr_bytes.len() < 56 {
-        return None;
-    }
-    let msg_name_ptr = u64::from_ne_bytes(msghdr_bytes[0..8].try_into().unwrap());
-    if msg_name_ptr == 0 {
+    let hdr = ChildMsghdr::read(notif, notif_fd, msghdr_ptr).ok()?;
+    if hdr.connected() {
         return None; // connected socket: no address to gate
     }
-    let msg_namelen = u32::from_ne_bytes(msghdr_bytes[8..12].try_into().unwrap());
     let addr_bytes =
-        read_child_mem(notif_fd, notif.id, notif.pid, msg_name_ptr, msg_namelen as usize).ok()?;
+        read_child_mem(notif_fd, notif.id, notif.pid, hdr.name_ptr, hdr.namelen as usize).ok()?;
     // None unless this is a NAMED AF_UNIX target; IP/abstract fall through.
     let path = named_unix_socket_path(&addr_bytes)?;
 
@@ -956,25 +952,7 @@ fn send_named_unix_msghdr(
     };
     let (sun, sun_len) = proc_self_fd_sockaddr(pinned.as_raw_fd()).ok_or(libc::ENAMETOOLONG)?;
 
-    let msghdr_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, msghdr_ptr, 56) {
-        Ok(b) if b.len() >= 56 => b,
-        _ => return Err(libc::EFAULT),
-    };
-    let msg_iov_ptr = u64::from_ne_bytes(msghdr_bytes[16..24].try_into().unwrap());
-    let msg_iovlen = u64::from_ne_bytes(msghdr_bytes[24..32].try_into().unwrap());
-    let msg_control_ptr = u64::from_ne_bytes(msghdr_bytes[32..40].try_into().unwrap());
-    let msg_controllen = u64::from_ne_bytes(msghdr_bytes[40..48].try_into().unwrap());
-
-    let iovlen = (msg_iovlen as usize).min(1024);
-    let iov_bytes = read_child_mem(notif_fd, notif.id, notif.pid, msg_iov_ptr, iovlen * 16)
-        .map_err(|_| libc::EIO)?;
-    let data = flatten_iovecs(notif, notif_fd, &iov_bytes, iovlen)?;
-    // Named target is always AF_UNIX, so translate SCM_RIGHTS / reject creds.
-    let (control_buf, scm_fds) =
-        materialize_control(notif, notif_fd, msg_control_ptr, msg_controllen, true)?;
-
-    let dup_fd = crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd)
-        .map_err(|e| e.raw_os_error().unwrap_or(libc::EBADF))?;
+    let hdr = ChildMsghdr::read(notif, notif_fd, msghdr_ptr)?;
 
     // The destination is the `/proc/self/fd/<pinned>` sockaddr; `pinned` must
     // stay open (and at the same fd number) for that path to resolve, so the
@@ -984,16 +962,13 @@ fn send_named_unix_msghdr(
     }
     .to_vec();
 
-    Ok((
-        dup_fd,
-        MaterializedMsg {
-            data,
-            control: control_buf,
-            addr,
-            _scm_fds: scm_fds,
-            _pinned: Some(pinned),
-        },
-    ))
+    // Named target is always AF_UNIX, so translate SCM_RIGHTS / reject creds.
+    let m = materialize_msg(notif, notif_fd, &hdr, addr, true, Some(pinned))?;
+
+    let dup_fd = crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd)
+        .map_err(|e| e.raw_os_error().unwrap_or(libc::EBADF))?;
+
+    Ok((dup_fd, m))
 }
 
 /// Read a `sendmmsg` entry's `msg_name` and return its NAMED `AF_UNIX` path, or
@@ -1004,17 +979,12 @@ fn mmsg_entry_named_unix_path(
     notif_fd: RawFd,
     entry_ptr: u64,
 ) -> Option<std::path::PathBuf> {
-    let hdr = read_child_mem(notif_fd, notif.id, notif.pid, entry_ptr, 12).ok()?;
-    if hdr.len() < 12 {
+    let hdr = ChildMsghdr::read(notif, notif_fd, entry_ptr).ok()?;
+    if hdr.connected() {
         return None;
     }
-    let msg_name_ptr = u64::from_ne_bytes(hdr[0..8].try_into().unwrap());
-    if msg_name_ptr == 0 {
-        return None;
-    }
-    let msg_namelen = u32::from_ne_bytes(hdr[8..12].try_into().unwrap());
     let addr_bytes =
-        read_child_mem(notif_fd, notif.id, notif.pid, msg_name_ptr, msg_namelen as usize).ok()?;
+        read_child_mem(notif_fd, notif.id, notif.pid, hdr.name_ptr, hdr.namelen as usize).ok()?;
     named_unix_socket_path(&addr_bytes)
 }
 
@@ -1036,7 +1006,7 @@ fn sendmmsg_named_unix_on_behalf(
     let mut sent: usize = 0;
     let mut first_errno: Option<i32> = None;
     for i in 0..vlen {
-        let entry_ptr = msgvec_ptr + (i * MMSGHDR_SIZE) as u64;
+        let entry_ptr = mmsg_entry_ptr(msgvec_ptr, i);
         let path = match mmsg_entry_named_unix_path(notif, notif_fd, entry_ptr) {
             Some(p) => p,
             // Connected/abstract/unreadable entry: cannot gate on-behalf, so
@@ -1061,12 +1031,12 @@ fn sendmmsg_named_unix_on_behalf(
                 // silently truncated.
                 return complete_batch_entry(
                     dup_fd, m, flags, ret as usize, notif_fd, notif.id, notif.pid,
-                    entry_ptr + MSG_LEN_OFFSET as u64, sent,
+                    mmsg_msglen_addr(entry_ptr), sent,
                 );
             }
             let bytes = (ret as u32).to_ne_bytes();
             let _ = write_child_mem(
-                notif_fd, notif.id, notif.pid, entry_ptr + MSG_LEN_OFFSET as u64, &bytes,
+                notif_fd, notif.id, notif.pid, mmsg_msglen_addr(entry_ptr), &bytes,
             );
             sent += 1;
         } else {
@@ -1077,7 +1047,7 @@ fn sendmmsg_named_unix_on_behalf(
                     // EAGAIN, so complete it off the loop.
                     return complete_batch_entry(
                         dup_fd, m, flags, 0, notif_fd, notif.id, notif.pid,
-                        entry_ptr + MSG_LEN_OFFSET as u64, 0,
+                        mmsg_msglen_addr(entry_ptr), 0,
                     );
                 }
                 // i>0 with nothing sent is a contract-legal short count; a
@@ -1329,16 +1299,14 @@ fn prescan_msghdr(
     notif_fd: RawFd,
     msghdr_ptr: u64,
 ) -> PrescanResult {
-    let msghdr_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, msghdr_ptr, 56) {
-        Ok(b) if b.len() >= 56 => b,
-        _ => return PrescanResult::Errno(libc::EFAULT),
+    let hdr = match ChildMsghdr::read(notif, notif_fd, msghdr_ptr) {
+        Ok(h) => h,
+        Err(e) => return PrescanResult::Errno(e),
     };
-    let msg_name_ptr = u64::from_ne_bytes(msghdr_bytes[0..8].try_into().unwrap());
-    if msg_name_ptr == 0 {
+    if hdr.connected() {
         return PrescanResult::ContinueWholeCall;
     }
-    let msg_namelen = u32::from_ne_bytes(msghdr_bytes[8..12].try_into().unwrap());
-    let addr_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, msg_name_ptr, msg_namelen as usize) {
+    let addr_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, hdr.name_ptr, hdr.namelen as usize) {
         Ok(b) => b,
         Err(_) => return PrescanResult::Errno(libc::EIO),
     };
@@ -1375,16 +1343,7 @@ async fn send_msghdr_on_behalf(
     protocol: Option<Protocol>,
     msghdr_ptr: u64,
 ) -> Result<MaterializedMsg, i32> {
-    let msghdr_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, msghdr_ptr, 56) {
-        Ok(b) if b.len() >= 56 => b,
-        _ => return Err(libc::EFAULT),
-    };
-    let msg_name_ptr = u64::from_ne_bytes(msghdr_bytes[0..8].try_into().unwrap());
-    let msg_namelen = u32::from_ne_bytes(msghdr_bytes[8..12].try_into().unwrap());
-    let msg_iov_ptr = u64::from_ne_bytes(msghdr_bytes[16..24].try_into().unwrap());
-    let msg_iovlen = u64::from_ne_bytes(msghdr_bytes[24..32].try_into().unwrap());
-    let msg_control_ptr = u64::from_ne_bytes(msghdr_bytes[32..40].try_into().unwrap());
-    let msg_controllen = u64::from_ne_bytes(msghdr_bytes[40..48].try_into().unwrap());
+    let hdr = ChildMsghdr::read(notif, notif_fd, msghdr_ptr)?;
 
     // A connected socket carries no per-message address (`msg_name == NULL` or
     // zero length). There is nothing to check against the destination
@@ -1393,11 +1352,11 @@ async fn send_msghdr_on_behalf(
     // the msghdr from child memory, where a racing thread could have swapped a
     // null `msg_name` for a denied address. A non-connected entry has its IP
     // destination validated on the immune copy before the send.
-    let connected = msg_name_ptr == 0 || msg_namelen == 0;
+    let connected = hdr.connected();
     let addr_bytes = if connected {
         Vec::new()
     } else {
-        match read_child_mem(notif_fd, notif.id, notif.pid, msg_name_ptr, msg_namelen as usize) {
+        match read_child_mem(notif_fd, notif.id, notif.pid, hdr.name_ptr, hdr.namelen as usize) {
             Ok(b) => b,
             Err(_) => return Err(libc::EIO),
         }
@@ -1430,41 +1389,23 @@ async fn send_msghdr_on_behalf(
         drop(ns);
     }
 
-    let iovlen = (msg_iovlen as usize).min(1024);
-    let iov_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, msg_iov_ptr, iovlen * 16) {
-        Ok(b) => b,
-        Err(_) => return Err(libc::EIO),
-    };
-    let data = flatten_iovecs(notif, notif_fd, &iov_bytes, iovlen)?;
-
     // Translate SCM_RIGHTS / reject creds only for a unix socket; an IP socket's
     // control carries no fds or credentials and passes through untouched.
-    let (control_buf, scm_fds) = materialize_control(
+    // (`addr_bytes` is already empty for a connected send.)
+    materialize_msg(
         notif,
         notif_fd,
-        msg_control_ptr,
-        msg_controllen,
+        &hdr,
+        addr_bytes,
         socket_is_unix(dup_fd.as_raw_fd()),
-    )?;
-
-    Ok(MaterializedMsg {
-        data,
-        control: control_buf,
-        addr: if connected { Vec::new() } else { addr_bytes },
-        _scm_fds: scm_fds,
-        _pinned: None,
-    })
+        None,
+    )
 }
 
 // ============================================================
 // sendmmsg_on_behalf — multi-message variant
 // ============================================================
 
-/// `struct mmsghdr` size on Linux x86_64 / aarch64: 56-byte msghdr +
-/// 4-byte msg_len + 4-byte tail padding = 64 bytes. msg_len lives at
-/// offset 56.
-const MMSGHDR_SIZE: usize = 64;
-const MSG_LEN_OFFSET: usize = 56;
 /// Cap on the number of messages we'll process per sendmmsg call.
 /// Linux's UIO_MAXIOV is 1024; lower here to bound supervisor work
 /// per syscall (each entry costs at minimum a few read_child_mem
@@ -1505,7 +1446,7 @@ async fn sendmmsg_on_behalf(
     if ctx.policy.has_unix_fs_gate {
         let mut named_unix = false;
         for i in 0..vlen {
-            let entry_ptr = msgvec_ptr + (i * MMSGHDR_SIZE) as u64;
+            let entry_ptr = mmsg_entry_ptr(msgvec_ptr, i);
             if mmsg_entry_named_unix_path(notif, notif_fd, entry_ptr).is_some() {
                 named_unix = true;
                 break;
@@ -1516,7 +1457,7 @@ async fn sendmmsg_on_behalf(
                 // Chroot: lexical check; deny the whole call if any named-unix
                 // entry is outside the (virtual) write grants.
                 for i in 0..vlen {
-                    let entry_ptr = msgvec_ptr + (i * MMSGHDR_SIZE) as u64;
+                    let entry_ptr = mmsg_entry_ptr(msgvec_ptr, i);
                     if let Some(path) = mmsg_entry_named_unix_path(notif, notif_fd, entry_ptr) {
                         if !path_under_any(&path, &ctx.policy.chroot_writable) {
                             return NotifAction::Errno(libc::EACCES);
@@ -1559,7 +1500,7 @@ async fn sendmmsg_on_behalf(
         let mut sent: usize = 0;
         let mut first_errno: Option<i32> = None;
         for i in 0..vlen {
-            let entry_ptr = msgvec_ptr + (i * MMSGHDR_SIZE) as u64;
+            let entry_ptr = mmsg_entry_ptr(msgvec_ptr, i);
             let m = match send_msghdr_on_behalf(notif, ctx, notif_fd, &dup_fd, protocol, entry_ptr)
                 .await
             {
@@ -1579,12 +1520,12 @@ async fn sendmmsg_on_behalf(
                 if blocking && (ret as usize) < m.data.len() {
                     return complete_batch_entry(
                         dup_fd, m, flags, ret as usize, notif_fd, notif.id, notif.pid,
-                        entry_ptr + MSG_LEN_OFFSET as u64, sent,
+                        mmsg_msglen_addr(entry_ptr), sent,
                     );
                 }
                 let bytes = (ret as u32).to_ne_bytes();
                 let _ = write_child_mem(
-                    notif_fd, notif.id, notif.pid, entry_ptr + MSG_LEN_OFFSET as u64, &bytes,
+                    notif_fd, notif.id, notif.pid, mmsg_msglen_addr(entry_ptr), &bytes,
                 );
                 sent += 1;
             } else {
@@ -1593,7 +1534,7 @@ async fn sendmmsg_on_behalf(
                     if sent == 0 && blocking {
                         return complete_batch_entry(
                             dup_fd, m, flags, 0, notif_fd, notif.id, notif.pid,
-                            entry_ptr + MSG_LEN_OFFSET as u64, 0,
+                            mmsg_msglen_addr(entry_ptr), 0,
                         );
                     }
                     if sent == 0 {
@@ -1618,7 +1559,7 @@ async fn sendmmsg_on_behalf(
     // whole sendmmsg. Mixed-shape calls aren't supported because Continue is
     // binary at the syscall level.
     for i in 0..vlen {
-        let entry_ptr = msgvec_ptr + (i * MMSGHDR_SIZE) as u64;
+        let entry_ptr = mmsg_entry_ptr(msgvec_ptr, i);
         match prescan_msghdr(notif, notif_fd, entry_ptr) {
             PrescanResult::OnBehalf => continue,
             PrescanResult::ContinueWholeCall => return NotifAction::Continue,
@@ -1639,7 +1580,7 @@ async fn sendmmsg_on_behalf(
     let mut first_errno: Option<i32> = None;
 
     for i in 0..vlen {
-        let entry_ptr = msgvec_ptr + (i * MMSGHDR_SIZE) as u64;
+        let entry_ptr = mmsg_entry_ptr(msgvec_ptr, i);
         // Every entry is OnBehalf (IP, non-connected) per the prescan above, so
         // the resolved protocol is always required and present here.
         let m = match send_msghdr_on_behalf(notif, ctx, notif_fd, &dup_fd, Some(protocol), entry_ptr).await {
@@ -1657,12 +1598,12 @@ async fn sendmmsg_on_behalf(
             if blocking && (ret as usize) < m.data.len() {
                 return complete_batch_entry(
                     dup_fd, m, flags, ret as usize, notif_fd, notif.id, notif.pid,
-                    entry_ptr + MSG_LEN_OFFSET as u64, sent,
+                    mmsg_msglen_addr(entry_ptr), sent,
                 );
             }
             let bytes = (ret as u32).to_ne_bytes();
             let _ = write_child_mem(
-                notif_fd, notif.id, notif.pid, entry_ptr + MSG_LEN_OFFSET as u64, &bytes,
+                notif_fd, notif.id, notif.pid, mmsg_msglen_addr(entry_ptr), &bytes,
             );
             sent += 1;
         } else {
@@ -1671,7 +1612,7 @@ async fn sendmmsg_on_behalf(
                 if sent == 0 && blocking {
                     return complete_batch_entry(
                         dup_fd, m, flags, 0, notif_fd, notif.id, notif.pid,
-                        entry_ptr + MSG_LEN_OFFSET as u64, 0,
+                        mmsg_msglen_addr(entry_ptr), 0,
                     );
                 }
                 if sent == 0 {
