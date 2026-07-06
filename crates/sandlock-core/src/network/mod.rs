@@ -4,7 +4,7 @@
 //
 // The module is organized around three phases, each enforced by a boundary:
 //
-//   child_abi    parse phase: every byte-level reader of child-controlled
+//   materialize  parse phase: every byte-level reader of child-controlled
 //                memory; produces owned values (ChildMsghdr, MaterializedMsg)
 //                so later phases never re-read child state (TOCTOU-safe).
 //   verdict      decide phase: pure policy verdicts over materialized values;
@@ -28,8 +28,8 @@ use crate::seccomp::ctx::SupervisorCtx;
 use crate::seccomp::notif::NotifAction;
 use crate::sys::structs::SeccompNotif;
 
-mod child_abi;
 mod connect;
+mod materialize;
 mod rules;
 mod send;
 mod send_engine;

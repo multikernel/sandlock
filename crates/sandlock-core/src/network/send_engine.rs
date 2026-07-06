@@ -9,7 +9,7 @@ use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
 
 use crate::seccomp::notif::{write_child_mem, NotifAction};
 
-use super::child_abi::MaterializedMsg;
+use super::materialize::MaterializedMsg;
 
 /// True iff this send should block until it completes: the socket is in blocking
 /// mode (`O_NONBLOCK` clear — the dup shares the child's file description, so it

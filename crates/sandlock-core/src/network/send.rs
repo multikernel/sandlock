@@ -11,7 +11,7 @@ use crate::seccomp::ctx::SupervisorCtx;
 use crate::seccomp::notif::{read_child_mem, NotifAction};
 use crate::sys::structs::{SeccompNotif, ECONNREFUSED};
 
-use super::child_abi::{
+use super::materialize::{
     materialize_msg, mmsg_entry_ptr, mmsg_msglen_addr, named_unix_socket_path,
     parse_ip_from_sockaddr, parse_port_from_sockaddr, ChildMsghdr, MaterializedMsg,
     MAX_SEND_BUF,

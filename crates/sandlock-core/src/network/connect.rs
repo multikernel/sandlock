@@ -11,7 +11,7 @@ use crate::seccomp::ctx::SupervisorCtx;
 use crate::seccomp::notif::{read_child_mem, NotifAction};
 use crate::sys::structs::{SeccompNotif, ECONNREFUSED};
 
-use super::child_abi::{
+use super::materialize::{
     named_unix_socket_path, parse_ip_from_sockaddr, parse_port_from_sockaddr,
     set_port_in_sockaddr,
 };
