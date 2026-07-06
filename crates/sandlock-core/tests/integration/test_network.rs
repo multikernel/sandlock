@@ -793,3 +793,303 @@ async fn test_empty_net_allow_denies_tcp_despite_fs_grants() {
         "empty net_allow must deny TCP connect via Landlock (EACCES); got {got:?}"
     );
 }
+
+/// Regression: a `sendmsg()` on a *connected* `AF_UNIX` stream socket must pass
+/// through when a `net_allow` destination policy is active. The IP destination
+/// policy governs IP sockets only; a bug routed every connected send through
+/// the IP on-behalf path, where `query_socket_protocol` returns `None` for a
+/// unix socket and the send was refused with `ECONNREFUSED`. That broke every
+/// connected-socket `sendmsg` user (Wayland, D-Bus — they use `sendmsg` for its
+/// fd-passing capability) the moment any `--net-allow` rule was set, even
+/// though the send targets no network destination. `send()`/`sendto` were
+/// unaffected (they Continue connected sockets), so only `sendmsg` regressed.
+///
+/// A live `AF_UNIX` listener is used so the child's `connect()` succeeds and the
+/// `sendmsg()` reaches a real peer: the send must return the byte count, not an
+/// errno.
+#[tokio::test]
+async fn test_connected_unix_sendmsg_passes_through_under_net_policy() {
+    use std::io::Read;
+    use std::os::unix::net::UnixListener;
+
+    let sock_path = temp_file("unix-sendmsg.sock");
+    let _ = std::fs::remove_file(&sock_path);
+    let listener = UnixListener::bind(&sock_path).unwrap();
+
+    // Accept + drain in a background thread so the child's send has a peer.
+    let accepter = std::thread::spawn(move || {
+        if let Ok((mut conn, _)) = listener.accept() {
+            let mut buf = [0u8; 16];
+            let _ = conn.read(&mut buf);
+        }
+    });
+
+    let out = temp_file("unix-sendmsg-out");
+
+    // `net_allow` activates `has_net_destination_policy`; `fs_write("/tmp")`
+    // covers the socket path so `has_unix_fs_gate` is on too — the realistic
+    // shape of the report (a `--net-allow` rule plus fs grants).
+    let policy = base_policy().net_allow("127.0.0.1:80").build().unwrap();
+
+    let script = format!(concat!(
+        "import socket\n",
+        "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n",
+        "s.connect('{sock}')\n",
+        "try:\n",
+        "  n = s.sendmsg([b'hello'])\n",
+        "  open('{out}', 'w').write('SENT:%d' % n)\n",
+        "except OSError as e:\n",
+        "  open('{out}', 'w').write('ERR:%d' % e.errno)\n",
+        "s.close()\n",
+    ), sock = sock_path.display(), out = out.display());
+
+    let result = policy.with_name("test")
+        .run_interactive(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+
+    let got = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    let _ = accepter.join();
+    let _ = std::fs::remove_file(&sock_path);
+
+    assert_eq!(
+        got, "SENT:5",
+        "connected AF_UNIX sendmsg under net_allow must pass through (got {got:?})"
+    );
+}
+
+/// Regression: a `sendmsg()` that passes a file descriptor via `SCM_RIGHTS` on a
+/// connected `AF_UNIX` socket must deliver a *working* fd when a `net_allow`
+/// policy routes the send on-behalf. The on-behalf path copies the control
+/// buffer, so without translation the child's fd numbers reach the supervisor's
+/// `sendmsg` verbatim — passing the wrong file or failing `EBADF`. The fix
+/// `pidfd_getfd`s each `SCM_RIGHTS` fd into the supervisor before the send.
+///
+/// The child opens a payload file and passes its fd; the receiver reads the
+/// passed fd back and must see the payload's exact bytes — which only holds if
+/// the fd was translated to the real open file, not an unrelated supervisor fd.
+#[tokio::test]
+async fn test_connected_unix_sendmsg_translates_scm_rights_under_net_policy() {
+    use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+
+    let payload = temp_file("scm-payload");
+    std::fs::write(&payload, b"SCMOK").unwrap();
+
+    let sock_path = temp_file("scm-sendmsg.sock");
+    let _ = std::fs::remove_file(&sock_path);
+    let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+
+    // Accept, recvmsg the SCM_RIGHTS fd, read it, and report the bytes.
+    let received = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let received_w = received.clone();
+    let accepter = std::thread::spawn(move || {
+        let (conn, _) = match listener.accept() { Ok(c) => c, Err(_) => return };
+        let cfd = conn.as_raw_fd();
+        let mut databuf = [0u8; 8];
+        let mut cmsgbuf = [0u8; 64];
+        let mut iov = libc::iovec {
+            iov_base: databuf.as_mut_ptr() as *mut libc::c_void,
+            iov_len: databuf.len(),
+        };
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsgbuf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = cmsgbuf.len() as _;
+        let n = unsafe { libc::recvmsg(cfd, &mut msg, 0) };
+        if n < 0 { return; }
+        let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+        if cmsg.is_null() { return; }
+        let c = unsafe { &*cmsg };
+        if c.cmsg_level == libc::SOL_SOCKET && c.cmsg_type == libc::SCM_RIGHTS {
+            let data = unsafe { libc::CMSG_DATA(cmsg) } as *const RawFd;
+            let passed = unsafe { std::ptr::read_unaligned(data) };
+            let f = unsafe { std::fs::File::from_raw_fd(passed) };
+            use std::io::Read;
+            let mut s = String::new();
+            let _ = (&f).take(16).read_to_string(&mut s);
+            *received_w.lock().unwrap() = s;
+        }
+    });
+
+    let out = temp_file("scm-out");
+    // fs_read("/tmp") lets the child open the payload O_RDONLY; net_allow forces
+    // the on-behalf path where the SCM_RIGHTS translation matters.
+    let policy = base_policy().fs_read("/tmp").net_allow("127.0.0.1:80").build().unwrap();
+
+    let script = format!(concat!(
+        "import socket, array, os\n",
+        "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n",
+        "s.connect('{sock}')\n",
+        "fd = os.open('{payload}', os.O_RDONLY)\n",
+        "try:\n",
+        "  n = s.sendmsg([b'F'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [fd]))])\n",
+        "  open('{out}', 'w').write('SENT:%d' % n)\n",
+        "except OSError as e:\n",
+        "  open('{out}', 'w').write('ERR:%d' % e.errno)\n",
+        "s.close()\n",
+    ), sock = sock_path.display(), payload = payload.display(), out = out.display());
+
+    let result = policy.with_name("test")
+        .run_interactive(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+
+    let sent = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = accepter.join();
+    let got_fd = received.lock().unwrap().clone();
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&sock_path);
+    let _ = std::fs::remove_file(&payload);
+
+    assert_eq!(sent, "SENT:1", "SCM_RIGHTS sendmsg under net_allow must succeed (got {sent:?})");
+    assert_eq!(
+        got_fd, "SCMOK",
+        "receiver must read the passed fd's file — SCM_RIGHTS translated to the real open file (got {got_fd:?})"
+    );
+}
+
+/// A large blocking on-behalf send to a peer that stalls before draining must
+/// fill the socket buffer, would-block, and *defer* off the notification loop —
+/// then resume on writability and deliver every byte. This exercises the
+/// `MSG_DONTWAIT` + `AsyncFd` deferred path; a regression would either truncate
+/// the transfer, spuriously fail with `EAGAIN`, or (before the fix) block the
+/// whole supervisor loop on the send.
+#[tokio::test]
+async fn test_large_blocking_send_defers_and_delivers_under_net_policy() {
+    use std::io::Read;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const N: usize = 4 * 1024 * 1024; // well past any socket send buffer
+
+    let sock_path = temp_file("defer-send.sock");
+    let _ = std::fs::remove_file(&sock_path);
+    let listener = UnixListener::bind(&sock_path).unwrap();
+
+    // Accept, stall briefly (so the sender's buffer fills and the on-behalf send
+    // must defer), then drain everything and count the bytes.
+    let total = std::sync::Arc::new(AtomicUsize::new(0));
+    let total_w = total.clone();
+    let accepter = std::thread::spawn(move || {
+        if let Ok((mut conn, _)) = listener.accept() {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let mut buf = [0u8; 65536];
+            loop {
+                match conn.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        total_w.fetch_add(n, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    });
+
+    let out = temp_file("defer-send-out");
+    let policy = base_policy().net_allow("127.0.0.1:80").build().unwrap();
+    // A SINGLE blocking send() of N bytes must return N — the kernel's contract
+    // for a blocking stream socket. A regression that returned on the first
+    // partial (one SO_SNDBUF worth) would write a short count here.
+    let script = format!(concat!(
+        "import socket\n",
+        "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n",
+        "s.connect('{sock}')\n",
+        "n = s.send(b'z' * {n})\n",   // one syscall; blocking → must return all N
+        "s.close()\n",
+        "open('{out}', 'w').write('SENT:%d' % n)\n",
+    ), sock = sock_path.display(), n = N, out = out.display());
+
+    let result = policy.with_name("test")
+        .run_interactive(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+
+    let sent = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = accepter.join();
+    let got = total.load(Ordering::Relaxed);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&sock_path);
+
+    assert_eq!(
+        sent, format!("SENT:{N}"),
+        "one blocking send() must return the full {N} bytes (deferred to completion, not truncated)"
+    );
+    assert_eq!(got, N, "peer must receive all {N} bytes — no truncation on the deferred path");
+}
+
+/// `sendmmsg` of one large message on a blocking connected stream socket, to a
+/// peer that stalls before draining: the entry can't complete on the first
+/// non-blocking attempt, so it must be finished off the loop (not reported as a
+/// spurious EAGAIN or a short `msg_len`). The child must see `ret == 1` with the
+/// entry's `msg_len == N`, and the peer must receive all `N` bytes.
+#[tokio::test]
+async fn test_sendmmsg_blocking_entry_defers_and_delivers_under_net_policy() {
+    use std::io::Read;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const N: usize = 4 * 1024 * 1024;
+
+    let sock_path = temp_file("mmsg-defer.sock");
+    let _ = std::fs::remove_file(&sock_path);
+    let listener = UnixListener::bind(&sock_path).unwrap();
+
+    let total = std::sync::Arc::new(AtomicUsize::new(0));
+    let total_w = total.clone();
+    let accepter = std::thread::spawn(move || {
+        if let Ok((mut conn, _)) = listener.accept() {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let mut buf = [0u8; 65536];
+            loop {
+                match conn.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        total_w.fetch_add(n, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    });
+
+    let out = temp_file("mmsg-defer-out");
+    let policy = base_policy().net_allow("127.0.0.1:80").build().unwrap();
+    let script = format!(concat!(
+        "import ctypes, socket\n",
+        "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
+        "libc.sendmmsg.restype = ctypes.c_int\n",
+        "class iovec(ctypes.Structure):\n",
+        "    _fields_ = [('iov_base', ctypes.c_void_p), ('iov_len', ctypes.c_size_t)]\n",
+        "class msghdr(ctypes.Structure):\n",
+        "    _fields_ = [('msg_name', ctypes.c_void_p), ('msg_namelen', ctypes.c_uint),\n",
+        "        ('_p1', ctypes.c_uint), ('msg_iov', ctypes.c_void_p), ('msg_iovlen', ctypes.c_size_t),\n",
+        "        ('msg_control', ctypes.c_void_p), ('msg_controllen', ctypes.c_size_t),\n",
+        "        ('msg_flags', ctypes.c_int), ('_p2', ctypes.c_uint)]\n",
+        "class mmsghdr(ctypes.Structure):\n",
+        "    _fields_ = [('msg_hdr', msghdr), ('msg_len', ctypes.c_uint), ('_p', ctypes.c_uint)]\n",
+        "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n",   // blocking, connected
+        "s.connect('{sock}')\n",
+        "data = ctypes.create_string_buffer(b'z' * {n}, {n})\n",
+        "iov = iovec(); iov.iov_base = ctypes.cast(data, ctypes.c_void_p).value; iov.iov_len = {n}\n",
+        "vec = (mmsghdr * 1)()\n",
+        "vec[0].msg_hdr.msg_iov = ctypes.cast(ctypes.pointer(iov), ctypes.c_void_p).value\n",
+        "vec[0].msg_hdr.msg_iovlen = 1\n",   // msg_name NULL => connected
+        "ret = libc.sendmmsg(s.fileno(), vec, 1, 0)\n",
+        "open('{out}', 'w').write('ret=%d msg_len=%d' % (ret, vec[0].msg_len))\n",
+        "s.close()\n",
+    ), sock = sock_path.display(), n = N, out = out.display());
+
+    let result = policy.with_name("test")
+        .run_interactive(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = accepter.join();
+    let got = total.load(Ordering::Relaxed);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&sock_path);
+
+    assert_eq!(
+        content, format!("ret=1 msg_len={N}"),
+        "blocking sendmmsg entry must complete off-loop: ret=1 with full msg_len (got {content:?})"
+    );
+    assert_eq!(got, N, "peer must receive all {N} bytes of the deferred batch entry");
+}
