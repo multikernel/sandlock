@@ -33,7 +33,7 @@ mod transparent_proxy;
 
 pub use error::SandlockError;
 pub use sys::structs::{SeccompData, SeccompNotif};
-pub use checkpoint::Checkpoint;
+pub use checkpoint::{Checkpoint, SkippedFd};
 pub use protection::{Protection, ProtectionState, ProtectionPolicy, ProtectionStatus};
 pub use sandbox::{Confinement, ConfinementBuilder, Process, Sandbox, SandboxBuilder, StdioMode};
 pub use result::{RunResult, ExitStatus};

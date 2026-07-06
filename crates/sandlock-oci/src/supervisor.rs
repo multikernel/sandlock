@@ -1011,15 +1011,12 @@ async fn supervisor_restore_main(
     // Restore: forks the child under the saved policy, injects the checkpoint,
     // and RESUMES it. The child is already running on return — there is no
     // separate start step.
-    let skipped = match sandbox.restore_interactive(&cp).await {
-        Ok(s) => s,
-        Err(e) => {
-            pipe_write(pid_write_fd, &format!("ERR restore: {}", e));
-            return Err(anyhow::anyhow!("sandbox restore_interactive: {}", e));
-        }
-    };
-    for path in &skipped {
-        eprintln!("sandlock: not transparently restored: {}", path);
+    if let Err(e) = sandbox.restore_interactive(&cp).await {
+        pipe_write(pid_write_fd, &format!("ERR restore: {}", e));
+        return Err(anyhow::anyhow!("sandbox restore_interactive: {}", e));
+    }
+    for f in sandbox.restore_skipped() {
+        eprintln!("sandlock: fd {} not transparently restored: {}", f.fd, f.path);
     }
 
     let child_pid = sandbox.pid().unwrap_or(0);

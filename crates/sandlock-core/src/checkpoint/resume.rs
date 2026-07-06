@@ -1,4 +1,4 @@
-use crate::checkpoint::{Checkpoint, FdInfo, MemoryMap, MemorySegment};
+use crate::checkpoint::{Checkpoint, FdInfo, MemoryMap, MemorySegment, SkippedFd};
 
 /// One planned memory-restore action for a saved region.
 #[derive(Debug)]
@@ -53,17 +53,17 @@ fn is_restorable_file_path(path: &str) -> bool {
 
 /// Split the saved fd table into transparently restorable regular files and a
 /// list of skipped non-regular fds (sockets, pipes, eventfd, ...). The skipped
-/// list is logged by the caller; those resources fall to the app_state hatch.
+/// list is surfaced to the caller; those resources fall to the app_state hatch.
 /// memfd, "(deleted)", and pseudo-filesystem (/proc/, /sys/, /dev/) paths start
 /// with '/' but are not transparently reopenable, so they are skipped.
-pub(crate) fn build_fd_plan(fds: &[FdInfo]) -> (Vec<FdInfo>, Vec<String>) {
+pub(crate) fn build_fd_plan(fds: &[FdInfo]) -> (Vec<FdInfo>, Vec<SkippedFd>) {
     let mut restorable = Vec::new();
     let mut skipped = Vec::new();
     for f in fds {
         if is_restorable_file_path(&f.path) {
             restorable.push(f.clone());
         } else {
-            skipped.push(f.path.clone());
+            skipped.push(SkippedFd { fd: f.fd, path: f.path.clone() });
         }
     }
     (restorable, skipped)
@@ -83,8 +83,8 @@ fn prot_from_perms(perms: &str) -> libc::c_int {
 /// a valid executable rip). Drives the rebuild entirely via ptrace syscall
 /// injection through a trampoline placed in a hole of the CHECKPOINT's layout.
 /// Leaves the child stopped with the saved registers loaded; the caller resumes
-/// it (PTRACE_CONT / detach). Returns the list of non-transparently-restored
-/// resource names (skipped fds) for the caller to log.
+/// it (PTRACE_CONT / detach). Returns the non-transparently-restored fds
+/// (as [`SkippedFd`] fd + path entries) for the caller to surface.
 /// On `Err`, the child is left half-built and still ptrace-stopped; the caller
 /// MUST kill and reap it.
 /// Limitation: file-backed regions are restored `MAP_PRIVATE` from the on-disk
@@ -98,7 +98,7 @@ fn prot_from_perms(perms: &str) -> libc::c_int {
 pub(crate) fn restore_into(
     pid: i32,
     cp: &Checkpoint,
-) -> Result<Vec<String>, crate::error::SandlockError> {
+) -> Result<Vec<SkippedFd>, crate::error::SandlockError> {
     use crate::checkpoint::inject;
     use crate::error::{SandboxRuntimeError, SandlockError};
 
@@ -316,7 +316,7 @@ pub(crate) fn restore_into(
 pub(crate) fn restore_into(
     _pid: i32,
     _cp: &Checkpoint,
-) -> Result<Vec<String>, crate::error::SandlockError> {
+) -> Result<Vec<SkippedFd>, crate::error::SandlockError> {
     Err(crate::error::SandlockError::Runtime(
         crate::error::SandboxRuntimeError::Child(
             "injection-based restore is only implemented on x86_64".into(),
@@ -327,7 +327,7 @@ pub(crate) fn restore_into(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checkpoint::{FdInfo, MemoryMap, MemorySegment};
+    use crate::checkpoint::{FdInfo, MemoryMap, MemorySegment, SkippedFd};
 
     #[test]
     fn fd_plan_keeps_regular_files_only() {
@@ -339,7 +339,10 @@ mod tests {
         let (restorable, skipped) = build_fd_plan(&fds);
         assert_eq!(restorable.len(), 1);
         assert_eq!(restorable[0].fd, 3);
-        assert_eq!(skipped, vec!["socket:[12345]".to_string(), "pipe:[6789]".to_string()]);
+        assert_eq!(skipped, vec![
+            SkippedFd { fd: 4, path: "socket:[12345]".into() },
+            SkippedFd { fd: 5, path: "pipe:[6789]".into() },
+        ]);
     }
 
     #[test]
@@ -357,13 +360,13 @@ mod tests {
         assert_eq!(restorable[0].fd, 3);
         assert!(restorable.iter().all(|f| f.fd != 6 && f.fd != 7 && f.fd != 8 && f.fd != 9 && f.fd != 10),
             "deleted, memfd, and pseudo-filesystem fds must not appear in restorable");
-        assert!(skipped.contains(&"/tmp/gone (deleted)".to_string()));
-        assert!(skipped.contains(&"/memfd:scratch (deleted)".to_string()));
-        assert!(skipped.contains(&"/proc/1234/maps".to_string()),
+        assert!(skipped.contains(&SkippedFd { fd: 6, path: "/tmp/gone (deleted)".into() }));
+        assert!(skipped.contains(&SkippedFd { fd: 7, path: "/memfd:scratch (deleted)".into() }));
+        assert!(skipped.contains(&SkippedFd { fd: 8, path: "/proc/1234/maps".into() }),
             "/proc/ paths must be skipped");
-        assert!(skipped.contains(&"/dev/pts/3".to_string()),
+        assert!(skipped.contains(&SkippedFd { fd: 9, path: "/dev/pts/3".into() }),
             "/dev/ paths must be skipped");
-        assert!(skipped.contains(&"/sys/kernel/x".to_string()),
+        assert!(skipped.contains(&SkippedFd { fd: 10, path: "/sys/kernel/x".into() }),
             "/sys/ paths must be skipped");
     }
 

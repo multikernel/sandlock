@@ -348,6 +348,29 @@ Raises `RuntimeError` if the sandbox is not running.
 
 Capture a checkpoint of the running sandbox. See [Checkpoint](#checkpoint).
 
+#### `sandbox.restore_interactive(cp) -> None`
+
+Restore a checkpoint into a fresh, fully-sandboxed process. The
+checkpoint image is injected over a parked child, which resumes at the
+saved program counter under the full confinement; the sandbox is
+running when this returns (no `start()` needed). Manage it with `pid`,
+`pause()`, `resume()`, `kill()`, and `wait()` as usual.
+
+x86_64 only; transparent restore currently works for vDSO-free
+programs (a glibc program resumes but crashes on its first vDSO call).
+
+Raises `RuntimeError` if a process is already running in this sandbox
+or the restore fails. See [Checkpoint](#checkpoint).
+
+#### `sandbox.restore_skipped -> list[SkippedFd]`
+
+Fds the last `restore_interactive()` could not transparently recreate
+(sockets, pipes, memfds, pseudo-filesystem paths); the restored process
+runs without them. Each entry is a `SkippedFd` named tuple with `fd`
+(the fd number in the checkpointed process) and `path` (the resource it
+pointed at, e.g. `pipe:[12345]`). Empty if this sandbox never restored
+a checkpoint or every fd was restored.
+
 ### Result
 
 Returned by `sandbox.run()`.
@@ -563,17 +586,24 @@ cp = sb.checkpoint(save_fn=lambda: my_state_bytes())
 cp.save("my-snapshot")
 
 # Later:
-cp2 = Checkpoint.load("my-snapshot")
-Checkpoint.restore("my-snapshot", restore_fn=lambda data: rebuild(data))
+cp2 = Checkpoint.load("my-snapshot", restore_fn=lambda data: rebuild(data))
+
+# Or restore the OS-level process image into a fresh sandbox
+# (x86_64, vDSO-free programs):
+sb2 = Sandbox(...)   # same policy
+sb2.restore_interactive(cp2)
+for f in sb2.restore_skipped:
+    print(f"fd {f.fd} not restored: {f.path}")
 ```
 
 | Method | Description |
 |--------|-------------|
 | `cp.save(name, store=None)` | Persist checkpoint to disk |
-| `Checkpoint.load(name, store=None)` | Load from disk |
-| `Checkpoint.restore(name, restore_fn=None, store=None)` | Load; if app_state was saved (via save_fn) call restore_fn with it. restore_fn and save_fn must both be present or both absent. |
+| `Checkpoint.load(name, store=None, restore_fn=None)` | Load from disk; if the checkpoint carries app_state and restore_fn is given, call restore_fn with it. Neither save_fn nor restore_fn is mandatory, and they need not be paired |
 | `Checkpoint.list(store=None)` | List saved checkpoint names |
 | `Checkpoint.delete(name, store=None)` | Delete a saved checkpoint |
+| `sb.restore_interactive(cp)` | Restore the process image into a fresh sandbox; see [Sandbox](#sandbox) |
+| `sb.restore_skipped` | Fds the last restore could not recreate, as `SkippedFd(fd, path)` |
 
 Properties: `cp.name` (str), `cp.app_state` (bytes or None).
 

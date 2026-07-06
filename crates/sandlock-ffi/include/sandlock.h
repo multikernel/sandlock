@@ -1232,6 +1232,62 @@ const uint8_t *sandlock_checkpoint_app_state(const sandlock_checkpoint_t *cp, ui
 void sandlock_checkpoint_free(sandlock_checkpoint_t *cp);
 
 /**
+ * Restore a checkpoint into a fresh, fully-sandboxed process.
+ *
+ * Builds a new sandbox from `policy` (with the optional `name`, as in
+ * `sandlock_create`) and injects the checkpoint image over a parked child,
+ * which resumes at the saved program counter under the full confinement.
+ * Returns a live handle: the process is already running, so do NOT call
+ * `sandlock_start` on it; manage it with `sandlock_handle_kill` /
+ * `sandlock_handle_wait` / `sandlock_handle_free` as usual. Returns NULL on
+ * error (any half-built child is reaped before returning).
+ *
+ * Fds that could not be transparently restored (sockets, pipes, memfds,
+ * pseudo-filesystem paths) are recorded on the handle; enumerate them with
+ * `sandlock_handle_restore_skipped_len` / `_fd` / `_path`.
+ *
+ * x86_64 restore engine only. Transparent restore currently holds for
+ * vDSO-free programs; see `Sandbox::restore_interactive` in sandlock-core.
+ *
+ * # Safety
+ * `policy` must be a valid policy pointer and `cp` a valid checkpoint
+ * pointer. `name` may be NULL to auto-generate a sandbox name, or a valid
+ * NUL-terminated string.
+ */
+sandlock_handle_t *sandlock_restore_interactive(const sandlock_sandbox_t *policy,
+                                                const char *name,
+                                                const sandlock_checkpoint_t *cp);
+
+/**
+ * Number of fds the restore that produced this handle could not
+ * transparently recreate. 0 for a NULL handle or a handle not produced by
+ * `sandlock_restore_interactive`.
+ *
+ * # Safety
+ * `h` must be null or a valid handle.
+ */
+uintptr_t sandlock_handle_restore_skipped_len(const sandlock_handle_t *h);
+
+/**
+ * The fd number of the i-th skipped entry (its fd in the checkpointed
+ * process). Returns -1 if `h` is NULL or `i` is out of range.
+ *
+ * # Safety
+ * `h` must be null or a valid handle.
+ */
+int sandlock_handle_restore_skipped_fd(const sandlock_handle_t *h, uintptr_t i);
+
+/**
+ * The resource path of the i-th skipped entry (e.g. `pipe:[12345]`).
+ * Returns a malloc'd C string to free with `sandlock_string_free`, or NULL
+ * if `h` is NULL or `i` is out of range.
+ *
+ * # Safety
+ * `h` must be null or a valid handle.
+ */
+char *sandlock_handle_restore_skipped_path(const sandlock_handle_t *h, uintptr_t i);
+
+/**
  * Query the Landlock ABI version supported by the running kernel.
  * Returns the ABI version (>= 1), or -1 if Landlock is unavailable.
  */

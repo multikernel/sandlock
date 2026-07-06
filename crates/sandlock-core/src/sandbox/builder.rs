@@ -782,6 +782,7 @@ impl SandboxBuilder {
             init_fn: self.init_fn,
             work_fn: self.work_fn,
             runtime: None,
+            restore_skipped: Vec::new(),
         })
     }
 

@@ -4,11 +4,15 @@
 from __future__ import annotations
 
 import json
+import platform
+import shutil
+import subprocess
 import sys
+import time
 
 import pytest
 
-from sandlock import Sandbox, Checkpoint
+from sandlock import Sandbox, Checkpoint, SkippedFd
 from sandlock._sdk import _encode, _lib, _make_argv
 
 
@@ -120,8 +124,16 @@ class TestCheckpointPersistence:
             Checkpoint.delete("nope", store=tmp_dir)
 
 
-class TestCheckpointRestore:
-    def test_restore_calls_restore_fn(self, running_sandbox, tmp_dir):
+class TestCheckpointLoadRestoreFn:
+    """load(restore_fn=...) semantics. app_state is auxiliary to the real
+    process-image restore, so save_fn/restore_fn pairing is NOT mandatory:
+    restore_fn runs only when both it and app_state are present."""
+
+    def test_restore_classmethod_is_gone(self):
+        # Folded into load(); "restore" now means process-image restore only.
+        assert not hasattr(Checkpoint, "restore")
+
+    def test_load_calls_restore_fn_with_app_state(self, running_sandbox, tmp_dir):
         original = {"model": "gpt-4", "tokens": 99}
         cp = running_sandbox.checkpoint(
             save_fn=lambda: json.dumps(original).encode(),
@@ -129,51 +141,154 @@ class TestCheckpointRestore:
         cp.save("restorable", store=tmp_dir)
 
         restored = {}
-        Checkpoint.restore(
+        result = Checkpoint.load(
             "restorable",
-            restore_fn=lambda data: restored.update(json.loads(data)),
             store=tmp_dir,
+            restore_fn=lambda data: restored.update(json.loads(data)),
         )
         assert restored == original
-
-    def test_restore_returns_checkpoint(self, running_sandbox, tmp_dir):
-        cp = running_sandbox.checkpoint(
-            save_fn=lambda: b"state",
-        )
-        cp.save("ret-test", store=tmp_dir)
-
-        result = Checkpoint.restore("ret-test", lambda d: None, store=tmp_dir)
         assert isinstance(result, Checkpoint)
-        assert result.name == "ret-test"
+        assert result.name == "restorable"
 
-    def test_restore_no_app_state_no_fn_succeeds(self, running_sandbox, tmp_dir):
-        # save_fn absent at checkpoint, restore_fn absent at restore: both
-        # absent is the symmetric, valid case and must not raise.
-        cp = running_sandbox.checkpoint()
-        cp.save("no-app", store=tmp_dir)
-
-        result = Checkpoint.restore("no-app", store=tmp_dir)
-        assert isinstance(result, Checkpoint)
-        assert result.app_state is None
-
-    def test_restore_fn_without_app_state_raises(self, running_sandbox, tmp_dir):
-        # restore_fn given but the checkpoint has no app_state: a one-sided
-        # pairing, which is rejected.
-        cp = running_sandbox.checkpoint()
-        cp.save("no-app-fn", store=tmp_dir)
-
-        with pytest.raises(ValueError, match="no app_state"):
-            Checkpoint.restore("no-app-fn", lambda d: None, store=tmp_dir)
-
-    def test_restore_app_state_without_fn_raises(self, running_sandbox, tmp_dir):
-        # app_state present but restore_fn omitted: the other one-sided pairing,
-        # also rejected.
+    def test_load_without_restore_fn_keeps_app_state(self, running_sandbox, tmp_dir):
+        # app_state present, restore_fn omitted: no error, state stays readable.
         cp = running_sandbox.checkpoint(save_fn=lambda: b"state")
         cp.save("app-no-fn", store=tmp_dir)
 
-        with pytest.raises(ValueError, match="has app_state"):
-            Checkpoint.restore("app-no-fn", store=tmp_dir)
+        loaded = Checkpoint.load("app-no-fn", store=tmp_dir)
+        assert loaded.app_state == b"state"
 
-    def test_restore_nonexistent_raises(self, tmp_dir):
-        with pytest.raises(FileNotFoundError):
-            Checkpoint.restore("nope", lambda d: None, store=tmp_dir)
+    def test_load_restore_fn_without_app_state_not_called(
+        self, running_sandbox, tmp_dir
+    ):
+        # restore_fn given, checkpoint has no app_state: fn is simply not
+        # called; no error.
+        cp = running_sandbox.checkpoint()
+        cp.save("no-app-fn", store=tmp_dir)
+
+        calls = []
+        loaded = Checkpoint.load("no-app-fn", store=tmp_dir, restore_fn=calls.append)
+        assert calls == []
+        assert loaded.app_state is None
+
+
+# Freestanding x86_64 program (no libc, no vDSO; raw syscalls only) that opens
+# an output file once, then loops forever rewriting an incrementing counter
+# through that kept-open fd. Mirrors the core restore integration test: the
+# injection-based restore engine does not relocate the vDSO, so the guest must
+# be vDSO-free for transparent restore to hold.
+_COUNTER_TEMPLATE = r"""
+#define SYS_write 1
+#define SYS_open 2
+#define SYS_nanosleep 35
+#define SYS_lseek 8
+#define SYS_ftruncate 77
+#define O_WRONLY 1
+#define O_CREAT 0100
+#define O_TRUNC 01000
+static long sys3(long n, long a, long b, long c){
+  long r; __asm__ volatile("syscall":"=a"(r):"a"(n),"D"(a),"S"(b),"d"(c):"rcx","r11","memory"); return r;
+}
+struct ts { long sec; long nsec; };
+void _start(void){
+  const char *path = "@OUT_PATH@";
+  long fd = sys3(SYS_open, (long)path, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+  unsigned long i = 0;
+  char buf[24];
+  struct ts t; t.sec = 0; t.nsec = 20000000;
+  for(;;){
+    i++;
+    int p = 0; unsigned long v = i; char tmp[24]; int k=0;
+    if(v==0){ tmp[k++]='0'; } while(v){ tmp[k++]='0'+(v%10); v/=10; }
+    while(k>0){ buf[p++]=tmp[--k]; } buf[p++]='\n';
+    sys3(SYS_lseek, fd, 0, 0);
+    sys3(SYS_ftruncate, fd, 0, 0);
+    sys3(SYS_write, fd, (long)buf, p);
+    sys3(SYS_nanosleep, (long)&t, 0, 0);
+  }
+}
+"""
+
+
+def _build_counter(tmp_dir):
+    """Compile the vDSO-free counter program, or skip if this host can't."""
+    if platform.machine() != "x86_64":
+        pytest.skip("injection-based restore is x86_64-only")
+    cc = shutil.which("cc") or shutil.which("gcc")
+    if cc is None:
+        pytest.skip("no C compiler (cc/gcc) available")
+    counter = tmp_dir / "counter.cnt"
+    src = tmp_dir / "counter.c"
+    binary = tmp_dir / "counter"
+    src.write_text(_COUNTER_TEMPLATE.replace("@OUT_PATH@", str(counter)))
+    build = subprocess.run(
+        [cc, "-static", "-nostdlib", "-no-pie", "-O0", "-o", str(binary), str(src)],
+        capture_output=True,
+    )
+    if build.returncode != 0:
+        pytest.skip(f"counter build failed: {build.stderr.decode()}")
+    return binary, counter
+
+
+def _read_counter(path) -> int:
+    try:
+        return int(path.read_text().strip())
+    except (FileNotFoundError, ValueError):
+        return 0  # absent or torn read mid-rewrite
+
+
+class TestRestoreInteractive:
+    def test_restore_resumes_counter(self, tmp_dir):
+        binary, counter = _build_counter(tmp_dir)
+        policy_kw = dict(
+            fs_readable=_PYTHON_READABLE + [str(tmp_dir)],
+            fs_writable=[str(tmp_dir)],
+        )
+
+        sb = _policy(**policy_kw)
+        sb.spawn([str(binary)])
+        try:
+            time.sleep(0.4)
+            cp = sb.checkpoint()
+            baseline = _read_counter(counter)
+            assert baseline > 2, f"counter should have advanced, got {baseline}"
+        finally:
+            sb.kill()
+            sb.wait()
+
+        # Sentinel: only the restored process can advance the file past baseline.
+        counter.write_text("0\n")
+
+        sb2 = _policy(**policy_kw)
+        assert sb2.restore_skipped == []
+        ret = sb2.restore_interactive(cp)
+        assert ret is None
+        skipped = sb2.restore_skipped
+        assert isinstance(skipped, list)
+        for s in skipped:
+            assert isinstance(s, SkippedFd)
+            assert isinstance(s.fd, int) and s.fd >= 0
+            assert isinstance(s.path, str) and s.path
+        try:
+            assert sb2.is_running
+            assert sb2.pid
+            deadline = time.monotonic() + 3
+            last = 0
+            advanced = False
+            while time.monotonic() < deadline:
+                last = _read_counter(counter)
+                if last > baseline:
+                    advanced = True
+                    break
+                time.sleep(0.05)
+        finally:
+            sb2.kill()
+            sb2.wait()
+        assert advanced, (
+            f"restored process must resume and advance past {baseline}, last {last}"
+        )
+
+    def test_restore_while_running_raises(self, running_sandbox):
+        cp = running_sandbox.checkpoint()
+        with pytest.raises(RuntimeError, match="already"):
+            running_sandbox.restore_interactive(cp)

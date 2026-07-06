@@ -423,6 +423,7 @@ class Sandbox:
         self._process = None  # weakref to the live popen() Process; it OWNS its
                               # own handle (see `_popen_process`), this is only a
                               # non-owning busy marker
+        self._restore_skipped = []  # SkippedFd entries from the last restore
 
     def _resolve_name(self) -> str:
         """Resolve sandbox name: explicit > auto-generated."""
@@ -1256,6 +1257,66 @@ class Sandbox:
         if save_fn is not None:
             cp.app_state = save_fn()
         return cp
+
+    def restore_interactive(self, cp: "Checkpoint") -> None:
+        """Restore a checkpoint into a fresh, fully-sandboxed process.
+
+        The checkpoint image is injected over a parked child, which resumes
+        at the saved program counter under the full confinement. The sandbox
+        is running when this returns (no ``start()`` needed); manage it with
+        ``pid`` / ``pause()`` / ``resume()`` / ``kill()`` / ``wait()`` as
+        usual. This restores the OS-level process image; for application
+        state carried in ``app_state``, see ``Checkpoint.load``'s
+        ``restore_fn``. Fds that
+        could not be transparently restored are reported by
+        :attr:`restore_skipped`.
+
+        x86_64 only. Transparent restore currently works for vDSO-free
+        programs: a glibc program resumes but crashes on its first vDSO call
+        (known limitation of the injection-based restore engine).
+
+        Args:
+            cp: Checkpoint to restore, from :meth:`checkpoint` or
+                ``Checkpoint.load``.
+
+        Raises:
+            RuntimeError: If a process is already running in this sandbox,
+                or the restore fails.
+        """
+        import ctypes
+
+        from ._sdk import _lib, SkippedFd
+
+        self._check_not_running()
+        native = self._ensure_native()
+        handle = _lib.sandlock_restore_interactive(
+            native.ptr, _encode(self._resolve_name()), cp._ptr,
+        )
+        if not handle:
+            raise RuntimeError("checkpoint restore failed")
+        self._handle = handle
+        # Copy the skipped-fd diagnostics out eagerly: the native entries live
+        # on the handle, which wait() frees.
+        skipped = []
+        for i in range(_lib.sandlock_handle_restore_skipped_len(handle)):
+            fd = _lib.sandlock_handle_restore_skipped_fd(handle, i)
+            raw = _lib.sandlock_handle_restore_skipped_path(handle, i)
+            path = ""
+            if raw:
+                c_str = ctypes.cast(raw, ctypes.c_char_p)
+                if c_str.value:
+                    path = c_str.value.decode("utf-8", errors="replace")
+                _lib.sandlock_string_free(c_str)
+            skipped.append(SkippedFd(fd=fd, path=path))
+        self._restore_skipped = skipped
+
+    @property
+    def restore_skipped(self) -> "list[SkippedFd]":
+        """Fds the last :meth:`restore_interactive` could not transparently
+        recreate (sockets, pipes, memfds, pseudo-filesystem paths); the
+        restored process runs without them. Empty if this sandbox never
+        restored a checkpoint or every fd was restored."""
+        return list(self._restore_skipped)
 
 
 def _read_port_mappings(handle) -> dict[int, int]:

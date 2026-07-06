@@ -2567,6 +2567,127 @@ pub unsafe extern "C" fn sandlock_checkpoint_free(cp: *mut sandlock_checkpoint_t
     }
 }
 
+/// Restore a checkpoint into a fresh, fully-sandboxed process.
+///
+/// Builds a new sandbox from `policy` (with the optional `name`, as in
+/// `sandlock_create`) and injects the checkpoint image over a parked child,
+/// which resumes at the saved program counter under the full confinement.
+/// Returns a live handle: the process is already running, so do NOT call
+/// `sandlock_start` on it; manage it with `sandlock_handle_kill` /
+/// `sandlock_handle_wait` / `sandlock_handle_free` as usual. Returns NULL on
+/// error (any half-built child is reaped before returning).
+///
+/// Fds that could not be transparently restored (sockets, pipes, memfds,
+/// pseudo-filesystem paths) are recorded on the handle; enumerate them with
+/// `sandlock_handle_restore_skipped_len` / `_fd` / `_path`.
+///
+/// x86_64 restore engine only. Transparent restore currently holds for
+/// vDSO-free programs; see `Sandbox::restore_interactive` in sandlock-core.
+///
+/// # Safety
+/// `policy` must be a valid policy pointer and `cp` a valid checkpoint
+/// pointer. `name` may be NULL to auto-generate a sandbox name, or a valid
+/// NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_restore_interactive(
+    policy: *const sandlock_sandbox_t,
+    name: *const c_char,
+    cp: *const sandlock_checkpoint_t,
+) -> *mut sandlock_handle_t {
+    if policy.is_null() || cp.is_null() {
+        return ptr::null_mut();
+    }
+    let policy = &(*policy)._private;
+    let name = match optional_name(name) {
+        Ok(n) => n,
+        Err(_) => return ptr::null_mut(),
+    };
+    // Live (multi-threaded) runtime: the restored process is a long-lived
+    // handle whose seccomp supervisor must keep pumping between FFI calls.
+    let rt = match build_live_runtime() {
+        Some(rt) => rt,
+        None => return ptr::null_mut(),
+    };
+    let mut sb = match name {
+        Some(ref n) => policy.clone().with_name(n.clone()),
+        None => policy.clone(),
+    };
+    // Core returns a Process borrowing `sb`; it carries nothing the handle
+    // does not, so let it drop and move `sb` into the handle (the process
+    // keeps running; the Sandbox owns it). Skipped fds live on the Sandbox.
+    let cp_ref = &(*cp)._private;
+    let restored = matches!(
+        block_on_runtime(&rt, async { sb.restore_interactive(cp_ref).await.map(|_| ()) }),
+        Some(Ok(()))
+    );
+    if !restored {
+        // Dropping `sb` reaps any half-built child left by a failed restore.
+        return ptr::null_mut();
+    }
+    Box::into_raw(Box::new(sandlock_handle_t {
+        sandbox: sb,
+        runtime: rt,
+    }))
+}
+
+/// Number of fds the restore that produced this handle could not
+/// transparently recreate. 0 for a NULL handle or a handle not produced by
+/// `sandlock_restore_interactive`.
+///
+/// # Safety
+/// `h` must be null or a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_handle_restore_skipped_len(
+    h: *const sandlock_handle_t,
+) -> usize {
+    if h.is_null() {
+        return 0;
+    }
+    (*h).sandbox.restore_skipped().len()
+}
+
+/// The fd number of the i-th skipped entry (its fd in the checkpointed
+/// process). Returns -1 if `h` is NULL or `i` is out of range.
+///
+/// # Safety
+/// `h` must be null or a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_handle_restore_skipped_fd(
+    h: *const sandlock_handle_t,
+    i: usize,
+) -> c_int {
+    if h.is_null() {
+        return -1;
+    }
+    match (*h).sandbox.restore_skipped().get(i) {
+        Some(f) => f.fd,
+        None => -1,
+    }
+}
+
+/// The resource path of the i-th skipped entry (e.g. `pipe:[12345]`).
+/// Returns a malloc'd C string to free with `sandlock_string_free`, or NULL
+/// if `h` is NULL or `i` is out of range.
+///
+/// # Safety
+/// `h` must be null or a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_handle_restore_skipped_path(
+    h: *const sandlock_handle_t,
+    i: usize,
+) -> *mut c_char {
+    if h.is_null() {
+        return ptr::null_mut();
+    }
+    match (*h).sandbox.restore_skipped().get(i) {
+        Some(f) => match CString::new(f.path.as_str()) {
+            Ok(cs) => cs.into_raw(),
+            Err(_) => ptr::null_mut(),
+        },
+        None => ptr::null_mut(),
+    }
+}
+
 // ----------------------------------------------------------------
 // Platform query
 // ----------------------------------------------------------------

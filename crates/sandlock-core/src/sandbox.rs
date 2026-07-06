@@ -438,6 +438,11 @@ pub struct Sandbox {
     // Heap-allocated runtime state; `None` when not started.
     #[serde(skip)]
     runtime: Option<Box<Runtime>>,
+
+    // Fds the last `restore_interactive` could not transparently recreate.
+    // Runtime state: not serialized, not cloned.
+    #[serde(skip)]
+    restore_skipped: Vec<crate::checkpoint::SkippedFd>,
 }
 
 impl std::fmt::Debug for Sandbox {
@@ -521,6 +526,8 @@ impl Clone for Sandbox {
             work_fn: self.work_fn.clone(),
             // Runtime is NOT cloned — the clone starts with no runtime.
             runtime: None,
+            // Restore diagnostics belong to the original's run, not the clone.
+            restore_skipped: Vec::new(),
         }
     }
 }
@@ -818,8 +825,10 @@ impl Sandbox {
     /// full notify stack in place (the child parks before execve), then takes the
     /// parked child over with ptrace and injects the checkpoint image over it via
     /// `restore_into`, resuming it at the saved program counter. The process comes
-    /// up already sandboxed. Returns the list of non-transparently-restored fd
-    /// paths (skipped; the caller should log them). x86_64 restore engine only.
+    /// up already sandboxed and running; like [`Sandbox::popen`], the returned
+    /// [`Process`] is the handle to it (no `start()` step). Fds that could not be
+    /// transparently recreated are recorded on this `Sandbox`; query them with
+    /// [`Sandbox::restore_skipped`]. x86_64 restore engine only.
     ///
     /// Limitation: transparent restore currently works for vDSO-free programs.
     /// libc/glibc programs that call vDSO functions (e.g. `clock_gettime`) crash
@@ -831,7 +840,7 @@ impl Sandbox {
     pub async fn restore_interactive(
         &mut self,
         cp: &crate::checkpoint::Checkpoint,
-    ) -> Result<Vec<String>, crate::error::SandlockError> {
+    ) -> Result<Process<'_>, crate::error::SandlockError> {
         use crate::error::SandboxRuntimeError;
 
         // The exe to launch is the checkpoint's original binary (within the
@@ -856,7 +865,7 @@ impl Sandbox {
         // restore_into reads only process_state + fd_table, never policy.
         let cp = cp.clone();
         let skipped = tokio::task::spawn_blocking(
-            move || -> Result<Vec<String>, crate::error::SandlockError> {
+            move || -> Result<Vec<crate::checkpoint::SkippedFd>, crate::error::SandlockError> {
                 // PTRACE_SEIZE + PTRACE_INTERRUPT + waitpid to reach the ptrace-stop.
                 crate::checkpoint::capture::ptrace_seize(pid).map_err(|e| {
                     SandboxRuntimeError::Child(format!("restore ptrace seize {pid}: {e}"))
@@ -884,7 +893,16 @@ impl Sandbox {
         .await
         .map_err(|e| SandboxRuntimeError::Child(format!("restore join error: {e}")))??;
 
-        Ok(skipped)
+        self.restore_skipped = skipped;
+        Ok(Process { sandbox: self })
+    }
+
+    /// Fds that the last [`Sandbox::restore_interactive`] on this sandbox could
+    /// not transparently recreate (sockets, pipes, memfds, pseudo-filesystem
+    /// paths); the restored process runs without them. Empty if this sandbox
+    /// never restored a checkpoint or every fd was restored.
+    pub fn restore_skipped(&self) -> &[crate::checkpoint::SkippedFd] {
+        &self.restore_skipped
     }
 
     /// Wait for the child to finish `execve`. Detected by `/proc/<pid>/exe`

@@ -71,3 +71,14 @@ pub struct FdInfo {
     pub flags: i32,
     pub offset: u64,
 }
+
+/// An fd that a restore could not transparently recreate (socket, pipe,
+/// memfd, deleted or pseudo-filesystem path). The restored process runs
+/// without it; such resources fall to the `app_state` hatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedFd {
+    /// The fd number in the checkpointed process.
+    pub fd: i32,
+    /// The resource the fd pointed at (e.g. `pipe:[12345]`, `/memfd:x`).
+    pub path: String,
+}

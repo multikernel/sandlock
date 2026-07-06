@@ -112,10 +112,11 @@ async fn test_restore_real_program_resumes() {
     // Sentinel: prove the *restored* process (not a leftover original) is writing.
     std::fs::write(&counter, b"0\n").unwrap();
 
-    // Restore into a fresh, fully-sandboxed process.
+    // Restore into a fresh, fully-sandboxed process. The returned Process is
+    // the handle; the sandbox owns the child, so dropping it here is fine.
     let mut sb2 = policy.clone().with_name("restore-dst");
-    let skipped = sb2.restore_interactive(&cp).await.unwrap();
-    eprintln!("restore skipped fds: {skipped:?}");
+    let _ = sb2.restore_interactive(&cp).await.unwrap();
+    eprintln!("restore skipped fds: {:?}", sb2.restore_skipped());
 
     // Poll up to ~3s for the restored process to resume and advance the counter
     // past the checkpointed baseline.

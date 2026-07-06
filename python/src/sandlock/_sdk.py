@@ -10,7 +10,7 @@ import sys
 from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, NamedTuple, Sequence
 
 from .sandbox import Sandbox as PolicyDataclass
 
@@ -480,6 +480,18 @@ _lib.sandlock_checkpoint_app_state.argtypes = [_c_checkpoint_p, ctypes.POINTER(c
 _lib.sandlock_checkpoint_free.restype = None
 _lib.sandlock_checkpoint_free.argtypes = [_c_checkpoint_p]
 
+_lib.sandlock_restore_interactive.restype = _c_handle_p
+_lib.sandlock_restore_interactive.argtypes = [_c_policy_p, ctypes.c_char_p, _c_checkpoint_p]
+
+_lib.sandlock_handle_restore_skipped_len.restype = ctypes.c_size_t
+_lib.sandlock_handle_restore_skipped_len.argtypes = [_c_handle_p]
+
+_lib.sandlock_handle_restore_skipped_fd.restype = ctypes.c_int
+_lib.sandlock_handle_restore_skipped_fd.argtypes = [_c_handle_p, ctypes.c_size_t]
+
+_lib.sandlock_handle_restore_skipped_path.restype = ctypes.c_void_p
+_lib.sandlock_handle_restore_skipped_path.argtypes = [_c_handle_p, ctypes.c_size_t]
+
 
 # ----------------------------------------------------------------
 # Handler ABI — extension handlers for seccomp-notif syscalls.
@@ -753,6 +765,18 @@ class Result:
 _DEFAULT_STORE = Path.home() / ".sandlock" / "checkpoints"
 
 
+class SkippedFd(NamedTuple):
+    """An fd that ``Sandbox.restore_interactive`` could not transparently
+    recreate (socket, pipe, memfd, deleted or pseudo-filesystem path). The
+    restored process runs without it; such resources fall to the
+    ``app_state`` hatch."""
+
+    fd: int
+    """The fd number in the checkpointed process."""
+    path: str
+    """The resource the fd pointed at (e.g. ``pipe:[12345]``)."""
+
+
 class Checkpoint:
     """A frozen snapshot of sandbox state (registers, memory, fds).
 
@@ -850,15 +874,32 @@ class Checkpoint:
         return cp_dir
 
     @classmethod
-    def load(cls, name: str, *, store: Path | str | None = None) -> "Checkpoint":
+    def load(
+        cls,
+        name: str,
+        *,
+        store: Path | str | None = None,
+        restore_fn: "Callable[[bytes], None] | None" = None,
+    ) -> "Checkpoint":
         """Load a named checkpoint from disk.
+
+        ``restore_fn`` mirrors ``save_fn`` on ``Sandbox.checkpoint``: use it
+        to rebuild application-level state that ptrace cannot capture (caches,
+        session data, etc.). Neither is mandatory, and they need not be
+        paired: ``restore_fn`` is called with ``cp.app_state`` only when the
+        checkpoint carries app state, and app state left unconsumed here
+        remains readable via ``cp.app_state``. Restoring the OS-level process
+        image is separate: see ``Sandbox.restore_interactive``.
 
         Args:
             name: Checkpoint name.
             store: Storage root. Defaults to ``~/.sandlock/checkpoints/``.
+            restore_fn: Optional callback receiving the saved
+                application-level state bytes; not called if the checkpoint
+                has no app state.
 
         Returns:
-            Checkpoint with all state restored.
+            The loaded Checkpoint.
 
         Raises:
             FileNotFoundError: If the checkpoint does not exist.
@@ -871,59 +912,11 @@ class Checkpoint:
         ptr = _lib.sandlock_checkpoint_load(_encode(str(cp_dir)))
         if not ptr:
             raise RuntimeError(f"Failed to load checkpoint from {cp_dir}")
-        return cls(ptr)
-
-    @classmethod
-    def restore(
-        cls,
-        name: str,
-        restore_fn: "Callable[[bytes], None] | None" = None,
-        *,
-        store: "Path | str | None" = None,
-    ) -> "Checkpoint":
-        """Load a checkpoint and, if it carries app state, pass it to restore_fn.
-
-        Convenience for ``load()`` plus calling ``restore_fn(cp.app_state)``.
-
-        ``restore_fn`` mirrors ``save_fn`` on ``Sandbox.checkpoint``: a checkpoint
-        taken without ``save_fn`` has no app state and is restored without
-        ``restore_fn``; a checkpoint taken with ``save_fn`` carries app state and
-        must be restored with ``restore_fn``. Supplying exactly one of the pair
-        is an error.
-
-        Args:
-            name: Checkpoint name.
-            restore_fn: Optional callback receiving the saved application-level
-                state bytes. Required if (and only if) the checkpoint was taken
-                with ``save_fn``. Use it to rebuild state that ptrace cannot
-                capture (caches, session data, etc.).
-            store: Storage root. Defaults to ``~/.sandlock/checkpoints/``.
-
-        Returns:
-            The loaded Checkpoint.
-
-        Raises:
-            FileNotFoundError: If the checkpoint does not exist.
-            ValueError: If the checkpoint has app_state but no restore_fn was
-                given, or a restore_fn was given but the checkpoint has no
-                app_state.
-        """
-        cp = cls.load(name, store=store)
-        state = cp.app_state
-        has_state = state is not None
-        has_fn = restore_fn is not None
-        if has_state and not has_fn:
-            raise ValueError(
-                f"Checkpoint {name!r} has app_state; pass restore_fn to "
-                "consume it (it was created with save_fn)"
-            )
-        if has_fn and not has_state:
-            raise ValueError(
-                f"Checkpoint {name!r} has no app_state; restore_fn was given "
-                "but there is nothing to pass (was it created with save_fn?)"
-            )
-        if has_fn:
-            restore_fn(state)
+        cp = cls(ptr)
+        if restore_fn is not None:
+            state = cp.app_state
+            if state is not None:
+                restore_fn(state)
         return cp
 
     @classmethod
