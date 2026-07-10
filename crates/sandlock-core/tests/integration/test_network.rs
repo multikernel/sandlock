@@ -795,6 +795,136 @@ async fn test_net_deny_bind_blocks_tcp_only() {
     assert!(content.contains("\"udp_denied\": \"ok\""), "UDP on the denied port must be allowed (TCP-only); got: {content}");
 }
 
+/// `--net-allow-bind '*'` leaves Landlock's BIND_TCP hook unhandled: any
+/// TCP port may be bound, including an ephemeral port-0 bind that a port
+/// enumeration cannot express. The control run pins the default: with no
+/// allow-bind list, a TCP bind is denied with EACCES.
+#[tokio::test]
+async fn test_net_allow_bind_wildcard_permits_any_bind() {
+    let out = temp_file("bindall");
+
+    let script = format!(concat!(
+        "import socket, json\n",
+        "res = {{}}\n",
+        "for key, port in (('fixed', 18461), ('ephemeral', 0)):\n",
+        "  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+        "  s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
+        "  try:\n",
+        "    s.bind(('127.0.0.1', port))\n",
+        "    res[key] = 'ok'\n",
+        "  except OSError as e:\n",
+        "    res[key] = 'err:%d' % e.errno\n",
+        "  s.close()\n",
+        "open('{out}', 'w').write(json.dumps(res))\n",
+    ), out = out.display());
+
+    // Control: no allow-bind list means default-deny for TCP bind.
+    let policy = base_policy().build().unwrap();
+    let result = policy.clone().with_name("test")
+        .run_interactive(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(
+        content.contains("\"fixed\": \"err:13\""),
+        "default must deny TCP bind with EACCES; got: {content}"
+    );
+
+    // Wildcard: every bind succeeds.
+    let policy = base_policy().net_allow_bind("*").build().unwrap();
+    let result = policy.clone().with_name("test")
+        .run_interactive(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert!(
+        content.contains("\"fixed\": \"ok\""),
+        "wildcard must allow a fixed-port bind; got: {content}"
+    );
+    assert!(
+        content.contains("\"ephemeral\": \"ok\""),
+        "wildcard must allow an ephemeral port-0 bind; got: {content}"
+    );
+}
+
+/// `--net-allow-bind '*'` must loosen bind only: connect enforcement stays
+/// fully active. Exercised at runtime against a live loopback listener (so a
+/// wrongly-permitted connect would SUCCEED, not merely ECONNREFUSED a dead
+/// port), under both connect enforcers:
+///
+/// 1. Wildcard bind alone (empty `net_allow` = deny-all): Landlock's
+///    `CONNECT_TCP` deny-all must survive `BIND_TCP` being dropped from the
+///    handled set — connect fails with `EACCES` at the kernel.
+/// 2. Wildcard bind plus a bounded `net_allow`: the destination policy is
+///    enforced on-behalf, which refuses a disallowed endpoint with
+///    `ECONNREFUSED`.
+///
+/// In both, a fixed-port bind succeeds alongside the failing connect.
+#[tokio::test]
+async fn test_net_allow_bind_wildcard_keeps_connect_enforcement() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let out = temp_file("bindall-connect");
+
+    let script = format!(concat!(
+        "import socket, json\n",
+        "res = {{}}\n",
+        "b = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+        "b.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
+        "try:\n",
+        "  b.bind(('127.0.0.1', 18517))\n",
+        "  res['bind'] = 'ok'\n",
+        "except OSError as e:\n",
+        "  res['bind'] = 'err:%d' % e.errno\n",
+        "b.close()\n",
+        "c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+        "c.settimeout(3)\n",
+        "try:\n",
+        "  c.connect(('127.0.0.1', {port}))\n",
+        "  res['connect'] = 'ok'\n",
+        "except OSError as e:\n",
+        "  res['connect'] = 'err:%d' % e.errno\n",
+        "c.close()\n",
+        "open('{out}', 'w').write(json.dumps(res))\n",
+    ), port = port, out = out.display());
+
+    // 1. Wildcard bind, empty net_allow: Landlock CONNECT_TCP deny-all.
+    let policy = base_policy().net_allow_bind("*").build().unwrap();
+    let result = policy.with_name("test")
+        .run_interactive(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(
+        content.contains("\"bind\": \"ok\""),
+        "wildcard must allow the bind (deny-all connect case); got: {content}"
+    );
+    assert!(
+        content.contains("\"connect\": \"err:13\""),
+        "empty net_allow must still deny connect via Landlock (EACCES); got: {content}"
+    );
+
+    // 2. Wildcard bind + bounded net_allow that does not cover `port`: the
+    //    on-behalf destination policy refuses the endpoint.
+    let policy = base_policy()
+        .net_allow_bind("*")
+        .net_allow("127.0.0.1:80")
+        .build()
+        .unwrap();
+    let result = policy.with_name("test")
+        .run_interactive(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    drop(listener);
+    assert!(
+        content.contains("\"bind\": \"ok\""),
+        "wildcard must allow the bind (bounded net_allow case); got: {content}"
+    );
+    assert!(
+        content.contains("\"connect\": \"err:111\""),
+        "bounded net_allow must refuse a disallowed connect on-behalf (ECONNREFUSED); got: {content}"
+    );
+}
+
 /// Regression (deny-all bypass via the unix-socket connect gate): an empty
 /// `net_allow` must DENY outbound TCP even when filesystem grants are present.
 ///

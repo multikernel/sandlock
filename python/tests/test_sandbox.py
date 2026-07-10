@@ -152,13 +152,61 @@ class TestNetDenyBind:
         assert result.success
         assert result.stdout.strip() == b"ok"
 
-    def test_deny_bind_ports_expands(self):
-        sb = _policy(net_deny_bind=["8080,9000-9002", 443])
-        assert sb.deny_bind_ports() == [443, 8080, 9000, 9001, 9002]
+    def test_deny_bind_invalid_spec_rejected_at_build(self):
+        # Spec validation happens in the native build, like net_allow/net_deny.
+        with pytest.raises(RuntimeError):
+            _policy(net_deny_bind=["9000-8000"]).run(["echo", "ok"])
+        with pytest.raises(RuntimeError, match="wildcard"):
+            _policy(net_deny_bind=["*"]).run(["echo", "ok"])
 
     def test_allow_bind_and_deny_bind_mutually_exclusive(self):
         with pytest.raises(RuntimeError, match="mutually exclusive"):
             _policy(net_allow_bind=[8080], net_deny_bind=[9090]).run(["echo", "ok"])
+
+
+class TestNetAllowBindWildcard:
+    """`net_allow_bind=["*"]` wired through the FFI: any TCP port may be
+    bound while the other network protections stay active."""
+
+    def test_wildcard_allows_bind(self):
+        script = (
+            "import socket\n"
+            "s = socket.socket()\n"
+            "s.bind(('127.0.0.1', 18462))\n"
+            "s.close()\n"
+            "print('BOUND')\n"
+        )
+        result = _policy(net_allow_bind=["*"]).run(["python3", "-c", script])
+        assert result.success
+        assert b"BOUND" in result.stdout
+
+    def test_default_denies_bind(self):
+        # Control for the wildcard test: with no allow-bind list the same
+        # bind is denied by Landlock with EACCES.
+        script = (
+            "import socket\n"
+            "s = socket.socket()\n"
+            "try:\n"
+            "  s.bind(('127.0.0.1', 18462))\n"
+            "  print('BOUND')\n"
+            "except PermissionError:\n"
+            "  print('DENIED')\n"
+        )
+        result = _policy().run(["python3", "-c", script])
+        assert result.success
+        assert b"DENIED" in result.stdout
+
+    def test_wildcard_mixed_with_ports_rejected(self):
+        with pytest.raises(RuntimeError, match="wildcard"):
+            _policy(net_allow_bind=["*", 8080]).run(["echo", "ok"])
+
+    def test_repeated_bare_wildcard_is_idempotent(self):
+        result = _policy(net_allow_bind=["*", "*"]).run(["echo", "ok"])
+        assert result.success
+
+    def test_wildcard_exclusive_with_deny_bind(self):
+        with pytest.raises(RuntimeError, match="mutually exclusive"):
+            _policy(net_allow_bind=["*"], net_deny_bind=[22]).run(["echo", "ok"])
 
 
 class TestSandlockRunCAbiMultiThreaded:

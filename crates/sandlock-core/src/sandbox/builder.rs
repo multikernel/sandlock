@@ -42,7 +42,8 @@ pub struct SandboxBuilder {
 
     /// `--net-allow-bind`: TCP ports the sandbox may bind/listen on
     /// (default-deny). Each value is a comma-separated list of single ports
-    /// or inclusive `lo-hi` ranges, e.g. `8080,9000-9005`. Repeatable.
+    /// or inclusive `lo-hi` ranges, e.g. `8080,9000-9005`, or `'*'` to
+    /// allow binding any port (cannot be mixed with port lists). Repeatable.
     #[cfg_attr(feature = "cli", arg(long = "net-allow-bind", value_name = "PORTS"))]
     pub net_allow_bind: Vec<String>,
 
@@ -365,7 +366,10 @@ impl SandboxBuilder {
     }
 
     /// Allow binding TCP ports from a spec: a comma-separated list of single
-    /// ports or inclusive `lo-hi` ranges (e.g. `"8080,9000-9005"`).
+    /// ports or inclusive `lo-hi` ranges (e.g. `"8080,9000-9005"`), or the
+    /// `"*"` wildcard to allow binding any port. Mixing the wildcard with
+    /// port lists fails at build time; repeating the bare wildcard is
+    /// idempotent.
     pub fn net_allow_bind(mut self, spec: impl Into<String>) -> Self {
         self.net_allow_bind.push(spec.into());
         self
@@ -716,9 +720,9 @@ impl SandboxBuilder {
 
         // Expand bind port specs. --net-allow-bind (default-deny allowlist)
         // and --net-deny-bind (default-allow denylist) are contradictory.
-        let net_allow_bind = parse_bind_ports(&self.net_allow_bind, "--net-allow-bind")?;
+        let net_allow_bind = parse_allow_bind_ports(&self.net_allow_bind, "--net-allow-bind")?;
         let net_deny_bind = parse_bind_ports(&self.net_deny_bind, "--net-deny-bind")?;
-        if !net_allow_bind.is_empty() && !net_deny_bind.is_empty() {
+        if !net_allow_bind.is_default() && !net_deny_bind.is_empty() {
             return Err(SandboxError::Invalid(
                 "--net-allow-bind and --net-deny-bind are mutually exclusive".into(),
             ));

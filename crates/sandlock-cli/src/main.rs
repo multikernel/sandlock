@@ -377,7 +377,12 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         for rule in &base.net_deny {
             b = b.net_deny(format_net_rule(rule));
         }
-        for p in &base.net_allow_bind { b = b.net_allow_bind_port(*p); }
+        match &base.net_allow_bind {
+            sandlock_core::BindPorts::All => b = b.net_allow_bind("*"),
+            sandlock_core::BindPorts::Ports(ports) => {
+                for p in ports { b = b.net_allow_bind_port(*p); }
+            }
+        }
         for p in &base.net_deny_bind { b = b.net_deny_bind_port(*p); }
         for rule in &base.http_allow {
             let s = format!("{} {}{}", rule.method, rule.host, rule.path);
@@ -767,7 +772,7 @@ fn validate_no_supervisor_profile(profile: &Sandbox, source: &str) -> Result<()>
     if !profile.fs_denied.is_empty() { bad.push("[filesystem].deny"); }
     if !profile.net_allow.is_empty() { bad.push("[network].allow"); }
     if !profile.net_deny.is_empty() { bad.push("[network].deny"); }
-    if !profile.net_allow_bind.is_empty() { bad.push("[network].allow_bind"); }
+    if !profile.net_allow_bind.is_default() { bad.push("[network].allow_bind"); }
     if !profile.net_deny_bind.is_empty() { bad.push("[network].deny_bind"); }
     if profile.port_remap { bad.push("[network].port_remap"); }
     if !profile.http_allow.is_empty() { bad.push("[http].allow"); }

@@ -387,32 +387,44 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_net_deny(
     Box::into_raw(Box::new(builder.net_deny(spec)))
 }
 
+/// Append a `--net-allow-bind` port spec: a comma-separated list of single
+/// ports / inclusive `lo-hi` ranges, or the `"*"` wildcard to allow binding
+/// any TCP port. Spec is validated when the policy is built; invalid specs
+/// (including `"*"` mixed with port lists) surface as a build error.
+///
 /// # Safety
-/// `b` must be a valid builder pointer.
+/// `b` and `spec` must be valid pointers.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_sandbox_builder_net_allow_bind_port(
+pub unsafe extern "C" fn sandlock_sandbox_builder_net_allow_bind(
     b: *mut SandboxBuilder,
-    port: u16,
+    spec: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() {
+    if b.is_null() || spec.is_null() {
         return b;
     }
+    let spec = CStr::from_ptr(spec).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.net_allow_bind_port(port)))
+    Box::into_raw(Box::new(builder.net_allow_bind(spec)))
 }
 
+/// Append a `--net-deny-bind` port spec: a comma-separated list of single
+/// ports / inclusive `lo-hi` ranges. The `"*"` wildcard is not accepted on
+/// the deny side. Spec is validated when the policy is built; invalid specs
+/// surface as a build error.
+///
 /// # Safety
-/// `b` must be a valid builder pointer.
+/// `b` and `spec` must be valid pointers.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_sandbox_builder_net_deny_bind_port(
+pub unsafe extern "C" fn sandlock_sandbox_builder_net_deny_bind(
     b: *mut SandboxBuilder,
-    port: u16,
+    spec: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() {
+    if b.is_null() || spec.is_null() {
         return b;
     }
+    let spec = CStr::from_ptr(spec).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.net_deny_bind_port(port)))
+    Box::into_raw(Box::new(builder.net_deny_bind(spec)))
 }
 
 /// # Safety

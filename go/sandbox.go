@@ -218,6 +218,8 @@ type Sandbox struct {
 	// NetAllowBind lists TCP ports the sandbox may bind/listen on
 	// (default-deny). Each entry is a comma-separated list of single ports
 	// or inclusive "lo-hi" ranges ("8080", "3000-3010", "8080,9000-9005").
+	// The "*" wildcard allows binding any port and cannot be mixed with
+	// port entries.
 	// Mutually exclusive with NetDenyBind.
 	NetAllowBind []string
 	// NetDenyBind is the inverse of NetAllowBind: default-allow binding,

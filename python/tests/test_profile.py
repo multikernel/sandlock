@@ -94,6 +94,12 @@ class TestPolicyFromDict:
         assert list(p.net_allow) == ["api.example.com:443", ":8080"]
         assert p.port_remap is True
 
+    def test_network_allow_bind_wildcard(self):
+        p = policy_from_dict({
+            "network": {"allow_bind": ["*"]},
+        })
+        assert p.net_allow_bind == ["*"]
+
     def test_network_deny_section(self):
         p = policy_from_dict({
             "network": {"deny": ["10.0.0.0/8", "169.254.169.254:80"]},
@@ -104,7 +110,7 @@ class TestPolicyFromDict:
         p = policy_from_dict({
             "network": {"deny_bind": [8080, "9000-9002"]},
         })
-        assert p.deny_bind_ports() == [8080, 9000, 9001, 9002]
+        assert list(p.net_deny_bind) == [8080, "9000-9002"]
 
     def test_http_section(self):
         p = policy_from_dict({

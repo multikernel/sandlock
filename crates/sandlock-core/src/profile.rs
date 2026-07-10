@@ -515,7 +515,10 @@ mod tests {
         // merge is the contract being verified here.
         assert!(policy.net_allow.len() >= 2);
         // allow_bind mixes a bare int port and a quoted range string.
-        assert_eq!(policy.net_allow_bind, vec![8080, 9000, 9001, 9002]);
+        assert_eq!(
+            policy.net_allow_bind,
+            crate::sandbox::BindPorts::Ports(vec![8080, 9000, 9001, 9002])
+        );
         assert_eq!(policy.http_allow.len(), 1);
         assert_eq!(policy.fs_mount.len(), 1);
     }
@@ -587,7 +590,7 @@ mod tests {
         "#;
         let (policy, _spec) = parse_profile(toml).unwrap();
         assert_eq!(policy.net_deny_bind, vec![8080, 9000, 9001, 9002]);
-        assert!(policy.net_allow_bind.is_empty());
+        assert!(policy.net_allow_bind.is_default());
     }
 
     #[test]

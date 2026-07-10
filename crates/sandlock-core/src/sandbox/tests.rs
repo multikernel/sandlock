@@ -190,7 +190,10 @@ fn builder_net_allow_bind_comma_and_ranges() {
         .net_allow_bind("9001,443") // overlaps dedup away
         .build()
         .unwrap();
-    assert_eq!(policy.net_allow_bind, vec![443, 8080, 9000, 9001, 9002]);
+    assert_eq!(
+        policy.net_allow_bind,
+        BindPorts::Ports(vec![443, 8080, 9000, 9001, 9002])
+    );
 }
 
 #[test]
@@ -199,6 +202,52 @@ fn builder_net_allow_bind_rejects_bad_specs() {
     assert!(Sandbox::builder().net_allow_bind("80,abc").build().is_err());    // bad port
     assert!(Sandbox::builder().net_allow_bind("70000").build().is_err());     // > u16
     assert!(Sandbox::builder().net_allow_bind("8080,").build().is_err());     // empty part
+}
+
+#[test]
+fn builder_net_allow_bind_wildcard() {
+    // `*`, padded ` * `, and a repeated bare wildcard (idempotent) all
+    // mean "any port". This parser is the single implementation of the
+    // wildcard rule; the SDKs forward specs verbatim over the C ABI.
+    for specs in [vec!["*"], vec![" * "], vec!["*", "*"], vec!["*,*"]] {
+        let mut builder = Sandbox::builder();
+        for spec in specs.iter() {
+            builder = builder.net_allow_bind(*spec);
+        }
+        let policy = builder.build().unwrap();
+        assert_eq!(policy.net_allow_bind, BindPorts::All, "specs: {specs:?}");
+    }
+}
+
+#[test]
+fn builder_net_allow_bind_wildcard_rejects_mixing() {
+    // Within one spec.
+    assert!(Sandbox::builder().net_allow_bind("*,8080").build().is_err());
+    // Across specs.
+    assert!(Sandbox::builder()
+        .net_allow_bind("*")
+        .net_allow_bind_port(8080)
+        .build()
+        .is_err());
+    assert!(Sandbox::builder()
+        .net_allow_bind("8080")
+        .net_allow_bind("*")
+        .build()
+        .is_err());
+}
+
+#[test]
+fn builder_net_deny_bind_rejects_wildcard() {
+    assert!(Sandbox::builder().net_deny_bind("*").build().is_err());
+}
+
+#[test]
+fn builder_net_allow_bind_wildcard_exclusive_with_deny_bind() {
+    assert!(Sandbox::builder()
+        .net_allow_bind("*")
+        .net_deny_bind_port(22)
+        .build()
+        .is_err());
 }
 
 #[test]
@@ -219,7 +268,7 @@ fn builder_net_deny_bind_comma_and_ranges() {
         .build()
         .unwrap();
     assert_eq!(policy.net_deny_bind, vec![443, 8080, 9000, 9001, 9002]);
-    assert!(policy.net_allow_bind.is_empty());
+    assert!(policy.net_allow_bind.is_default());
 }
 
 #[test]

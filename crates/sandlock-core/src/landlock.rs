@@ -340,7 +340,9 @@ pub fn compute_net_mask(
     // must not gate BIND_TCP. Drop it from the handled set; the on-behalf
     // path becomes the sole bind enforcer. (Mutually exclusive with
     // `--net-allow-bind`, so no kernel bind rules are installed either.)
-    if !sandbox.net_deny_bind.is_empty() {
+    // `--net-allow-bind '*'` likewise leaves BIND_TCP unhandled: every
+    // port is allowed and nothing enforces on the on-behalf path.
+    if !sandbox.net_deny_bind.is_empty() || sandbox.net_allow_bind.is_all() {
         mask &= !LANDLOCK_ACCESS_NET_BIND_TCP;
     }
     (mask, net_wildcard)
@@ -538,11 +540,15 @@ fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError
     // is 0 in that case and the kernel would reject any rule with EINVAL.
     let net_tcp_active =
         ProtectionStatus::resolve(Protection::NetTcp, abi, pol) == ProtectionStatus::Active;
+    // `BindPorts::All` installs no rules: BIND_TCP was dropped from the
+    // handled set, so every bind is already allowed.
     if handle_net && net_tcp_active {
-        for &port in &policy.net_allow_bind {
-            add_net_rule(&ruleset_fd, port, LANDLOCK_ACCESS_NET_BIND_TCP).map_err(|e| {
-                SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
-            })?;
+        if let crate::sandbox::BindPorts::Ports(ports) = &policy.net_allow_bind {
+            for &port in ports {
+                add_net_rule(&ruleset_fd, port, LANDLOCK_ACCESS_NET_BIND_TCP).map_err(|e| {
+                    SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
+                })?;
+            }
         }
     }
     // For TCP connect, Landlock is the only enforcer on the direct path.
@@ -837,5 +843,39 @@ mod mask_contract_tests {
             0,
             "net_deny_bind must not affect CONNECT_TCP handling",
         );
+    }
+
+    #[test]
+    fn net_mask_bind_all_drops_bind_tcp() {
+        // `--net-allow-bind '*'` allows every TCP bind: Landlock must not
+        // handle BIND_TCP at all (no rules needed, no on-behalf enforcement).
+        // CONNECT_TCP handling is unaffected.
+        let pol = ProtectionPolicy::strict_all();
+        let sb = Sandbox::builder()
+            .net_allow_bind("*")
+            .build()
+            .expect("wildcard allow-bind sandbox builds");
+        let (mask, wildcard) = compute_net_mask(6, &pol, &sb, true);
+        assert_eq!(
+            mask,
+            LANDLOCK_ACCESS_NET_CONNECT_TCP,
+            "bind-all must drop BIND_TCP from the handled set and keep CONNECT_TCP",
+        );
+        assert!(!wildcard, "bind-all must not force the connect wildcard");
+    }
+
+    #[test]
+    fn net_mask_bind_all_with_net_deny_yields_zero_mask() {
+        // net_deny drops CONNECT_TCP (on-behalf enforces connects) and
+        // bind-all drops BIND_TCP: nothing is left for Landlock to handle.
+        let pol = ProtectionPolicy::strict_all();
+        let sb = Sandbox::builder()
+            .net_deny("10.0.0.0/8")
+            .net_allow_bind("*")
+            .build()
+            .expect("net_deny + wildcard allow-bind sandbox builds");
+        let (mask, wildcard) = compute_net_mask(6, &pol, &sb, true);
+        assert_eq!(mask, 0, "net_deny + bind-all leaves no handled net access");
+        assert!(wildcard, "net_deny must still set the wildcard flag");
     }
 }

@@ -444,18 +444,27 @@ sandlock_builder_t *sandlock_sandbox_builder_net_allow(sandlock_builder_t *b, co
 sandlock_builder_t *sandlock_sandbox_builder_net_deny(sandlock_builder_t *b, const char *spec);
 
 /**
+ * Append a `--net-allow-bind` port spec: a comma-separated list of single
+ * ports / inclusive `lo-hi` ranges, or the `"*"` wildcard to allow binding
+ * any TCP port. Spec is validated when the policy is built; invalid specs
+ * (including `"*"` mixed with port lists) surface as a build error.
+ *
  * # Safety
- * `b` must be a valid builder pointer.
+ * `b` and `spec` must be valid pointers.
  */
-sandlock_builder_t *sandlock_sandbox_builder_net_allow_bind_port(sandlock_builder_t *b,
-                                                                 uint16_t port);
+sandlock_builder_t *sandlock_sandbox_builder_net_allow_bind(sandlock_builder_t *b,
+                                                            const char *spec);
 
 /**
+ * Append a `--net-deny-bind` port spec: a comma-separated list of single
+ * ports / inclusive `lo-hi` ranges. The `"*"` wildcard is not accepted on
+ * the deny side. Spec is validated when the policy is built; invalid specs
+ * surface as a build error.
+ *
  * # Safety
- * `b` must be a valid builder pointer.
+ * `b` and `spec` must be valid pointers.
  */
-sandlock_builder_t *sandlock_sandbox_builder_net_deny_bind_port(sandlock_builder_t *b,
-                                                                uint16_t port);
+sandlock_builder_t *sandlock_sandbox_builder_net_deny_bind(sandlock_builder_t *b, const char *spec);
 
 /**
  * # Safety

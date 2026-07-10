@@ -716,8 +716,11 @@ with no content inspection.
 **Bind.** `--net-allow-bind <ports>` is independent from `--net-allow` and
 governs server-side `bind()` as a default-deny allowlist. Each value is a
 comma-separated list of single ports or inclusive `lo-hi` ranges (e.g.
-`--net-allow-bind 8080,9000-9005`), and the flag repeats. Landlock enforces
-it (TCP only); `--port-remap` adds on-behalf virtualization for binding.
+`--net-allow-bind 8080,9000-9005`), and the flag repeats. The `'*'` wildcard
+allows binding any port, including an ephemeral `bind(0)`; it cannot be
+mixed with port lists (repeating the bare wildcard is fine). Landlock enforces the
+allowlist (TCP only; the wildcard simply leaves Landlock's `BIND_TCP` hook
+unhandled); `--port-remap` adds on-behalf virtualization for binding.
 `--net-deny-bind <ports>` is the inverse: default-allow binding, deny the
 listed TCP ports (same port syntax, mutually exclusive with
 `--net-allow-bind`). Because Landlock is allowlist-only, a deny-bind relaxes

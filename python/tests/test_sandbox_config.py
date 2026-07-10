@@ -177,13 +177,9 @@ class TestParsePorts:
 
 
 class TestNetPolicy:
-    def test_bind_ports(self):
-        p = Sandbox(net_allow_bind=[80, "443", "8000-8002"])
-        assert p.bind_ports() == [80, 443, 8000, 8001, 8002]
-
     def test_unrestricted_by_default(self):
         p = Sandbox()
-        assert p.bind_ports() == []
+        assert p.net_allow_bind == []
         assert p.net_allow == []
 
 

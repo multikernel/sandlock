@@ -219,25 +219,15 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 			return C.sandlock_sandbox_builder_net_deny(b, c)
 		}, spec)
 	}
-	if len(s.NetAllowBind) > 0 {
-		ports, err := policy.ParsePorts(s.NetAllowBind)
-		if err != nil {
-			freeBuilderViaBuild(b)
-			return nil, err
-		}
-		for _, p := range ports {
-			b = C.sandlock_sandbox_builder_net_allow_bind_port(b, C.uint16_t(p))
-		}
+	for _, spec := range s.NetAllowBind {
+		str(func(b *C.sandlock_builder_t, c *C.char) *C.sandlock_builder_t {
+			return C.sandlock_sandbox_builder_net_allow_bind(b, c)
+		}, spec)
 	}
-	if len(s.NetDenyBind) > 0 {
-		ports, err := policy.ParsePorts(s.NetDenyBind)
-		if err != nil {
-			freeBuilderViaBuild(b)
-			return nil, err
-		}
-		for _, p := range ports {
-			b = C.sandlock_sandbox_builder_net_deny_bind_port(b, C.uint16_t(p))
-		}
+	for _, spec := range s.NetDenyBind {
+		str(func(b *C.sandlock_builder_t, c *C.char) *C.sandlock_builder_t {
+			return C.sandlock_sandbox_builder_net_deny_bind(b, c)
+		}, spec)
 	}
 	if s.PortRemap {
 		b = C.sandlock_sandbox_builder_port_remap(b, cbool(true))

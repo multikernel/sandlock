@@ -111,7 +111,7 @@ with Sandbox(fs_readable=["/usr", "/lib"]) as sb:
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `net_allow` | `list[str]` | `[]` | Outbound endpoint rules. Bare `host:port` is TCP; protocol prefixes opt others in: `tcp://host:port`, `udp://host:port` (or `udp://*:*` for any UDP), `icmp://host` (or `icmp://*` for any ICMP echo via the kernel ping socket — gated by `net.ipv4.ping_group_range` on the host). Empty = deny all. Raw ICMP is not exposed. |
-| `net_allow_bind` | `list[int \| str]` | `[]` | TCP ports the sandbox may bind (empty = deny all) |
+| `net_allow_bind` | `list[int \| str]` | `[]` | TCP ports the sandbox may bind (empty = deny all; `["*"]` = allow any port) |
 | `port_remap` | `bool` | `False` | Transparent TCP port virtualization |
 
 #### HTTP ACL

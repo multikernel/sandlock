@@ -140,7 +140,7 @@ impl TryFrom<&Sandbox> for Confinement {
         if !sandbox.extra_deny_syscalls.is_empty() { unsupported.push("extra_deny_syscalls"); }
         if !sandbox.net_allow.is_empty() { unsupported.push("net_allow"); }
         if !sandbox.net_deny.is_empty() { unsupported.push("net_deny"); }
-        if !sandbox.net_allow_bind.is_empty() { unsupported.push("net_allow_bind"); }
+        if !sandbox.net_allow_bind.is_default() { unsupported.push("net_allow_bind"); }
         if !sandbox.net_deny_bind.is_empty() { unsupported.push("net_deny_bind"); }
         if sandbox.allows_sysv_ipc() { unsupported.push("extra_allow_syscalls=[\"sysv_ipc\"]"); }
         if !sandbox.http_allow.is_empty() { unsupported.push("http_allow"); }
@@ -280,6 +280,34 @@ enum RuntimeState {
     Stopped(crate::result::ExitStatus),
 }
 
+/// TCP bind allowlist (`--net-allow-bind`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BindPorts {
+    /// Allow binding only the listed ports. Empty means no bind is
+    /// permitted while the NetTcp protection is active (the default).
+    Ports(Vec<u16>),
+    /// `--net-allow-bind '*'`: any TCP port may be bound.
+    All,
+}
+
+impl Default for BindPorts {
+    fn default() -> Self {
+        BindPorts::Ports(Vec::new())
+    }
+}
+
+impl BindPorts {
+    /// True when no allowlist was configured (the default deny-all state).
+    pub fn is_default(&self) -> bool {
+        matches!(self, BindPorts::Ports(p) if p.is_empty())
+    }
+
+    /// True for the `'*'` wildcard (any port may be bound).
+    pub fn is_all(&self) -> bool {
+        matches!(self, BindPorts::All)
+    }
+}
+
 /// Sandbox configuration.
 #[derive(Serialize, Deserialize)]
 pub struct Sandbox {
@@ -332,8 +360,10 @@ pub struct Sandbox {
     /// Mutually exclusive with `net_allow`.
     pub net_deny: Vec<NetDeny>,
     /// `--net-allow-bind`: TCP ports the sandbox may bind (default-deny
-    /// allowlist, Landlock-enforced). Mutually exclusive with `net_deny_bind`.
-    pub net_allow_bind: Vec<u16>,
+    /// allowlist, Landlock-enforced; `All` leaves Landlock's `BIND_TCP`
+    /// hook unhandled so any port may be bound). Mutually exclusive with
+    /// `net_deny_bind`.
+    pub net_allow_bind: BindPorts,
     /// `--net-deny-bind`: TCP ports the sandbox may NOT bind (default-allow
     /// denylist, enforced on the on-behalf `bind()` path). Mutually
     /// exclusive with `net_allow_bind`.
@@ -2317,6 +2347,23 @@ fn validate_syscall_names(names: &[String]) -> Result<(), SandboxError> {
     }
 }
 
+/// Parse `--net-allow-bind` specs. Accepts the `*` wildcard (any port),
+/// which cannot be combined with port lists; repeating the bare wildcard
+/// is idempotent.
+fn parse_allow_bind_ports(specs: &[String], label: &str) -> Result<BindPorts, SandboxError> {
+    let mut parts = specs.iter().flat_map(|s| s.split(',')).map(str::trim);
+    if !parts.clone().any(|part| part == "*") {
+        return Ok(BindPorts::Ports(parse_bind_ports(specs, label)?));
+    }
+    if !parts.all(|part| part == "*") {
+        return Err(SandboxError::Invalid(format!(
+            "{}: wildcard `*` cannot be combined with port lists",
+            label
+        )));
+    }
+    Ok(BindPorts::All)
+}
+
 /// Expand `--net-allow-bind` specs into a sorted, deduplicated port list.
 /// Each spec is a comma-separated list of single ports (`8080`) or inclusive
 /// `lo-hi` ranges (`8000-8010`). Mirrors the Python SDK's `parse_ports`.
@@ -2329,6 +2376,12 @@ fn parse_bind_ports(specs: &[String], label: &str) -> Result<Vec<u16>, SandboxEr
                 return Err(SandboxError::Invalid(format!(
                     "{}: empty port in `{}`",
                     label, spec
+                )));
+            }
+            if part == "*" {
+                return Err(SandboxError::Invalid(format!(
+                    "{}: wildcard `*` is only supported for --net-allow-bind",
+                    label
                 )));
             }
             match part.split_once('-') {

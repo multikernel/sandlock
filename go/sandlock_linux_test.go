@@ -680,3 +680,59 @@ func TestRunDegradedBelowV6(t *testing.T) {
 		t.Fatalf("degraded run failed: exit=%d stdout=%q stderr=%q", res.ExitCode, res.Stdout, res.Stderr)
 	}
 }
+
+// TestNetAllowBindWildcard pins the end-to-end `*` path through the Go SDK:
+// NetAllowBind: ["*"] forwards to the native spec entry point and permits
+// both a fixed-port and an ephemeral port-0 bind, while the no-allowlist
+// control still denies TCP bind with EACCES (13). Mirrors the Rust
+// integration test test_net_allow_bind_wildcard_permits_any_bind.
+func TestNetAllowBindWildcard(t *testing.T) {
+	requireLandlock(t)
+	if _, err := os.Stat("/usr/bin/python3"); err != nil {
+		t.Skip("python3 not available")
+	}
+	script := `
+import json, socket
+res = {}
+for key, port in (("fixed", 18493), ("ephemeral", 0)):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(("127.0.0.1", port))
+        res[key] = "ok"
+    except OSError as e:
+        res[key] = "err:%d" % e.errno
+    s.close()
+print(json.dumps(res))
+`
+
+	// Control: no allow-bind list means default-deny for TCP bind.
+	ctrl := &sandlock.Sandbox{FSReadable: rootfs}
+	res, err := ctrl.Run(context.Background(), "python3", "-c", script)
+	if err != nil {
+		t.Fatalf("control Run: %v", err)
+	}
+	if !res.Success {
+		t.Fatalf("control run failed: exit=%d stderr=%q", res.ExitCode, res.Stderr)
+	}
+	if out := string(res.Stdout); !strings.Contains(out, `"fixed": "err:13"`) {
+		t.Fatalf("default must deny TCP bind with EACCES; got stdout=%q", out)
+	}
+
+	// Wildcard: every bind succeeds.
+	sb := &sandlock.Sandbox{FSReadable: rootfs, NetAllowBind: []string{"*"}}
+	res, err = sb.Run(context.Background(), "python3", "-c", script)
+	if err != nil {
+		t.Fatalf("wildcard Run: %v", err)
+	}
+	if !res.Success {
+		t.Fatalf("wildcard run failed: exit=%d stderr=%q", res.ExitCode, res.Stderr)
+	}
+	out := string(res.Stdout)
+	if !strings.Contains(out, `"fixed": "ok"`) {
+		t.Fatalf("wildcard must allow a fixed-port bind; got stdout=%q", out)
+	}
+	if !strings.Contains(out, `"ephemeral": "ok"`) {
+		t.Fatalf("wildcard must allow an ephemeral port-0 bind; got stdout=%q", out)
+	}
+}

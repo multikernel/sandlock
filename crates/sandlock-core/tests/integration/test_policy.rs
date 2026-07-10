@@ -33,7 +33,10 @@ fn test_builder_network() {
         .net_allow("api.example.com:443,80")
         .build()
         .unwrap();
-    assert_eq!(policy.net_allow_bind, vec![8080]);
+    assert_eq!(
+        policy.net_allow_bind,
+        sandlock_core::BindPorts::Ports(vec![8080])
+    );
     assert_eq!(policy.net_allow.len(), 1);
     let rule = &policy.net_allow[0];
     assert!(matches!(&rule.target, sandlock_core::sandbox::NetTarget::Host(h) if h == "api.example.com"));

@@ -215,8 +215,9 @@ class Sandbox:
     net_allow_bind: Sequence[int | str] = field(default_factory=list)
     """TCP ports the sandbox may bind (default-deny allowlist). Empty = deny
     all. Each entry is a port number or a ``"lo-hi"`` range string (or a
-    comma-separated list). Landlock's port hooks are TCP-only — UDP bind is
-    not separately gated. Mutually exclusive with :attr:`net_deny_bind`."""
+    comma-separated list); ``["*"]`` allows binding any port and cannot be
+    mixed with port entries. Landlock's port hooks are TCP-only — UDP bind is not
+    separately gated. Mutually exclusive with :attr:`net_deny_bind`."""
 
     net_deny_bind: Sequence[int | str] = field(default_factory=list)
     """TCP ports the sandbox may NOT bind (default-allow denylist; the
@@ -455,14 +456,6 @@ class Sandbox:
     # ------------------------------------------------------------------
     # Config helper methods
     # ------------------------------------------------------------------
-
-    def bind_ports(self) -> list[int]:
-        """Return parsed allow-bind port list, or empty if unrestricted."""
-        return parse_ports(self.net_allow_bind) if self.net_allow_bind else []
-
-    def deny_bind_ports(self) -> list[int]:
-        """Return parsed deny-bind port list, or empty if none."""
-        return parse_ports(self.net_deny_bind) if self.net_deny_bind else []
 
     def memory_bytes(self) -> int | None:
         """Return max_memory as bytes, or None if unset."""
