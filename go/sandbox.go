@@ -277,12 +277,31 @@ type Sandbox struct {
 	PolicyFn PolicyFunc
 }
 
+// ExitReason is why a sandboxed process terminated. It mirrors the C
+// sandlock_exit_reason enum. Linux bottoms both a timeout and an OOM kill out in
+// SIGKILL, so there is no distinct OOM reason: a timeout sandlock enforced is
+// ReasonTimeout, any other kill is ReasonKilled.
+type ExitReason uint32
+
+const (
+	// ReasonExited: exited normally with a code (Result.ExitCode).
+	ReasonExited ExitReason = 0
+	// ReasonSignaled: terminated by a signal (Result.Signal).
+	ReasonSignaled ExitReason = 1
+	// ReasonKilled: killed with no recoverable signal number.
+	ReasonKilled ExitReason = 2
+	// ReasonTimeout: killed by sandlock because it exceeded its timeout.
+	ReasonTimeout ExitReason = 3
+)
+
 // Result is the outcome of a captured run.
 type Result struct {
-	ExitCode int    // process exit code, or -1 if terminated abnormally
-	Success  bool   // true when the process exited 0
-	Stdout   []byte // captured standard output
-	Stderr   []byte // captured standard error
+	ExitCode int        // process exit code, or -1 if terminated abnormally
+	Reason   ExitReason // why the process terminated (exit / signal / kill / timeout)
+	Signal   int        // signal number for a ReasonSignaled result, else -1
+	Success  bool       // true when the process exited 0
+	Stdout   []byte     // captured standard output
+	Stderr   []byte     // captured standard error
 }
 
 // StdioMode selects how one of a Popen'd process's standard streams is wired.

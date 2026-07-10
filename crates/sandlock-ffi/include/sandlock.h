@@ -35,6 +35,39 @@ typedef struct sandlock_handler_t sandlock_handler_t;
 #define SANDLOCK_INJECT_NO_CLOEXEC (1 << 1)
 
 /**
+ * Why a sandboxed process terminated. `EXITED` carries an exit code
+ * (`sandlock_result_exit_code`); `SIGNALED` carries the signal number
+ * (`sandlock_result_signal`). Linux bottoms both a timeout and an OOM kill out
+ * in `SIGKILL`, so there is no distinct OOM reason: a timeout sandlock enforced
+ * is `TIMEOUT`, any other kill is `KILLED`.
+ */
+enum sandlock_exit_reason
+#ifdef __cplusplus
+  : uint32_t
+#endif // __cplusplus
+ {
+  /**
+   * Exited normally with a code (`sandlock_result_exit_code`).
+   */
+  SANDLOCK_EXIT_REASON_EXITED = 0,
+  /**
+   * Terminated by a signal (`sandlock_result_signal`).
+   */
+  SANDLOCK_EXIT_REASON_SIGNALED = 1,
+  /**
+   * Killed with no recoverable signal number.
+   */
+  SANDLOCK_EXIT_REASON_KILLED = 2,
+  /**
+   * Killed by sandlock because it exceeded its timeout.
+   */
+  SANDLOCK_EXIT_REASON_TIMEOUT = 3,
+};
+#ifndef __cplusplus
+typedef uint32_t sandlock_exit_reason;
+#endif // __cplusplus
+
+/**
  * Tag distinguishing payload variants of `sandlock_action_out_t`.
  */
 enum sandlock_action
@@ -808,6 +841,25 @@ int sandlock_run_interactive(const sandlock_sandbox_t *policy,
 int sandlock_result_exit_code(const sandlock_result_t *r);
 
 /**
+ * Terminating reason (normal exit / signal / kill / timeout). Pair with
+ * `sandlock_result_exit_code` (for `EXITED`) and `sandlock_result_signal`
+ * (for `SIGNALED`). Returns `KILLED` for a null result.
+ *
+ * # Safety
+ * `r` must be null or a valid result pointer.
+ */
+sandlock_exit_reason sandlock_result_reason(const sandlock_result_t *r);
+
+/**
+ * Signal number for a `SIGNALED` result, or `-1` for any other reason
+ * (including a null result).
+ *
+ * # Safety
+ * `r` must be null or a valid result pointer.
+ */
+int sandlock_result_signal(const sandlock_result_t *r);
+
+/**
  * # Safety
  * `r` must be null or a valid result pointer.
  */
@@ -881,6 +933,24 @@ sandlock_dry_run_result_t *sandlock_dry_run(const sandlock_sandbox_t *policy,
  * `r` must be a valid dry-run result pointer.
  */
 int sandlock_dry_run_result_exit_code(const sandlock_dry_run_result_t *r);
+
+/**
+ * Terminating reason of a dry-run result (parity with
+ * `sandlock_result_reason`). Returns `KILLED` for a null result.
+ *
+ * # Safety
+ * `r` must be null or a valid dry-run result pointer.
+ */
+sandlock_exit_reason sandlock_dry_run_result_reason(const sandlock_dry_run_result_t *r);
+
+/**
+ * Signal number for a `SIGNALED` dry-run result, or `-1` otherwise (parity
+ * with `sandlock_result_signal`).
+ *
+ * # Safety
+ * `r` must be null or a valid dry-run result pointer.
+ */
+int sandlock_dry_run_result_signal(const sandlock_dry_run_result_t *r);
 
 /**
  * Check if the dry-run result indicates success.

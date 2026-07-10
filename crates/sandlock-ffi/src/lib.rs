@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use sandlock_core::pipeline::Stage;
 use sandlock_core::sandbox::{BranchAction, ByteSize, SandboxBuilder};
-use sandlock_core::{Protection, RunResult, Sandbox, StdioMode};
+use sandlock_core::{ExitStatus, Protection, RunResult, Sandbox, StdioMode};
 
 pub mod handler;
 pub mod notif_repr;
@@ -1425,6 +1425,43 @@ pub unsafe extern "C" fn sandlock_run_interactive(
 // Result accessors
 // ----------------------------------------------------------------
 
+/// Why a sandboxed process terminated. `EXITED` carries an exit code
+/// (`sandlock_result_exit_code`); `SIGNALED` carries the signal number
+/// (`sandlock_result_signal`). Linux bottoms both a timeout and an OOM kill out
+/// in `SIGKILL`, so there is no distinct OOM reason: a timeout sandlock enforced
+/// is `TIMEOUT`, any other kill is `KILLED`.
+// `#[repr(u32)]` (not `#[repr(C)]`) pins the discriminant to a `uint32_t`,
+// matching the sibling FFI enums and the Go (`uint32`) / Python (`c_uint`)
+// bindings; a bare C enum's width is implementation-defined (`-fshort-enums`).
+#[allow(non_camel_case_types)]
+#[repr(u32)]
+pub enum sandlock_exit_reason_t {
+    /// Exited normally with a code (`sandlock_result_exit_code`).
+    Exited = 0,
+    /// Terminated by a signal (`sandlock_result_signal`).
+    Signaled = 1,
+    /// Killed with no recoverable signal number.
+    Killed = 2,
+    /// Killed by sandlock because it exceeded its timeout.
+    Timeout = 3,
+}
+
+fn exit_reason(status: &ExitStatus) -> sandlock_exit_reason_t {
+    match status {
+        ExitStatus::Code(_) => sandlock_exit_reason_t::Exited,
+        ExitStatus::Signal(_) => sandlock_exit_reason_t::Signaled,
+        ExitStatus::Killed => sandlock_exit_reason_t::Killed,
+        ExitStatus::Timeout => sandlock_exit_reason_t::Timeout,
+    }
+}
+
+fn exit_signal(status: &ExitStatus) -> c_int {
+    match status {
+        ExitStatus::Signal(n) => *n,
+        _ => -1,
+    }
+}
+
 /// # Safety
 /// `r` must be null or a valid result pointer.
 #[no_mangle]
@@ -1433,6 +1470,35 @@ pub unsafe extern "C" fn sandlock_result_exit_code(r: *const sandlock_result_t) 
         return -1;
     }
     (*r)._private.code().unwrap_or(-1)
+}
+
+/// Terminating reason (normal exit / signal / kill / timeout). Pair with
+/// `sandlock_result_exit_code` (for `EXITED`) and `sandlock_result_signal`
+/// (for `SIGNALED`). Returns `KILLED` for a null result.
+///
+/// # Safety
+/// `r` must be null or a valid result pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_result_reason(
+    r: *const sandlock_result_t,
+) -> sandlock_exit_reason_t {
+    if r.is_null() {
+        return sandlock_exit_reason_t::Killed;
+    }
+    exit_reason(&(*r)._private.exit_status)
+}
+
+/// Signal number for a `SIGNALED` result, or `-1` for any other reason
+/// (including a null result).
+///
+/// # Safety
+/// `r` must be null or a valid result pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_result_signal(r: *const sandlock_result_t) -> c_int {
+    if r.is_null() {
+        return -1;
+    }
+    exit_signal(&(*r)._private.exit_status)
 }
 
 /// # Safety
@@ -1613,6 +1679,36 @@ pub unsafe extern "C" fn sandlock_dry_run_result_exit_code(
         return -1;
     }
     (*r)._private.run_result.code().unwrap_or(-1) as c_int
+}
+
+/// Terminating reason of a dry-run result (parity with
+/// `sandlock_result_reason`). Returns `KILLED` for a null result.
+///
+/// # Safety
+/// `r` must be null or a valid dry-run result pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_dry_run_result_reason(
+    r: *const sandlock_dry_run_result_t,
+) -> sandlock_exit_reason_t {
+    if r.is_null() {
+        return sandlock_exit_reason_t::Killed;
+    }
+    exit_reason(&(*r)._private.run_result.exit_status)
+}
+
+/// Signal number for a `SIGNALED` dry-run result, or `-1` otherwise (parity
+/// with `sandlock_result_signal`).
+///
+/// # Safety
+/// `r` must be null or a valid dry-run result pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_dry_run_result_signal(
+    r: *const sandlock_dry_run_result_t,
+) -> c_int {
+    if r.is_null() {
+        return -1;
+    }
+    exit_signal(&(*r)._private.run_result.exit_status)
 }
 
 /// Check if the dry-run result indicates success.
@@ -2736,6 +2832,42 @@ unsafe fn read_argv(argv: *const *const c_char, argc: c_uint) -> Vec<String> {
 mod tests {
     use super::policy_ret_to_verdict;
     use sandlock_core::policy_fn::Verdict;
+
+    use super::{
+        exit_reason, exit_signal, sandlock_dry_run_result_reason, sandlock_dry_run_result_signal,
+        sandlock_exit_reason_t, sandlock_result_reason, sandlock_result_signal,
+    };
+    use sandlock_core::ExitStatus;
+
+    #[test]
+    fn exit_reason_maps_every_exit_status() {
+        assert!(matches!(exit_reason(&ExitStatus::Code(0)), sandlock_exit_reason_t::Exited));
+        assert!(matches!(exit_reason(&ExitStatus::Signal(15)), sandlock_exit_reason_t::Signaled));
+        // SIGKILL folds into Killed in core, so KILLED is a distinct reason with
+        // no recoverable signal — the "systemd-style minus oom-kill" boundary.
+        assert!(matches!(exit_reason(&ExitStatus::Killed), sandlock_exit_reason_t::Killed));
+        assert!(matches!(exit_reason(&ExitStatus::Timeout), sandlock_exit_reason_t::Timeout));
+        assert_eq!(exit_signal(&ExitStatus::Signal(15)), 15);
+        for s in [ExitStatus::Code(7), ExitStatus::Killed, ExitStatus::Timeout] {
+            assert_eq!(exit_signal(&s), -1, "only Signal(n) yields a number");
+        }
+    }
+
+    #[test]
+    fn null_result_reason_is_killed_and_signal_minus_one() {
+        unsafe {
+            assert!(matches!(
+                sandlock_result_reason(std::ptr::null()),
+                sandlock_exit_reason_t::Killed
+            ));
+            assert_eq!(sandlock_result_signal(std::ptr::null()), -1);
+            assert!(matches!(
+                sandlock_dry_run_result_reason(std::ptr::null()),
+                sandlock_exit_reason_t::Killed
+            ));
+            assert_eq!(sandlock_dry_run_result_signal(std::ptr::null()), -1);
+        }
+    }
 
     #[test]
     fn policy_ret_maps_documented_values() {

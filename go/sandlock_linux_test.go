@@ -80,6 +80,60 @@ func TestRunExitCode(t *testing.T) {
 	}
 }
 
+// TestExitReason pins the #131 terminating-reason surface across the four
+// ExitStatus variants. SIGKILL folds into ReasonKilled in core (no signal
+// number), distinct from a catchable signal (ReasonSignaled + number); a context
+// deadline enforced by sandlock is ReasonTimeout.
+func TestExitReason(t *testing.T) {
+	requireLandlock(t)
+
+	t.Run("exited", func(t *testing.T) {
+		sb := &sandlock.Sandbox{FSReadable: rootfs}
+		res, err := sb.Run(context.Background(), "sh", "-c", "exit 7")
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if res.Reason != sandlock.ReasonExited || res.ExitCode != 7 || res.Signal != -1 {
+			t.Fatalf("got reason=%d exit=%d signal=%d, want Exited/7/-1", res.Reason, res.ExitCode, res.Signal)
+		}
+	})
+
+	t.Run("timeout", func(t *testing.T) {
+		sb := &sandlock.Sandbox{FSReadable: rootfs}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		res, err := sb.Run(ctx, "sleep", "60")
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if res.Reason != sandlock.ReasonTimeout || res.Success {
+			t.Fatalf("got reason=%d success=%v, want ReasonTimeout / not success", res.Reason, res.Success)
+		}
+	})
+
+	t.Run("signaled", func(t *testing.T) {
+		sb := &sandlock.Sandbox{FSReadable: rootfs}
+		res, err := sb.Run(context.Background(), "sh", "-c", "kill -TERM $$")
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if res.Reason != sandlock.ReasonSignaled || res.Signal != 15 {
+			t.Fatalf("got reason=%d signal=%d, want ReasonSignaled/15", res.Reason, res.Signal)
+		}
+	})
+
+	t.Run("killed", func(t *testing.T) {
+		sb := &sandlock.Sandbox{FSReadable: rootfs}
+		res, err := sb.Run(context.Background(), "sh", "-c", "kill -KILL $$")
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if res.Reason != sandlock.ReasonKilled || res.Signal != -1 {
+			t.Fatalf("got reason=%d signal=%d, want ReasonKilled/-1", res.Reason, res.Signal)
+		}
+	})
+}
+
 func TestRunEmptyCommand(t *testing.T) {
 	sb := &sandlock.Sandbox{}
 	if _, err := sb.Run(context.Background()); err == nil {

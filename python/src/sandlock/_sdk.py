@@ -340,6 +340,12 @@ _lib.sandlock_result_exit_code.argtypes = [_c_result_p]
 _lib.sandlock_result_success.restype = ctypes.c_bool
 _lib.sandlock_result_success.argtypes = [_c_result_p]
 
+_lib.sandlock_result_reason.restype = ctypes.c_uint  # sandlock_exit_reason (repr u32)
+_lib.sandlock_result_reason.argtypes = [_c_result_p]
+
+_lib.sandlock_result_signal.restype = ctypes.c_int
+_lib.sandlock_result_signal.argtypes = [_c_result_p]
+
 _lib.sandlock_result_stdout_bytes.restype = ctypes.c_void_p
 _lib.sandlock_result_stdout_bytes.argtypes = [_c_result_p, ctypes.POINTER(ctypes.c_size_t)]
 
@@ -357,6 +363,12 @@ _lib.sandlock_dry_run.argtypes = [_c_policy_p, ctypes.c_char_p, ctypes.POINTER(c
 
 _lib.sandlock_dry_run_result_exit_code.restype = ctypes.c_int
 _lib.sandlock_dry_run_result_exit_code.argtypes = [_c_dry_run_p]
+
+_lib.sandlock_dry_run_result_reason.restype = ctypes.c_uint
+_lib.sandlock_dry_run_result_reason.argtypes = [_c_dry_run_p]
+
+_lib.sandlock_dry_run_result_signal.restype = ctypes.c_int
+_lib.sandlock_dry_run_result_signal.argtypes = [_c_dry_run_p]
 
 _lib.sandlock_dry_run_result_success.restype = ctypes.c_bool
 _lib.sandlock_dry_run_result_success.argtypes = [_c_dry_run_p]
@@ -748,6 +760,23 @@ def _read_result_bytes(result_p, fn) -> bytes:
 # Result
 # ----------------------------------------------------------------
 
+class ExitReason(IntEnum):
+    """Why a sandboxed process terminated (mirrors the C ``sandlock_exit_reason``).
+
+    Linux bottoms both a timeout and an OOM kill out in ``SIGKILL``, so there is
+    no distinct OOM reason: a timeout sandlock enforced is ``TIMEOUT``, any other
+    kill is ``KILLED``.
+    """
+    EXITED = 0
+    """Exited normally with a code (see ``Result.exit_code``)."""
+    SIGNALED = 1
+    """Terminated by a signal (see ``Result.signal``)."""
+    KILLED = 2
+    """Killed with no recoverable signal number."""
+    TIMEOUT = 3
+    """Killed by sandlock because it exceeded its timeout."""
+
+
 @dataclass
 class Result:
     """Result of a sandboxed command."""
@@ -756,6 +785,12 @@ class Result:
     stdout: bytes = field(default=b"", repr=False)
     stderr: bytes = field(default=b"", repr=False)
     error: str | None = None
+    # Appended after the original fields so positional construction is unchanged.
+    reason: ExitReason | None = None
+    """Why the process terminated (timeout / signal / kill / normal exit);
+    ``None`` on an error raised before a native result was produced."""
+    signal: int = -1
+    """Signal number for a ``SIGNALED`` result, else ``-1``."""
 
 
 # ----------------------------------------------------------------
@@ -1368,17 +1403,21 @@ class GatherPipeline:
 
         exit_code = _lib.sandlock_result_exit_code(result_p)
         success = _lib.sandlock_result_success(result_p)
+        reason = ExitReason(_lib.sandlock_result_reason(result_p))
+        signal = _lib.sandlock_result_signal(result_p)
         out_bytes = _read_result_bytes(result_p, _lib.sandlock_result_stdout_bytes)
         stderr = _read_result_bytes(result_p, _lib.sandlock_result_stderr_bytes)
         _lib.sandlock_result_free(result_p)
 
         error = None
-        if exit_code == -1 and not success and timeout:
+        if reason == ExitReason.TIMEOUT:
             error = "Gather timed out"
 
         return Result(
             success=bool(success),
             exit_code=exit_code,
+            reason=reason,
+            signal=signal,
             stdout=out_bytes,
             stderr=stderr,
             error=error,
@@ -1435,6 +1474,8 @@ class Pipeline:
 
         exit_code = _lib.sandlock_result_exit_code(result_p)
         success = _lib.sandlock_result_success(result_p)
+        reason = ExitReason(_lib.sandlock_result_reason(result_p))
+        signal = _lib.sandlock_result_signal(result_p)
         out_bytes = _read_result_bytes(result_p, _lib.sandlock_result_stdout_bytes)
         stderr = _read_result_bytes(result_p, _lib.sandlock_result_stderr_bytes)
         _lib.sandlock_result_free(result_p)
@@ -1444,14 +1485,15 @@ class Pipeline:
             os.write(stdout, out_bytes)
             out_bytes = b""
 
-        # Detect timeout (exit_code == -1 from ExitStatus::Timeout)
         error = None
-        if exit_code == -1 and not success and timeout:
+        if reason == ExitReason.TIMEOUT:
             error = "Pipeline timed out"
 
         return Result(
             success=bool(success),
             exit_code=exit_code,
+            reason=reason,
+            signal=signal,
             stdout=out_bytes,
             stderr=stderr,
             error=error,

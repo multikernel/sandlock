@@ -8,7 +8,7 @@ import time
 
 import pytest
 
-from sandlock import Sandbox
+from sandlock import Sandbox, ExitReason
 from sandlock._sdk import _lib
 
 
@@ -32,6 +32,38 @@ def _proc_state(pid: int) -> str | None:
     except FileNotFoundError:
         return None
     return None
+
+
+class TestExitReason:
+    """The terminating reason (issue #131) is surfaced on Result."""
+
+    def test_normal_exit_is_exited(self):
+        result = _policy().run(["sh", "-c", "exit 7"])
+        assert result.reason is ExitReason.EXITED
+        assert result.exit_code == 7
+        assert result.signal == -1
+
+    def test_timeout_is_timeout(self):
+        # sandlock kills the process when it exceeds the timeout; the reason must
+        # be TIMEOUT, distinct from a plain signal kill, and never a success.
+        result = _policy().run(["sleep", "60"], timeout=1)
+        assert result.reason is ExitReason.TIMEOUT
+        assert not result.success
+
+    def test_signal_is_signaled_with_number(self):
+        # A catchable signal (SIGTERM=15) is SIGNALED and carries the signal
+        # number — not TIMEOUT (sandlock did not initiate the kill).
+        result = _policy().run(["sh", "-c", "kill -TERM $$"])
+        assert result.reason is ExitReason.SIGNALED
+        assert result.signal == 15
+
+    def test_sigkill_is_killed_without_number(self):
+        # SIGKILL folds into KILLED (core sandbox.rs: `sig == SIGKILL => Killed`),
+        # distinct from SIGNALED, so no signal number is recoverable. This pins
+        # the "systemd-style minus oom-kill" boundary the C ABI promises.
+        result = _policy().run(["sh", "-c", "kill -KILL $$"])
+        assert result.reason is ExitReason.KILLED
+        assert result.signal == -1
 
 
 class TestSpawn:

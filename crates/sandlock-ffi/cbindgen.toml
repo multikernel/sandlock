@@ -73,6 +73,7 @@ exclude = [
 # than the verbose SANDLOCK_EXCEPTION_POLICY_T_* / SANDLOCK_ACTION_KIND_T_*.
 "sandlock_exception_policy_t" = "sandlock_exception"
 "sandlock_action_kind_t" = "sandlock_action"
+"sandlock_exit_reason_t" = "sandlock_exit_reason"
 
 [enum]
 rename_variants = "ScreamingSnakeCase"

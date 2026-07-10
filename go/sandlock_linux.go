@@ -589,6 +589,8 @@ func timeoutMs(ctx context.Context) C.uint64_t {
 func readResult(r *C.sandlock_result_t) *Result {
 	res := &Result{
 		ExitCode: int(C.sandlock_result_exit_code(r)),
+		Reason:   ExitReason(C.sandlock_result_reason(r)),
+		Signal:   int(C.sandlock_result_signal(r)),
 		Success:  bool(C.sandlock_result_success(r)),
 	}
 	res.Stdout = readBytes(r, true)
@@ -717,6 +719,8 @@ func (s *Sandbox) DryRun(ctx context.Context, cmd ...string) (*DryRunResult, err
 
 	out := &DryRunResult{Result: Result{
 		ExitCode: int(C.sandlock_dry_run_result_exit_code(r)),
+		Reason:   ExitReason(C.sandlock_dry_run_result_reason(r)),
+		Signal:   int(C.sandlock_dry_run_result_signal(r)),
 		Success:  bool(C.sandlock_dry_run_result_success(r)),
 	}}
 	var n C.uintptr_t

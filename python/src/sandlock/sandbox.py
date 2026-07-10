@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Callable, Mapping, Sequence
 
 if TYPE_CHECKING:
     from ._notif_policy import NotifPolicy
+    from ._sdk import ExitReason  # DryRunResult.reason annotation (runtime import is circular)
 
 
 # --- Memory size parsing (from branching/process/limits.py) ---
@@ -128,6 +129,12 @@ class DryRunResult:
     stderr: bytes = field(default=b"", repr=False)
     changes: list = field(default_factory=list)
     error: str | None = None
+    # Appended after the original fields so positional construction is unchanged.
+    reason: "ExitReason | None" = None
+    """Why the process terminated (parity with ``Result.reason``); ``None`` on an
+    error raised before a native result was produced."""
+    signal: int = -1
+    """Signal number for a ``SIGNALED`` result, else ``-1``."""
 
 
 @dataclass
@@ -596,7 +603,7 @@ class Sandbox:
                 killed and a timeout result is returned if exceeded.
                 None means no timeout.
         """
-        from ._sdk import _lib, _make_argv, _read_result_bytes, Result
+        from ._sdk import _lib, _make_argv, _read_result_bytes, Result, ExitReason
 
         self._check_not_running()
 
@@ -632,6 +639,8 @@ class Sandbox:
 
         exit_code = _lib.sandlock_result_exit_code(result_p)
         success = _lib.sandlock_result_success(result_p)
+        reason = ExitReason(_lib.sandlock_result_reason(result_p))
+        signal = _lib.sandlock_result_signal(result_p)
         stdout = _read_result_bytes(result_p, _lib.sandlock_result_stdout_bytes)
         stderr = _read_result_bytes(result_p, _lib.sandlock_result_stderr_bytes)
         _lib.sandlock_result_free(result_p)
@@ -639,6 +648,8 @@ class Sandbox:
         return Result(
             success=bool(success),
             exit_code=exit_code,
+            reason=reason,
+            signal=signal,
             stdout=stdout,
             stderr=stderr,
         )
@@ -692,6 +703,7 @@ class Sandbox:
             _make_argv,
             _read_result_bytes,
             Result,
+            ExitReason,
         )
 
         self._check_not_running()
@@ -812,6 +824,8 @@ class Sandbox:
 
         exit_code = _lib.sandlock_result_exit_code(result_p)
         success = _lib.sandlock_result_success(result_p)
+        reason = ExitReason(_lib.sandlock_result_reason(result_p))
+        signal = _lib.sandlock_result_signal(result_p)
         stdout = _read_result_bytes(result_p, _lib.sandlock_result_stdout_bytes)
         stderr = _read_result_bytes(result_p, _lib.sandlock_result_stderr_bytes)
         _lib.sandlock_result_free(result_p)
@@ -819,6 +833,8 @@ class Sandbox:
         return Result(
             success=bool(success),
             exit_code=exit_code,
+            reason=reason,
+            signal=signal,
             stdout=stdout,
             stderr=stderr,
         )
@@ -886,7 +902,7 @@ class Sandbox:
                 :meth:`popen` :class:`Process` (wait on that Process instead —
                 freeing its handle here would break it).
         """
-        from ._sdk import _lib, _read_result_bytes, Result
+        from ._sdk import _lib, _read_result_bytes, Result, ExitReason
 
         self._reject_if_popen()
         if self._handle is None:
@@ -903,6 +919,8 @@ class Sandbox:
 
         exit_code = _lib.sandlock_result_exit_code(result_p)
         success = _lib.sandlock_result_success(result_p)
+        reason = ExitReason(_lib.sandlock_result_reason(result_p))
+        signal = _lib.sandlock_result_signal(result_p)
         stdout = _read_result_bytes(result_p, _lib.sandlock_result_stdout_bytes)
         stderr = _read_result_bytes(result_p, _lib.sandlock_result_stderr_bytes)
         _lib.sandlock_result_free(result_p)
@@ -910,6 +928,8 @@ class Sandbox:
         return Result(
             success=bool(success),
             exit_code=exit_code,
+            reason=reason,
+            signal=signal,
             stdout=stdout,
             stderr=stderr,
         )
@@ -1007,7 +1027,7 @@ class Sandbox:
         Returns:
             DryRunResult with exit info and list of filesystem changes.
         """
-        from ._sdk import _lib, _make_argv, _read_result_bytes
+        from ._sdk import _lib, _make_argv, _read_result_bytes, ExitReason
 
         native = self._ensure_native()
         argv, argc = _make_argv(list(cmd))
@@ -1021,6 +1041,8 @@ class Sandbox:
         try:
             exit_code = _lib.sandlock_dry_run_result_exit_code(result_p)
             success = _lib.sandlock_dry_run_result_success(result_p)
+            reason = ExitReason(_lib.sandlock_dry_run_result_reason(result_p))
+            signal = _lib.sandlock_dry_run_result_signal(result_p)
             stdout = _read_result_bytes(result_p, _lib.sandlock_dry_run_result_stdout_bytes)
             stderr = _read_result_bytes(result_p, _lib.sandlock_dry_run_result_stderr_bytes)
 
@@ -1043,6 +1065,8 @@ class Sandbox:
         return DryRunResult(
             success=bool(success),
             exit_code=exit_code,
+            reason=reason,
+            signal=signal,
             stdout=stdout,
             stderr=stderr,
             changes=changes,
@@ -1131,7 +1155,7 @@ class Sandbox:
             clones = mapper.fork(4)
             result = reducer.reduce(["python3", "sum.py"], clones)
         """
-        from ._sdk import _lib, _make_argv, _read_result_bytes, Result
+        from ._sdk import _lib, _make_argv, _read_result_bytes, Result, ExitReason
 
         if fork_result._ptr is None:
             return Result(success=False, exit_code=-1, error="no fork result")
@@ -1148,6 +1172,8 @@ class Sandbox:
 
         exit_code = _lib.sandlock_result_exit_code(result_p)
         success = _lib.sandlock_result_success(result_p)
+        reason = ExitReason(_lib.sandlock_result_reason(result_p))
+        signal = _lib.sandlock_result_signal(result_p)
         stdout = _read_result_bytes(result_p, _lib.sandlock_result_stdout_bytes)
         stderr = _read_result_bytes(result_p, _lib.sandlock_result_stderr_bytes)
         _lib.sandlock_result_free(result_p)
@@ -1155,6 +1181,8 @@ class Sandbox:
         return Result(
             success=bool(success),
             exit_code=exit_code,
+            reason=reason,
+            signal=signal,
             stdout=stdout,
             stderr=stderr,
         )
@@ -1527,7 +1555,7 @@ class Process:
                 ``stdout``/``stderr`` you have not drained can block the child on a
                 full pipe and hang the wait forever; pass a ``timeout`` or drain first.
         """
-        from ._sdk import _lib, Result
+        from ._sdk import _lib, Result, ExitReason
 
         # Reserve the handle under the lock so a concurrent kill()/pid sees a
         # consistent state, then run the blocking wait WITHOUT the lock so kill()
@@ -1575,10 +1603,14 @@ class Process:
 
         exit_code = _lib.sandlock_result_exit_code(result_p)
         success = _lib.sandlock_result_success(result_p)
+        reason = ExitReason(_lib.sandlock_result_reason(result_p))
+        signal = _lib.sandlock_result_signal(result_p)
         # stdout/stderr were handed to the caller as fds, so the RunResult holds
         # none — read them off the streams, not the Result.
         _lib.sandlock_result_free(result_p)
-        self._result = Result(success=bool(success), exit_code=exit_code)
+        self._result = Result(
+            success=bool(success), exit_code=exit_code, reason=reason, signal=signal,
+        )
         return self._result
 
     def __enter__(self) -> "Process":
