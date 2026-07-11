@@ -100,9 +100,16 @@ impl LearnObserver {
                 // Mark PID: read maps on next event after execve completes.
                 self.pending_maps.lock().unwrap().insert(event.pid);
             }
-            "connect" | "sendto" => {
+            // Simplified: connect is assumed TCP, sendto/sendmsg UDP.
+            // Ideally we'd check SO_PROTOCOL on the socket fd (need emit_policy_event to expose that info in SyscallEvent)
+            "connect" => {
                 if let (Some(ip), Some(port)) = (event.host, event.port) {
                     self.connects.lock().unwrap().insert(format!("tcp://{ip}:{port}"));
+                }
+            }
+            "sendto" | "sendmsg" | "sendmmsg" => {
+                if let (Some(ip), Some(port)) = (event.host, event.port) {
+                    self.connects.lock().unwrap().insert(format!("udp://{ip}:{port}"));
                 }
             }
             _ => {}
@@ -132,6 +139,9 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     let policy = Sandbox::builder()
         .fs_read("/")
         .workdir(cow_dir.path())
+        .net_allow("*")
+        .net_allow("udp://*")
+        .net_allow("icmp://*")
         .policy_fn(move |event, _ctx| observer_cb.on_event(event))
         .build()
         .map_err(|e| anyhow!("failed to build sandbox policy: {e}"))?;

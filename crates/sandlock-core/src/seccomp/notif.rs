@@ -1568,13 +1568,33 @@ async fn emit_policy_event(
             .map(std::path::PathBuf::from);
     }
 
-    if nr == libc::SYS_connect || nr == libc::SYS_sendto || nr == libc::SYS_bind {
-        // connect(fd, addr, addrlen): args[1]=addr, args[2]=len
-        let addr_ptr = notif.data.args[1];
-        let addr_len = notif.data.args[2] as usize;
-        let (h, p) = read_sockaddr_for_event(notif, addr_ptr, addr_len, notif_fd);
+    // connect(fd, addr, addrlen) and bind(fd, addr, addrlen): sockaddr in args[1]/args[2].
+    if nr == libc::SYS_connect || nr == libc::SYS_bind {
+        let (h, p) = read_sockaddr_for_event(notif, notif.data.args[1], notif.data.args[2] as usize, notif_fd);
         host = h;
         port = p;
+    }
+
+    // sendto(fd, buf, len, flags, addr, addrlen): sockaddr in args[4]/args[5].
+    if nr == libc::SYS_sendto {
+        let (h, p) = read_sockaddr_for_event(notif, notif.data.args[4], notif.data.args[5] as usize, notif_fd);
+        host = h;
+        port = p;
+    }
+
+    // sendmsg/sendmmsg: sockaddr is inside struct msghdr at args[1].
+    // msghdr layout: msg_name ptr (u64 @ offset 0), msg_namelen u32 (@ offset 8).
+    // For sendmmsg the first mmsghdr entry's msghdr starts at offset 0, same layout.
+    if nr == libc::SYS_sendmsg || nr == libc::SYS_sendmmsg {
+        if let Ok(hdr) = read_child_mem(notif_fd, notif.id, notif.pid, notif.data.args[1], 12) {
+            if hdr.len() >= 12 {
+                let name_ptr = u64::from_ne_bytes(hdr[0..8].try_into().unwrap());
+                let name_len = u32::from_ne_bytes(hdr[8..12].try_into().unwrap()) as usize;
+                let (h, p) = read_sockaddr_for_event(notif, name_ptr, name_len, notif_fd);
+                host = h;
+                port = p;
+            }
+        }
     }
 
     if nr == libc::SYS_mmap {

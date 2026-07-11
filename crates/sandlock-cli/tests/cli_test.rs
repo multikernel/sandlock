@@ -457,6 +457,63 @@ fn test_learn_captures_net_connect() {
     );
 }
 
+/// `sandlock learn` must record UDP sendto destinations under `[network] allow`
+/// with a `udp://` scheme.
+#[test]
+fn test_learn_captures_udp_sendto() {
+    let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = sock.local_addr().unwrap().port();
+
+    let script = format!(
+        "import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); \
+         s.sendto(b'hi',('127.0.0.1',{port})); s.close()"
+    );
+    let output = sandlock_bin()
+        .args(["learn", "--", "python3", "-c", &script])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let expected = format!("udp://127.0.0.1:{port}");
+    assert!(
+        stdout.contains(&expected),
+        "expected {expected} in network output, got:\n{stdout}",
+    );
+}
+
+/// `sandlock learn` must record UDP sendmsg destinations under `[network] allow`
+/// with a `udp://` scheme. Uses Python's `socket.sendmsg()` which invokes the
+/// sendmsg syscall (not sendto), verifying the msghdr.msg_name extraction path.
+#[test]
+fn test_learn_captures_udp_sendmsg() {
+    let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = sock.local_addr().unwrap().port();
+
+    let script = format!(
+        "import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); \
+         s.sendmsg([b'hi'],[],0,('127.0.0.1',{port})); s.close()"
+    );
+    let output = sandlock_bin()
+        .args(["learn", "--", "python3", "-c", &script])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let expected = format!("udp://127.0.0.1:{port}");
+    assert!(
+        stdout.contains(&expected),
+        "expected {expected} in network output, got:\n{stdout}",
+    );
+}
+
 /// End-to-end network round-trip: learn captures a TCP connection, run allows it.
 /// A single listener accepts two connections, one from learn, one from run.
 #[test]
