@@ -753,33 +753,28 @@ impl SandboxBuilder {
         // is often a broad dir the workload needs), so warn on the overlap. Every
         // exposing grant is covered: read grants, write grants (write access
         // includes read), bind-mounted host dirs, and the chroot root (visible
-        // regardless of Landlock). Best-effort — canonicalize where possible.
+        // regardless of Landlock). An fs-deny covering the file suppresses the
+        // warning, so following its own advice actually silences it.
         for c in &self.credentials {
             let Some(path) = c.split_once('=').and_then(|(_, s)| s.strip_prefix("file:")) else {
                 continue;
             };
-            let secret = std::path::Path::new(path);
-            let secret_abs = secret.canonicalize();
-            let secret_ref = secret_abs.as_deref().unwrap_or(secret);
             let grants = self
                 .fs_readable
                 .iter()
                 .chain(self.fs_writable.iter())
                 .chain(self.fs_mount.iter().map(|(_, host)| host))
                 .chain(self.chroot.as_ref());
-            for grant in grants {
-                let grant_abs = grant.canonicalize();
-                let grant_ref = grant_abs.as_deref().unwrap_or(grant.as_path());
-                if secret_ref.starts_with(grant_ref) {
-                    eprintln!(
-                        "sandlock: warning: credential file {} is inside the sandbox grant {} — \
-                         the sandboxed child can read the secret directly; keep it outside every \
-                         fs grant (or add an fs-deny for it)",
-                        path,
-                        grant.display()
-                    );
-                    break;
-                }
+            if let Some(grant) =
+                exposing_grant(std::path::Path::new(path), grants, &self.fs_denied)
+            {
+                eprintln!(
+                    "sandlock: warning: credential file {} is inside the sandbox grant {}; \
+                     the sandboxed child can read the secret directly; keep it outside every \
+                     fs grant (or add an fs-deny for it)",
+                    path,
+                    grant.display()
+                );
             }
         }
         // Resolve credentials + injection rules, loading each secret into the
@@ -905,5 +900,58 @@ impl SandboxBuilder {
         let p = self.build_unchecked()?;
         p.validate()?;
         Ok(p)
+    }
+}
+
+/// The first fs grant that exposes `secret` to the sandboxed child, or `None`
+/// when no grant reaches it or an fs-deny covers it (the deny closes the hole,
+/// so no warning is due). Best-effort: canonicalize where possible.
+fn exposing_grant<'a>(
+    secret: &std::path::Path,
+    grants: impl Iterator<Item = &'a std::path::PathBuf>,
+    denies: &[std::path::PathBuf],
+) -> Option<std::path::PathBuf> {
+    let secret_abs = secret.canonicalize();
+    let secret_ref = secret_abs.as_deref().unwrap_or(secret);
+    let covered_by = |p: &std::path::PathBuf| {
+        let abs = p.canonicalize();
+        secret_ref.starts_with(abs.as_deref().unwrap_or(p.as_path()))
+    };
+    if denies.iter().any(&covered_by) {
+        return None;
+    }
+    grants.into_iter().find(|g| covered_by(g)).cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::exposing_grant;
+    use std::path::PathBuf;
+
+    #[test]
+    fn exposing_grant_reports_overlap_and_fs_deny_suppresses() {
+        let dir = std::env::temp_dir().join(format!("sandlock-grant-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret = dir.join("key.txt");
+        std::fs::write(&secret, "s").unwrap();
+        let grants = vec![dir.clone()];
+
+        // Inside a read grant: the exposing grant is reported.
+        assert_eq!(exposing_grant(&secret, grants.iter(), &[]), Some(dir.clone()));
+        // An fs-deny on the file itself, or on a covering directory, closes the
+        // hole: following the warning's own advice must silence it.
+        assert_eq!(exposing_grant(&secret, grants.iter(), std::slice::from_ref(&secret)), None);
+        assert_eq!(exposing_grant(&secret, grants.iter(), std::slice::from_ref(&dir)), None);
+        // A deny elsewhere does not suppress the warning.
+        assert_eq!(
+            exposing_grant(&secret, grants.iter(), &[PathBuf::from("/nonexistent-deny")]),
+            Some(dir.clone())
+        );
+        // Outside every grant: nothing to report.
+        let other = vec![PathBuf::from("/nonexistent-grant")];
+        assert_eq!(exposing_grant(&secret, other.iter(), &[]), None);
+
+        let _ = std::fs::remove_file(&secret);
+        let _ = std::fs::remove_dir(&dir);
     }
 }

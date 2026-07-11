@@ -123,10 +123,12 @@ fn read_capped<R: std::io::Read>(r: &mut R, what: &str) -> Result<Vec<u8>, Sandb
 
 /// Read a credential from an already-open fd (e.g. a shell `<(...)` process
 /// substitution passed as `fd:N`, or the secret piped on stdin as `fd:0`). Reads
-/// through a *dup*, so the caller's fd is left open. `fd:0` (stdin) is allowed —
-/// it's the most portable secret-passing pattern (`printf %s "$SECRET" | sandlock
-/// … --credential k=fd:0`, docker `-i`, systemd credential fds) — but `fd:1`/`fd:2`
-/// are refused so a typo can't close/consume stdout/stderr.
+/// through a *dup*, so the caller's fd is left open. `fd:1`/`fd:2` are refused so
+/// a typo can't close/consume stdout/stderr. `fd:0` (stdin) is allowed for the
+/// portable pipe pattern (`printf %s "$SECRET" | sandlock … --credential k=fd:0`,
+/// docker `-i`, systemd credential fds), but only when it cannot be rewound:
+/// unlike higher fds, stdin survives into the child, and a seekable stdin (a
+/// `< secret.txt` redirect) would let the child lseek back and read the secret.
 fn read_fd(n: i32) -> Result<Vec<u8>, SandboxError> {
     use std::os::fd::FromRawFd;
     if n == 1 || n == 2 {
@@ -143,7 +145,23 @@ fn read_fd(n: i32) -> Result<Vec<u8>, SandboxError> {
     }
     // Owns `dup` (not `n`), so only the dup is closed on drop.
     let mut f = unsafe { std::fs::File::from_raw_fd(dup) };
+    if n == 0 && fd_is_rewindable(&mut f) {
+        return Err(SandboxError::Invalid(
+            "credential fd 0 (stdin) is seekable, so the sandboxed child could rewind \
+             it and re-read the secret; pipe it instead (printf %s \"$SECRET\" | sandlock …)"
+                .into(),
+        ));
+    }
     read_capped(&mut f, &format!("fd {n}"))
+}
+
+/// Whether the fd behind `f` can be rewound. Probing the dup is sound because a
+/// dup shares the file offset with the original; for the same reason, draining a
+/// seekable stdin supervisor-side would not protect the secret. A pipe/socket/tty
+/// cannot rewind (lseek fails with ESPIPE).
+fn fd_is_rewindable(f: &mut std::fs::File) -> bool {
+    use std::io::Seek;
+    f.stream_position().is_ok()
 }
 
 /// How the secret is attached to a matching request.
@@ -283,8 +301,12 @@ impl InjectRule {
         // — no `=`, which `starts_with("key=")` would miss — is still recognised
         // as the target: otherwise Replace would append `key&key=secret`, and a
         // first-occurrence-reading upstream would authenticate with the child's
-        // empty value instead of the injected one.
-        let is_target = |kv: &str| kv.split('=').next().unwrap_or(kv) == enc;
+        // empty value instead of the injected one. Compare names DECODED, so a
+        // child spelling the name with stray percent-encoding (`%6Bey=` for
+        // `key=`) still counts as the target instead of evading the filter.
+        let is_target = |kv: &str| {
+            percent_decode_lossy(kv.split('=').next().unwrap_or(kv)) == param.as_bytes()
+        };
         // Honor AddOnly: don't append a param the request already carries.
         if self.on_existing == OnExistingHeader::AddOnly {
             if let Some(q) = existing {
@@ -341,8 +363,17 @@ pub fn parse_auth(spec: &str, credential: &str) -> Result<AuthShape, SandboxErro
             )))
         }
         ("basic", Some(user)) if !user.is_empty() => AuthShape::Basic { username: user.to_string() },
-        // `apikey:<header>` and `header:<name>` are the same rendering.
-        ("header" | "apikey", Some(name)) if !name.is_empty() => AuthShape::Header { name: name.to_string() },
+        // `apikey:<header>` and `header:<name>` are the same rendering. Validate
+        // the name here so a typo fails at build time; unchecked, it would only
+        // surface as a per-request 502 when `apply` first renders the header.
+        ("header" | "apikey", Some(name)) if !name.is_empty() => {
+            if hyper::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
+                return Err(SandboxError::Invalid(format!(
+                    "invalid header name {name:?} in auth shape {spec:?} for credential {credential:?}"
+                )));
+            }
+            AuthShape::Header { name: name.to_string() }
+        }
         ("query", Some(param)) if !param.is_empty() => AuthShape::Query { param: param.to_string() },
         _ => {
             return Err(SandboxError::Invalid(format!(
@@ -476,6 +507,28 @@ fn base64_encode(input: &[u8]) -> String {
         out.push(T[((n >> 12) & 63) as usize] as char);
         out.push(if chunk.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
         out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+/// Decode `%XX` escapes in a query token to raw bytes (an invalid escape is kept
+/// literally), so two spellings of the same param name compare equal.
+fn percent_decode_lossy(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hi = (b[i + 1] as char).to_digit(16);
+            let lo = (b[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi as u8) << 4 | lo as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
     }
     out
 }
@@ -693,6 +746,85 @@ mod tests {
         assert!(resolve_inject_rules(&[], &["GET x/* bearer missing".to_string()]).is_err());
         assert!(load_secret("fd:1").is_err()); // stdout
         assert!(load_secret("fd:2").is_err()); // stderr (fd:0/stdin is now allowed)
+    }
+
+    #[test]
+    fn fd0_rejects_seekable_stdin_but_allows_pipe() {
+        use std::os::fd::IntoRawFd;
+        // A seekable stdin (file redirect) must be refused: stdin survives into
+        // the child, which could lseek back and re-read the secret. A pipe on
+        // stdin (the documented pattern) can't rewind and stays allowed. Lib
+        // tests run single-threaded in CI, and stdin is restored either way.
+        let path = std::env::temp_dir()
+            .join(format!("sandlock-cred-fd0-{}", std::process::id()));
+        std::fs::write(&path, "sk-file\n").unwrap();
+        let file_fd = std::fs::File::open(&path).unwrap().into_raw_fd();
+        let saved = unsafe { libc::dup(0) };
+        assert!(saved >= 0);
+
+        assert_eq!(unsafe { libc::dup2(file_fd, 0) }, 0);
+        let res_file = load_secret("fd:0");
+
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        unsafe {
+            assert_eq!(libc::write(fds[1], b"sk-pipe\n".as_ptr().cast(), 8), 8);
+            libc::close(fds[1]);
+            libc::dup2(fds[0], 0);
+            libc::close(fds[0]);
+        }
+        let res_pipe = load_secret("fd:0");
+
+        unsafe {
+            libc::dup2(saved, 0); // restore the real stdin before asserting
+            libc::close(saved);
+            libc::close(file_fd);
+        }
+        let _ = std::fs::remove_file(&path);
+
+        let err = res_file.expect_err("seekable stdin must be rejected");
+        assert!(err.to_string().contains("pipe it instead"), "got: {err}");
+        assert_eq!(res_pipe.unwrap().expose(), b"sk-pipe");
+    }
+
+    #[test]
+    fn fd_above_two_may_be_seekable() {
+        use std::os::fd::IntoRawFd;
+        // Fds above 2 are closed in the child post-fork, so a seekable file fd
+        // is safe there; only fd 0 carries the rewind restriction.
+        let path = std::env::temp_dir()
+            .join(format!("sandlock-cred-fdn-{}", std::process::id()));
+        std::fs::write(&path, "sk-n").unwrap();
+        let fd = std::fs::File::open(&path).unwrap().into_raw_fd();
+        let s = load_secret(&format!("fd:{fd}")).unwrap();
+        assert_eq!(s.expose(), b"sk-n");
+        unsafe { libc::close(fd) };
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parse_auth_rejects_invalid_header_name_at_build_time() {
+        // A malformed header name must fail when the rule is parsed, not as a
+        // per-request 502 the first time the rule fires.
+        assert!(parse_auth("header:bad name", "c").is_err());
+        assert!(parse_auth("apikey:x:y", "c").is_err());
+        assert!(parse_auth("header:x-ok", "c").is_ok());
+    }
+
+    #[test]
+    fn query_encoded_spelling_of_param_is_still_target() {
+        // `%6Bey` decodes to `key`: Replace must treat it as the target and drop
+        // it, not leave the child's pair alongside the injected one.
+        let mut p = parts_of("https://api.example.com/x?%6Bey=child&a=1", &[]);
+        rule(AuthShape::Query { param: "key".into() }, "sk-real", OnExistingHeader::Replace)
+            .apply(&mut p).unwrap();
+        assert_eq!(p.uri.query().unwrap(), "a=1&key=sk-real");
+
+        // AddOnly sees the encoded spelling as present and keeps the child's value.
+        let mut p2 = parts_of("https://api.example.com/x?%6Bey=child", &[]);
+        let r = rule(AuthShape::Query { param: "key".into() }, "sk-real", OnExistingHeader::AddOnly);
+        assert!(matches!(r.apply(&mut p2), Ok(Applied::Skipped)));
+        assert_eq!(p2.uri.query().unwrap(), "%6Bey=child");
     }
 
     #[test]
