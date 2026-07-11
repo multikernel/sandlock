@@ -107,11 +107,14 @@ impl SeccompCowBranch {
         let branch_dir = storage_base.join(&branch_id);
         let upper = branch_dir.join("upper");
 
-        fs::create_dir_all(&upper)
-            .map_err(|e| BranchError::Operation(format!("create upper: {}", e)))?;
-
+        // Canonicalize the workdir BEFORE creating the branch dir, so a failure
+        // here (e.g. the workdir was removed between validation and now) can't
+        // orphan an empty branch/upper dir on disk.
         let workdir = workdir.canonicalize()
             .map_err(|e| BranchError::Operation(format!("canonicalize workdir: {}", e)))?;
+
+        fs::create_dir_all(&upper)
+            .map_err(|e| BranchError::Operation(format!("create upper: {}", e)))?;
 
         Ok(Self {
             workdir_str: workdir.to_string_lossy().into_owned(),
@@ -896,8 +899,30 @@ impl SeccompCowBranch {
         Ok(())
     }
 
+    /// Mark the branch as intentionally kept: its upper is left on disk and the
+    /// `Drop` backstop below will not clean it up. Used for `BranchAction::Keep`,
+    /// which preserves the changes for later inspection rather than merging or
+    /// discarding them.
+    pub(crate) fn keep(&mut self) {
+        self.finished = true;
+    }
+
     fn cleanup(&self) {
         let _ = fs::remove_dir_all(&self.storage_dir);
+    }
+}
+
+impl Drop for SeccompCowBranch {
+    /// Backstop against orphaning the upper on disk. A branch dropped without an
+    /// explicit disposition — an error/timeout/panic in a transactional pipeline,
+    /// an abandoned sandbox that was never `wait()`ed — removes its own private
+    /// storage dir. `commit()`, `abort()`, and `keep()` all set `finished`, so
+    /// this is a no-op on every deliberate path (in particular it does NOT clean
+    /// a kept branch). `remove_dir_all` is idempotent and scoped to `storage_dir`.
+    fn drop(&mut self) {
+        if !self.finished {
+            self.cleanup();
+        }
     }
 }
 
@@ -905,6 +930,32 @@ impl SeccompCowBranch {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn drop_cleans_undisposed_branch_but_keep_preserves() {
+        let workdir = tempfile::tempdir().unwrap();
+
+        // A branch dropped without commit/abort/keep must remove its private
+        // storage dir — otherwise a failed/aborted-by-error transaction orphans
+        // the upper on disk (the leak this Drop backstop closes).
+        let leaked = {
+            let branch = SeccompCowBranch::create(workdir.path(), None, 0).unwrap();
+            let dir = branch.storage_dir.clone();
+            assert!(dir.exists());
+            dir
+        };
+        assert!(!leaked.exists(), "an undisposed branch must clean its storage on drop");
+
+        // keep() marks the branch finished, so Drop preserves the upper.
+        let kept = {
+            let mut branch = SeccompCowBranch::create(workdir.path(), None, 0).unwrap();
+            let dir = branch.storage_dir.clone();
+            branch.keep();
+            dir
+        };
+        assert!(kept.exists(), "a kept branch must survive drop");
+        let _ = fs::remove_dir_all(&kept);
+    }
 
     fn setup_workdir() -> (tempfile::TempDir, tempfile::TempDir) {
         let workdir = tempfile::tempdir().unwrap();

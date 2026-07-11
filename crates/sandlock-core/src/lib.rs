@@ -40,7 +40,7 @@ pub use sandbox::{
     BindPorts, Confinement, ConfinementBuilder, Process, Sandbox, SandboxBuilder, StdioMode,
 };
 pub use result::{RunResult, ExitStatus};
-pub use pipeline::{Stage, Pipeline, Gather};
+pub use pipeline::{Stage, Pipeline, Gather, TxnOutcome};
 pub use dry_run::{Change, ChangeKind, DryRunResult};
 // Sectioned-profile parsing types: ProfileInput is the top-level deserialization
 // target; ProgramSpec carries [program].exec/args (not a Sandbox field).
