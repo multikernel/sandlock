@@ -51,21 +51,40 @@ fn first_cleartext_warn(scheme: &str, seen: &AtomicBool) -> bool {
     scheme == "http" && !seen.swap(true, Ordering::Relaxed)
 }
 
-/// Whether a request must be rejected because its absolute-form URI authority
-/// host disagrees (case-insensitive) with its `Host` header — the split that
-/// would otherwise let ACL/verify/inject key off one host while the request is
-/// forwarded to the other. Origin-form requests (no URI host) and a missing /
-/// unparseable Host header are not rejected. Split out so the guard is
-/// unit-tested without a live `Incoming` body.
-fn split_host_rejected(uri: &hyper::Uri, headers: &hyper::HeaderMap) -> bool {
-    let Some(uri_host) = uri.host() else { return false };
-    match headers
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .map(|h| h.split(':').next().unwrap_or(h))
-    {
-        Some(hdr_host) => !uri_host.eq_ignore_ascii_case(hdr_host),
-        None => false,
+/// The single upstream authority for a request, or `Err` if it is missing,
+/// malformed, or ambiguous.
+///
+/// Both the absolute-form URI authority and the `Host` header are parsed as an
+/// [`Authority`] (not split on the first `:`, which mis-handles userinfo and
+/// IPv6). Userinfo (`user@host`) is rejected because its `@` lets the real host
+/// diverge from a naive `split(':')` view; when both a URI authority and a Host
+/// header are present their hosts must agree. The returned authority — never the
+/// raw Host header — drives `verify_host`, the ACL, the credential match, AND the
+/// outbound request, so the host a credential is matched for is exactly the host
+/// it is sent to. Split out so it is unit-tested without a live `Incoming` body.
+fn request_authority(
+    uri: &hyper::Uri,
+    headers: &hyper::HeaderMap,
+) -> Result<hyper::http::uri::Authority, ()> {
+    use hyper::http::uri::Authority;
+
+    let hdr_auth: Option<Authority> = match headers.get("host") {
+        Some(v) => Some(v.to_str().map_err(|_| ())?.parse::<Authority>().map_err(|_| ())?),
+        None => None,
+    };
+    let uri_auth: Option<Authority> = uri.authority().cloned();
+
+    let has_userinfo = |a: &Authority| a.as_str().contains('@');
+    if hdr_auth.as_ref().is_some_and(has_userinfo) || uri_auth.as_ref().is_some_and(has_userinfo) {
+        return Err(());
+    }
+
+    match (uri_auth, hdr_auth) {
+        (Some(u), Some(h)) if u.host().eq_ignore_ascii_case(h.host()) => Ok(u),
+        (Some(_), Some(_)) => Err(()), // split host: URI authority vs Host header
+        (Some(u), None) => Ok(u),
+        (None, Some(h)) => Ok(h),
+        (None, None) => Err(()), // no host at all
     }
 }
 
@@ -136,35 +155,27 @@ impl AclService {
         req: Request<hyper::body::Incoming>,
     ) -> Response<BoxBody<Bytes, BoxError>> {
         let method = req.method().as_str().to_string();
-        let host = req
-            .uri()
-            .host()
-            .map(|h| h.to_string())
-            .or_else(|| {
-                req.headers()
-                    .get("host")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|h| h.split(':').next().unwrap_or(h).to_string())
-            })
-            .unwrap_or_default();
-        let path = req.uri().path().to_string();
 
-        // Fail closed on a split-host request: `host` above prefers the URI
-        // authority, but the outbound request is rebuilt from the Host header
-        // (`host_hdr` below), and the upstream client routes by that. If the two
-        // disagree, the ACL check, `verify_host`, and the credential match would
-        // all key off the URI host while the request — carrying the injected
-        // secret — is forwarded to the Host-header host. A malicious child could
-        // then send `GET https://allowed.example/… ` with `Host: attacker` and
-        // exfiltrate the credential cross-origin (and bypass the egress ACL).
-        // Requiring the two to agree collapses them to one destination; origin-
-        // form requests (no URI authority) are unaffected.
-        if split_host_rejected(req.uri(), req.headers()) {
-            return text_response(
-                StatusCode::FORBIDDEN,
-                "Blocked by sandlock: request-target host does not match the Host header",
-            );
-        }
+        // Resolve ONE authority for the whole request (see `request_authority`).
+        // `verify_host`, the ACL, the credential match, and the outbound request
+        // are all keyed off this single parsed value, so the host a credential is
+        // matched for is exactly the host it is forwarded to. This closes the
+        // split-host exfiltration where a child sends an allowed URI/Host but
+        // smuggles a different forward host (e.g. via userinfo `a:b@attacker`).
+        let authority = match request_authority(req.uri(), req.headers()) {
+            Ok(a) => a,
+            Err(()) => {
+                if let Ok(mut m) = self.orig_dest.write() {
+                    m.remove(&client_addr);
+                }
+                return text_response(
+                    StatusCode::FORBIDDEN,
+                    "Blocked by sandlock: missing, malformed, or mismatched request host",
+                );
+            }
+        };
+        let host = authority.host().to_string();
+        let path = req.uri().path().to_string();
 
         if !self.verify_host(&client_addr, &host).await {
             if let Ok(mut m) = self.orig_dest.write() {
@@ -183,20 +194,16 @@ impl AclService {
             return text_response(StatusCode::FORBIDDEN, "Blocked by sandlock HTTP ACL policy");
         }
 
-        // Rebuild an absolute-URI request for the upstream client.
-        let host_hdr = req
-            .headers()
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| host.clone());
+        // Rebuild an absolute-URI request for the upstream client from the SAME
+        // validated authority — never the raw Host header — so the forward host
+        // equals the host the ACL/credential match ran against.
         let pq = req
             .uri()
             .path_and_query()
             .map(|p| p.as_str())
             .unwrap_or("/")
             .to_string();
-        let uri: hyper::Uri = match format!("{scheme}://{host_hdr}{pq}").parse() {
+        let uri: hyper::Uri = match format!("{scheme}://{authority}{pq}").parse() {
             Ok(u) => u,
             Err(_) => return text_response(StatusCode::BAD_GATEWAY, "bad upstream URI"),
         };
@@ -273,7 +280,7 @@ fn text_response(status: StatusCode, msg: &str) -> Response<BoxBody<Bytes, BoxEr
 
 #[cfg(test)]
 mod tests {
-    use super::{first_cleartext_warn, split_host_rejected};
+    use super::{first_cleartext_warn, request_authority};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
@@ -289,26 +296,32 @@ mod tests {
         assert!(first_cleartext_warn("http", &fresh));
     }
 
-    fn rejected(uri: &str, host: Option<&str>) -> bool {
+    fn authority_of(uri: &str, host: Option<&str>) -> Result<String, ()> {
         let uri: hyper::Uri = uri.parse().unwrap();
         let mut headers = hyper::HeaderMap::new();
         if let Some(h) = host {
             headers.insert("host", h.parse().unwrap());
         }
-        split_host_rejected(&uri, &headers)
+        request_authority(&uri, &headers).map(|a| a.to_string())
     }
 
     #[test]
-    fn split_host_guard_rejects_only_a_real_mismatch() {
-        // The exfiltration case: absolute-form allowed host, spoofed Host header.
-        assert!(rejected("http://allowed.example/v1", Some("attacker.example")));
-        // Agreement (incl. case-insensitive, and a port on either side) is fine.
-        assert!(!rejected("http://allowed.example/v1", Some("allowed.example")));
-        assert!(!rejected("http://allowed.example/v1", Some("ALLOWED.EXAMPLE")));
-        assert!(!rejected("http://allowed.example/v1", Some("allowed.example:8080")));
-        assert!(!rejected("http://allowed.example:443/v1", Some("allowed.example")));
-        // Origin-form (no URI authority) and a missing Host header don't reject.
-        assert!(!rejected("/v1", Some("anything.example")));
-        assert!(!rejected("http://allowed.example/v1", None));
+    fn request_authority_collapses_to_one_safe_host() {
+        // Agreement, origin-form, a port, and a case-only difference all resolve.
+        assert_eq!(authority_of("http://allowed.example/v1", Some("allowed.example")).unwrap(), "allowed.example");
+        assert_eq!(authority_of("/v1", Some("allowed.example")).unwrap(), "allowed.example");
+        assert_eq!(authority_of("http://allowed.example/v1", Some("ALLOWED.EXAMPLE")).unwrap(), "allowed.example");
+        assert_eq!(authority_of("/v1", Some("allowed.example:443")).unwrap(), "allowed.example:443");
+
+        // The exfiltration vectors are all rejected:
+        // absolute-form URI host vs a spoofed Host header,
+        assert!(authority_of("http://allowed.example/v1", Some("attacker.example")).is_err());
+        // and userinfo smuggling that hides the real forward host behind `@`,
+        // in both origin-form and absolute-form.
+        assert!(authority_of("/v1", Some("allowed.example:x@attacker.example")).is_err());
+        assert!(authority_of("http://allowed.example/v1", Some("allowed.example:x@attacker.example")).is_err());
+
+        // A request with no host at all is rejected (fail closed).
+        assert!(authority_of("/v1", None).is_err());
     }
 }

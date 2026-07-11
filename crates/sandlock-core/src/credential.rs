@@ -122,14 +122,16 @@ fn read_capped<R: std::io::Read>(r: &mut R, what: &str) -> Result<Vec<u8>, Sandb
 }
 
 /// Read a credential from an already-open fd (e.g. a shell `<(...)` process
-/// substitution passed as `fd:N`). Reads through a *dup*, so the caller's fd is
-/// left open, and refuses the std streams (0/1/2) so a typo like `fd:1` can't
-/// close/consume stdout.
+/// substitution passed as `fd:N`, or the secret piped on stdin as `fd:0`). Reads
+/// through a *dup*, so the caller's fd is left open. `fd:0` (stdin) is allowed —
+/// it's the most portable secret-passing pattern (`printf %s "$SECRET" | sandlock
+/// … --credential k=fd:0`, docker `-i`, systemd credential fds) — but `fd:1`/`fd:2`
+/// are refused so a typo can't close/consume stdout/stderr.
 fn read_fd(n: i32) -> Result<Vec<u8>, SandboxError> {
     use std::os::fd::FromRawFd;
-    if n <= 2 {
+    if n == 1 || n == 2 {
         return Err(SandboxError::Invalid(format!(
-            "credential fd {n} refers to a standard stream (0/1/2); pass a dedicated fd"
+            "credential fd {n} refers to stdout/stderr; pass a dedicated fd (or fd:0 for stdin)"
         )));
     }
     let dup = unsafe { libc::dup(n) };
@@ -276,18 +278,24 @@ impl InjectRule {
         let uri = &parts.uri;
         let path = uri.path();
         let existing = uri.query();
-        let prefix = format!("{}=", urlencode_bytes(param.as_bytes()));
+        let enc = urlencode_bytes(param.as_bytes());
+        // Match on the param NAME (the token before `=`), so a value-less `?key`
+        // — no `=`, which `starts_with("key=")` would miss — is still recognised
+        // as the target: otherwise Replace would append `key&key=secret`, and a
+        // first-occurrence-reading upstream would authenticate with the child's
+        // empty value instead of the injected one.
+        let is_target = |kv: &str| kv.split('=').next().unwrap_or(kv) == enc;
         // Honor AddOnly: don't append a param the request already carries.
         if self.on_existing == OnExistingHeader::AddOnly {
             if let Some(q) = existing {
-                if q.split('&').any(|kv| kv.starts_with(&prefix)) {
+                if q.split('&').any(is_target) {
                     return Ok(Applied::Skipped);
                 }
             }
         }
         // Percent-encode the raw secret bytes (never lossy-stringify — a binary
         // key would be corrupted).
-        let pair = format!("{}{}", prefix, urlencode_bytes(self.secret.expose()));
+        let pair = format!("{}={}", enc, urlencode_bytes(self.secret.expose()));
         // Drop any existing occurrence of this param before appending, so
         // `Replace` actually replaces instead of appending a duplicate (most
         // frameworks read the first occurrence, so a duplicate would leave the
@@ -295,7 +303,7 @@ impl InjectRule {
         // param is absent, so the filter is a no-op there.
         let kept: Option<String> = existing.map(|q| {
             q.split('&')
-                .filter(|kv| !kv.is_empty() && !kv.starts_with(&prefix))
+                .filter(|kv| !kv.is_empty() && !is_target(kv))
                 .collect::<Vec<_>>()
                 .join("&")
         });
@@ -391,7 +399,7 @@ pub fn resolve_inject_rules(
     let mut parsed: Vec<Parsed> = Vec::with_capacity(inject.len());
     for spec in inject {
         let toks: Vec<&str> = spec.split_whitespace().collect();
-        if toks.len() < 4 {
+        if toks.len() < 4 || toks.len() > 5 {
             return Err(SandboxError::Invalid(format!(
                 "--http-auth must be 'METHOD HOST/PATH AUTHSPEC CREDNAME [replace|add-only]', got {spec:?}"
             )));
@@ -632,6 +640,23 @@ mod tests {
     }
 
     #[test]
+    fn query_targets_value_less_param() {
+        // A bare `?key` (no `=`) is still the target: Replace must drop it and
+        // inject, not append `key&key=secret` (a first-occurrence-reading upstream
+        // would authenticate with the child's empty value).
+        let mut p = parts_of("https://api.example.com/x?key", &[]);
+        rule(AuthShape::Query { param: "key".into() }, "sk-real", OnExistingHeader::Replace)
+            .apply(&mut p).unwrap();
+        assert_eq!(p.uri.query().unwrap(), "key=sk-real");
+
+        // AddOnly sees the value-less param as present → keep the child's, skip.
+        let mut p2 = parts_of("https://api.example.com/x?key", &[]);
+        let r = rule(AuthShape::Query { param: "key".into() }, "sk-real", OnExistingHeader::AddOnly);
+        assert!(matches!(r.apply(&mut p2), Ok(Applied::Skipped)));
+        assert_eq!(p2.uri.query().unwrap(), "key");
+    }
+
+    #[test]
     fn resolve_dedups_credentials_and_collects_env_strip() {
         std::env::set_var("SANDLOCK_TEST_RESOLVE", "sk-resolve");
         let creds = vec!["a=env:SANDLOCK_TEST_RESOLVE".to_string()];
@@ -667,7 +692,7 @@ mod tests {
     fn resolve_rejects_undeclared_and_std_fd() {
         assert!(resolve_inject_rules(&[], &["GET x/* bearer missing".to_string()]).is_err());
         assert!(load_secret("fd:1").is_err()); // stdout
-        assert!(load_secret("fd:0").is_err()); // stdin
+        assert!(load_secret("fd:2").is_err()); // stderr (fd:0/stdin is now allowed)
     }
 
     #[test]
