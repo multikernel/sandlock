@@ -341,8 +341,10 @@ pub struct Sandbox {
     ///
     /// **Protocol gating falls out of rule presence.** Sandlock denies
     /// UDP and ICMP socket creation by default; opting in is "list at
-    /// least one rule for that protocol" (e.g. `udp://*:*` for any UDP,
-    /// `icmp://*` for any ICMP echo). TCP is always permitted.
+    /// least one rule for that protocol". Scheme-less specs expand to a
+    /// TCP + UDP rule pair at parse time, so any of them opts UDP in;
+    /// ICMP always needs an explicit rule (`icmp://*` for any ICMP
+    /// echo). TCP is always permitted.
     ///
     /// Empty `net_allow` and empty `http_allow`/`http_deny` together
     /// mean "deny all outbound" (Landlock direct path denies, no

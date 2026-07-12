@@ -282,15 +282,16 @@ entry of `net_allow` is a single rule of the form **protocol, host,
 port**. Rules are OR'd. An empty `net_allow` denies all outbound
 traffic. Protocol gating falls out of rule presence: without a UDP
 rule, UDP socket creation is denied at the seccomp layer; without an
-ICMP rule, kernel ping socket creation is denied. Raw ICMP (`SOCK_RAW
+ICMP rule, kernel ping socket creation is denied. A scheme-less rule
+counts for both TCP and UDP; ICMP always needs `icmp://`. Raw ICMP (`SOCK_RAW
 + IPPROTO_ICMP`) is never exposed. See the project README's "Network
 Model" section for the full grammar.
 
 Rule shapes:
 
-* `host:port[,port,...]`: TCP, default scheme (no prefix).
-* `tcp://host:port`: TCP, explicit scheme.
-* `udp://host:port`: UDP. `udp://*:*` opens any UDP destination.
+* `host:port[,port,...]`: no scheme prefix, covers TCP and UDP.
+* `tcp://host:port`: TCP only.
+* `udp://host:port`: UDP only. `udp://*:*` opens any UDP destination.
 * `icmp://host`: kernel ping socket (`SOCK_DGRAM + IPPROTO_ICMP`).
   `icmp://*` opens any echo destination.
 

@@ -115,10 +115,12 @@ pub enum NetTarget {
 /// representation and the same grammar; they differ only in whether
 /// hostnames are accepted (`--net-deny` rejects them) and in how the
 /// resolved rule is enforced (allowlist vs denylist).
+///
+/// A rule always names exactly one concrete protocol: a scheme-less
+/// spec expands to a TCP rule plus a UDP rule at parse time.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NetRule {
     /// L4 protocol this rule applies to.
-    #[serde(default = "default_protocol_tcp")]
     pub protocol: Protocol,
     /// What the rule targets at the IP layer.
     pub target: NetTarget,
@@ -135,38 +137,38 @@ pub struct NetRule {
 pub type NetAllow = NetRule;
 pub type NetDeny = NetRule;
 
-fn default_protocol_tcp() -> Protocol {
-    Protocol::Tcp
-}
-
 impl NetRule {
-    /// Parse a `--net-allow` spec into a rule. Hostnames are accepted and
+    /// Parse a `--net-allow` spec into rules. Hostnames are accepted and
     /// resolved to IPs at sandbox start. Grammar (shared with `--net-deny`):
     ///
     /// - `host` / `<ip>` / `<cidr>` / `*` -- all ports (port optional; `*`
-    ///   targets any IP). TCP is the default scheme.
+    ///   targets any IP).
     /// - `host:<port[,port,...]>` / `<ip>:<port>` / `<cidr>:*` / `:port`.
     /// - `[<ipv6|ipv6cidr>]:<port>` -- bracketed IPv6 with a port (a bare
     ///   `addr:port` string is itself a valid IPv6 address, so the port
     ///   form needs brackets).
     /// - `tcp://...` / `udp://...` / `icmp://...` schemes (icmp: no port).
-    pub fn parse_allow(spec: &str) -> Result<NetRule, SandboxError> {
+    ///
+    /// A spec with no scheme applies to both TCP and UDP and expands to
+    /// one rule per protocol; a scheme restricts the spec to that one
+    /// protocol. ICMP is never implied: it always needs `icmp://`.
+    pub fn parse_allow(spec: &str) -> Result<Vec<NetRule>, SandboxError> {
         Self::parse_spec(spec, "--net-allow", true)
     }
 
-    /// Parse a `--net-deny` spec into a rule. Identical grammar to
+    /// Parse a `--net-deny` spec into rules. Identical grammar to
     /// [`parse_allow`](Self::parse_allow), except hostnames are rejected
     /// (the target must be a literal IP/CIDR or `*`); use `--http-deny`
     /// for domain blocking.
-    pub fn parse_deny(spec: &str) -> Result<NetDeny, SandboxError> {
+    pub fn parse_deny(spec: &str) -> Result<Vec<NetDeny>, SandboxError> {
         Self::parse_spec(spec, "--net-deny", false)
     }
 
     /// Shared grammar for both flags. `label` selects the error prefix and
     /// `allow_hosts` whether non-IP targets are accepted (allow) or
     /// rejected (deny).
-    fn parse_spec(spec: &str, label: &str, allow_hosts: bool) -> Result<NetRule, SandboxError> {
-        let (protocol, rest) = match spec.split_once("://") {
+    fn parse_spec(spec: &str, label: &str, allow_hosts: bool) -> Result<Vec<NetRule>, SandboxError> {
+        let (scheme, rest) = match spec.split_once("://") {
             Some((scheme, body)) => {
                 let proto = Protocol::parse(scheme).ok_or_else(|| {
                     SandboxError::Invalid(format!(
@@ -174,13 +176,13 @@ impl NetRule {
                         label, scheme, spec
                     ))
                 })?;
-                (proto, body)
+                (Some(proto), body)
             }
-            None => (Protocol::Tcp, spec),
+            None => (None, spec),
         };
 
         // ICMP carries no port: the whole body is the target.
-        if protocol == Protocol::Icmp {
+        if scheme == Some(Protocol::Icmp) {
             if rest.is_empty() {
                 return Err(SandboxError::Invalid(format!(
                     "{}: icmp rule needs a host/IP or `*`, got `{}`",
@@ -195,67 +197,64 @@ impl NetRule {
                     label, spec
                 )));
             }
-            return Ok(NetRule {
-                protocol,
+            return Ok(vec![NetRule {
+                protocol: Protocol::Icmp,
                 target: parse_target(rest, label, allow_hosts)?,
                 ports: Vec::new(),
                 all_ports: true,
-            });
+            }]);
         }
 
         // 1. Bracketed IPv6 with a port: `[addr]:ports`.
-        if let Some(stripped) = rest.strip_prefix('[') {
+        let (target, ports, all_ports) = if let Some(stripped) = rest.strip_prefix('[') {
             let (inside, port_part) = stripped.rsplit_once("]:").ok_or_else(|| {
                 SandboxError::Invalid(format!("{}: malformed bracketed address in `{}`", label, spec))
             })?;
             let (ports, all_ports) = parse_ports(port_part, label, spec)?;
-            return Ok(NetRule {
-                protocol,
-                target: NetTarget::Cidr(IpCidr::parse(inside)?),
-                ports,
-                all_ports,
-            });
-        }
-
-        // An empty body must not silently mean "everything"; require an
-        // explicit `*` for the any-IP target.
-        if rest.is_empty() {
+            (NetTarget::Cidr(IpCidr::parse(inside)?), ports, all_ports)
+        } else if rest.is_empty() {
+            // An empty body must not silently mean "everything"; require
+            // an explicit `*` for the any-IP target.
             return Err(SandboxError::Invalid(format!(
                 "{}: empty rule in `{}` (use `*` for any host)",
                 label, spec
             )));
-        }
+        } else if let Ok(cidr) = IpCidr::parse(rest) {
+            // 2. Whole body is an IP/CIDR with no port -> all ports. Trying
+            //    `IpCidr::parse` first is what makes bare IPv6 (`::1`) and
+            //    IPv6 CIDRs (`fc00::/7`) work despite containing colons.
+            (NetTarget::Cidr(cidr), Vec::new(), true)
+        } else {
+            // 3. `target[:ports]` where target is an IP/CIDR, hostname, `*`,
+            //    or empty. The port suffix is optional: a target with no
+            //    `:port` covers all ports, mirroring the bare-target form.
+            let (host_part, port_part) = match rest.rsplit_once(':') {
+                Some((h, p)) => (h, Some(p)),
+                None => (rest, None),
+            };
+            let target = parse_target(host_part, label, allow_hosts)?;
+            let (ports, all_ports) = match port_part {
+                Some(p) => parse_ports(p, label, spec)?,
+                None => (Vec::new(), true),
+            };
+            (target, ports, all_ports)
+        };
 
-        // 2. Whole body is an IP/CIDR with no port -> all ports. Trying
-        //    `IpCidr::parse` first is what makes bare IPv6 (`::1`) and IPv6
-        //    CIDRs (`fc00::/7`) work despite containing colons.
-        if let Ok(cidr) = IpCidr::parse(rest) {
-            return Ok(NetRule {
+        // A scheme pins one protocol; no scheme covers both port-carrying
+        // protocols, so the spec expands to a TCP rule plus a UDP rule.
+        let protocols = match scheme {
+            Some(p) => vec![p],
+            None => vec![Protocol::Tcp, Protocol::Udp],
+        };
+        Ok(protocols
+            .into_iter()
+            .map(|protocol| NetRule {
                 protocol,
-                target: NetTarget::Cidr(cidr),
-                ports: Vec::new(),
-                all_ports: true,
-            });
-        }
-
-        // 3. `target[:ports]` where target is an IP/CIDR, hostname, `*`, or
-        //    empty. The port suffix is optional: a target with no `:port`
-        //    covers all ports, mirroring the bare-target form above.
-        let (host_part, port_part) = match rest.rsplit_once(':') {
-            Some((h, p)) => (h, Some(p)),
-            None => (rest, None),
-        };
-        let target = parse_target(host_part, label, allow_hosts)?;
-        let (ports, all_ports) = match port_part {
-            Some(p) => parse_ports(p, label, spec)?,
-            None => (Vec::new(), true),
-        };
-        Ok(NetRule {
-            protocol,
-            target,
-            ports,
-            all_ports,
-        })
+                target: target.clone(),
+                ports: ports.clone(),
+                all_ports,
+            })
+            .collect())
     }
 }
 
@@ -324,8 +323,9 @@ fn parse_ports(s: &str, label: &str, full: &str) -> Result<(Vec<u16>, bool), San
 
 /// L4 protocol that a `NetAllow` rule applies to.
 ///
-/// `Tcp` is the default if a rule has no scheme (the bare `host:port`
-/// form). `Udp` and `Icmp` require an explicit scheme.
+/// A rule with no scheme (the bare `host:port` form) covers TCP and
+/// UDP: it expands to one rule per protocol at parse time. `Icmp`
+/// requires an explicit `icmp://` scheme.
 ///
 /// `Icmp` is the kernel's unprivileged ping socket
 /// (`SOCK_DGRAM + IPPROTO_ICMP{,V6}`), gated by `ping_group_range` —
@@ -391,8 +391,9 @@ pub struct ResolvedNetAllowSet {
     pub tcp: ResolvedNetAllow,
     pub udp: ResolvedNetAllow,
     pub icmp: ResolvedNetAllow,
-    /// `<ip> <hostname>\n` lines from every concrete-host rule across
-    /// every protocol, in resolution order. Empty when no concrete-host
+    /// `<ip> <hostname>\n` lines for every unique concrete host across
+    /// every protocol, in first-appearance order (each host resolves
+    /// once, shared by all its rules). Empty when no concrete-host
     /// rules are present. Combined with the loopback base (or, in chroot
     /// mode, the image's `/etc/hosts`) by [`compose_virtual_etc_hosts`]
     /// to build the synthetic file served to the sandbox.
@@ -411,13 +412,40 @@ pub async fn resolve_net_allow(
     rules: &[NetAllow],
 ) -> io::Result<ResolvedNetAllowSet> {
     use crate::seccomp::notif::PortAllow;
-    let per_proto = |target: Protocol| async move {
+
+    // Resolve each unique hostname once, up front. A scheme-less spec
+    // expands to a TCP + UDP rule pair naming the same host; one lookup
+    // per protocol pass could disagree under DNS round-robin, leaving
+    // the two allowlists pinned to different IPs, and would emit the
+    // `/etc/hosts` line once per pass.
+    let mut host_ips: HashMap<&str, Vec<IpAddr>> = HashMap::new();
+    let mut concrete_host_entries = String::new();
+    for rule in rules {
+        if let NetTarget::Host(host) = &rule.target {
+            if host_ips.contains_key(host.as_str()) {
+                continue;
+            }
+            let addr = format!("{}:0", host);
+            let resolved = tokio::net::lookup_host(addr.as_str()).await.map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("failed to resolve host '{}': {}", host, e),
+                )
+            })?;
+            let ips: Vec<IpAddr> = resolved.map(|sa| sa.ip()).collect();
+            for ip in &ips {
+                concrete_host_entries.push_str(&format!("{} {}\n", ip, host));
+            }
+            host_ips.insert(host.as_str(), ips);
+        }
+    }
+
+    let per_proto = |target: Protocol| {
         let mut per_ip: HashMap<IpAddr, HashSet<u16>> = HashMap::new();
         let mut per_ip_all_ports: HashSet<IpAddr> = HashSet::new();
         let mut cidrs: Vec<(IpCidr, PortAllow)> = Vec::new();
         let mut any_ip_ports: HashSet<u16> = HashSet::new();
         let mut any_ip_all_ports = false;
-        let mut local_etc_hosts = String::new();
 
         for rule in rules.iter().filter(|r| r.protocol == target) {
             match &rule.target {
@@ -443,15 +471,7 @@ pub async fn resolve_net_allow(
                     cidrs.push((*c, pa));
                 }
                 NetTarget::Host(host) => {
-                    let addr = format!("{}:0", host);
-                    let resolved = tokio::net::lookup_host(addr.as_str()).await.map_err(|e| {
-                        io::Error::new(
-                            e.kind(),
-                            format!("failed to resolve host '{}': {}", host, e),
-                        )
-                    })?;
-                    for socket_addr in resolved {
-                        let ip = socket_addr.ip();
+                    for &ip in &host_ips[host.as_str()] {
                         if rule.all_ports || target == Protocol::Icmp {
                             per_ip_all_ports.insert(ip);
                             per_ip.entry(ip).or_default();
@@ -461,37 +481,24 @@ pub async fn resolve_net_allow(
                                 entry.insert(p);
                             }
                         }
-                        local_etc_hosts.push_str(&format!("{} {}\n", ip, host));
                     }
                 }
             }
         }
 
-        Ok::<_, io::Error>((
-            ResolvedNetAllow {
-                per_ip,
-                per_ip_all_ports,
-                cidrs,
-                any_ip_ports,
-                any_ip_all_ports,
-            },
-            local_etc_hosts,
-        ))
+        ResolvedNetAllow {
+            per_ip,
+            per_ip_all_ports,
+            cidrs,
+            any_ip_ports,
+            any_ip_all_ports,
+        }
     };
 
-    let (tcp, tcp_eh) = per_proto(Protocol::Tcp).await?;
-    let (udp, udp_eh) = per_proto(Protocol::Udp).await?;
-    let (icmp, icmp_eh) = per_proto(Protocol::Icmp).await?;
-
-    let mut concrete_host_entries = String::new();
-    for chunk in [tcp_eh, udp_eh, icmp_eh] {
-        concrete_host_entries.push_str(&chunk);
-    }
-
     Ok(ResolvedNetAllowSet {
-        tcp,
-        udp,
-        icmp,
+        tcp: per_proto(Protocol::Tcp),
+        udp: per_proto(Protocol::Udp),
+        icmp: per_proto(Protocol::Icmp),
         concrete_host_entries,
     })
 }
@@ -621,11 +628,48 @@ pub fn compose_virtual_etc_hosts(
 mod tests {
     use super::*;
 
+    /// Parse an allow spec that carries an explicit scheme: exactly one
+    /// rule comes back.
+    fn allow_one(spec: &str) -> NetRule {
+        let mut v = NetRule::parse_allow(spec).unwrap();
+        assert_eq!(v.len(), 1, "expected a single rule for `{spec}`");
+        v.remove(0)
+    }
+
+    /// Parse a scheme-less allow spec: it expands to a TCP + UDP pair
+    /// sharing target/ports. Returns the TCP rule after checking the
+    /// pair is consistent.
+    fn allow_pair(spec: &str) -> NetRule {
+        pair(NetRule::parse_allow(spec).unwrap(), spec)
+    }
+
+    fn deny_one(spec: &str) -> NetRule {
+        let mut v = NetRule::parse_deny(spec).unwrap();
+        assert_eq!(v.len(), 1, "expected a single rule for `{spec}`");
+        v.remove(0)
+    }
+
+    fn deny_pair(spec: &str) -> NetRule {
+        pair(NetRule::parse_deny(spec).unwrap(), spec)
+    }
+
+    fn pair(mut v: Vec<NetRule>, spec: &str) -> NetRule {
+        assert_eq!(v.len(), 2, "expected a TCP+UDP pair for `{spec}`");
+        let udp = v.pop().unwrap();
+        let tcp = v.pop().unwrap();
+        assert_eq!(tcp.protocol, Protocol::Tcp, "spec `{spec}`");
+        assert_eq!(udp.protocol, Protocol::Udp, "spec `{spec}`");
+        assert_eq!(tcp.target, udp.target, "spec `{spec}`");
+        assert_eq!(tcp.ports, udp.ports, "spec `{spec}`");
+        assert_eq!(tcp.all_ports, udp.all_ports, "spec `{spec}`");
+        tcp
+    }
+
     // --- NetAllow::parse tests ---
 
     #[test]
     fn netallow_parse_concrete_host_port() {
-        let r = NetRule::parse_allow("example.com:443").unwrap();
+        let r = allow_pair("example.com:443");
         assert!(matches!(&r.target, NetTarget::Host(h) if h == "example.com"));
         assert_eq!(r.ports, vec![443]);
         assert!(!r.all_ports);
@@ -633,12 +677,12 @@ mod tests {
 
     #[test]
     fn netallow_parse_any_host_port() {
-        let r = NetRule::parse_allow(":8080").unwrap();
+        let r = allow_pair(":8080");
         assert_eq!(r.target, NetTarget::AnyIp);
         assert_eq!(r.ports, vec![8080]);
         assert!(!r.all_ports);
 
-        let r = NetRule::parse_allow("*:8080").unwrap();
+        let r = allow_pair("*:8080");
         assert_eq!(r.target, NetTarget::AnyIp);
         assert_eq!(r.ports, vec![8080]);
         assert!(!r.all_ports);
@@ -646,7 +690,7 @@ mod tests {
 
     #[test]
     fn netallow_parse_multiple_ports() {
-        let r = NetRule::parse_allow("github.com:22,80,443").unwrap();
+        let r = allow_pair("github.com:22,80,443");
         assert!(matches!(&r.target, NetTarget::Host(h) if h == "github.com"));
         assert_eq!(r.ports, vec![22, 80, 443]);
         assert!(!r.all_ports);
@@ -654,7 +698,7 @@ mod tests {
 
     #[test]
     fn netallow_parse_wildcard_any_host_any_port_colon() {
-        let r = NetRule::parse_allow(":*").unwrap();
+        let r = allow_pair(":*");
         assert_eq!(r.target, NetTarget::AnyIp);
         assert!(r.ports.is_empty());
         assert!(r.all_ports);
@@ -662,7 +706,7 @@ mod tests {
 
     #[test]
     fn netallow_parse_wildcard_any_host_any_port_star() {
-        let r = NetRule::parse_allow("*:*").unwrap();
+        let r = allow_pair("*:*");
         assert_eq!(r.target, NetTarget::AnyIp);
         assert!(r.ports.is_empty());
         assert!(r.all_ports);
@@ -670,7 +714,7 @@ mod tests {
 
     #[test]
     fn netallow_parse_wildcard_concrete_host_any_port() {
-        let r = NetRule::parse_allow("example.com:*").unwrap();
+        let r = allow_pair("example.com:*");
         assert!(matches!(&r.target, NetTarget::Host(h) if h == "example.com"));
         assert!(r.ports.is_empty());
         assert!(r.all_ports);
@@ -703,7 +747,7 @@ mod tests {
     fn netallow_bare_host_is_all_ports() {
         // No port suffix means "all ports" (port optional), symmetric
         // with the `host:*` form.
-        let r = NetRule::parse_allow("example.com").unwrap();
+        let r = allow_pair("example.com");
         assert!(matches!(&r.target, NetTarget::Host(h) if h == "example.com"));
         assert!(r.all_ports);
         assert!(r.ports.is_empty());
@@ -711,7 +755,7 @@ mod tests {
 
     #[test]
     fn netallow_bare_star_is_any_host_all_ports() {
-        let r = NetRule::parse_allow("*").unwrap();
+        let r = allow_pair("*");
         assert_eq!(r.target, NetTarget::AnyIp);
         assert!(r.all_ports);
         assert!(r.ports.is_empty());
@@ -727,7 +771,7 @@ mod tests {
     fn netallow_cidr_target_with_port() {
         // CIDR ranges are now first-class in --net-allow (matched by
         // containment, no DNS), symmetric with --net-deny.
-        let r = NetRule::parse_allow("10.0.0.0/8:80").unwrap();
+        let r = allow_pair("10.0.0.0/8:80");
         assert!(matches!(&r.target, NetTarget::Cidr(c) if !c.is_single_host()));
         assert_eq!(r.ports, vec![80]);
         assert!(!r.all_ports);
@@ -737,15 +781,15 @@ mod tests {
     fn netallow_ipv6_literal_and_bracket() {
         let lo: std::net::IpAddr = "::1".parse().unwrap();
         // Bare IPv6 literal (previously mis-split on its colons).
-        let r = NetRule::parse_allow("::1").unwrap();
+        let r = allow_pair("::1");
         assert!(matches!(&r.target, NetTarget::Cidr(c) if c.addr == lo && c.is_single_host()));
         assert!(r.all_ports);
         // Bracketed IPv6 with a port.
-        let r = NetRule::parse_allow("[::1]:443").unwrap();
+        let r = allow_pair("[::1]:443");
         assert!(matches!(&r.target, NetTarget::Cidr(c) if c.addr == lo && c.is_single_host()));
         assert_eq!(r.ports, vec![443]);
         // IPv6 CIDR.
-        let r = NetRule::parse_allow("fc00::/7").unwrap();
+        let r = allow_pair("fc00::/7");
         assert!(matches!(&r.target, NetTarget::Cidr(c) if !c.is_single_host()));
         assert!(r.all_ports);
     }
@@ -768,7 +812,7 @@ mod tests {
     fn netallow_parse_repeated_wildcard_is_idempotent() {
         // `*,*` collapses to a single wildcard — neither token contributes
         // a concrete port, so the rule remains "any port".
-        let r = NetRule::parse_allow(":*,*").unwrap();
+        let r = allow_pair(":*,*");
         assert!(r.all_ports);
         assert!(r.ports.is_empty());
     }
@@ -776,14 +820,16 @@ mod tests {
     // --- Protocol scheme prefix tests ---
 
     #[test]
-    fn netallow_bare_form_defaults_to_tcp() {
-        let r = NetRule::parse_allow("example.com:443").unwrap();
+    fn netallow_schemeless_expands_to_tcp_and_udp() {
+        // Issue #132: a spec with no scheme covers both port-carrying
+        // protocols. `allow_pair` asserts the TCP+UDP pair shape.
+        let r = allow_pair("example.com:443");
         assert_eq!(r.protocol, Protocol::Tcp);
     }
 
     #[test]
-    fn netallow_explicit_tcp_scheme() {
-        let r = NetRule::parse_allow("tcp://example.com:443").unwrap();
+    fn netallow_explicit_tcp_scheme_is_tcp_only() {
+        let r = allow_one("tcp://example.com:443");
         assert_eq!(r.protocol, Protocol::Tcp);
         assert!(matches!(&r.target, NetTarget::Host(h) if h == "example.com"));
         assert_eq!(r.ports, vec![443]);
@@ -791,7 +837,7 @@ mod tests {
 
     #[test]
     fn netallow_udp_scheme_with_host_port() {
-        let r = NetRule::parse_allow("udp://1.1.1.1:53").unwrap();
+        let r = allow_one("udp://1.1.1.1:53");
         assert_eq!(r.protocol, Protocol::Udp);
         // An IP literal becomes a single-host CIDR target (no DNS).
         let one: std::net::IpAddr = "1.1.1.1".parse().unwrap();
@@ -802,7 +848,7 @@ mod tests {
     #[test]
     fn netallow_udp_wildcard_any_anywhere() {
         // The "any UDP" gate, equivalent to the old `allow_udp = true`.
-        let r = NetRule::parse_allow("udp://*:*").unwrap();
+        let r = allow_one("udp://*:*");
         assert_eq!(r.protocol, Protocol::Udp);
         assert_eq!(r.target, NetTarget::AnyIp);
         assert!(r.all_ports);
@@ -810,7 +856,7 @@ mod tests {
 
     #[test]
     fn netallow_icmp_scheme_with_host() {
-        let r = NetRule::parse_allow("icmp://github.com").unwrap();
+        let r = allow_one("icmp://github.com");
         assert_eq!(r.protocol, Protocol::Icmp);
         assert!(matches!(&r.target, NetTarget::Host(h) if h == "github.com"));
         assert!(r.ports.is_empty());
@@ -822,7 +868,7 @@ mod tests {
     fn netallow_icmp_wildcard() {
         // The "any ICMP echo" gate, equivalent to the old
         // `allow_icmp = true` for the SOCK_DGRAM path.
-        let r = NetRule::parse_allow("icmp://*").unwrap();
+        let r = allow_one("icmp://*");
         assert_eq!(r.protocol, Protocol::Icmp);
         assert_eq!(r.target, NetTarget::AnyIp);
     }
@@ -1193,16 +1239,17 @@ mod tests {
     // --- NetDeny::parse tests ---
 
     #[test]
-    fn netdeny_bare_cidr_is_all_ports_tcp() {
-        let rule = NetRule::parse_deny("10.0.0.0/8").unwrap();
-        assert_eq!(rule.protocol, Protocol::Tcp);
+    fn netdeny_bare_cidr_is_all_ports_tcp_and_udp() {
+        // A scheme-less deny covers both protocols (issue #132): a
+        // blocked CIDR must not stay reachable over UDP.
+        let rule = deny_pair("10.0.0.0/8");
         assert!(matches!(rule.target, NetTarget::Cidr(_)));
         assert!(rule.all_ports);
     }
 
     #[test]
     fn netdeny_bare_ip_is_host_route_all_ports() {
-        let rule = NetRule::parse_deny("169.254.169.254").unwrap();
+        let rule = deny_pair("169.254.169.254");
         match &rule.target {
             NetTarget::Cidr(c) => assert_eq!(c.prefix_len, 32),
             _ => panic!("expected cidr"),
@@ -1212,28 +1259,28 @@ mod tests {
 
     #[test]
     fn netdeny_cidr_with_port() {
-        let rule = NetRule::parse_deny("10.0.0.0/8:443").unwrap();
+        let rule = deny_pair("10.0.0.0/8:443");
         assert_eq!(rule.ports, vec![443]);
         assert!(!rule.all_ports);
     }
 
     #[test]
     fn netdeny_any_ip_port() {
-        let rule = NetRule::parse_deny(":25").unwrap();
+        let rule = deny_pair(":25");
         assert!(matches!(rule.target, NetTarget::AnyIp));
         assert_eq!(rule.ports, vec![25]);
     }
 
     #[test]
     fn netdeny_udp_scheme() {
-        let rule = NetRule::parse_deny("udp://192.168.0.0/16:53").unwrap();
+        let rule = deny_one("udp://192.168.0.0/16:53");
         assert_eq!(rule.protocol, Protocol::Udp);
         assert_eq!(rule.ports, vec![53]);
     }
 
     #[test]
     fn netdeny_ipv6_bracket_port() {
-        let rule = NetRule::parse_deny("[::1]:443").unwrap();
+        let rule = deny_pair("[::1]:443");
         assert_eq!(rule.ports, vec![443]);
         match &rule.target {
             NetTarget::Cidr(c) => assert_eq!(c.prefix_len, 128),
@@ -1249,7 +1296,7 @@ mod tests {
 
     #[test]
     fn netdeny_bare_ipv6_address_all_ports() {
-        let rule = NetRule::parse_deny("::1").unwrap();
+        let rule = deny_pair("::1");
         assert!(rule.all_ports);
         match &rule.target {
             NetTarget::Cidr(c) => assert_eq!(c.prefix_len, 128),
@@ -1259,7 +1306,7 @@ mod tests {
 
     #[test]
     fn netdeny_bare_ipv6_cidr_all_ports() {
-        let rule = NetRule::parse_deny("fc00::/7").unwrap();
+        let rule = deny_pair("fc00::/7");
         assert!(rule.all_ports);
         let ula: std::net::IpAddr = "fd00::1".parse().unwrap();
         assert!(matches!(&rule.target, NetTarget::Cidr(c) if c.contains(ula)));
@@ -1273,9 +1320,8 @@ mod tests {
     #[test]
     fn netdeny_bare_star_is_any_ip_all_ports() {
         // `*` with no port is the any-IP, all-ports form (port optional,
-        // symmetric with a bare IP/CIDR).
-        let rule = NetRule::parse_deny("*").unwrap();
-        assert_eq!(rule.protocol, Protocol::Tcp);
+        // symmetric with a bare IP/CIDR), covering TCP and UDP.
+        let rule = deny_pair("*");
         assert!(matches!(rule.target, NetTarget::AnyIp));
         assert!(rule.all_ports);
         assert!(rule.ports.is_empty());
@@ -1283,7 +1329,7 @@ mod tests {
 
     #[test]
     fn netdeny_udp_bare_star_all_ports() {
-        let rule = NetRule::parse_deny("udp://*").unwrap();
+        let rule = deny_one("udp://*");
         assert_eq!(rule.protocol, Protocol::Udp);
         assert!(matches!(rule.target, NetTarget::AnyIp));
         assert!(rule.all_ports);
@@ -1299,19 +1345,81 @@ mod tests {
     // --- resolve_net_deny tests ---
 
     #[test]
+    fn resolve_net_deny_schemeless_covers_tcp_and_udp() {
+        let rules = NetRule::parse_deny("10.0.0.0/8").unwrap();
+        let set = resolve_net_deny(&rules);
+        // A scheme-less deny closes both L4 paths to the CIDR; ICMP has
+        // no rule and stays allow-all.
+        assert!(!set.tcp.allows("10.0.0.1".parse().unwrap(), 443));
+        assert!(!set.udp.allows("10.0.0.1".parse().unwrap(), 443));
+        assert!(set.icmp.allows("10.0.0.1".parse().unwrap(), 0));
+    }
+
+    #[test]
     fn resolve_net_deny_groups_per_protocol() {
-        let rule = NetRule::parse_deny("10.0.0.0/8").unwrap();
-        let set = resolve_net_deny(std::slice::from_ref(&rule));
-        // TCP policy denies 10.x, UDP/ICMP unaffected (still allow-all).
+        let rules = NetRule::parse_deny("tcp://10.0.0.0/8").unwrap();
+        let set = resolve_net_deny(&rules);
+        // An explicit tcp:// deny leaves UDP/ICMP unaffected (allow-all).
         assert!(!set.tcp.allows("10.0.0.1".parse().unwrap(), 443));
         assert!(set.udp.allows("10.0.0.1".parse().unwrap(), 443));
     }
 
     #[test]
     fn resolve_net_deny_any_ip_port() {
-        let rule = NetRule::parse_deny(":25").unwrap();
-        let set = resolve_net_deny(std::slice::from_ref(&rule));
-        assert!(!set.tcp.allows("8.8.8.8".parse().unwrap(), 25));
-        assert!(set.tcp.allows("8.8.8.8".parse().unwrap(), 80));
+        let rules = NetRule::parse_deny(":25").unwrap();
+        let set = resolve_net_deny(&rules);
+        for policy in [&set.tcp, &set.udp] {
+            assert!(!policy.allows("8.8.8.8".parse().unwrap(), 25));
+            assert!(policy.allows("8.8.8.8".parse().unwrap(), 80));
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_net_allow_schemeless_star_unrestricts_tcp_and_udp() {
+        // Issue #132: `--net-allow '*'` alone now grants full TCP and
+        // UDP egress; ICMP still requires an explicit `icmp://` rule.
+        let rules = NetRule::parse_allow("*").unwrap();
+        let resolved = resolve_net_allow(&rules).await.unwrap();
+        assert!(resolved.tcp.any_ip_all_ports);
+        assert!(resolved.udp.any_ip_all_ports);
+        assert!(!resolved.icmp.any_ip_all_ports);
+    }
+
+    #[tokio::test]
+    async fn resolve_net_allow_explicit_tcp_scheme_leaves_udp_closed() {
+        let rules = NetRule::parse_allow("tcp://*").unwrap();
+        let resolved = resolve_net_allow(&rules).await.unwrap();
+        assert!(resolved.tcp.any_ip_all_ports);
+        assert!(!resolved.udp.any_ip_all_ports);
+        assert!(resolved.udp.any_ip_ports.is_empty());
+        assert!(resolved.udp.cidrs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_net_allow_schemeless_port_populates_both_sets() {
+        // `:53` grants port 53 over both TCP and UDP, so plain DNS
+        // works without a separate `udp://` rule.
+        let rules = NetRule::parse_allow(":53").unwrap();
+        let resolved = resolve_net_allow(&rules).await.unwrap();
+        assert!(resolved.tcp.any_ip_ports.contains(&53));
+        assert!(resolved.udp.any_ip_ports.contains(&53));
+        assert!(!resolved.tcp.any_ip_all_ports);
+        assert!(!resolved.udp.any_ip_all_ports);
+    }
+
+    #[tokio::test]
+    async fn resolve_net_allow_schemeless_host_resolves_once() {
+        // A scheme-less host spec expands to a TCP + UDP rule pair; the
+        // host must resolve once and share the IP set (independent
+        // lookups could disagree under DNS round-robin) and each
+        // /etc/hosts line must appear exactly once.
+        let rules = NetRule::parse_allow("localhost:443").unwrap();
+        let resolved = resolve_net_allow(&rules).await.unwrap();
+        let tcp_ips: HashSet<&IpAddr> = resolved.tcp.per_ip.keys().collect();
+        let udp_ips: HashSet<&IpAddr> = resolved.udp.per_ip.keys().collect();
+        assert_eq!(tcp_ips, udp_ips);
+        let lines: Vec<&str> = resolved.concrete_host_entries.lines().collect();
+        let unique: HashSet<&str> = lines.iter().copied().collect();
+        assert_eq!(lines.len(), unique.len(), "duplicate hosts lines: {lines:?}");
     }
 }

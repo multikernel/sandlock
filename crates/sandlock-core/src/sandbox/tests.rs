@@ -178,7 +178,8 @@ fn builder_parses_net_deny() {
         .net_deny("10.0.0.0/8")
         .build()
         .unwrap();
-    assert_eq!(policy.net_deny.len(), 1);
+    // Scheme-less deny expands to a TCP rule plus a UDP rule.
+    assert_eq!(policy.net_deny.len(), 2);
 }
 
 #[test]

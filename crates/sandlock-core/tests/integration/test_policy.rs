@@ -37,10 +37,12 @@ fn test_builder_network() {
         policy.net_allow_bind,
         sandlock_core::BindPorts::Ports(vec![8080])
     );
-    assert_eq!(policy.net_allow.len(), 1);
-    let rule = &policy.net_allow[0];
-    assert!(matches!(&rule.target, sandlock_core::sandbox::NetTarget::Host(h) if h == "api.example.com"));
-    assert_eq!(rule.ports, vec![443, 80]);
+    // A scheme-less spec expands to a TCP rule plus a UDP rule.
+    assert_eq!(policy.net_allow.len(), 2);
+    for rule in &policy.net_allow {
+        assert!(matches!(&rule.target, sandlock_core::sandbox::NetTarget::Host(h) if h == "api.example.com"));
+        assert_eq!(rule.ports, vec![443, 80]);
+    }
 }
 
 #[test]
@@ -51,7 +53,7 @@ fn test_net_allow_parse_grammar() {
     assert!(NetRule::parse_allow(":8080").is_ok());
     assert!(NetRule::parse_allow("*:8080").is_ok());
     assert!(NetRule::parse_allow("foo.com").is_ok()); // no port -> all ports
-    assert!(NetRule::parse_allow("foo.com").unwrap().all_ports);
+    assert!(NetRule::parse_allow("foo.com").unwrap().iter().all(|r| r.all_ports));
     assert!(NetRule::parse_allow("*").is_ok()); // any host, all ports
     assert!(NetRule::parse_allow("").is_err()); // empty rule
     assert!(NetRule::parse_allow("foo.com:abc").is_err()); // bad port
