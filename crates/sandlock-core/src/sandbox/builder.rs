@@ -361,13 +361,16 @@ impl SandboxBuilder {
     }
 
     /// Add a network endpoint rule. Spec is `host:port[,port,...]`,
-    /// `:port`, or `*:port`. Validated at `build()` time so callers
-    /// receive parse errors via the standard `SandboxBuilder` flow.
+    /// `:port`, or `*:port`; a spec with no scheme covers both TCP and
+    /// UDP, while `tcp://`, `udp://`, or `icmp://` pins one protocol.
+    /// Validated at `build()` time so callers receive parse errors via
+    /// the standard `SandboxBuilder` flow.
     ///
     /// Examples:
-    /// - `.net_allow("api.openai.com:443")`: HTTPS to OpenAI only
+    /// - `.net_allow("api.openai.com:443")`: port 443 to OpenAI only
     /// - `.net_allow("github.com:22,443")`: SSH and HTTPS to GitHub
     /// - `.net_allow(":8080")`: any IP on port 8080
+    /// - `.net_allow("tcp://10.0.0.5:22")`: TCP only, no UDP
     pub fn net_allow(mut self, spec: impl Into<String>) -> Self {
         self.net_allow.push(spec.into());
         self
@@ -802,19 +805,18 @@ impl SandboxBuilder {
             self.http_ports
         };
 
-        // Parse user-supplied --net-allow specs.
-        let mut net_allow: Vec<NetAllow> = self
-            .net_allow
-            .into_iter()
-            .map(|s| NetRule::parse_allow(&s))
-            .collect::<Result<_, _>>()?;
+        // Parse user-supplied --net-allow specs. A scheme-less spec
+        // covers TCP and UDP, so one spec can yield two rules.
+        let mut net_allow: Vec<NetAllow> = Vec::new();
+        for s in self.net_allow {
+            net_allow.extend(NetRule::parse_allow(&s)?);
+        }
 
-        // Parse --net-deny rules (one rule per spec).
-        let net_deny: Vec<NetDeny> = self
-            .net_deny
-            .into_iter()
-            .map(|s| NetRule::parse_deny(&s))
-            .collect::<Result<_, _>>()?;
+        // Parse --net-deny rules, expanded the same way.
+        let mut net_deny: Vec<NetDeny> = Vec::new();
+        for s in self.net_deny {
+            net_deny.extend(NetRule::parse_deny(&s)?);
+        }
 
         // --net-allow and --net-deny are mutually exclusive. Check the
         // user-supplied allow count (the original specs), not the post-HTTP

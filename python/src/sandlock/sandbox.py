@@ -173,14 +173,14 @@ class Sandbox:
 
     # Network — endpoint allowlist (protocol × IP × port via seccomp on-behalf path)
     net_allow: Sequence[str] = field(default_factory=list)
-    """Outbound endpoint rules. Each entry is a string. The bare form is
-    TCP; other protocols use a scheme prefix:
+    """Outbound endpoint rules. Each entry is a string. The bare form
+    covers both TCP and UDP; a scheme prefix pins one protocol:
 
-    * ``"host:port"`` — TCP to one host on one port (e.g. ``"api.openai.com:443"``)
-    * ``"host:port,port,..."`` — TCP, multiple ports (e.g. ``"github.com:22,443"``)
-    * ``":port"`` / ``"*:port"`` — TCP on any IP (e.g. ``":53"``)
-    * ``"tcp://host:port"`` — explicit TCP (same suffix grammar as bare form)
-    * ``"udp://host:port"`` — UDP to a host
+    * ``"host:port"`` — TCP and UDP to one host on one port (e.g. ``"api.openai.com:443"``)
+    * ``"host:port,port,..."`` — TCP and UDP, multiple ports (e.g. ``"github.com:22,443"``)
+    * ``":port"`` / ``"*:port"`` — TCP and UDP on any IP (e.g. ``":53"``)
+    * ``"tcp://host:port"`` — TCP only (same suffix grammar as bare form)
+    * ``"udp://host:port"`` — UDP only
     * ``"udp://*:*"`` — any UDP (matches the previous ``allow_udp=True`` behavior)
     * ``"icmp://host"`` — kernel ping socket (SOCK_DGRAM + IPPROTO_ICMP) to a host
     * ``"icmp://*"`` — any ICMP echo destination
@@ -190,7 +190,9 @@ class Sandbox:
     use the dgram path above.
 
     Protocol gating falls out of rule presence: with no UDP/ICMP rules,
-    UDP and ICMP socket creation are denied at the seccomp layer.
+    UDP and ICMP socket creation are denied at the seccomp layer. Bare
+    (scheme-less) rules count for both TCP and UDP; ICMP is never
+    implied and always needs ``icmp://``.
     A target may also be an IP, a CIDR range, or an IPv6 literal
     (``"10.0.0.0/8:443"``, ``"[2606:4700::/32]:443"``), matched by
     containment with no DNS. Hostnames are resolved at sandbox-creation

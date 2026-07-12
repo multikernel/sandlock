@@ -1102,8 +1102,8 @@ class _NativePolicy:
             arr = (ctypes.c_uint32 * len(policy.cpu_cores))(*policy.cpu_cores)
             b = _b_cpu_cores(b, arr, len(policy.cpu_cores))
 
-        # net_allow: list of endpoint specs. Bare `host:port` means TCP;
-        # `tcp://`/`udp://`/`icmp://` schemes opt other protocols in.
+        # net_allow: list of endpoint specs. Bare `host:port` means TCP
+        # and UDP; `tcp://`/`udp://`/`icmp://` schemes pin one protocol.
         # Empty = deny all outbound. net_deny is the inverse (default-allow
         # denylist of IP/CIDR/port specs); the two are mutually exclusive.
         # Validation of each spec happens in the native build().

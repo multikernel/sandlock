@@ -300,9 +300,10 @@ impl CowState {
 /// `NetworkPolicy` per L4 protocol — the on-behalf handler picks the
 /// matching one based on the dup'd fd's `SO_PROTOCOL`.
 pub struct NetworkState {
-    /// Allowlist for TCP destinations (`tcp://...` and bare-form rules).
+    /// Allowlist for TCP destinations (`tcp://...` and bare-form rules;
+    /// bare specs expand to a TCP + UDP pair at parse time).
     pub tcp_policy: crate::seccomp::notif::NetworkPolicy,
-    /// Allowlist for UDP destinations (`udp://...` rules).
+    /// Allowlist for UDP destinations (`udp://...` and bare-form rules).
     pub udp_policy: crate::seccomp::notif::NetworkPolicy,
     /// Allowlist for ICMP destinations (`icmp://...` rules). ICMP rules
     /// carry no ports, so every entry uses `PortAllow::Any` and the

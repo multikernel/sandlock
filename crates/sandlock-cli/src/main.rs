@@ -818,9 +818,11 @@ fn validate_no_supervisor_profile(profile: &Sandbox, source: &str) -> Result<()>
 
 /// Render a parsed `NetRule` back into a `--net-allow` / `--net-deny` spec
 /// string, so a profile loaded via `--profile-file` round-trips through the
-/// builder. Allow and deny share one grammar: bare TCP, explicit
-/// `udp://`/`icmp://`, IPv6 bracketed only when a port follows, and the
-/// all-ports case drops the redundant `:*`.
+/// builder. Allow and deny share one grammar. The scheme is always
+/// rendered: a scheme-less spec parses as a TCP + UDP pair, so a
+/// single-protocol rule must carry its scheme to round-trip exactly.
+/// IPv6 is bracketed only when a port follows, and the all-ports case
+/// drops the redundant `:*`.
 fn format_net_rule(rule: &sandlock_core::sandbox::NetRule) -> String {
     use sandlock_core::sandbox::{NetTarget, Protocol};
     let target = match &rule.target {
@@ -839,7 +841,7 @@ fn format_net_rule(rule: &sandlock_core::sandbox::NetRule) -> String {
     match rule.protocol {
         Protocol::Icmp => format!("icmp://{}", target),
         proto => {
-            let scheme = if matches!(proto, Protocol::Udp) { "udp://" } else { "" };
+            let scheme = if matches!(proto, Protocol::Udp) { "udp://" } else { "tcp://" };
             if rule.all_ports {
                 format!("{}{}", scheme, target)
             } else {
@@ -880,44 +882,49 @@ mod render_tests {
 
     #[test]
     fn render_allow_drops_redundant_all_ports_star() {
-        let r = NetRule::parse_allow("udp://*:*").unwrap();
-        assert_eq!(format_net_rule(&r), "udp://*");
+        let r = &NetRule::parse_allow("udp://*:*").unwrap()[0];
+        assert_eq!(format_net_rule(r), "udp://*");
     }
 
     #[test]
-    fn render_allow_any_ip_all_ports_tcp_is_bare_star() {
-        let r = NetRule::parse_allow(":*").unwrap();
-        assert_eq!(format_net_rule(&r), "*");
+    fn render_allow_any_ip_all_ports_schemeless_pair() {
+        // `:*` expands to a TCP + UDP pair; each rule renders its scheme
+        // so the pair round-trips without widening.
+        let rules = NetRule::parse_allow(":*").unwrap();
+        let rendered: Vec<String> = rules.iter().map(format_net_rule).collect();
+        assert_eq!(rendered, vec!["tcp://*", "udp://*"]);
     }
 
     #[test]
     fn render_allow_host_ports() {
-        let r = NetRule::parse_allow("example.com:443").unwrap();
-        assert_eq!(format_net_rule(&r), "example.com:443");
+        let rules = NetRule::parse_allow("example.com:443").unwrap();
+        assert_eq!(format_net_rule(&rules[0]), "tcp://example.com:443");
+        assert_eq!(format_net_rule(&rules[1]), "udp://example.com:443");
     }
 
     #[test]
     fn render_cidr_and_ipv6_round_trip() {
         // CIDR and IPv6-literal targets render identically for allow/deny.
-        assert_eq!(format_net_rule(&NetRule::parse_allow("10.0.0.0/8:80").unwrap()), "10.0.0.0/8:80");
-        assert_eq!(format_net_rule(&NetRule::parse_deny("10.0.0.0/8").unwrap()), "10.0.0.0/8");
-        assert_eq!(format_net_rule(&NetRule::parse_allow("[::1]:443").unwrap()), "[::1]:443");
-        assert_eq!(format_net_rule(&NetRule::parse_allow("::1").unwrap()), "::1");
+        assert_eq!(format_net_rule(&NetRule::parse_allow("10.0.0.0/8:80").unwrap()[0]), "tcp://10.0.0.0/8:80");
+        assert_eq!(format_net_rule(&NetRule::parse_deny("10.0.0.0/8").unwrap()[0]), "tcp://10.0.0.0/8");
+        assert_eq!(format_net_rule(&NetRule::parse_allow("[::1]:443").unwrap()[0]), "tcp://[::1]:443");
+        assert_eq!(format_net_rule(&NetRule::parse_allow("::1").unwrap()[0]), "tcp://::1");
     }
 
     #[test]
     fn render_roundtrips_through_parse() {
         for spec in [
             "example.com:443", "udp://1.1.1.1:53", "icmp://github.com", "*", "udp://*",
-            "10.0.0.0/8:80", "[fc00::/7]:443", "::1", "1.2.3.4",
+            "tcp://*", "10.0.0.0/8:80", "[fc00::/7]:443", "::1", "1.2.3.4",
         ] {
-            let r = NetRule::parse_allow(spec).unwrap();
-            let rendered = format_net_rule(&r);
-            let r2 = NetRule::parse_allow(&rendered).unwrap();
-            assert_eq!(r.target, r2.target, "target mismatch for {spec}");
-            assert_eq!(r.ports, r2.ports, "ports mismatch for {spec}");
-            assert_eq!(r.all_ports, r2.all_ports, "all_ports mismatch for {spec}");
-            assert_eq!(r.protocol, r2.protocol, "protocol mismatch for {spec}");
+            for r in &NetRule::parse_allow(spec).unwrap() {
+                let rendered = format_net_rule(r);
+                // A rendered rule always carries its scheme, so it must
+                // reparse to exactly one rule equal to the original.
+                let reparsed = NetRule::parse_allow(&rendered).unwrap();
+                assert_eq!(reparsed.len(), 1, "rendered `{rendered}` from {spec} not single");
+                assert_eq!(*r, reparsed[0], "round-trip mismatch for {spec} via `{rendered}`");
+            }
         }
     }
 }

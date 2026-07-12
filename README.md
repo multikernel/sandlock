@@ -135,14 +135,15 @@ sandlock run --net-allow github.com -r /usr -r /lib -r /etc -- ssh user@github.c
 sandlock run --net-allow 10.0.0.0/8:443 --net-allow '[2606:4700::/32]:443' \
   -r /usr -r /lib -r /etc -- python3 agent.py
 
-# Unrestricted outbound: `*` opens any host and any TCP port (`:*` / `*:*`
-# are equivalent). For full egress add a UDP wildcard, `udp://*`.
-sandlock run --net-allow '*' --net-allow 'udp://*' \
+# Unrestricted outbound: `*` opens any host and any port over both TCP
+# and UDP (`:*` / `*:*` are equivalent). ICMP still needs `icmp://`.
+sandlock run --net-allow '*' \
   -r /usr -r /lib -r /etc -- ./client
 
-# UDP — scheme prefix gates the protocol and scopes the destination
-# (e.g. DNS to 1.1.1.1, plus TCP HTTPS to anywhere)
-sandlock run --net-allow udp://1.1.1.1:53 --net-allow :443 \
+# Scheme prefix: a spec with no scheme covers TCP and UDP; `tcp://` or
+# `udp://` pins one protocol (e.g. UDP DNS to 1.1.1.1 only, plus
+# TCP-only HTTPS to anywhere)
+sandlock run --net-allow udp://1.1.1.1:53 --net-allow tcp://:443 \
   -r /usr -r /lib -r /etc -- ./client
 
 # Ping — kernel ping socket (SOCK_DGRAM) gated by net.ipv4.ping_group_range
@@ -623,11 +624,15 @@ Outbound traffic is gated by an endpoint list naming
   target   host | <ip> | <cidr> | *           (`*` or empty target = any IP)
   forms    target[:port[,port,...]] · :port · host:* · :* · *:*
            [<ipv6|cidr>]:port                  (bracket IPv6 when a port follows)
-  scheme   tcp:// (default) · udp:// (`udp://*` = any UDP) · icmp:// (no port)
+  scheme   none = tcp + udp · tcp:// · udp:// (`udp://*` = any UDP) · icmp:// (no port)
 
   --net-allow  target may also be a hostname, resolved via DNS at start
   --net-deny   target must be a literal IP/CIDR (no hostnames; use --http-deny)
 ```
+
+A spec with no scheme applies to both TCP and UDP (it expands to one
+rule per protocol at parse time); a scheme pins the spec to that one
+protocol. ICMP is never implied and always needs `icmp://`.
 
 A comma groups ports within one spec (`host:80,443`); to pass multiple
 rules, repeat the flag. IP and CIDR targets are matched by containment
@@ -639,7 +644,8 @@ and port (port is N/A for ICMP).
 
 **Protocol gating** falls out of rule presence per scheme:
 
-  * No UDP rule → UDP socket creation is denied at the seccomp layer.
+  * No UDP rule → UDP socket creation is denied at the seccomp layer
+    (a scheme-less rule counts for both TCP and UDP).
   * No ICMP rule → kernel ping socket creation (SOCK_DGRAM + IPPROTO_ICMP)
     is denied at the seccomp layer.
   * Raw ICMP (SOCK_RAW + IPPROTO_ICMP) is **never exposed** — packet
@@ -652,8 +658,8 @@ and port (port is N/A for ICMP).
 **Defaults.** With no `--net-allow` and no HTTP ACL flags, Landlock
 denies every TCP `connect()`, UDP / ICMP / raw socket creation are
 denied at the seccomp layer, and there is no on-behalf path active.
-For unrestricted TCP egress, opt in explicitly with
-`--net-allow '*'`; for any UDP, add `--net-allow 'udp://*'`.
+For unrestricted TCP and UDP egress, opt in explicitly with
+`--net-allow '*'`; ICMP needs its own `--net-allow 'icmp://*'`.
 
 **Denylist (`--net-deny`).** The inverse of the allowlist: networking is
 default-allow and the listed targets are blocked. It uses the same
@@ -662,11 +668,12 @@ must be literal IPs/CIDRs (hostnames are rejected; use `--http-deny` for
 domains). Examples:
 
 ```
---net-deny 10.0.0.0/8               # all ports on a CIDR (all protocols)
---net-deny 169.254.169.254:80      # one IP, one port
+--net-deny 10.0.0.0/8               # all ports on a CIDR (TCP and UDP)
+--net-deny 169.254.169.254:80      # one IP, one port (TCP and UDP)
 --net-deny 169.254.169.254:80,443  # comma-separated ports in one rule
---net-deny '*'                     # any IP, all ports (TCP)
---net-deny 'udp://192.168.0.0/16'  # any UDP to a CIDR
+--net-deny '*'                     # any IP, all ports (TCP and UDP)
+--net-deny 'udp://192.168.0.0/16'  # UDP only, to a CIDR
+--net-deny 'tcp://10.0.0.1:22'     # TCP only, one IP and port
 ```
 
 **Resolution.** Only hostname targets touch DNS: they are resolved once
