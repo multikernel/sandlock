@@ -582,6 +582,42 @@ static int cmd_spawn_loop(int argc, char **argv) {
     return 0;
 }
 
+/* ── clock-loop (non-standard: single-process vDSO counter loop) ──────────── */
+/*
+ * Opens <file> once, then loops forever calling clock_gettime(CLOCK_MONOTONIC)
+ * — the canonical vDSO fast path — and publishing an incrementing counter
+ * through that kept-open fd (single fixed-width 21-byte overwrite, never
+ * truncating, so a reader always sees a complete value), sleeping via nanosleep
+ * between writes. Unlike spawn-loop it never forks, so the whole process is a
+ * single thread with one open fd: exactly the shape the checkpoint/restore
+ * engine supports. Used by the restore test to prove a restored process keeps
+ * making vDSO calls (which requires the engine to relocate the vDSO onto the
+ * checkpoint-recorded base); as a static-musl binary its clock_gettime routes
+ * through the kernel vDSO just as a glibc program's would.
+ */
+static int cmd_clock_loop(int argc, char **argv) {
+    if (argc < 1) { fprintf(stderr, "clock-loop: missing file operand\n"); return 1; }
+    int fd = open(argv[0], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { perror("clock-loop: open"); return 1; }
+    unsigned long i = 0;
+    char buf[24];
+    struct timespec t = { 0, 20000000 };
+    struct timespec now;
+    for (;;) {
+        i++;
+        clock_gettime(CLOCK_MONOTONIC, &now); /* vDSO fast path */
+        unsigned long v = i;
+        for (int d = 19; d >= 0; d--) { buf[d] = '0' + (v % 10); v /= 10; }
+        buf[20] = '\n';
+        /* Touch `now` so the vDSO call cannot be optimized away. */
+        if (now.tv_sec < 0) buf[0] = '?';
+        lseek(fd, 0, SEEK_SET);
+        if (write(fd, buf, 21) < 0) _exit(1);
+        nanosleep(&t, NULL);
+    }
+    return 0;
+}
+
 /* ── chdir (non-standard: chdir from a READ-ONLY path buffer) ─── */
 /*
  * Copies the target path onto a freshly mmap'd page, flips it to PROT_READ,
@@ -719,6 +755,7 @@ static int dispatch(const char *cmd, int argc, char **argv) {
     if (strcmp(cmd, "listxattr") == 0)      return cmd_listxattr(argc, argv);
     if (strcmp(cmd, "fstat-fd") == 0)      return cmd_fstat_fd(argc, argv);
     if (strcmp(cmd, "spawn-loop") == 0)     return cmd_spawn_loop(argc, argv);
+    if (strcmp(cmd, "clock-loop") == 0)     return cmd_clock_loop(argc, argv);
     if (strcmp(cmd, "true") == 0)           return 0;
     if (strcmp(cmd, "false") == 0)          return 1;
 

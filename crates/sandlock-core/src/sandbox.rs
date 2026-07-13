@@ -874,10 +874,9 @@ impl Sandbox {
     /// transparently recreated are recorded on this `Sandbox`; query them with
     /// [`Sandbox::restore_skipped`]. x86_64 restore engine only.
     ///
-    /// Limitation: transparent restore currently works for vDSO-free programs.
-    /// libc/glibc programs that call vDSO functions (e.g. `clock_gettime`) crash
-    /// on resume because the vDSO is not yet relocated/restored (known limitation,
-    /// next milestone).
+    /// The kernel vDSO is relocated onto the checkpoint-recorded base during
+    /// restore, so ordinary libc/glibc programs that call vDSO functions (e.g.
+    /// `clock_gettime`) resume correctly. Assumes a same-kernel restore.
     ///
     /// On error the child may be left half-built; the caller should drop/kill the
     /// Sandbox (Drop reaps it).

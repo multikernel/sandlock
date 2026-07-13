@@ -69,6 +69,74 @@ pub(crate) fn build_fd_plan(fds: &[FdInfo]) -> (Vec<FdInfo>, Vec<SkippedFd>) {
     (restorable, skipped)
 }
 
+/// The (start, end) of the mapping named exactly `name` (e.g. `"[vdso]"`) in
+/// `maps`, or `None` if absent.
+fn find_named_map(maps: &[MemoryMap], name: &str) -> Option<(u64, u64)> {
+    maps.iter()
+        .find(|m| m.path.as_deref() == Some(name))
+        .map(|m| (m.start, m.end))
+}
+
+/// One planned relocation of a kernel special mapping ([vdso]/[vvar]): move the
+/// mapping currently at `cur_start` (length `len`) to `target_start`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct VdsoMove {
+    pub cur_start: u64,
+    pub len: u64,
+    pub target_start: u64,
+}
+
+/// Plan the relocations that put the stub's `[vvar]`/`[vdso]` at the addresses
+/// the checkpoint recorded. A mapping is moved only when present in both layouts
+/// and its current base differs from the target. The returned moves are ordered
+/// so that no move's *target* range overlaps a not-yet-executed move's *current*
+/// range, which would destroy a source before it is relocated. A layout that
+/// would require swapping two overlapping ranges (a dependency cycle) is
+/// reported as an error rather than corrupting the mappings.
+///
+/// Rationale for same-kernel restore: the vDSO/vvar *code and data* the kernel
+/// mapped into the stub are identical to the checkpoint's (same kernel); only
+/// the ASLR base differs. Moving each mapping to its recorded base makes every
+/// pointer glibc cached into the vDSO resolve correctly on resume. The constant
+/// vvar-to-vdso distance is preserved automatically because both are moved to
+/// recorded addresses that already encode that distance.
+pub(crate) fn plan_vdso_moves(
+    cur: &[MemoryMap],
+    cp: &[MemoryMap],
+) -> Result<Vec<VdsoMove>, String> {
+    let mut remaining: Vec<VdsoMove> = Vec::new();
+    for name in ["[vvar]", "[vvar_vclock]", "[vdso]"] {
+        if let (Some((cs, ce)), Some((ts, _))) =
+            (find_named_map(cur, name), find_named_map(cp, name))
+        {
+            if cs != ts {
+                remaining.push(VdsoMove { cur_start: cs, len: ce - cs, target_start: ts });
+            }
+        }
+    }
+
+    let mut ordered = Vec::new();
+    while !remaining.is_empty() {
+        // Pick a move whose target does not overlap any *other* remaining move's
+        // current range: relocating it cannot clobber a source we still need.
+        let pick = remaining.iter().position(|m| {
+            let (t_start, t_end) = (m.target_start, m.target_start + m.len);
+            !remaining
+                .iter()
+                .any(|o| o != m && t_start < (o.cur_start + o.len) && o.cur_start < t_end)
+        });
+        match pick {
+            Some(i) => ordered.push(remaining.remove(i)),
+            None => {
+                return Err(
+                    "vdso/vvar relocation requires swapping overlapping ranges".into(),
+                )
+            }
+        }
+    }
+    Ok(ordered)
+}
+
 fn prot_from_perms(perms: &str) -> libc::c_int {
     let mut prot = 0;
     if perms.as_bytes().first() == Some(&b'r') { prot |= libc::PROT_READ; }
@@ -90,10 +158,15 @@ fn prot_from_perms(perms: &str) -> libc::c_int {
 /// Limitation: file-backed regions are restored `MAP_PRIVATE` from the on-disk
 /// file, so a checkpointed `MAP_SHARED` mapping is restored as private
 /// (documented M1 limitation).
-/// Limitation: transparent restore currently works for vDSO-free programs.
-/// libc/glibc programs that call vDSO functions (e.g. `clock_gettime`) crash
-/// on resume because the vDSO is not yet relocated/restored (known limitation,
-/// next milestone).
+/// vDSO handling: the kernel-provided `[vdso]`/`[vvar]`/`[vvar_vclock]` mappings
+/// are relocated onto the checkpoint-recorded bases (see `plan_vdso_moves`), so
+/// libc/glibc programs whose cached vDSO pointers (e.g. `clock_gettime`) target
+/// the checkpoint-era base resume correctly. This assumes a same-kernel restore
+/// (the vDSO code is byte-identical; only the ASLR base differs).
+/// Limitation: the stub's own leftover mappings (launcher text, pre-exec stack,
+/// inherited anon) are not swept, so the restored address space is the union of
+/// the checkpoint image and those leftovers; `/proc/self/maps` shows them and
+/// they remain readable to the workload.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn restore_into(
     pid: i32,
@@ -106,6 +179,7 @@ pub(crate) fn restore_into(
     const MMAP: u64 = 9;
     const MPROTECT: u64 = 10;
     const MUNMAP: u64 = 11;
+    const MREMAP: u64 = 25;
     const OPEN: u64 = 2;
     const CLOSE: u64 = 3;
     const LSEEK: u64 = 8;
@@ -257,6 +331,42 @@ pub(crate) fn restore_into(
         }
     }
 
+    // Relocate the kernel-provided [vdso]/[vvar] to the addresses the checkpoint
+    // recorded. glibc caches vDSO function pointers (clock_gettime, getcpu, ...)
+    // in process memory at the vDSO's original base; without this, a restored
+    // libc program jumps to the checkpoint-era base, which the fresh stub mapped
+    // elsewhere under ASLR, and faults on its first vDSO call. Same-kernel
+    // restore only: the vDSO code is byte-identical, so moving it to the recorded
+    // base makes every cached pointer valid. A vDSO-free checkpoint yields no
+    // moves.
+    {
+        let cur = crate::checkpoint::capture::parse_proc_maps(pid)
+            .map_err(|e| err(format!("restore read maps for vdso relocation: {e}")))?;
+        let moves = plan_vdso_moves(&cur, &cp.process_state.memory_maps)
+            .map_err(|m| err(format!("restore vdso relocation: {m}")))?;
+        for mv in moves {
+            let flags = (libc::MREMAP_MAYMOVE | libc::MREMAP_FIXED) as u64;
+            let r = inject::inject_syscall_at(
+                pid,
+                tramp,
+                MREMAP,
+                [mv.cur_start, mv.len, mv.len, flags, mv.target_start, 0],
+            )
+            .map_err(|e| {
+                err(format!(
+                    "restore mremap {:#x}->{:#x}: {e}",
+                    mv.cur_start, mv.target_start
+                ))
+            })?;
+            if r as u64 != mv.target_start {
+                return Err(err(format!(
+                    "restore mremap {:#x}->{:#x} -> {r:#x}",
+                    mv.cur_start, mv.target_start
+                )));
+            }
+        }
+    }
+
     // Unmap the RWX trampoline as the very last injected syscall, after all
     // region and fd injections (which need it), and before the register restores
     // (which use ptrace, not the trampoline). The `syscall` instruction at
@@ -368,6 +478,76 @@ mod tests {
             "/dev/ paths must be skipped");
         assert!(skipped.contains(&SkippedFd { fd: 10, path: "/sys/kernel/x".into() }),
             "/sys/ paths must be skipped");
+    }
+
+    fn map(start: u64, end: u64, path: Option<&str>) -> MemoryMap {
+        MemoryMap { start, end, perms: "rw-p".into(), offset: 0, path: path.map(Into::into) }
+    }
+
+    #[test]
+    fn vdso_moves_relocate_present_mappings_only() {
+        // Stub layout (cur) and checkpoint layout (cp) disagree on vdso/vvar
+        // bases; a non-special region present in both is ignored.
+        let cur = vec![
+            map(0x1000, 0x2000, Some("[vvar]")),
+            map(0x2000, 0x3000, Some("[vdso]")),
+            map(0x9000, 0xa000, None),
+        ];
+        let cp = vec![
+            map(0x5000, 0x6000, Some("[vvar]")),
+            map(0x6000, 0x7000, Some("[vdso]")),
+        ];
+        let moves = plan_vdso_moves(&cur, &cp).expect("no cycle");
+        assert_eq!(moves.len(), 2, "both special mappings relocate");
+        assert!(moves.iter().any(|m| m.cur_start == 0x1000 && m.target_start == 0x5000));
+        assert!(moves.iter().any(|m| m.cur_start == 0x2000 && m.target_start == 0x6000));
+    }
+
+    #[test]
+    fn vdso_moves_skip_when_base_already_matches() {
+        let cur = vec![map(0x5000, 0x6000, Some("[vdso]"))];
+        let cp = vec![map(0x5000, 0x6000, Some("[vdso]"))];
+        assert!(plan_vdso_moves(&cur, &cp).unwrap().is_empty(),
+            "no move when the base already matches");
+    }
+
+    #[test]
+    fn vdso_moves_skip_when_absent_from_checkpoint() {
+        // A freestanding checkpoint records no vdso; nothing to relocate.
+        let cur = vec![map(0x2000, 0x3000, Some("[vdso]"))];
+        let cp = vec![map(0x2000, 0x3000, None)];
+        assert!(plan_vdso_moves(&cur, &cp).unwrap().is_empty());
+    }
+
+    #[test]
+    fn vdso_moves_order_avoids_clobbering_a_source() {
+        // vvar must move onto the range vdso currently occupies. Moving vvar
+        // first would destroy vdso's source, so vdso must be scheduled first.
+        let cur = vec![
+            map(0x1000, 0x2000, Some("[vvar]")),
+            map(0x5000, 0x6000, Some("[vdso]")),
+        ];
+        let cp = vec![
+            map(0x5000, 0x6000, Some("[vvar]")), // vvar target == vdso's current base
+            map(0x8000, 0x9000, Some("[vdso]")),
+        ];
+        let moves = plan_vdso_moves(&cur, &cp).expect("no cycle");
+        assert_eq!(moves[0].cur_start, 0x5000, "vdso relocates before vvar overwrites its base");
+        assert_eq!(moves[1].cur_start, 0x1000);
+    }
+
+    #[test]
+    fn vdso_moves_reject_unresolvable_swap() {
+        // Each mapping's target is the other's current base: no safe order.
+        let cur = vec![
+            map(0x1000, 0x2000, Some("[vvar]")),
+            map(0x5000, 0x6000, Some("[vdso]")),
+        ];
+        let cp = vec![
+            map(0x5000, 0x6000, Some("[vvar]")),
+            map(0x1000, 0x2000, Some("[vdso]")),
+        ];
+        assert!(plan_vdso_moves(&cur, &cp).is_err(), "a pure swap is rejected, not corrupted");
     }
 
     #[test]

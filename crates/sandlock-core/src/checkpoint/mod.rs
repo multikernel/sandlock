@@ -59,7 +59,12 @@ impl MemoryMap {
 
     pub fn is_special(&self) -> bool {
         self.path.as_ref().map_or(false, |p| {
-            p.starts_with("[vdso]") || p.starts_with("[vvar]") || p.starts_with("[vsyscall]")
+            // `[vvar_vclock]` is a newer-kernel split of `[vvar]`; it is also
+            // kernel-provided and relocated (not captured) during restore.
+            p.starts_with("[vdso]")
+                || p.starts_with("[vvar]")
+                || p.starts_with("[vvar_vclock]")
+                || p.starts_with("[vsyscall]")
         })
     }
 }
