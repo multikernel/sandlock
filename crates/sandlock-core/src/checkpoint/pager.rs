@@ -4,10 +4,13 @@
 //! UFFDIO_COPY-ing the page from the in-memory image. Only the anonymous working
 //! set flows through here; file-backed regions are kernel-paged.
 //!
-//! Note: the stub creates the userfaultfd with a plain -> UFFD_USER_MODE_ONLY
-//! fallback (hosts with vm.unprivileged_userfaultfd=0 reject the plain form).
-//! USER_MODE_ONLY serves only user-mode faults; full-fidelity paging of real
-//! programs (kernel-mode faults from syscalls touching unfilled pages) requires
+//! The userfaultfd MUST be created with O_NONBLOCK: poll()/epoll on a blocking
+//! userfaultfd always reports POLLERR (never POLLIN), so a polling pager would
+//! spin without ever reading a fault. The stub creates it O_CLOEXEC|O_NONBLOCK
+//! with a plain -> UFFD_USER_MODE_ONLY fallback (hosts with
+//! vm.unprivileged_userfaultfd=0 reject the plain form). USER_MODE_ONLY serves
+//! only user-mode faults; full-fidelity paging of real programs (kernel-mode
+//! faults from syscalls touching unfilled pages) requires
 //! vm.unprivileged_userfaultfd=1 on the node.
 
 use std::io;
@@ -123,7 +126,10 @@ fn handle_ready(uffd: i32, image: &PageImage) -> io::Result<bool> {
         return Err(e);
     }
     if msg.event == UFFD_EVENT_PAGEFAULT {
-        let addr = msg.arg[2]; // uffd_msg.arg.pagefault.address is the 3rd u64
+        // struct uffd_msg: 8-byte header (event+reserved), then the pagefault
+        // arm { u64 flags; u64 address; ... }. With the 8-byte header the fault
+        // address is the SECOND u64 of `arg` (byte offset 16), not the third.
+        let addr = msg.arg[1];
         copy_page(uffd, image, addr, page)?;
     }
     Ok(true)
@@ -189,17 +195,20 @@ mod tests {
         assert_ne!(addr, libc::MAP_FAILED);
         let start = addr as u64;
 
+        // O_NONBLOCK is mandatory: poll()/epoll on a *blocking* userfaultfd always
+        // returns POLLERR (never POLLIN), so the pager would spin forever. And
         // vm.unprivileged_userfaultfd=0 rejects plain userfaultfd(); UFFD_USER_MODE_ONLY
         // (0x1) is permitted unprivileged and handles user-mode faults, which is all
         // this test triggers.
         const UFFD_USER_MODE_ONLY: libc::c_int = 1;
+        let flags = libc::O_CLOEXEC | libc::O_NONBLOCK;
         let uffd = {
-            let plain = unsafe { libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC) } as i32;
+            let plain = unsafe { libc::syscall(libc::SYS_userfaultfd, flags) } as i32;
             if plain >= 0 {
                 plain
             } else {
                 (unsafe {
-                    libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC | UFFD_USER_MODE_ONLY)
+                    libc::syscall(libc::SYS_userfaultfd, flags | UFFD_USER_MODE_ONLY)
                 }) as i32
             }
         };
