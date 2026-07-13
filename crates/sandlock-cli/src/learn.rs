@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{anyhow, Result};
 use sandlock_core::policy_fn::{SyscallEvent, Verdict};
 use sandlock_core::profile::{FilesystemSection, ProfileInput};
+use sandlock_core::sandbox::BranchAction;
 use sandlock_core::Sandbox;
 
 use crate::LearnArgs;
@@ -133,18 +134,18 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     let cmd_str = args.cmd.join(" ");
     let cmd_refs: Vec<&str> = args.cmd.iter().map(String::as_str).collect();
 
-    // Fully permissive Landlock so nothing is blocked during observation.
-    // workdir (COW overlay) lets writes go anywhere without touching the real filesystem.
-    let cow_dir = tempfile::Builder::new()
-        .prefix("sandlock-learn-")
-        .tempdir_in("/var/tmp")
-        .map_err(|e| anyhow!("failed to create COW tempdir: {e}"))?;
-
+    // COW workdir="/" covers every path: seccomp fires before Landlock, so the
+    // supervisor intercepts every write openat and redirects it to an upper layer
+    // the real filesystem is untouched and no write is blocked.
     let observer = LearnObserver::new();
     let observer_cb = observer.clone();
     let policy = Sandbox::builder()
         .fs_read("/")
-        .workdir(cow_dir.path())
+        .workdir("/")
+        // Discard all COW changes after observation; learn is read-only from
+        // the real filesystem's perspective.
+        .on_exit(BranchAction::Abort)
+        .on_error(BranchAction::Abort)
         .net_allow("*")
         .net_allow("udp://*")
         .net_allow("icmp://*")
@@ -201,7 +202,7 @@ pub async fn run(args: LearnArgs) -> Result<()> {
 
     sampler.abort();
 
-    eprintln!("sandlock learn: done (exit={:?})", result.code());
+    eprintln!("sandlock learn: done");
 
     let peak_rss_kb = peak_rss_kb_atomic.load(Ordering::Relaxed);
     let threads = max_threads.load(Ordering::Relaxed);
@@ -215,20 +216,19 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     profile_out.program.exec = Some(PathBuf::from(&args.cmd[0]));
     profile_out.program.args = args.cmd[1..].to_vec();
 
-    let cow_path = cow_dir.path().to_path_buf();
     profile_out.filesystem = FilesystemSection {
         // Filter reads by existence to drop failed PATH-probe openats.
         // Executed binaries are merged into read.
         read: observer.reads.lock().unwrap().iter()
-            .filter(|p| p.exists() && !p.starts_with(&cow_path))
+            .filter(|p| p.exists())
             .cloned()
             .collect(),
-        // For writes: if the file exists, record the specific path (existing file modified).
-        // If it doesn't exist on the real FS (COW intercepted a create), record the parent
-        // directory instead, Landlock requires the path to exist, and the program needs
-        // write access to the directory to create new files inside it.
+        // For writes: if the file exists on the real FS, record the specific path
+        // (COW kept the original intact; the file was there before the run).
+        // If it doesn't exist (COW intercepted a create → new file in upper layer),
+        // record the parent directory instead; Landlock requires existing paths,
+        // and the program needs directory write access to create new files.
         write: observer.writes.lock().unwrap().iter()
-            .filter(|p| !p.starts_with(&cow_path))
             .filter_map(|p| {
                 if p.exists() {
                     Some(p.clone())

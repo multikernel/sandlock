@@ -335,12 +335,16 @@ fn test_learn_then_run() {
 }
 
 /// `sandlock learn` must classify file opens with write flags under `write`.
-/// Runs a shell that writes a temp file and verifies it appears under `write`.
+/// Writes to two pre-existing temp files in different directories (no error
+/// handling in the script; any blocked write would exit sh non-zero).
 #[test]
 fn test_learn_captures_fs_write() {
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
-    let path = tmp.path().to_str().unwrap().to_owned();
-    let cmd = format!("echo x > {path}");
+    let tmp1 = tempfile::NamedTempFile::new().expect("tempfile");
+    let tmp2 = tempfile::Builder::new().tempdir_in("/var/tmp").expect("tempdir");
+    let tmp2_file = tmp2.path().join("sandlock-learn-write2.txt");
+    let path1 = tmp1.path().to_str().unwrap().to_owned();
+    let path2 = tmp2_file.to_str().unwrap().to_owned();
+    let cmd = format!("echo x > {path1} && echo y > {path2}");
     let output = sandlock_bin()
         .args(["learn", "--", "sh", "-c", &cmd])
         .output()
@@ -352,10 +356,9 @@ fn test_learn_captures_fs_write() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("");
-    assert!(
-        write_line.contains(&path),
-        "expected {path} under write = [...], got: {write_line}",
-    );
+    assert!(write_line.contains(&path1), "expected {path1} under write = [...], got: {write_line}");
+    assert!(write_line.contains(&path2) || write_line.contains(tmp2.path().to_str().unwrap()),
+        "expected {path2} (or its parent) under write = [...], got: {write_line}");
 }
 
 /// New file creates must be collapsed to the parent directory in the profile.
