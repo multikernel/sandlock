@@ -295,9 +295,10 @@ fn test_learn_captures_fs_read() {
         String::from_utf8_lossy(&output.stderr),
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let read_line = stdout.lines().find(|l| l.starts_with("read = [")).unwrap_or("");
     assert!(
-        stdout.contains("/etc/hostname"),
-        "expected /etc/hostname in learn output, got:\n{stdout}",
+        read_line.contains("/etc/hostname"),
+        "expected /etc/hostname under read = [...], got: {read_line}",
     );
 }
 
@@ -350,11 +351,6 @@ fn test_learn_captures_fs_write() {
         String::from_utf8_lossy(&output.stderr),
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains(&path),
-        "expected {path} in learn write output, got:\n{stdout}",
-    );
-    // Confirm it appears in write = [...], not read
     let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("");
     assert!(
         write_line.contains(&path),
@@ -454,6 +450,38 @@ fn test_learn_captures_net_connect() {
     assert!(
         net_line.contains(&expected),
         "expected {expected} under [network] allow = [...], got: {net_line}",
+    );
+}
+
+/// `sandlock learn` must capture reads done via the `openat2` syscall (not just
+/// `openat`).
+#[test]
+fn test_learn_captures_openat2() {
+    // SYS_openat2 = 437 on x86_64; struct open_how { u64 flags; u64 mode; u64 resolve; }
+    // class can't follow ';' in Python one-liners; use embedded newlines.
+    let script = concat!(
+        "import ctypes, os\n",
+        "libc = ctypes.CDLL(None)\n",
+        "class How(ctypes.Structure):\n",
+        " _fields_ = [('f',ctypes.c_uint64),('m',ctypes.c_uint64),('r',ctypes.c_uint64)]\n",
+        "how = How(f=os.O_RDONLY)\n",
+        "fd = libc.syscall(437, -100, b'/etc/hostname', ctypes.byref(how), ctypes.sizeof(how))\n",
+        "os.read(fd, 4); os.close(fd)",
+    );
+    let output = sandlock_bin()
+        .args(["learn", "--", "python3", "-c", script])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let read_line = stdout.lines().find(|l| l.starts_with("read = [")).unwrap_or("");
+    assert!(
+        read_line.contains("/etc/hostname"),
+        "expected /etc/hostname under read = [...] (via openat2), got: {read_line}",
     );
 }
 
