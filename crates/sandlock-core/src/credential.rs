@@ -374,6 +374,11 @@ pub fn parse_auth(spec: &str, credential: &str) -> Result<AuthShape, SandboxErro
             }
             AuthShape::Header { name: name.to_string() }
         }
+        // The de-dup filter matches param names percent-decoded, but not `+`
+        // (form-encoded space) or the quirks of non-conformant server query
+        // parsers. Use a plain URL-token name (letters/digits, no spaces, `+`,
+        // or percent-encoding) so the injected pair reliably replaces the
+        // child's rather than sitting alongside it.
         ("query", Some(param)) if !param.is_empty() => AuthShape::Query { param: param.to_string() },
         _ => {
             return Err(SandboxError::Invalid(format!(

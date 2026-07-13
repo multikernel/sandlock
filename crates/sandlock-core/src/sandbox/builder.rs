@@ -765,15 +765,19 @@ impl SandboxBuilder {
                 .chain(self.fs_writable.iter())
                 .chain(self.fs_mount.iter().map(|(_, host)| host))
                 .chain(self.chroot.as_ref());
-            if let Some(grant) =
-                exposing_grant(std::path::Path::new(path), grants, &self.fs_denied)
-            {
+            if let Some(exposure) = exposing_grant(
+                std::path::Path::new(path),
+                grants,
+                &self.fs_denied,
+                self.chroot.as_deref(),
+            ) {
                 eprintln!(
                     "sandlock: warning: credential file {} is inside the sandbox grant {}; \
                      the sandboxed child can read the secret directly; keep it outside every \
-                     fs grant (or add an fs-deny for it)",
+                     fs grant (or add `--fs-deny {}` to close it)",
                     path,
-                    grant.display()
+                    exposure.grant.display(),
+                    exposure.deny_target.display(),
                 );
             }
         }
@@ -903,24 +907,75 @@ impl SandboxBuilder {
     }
 }
 
+/// An fs grant that exposes a credential file to the sandboxed child, with the
+/// path an operator should hand `--fs-deny` to actually close the hole.
+struct Exposure {
+    /// The first fs grant that reaches the secret (named in the diagnostic).
+    grant: std::path::PathBuf,
+    /// What `--fs-deny` must target to suppress this: the host path normally,
+    /// but the in-jail (virtual) path under chroot, where the notif layer
+    /// matches `--fs-deny` values as virtual prefixes (`ChrootCtx::is_denied`).
+    deny_target: std::path::PathBuf,
+}
+
 /// The first fs grant that exposes `secret` to the sandboxed child, or `None`
 /// when no grant reaches it or an fs-deny covers it (the deny closes the hole,
 /// so no warning is due). Best-effort: canonicalize where possible.
+///
+/// `chroot` is the jail root when running chrooted. In that mode `--fs-deny`
+/// values are matched as in-jail (virtual) prefixes, not host paths, so the
+/// deny suppression and the advised deny path are computed in the virtual
+/// namespace: a host-path deny like `/jail/etc/token` would silence the warning
+/// here yet never fire at runtime (the child opens `/etc/token`).
 fn exposing_grant<'a>(
     secret: &std::path::Path,
     grants: impl Iterator<Item = &'a std::path::PathBuf>,
     denies: &[std::path::PathBuf],
-) -> Option<std::path::PathBuf> {
+    chroot: Option<&std::path::Path>,
+) -> Option<Exposure> {
     let secret_abs = secret.canonicalize();
     let secret_ref = secret_abs.as_deref().unwrap_or(secret);
-    let covered_by = |p: &std::path::PathBuf| {
-        let abs = p.canonicalize();
-        secret_ref.starts_with(abs.as_deref().unwrap_or(p.as_path()))
+
+    // Whether the child's view of the secret is host-native or in-jail, and the
+    // path a matching `--fs-deny` targets. Under chroot the secret at host
+    // `<root>/etc/token` appears to the child at `/etc/token`; a deny is matched
+    // against that virtual path, so translate before testing.
+    let (deny_target, deny_is_virtual) = match chroot {
+        Some(root) => {
+            let root_abs = root.canonicalize();
+            let root_ref = root_abs.as_deref().unwrap_or(root);
+            match secret_ref.strip_prefix(root_ref) {
+                Ok(sub) => (std::path::Path::new("/").join(sub), true),
+                // Secret lives outside the jail: chroot can't expose it, but a
+                // host grant still might, so keep host-path deny semantics.
+                Err(_) => (secret_ref.to_path_buf(), false),
+            }
+        }
+        None => (secret_ref.to_path_buf(), false),
     };
-    if denies.iter().any(&covered_by) {
+
+    let covered_by_deny = |d: &std::path::PathBuf| {
+        if deny_is_virtual {
+            // Virtual prefix match mirroring `ChrootCtx::is_denied`. No
+            // canonicalize: an in-jail path need not exist on the host.
+            deny_target.starts_with(d)
+        } else {
+            let abs = d.canonicalize();
+            deny_target.starts_with(abs.as_deref().unwrap_or(d.as_path()))
+        }
+    };
+    if denies.iter().any(covered_by_deny) {
         return None;
     }
-    grants.into_iter().find(|g| covered_by(g)).cloned()
+
+    // Grant overlap stays host-native: the file physically sits inside the
+    // grant (chroot root, bind-mount host dir, or read/write grant).
+    let covered_by_grant = |g: &std::path::PathBuf| {
+        let abs = g.canonicalize();
+        secret_ref.starts_with(abs.as_deref().unwrap_or(g.as_path()))
+    };
+    let grant = grants.into_iter().find(|g| covered_by_grant(g)).cloned()?;
+    Some(Exposure { grant, deny_target })
 }
 
 #[cfg(test)]
@@ -935,23 +990,61 @@ mod tests {
         let secret = dir.join("key.txt");
         std::fs::write(&secret, "s").unwrap();
         let grants = vec![dir.clone()];
+        let found = |denies: &[PathBuf]| {
+            exposing_grant(&secret, grants.iter(), denies, None).map(|e| e.grant)
+        };
 
         // Inside a read grant: the exposing grant is reported.
-        assert_eq!(exposing_grant(&secret, grants.iter(), &[]), Some(dir.clone()));
+        assert_eq!(found(&[]), Some(dir.clone()));
         // An fs-deny on the file itself, or on a covering directory, closes the
         // hole: following the warning's own advice must silence it.
-        assert_eq!(exposing_grant(&secret, grants.iter(), std::slice::from_ref(&secret)), None);
-        assert_eq!(exposing_grant(&secret, grants.iter(), std::slice::from_ref(&dir)), None);
+        assert_eq!(found(std::slice::from_ref(&secret)), None);
+        assert_eq!(found(std::slice::from_ref(&dir)), None);
         // A deny elsewhere does not suppress the warning.
-        assert_eq!(
-            exposing_grant(&secret, grants.iter(), &[PathBuf::from("/nonexistent-deny")]),
-            Some(dir.clone())
-        );
+        assert_eq!(found(&[PathBuf::from("/nonexistent-deny")]), Some(dir.clone()));
         // Outside every grant: nothing to report.
         let other = vec![PathBuf::from("/nonexistent-grant")];
-        assert_eq!(exposing_grant(&secret, other.iter(), &[]), None);
+        assert_eq!(exposing_grant(&secret, other.iter(), &[], None).map(|e| e.grant), None);
 
         let _ = std::fs::remove_file(&secret);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn exposing_grant_chroot_deny_uses_virtual_namespace() {
+        // Jail root with the secret at <root>/etc/token; the child sees it at
+        // the in-jail path /etc/token, which is also what --fs-deny matches.
+        let root = std::env::temp_dir().join(format!("sandlock-jail-{}", std::process::id()));
+        let etc = root.join("etc");
+        std::fs::create_dir_all(&etc).unwrap();
+        let secret = etc.join("token");
+        std::fs::write(&secret, "s").unwrap();
+        let grants = vec![root.clone()];
+        let chroot = Some(root.as_path());
+        let virtual_path = PathBuf::from("/etc/token");
+
+        // The whole jail is visible: the chroot root grant is reported, and the
+        // advised deny path is the in-jail path, not the host path.
+        let exposure = exposing_grant(&secret, grants.iter(), &[], chroot).unwrap();
+        assert_eq!(exposure.grant, root);
+        assert_eq!(exposure.deny_target, virtual_path);
+
+        // Denying the in-jail path (what the notif layer actually matches, and
+        // what the warning now advises) suppresses it.
+        assert!(exposing_grant(&secret, grants.iter(), &[virtual_path.clone()], chroot).is_none());
+        // Denying a covering in-jail directory also suppresses.
+        assert!(
+            exposing_grant(&secret, grants.iter(), &[PathBuf::from("/etc")], chroot).is_none()
+        );
+        // The old advice (the host path) does NOT suppress: at runtime the child
+        // opens /etc/token, so a /jail/etc/token deny never fires. This is the
+        // regression the fix closes.
+        assert!(
+            exposing_grant(&secret, grants.iter(), std::slice::from_ref(&secret), chroot).is_some()
+        );
+
+        let _ = std::fs::remove_file(&secret);
+        let _ = std::fs::remove_dir(&etc);
+        let _ = std::fs::remove_dir(&root);
     }
 }
