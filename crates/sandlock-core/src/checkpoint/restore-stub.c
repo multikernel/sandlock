@@ -1,5 +1,5 @@
 /*
- * restore-stub — freestanding self-restore stub (x86_64, Milestone 1).
+ * restore-stub — freestanding self-restore stub (x86_64).
  *
  * This is a core component of the checkpoint restore engine, not a test
  * fixture: the supervisor execs this stub into a fresh, fully-sandboxed process
@@ -12,8 +12,8 @@
  * checkpoint's anonymous regions, registers them with userfaultfd (missing
  * mode), hands the uffd to the supervisor at UFFD_SLOT, waits for the supervisor
  * to attach its pager (GO_FD), then rt_sigreturns into the checkpoint register
- * context. M1 handles anon regions only: no vDSO relocation, no file-backed
- * regions, no fd table.
+ * context. This first cut handles anonymous regions only: no vDSO relocation,
+ * no file-backed regions, no fd table (those come later).
  *
  * Exit codes (all _exit): 2 blob read, 3 bad magic/version, 4 mmap region,
  * 5 userfaultfd, 6 UFFDIO_API, 7 UFFDIO_REGISTER, 8 dup2 uffd, 9 ready write,
@@ -128,11 +128,15 @@ static void _start_c(void) {
     unsigned char *anon = (unsigned char*)blob + h->anon_data_off;
     u64 *gp = (u64*)((char*)blob + h->regs_off);
 
-    /* 2. Map each anon region MAP_FIXED. (M1: all regions are anon.) */
+    /* 2. Map each anon region MAP_FIXED with its captured prot. (For now all
+     * regions are anon.) The prot must match the checkpoint: an executable region mapped
+     * without PROT_EXEC would fault as a protection violation (SIGSEGV) on the
+     * instruction fetch rather than a uffd missing-page fault the pager can
+     * serve. r->prot already holds standard PROT_* bits (see restore_blob.rs). */
     for (u32 i = 0; i < h->n_regions; i++) {
         struct blob_region *r = &regs_tbl[i];
         u64 len = r->end - r->start;
-        i64 p = SC6(SYS_mmap, r->start, len, PROT_READ|PROT_WRITE,
+        i64 p = SC6(SYS_mmap, r->start, len, r->prot,
                     MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0);
         if ((u64)p != r->start) die(4);
     }
@@ -142,7 +146,7 @@ static void _start_c(void) {
      * on a *blocking* userfaultfd always reports POLLERR (never POLLIN), so the
      * pager would spin and never serve a page. Hosts with
      * vm.unprivileged_userfaultfd=0 reject the plain form; retry with
-     * UFFD_USER_MODE_ONLY (user-mode faults only, sufficient for the M1 proof). */
+     * UFFD_USER_MODE_ONLY (user-mode faults only, sufficient here). */
     i64 uffd = SC1(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK);
     if (uffd < 0) uffd = SC1(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
     if (uffd < 0) die(5);
@@ -150,7 +154,7 @@ static void _start_c(void) {
     if (SC3(SYS_ioctl, uffd, UFFDIO_API, &api) < 0) die(6);
     for (u32 i = 0; i < h->n_regions; i++) {
         struct blob_region *r = &regs_tbl[i];
-        if (r->data_off == NO_DATA) continue; /* M2: file-backed, kernel-paged */
+        if (r->data_off == NO_DATA) continue; /* file-backed: kernel-paged (handled later) */
         struct uffdio_register reg = {
             r->start, r->end - r->start, UFFDIO_REGISTER_MODE_MISSING, 0 };
         if (SC3(SYS_ioctl, uffd, UFFDIO_REGISTER, &reg) < 0) die(7);
@@ -184,7 +188,7 @@ static void _start_c(void) {
                      | ((gp[UR_GS] & 0xffff) << 16)
                      | ((gp[UR_FS] & 0xffff) << 32)
                      | ((gp[UR_SS] & 0xffff) << 48);
-    m->fpstate = 0; /* M1: no FP restore */
+    m->fpstate = 0; /* no FP restore yet */
 
     /* Set rsp = &uc, then syscall rt_sigreturn. */
     register u64 rax __asm__("rax") = SYS_rt_sigreturn;
