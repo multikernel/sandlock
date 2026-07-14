@@ -157,7 +157,7 @@ fn prot_from_perms(perms: &str) -> libc::c_int {
 /// MUST kill and reap it.
 /// Limitation: file-backed regions are restored `MAP_PRIVATE` from the on-disk
 /// file, so a checkpointed `MAP_SHARED` mapping is restored as private
-/// (documented M1 limitation).
+/// (a documented limitation for now).
 /// vDSO handling: the kernel-provided `[vdso]`/`[vvar]`/`[vvar_vclock]` mappings
 /// are relocated onto the checkpoint-recorded bases (see `plan_vdso_moves`), so
 /// libc/glibc programs whose cached vDSO pointers (e.g. `clock_gettime`) target
@@ -310,8 +310,8 @@ pub(crate) fn restore_into(
         }
         if opened as i32 != f.fd {
             // dup2 may clobber an inherited stub fd at this number; that is
-            // acceptable -- inherited stub fds are disposable. Documented M1
-            // limitation, alongside the W^X trampoline constraint.
+            // acceptable -- inherited stub fds are disposable. A documented
+            // limitation for now, alongside the W^X trampoline constraint.
             let d = inject::inject_syscall_at(pid, tramp, DUP2, [opened as u64, f.fd as u64, 0, 0, 0, 0])
                 .map_err(|e| err(format!("restore dup2 {opened}->{}: {e}", f.fd)))?;
             if d < 0 { return Err(err(format!("restore dup2 {} -> {} failed: {d}", opened, f.fd))); }
