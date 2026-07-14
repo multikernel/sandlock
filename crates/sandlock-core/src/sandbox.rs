@@ -908,6 +908,13 @@ impl Sandbox {
         // 'static closure, so move a clone of `cp` in. The clone resets the
         // policy's runtime to None (Sandbox::clone), which is harmless here:
         // restore_into reads only process_state + fd_table, never policy.
+        // Resolve the confinement's chroot root and mounts so restore_into can
+        // translate the checkpoint's HOST-recorded mapping/fd paths back into
+        // the child's in-chroot view before reopening them (see restore_into).
+        // Empty/None when there is no chroot, leaving paths untranslated.
+        let chroot_root = crate::chroot::resolve::resolve_chroot_root(self.chroot.as_deref())?;
+        let mounts = crate::chroot::resolve::resolve_chroot_mounts(&self.fs_mount);
+
         let cp = cp.clone();
         let skipped = tokio::task::spawn_blocking(
             move || -> Result<Vec<crate::checkpoint::SkippedFd>, crate::error::SandlockError> {
@@ -919,7 +926,9 @@ impl Sandbox {
                 // saved registers (including rip at the checkpoint pc) loaded.
                 // On error, best-effort detach so the child is not left seized
                 // with a dangling tracer thread.
-                let skipped = match crate::checkpoint::resume::restore_into(pid, &cp) {
+                let skipped = match crate::checkpoint::resume::restore_into(
+                    pid, &cp, chroot_root.as_deref(), &mounts,
+                ) {
                     Ok(s) => s,
                     Err(e) => {
                         let _ = crate::checkpoint::capture::ptrace_detach(pid);

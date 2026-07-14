@@ -199,7 +199,21 @@ fn capture_memory(pid: i32, maps: &[MemoryMap]) -> io::Result<Vec<MemorySegment>
     let mut segments = Vec::new();
 
     for map in maps {
-        if !map.writable() || !map.private() || map.is_special() {
+        if map.is_special() || !map.private() {
+            continue;
+        }
+        // Dump writable regions (their contents are live process state) and any
+        // region backed by an unreopenable file. A memfd (e.g. the memfd the
+        // launcher execs the image binary from) or a "(deleted)" path has no
+        // file restore can reopen, so its bytes must travel inside the image or
+        // the mapping — including the program text of an imaged workload — is
+        // lost. Read-only regions backed by a real file are left to be remapped
+        // from that file at restore, which is cheaper and shares pages.
+        let unreopenable = map
+            .path
+            .as_deref()
+            .map_or(false, |p| p.starts_with("/memfd:") || p.ends_with(" (deleted)"));
+        if !map.writable() && !unreopenable {
             continue;
         }
         let size = (map.end - map.start) as usize;
