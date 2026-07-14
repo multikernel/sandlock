@@ -171,6 +171,8 @@ fn prot_from_perms(perms: &str) -> libc::c_int {
 pub(crate) fn restore_into(
     pid: i32,
     cp: &Checkpoint,
+    chroot_root: Option<&std::path::Path>,
+    mounts: &[(std::path::PathBuf, std::path::PathBuf)],
 ) -> Result<Vec<SkippedFd>, crate::error::SandlockError> {
     use crate::checkpoint::inject;
     use crate::error::{SandboxRuntimeError, SandlockError};
@@ -187,6 +189,27 @@ pub(crate) fn restore_into(
 
     // Build SandlockError::Runtime(Child(..)) the same way capture.rs does.
     let err = |msg: String| SandlockError::Runtime(SandboxRuntimeError::Child(msg));
+
+    // A confined process records its mapping/fd paths as HOST paths: capture
+    // reads /proc/<pid>/maps and /proc/<pid>/fd, whose entries are resolved in
+    // the mount namespace and so ignore the process's chroot (a file the
+    // workload sees at /lib/ld-musl... appears as <rootfs>/lib/ld-musl...).
+    // The open()s injected below run in the already-confined child, where those
+    // host paths do not resolve. Translate each back to the child's in-chroot
+    // view so the reopen lands on the same file. Without a chroot the paths are
+    // already the child's view, so they pass through unchanged.
+    let to_open_path = |host_path: &str| -> String {
+        match chroot_root {
+            Some(root) => crate::chroot::resolve::host_to_virtual(
+                root,
+                mounts,
+                std::path::Path::new(host_path),
+            )
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| host_path.to_string()),
+            None => host_path.to_string(),
+        }
+    };
 
     let plan = build_memory_plan(&cp.process_state.memory_maps, &cp.process_state.memory_data);
     let (restorable_fds, skipped) = build_fd_plan(&cp.fd_table);
@@ -255,16 +278,17 @@ pub(crate) fn restore_into(
             RestoreRegion::RemapFromFile { start, end, perms, offset, path } => {
                 let len = (end - start) as usize;
                 let prot = prot_from_perms(perms);
-                write_path(path)?;
+                let open_path = to_open_path(path);
+                write_path(&open_path)?;
                 let fd = inject::inject_syscall_at(
                     pid,
                     tramp,
                     OPEN,
                     [scratch, libc::O_RDONLY as u64, 0, 0, 0, 0],
                 )
-                .map_err(|e| err(format!("restore open {path}: {e}")))?;
+                .map_err(|e| err(format!("restore open {open_path}: {e}")))?;
                 if fd < 0 {
-                    return Err(err(format!("restore open {path} -> {fd}")));
+                    return Err(err(format!("restore open {open_path} -> {fd}")));
                 }
                 let r = inject::inject_syscall_at(
                     pid,
@@ -292,7 +316,8 @@ pub(crate) fn restore_into(
 
     // Reopen transparently restorable fds at their saved numbers/offsets.
     for f in &restorable_fds {
-        write_path(&f.path)?;
+        let open_path = to_open_path(&f.path);
+        write_path(&open_path)?;
         // Mask creation/truncation flags so the restored open cannot create,
         // truncate, or fail-exclusive on the workload's real file. The kernel
         // strips these in fdinfo, but mask defensively since O_TRUNC would be
@@ -304,9 +329,9 @@ pub(crate) fn restore_into(
             OPEN,
             [scratch, safe_flags as u64, 0, 0, 0, 0],
         )
-        .map_err(|e| err(format!("restore fd open {}: {e}", f.path)))?;
+        .map_err(|e| err(format!("restore fd open {}: {e}", open_path)))?;
         if opened < 0 {
-            return Err(err(format!("restore fd open {} -> {opened}", f.path)));
+            return Err(err(format!("restore fd open {} -> {opened}", open_path)));
         }
         if opened as i32 != f.fd {
             // dup2 may clobber an inherited stub fd at this number; that is
@@ -426,6 +451,8 @@ pub(crate) fn restore_into(
 pub(crate) fn restore_into(
     _pid: i32,
     _cp: &Checkpoint,
+    _chroot_root: Option<&std::path::Path>,
+    _mounts: &[(std::path::PathBuf, std::path::PathBuf)],
 ) -> Result<Vec<SkippedFd>, crate::error::SandlockError> {
     Err(crate::error::SandlockError::Runtime(
         crate::error::SandboxRuntimeError::Child(
@@ -649,7 +676,7 @@ mod tests {
             libc::waitpid(stub, &mut st, 0);
         } // catch the SIGSTOP-stop
 
-        let _skipped = restore_into(stub, &cp).expect("restore_into");
+        let _skipped = restore_into(stub, &cp, None, &[]).expect("restore_into");
 
         // Read the restored DON page back out of the still-stopped stub.
         let mut buf = vec![0u8; 4096];
