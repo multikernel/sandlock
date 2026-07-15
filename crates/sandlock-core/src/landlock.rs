@@ -156,13 +156,33 @@ fn add_path_rule(ruleset_fd: &OwnedFd, path: &Path, access: u64) -> Result<(), C
     // on a FIFO or a write-only/no-read path neither hangs nor fails here. An
     // O_PATH fd still supports fstat (the file-type check below) and serves as a
     // valid parent_fd for landlock_add_rule.
-    let file = std::fs::OpenOptions::new()
+    let file = match std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
         .open(path)
-        .map_err(|e| {
-            ConfinementError::Landlock(format!("open path {:?} failed: {}", path, e))
-        })?;
+    {
+        Ok(f) => f,
+        // A read/exec grant naming an absent subtree is vacuous: Landlock is
+        // default-deny, so skipping it adds no allowance and leaves confinement
+        // at least as strict (there are no files under a path that does not
+        // exist to grant). This lets one base policy list /lib, /lib64,
+        // /usr/lib, /usr/lib64, ... and take whatever subset a given host or
+        // arch actually has (e.g. RISC-V glibc and musl have no /lib64). The
+        // skip is warned, not silent, and a genuine typo still surfaces as the
+        // loud runtime failure of a program that cannot find its files. A
+        // missing WRITE target stays a hard error: the caller means it to exist.
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound && (access & !READ_ACCESS) == 0 =>
+        {
+            eprintln!("sandlock: read grant for missing path {path:?} skipped");
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(ConfinementError::Landlock(format!(
+                "open path {path:?} failed: {e}"
+            )));
+        }
+    };
 
     // Directory-only access rights (READ_DIR, MAKE_*, REMOVE_*, REFER) make
     // landlock_add_rule fail with EINVAL on a non-directory path. Mask the
@@ -877,5 +897,23 @@ mod mask_contract_tests {
         let (mask, wildcard) = compute_net_mask(6, &pol, &sb, true);
         assert_eq!(mask, 0, "net_deny + bind-all leaves no handled net access");
         assert!(wildcard, "net_deny must still set the wildcard flag");
+    }
+
+    #[test]
+    fn add_path_rule_skips_missing_read_but_fails_missing_write() {
+        let dummy = std::os::fd::OwnedFd::from(std::fs::File::open("/dev/null").unwrap());
+        let missing = std::path::Path::new("/nonexistent-sandlock-portability-probe");
+        assert!(!missing.exists(), "probe path must be absent for this test");
+
+        assert!(
+            add_path_rule(&dummy, missing, READ_ACCESS).is_ok(),
+            "a read/exec grant for a missing subtree must be skipped, not fatal"
+        );
+
+        let write_mask = LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_READ_FILE;
+        assert!(
+            add_path_rule(&dummy, missing, write_mask).is_err(),
+            "a write grant for a missing target must remain a hard error"
+        );
     }
 }
