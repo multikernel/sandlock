@@ -160,8 +160,11 @@ pub struct TxnOutcome {
     /// workdir. False if any stage failed (or the pipeline timed out) and the
     /// upper was discarded, leaving the workdir byte-identical.
     pub committed: bool,
-    /// Per-stage results in execution order. On abort this holds the stages that
-    /// actually ran, up to and including the one that failed.
+    /// Per-stage results in execution order. On a stage-failure abort this holds
+    /// the stages that ran, up to and including the one that failed. On a timeout
+    /// or driver-error abort it is empty: the in-flight stage-driver future is
+    /// cancelled and its accumulated results are dropped (`committed` and
+    /// `abort_reason` still report the outcome).
     pub stages: Vec<RunResult>,
     /// Human-readable reason the transaction aborted; `None` when committed.
     pub abort_reason: Option<String>,
