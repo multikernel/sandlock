@@ -1311,7 +1311,7 @@ fn plan_exec_rewrite(
 
     let mut buf = fd_path.to_vec();
     let mut relocated: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
-    let mut relocate = |buf: &mut Vec<u8>,
+    let relocate = |buf: &mut Vec<u8>,
                         relocated: &mut std::collections::BTreeMap<u64, u64>,
                         read: &mut dyn FnMut(u64, usize) -> Result<Vec<u8>, NotifError>,
                         ptr: u64|
