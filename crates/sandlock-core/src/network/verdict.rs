@@ -76,6 +76,47 @@ pub(crate) fn path_under_any(path: &std::path::Path, prefixes: &[std::path::Path
     prefixes.iter().any(|p| norm.starts_with(p))
 }
 
+/// The send path selected for one message, from the already-parsed destination
+/// shape and the *stable* socket domain. Pure: the caller supplies whether the
+/// message is connected, the parsed IP (if any), and whether the pinned socket
+/// is `AF_UNIX`, so the decision is unit-testable and cannot re-read child state.
+///
+/// The unix-datagram arm sends on-behalf on the pinned fd rather than returning
+/// `Continue`: gating on the transient address family and Continuing would let a
+/// racing `dup2(inet_sock, sockfd)` + `msg_name` swap ride out on the kernel's
+/// re-read and reach a denied IP. Sending on the pinned fd we already checked
+/// closes that window.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SendPath {
+    /// Connected socket: no per-message destination; send on-behalf, no check.
+    ConnectedOnBehalf,
+    /// IP destination: validate `ip` against the allowlist, then send on-behalf.
+    IpChecked(IpAddr),
+    /// Non-IP address on a unix-domain socket: a unix datagram; send on-behalf on
+    /// the pinned fd with no IP check (the kernel constrains a unix socket to
+    /// unix peers, and we never Continue).
+    UnixOnBehalf,
+    /// Non-IP address on a non-unix socket: the address-family-swap shape; fail
+    /// closed with `EAFNOSUPPORT`.
+    Reject,
+}
+
+/// Classify a send destination into the [`SendPath`] the handler should take.
+pub(crate) fn classify_send_path(
+    connected: bool,
+    ip: Option<IpAddr>,
+    is_unix_socket: bool,
+) -> SendPath {
+    if connected {
+        return SendPath::ConnectedOnBehalf;
+    }
+    match ip {
+        Some(ip) => SendPath::IpChecked(ip),
+        None if is_unix_socket => SendPath::UnixOnBehalf,
+        None => SendPath::Reject,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,5 +160,43 @@ mod tests {
         let p = allowlist_for("10.0.0.1", 443);
         let allowed: IpAddr = "10.0.0.1".parse().unwrap();
         assert_eq!(destination_verdict(&p, allowed, None), Err(ECONNREFUSED));
+    }
+
+    #[test]
+    fn send_path_connected_never_checks_address() {
+        // A connected socket carries no per-message destination; the parsed
+        // address and socket domain are irrelevant.
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        assert_eq!(
+            classify_send_path(true, Some(ip), false),
+            SendPath::ConnectedOnBehalf
+        );
+        assert_eq!(
+            classify_send_path(true, None, true),
+            SendPath::ConnectedOnBehalf
+        );
+    }
+
+    #[test]
+    fn send_path_ip_destination_is_checked() {
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        assert_eq!(classify_send_path(false, Some(ip), false), SendPath::IpChecked(ip));
+        // Socket domain does not override a parsed IP destination.
+        assert_eq!(classify_send_path(false, Some(ip), true), SendPath::IpChecked(ip));
+    }
+
+    #[test]
+    fn send_path_non_ip_on_unix_socket_goes_on_behalf() {
+        // A non-IP address on a unix-domain socket is a unix datagram: send it
+        // on-behalf on the pinned fd (never Continue), so a raced fd/addr swap
+        // cannot redirect it to a denied IP.
+        assert_eq!(classify_send_path(false, None, true), SendPath::UnixOnBehalf);
+    }
+
+    #[test]
+    fn send_path_non_ip_on_non_unix_socket_is_rejected() {
+        // A non-IP address on a non-unix (IP) socket is the address-family-swap
+        // shape; fail closed.
+        assert_eq!(classify_send_path(false, None, false), SendPath::Reject);
     }
 }
