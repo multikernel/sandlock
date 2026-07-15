@@ -398,6 +398,65 @@ async fn test_seccomp_cow_read_existing() {
     let _ = fs::remove_dir_all(&workdir);
 }
 
+/// Regression test: a file deleted inside the COW workdir must read back as
+/// ENOENT, not its pre-delete content. The read/open path returned
+/// `Skip -> Continue` for a whiteout, so the kernel opened the untouched lower
+/// file and leaked the original bytes — while stat/access already returned
+/// ENOENT, so the two paths disagreed and a deletion was invisible to a reader.
+#[tokio::test]
+async fn test_seccomp_cow_read_deleted_file_is_enoent() {
+    let workdir = temp_dir("seccomp-read-deleted");
+    let out_file = std::env::temp_dir().join(format!(
+        "sandlock-test-read-deleted-{}", std::process::id()
+    ));
+    fs::write(workdir.join("secret.txt"), "PREDELETE").unwrap();
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc").fs_read("/dev")
+        .fs_write(&workdir).fs_write("/tmp")
+        .workdir(&workdir)
+        .cwd(&workdir)
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+
+    // Delete the file, then read it back with `dd`, which issues a bare
+    // open(O_RDONLY) with no preceding path stat — unlike `cat FILE` or a shell
+    // redirect, which stat first and would short-circuit on the (correct) stat
+    // ENOENT without ever exercising the open path this fix targets. `dd`
+    // succeeding means the open was honored and the untouched lower bytes leaked;
+    // `dd` failing means the whiteout was honored (ENOENT). Both the copied bytes
+    // and the marker land in /tmp (not the COW workdir), so they are real writes.
+    let secret = workdir.join("secret.txt");
+    let leak_file = std::env::temp_dir().join(format!(
+        "sandlock-test-read-deleted-leak-{}", std::process::id()
+    ));
+    let cmd = format!(
+        "rm -f {secret}; if dd if={secret} of={leak} status=none; then printf 'OPENED' > {marker}; else printf 'DENIED' > {marker}; fi",
+        secret = secret.display(),
+        leak = leak_file.display(),
+        marker = out_file.display(),
+    );
+
+    let result = policy.clone().with_name("test").run(&["sh", "-c", &cmd]).await.unwrap();
+    assert!(result.success(), "exit={:?}, stderr={}", result.code(), result.stderr_str().unwrap_or(""));
+    let marker = fs::read_to_string(&out_file).unwrap_or_default();
+    let leaked = fs::read_to_string(&leak_file).unwrap_or_default();
+    assert_eq!(
+        marker, "DENIED",
+        "open of a deleted COW file must be denied (ENOENT), not read lower content (leaked: {:?})", leaked
+    );
+    assert!(
+        leaked.is_empty(),
+        "no pre-delete bytes may leak through the read path, got: {:?}", leaked
+    );
+
+    let _ = fs::remove_dir_all(&workdir);
+    let _ = fs::remove_file(&out_file);
+    let _ = fs::remove_file(&leak_file);
+}
+
 /// Regression test: statx on a COW-created file must succeed.
 ///
 /// statx is what `ls`, `stat`, and most modern coreutils use. The COW

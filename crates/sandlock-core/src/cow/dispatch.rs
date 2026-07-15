@@ -256,6 +256,10 @@ pub(crate) async fn handle_cow_open(
     // Phase 2: execute I/O plan without holding the lock
     let real_path = match plan {
         CowOpenPlan::Skip => return NotifAction::Continue,
+        // Deleted in this branch (whiteout): the lower file still exists, so
+        // Continue would read its pre-delete content. Return ENOENT, matching
+        // the stat/access handlers.
+        CowOpenPlan::Deleted => return NotifAction::Errno(libc::ENOENT),
         CowOpenPlan::Resolved(p) | CowOpenPlan::UpperReady { upper: p } => p,
         CowOpenPlan::NeedsCopy { upper, lower: _lower, file_size, rel_path } => {
             // Do the potentially-expensive copy on a blocking thread

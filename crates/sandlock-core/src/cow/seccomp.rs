@@ -46,6 +46,10 @@ pub enum CowCopyPlan {
 pub enum CowOpenPlan {
     /// No interception needed — let the kernel handle it.
     Skip,
+    /// The path was deleted in this branch (a whiteout) and is opened without
+    /// `O_CREAT`. The caller must return `ENOENT` rather than letting the kernel
+    /// open the untouched lower file, which still holds the pre-delete bytes.
+    Deleted,
     /// File already resolved (upper or lower) — open this path directly.
     Resolved(PathBuf),
     /// Need to copy lower to upper, then open upper.
@@ -447,7 +451,11 @@ impl SeccompCowBranch {
             if flags & O_CREAT != 0 {
                 return self.prepare_cow_copy(&rel);
             }
-            return Ok(CowOpenPlan::Skip);
+            // Whiteout: the file was deleted in this branch. Do NOT skip to the
+            // lower file (which still physically exists with its pre-delete
+            // content); report the deletion so the caller returns ENOENT,
+            // matching the stat/access path.
+            return Ok(CowOpenPlan::Deleted);
         }
 
         // O_EXCL: fail if file already exists
@@ -1382,6 +1390,21 @@ mod tests {
         // O_RDONLY
         let plan = branch.prepare_open(&path, 0).unwrap();
         assert!(matches!(plan, CowOpenPlan::Resolved(_)));
+    }
+
+    #[test]
+    fn test_prepare_open_read_deleted_reports_deleted() {
+        // A file deleted in this branch is a whiteout: a read-only open must NOT
+        // fall through to the untouched lower file (which still holds the
+        // pre-delete bytes). It must report the deletion so the caller returns
+        // ENOENT, matching the stat/access path.
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        branch.mark_deleted("existing.txt");
+        let path = abs(&branch, "existing.txt");
+        // O_RDONLY
+        let plan = branch.prepare_open(&path, 0).unwrap();
+        assert!(matches!(plan, CowOpenPlan::Deleted));
     }
 
     #[test]
