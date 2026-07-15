@@ -721,10 +721,10 @@ pub(crate) async fn handle_chroot_exec(
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
     let nr = notif.data.nr as i64;
-    let (dirfd, path_ptr) = if nr == libc::SYS_execveat {
-        (notif.data.args[0] as i64, notif.data.args[1])
+    let (dirfd, path_ptr, argv_ptr) = if nr == libc::SYS_execveat {
+        (notif.data.args[0] as i64, notif.data.args[1], notif.data.args[2])
     } else {
-        (libc::AT_FDCWD as i64, notif.data.args[0])
+        (libc::AT_FDCWD as i64, notif.data.args[0], notif.data.args[1])
     };
 
     let rel_path = match read_path(notif, path_ptr, notif_fd) {
@@ -868,12 +868,17 @@ pub(crate) async fn handle_chroot_exec(
         return NotifAction::Errno(libc::EIO);
     }
 
-    // Force-write past read-only page protections: the child commonly passes a
-    // .rodata path literal to execve, which process_vm_writev can't overwrite.
-    // No length guard needed — execve replaces the address space on success, so
-    // a write past the original buffer is harmless.
-    let fd_path = format!("/proc/self/fd/{}\0", child_fd);
-    if write_child_mem_force(notif_fd, notif.id, notif.pid, path_ptr, fd_path.as_bytes()).is_err() {
+    // Rewrite the path to /proc/self/fd/N, relocating argv[0] when it aliases
+    // the path buffer (see rewrite_exec_path_to_fd). Force-writes past
+    // read-only page protections: the child commonly passes a .rodata path
+    // literal to execve, which process_vm_writev can't overwrite. No length
+    // guard needed — execve replaces the address space on success, so a write
+    // past the original buffer is harmless.
+    if crate::seccomp::notif::rewrite_exec_path_to_fd(
+        notif_fd, notif.id, notif.pid, path_ptr, argv_ptr, child_fd,
+    )
+    .is_err()
+    {
         return NotifAction::Errno(libc::EFAULT);
     }
 

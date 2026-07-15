@@ -1176,6 +1176,66 @@ fn write_child_mem_proc(pid: u32, addr: u64, data: &[u8]) -> Result<(), NotifErr
     Ok(())
 }
 
+/// Rewrite an execve/execveat path argument to `/proc/self/fd/<child_fd>`,
+/// preserving argv[0].
+///
+/// Shells and `execvp`-style callers commonly pass the same buffer as both
+/// the exec path and argv[0] (dash execs `./m` with path == argv[0]).
+/// Rewriting the path in place would then also rewrite argv[0], breaking
+/// multicall binaries (busybox, uutils coreutils) that dispatch on
+/// basename(argv[0]) — they would see basename "N" of the fd path. When
+/// argv[0] points into the bytes the rewrite clobbers, the original argv[0]
+/// string is relocated to directly after the fd path and the argv[0] pointer
+/// slot is patched to the relocated copy.
+///
+/// Writing past the original path buffer (both the fd path itself and the
+/// relocated argv[0]) is harmless for the same reason as the plain rewrite:
+/// execve replaces the whole address space on success, and the kernel copies
+/// the path and argv/envp strings out of the old address space only after
+/// this returns Continue, before anything else runs in the child.
+///
+/// `argv_ptr` is the syscall's argv argument (args[1] for execve, args[2]
+/// for execveat); 0 (NULL argv) skips the preservation and only rewrites
+/// the path.
+pub(crate) fn rewrite_exec_path_to_fd(
+    notif_fd: RawFd,
+    id: u64,
+    pid: u32,
+    path_ptr: u64,
+    argv_ptr: u64,
+    child_fd: i32,
+) -> Result<(), NotifError> {
+    let fd_path = format!("/proc/self/fd/{}\0", child_fd);
+    let clobber_end = path_ptr + fd_path.len() as u64;
+
+    // Read the argv[0] pointer slot before deciding whether the rewrite
+    // clobbers the string it points at.
+    let argv0_ptr = if argv_ptr != 0 {
+        read_child_mem(notif_fd, id, pid, argv_ptr, 8)
+            .ok()
+            .and_then(|b| <[u8; 8]>::try_from(b).ok())
+            .map(u64::from_ne_bytes)
+    } else {
+        None
+    };
+
+    match argv0_ptr {
+        Some(p) if p >= path_ptr && p < clobber_end => {
+            // argv[0] aliases the path buffer: save it first, then write
+            // [fd_path NUL][argv0 NUL] and point the argv[0] slot at the copy.
+            let orig = read_child_cstr(notif_fd, id, pid, p, 4096).unwrap_or_default();
+            let mut buf = Vec::with_capacity(fd_path.len() + orig.len() + 1);
+            buf.extend_from_slice(fd_path.as_bytes());
+            buf.extend_from_slice(orig.as_bytes());
+            buf.push(0);
+            write_child_mem_force(notif_fd, id, pid, path_ptr, &buf)?;
+            let relocated = path_ptr + fd_path.len() as u64;
+            write_child_mem_force(notif_fd, id, pid, argv_ptr, &relocated.to_ne_bytes())
+        }
+        _ => write_child_mem_force(notif_fd, id, pid, path_ptr, fd_path.as_bytes()),
+    }
+}
+
 // ============================================================
 // Response dispatch
 // ============================================================
