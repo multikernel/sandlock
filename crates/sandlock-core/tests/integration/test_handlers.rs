@@ -677,11 +677,15 @@ async fn run_with_handlers_rejects_handler_on_default_blocklist_syscall() {
 async fn inject_bytes_delivers_synthetic_content_to_guest() {
     let policy = base_policy().build().unwrap();
     let out = temp_out("inject-bytes-content");
-    // Sentinel path: never created on the host. `cat` opens it (intercepted),
-    // the handler injects content, and `cat` writes that to `out`.
+    // Sentinel path: never created on the host. The shell opens it as a
+    // stdin redirect (intercepted), the handler injects content, and `cat`
+    // copies that to `out`. Redirection (not a `cat` path operand) keeps the
+    // open a bare openat: multicall coreutils `cat` (Ubuntu rust-coreutils)
+    // statx-es a path operand first and would fail on the host-nonexistent
+    // path before ever reaching the intercepted openat.
     let virt = "/tmp/sandlock-virtual-inject-XYZ";
     let content = "INJECTED_SECRET_42\n";
-    let cmd = format!("cat {virt} > {}", out.display());
+    let cmd = format!("cat < {virt} > {}", out.display());
 
     let handler = |cx: &HandlerCtx| {
         // openat(2): args[1] is the path. Read it synchronously, then move only
