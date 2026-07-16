@@ -6,6 +6,27 @@ fn sandlock_bin() -> Command {
     cmd
 }
 
+/// Drop `-r /lib64` from a CLI argument list when the host has no `/lib64`
+/// (RISC-V glibc and musl put the loader under `/lib`, with no `/lib64` at
+/// all). `-r` maps to a mandatory `fs_read`, so requiring `/lib64` on such a
+/// host aborts confinement; this mirrors `fs_read_if_exists` at the CLI layer.
+/// On hosts that have `/lib64` (x86-64) the arguments pass through unchanged.
+fn args_for_host(args: &[&str]) -> Vec<String> {
+    let has_lib64 = std::path::Path::new("/lib64").exists();
+    let mut out: Vec<String> = Vec::with_capacity(args.len());
+    for a in args {
+        if *a == "/lib64" && !has_lib64 {
+            // Also drop the `-r` we just pushed for this now-omitted path.
+            if out.last().map(|s| s == "-r").unwrap_or(false) {
+                out.pop();
+            }
+            continue;
+        }
+        out.push((*a).to_string());
+    }
+    out
+}
+
 #[test]
 fn test_check_command() {
     let output = sandlock_bin()
@@ -20,7 +41,7 @@ fn test_check_command() {
 #[test]
 fn test_run_echo() {
     let output = sandlock_bin()
-        .args(["run", "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "-r", "/etc", "--", "echo", "test123"])
+        .args(args_for_host(&["run", "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "-r", "/etc", "--", "echo", "test123"]))
         .output()
         .expect("failed to run sandlock");
     assert!(output.status.success(), "Exit status: {:?}, stderr: {}", output.status, String::from_utf8_lossy(&output.stderr));
@@ -31,7 +52,7 @@ fn test_run_echo() {
 #[test]
 fn test_run_exit_code() {
     let output = sandlock_bin()
-        .args(["run", "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "--", "sh", "-c", "exit 42"])
+        .args(args_for_host(&["run", "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "--", "sh", "-c", "exit 42"]))
         .output()
         .expect("failed to run");
     assert_eq!(output.status.code(), Some(42));
@@ -40,7 +61,7 @@ fn test_run_exit_code() {
 #[test]
 fn test_run_denied_path() {
     let output = sandlock_bin()
-        .args(["run", "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "--", "cat", "/etc/group"])
+        .args(args_for_host(&["run", "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "--", "cat", "/etc/group"]))
         .output()
         .expect("failed to run");
     assert!(!output.status.success(), "Should fail without /etc readable");
@@ -52,7 +73,7 @@ fn test_run_hostname_virtualized() {
     // even when /etc is not in fs_read, and should return the sandbox hostname
     // (not the host's).
     let output = sandlock_bin()
-        .args(["run", "--name", "mybox", "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "--", "cat", "/etc/hostname"])
+        .args(args_for_host(&["run", "--name", "mybox", "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "--", "cat", "/etc/hostname"]))
         .output()
         .expect("failed to run");
     assert!(output.status.success(), "virtualized /etc/hostname should be readable: stderr={}", String::from_utf8_lossy(&output.stderr));
@@ -105,7 +126,7 @@ fn test_status_fd_flag_accepted() {
 #[test]
 fn test_time_start_fakes_year() {
     let output = sandlock_bin()
-        .args([
+        .args(args_for_host(&[
             "run",
             "-r", "/usr",
             "-r", "/lib",
@@ -115,7 +136,7 @@ fn test_time_start_fakes_year() {
             "--time-start", "2000-06-15T00:00:00Z",
             "--",
             "date", "+%Y",
-        ])
+        ]))
         .output()
         .expect("failed to run sandlock with --time-start");
     assert!(
@@ -134,7 +155,7 @@ fn test_time_start_fakes_year() {
 #[test]
 fn test_no_supervisor_echo() {
     let output = sandlock_bin()
-        .args(["run", "--no-supervisor", "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "-r", "/etc", "--", "echo", "no-supervisor-test"])
+        .args(args_for_host(&["run", "--no-supervisor", "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "-r", "/etc", "--", "echo", "no-supervisor-test"]))
         .output()
         .expect("failed to run sandlock --no-supervisor");
     assert!(output.status.success(), "Exit status: {:?}, stderr: {}", output.status, String::from_utf8_lossy(&output.stderr));
@@ -145,7 +166,7 @@ fn test_no_supervisor_echo() {
 #[test]
 fn test_no_supervisor_blocks_denied_path() {
     let output = sandlock_bin()
-        .args(["run", "--no-supervisor", "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "--", "cat", "/etc/hostname"])
+        .args(args_for_host(&["run", "--no-supervisor", "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "--", "cat", "/etc/hostname"]))
         .output()
         .expect("failed to run");
     assert!(!output.status.success(), "Should fail without /etc readable");
@@ -200,8 +221,8 @@ fn test_no_supervisor_rejects_incompatible_flags() {
 #[test]
 fn test_no_supervisor_writable_path() {
     let output = sandlock_bin()
-        .args(["run", "--no-supervisor", "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "-w", "/tmp", "--",
-               "sh", "-c", "echo no-supervisor-write > /tmp/sandlock-no-supervisor-test && cat /tmp/sandlock-no-supervisor-test"])
+        .args(args_for_host(&["run", "--no-supervisor", "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "-w", "/tmp", "--",
+               "sh", "-c", "echo no-supervisor-write > /tmp/sandlock-no-supervisor-test && cat /tmp/sandlock-no-supervisor-test"]))
         .output()
         .expect("failed to run");
     assert!(output.status.success(), "Exit status: {:?}, stderr: {}", output.status, String::from_utf8_lossy(&output.stderr));
@@ -215,13 +236,13 @@ fn test_no_supervisor_nested_sandbox() {
     let sandlock_path = env!("CARGO_BIN_EXE_sandlock");
     let sandlock_dir = std::path::Path::new(sandlock_path).parent().unwrap().to_str().unwrap();
     let output = sandlock_bin()
-        .args(["run", "--no-supervisor",
+        .args(args_for_host(&["run", "--no-supervisor",
                "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "-r", "/etc",
                "-r", "/proc", "-r", "/dev", "-w", "/tmp",
                "-r", sandlock_dir,
                "--", sandlock_path, "run",
                "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "-r", "/etc",
-               "--", "echo", "nested-works"])
+               "--", "echo", "nested-works"]))
         .output()
         .expect("failed to run nested sandbox");
     assert!(output.status.success(), "Exit status: {:?}, stderr: {}", output.status, String::from_utf8_lossy(&output.stderr));
@@ -232,7 +253,7 @@ fn test_no_supervisor_nested_sandbox() {
 #[test]
 fn test_no_supervisor_exit_code() {
     let output = sandlock_bin()
-        .args(["run", "--no-supervisor", "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "--", "sh", "-c", "exit 42"])
+        .args(args_for_host(&["run", "--no-supervisor", "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "--", "sh", "-c", "exit 42"]))
         .output()
         .expect("failed to run");
     assert_eq!(output.status.code(), Some(42));
@@ -255,13 +276,13 @@ fn test_cow_commit_runs_on_cli_exit() {
 
     let cmd = format!("echo committed > {}", sentinel.display());
     let output = sandlock_bin()
-        .args([
+        .args(args_for_host(&[
             "run",
             "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "-r", "/etc",
             "-w", workdir.path().to_str().unwrap(),
             "--workdir", workdir.path().to_str().unwrap(),
             "--", "sh", "-c", &cmd,
-        ])
+        ]))
         .output()
         .expect("failed to run sandlock");
     assert!(
@@ -290,12 +311,12 @@ fn test_uid_mapping_fakes_root() {
     // `id -u` reports the in-namespace UID. Passing --user 0:0 should make
     // the child see UID 0 (fake root) regardless of the host UID.
     let output = sandlock_bin()
-        .args([
+        .args(args_for_host(&[
             "run",
             "--user", "0:0",
             "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "-r", "/etc",
             "--", "id", "-u",
-        ])
+        ]))
         .output()
         .expect("failed to run sandlock");
     assert!(
@@ -315,12 +336,12 @@ fn test_uid_mapping_fakes_root() {
 fn test_uid_mapping_arbitrary_uid() {
     // Arbitrary --user value should also map cleanly (not just 0).
     let output = sandlock_bin()
-        .args([
+        .args(args_for_host(&[
             "run",
             "--user", "1234:1234",
             "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "-r", "/etc",
             "--", "id", "-u",
-        ])
+        ]))
         .output()
         .expect("failed to run sandlock");
     assert!(

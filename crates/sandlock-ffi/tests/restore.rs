@@ -61,6 +61,8 @@ void _start(void){{
 fn build_policy(tmp: &str) -> *mut sandlock_sandbox_t {
     let mut b = sandlock_sandbox_builder_new();
     for p in ["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev", tmp] {
+        // `/lib64` is absent on RISC-V glibc / musl; fs_read is mandatory.
+        if p == "/lib64" && !std::path::Path::new("/lib64").exists() { continue; }
         let c = CString::new(p).unwrap();
         b = unsafe { sandlock_sandbox_builder_fs_read(b, c.as_ptr()) };
     }

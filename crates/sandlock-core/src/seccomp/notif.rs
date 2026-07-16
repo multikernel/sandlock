@@ -1176,6 +1176,251 @@ fn write_child_mem_proc(pid: u32, addr: u64, data: &[u8]) -> Result<(), NotifErr
     Ok(())
 }
 
+/// Kernel limit on a single argv/envp string (MAX_ARG_STRLEN, 32 pages).
+/// A longer string makes execve fail with E2BIG, so no string that could
+/// matter to a successful exec exceeds this.
+const EXEC_MAX_ARG_STRLEN: usize = 32 * 4096;
+
+/// Upper bound on argv/envp entries scanned. The kernel's argument budget
+/// (pointers count toward it) keeps any exec that could succeed far below
+/// this; it only stops a runaway scan of a corrupt, unterminated array,
+/// whose exec the kernel would fail anyway.
+const EXEC_MAX_PTR_ENTRIES: usize = 1 << 20;
+
+/// Byte range `[start, end)` that the path rewrite will overwrite in the
+/// child, plus the relocation buffer being assembled for it.
+struct ExecRewritePlan {
+    /// Bytes to write at the path pointer: the fd path, then every
+    /// relocated string, all NUL-terminated.
+    buf: Vec<u8>,
+    /// Pointer-slot patches: (slot address in the argv/envp array,
+    /// relocated string address).
+    patches: Vec<(u64, u64)>,
+}
+
+/// Read a NULL-terminated pointer array (argv or envp) from child memory.
+/// Chunked at page boundaries because a single straddling read fails whole
+/// if any page is unmapped, and mappings are page-granular.
+fn read_exec_ptr_array(
+    read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>, NotifError>,
+    base: u64,
+) -> Result<Vec<u64>, NotifError> {
+    if base == 0 {
+        return Ok(Vec::new());
+    }
+    const PAGE: u64 = 4096;
+    let mut ptrs = Vec::new();
+    let mut pending: Vec<u8> = Vec::new();
+    let mut cur = base;
+    loop {
+        let chunk = (PAGE - cur % PAGE) as usize;
+        let bytes = read(cur, chunk)?;
+        cur += chunk as u64;
+        pending.extend_from_slice(&bytes);
+        let mut consumed = 0;
+        while pending.len() - consumed >= 8 {
+            let ptr = u64::from_ne_bytes(pending[consumed..consumed + 8].try_into().unwrap());
+            consumed += 8;
+            if ptr == 0 {
+                return Ok(ptrs);
+            }
+            ptrs.push(ptr);
+            if ptrs.len() >= EXEC_MAX_PTR_ENTRIES {
+                return Ok(ptrs);
+            }
+        }
+        pending.drain(..consumed);
+    }
+}
+
+/// Read exactly `len` bytes starting at `addr`, chunked at page boundaries.
+fn read_exec_range(
+    read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>, NotifError>,
+    addr: u64,
+    len: usize,
+) -> Result<Vec<u8>, NotifError> {
+    let mut out = Vec::with_capacity(len);
+    let mut cur = addr;
+    while out.len() < len {
+        let chunk = ((4096 - cur % 4096) as usize).min(len - out.len());
+        out.extend_from_slice(&read(cur, chunk)?);
+        cur += chunk as u64;
+    }
+    Ok(out)
+}
+
+/// Read a NUL-terminated string (NUL excluded) of at most
+/// `EXEC_MAX_ARG_STRLEN` bytes, chunked at page boundaries.
+fn read_exec_cstr(
+    read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>, NotifError>,
+    addr: u64,
+) -> Result<Vec<u8>, NotifError> {
+    let mut out = Vec::new();
+    let mut cur = addr;
+    while out.len() < EXEC_MAX_ARG_STRLEN {
+        let chunk = ((4096 - cur % 4096) as usize).min(EXEC_MAX_ARG_STRLEN - out.len());
+        let bytes = read(cur, chunk)?;
+        if let Some(n) = bytes.iter().position(|&b| b == 0) {
+            out.extend_from_slice(&bytes[..n]);
+            return Ok(out);
+        }
+        out.extend_from_slice(&bytes);
+        cur += chunk as u64;
+    }
+    Err(NotifError::Supervisor(format!(
+        "exec arg string at {addr:#x} exceeds MAX_ARG_STRLEN"
+    )))
+}
+
+/// Compute the write buffer and pointer patches for rewriting an exec path
+/// to `fd_path` without corrupting any argv/envp string.
+///
+/// The rewrite overwrites `[path_ptr, path_ptr + buf.len())`. Any argv/envp
+/// string overlapping that window is appended to the buffer (preserving its
+/// original bytes, read before any write happens) and every pointer slot
+/// referencing it is patched to the relocated copy. Appending grows the
+/// window, which can pull further strings in, hence the fixpoint loop.
+///
+/// Overlap comes in two shapes:
+/// - a string starting inside the window (the common shell aliasing where
+///   path == argv[0]);
+/// - a string starting below `path_ptr` whose tail reaches it (the caller
+///   passed a path pointer into the middle of a longer string). Reaching
+///   means no NUL between its start and `path_ptr`; candidates are walked
+///   downward so each gap segment is read once, and once a NUL is seen every
+///   lower string is known to terminate before the window.
+///
+/// Fails if the argv/envp pointer arrays themselves fall inside the final
+/// window: the kernel reads those arrays after we return, and they cannot be
+/// moved because their addresses live in syscall registers.
+fn plan_exec_rewrite(
+    read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>, NotifError>,
+    path_ptr: u64,
+    fd_path: &[u8],
+    argv_ptr: u64,
+    envp_ptr: u64,
+) -> Result<ExecRewritePlan, NotifError> {
+    let argv = read_exec_ptr_array(read, argv_ptr)?;
+    let envp = read_exec_ptr_array(read, envp_ptr)?;
+    let slots: Vec<(u64, u64)> = argv
+        .iter()
+        .enumerate()
+        .map(|(i, &p)| (argv_ptr + 8 * i as u64, p))
+        .chain(envp.iter().enumerate().map(|(i, &p)| (envp_ptr + 8 * i as u64, p)))
+        .collect();
+
+    let mut buf = fd_path.to_vec();
+    let mut relocated: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
+    let relocate = |buf: &mut Vec<u8>,
+                        relocated: &mut std::collections::BTreeMap<u64, u64>,
+                        read: &mut dyn FnMut(u64, usize) -> Result<Vec<u8>, NotifError>,
+                        ptr: u64|
+     -> Result<(), NotifError> {
+        let s = read_exec_cstr(&mut |a, l| read(a, l), ptr)?;
+        relocated.insert(ptr, path_ptr + buf.len() as u64);
+        buf.extend_from_slice(&s);
+        buf.push(0);
+        Ok(())
+    };
+
+    // Strings whose tail reaches path_ptr from below. Anything further than
+    // MAX_ARG_STRLEN below cannot reach it within a string the kernel would
+    // accept.
+    let mut below: Vec<u64> = slots
+        .iter()
+        .map(|&(_, p)| p)
+        .filter(|&p| p < path_ptr && path_ptr - p < EXEC_MAX_ARG_STRLEN as u64)
+        .collect();
+    below.sort_unstable();
+    below.dedup();
+    let mut nul_free_from = path_ptr;
+    for &p in below.iter().rev() {
+        let seg = read_exec_range(read, p, (nul_free_from - p) as usize)?;
+        if seg.contains(&0) {
+            break;
+        }
+        relocate(&mut buf, &mut relocated, read, p)?;
+        nul_free_from = p;
+    }
+
+    // Strings starting inside the (growing) window.
+    loop {
+        let end = path_ptr + buf.len() as u64;
+        let mut grew = false;
+        for &(_, p) in &slots {
+            if !relocated.contains_key(&p) && p >= path_ptr && p < end {
+                relocate(&mut buf, &mut relocated, read, p)?;
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    let end = path_ptr + buf.len() as u64;
+    for (base, n) in [(argv_ptr, argv.len()), (envp_ptr, envp.len())] {
+        if base != 0 && base < end && base + 8 * (n as u64 + 1) > path_ptr {
+            return Err(NotifError::Supervisor(
+                "execve argv/envp pointer array overlaps the path rewrite window".into(),
+            ));
+        }
+    }
+
+    let patches = slots
+        .iter()
+        .filter_map(|&(slot, p)| relocated.get(&p).map(|&np| (slot, np)))
+        .collect();
+    Ok(ExecRewritePlan { buf, patches })
+}
+
+/// Rewrite an execve/execveat path argument to `/proc/self/fd/<child_fd>`,
+/// preserving every argv/envp string the rewrite would clobber.
+///
+/// A user-notif supervisor cannot change syscall registers, so redirecting
+/// an exec to an injected fd means overwriting the child's path buffer in
+/// place. Shells and `execvp`-style callers commonly pass the same buffer as
+/// both the exec path and argv[0] (dash execs `./m` with path == argv[0]),
+/// and libcs may pack other argv/envp strings right after it; a blind
+/// overwrite corrupts whatever the fd path lands on. Multicall binaries
+/// (busybox, uutils coreutils) then dispatch on basename(argv[0]) = "N" and
+/// fail. [`plan_exec_rewrite`] relocates every affected string past the fd
+/// path and patches the pointer slots, so the exec'd program sees its
+/// original arguments for any string layout.
+///
+/// Writing past the original path buffer is safe because execve replaces the
+/// whole address space on success, and the kernel copies the path and
+/// argv/envp strings out of the old address space only after this returns
+/// Continue, before anything else runs in the child. If the exec fails
+/// instead (e.g. the injected fd is not executable), the child keeps running
+/// with the rewritten buffer and patched pointers; argv is preserved so the
+/// damage is confined to the path string, same as before this helper.
+///
+/// Pointer slots are 8 bytes: the BPF filter kills non-native-arch syscalls
+/// before they reach the notif fd, and every supported native arch is
+/// 64-bit.
+///
+/// `argv_ptr`/`envp_ptr` are the syscall's argv/envp arguments (args[1]/[2]
+/// for execve, args[2]/[3] for execveat); 0 (NULL) arrays are skipped.
+pub(crate) fn rewrite_exec_path_to_fd(
+    notif_fd: RawFd,
+    id: u64,
+    pid: u32,
+    path_ptr: u64,
+    argv_ptr: u64,
+    envp_ptr: u64,
+    child_fd: i32,
+) -> Result<(), NotifError> {
+    let fd_path = format!("/proc/self/fd/{}\0", child_fd);
+    let mut read = |addr: u64, len: usize| read_child_mem(notif_fd, id, pid, addr, len);
+    let plan = plan_exec_rewrite(&mut read, path_ptr, fd_path.as_bytes(), argv_ptr, envp_ptr)?;
+    write_child_mem_force(notif_fd, id, pid, path_ptr, &plan.buf)?;
+    for (slot, new_ptr) in plan.patches {
+        write_child_mem_force(notif_fd, id, pid, slot, &new_ptr.to_ne_bytes())?;
+    }
+    Ok(())
+}
+
 // ============================================================
 // Response dispatch
 // ============================================================
@@ -2050,6 +2295,157 @@ mod tests {
 
     fn gettid() -> u32 {
         (unsafe { libc::syscall(libc::SYS_gettid) }) as u32
+    }
+
+    // ---- plan_exec_rewrite ----
+
+    /// Fake child memory: whole zero-filled pages at FAKE_BASE, so the
+    /// page-chunked readers never run off a mapped page mid-scan and a
+    /// zero word naturally terminates a pointer array.
+    const FAKE_BASE: u64 = 0x10000;
+    const FD: &[u8] = b"/proc/self/fd/3\0"; // 16 bytes
+
+    fn put(mem: &mut [u8], addr: u64, bytes: &[u8]) {
+        let off = (addr - FAKE_BASE) as usize;
+        mem[off..off + bytes.len()].copy_from_slice(bytes);
+    }
+
+    fn put_ptrs(mem: &mut [u8], addr: u64, ptrs: &[u64]) {
+        for (i, &p) in ptrs.iter().enumerate() {
+            put(mem, addr + 8 * i as u64, &p.to_ne_bytes());
+        }
+    }
+
+    fn plan(
+        mem: &[u8],
+        path_ptr: u64,
+        argv_ptr: u64,
+        envp_ptr: u64,
+    ) -> Result<ExecRewritePlan, NotifError> {
+        let mut read = |addr: u64, len: usize| {
+            let off = addr
+                .checked_sub(FAKE_BASE)
+                .ok_or_else(|| NotifError::Supervisor("read below fake memory".into()))?
+                as usize;
+            mem.get(off..off + len)
+                .map(|s| s.to_vec())
+                .ok_or_else(|| NotifError::Supervisor("read past fake memory".into()))
+        };
+        plan_exec_rewrite(&mut read, path_ptr, FD, argv_ptr, envp_ptr)
+    }
+
+    #[test]
+    fn exec_rewrite_plain_when_no_string_overlaps() {
+        let mut mem = vec![0u8; 4096];
+        put(&mut mem, FAKE_BASE, b"./m\0");
+        put(&mut mem, FAKE_BASE + 0x200, b"prog\0");
+        put_ptrs(&mut mem, FAKE_BASE + 0x800, &[FAKE_BASE + 0x200]);
+        let p = plan(&mem, FAKE_BASE, FAKE_BASE + 0x800, 0).unwrap();
+        assert_eq!(p.buf, FD);
+        assert!(p.patches.is_empty());
+    }
+
+    #[test]
+    fn exec_rewrite_relocates_aliased_argv0() {
+        // The common shell case: execve path and argv[0] are the same buffer.
+        let mut mem = vec![0u8; 4096];
+        put(&mut mem, FAKE_BASE, b"./m\0");
+        put_ptrs(&mut mem, FAKE_BASE + 0x800, &[FAKE_BASE]);
+        let p = plan(&mem, FAKE_BASE, FAKE_BASE + 0x800, 0).unwrap();
+        assert_eq!(p.buf, [FD, b"./m\0".as_slice()].concat());
+        assert_eq!(p.patches, vec![(FAKE_BASE + 0x800, FAKE_BASE + 16)]);
+    }
+
+    #[test]
+    fn exec_rewrite_relocates_packed_argv1() {
+        // argv[1] sits right after the path string, inside the fd-path
+        // window; both strings must survive.
+        let mut mem = vec![0u8; 4096];
+        put(&mut mem, FAKE_BASE, b"./echo\0EXEC_OK\0");
+        put_ptrs(&mut mem, FAKE_BASE + 0x800, &[FAKE_BASE, FAKE_BASE + 7]);
+        let p = plan(&mem, FAKE_BASE, FAKE_BASE + 0x800, 0).unwrap();
+        assert_eq!(p.buf, [FD, b"./echo\0EXEC_OK\0".as_slice()].concat());
+        assert_eq!(
+            p.patches,
+            vec![
+                (FAKE_BASE + 0x800, FAKE_BASE + 16),
+                (FAKE_BASE + 0x808, FAKE_BASE + 23),
+            ]
+        );
+    }
+
+    #[test]
+    fn exec_rewrite_relocates_string_reaching_window_from_below() {
+        // The path pointer aims into the tail of argv[0] ("echo" inside
+        // "/bin/echo"): the whole string must be relocated.
+        let mut mem = vec![0u8; 4096];
+        put(&mut mem, FAKE_BASE, b"/bin/echo\0");
+        put_ptrs(&mut mem, FAKE_BASE + 0x800, &[FAKE_BASE]);
+        let p = plan(&mem, FAKE_BASE + 5, FAKE_BASE + 0x800, 0).unwrap();
+        assert_eq!(p.buf, [FD, b"/bin/echo\0".as_slice()].concat());
+        assert_eq!(p.patches, vec![(FAKE_BASE + 0x800, FAKE_BASE + 5 + 16)]);
+    }
+
+    #[test]
+    fn exec_rewrite_skips_terminated_string_below_window() {
+        let mut mem = vec![0u8; 4096];
+        put(&mut mem, FAKE_BASE, b"a\0");
+        put(&mut mem, FAKE_BASE + 8, b"./m\0");
+        put_ptrs(&mut mem, FAKE_BASE + 0x800, &[FAKE_BASE]);
+        let p = plan(&mem, FAKE_BASE + 8, FAKE_BASE + 0x800, 0).unwrap();
+        assert_eq!(p.buf, FD);
+        assert!(p.patches.is_empty());
+    }
+
+    #[test]
+    fn exec_rewrite_relocates_envp_string() {
+        let mut mem = vec![0u8; 4096];
+        put(&mut mem, FAKE_BASE, b"./m\0K=V\0");
+        put(&mut mem, FAKE_BASE + 0x200, b"prog\0");
+        put_ptrs(&mut mem, FAKE_BASE + 0x800, &[FAKE_BASE + 0x200]);
+        put_ptrs(&mut mem, FAKE_BASE + 0x900, &[FAKE_BASE + 4]);
+        let p = plan(&mem, FAKE_BASE, FAKE_BASE + 0x800, FAKE_BASE + 0x900).unwrap();
+        assert_eq!(p.buf, [FD, b"K=V\0".as_slice()].concat());
+        assert_eq!(p.patches, vec![(FAKE_BASE + 0x900, FAKE_BASE + 16)]);
+    }
+
+    #[test]
+    fn exec_rewrite_window_growth_pulls_in_later_string() {
+        // argv[1] starts past the fd path but inside the window once the
+        // relocated argv[0] extends it.
+        let mut mem = vec![0u8; 4096];
+        put(&mut mem, FAKE_BASE, b"./m\0");
+        put(&mut mem, FAKE_BASE + 18, b"Z\0");
+        put_ptrs(&mut mem, FAKE_BASE + 0x800, &[FAKE_BASE, FAKE_BASE + 18]);
+        let p = plan(&mem, FAKE_BASE, FAKE_BASE + 0x800, 0).unwrap();
+        assert_eq!(p.buf, [FD, b"./m\0".as_slice(), b"Z\0".as_slice()].concat());
+        assert_eq!(
+            p.patches,
+            vec![
+                (FAKE_BASE + 0x800, FAKE_BASE + 16),
+                (FAKE_BASE + 0x808, FAKE_BASE + 20),
+            ]
+        );
+    }
+
+    #[test]
+    fn exec_rewrite_rejects_pointer_array_inside_window() {
+        // The arrays cannot be moved (their addresses live in registers), so
+        // a layout where the rewrite would smash them must fail closed.
+        let mut mem = vec![0u8; 4096];
+        put(&mut mem, FAKE_BASE, b"./m\0");
+        put_ptrs(&mut mem, FAKE_BASE + 8, &[FAKE_BASE + 0x200]);
+        put(&mut mem, FAKE_BASE + 0x200, b"prog\0");
+        assert!(plan(&mem, FAKE_BASE, FAKE_BASE + 8, 0).is_err());
+    }
+
+    #[test]
+    fn exec_rewrite_null_arrays() {
+        let mut mem = vec![0u8; 4096];
+        put(&mut mem, FAKE_BASE, b"./m\0");
+        let p = plan(&mem, FAKE_BASE, 0, 0).unwrap();
+        assert_eq!(p.buf, FD);
+        assert!(p.patches.is_empty());
     }
 
     #[test]

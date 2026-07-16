@@ -936,12 +936,12 @@ pub(crate) async fn handle_cow_exec(
     notif_fd: RawFd,
 ) -> NotifAction {
     let nr = notif.data.nr as i64;
-    // execve(path, argv, envp):        args[0] = path
-    // execveat(dirfd, path, argv, ..): args[0]=dirfd, args[1]=path
-    let (dirfd, path_ptr) = if nr == libc::SYS_execveat {
-        (notif.data.args[0] as i64, notif.data.args[1])
+    // execve(path, argv, envp):              args[0]=path,  args[1]=argv, args[2]=envp
+    // execveat(dirfd, path, argv, envp, ..): args[1]=path, args[2]=argv, args[3]=envp
+    let (dirfd, path_ptr, argv_ptr, envp_ptr) = if nr == libc::SYS_execveat {
+        (notif.data.args[0] as i64, notif.data.args[1], notif.data.args[2], notif.data.args[3])
     } else {
-        (libc::AT_FDCWD as i64, notif.data.args[0])
+        (libc::AT_FDCWD as i64, notif.data.args[0], notif.data.args[1], notif.data.args[2])
     };
 
     let rel_path = match read_path(notif, path_ptr, notif_fd) {
@@ -1012,14 +1012,16 @@ pub(crate) async fn handle_cow_exec(
     }
 
     // Rewrite the path argument to /proc/self/fd/N so the kernel execs the
-    // injected fd. execve replaces the whole address space on success, so
-    // (unlike chdir) writing past the original buffer is harmless — the
-    // only memory the kernel still reads is argv/envp, which sit elsewhere.
-    // Force-write past read-only protections (a .rodata exec path literal). No
-    // length guard: execve replaces the address space on success (see above), so
-    // a write past the original buffer is harmless.
-    let fd_path = format!("/proc/self/fd/{}\0", child_fd);
-    if write_child_mem_force(notif_fd, notif.id, notif.pid, path_ptr, fd_path.as_bytes()).is_err() {
+    // injected fd, relocating argv[0] when it aliases the path buffer (see
+    // rewrite_exec_path_to_fd). Force-writes past read-only protections (a
+    // .rodata exec path literal). No length guard: execve replaces the
+    // address space on success, so a write past the original buffer is
+    // harmless.
+    if crate::seccomp::notif::rewrite_exec_path_to_fd(
+        notif_fd, notif.id, notif.pid, path_ptr, argv_ptr, envp_ptr, child_fd,
+    )
+    .is_err()
+    {
         return NotifAction::Errno(libc::EFAULT);
     }
 

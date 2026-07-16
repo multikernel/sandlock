@@ -40,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let policy = Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
-        .fs_read("/lib64")
+        .fs_read_if_exists("/lib64")
         .fs_read("/etc")
         .fs_read("/proc")
         .fs_write("/tmp")

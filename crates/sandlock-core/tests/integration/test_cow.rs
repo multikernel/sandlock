@@ -9,6 +9,14 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
+/// Path to the static rootfs-helper binary (compiled by build.rs).
+fn helper_binary() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/rootfs-helper")
+        .canonicalize()
+        .expect("rootfs-helper not found — build.rs should have compiled it")
+}
+
 // ============================================================
 // Seccomp-based COW tests (workdir set)
 // ============================================================
@@ -431,7 +439,7 @@ async fn test_seccomp_cow_statx_created_file() {
         "buf = ctypes.create_string_buffer(256)\n",
         "AT_FDCWD = -100\n",
         "STATX_BASIC_STATS = 0x7ff\n",
-        "nr = 291 if platform.machine() == 'aarch64' else 332\n",
+        "nr = 291 if platform.machine() in ('aarch64', 'riscv64') else 332\n",
         "ret = libc.syscall(nr, AT_FDCWD, b'created.txt', 0, STATX_BASIC_STATS, buf)\n",
         "err = ctypes.get_errno()\n",
         "open('{out}', 'w').write('OK' if ret == 0 else f'FAIL:errno={{err}}')\n",
@@ -453,10 +461,13 @@ async fn test_seccomp_cow_statx_created_file() {
 #[tokio::test]
 async fn test_seccomp_cow_exec_created_file() {
     let workdir = temp_dir("seccomp-exec");
+    let helper = helper_binary();
+    let helper_dir = helper.parent().unwrap().to_path_buf();
 
     let policy = Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
         .fs_read("/proc").fs_read("/dev")
+        .fs_read(&helper_dir)
         .fs_write(&workdir)
         .workdir(&workdir)
         .cwd(&workdir)
@@ -464,19 +475,78 @@ async fn test_seccomp_cow_exec_created_file() {
         .build()
         .unwrap();
 
-    // Copy a real binary into the COW workdir (lands in upper), then exec it.
+    // Copy our own static rootfs-helper into the COW workdir (lands in
+    // upper), then exec it. The helper (not a system binary like /bin/echo,
+    // whose behavior varies across hosts: Ubuntu rust-coreutils ships a
+    // multicall binary) is itself busybox-style: invoked as `./echo` it
+    // dispatches on basename(argv[0]). That also catches the exec redirect
+    // clobbering argv[0]: shells pass the same buffer as execve path and
+    // argv[0], so rewriting the path to /proc/self/fd/N must relocate
+    // argv[0], or the helper sees basename "N" and exits 127.
+    let cmd = format!("cp {} echo && ./echo EXEC_OK", helper.display());
     let result = policy.clone().with_name("test").run(&[
-        "sh", "-c", "cp /bin/echo m && ./m EXEC_OK",
+        "sh", "-c", &cmd,
     ]).await.unwrap();
 
     assert!(
         result.success(),
-        "exec of COW-created binary should succeed, exit={:?}, stderr={}",
+        "exec of COW-created binary should succeed (argv[0] preserved), exit={:?}, stderr={}",
         result.code(), result.stderr_str().unwrap_or("")
     );
     assert!(
         result.stdout_str().unwrap_or("").contains("EXEC_OK"),
         "exec'd binary should print EXEC_OK, stdout={:?}",
+        result.stdout_str()
+    );
+
+    let _ = fs::remove_dir_all(&workdir);
+}
+
+/// Exec a COW-created binary with the path and argv strings tightly packed
+/// in one buffer: the /proc/self/fd/N rewrite window covers argv[1] too, so
+/// the supervisor must relocate every clobbered string, not only argv[0].
+/// Shell-driven layouts happen to keep argv[1] out of the window; this
+/// crafts the packed layout directly with execve(2) via ctypes.
+#[tokio::test]
+async fn test_seccomp_cow_exec_packed_argv_relocation() {
+    let workdir = temp_dir("seccomp-exec-packed");
+    let helper = helper_binary();
+    let helper_dir = helper.parent().unwrap().to_path_buf();
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc").fs_read("/dev")
+        .fs_read(&helper_dir)
+        .fs_write(&workdir)
+        .workdir(&workdir)
+        .cwd(&workdir)
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+
+    let script = format!(concat!(
+        "import ctypes, shutil, os\n",
+        "shutil.copy('{helper}', 'echo')\n",
+        "os.chmod('echo', 0o755)\n",
+        "libc = ctypes.CDLL(None, use_errno=True)\n",
+        "buf = ctypes.create_string_buffer(b'./echo\\0EXEC_OK_PACKED\\0')\n",
+        "base = ctypes.addressof(buf)\n",
+        "argv = (ctypes.c_void_p * 3)(base, base + 7, None)\n",
+        "envp = (ctypes.c_void_p * 1)(None)\n",
+        "libc.execve(ctypes.c_void_p(base), argv, envp)\n",
+        "raise SystemExit('execve failed errno=%d' % ctypes.get_errno())\n",
+    ), helper = helper.display());
+
+    let result = policy.clone().with_name("test").run(&["python3", "-c", &script]).await.unwrap();
+
+    assert!(
+        result.success(),
+        "packed-argv exec should succeed, exit={:?}, stderr={}",
+        result.code(), result.stderr_str().unwrap_or("")
+    );
+    assert!(
+        result.stdout_str().unwrap_or("").contains("EXEC_OK_PACKED"),
+        "argv[1] must survive the path rewrite, stdout={:?}",
         result.stdout_str()
     );
 

@@ -4,17 +4,30 @@ fn sandlock_bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_sandlock"))
 }
 
+/// The `[filesystem]` `read` list for a test profile, including `/lib64` only
+/// when the host has it. RISC-V glibc and musl have no `/lib64` (the loader
+/// lives under `/lib`), and a profile `read` entry is a mandatory grant, so
+/// requiring `/lib64` on such a host aborts confinement. Mirrors
+/// `fs_read_if_exists` for the profile layer.
+fn read_list() -> &'static str {
+    if std::path::Path::new("/lib64").exists() {
+        r#"read = ["/usr", "/lib", "/lib64", "/bin", "/etc"]"#
+    } else {
+        r#"read = ["/usr", "/lib", "/bin", "/etc"]"#
+    }
+}
+
 #[test]
 fn profile_program_section_supplies_command() {
     let tmp = tempfile::tempdir().unwrap();
     let profile_path = tmp.path().join("p.toml");
-    std::fs::write(&profile_path, r#"
+    std::fs::write(&profile_path, format!(r#"
         [program]
         exec = "/bin/true"
 
         [filesystem]
-        read = ["/usr", "/lib", "/lib64", "/bin", "/etc"]
-    "#).unwrap();
+        {read}
+    "#, read = read_list())).unwrap();
 
     let out = sandlock_bin()
         .args(["run", "--profile-file", profile_path.to_str().unwrap()])
@@ -29,13 +42,13 @@ fn trailing_command_overrides_profile_program_section() {
     let tmp = tempfile::tempdir().unwrap();
     let profile_path = tmp.path().join("p.toml");
     // Profile says exec = "/bin/false" — should be overridden by CLI command.
-    std::fs::write(&profile_path, r#"
+    std::fs::write(&profile_path, format!(r#"
         [program]
         exec = "/bin/false"
 
         [filesystem]
-        read = ["/usr", "/lib", "/lib64", "/bin", "/etc"]
-    "#).unwrap();
+        {read}
+    "#, read = read_list())).unwrap();
 
     let out = sandlock_bin()
         .args(["run", "--profile-file", profile_path.to_str().unwrap(), "--", "/bin/true"])
@@ -49,14 +62,14 @@ fn trailing_command_overrides_profile_program_section() {
 fn profile_with_args_are_passed_to_command() {
     let tmp = tempfile::tempdir().unwrap();
     let profile_path = tmp.path().join("p.toml");
-    std::fs::write(&profile_path, r#"
+    std::fs::write(&profile_path, format!(r#"
         [program]
         exec = "/bin/sh"
         args = ["-c", "exit 0"]
 
         [filesystem]
-        read = ["/usr", "/lib", "/lib64", "/bin", "/etc"]
-    "#).unwrap();
+        {read}
+    "#, read = read_list())).unwrap();
 
     let out = sandlock_bin()
         .args(["run", "--profile-file", profile_path.to_str().unwrap()])
@@ -96,13 +109,13 @@ fn profile_by_name_loads_program_section() {
     let profiles_dir = tmp.path().join("sandlock").join("profiles");
     std::fs::create_dir_all(&profiles_dir).unwrap();
     let profile_path = profiles_dir.join("by-name-test.toml");
-    std::fs::write(&profile_path, r#"
+    std::fs::write(&profile_path, format!(r#"
         [program]
         exec = "/bin/true"
 
         [filesystem]
-        read = ["/usr", "/lib", "/lib64", "/bin", "/etc"]
-    "#).unwrap();
+        {read}
+    "#, read = read_list())).unwrap();
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_sandlock"))
         .env("XDG_CONFIG_HOME", tmp.path())
@@ -121,16 +134,16 @@ fn profile_by_name_loads_program_section() {
 fn no_supervisor_rejects_supervisor_only_profile_fields() {
     let tmp = tempfile::tempdir().unwrap();
     let profile_path = tmp.path().join("p.toml");
-    std::fs::write(&profile_path, r#"
+    std::fs::write(&profile_path, format!(r#"
         [program]
         exec = "/bin/true"
 
         [filesystem]
-        read = ["/usr", "/lib", "/lib64", "/bin", "/etc"]
+        {read}
 
         [network]
         allow = ["example.com:443"]
-    "#).unwrap();
+    "#, read = read_list())).unwrap();
 
     let out = sandlock_bin()
         .args(["run", "--no-supervisor", "--profile-file", profile_path.to_str().unwrap()])

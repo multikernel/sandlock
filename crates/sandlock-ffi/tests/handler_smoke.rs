@@ -487,9 +487,15 @@ fn run_with_handlers_intercepts_getpid() {
         let p = CString::new("/lib").unwrap();
         sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
     };
-    let builder = unsafe {
-        let p = CString::new("/lib64").unwrap();
-        sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
+    // `/lib64` only when the host has it (RISC-V glibc / musl put the loader
+    // under `/lib` and have no `/lib64`); fs_read is a mandatory grant.
+    let builder = if std::path::Path::new("/lib64").exists() {
+        unsafe {
+            let p = CString::new("/lib64").unwrap();
+            sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
+        }
+    } else {
+        builder
     };
     let builder = unsafe {
         let p = CString::new("/etc").unwrap();
@@ -1437,9 +1443,15 @@ fn run_with_handlers_empty_registrations_runs_normally() {
         let p = CString::new("/lib").unwrap();
         sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
     };
-    let builder = unsafe {
-        let p = CString::new("/lib64").unwrap();
-        sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
+    // `/lib64` only when the host has it (RISC-V glibc / musl put the loader
+    // under `/lib` and have no `/lib64`); fs_read is a mandatory grant.
+    let builder = if std::path::Path::new("/lib64").exists() {
+        unsafe {
+            let p = CString::new("/lib64").unwrap();
+            sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
+        }
+    } else {
+        builder
     };
     let builder = unsafe {
         let p = CString::new("/etc").unwrap();
@@ -1610,9 +1622,15 @@ fn run_with_handlers_two_handlers_each_fires_for_own_syscall() {
         let p = CString::new("/lib").unwrap();
         sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
     };
-    let builder = unsafe {
-        let p = CString::new("/lib64").unwrap();
-        sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
+    // `/lib64` only when the host has it (RISC-V glibc / musl put the loader
+    // under `/lib` and have no `/lib64`); fs_read is a mandatory grant.
+    let builder = if std::path::Path::new("/lib64").exists() {
+        unsafe {
+            let p = CString::new("/lib64").unwrap();
+            sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
+        }
+    } else {
+        builder
     };
     let builder = unsafe {
         let p = CString::new("/etc").unwrap();
@@ -1774,9 +1792,15 @@ fn mem_read_cstr_reads_path_from_intercepted_openat() {
         let p = CString::new("/lib").unwrap();
         sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
     };
-    let builder = unsafe {
-        let p = CString::new("/lib64").unwrap();
-        sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
+    // `/lib64` only when the host has it (RISC-V glibc / musl put the loader
+    // under `/lib` and have no `/lib64`); fs_read is a mandatory grant.
+    let builder = if std::path::Path::new("/lib64").exists() {
+        unsafe {
+            let p = CString::new("/lib64").unwrap();
+            sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
+        }
+    } else {
+        builder
     };
     let builder = unsafe {
         let p = CString::new("/etc").unwrap();

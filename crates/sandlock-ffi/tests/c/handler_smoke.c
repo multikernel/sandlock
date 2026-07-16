@@ -123,7 +123,11 @@ static int check_policy_fn_user_data_drop(void) {
     b = sandlock_sandbox_builder_fs_read(b, "/usr");
     b = sandlock_sandbox_builder_fs_read(b, "/bin");
     b = sandlock_sandbox_builder_fs_read(b, "/lib");
-    b = sandlock_sandbox_builder_fs_read(b, "/lib64");
+    /* /lib64 does not exist on all arches (e.g. riscv64); granting a
+     * nonexistent path makes the run fail. */
+    if (access("/lib64", F_OK) == 0) {
+        b = sandlock_sandbox_builder_fs_read(b, "/lib64");
+    }
     b = sandlock_sandbox_builder_fs_read(b, "/etc");
     b = sandlock_sandbox_builder_fs_read(b, "/proc");
     b = sandlock_sandbox_builder_fs_read(b, "/dev");
@@ -164,7 +168,11 @@ int main(void) {
     b = sandlock_sandbox_builder_fs_read(b, "/usr");
     b = sandlock_sandbox_builder_fs_read(b, "/bin");
     b = sandlock_sandbox_builder_fs_read(b, "/lib");
-    b = sandlock_sandbox_builder_fs_read(b, "/lib64");
+    /* /lib64 does not exist on all arches (e.g. riscv64); granting a
+     * nonexistent path makes the run fail. */
+    if (access("/lib64", F_OK) == 0) {
+        b = sandlock_sandbox_builder_fs_read(b, "/lib64");
+    }
     b = sandlock_sandbox_builder_fs_read(b, "/etc");
     b = sandlock_sandbox_builder_fs_read(b, "/proc");
     b = sandlock_sandbox_builder_fs_read(b, "/dev");

@@ -24,8 +24,17 @@ fn minimal_exec_policy(rootfs: &PathBuf) -> sandlock_core::SandboxBuilder {
 }
 
 fn temp_dir(name: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("sandlock-test-chroot-{}-{}", name, std::process::id()));
+    // Prefer cargo's per-test-binary tmp dir (under `target/`, the same
+    // filesystem as the compiled rootfs-helper) so build_test_rootfs can
+    // hard-link the helper into the rootfs instead of copying it. A
+    // cross-filesystem temp such as /tmp (often tmpfs) forces the fs::copy
+    // fallback, whose writable fd can be inherited by a concurrent fork+exec in
+    // another parallel test and leave the helper briefly open for write, making
+    // the eventual execve fail with ETXTBSY (Text file busy).
+    let base = option_env!("CARGO_TARGET_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = base.join(format!("sandlock-test-chroot-{}-{}", name, std::process::id()));
     let _ = fs::create_dir_all(&dir);
     dir
 }
