@@ -21,7 +21,7 @@ use super::unix::{
     mmsg_entry_named_unix_path, sendmmsg_named_unix_on_behalf, sendto_named_unix_on_behalf,
     unix_sendmsg_gate,
 };
-use super::verdict::{check_ip_destination, path_under_any};
+use super::verdict::{check_ip_destination, classify_send_path, path_under_any, SendPath};
 use super::{query_socket_protocol, socket_is_unix, Protocol};
 
 // ============================================================
@@ -127,7 +127,41 @@ pub(super) async fn sendto_on_behalf(
                     )
                 }
             }
-            _ => NotifAction::Continue,
+            _ => {
+                // Non-IP destination with no fs-path gate (an abstract unix
+                // address, or the fs-gate-off case). With no destination policy
+                // there is nothing to bypass, so Continue (matching the connected
+                // fast path). Under a destination policy do NOT Continue: the
+                // kernel would re-read `sockfd`/addr and a racing
+                // `dup2(inet_sock, sockfd)` + addr swap could redirect the send to
+                // a denied IP. Gate on the stable socket domain and send a unix
+                // datagram on-behalf on the pinned fd (mirroring the sendmsg
+                // path); fail closed on a non-unix socket presenting a non-IP
+                // address.
+                if !ctx.policy.has_net_destination_policy {
+                    return NotifAction::Continue;
+                }
+                let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
+                    Ok(fd) => fd,
+                    Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
+                };
+                if !socket_is_unix(dup_fd.as_raw_fd()) {
+                    return NotifAction::Errno(libc::EAFNOSUPPORT);
+                }
+                let data = match read_child_mem(notif_fd, notif.id, notif.pid, buf_ptr, buf_len) {
+                    Ok(b) => b,
+                    Err(_) => return NotifAction::Errno(libc::EIO),
+                };
+                let m = MaterializedMsg {
+                    data,
+                    control: None,
+                    addr: addr_bytes,
+                    _scm_fds: Vec::new(),
+                    _pinned: None,
+                };
+                let blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
+                resolve_send(dup_fd, m, flags, blocking)
+            }
         }
     }
 }
@@ -296,31 +330,35 @@ async fn send_msghdr_on_behalf(
             Err(e) => return Err(e),
         }
     };
-    if !connected {
-        let ip = match parse_ip_from_sockaddr(&addr_bytes) {
-            Some(ip) => ip,
-            // A non-IP, non-connected address on an IP send path (e.g. the
-            // sockaddr changed under us). Fail closed.
-            None => return Err(libc::EAFNOSUPPORT),
-        };
-        let dest_port = parse_port_from_sockaddr(&addr_bytes);
-        // A non-connected IP send must have a resolved protocol to key the
-        // per-protocol allowlist. If it couldn't be resolved, fail closed.
-        let protocol = protocol.ok_or(ECONNREFUSED)?;
-        check_ip_destination(ctx, notif.pid, protocol, ip, dest_port).await?;
+
+    // Classify on the *stable* socket domain of the pinned `dup_fd`, not the
+    // transient address family: a unix datagram sends on-behalf here (never
+    // Continue), so a racing `dup2(inet_sock, sockfd)` + `msg_name` swap cannot
+    // redirect it to a denied IP.
+    let is_unix = socket_is_unix(dup_fd.as_raw_fd());
+    match classify_send_path(connected, parse_ip_from_sockaddr(&addr_bytes), is_unix) {
+        SendPath::ConnectedOnBehalf => {}
+        SendPath::IpChecked(ip) => {
+            let dest_port = parse_port_from_sockaddr(&addr_bytes);
+            // A non-connected IP send must have a resolved protocol to key the
+            // per-protocol allowlist. If it couldn't be resolved, fail closed.
+            let protocol = protocol.ok_or(ECONNREFUSED)?;
+            check_ip_destination(ctx, notif.pid, protocol, ip, dest_port).await?;
+        }
+        // A named/abstract unix datagram (the fs-gate-off case; the fs-gate-on
+        // case was handled by `unix_sendmsg_gate` before we got here). The IP
+        // allowlist does not govern unix traffic, so send it on-behalf on the
+        // pinned fd with no IP check.
+        SendPath::UnixOnBehalf => {}
+        // A non-IP address on a non-unix (IP) socket — the address-family-swap
+        // shape. Fail closed.
+        SendPath::Reject => return Err(libc::EAFNOSUPPORT),
     }
 
     // Translate SCM_RIGHTS / reject creds only for a unix socket; an IP socket's
     // control carries no fds or credentials and passes through untouched.
     // (`addr_bytes` is already empty for a connected send.)
-    materialize_msg(
-        notif,
-        notif_fd,
-        &hdr,
-        addr_bytes,
-        socket_is_unix(dup_fd.as_raw_fd()),
-        None,
-    )
+    materialize_msg(notif, notif_fd, &hdr, addr_bytes, is_unix, None)
 }
 
 // ============================================================
