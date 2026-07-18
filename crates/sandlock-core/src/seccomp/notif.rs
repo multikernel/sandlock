@@ -1324,10 +1324,10 @@ fn read_ppid(pid: u32) -> Option<u32> {
     fields.get(1)?.parse().ok()
 }
 
-/// Read a NUL-terminated path from child memory (up to 256 bytes).
+/// Read a NUL-terminated path from child memory (up to PATH_MAX bytes).
 fn read_path_for_event(notif: &SeccompNotif, addr: u64, notif_fd: RawFd) -> Option<String> {
     if addr == 0 { return None; }
-    let bytes = read_child_mem(notif_fd, notif.id, notif.pid, addr, 256).ok()?;
+    let bytes = read_child_mem(notif_fd, notif.id, notif.pid, addr, libc::PATH_MAX as usize).ok()?;
     let nul = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     String::from_utf8(bytes[..nul].to_vec()).ok()
 }
