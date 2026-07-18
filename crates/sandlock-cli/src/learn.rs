@@ -14,6 +14,7 @@ use sandlock_core::profile::{FilesystemSection, ProfileInput};
 use sandlock_core::sandbox::BranchAction;
 use sandlock_core::Sandbox;
 
+
 /// Returns true for pid/session-specific paths that are meaningless across runs.
 fn is_junk_path(p: &std::path::Path) -> bool {
     let b = p.as_os_str().as_encoded_bytes();
@@ -42,29 +43,26 @@ fn is_write_open(flags: u64) -> bool {
     flags & (O_WRONLY | O_RDWR | O_CREAT) != 0
 }
 
-/// Read the dynamic linker path from `/proc/<pid>/maps`. The kernel loads it
-/// during execve (bypassing seccomp), so this is the way to discover it
-/// after the execve completes and `/proc/<pid>/maps` reflects the new binary.
-fn read_linker_from_maps(pid: u32) -> Option<PathBuf> {
+/// Read all file-backed r-xp (executable) mappings from `/proc/<pid>/maps`.
+/// This captures the dynamic linker, all shared libraries, and the main binary
+/// as actually mapped by the kernel. 
+fn read_rx_mapped_files(pid: u32) -> Vec<PathBuf> {
     use std::io::BufRead;
-    let file = std::fs::File::open(format!("/proc/{pid}/maps")).ok()?;
+    let Ok(file) = std::fs::File::open(format!("/proc/{pid}/maps")) else { return vec![] };
+    let mut out = Vec::new();
     for line in std::io::BufReader::new(file).lines() {
-        let line = line.ok()?;
+        let Ok(line) = line else { break };
         // Format: "addr-addr perms offset dev inode pathname"
-        let pathname = line.splitn(6, ' ').nth(5).map(str::trim).unwrap_or("");
-        if !pathname.is_empty() && !pathname.starts_with('[') {
-            let p = std::path::Path::new(pathname);
-            if p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.starts_with("ld-"))
-                .unwrap_or(false)
-            {
-                return Some(p.to_path_buf());
-            }
+        let mut parts = line.splitn(6, ' ');
+        let perms = parts.nth(1).unwrap_or("");
+        let pathname = parts.nth(3).map(str::trim).unwrap_or("");
+        if perms.contains('x') && !pathname.is_empty() && !pathname.starts_with('[') {
+            out.push(PathBuf::from(pathname));
         }
     }
-    None
+    out
 }
+
 
 /// Accumulated observations from the policy_fn callback during learn.
 #[derive(Clone)]
@@ -94,17 +92,23 @@ impl LearnObserver {
         // new binary is running — /proc/<pid>/maps now shows the dynamic
         // linker loaded by the kernel (which bypassed seccomp).
         if self.pending_maps.lock().unwrap().remove(&event.pid) {
-            if let Some(linker) = read_linker_from_maps(event.pid) {
-                self.reads.lock().unwrap().insert(linker);
+            let mut reads = self.reads.lock().unwrap();
+            // /proc/<pid>/exe is the canonical real binary path (symlinks resolved by the kernel),
+            // race-free at this point since the new image is already loaded.
+            if let Ok(exe) = std::fs::read_link(format!("/proc/{}/exe", event.pid)) {
+                reads.insert(exe);
+            }
+            for path in read_rx_mapped_files(event.pid) {
+                reads.insert(path);
             }
         }
 
         match event.syscall.as_str() {
             "execve" | "execveat" => {
+                // event.path may be a symlink; canonical real path comes from /proc/<pid>/exe in pending_maps.
                 if let Some(path) = event.path {
                     self.reads.lock().unwrap().insert(path);
                 }
-                // Mark PID: read maps on next event after execve completes.
                 self.pending_maps.lock().unwrap().insert(event.pid);
             }
             "openat" | "open" => {
