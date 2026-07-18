@@ -117,6 +117,9 @@ pub struct SyscallEvent {
     /// Open flags for openat (the `flags` argument, e.g. `O_RDONLY`,
     /// `O_WRONLY`, `O_CREAT`). `None` for non-openat syscalls.
     pub flags: Option<u64>,
+    /// Socket protocol for network syscalls (connect, sendto, sendmsg, sendmmsg).
+    /// One of "tcp", "udp", "icmp". `None` for non-network syscalls or if
+    pub protocol: Option<String>,
 }
 
 impl SyscallEvent {
@@ -498,6 +501,7 @@ mod tests {
             path: None,
             path2: None,
             flags: None,
+            protocol: None,
         };
         assert!(event.argv_contains("python3"));
         assert!(event.argv_contains("-c"));
@@ -520,6 +524,7 @@ mod tests {
             path: None,
             path2: None,
             flags: None,
+            protocol: None,
         };
         assert!(!event.argv_contains("anything"));
     }

@@ -1643,6 +1643,23 @@ async fn emit_policy_event(
         }
     }
 
+    // Resolve the real socket protocol via SO_PROTOCOL on a dup'd fd.
+    // args[0] is the socket fd for connect, sendto, sendmsg, sendmmsg.
+    let mut protocol: Option<String> = None;
+    if nr == libc::SYS_connect || nr == libc::SYS_sendto
+        || nr == libc::SYS_sendmsg || nr == libc::SYS_sendmmsg
+    {
+        if let Ok(sock) = dup_fd_from_pid(notif.pid, notif.data.args[0] as i32) {
+            use std::os::unix::io::AsRawFd;
+            protocol = crate::network::query_socket_protocol(sock.as_raw_fd())
+                .map(|p| match p {
+                    crate::network::Protocol::Tcp => "tcp",
+                    crate::network::Protocol::Udp => "udp",
+                    crate::network::Protocol::Icmp => "icmp",
+                }.to_string());
+        }
+    }
+
     if nr == libc::SYS_mmap {
         // mmap(addr, length, ...): args[1] = length
         size = Some(notif.data.args[1]);
@@ -1683,6 +1700,7 @@ async fn emit_policy_event(
         path,
         path2,
         flags,
+        protocol,
     };
 
     // Hold syscalls where the callback's verdict matters.

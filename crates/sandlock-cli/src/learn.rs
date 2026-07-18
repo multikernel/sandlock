@@ -156,16 +156,11 @@ impl LearnObserver {
                     self.writes.lock().unwrap().insert(p);
                 }
             }
-            // Simplified: connect is assumed TCP, sendto/sendmsg UDP.
-            // Ideally we'd check SO_PROTOCOL on the socket fd (need emit_policy_event to expose that info in SyscallEvent)
-            "connect" => {
-                if let (Some(ip), Some(port)) = (event.host, event.port) {
-                    self.connects.lock().unwrap().insert(format!("tcp://{ip}:{port}"));
-                }
-            }
-            "sendto" | "sendmsg" | "sendmmsg" => {
-                if let (Some(ip), Some(port)) = (event.host, event.port) {
-                    self.connects.lock().unwrap().insert(format!("udp://{ip}:{port}"));
+            "connect" | "sendto" | "sendmsg" | "sendmmsg" => {
+                if let (Some(ip), Some(port), Some(proto)) = (event.host, event.port, event.protocol) {
+                    if proto != "icmp" {
+                        self.connects.lock().unwrap().insert(format!("{proto}://{ip}:{port}"));
+                    }
                 }
             }
             _ => {}
