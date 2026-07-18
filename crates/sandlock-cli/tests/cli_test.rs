@@ -805,3 +805,37 @@ fn test_uid_mapping_arbitrary_uid() {
     );
 }
 
+/// When the workload binary is a symlink (e.g. python3 -> python3.13), the execve
+/// event records the symlink path, not the real binary. The real binary path only
+/// appears via r-xp maps scanned by the sampler. This test verifies it ends up in reads.
+#[test]
+fn test_learn_captures_real_binary_path_via_maps() {
+    let python3 = std::process::Command::new("which")
+        .arg("python3")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if python3.is_empty() { return; }
+    let real = match std::fs::canonicalize(&python3) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    if real.to_str() == Some(python3.as_str()) { return; } // not a symlink, skip
+    let real_str = real.to_str().unwrap().to_string();
+
+    let output = sandlock_bin()
+        .args(["learn", "--", "python3", "-c", "pass"])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(output.status.success(),
+        "sandlock learn failed: stderr={}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let read_line = stdout.lines().find(|l| l.starts_with("read = [")).unwrap_or("");
+    assert!(
+        read_line.contains(&real_str),
+        "real binary {real_str} not in reads (only visible via r-xp maps, not execve event): {read_line}",
+    );
+}
+

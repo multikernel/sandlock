@@ -16,7 +16,7 @@ use sandlock_core::Sandbox;
 
 /// Returns true for pid/session-specific paths that are meaningless across runs.
 fn is_junk_path(p: &std::path::Path) -> bool {
-    let b = p.as_os_str().as_bytes();
+    let b = p.as_os_str().as_encoded_bytes();
     // /proc/self/... and /proc/<pid>/... are pid-specific;
     let proc_pid = b.starts_with(b"/proc/self")
         || (b.starts_with(b"/proc/") && b.get(6).map_or(false, u8::is_ascii_digit));
