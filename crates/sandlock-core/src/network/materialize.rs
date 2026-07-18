@@ -28,6 +28,13 @@ const MAX_CONTROL_BUF: usize = 16 << 10;
 
 /// Parse IP address from a sockaddr byte buffer.
 /// Returns None for non-IP families (AF_UNIX etc.) — always allowed.
+///
+/// A v4-mapped IPv6 destination (`::ffff:a.b.c.d`) is returned as the
+/// canonical `V4` address: on a dual-stack socket it reaches `a.b.c.d`
+/// over IPv4, so leaving it in `V6` form would let the mapped spelling
+/// bypass every v4 policy rule (family-exact CIDR matching) and dodge
+/// `is_loopback()` gates. Family-sensitive sockaddr rewrites must use
+/// [`sockaddr_is_ipv6`], not the returned IP's family.
 pub(crate) fn parse_ip_from_sockaddr(bytes: &[u8]) -> Option<IpAddr> {
     if bytes.len() < 2 {
         return None;
@@ -48,10 +55,17 @@ pub(crate) fn parse_ip_from_sockaddr(bytes: &[u8]) -> Option<IpAddr> {
             }
             let mut addr_bytes = [0u8; 16];
             addr_bytes.copy_from_slice(&bytes[8..24]);
-            Some(IpAddr::V6(Ipv6Addr::from(addr_bytes)))
+            Some(IpAddr::V6(Ipv6Addr::from(addr_bytes)).to_canonical())
         }
         _ => None,
     }
+}
+
+/// True iff the sockaddr's family field is `AF_INET6`. Sockaddr rewrites
+/// (proxy redirect) must follow the socket's family, which
+/// [`parse_ip_from_sockaddr`] no longer preserves for v4-mapped addresses.
+pub(crate) fn sockaddr_is_ipv6(bytes: &[u8]) -> bool {
+    bytes.len() >= 2 && u16::from_ne_bytes([bytes[0], bytes[1]]) as u32 == AF_INET6
 }
 
 // ============================================================
@@ -447,5 +461,49 @@ mod tests {
         assert_eq!(mmsg_entry_ptr(0x1000, 0), 0x1000);
         assert_eq!(mmsg_entry_ptr(0x1000, 2), 0x1000 + 2 * MMSGHDR_SIZE as u64);
         assert_eq!(mmsg_msglen_addr(0x1000), 0x1000 + MSG_LEN_OFFSET as u64);
+    }
+
+    // --- parse_ip_from_sockaddr tests (sockaddr bytes, child-controlled) ---
+
+    fn v6_sockaddr_bytes(ip: Ipv6Addr, port: u16) -> Vec<u8> {
+        let mut sa6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+        sa6.sin6_family = libc::AF_INET6 as u16;
+        sa6.sin6_port = port.to_be();
+        sa6.sin6_addr.s6_addr = ip.octets();
+        unsafe {
+            std::slice::from_raw_parts(
+                &sa6 as *const _ as *const u8,
+                std::mem::size_of::<libc::sockaddr_in6>(),
+            )
+        }
+        .to_vec()
+    }
+
+    #[test]
+    fn parse_ip_canonicalizes_v4_mapped_ipv6() {
+        // ::ffff:a.b.c.d names an IPv4 destination; the parse phase must
+        // hand the policy layer the canonical V4 form so v4 rules match.
+        let bytes = v6_sockaddr_bytes("::ffff:169.254.169.254".parse().unwrap(), 80);
+        assert_eq!(
+            parse_ip_from_sockaddr(&bytes),
+            Some("169.254.169.254".parse::<IpAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn parse_ip_keeps_plain_ipv6_untouched() {
+        let bytes = v6_sockaddr_bytes(Ipv6Addr::LOCALHOST, 80);
+        assert_eq!(parse_ip_from_sockaddr(&bytes), Some(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(sockaddr_is_ipv6(&bytes));
+    }
+
+    #[test]
+    fn sockaddr_family_is_independent_of_canonical_ip() {
+        // The socket family drives sockaddr rewrites (proxy redirect); it
+        // must come from the family field, not from the canonicalized IP.
+        let mapped = v6_sockaddr_bytes("::ffff:1.2.3.4".parse().unwrap(), 80);
+        assert!(sockaddr_is_ipv6(&mapped));
+        let v4_family = (AF_INET as u16).to_ne_bytes();
+        assert!(!sockaddr_is_ipv6(&[v4_family[0], v4_family[1], 0, 0]));
     }
 }

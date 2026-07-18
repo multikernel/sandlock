@@ -29,7 +29,7 @@ use crate::seccomp::notif::{read_child_mem, NotifAction};
 use crate::sys::structs::SeccompNotif;
 
 mod connect;
-mod materialize;
+pub(crate) mod materialize;
 mod rules;
 mod send;
 mod send_engine;

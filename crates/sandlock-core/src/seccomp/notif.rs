@@ -273,6 +273,11 @@ pub enum NetworkPolicy {
 impl NetworkPolicy {
     /// True iff a connection to (ip, port) should be permitted.
     pub fn allows(&self, ip: IpAddr, port: u16) -> bool {
+        // `::ffff:a.b.c.d` is the same destination as `a.b.c.d` (a
+        // dual-stack socket reaches it over IPv4), and CIDR matching is
+        // family-exact: match rules against the canonical form so the
+        // mapped spelling can't bypass a v4 rule.
+        let ip = ip.to_canonical();
         match self {
             NetworkPolicy::Unrestricted => true,
             NetworkPolicy::AllowList { per_ip, cidrs, any_ip_ports } => {
@@ -1689,7 +1694,9 @@ fn resolve_second_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Optio
     }
 }
 
-/// Extract IP and port from a sockaddr in child memory.
+/// Extract IP and port from a sockaddr in child memory. Parsing (including
+/// v4-mapped canonicalization) is shared with the enforcement path so the
+/// policy_fn callback judges the same address the policy layer does.
 fn read_sockaddr_for_event(notif: &SeccompNotif, addr: u64, len: usize, notif_fd: RawFd)
     -> (Option<std::net::IpAddr>, Option<u16>)
 {
@@ -1698,23 +1705,9 @@ fn read_sockaddr_for_event(notif: &SeccompNotif, addr: u64, len: usize, notif_fd
         Ok(b) => b,
         Err(_) => return (None, None),
     };
-    if bytes.len() < 4 { return (None, None); }
-    let family = u16::from_ne_bytes([bytes[0], bytes[1]]);
-    let port = u16::from_be_bytes([bytes[2], bytes[3]]);
-    let ip = match family as u32 {
-        f if f == crate::sys::structs::AF_INET && bytes.len() >= 8 => {
-            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
-                bytes[4], bytes[5], bytes[6], bytes[7],
-            )))
-        }
-        f if f == crate::sys::structs::AF_INET6 && bytes.len() >= 24 => {
-            let mut addr = [0u8; 16];
-            addr.copy_from_slice(&bytes[8..24]);
-            Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(addr)))
-        }
-        _ => None,
-    };
-    (ip, if port > 0 { Some(port) } else { None })
+    let ip = crate::network::materialize::parse_ip_from_sockaddr(&bytes);
+    let port = crate::network::materialize::parse_port_from_sockaddr(&bytes);
+    (ip, port.filter(|&p| p > 0))
 }
 
 /// Read argv (NULL-terminated array of char* in child memory) for execve.
@@ -2834,5 +2827,36 @@ mod tests {
         };
         assert!(policy.allows("192.168.5.5".parse().unwrap(), 9999)); // any port in range
         assert!(!policy.allows("10.0.0.1".parse().unwrap(), 9999));   // out of range
+    }
+
+    #[test]
+    fn denylist_blocks_v4_mapped_ipv6_form_of_denied_ip() {
+        // A dual-stack AF_INET6 socket connecting to ::ffff:169.254.169.254
+        // reaches 169.254.169.254 over IPv4, so a v4 deny rule must match
+        // the mapped form or the denylist is bypassable.
+        use crate::network::IpCidr;
+        let policy = NetworkPolicy::DenyList {
+            cidrs: vec![(IpCidr::parse("169.254.169.254").unwrap(), PortAllow::Any)],
+            any_ip_ports: HashSet::new(),
+            deny_all: false,
+        };
+        assert!(!policy.allows("::ffff:169.254.169.254".parse().unwrap(), 80));
+    }
+
+    #[test]
+    fn allowlist_accepts_v4_mapped_ipv6_form_of_allowed_ip() {
+        // Mirror of the deny case: the mapped form is the same destination,
+        // so a v4 allow entry must match it (per_ip and cidr paths both).
+        use crate::network::IpCidr;
+        let mut per_ip = HashMap::new();
+        per_ip.insert("1.2.3.4".parse().unwrap(), PortAllow::Any);
+        let policy = NetworkPolicy::AllowList {
+            per_ip,
+            cidrs: vec![(IpCidr::parse("10.0.0.0/8").unwrap(), PortAllow::Any)],
+            any_ip_ports: HashSet::new(),
+        };
+        assert!(policy.allows("::ffff:1.2.3.4".parse().unwrap(), 443));
+        assert!(policy.allows("::ffff:10.1.2.3".parse().unwrap(), 443));
+        assert!(!policy.allows("::ffff:8.8.8.8".parse().unwrap(), 443));
     }
 }

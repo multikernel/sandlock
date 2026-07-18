@@ -13,7 +13,7 @@ use crate::sys::structs::{SeccompNotif, ECONNREFUSED};
 
 use super::materialize::{
     named_unix_socket_path, parse_ip_from_sockaddr, parse_port_from_sockaddr,
-    set_port_in_sockaddr,
+    set_port_in_sockaddr, sockaddr_is_ipv6,
 };
 use super::unix::connect_named_unix_on_behalf;
 use super::verdict::{destination_verdict, path_under_any};
@@ -110,7 +110,10 @@ pub(super) async fn connect_on_behalf(
         // reused rather than pidfd_getfd-ing a second time.
         if plan.record_orig_dest {
             if let Some(ref map) = orig_dest_map {
-                record_orig_dest(map, dup_fd.as_raw_fd(), ip.is_ipv6(), ip);
+                // The local-address probe must bind in the socket's own
+                // family, which for a v4-mapped destination is AF_INET6
+                // even though the canonical `ip` is V4.
+                record_orig_dest(map, dup_fd.as_raw_fd(), sockaddr_is_ipv6(&addr_bytes), ip);
             }
         }
         connect_dup(dup_fd.as_raw_fd(), &plan.addr)
@@ -181,7 +184,10 @@ fn plan_connect_target(
     proxy: Option<std::net::SocketAddr>,
     remap_port: Option<u16>,
 ) -> Result<ConnectPlan, i32> {
-    let is_ipv6 = parse_ip_from_sockaddr(addr_bytes).map_or(false, |ip| ip.is_ipv6());
+    // Family of the sockaddr (== the socket's family on a valid connect):
+    // a v4-mapped destination on a dual-stack socket still needs an
+    // AF_INET6 sockaddr, so this must not come from the canonical IP.
+    let is_ipv6 = sockaddr_is_ipv6(addr_bytes);
     if let Some(proxy_addr) = proxy {
         let addr = if is_ipv6 {
             // IPv6 socket: redirect via the IPv4-mapped IPv6 address
@@ -405,9 +411,17 @@ mod tests {
         let a = v6_sockaddr(80);
         let proxy: std::net::SocketAddr = "127.0.0.1:3128".parse().unwrap();
         let plan = plan_connect_target(&a, Some(proxy), None).unwrap();
+        // The rewritten sockaddr stays AF_INET6 (the socket's family) and
+        // carries ::ffff:127.0.0.1; the parser reports the canonical V4.
+        let family = u16::from_ne_bytes([plan.addr[0], plan.addr[1]]);
+        assert_eq!(family, libc::AF_INET6 as u16);
+        assert_eq!(
+            plan.addr[8..24],
+            "::ffff:127.0.0.1".parse::<std::net::Ipv6Addr>().unwrap().octets()
+        );
         assert_eq!(
             parse_ip_from_sockaddr(&plan.addr),
-            Some("::ffff:127.0.0.1".parse().unwrap())
+            Some("127.0.0.1".parse().unwrap())
         );
         assert_eq!(parse_port_from_sockaddr(&plan.addr), Some(3128));
         assert!(plan.record_orig_dest);
@@ -421,6 +435,22 @@ mod tests {
             plan_connect_target(&a, Some(proxy), None).map(|p| p.addr),
             Err(libc::EAFNOSUPPORT)
         );
+    }
+
+    #[test]
+    fn plan_proxy_on_v6_socket_with_mapped_v4_destination_keeps_v6_family() {
+        // A dual-stack v6 socket connecting to ::ffff:a.b.c.d must be
+        // redirected with an AF_INET6 sockaddr (family follows the socket,
+        // not the canonicalized destination IP).
+        let mut a = v6_sockaddr(80);
+        let mapped: std::net::Ipv6Addr = "::ffff:93.184.216.34".parse().unwrap();
+        a[8..24].copy_from_slice(&mapped.octets());
+        let proxy: std::net::SocketAddr = "127.0.0.1:3128".parse().unwrap();
+        let plan = plan_connect_target(&a, Some(proxy), None).unwrap();
+        let family = u16::from_ne_bytes([plan.addr[0], plan.addr[1]]);
+        assert_eq!(family, libc::AF_INET6 as u16);
+        assert_eq!(parse_port_from_sockaddr(&plan.addr), Some(3128));
+        assert!(plan.record_orig_dest);
     }
 
     #[test]
