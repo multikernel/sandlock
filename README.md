@@ -213,8 +213,12 @@ sandlock run --port-remap --net-allow-bind 6379 -r /usr -r /lib -r /etc -- redis
 sandlock run --name api.local --port-remap --net-allow-bind 8080 -r /usr -r /lib -r /etc -- python3 server.py
 sandlock run --name web.local --port-remap --net-allow-bind 8080 -r /usr -r /lib -r /etc -- python3 server.py
 
-# List all running sandboxes
-sandlock list
+# List all running sandboxes (with uptime and command)
+sandlock ps
+
+# Show effective policy for a running sandbox (JSON or TOML)
+sandlock config api.local
+sandlock config api.local --toml
 
 # Kill a running sandbox by name
 sandlock kill web.local
@@ -756,15 +760,22 @@ of the child via `pidfd_getfd` (TOCTOU-safe). When a port conflicts, a
 different real port is allocated transparently. `/proc/net/tcp` is filtered
 to only show the sandbox's own ports.
 
-When `--port-remap` is enabled, the sandbox registers its state in a
-shared registry (`/dev/shm`). Use `sandlock list` to see all running
-sandboxes and `sandlock kill` to stop them:
+When `--port-remap` is enabled, the sandbox's bind ports are virtualized.
+Use `sandlock ps` to see all running sandboxes and `sandlock kill` to
+stop them:
 
 ```
-$ sandlock list
-NAME                    PID  PORTS
-api.local            12345  8080
-web.local            12346  8080 -> 35299
+$ sandlock ps
+NAME                                  PID        UPTIME  CMD
+api.local                           12345            5m  python3 server.py
+web.local                           12346            3m  python3 server.py
+
+$ sandlock config api.local --toml | head -10
+[config]
+http_inject_ca = []
+
+[determinism]
+...
 
 $ sandlock kill web.local
 Killed sandbox 'web.local' (PID 12346)

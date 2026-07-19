@@ -355,3 +355,273 @@ fn test_uid_mapping_arbitrary_uid() {
     );
 }
 
+// ============================================================
+// RFC #68: control socket introspection tests
+// ============================================================
+
+/// Helper: return a sandlock binary with common fs-read args for running
+/// /bin/sleep in a sandbox.
+fn sandlock_sleep_args(name: &str) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "--name".into(),
+        name.into(),
+        "-r".into(),
+        "/usr".into(),
+        "-r".into(),
+        "/lib".into(),
+        "-r".into(),
+        "/lib64".into(),
+        "-r".into(),
+        "/bin".into(),
+        "-r".into(),
+        "/etc".into(),
+        "-r".into(),
+        "/proc".into(),
+        "-r".into(),
+        "/dev".into(),
+        "--".into(),
+        "/bin/sleep".into(),
+        "30".into(),
+    ];
+    let has_lib64 = std::path::Path::new("/lib64").exists();
+    if !has_lib64 {
+        // Remove -r /lib64 and its value.
+        if let Some(pos) = args.iter().position(|s| s == "/lib64") {
+            args.remove(pos);
+            args.remove(pos - 1);
+        }
+    }
+    args
+}
+
+/// Start a background sandbox, wait for it to be listed by `ps`, then
+/// return its PID. The caller is responsible for killing it.
+fn spawn_sandbox(name: &str) -> std::process::Child {
+    let bin = env!("CARGO_BIN_EXE_sandlock");
+    let args = sandlock_sleep_args(name);
+    std::process::Command::new(bin)
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn sandlock")
+}
+
+/// Wait for a sandbox to appear in `sandlock ps` output.
+fn wait_for_sandbox(name: &str) -> Result<(), String> {
+    let bin = env!("CARGO_BIN_EXE_sandlock");
+    for _ in 0..10 {
+        let out = std::process::Command::new(bin)
+            .args(["ps"])
+            .output()
+            .expect("sandlock ps");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if stdout.contains(name) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    Err(format!("sandbox '{}' did not appear in ps output", name))
+}
+
+#[test]
+fn test_ps_lists_running_sandbox() {
+    let name = format!("test-ps-cli-{}", std::process::id());
+    let mut child = spawn_sandbox(&name);
+
+    match wait_for_sandbox(&name) {
+        Ok(()) => {
+            let out = sandlock_bin()
+                .args(["ps"])
+                .output()
+                .expect("sandlock ps");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                stdout.contains(&name),
+                "ps output should contain sandbox name '{}':\n{}",
+                name,
+                stdout
+            );
+            // Should have column headers.
+            assert!(
+                stdout.contains("NAME") && stdout.contains("PID") && stdout.contains("UPTIME"),
+                "ps output should have column headers: {}",
+                stdout
+            );
+        }
+        Err(e) => {
+            let _ = child.kill();
+            panic!("{}", e);
+        }
+    }
+
+    // Clean up.
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn test_ps_no_sandboxes() {
+    let out = sandlock_bin()
+        .args(["ps"])
+        .output()
+        .expect("sandlock ps");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Either "No running sandboxes" or the header with no entries.
+    assert!(
+        stdout.contains("No running sandboxes") || stdout.contains("NAME"),
+        "ps should print header or 'No running sandboxes': {}",
+        stdout
+    );
+}
+
+#[test]
+fn test_config_returns_json_policy() {
+    let name = format!("test-config-cli-{}", std::process::id());
+    let mut child = spawn_sandbox(&name);
+
+    match wait_for_sandbox(&name) {
+        Ok(()) => {
+            let out = sandlock_bin()
+                .args(["config", &name])
+                .output()
+                .expect("sandlock config");
+            assert!(
+                out.status.success(),
+                "config should succeed: stderr={}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            // JSON output should contain the filesystem section.
+            assert!(
+                stdout.contains("filesystem"),
+                "config JSON should contain 'filesystem': {}",
+                stdout
+            );
+            assert!(
+                stdout.contains("/usr"),
+                "config JSON should contain /usr in read list: {}",
+                stdout
+            );
+        }
+        Err(e) => {
+            let _ = child.kill();
+            panic!("{}", e);
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn test_config_toml_flag_produces_toml() {
+    let name = format!("test-config-toml-cli-{}", std::process::id());
+    let mut child = spawn_sandbox(&name);
+
+    match wait_for_sandbox(&name) {
+        Ok(()) => {
+            let out = sandlock_bin()
+                .args(["config", "--toml", &name])
+                .output()
+                .expect("sandlock config --toml");
+            assert!(
+                out.status.success(),
+                "config --toml should succeed: stderr={}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            // TOML output should have section headers.
+            assert!(
+                stdout.contains("[filesystem]"),
+                "config --toml should contain [filesystem]: {}",
+                stdout
+            );
+            assert!(
+                stdout.contains("/usr"),
+                "config --toml should contain /usr: {}",
+                stdout
+            );
+        }
+        Err(e) => {
+            let _ = child.kill();
+            panic!("{}", e);
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn test_config_nonexistent_sandbox() {
+    let out = sandlock_bin()
+        .args(["config", "nonexistent-sandbox-xyz-99999"])
+        .output()
+        .expect("sandlock config");
+    assert!(!out.status.success(), "config for nonexistent sandbox should fail");
+}
+
+#[test]
+fn test_kill_stops_sandbox() {
+    let name = format!("test-kill-cli-{}", std::process::id());
+    let mut child = spawn_sandbox(&name);
+
+    match wait_for_sandbox(&name) {
+        Ok(()) => {
+            let out = sandlock_bin()
+                .args(["kill", &name])
+                .output()
+                .expect("sandlock kill");
+            assert!(
+                out.status.success(),
+                "kill should succeed: stderr={}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                stdout.contains("Killed"),
+                "kill output should say 'Killed': {}",
+                stdout
+            );
+
+            // The child should now exit (killed).
+            let status = child.wait().expect("wait for killed child");
+            // SIGKILL → signal 9.
+            assert!(!status.success());
+        }
+        Err(e) => {
+            let _ = child.kill();
+            panic!("{}", e);
+        }
+    }
+}
+
+#[test]
+fn test_kill_nonexistent_sandbox() {
+    let out = sandlock_bin()
+        .args(["kill", "nonexistent-sandbox-xyz-99999"])
+        .output()
+        .expect("sandlock kill");
+    assert!(!out.status.success(), "kill for nonexistent sandbox should fail");
+}
+
+#[test]
+fn test_help_shows_ps_and_config() {
+    let out = sandlock_bin()
+        .args(["--help"])
+        .output()
+        .expect("sandlock --help");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("ps"), "--help should show 'ps' command");
+    assert!(stdout.contains("config"), "--help should show 'config' command");
+    assert!(stdout.contains("kill"), "--help should show 'kill' command");
+    // The old 'list' command should be gone.
+    assert!(
+        !stdout.contains("  list"),
+        "--help should NOT show 'list' command (renamed to 'ps')"
+    );
+}
+

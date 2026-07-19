@@ -1775,13 +1775,26 @@ impl Sandbox {
             // Set up the per-sandbox runtime dir and control socket.  Must
             // happen before the notif supervisor is spawned so the socket
             // exists when the child is released.
+            //
+            // Best-effort: in nested sandboxes /dev/shm may be restricted by
+            // the outer sandlock's landlock policy.  Warn and continue without
+            // a control socket rather than failing the sandbox.
             let sandbox_name = self.rt().name.clone();
-            let (control_listener, control_dir) =
-                crate::control::setup_runtime_dir(&sandbox_name, pid)
-                    .map_err(|e| SandboxRuntimeError::Child(
-                        format!("control socket setup: {}", e)
-                    ))?;
-            self.rt_mut().control_dir = Some(control_dir);
+            let control_listener: Option<std::os::unix::net::UnixListener>;
+            match crate::control::setup_runtime_dir(&sandbox_name, pid) {
+                Ok((listener, control_dir)) => {
+                    self.rt_mut().control_dir = Some(control_dir);
+                    control_listener = Some(listener);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "sandlock: control socket setup failed for '{}': {} \
+                         (introspection unavailable for this sandbox)",
+                        sandbox_name, e
+                    );
+                    control_listener = None;
+                }
+            }
 
             if self.time_start.is_some() || self.random_seed.is_some() {
                 let time_offset = self.time_start.map(|t| crate::time::calculate_time_offset(t));
@@ -1969,9 +1982,10 @@ impl Sandbox {
             let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
 
             // Clone ctx for the control loop before moving the original into
-            // the notif supervisor.
+            // the notif supervisor.  Only set up if the control dir was
+            // successfully created above.
             let control_ctx = Arc::clone(&ctx);
-            let control_dir_path = self.rt().control_dir.clone().expect("control dir set above");
+            let control_dir_opt = self.rt().control_dir.clone();
 
             self.rt_mut().notif_handle = Some(tokio::spawn(
                 notif::supervisor(notif_fd, ctx, handlers, startup_tx),
@@ -1995,14 +2009,18 @@ impl Sandbox {
             // Spawn the control-socket loop as a dedicated tokio task.
             // Independent of the seccomp-notify loop so accept() never adds
             // latency to syscall notification processing.
-            self.rt_mut().control_handle = Some(
-                crate::control::spawn_control_loop(
-                    control_listener,
-                    control_ctx,
-                    sandbox_snapshot,
-                    control_dir_path,
-                )
-            );
+            if let (Some(listener), Some(dir_path)) =
+                (control_listener, control_dir_opt)
+            {
+                self.rt_mut().control_handle = Some(
+                    crate::control::spawn_control_loop(
+                        listener,
+                        control_ctx,
+                        sandbox_snapshot,
+                        dir_path,
+                    )
+                );
+            }
 
             let la_resource = Arc::clone(&res_state);
             self.rt_mut().loadavg_handle = Some(tokio::spawn(async move {

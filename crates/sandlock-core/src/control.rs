@@ -210,7 +210,7 @@ struct ControlRequest {
     args: serde_json::Value,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct ControlResponse {
     pub v: u32,
     pub ok: bool,
