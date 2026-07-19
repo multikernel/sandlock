@@ -15,32 +15,35 @@ use sandlock_core::sandbox::BranchAction;
 use sandlock_core::Sandbox;
 
 
-/// Directories the write-collapser must never silently grant.
-/// Collapsing to any of these emits a warning and an observed-vs-granted diff.
-const SENSITIVE_WRITE_PREFIXES: &[&[u8]] = &[
-    b"/etc",
-    b"/proc",
-    b"/sys",
-    b"/dev",
-    b"/root",
-    b"/boot",
-    b"/run/secrets",
-];
+/// Protected: no legitimate sandboxed workload needs a recursive grant here.
+/// Write collapse to these is skipped + error. Read collapse never fires here.
+const PROTECTED_PATHS: &[&[u8]] = &[b"/", b"/root"];
+const PROTECTED_CRED_SUFFIXES: &[&[u8]] = &[b"/.ssh", b"/.aws", b"/.kube", b"/.gnupg"];
 
-fn is_sensitive_write_target(p: &std::path::Path) -> bool {
+/// Guarded: write grants are sometimes necessary but warrant operator awareness.
+/// Write collapse emits + warning + diff. Read collapse never fires here.
+const GUARDED_PATHS: &[&[u8]] = &[b"/etc", b"/proc", b"/sys", b"/dev", b"/boot", b"/run/secrets"];
+
+#[derive(PartialEq)]
+enum PathTier { Protected, Guarded, Normal }
+
+fn classify_path(p: &std::path::Path) -> PathTier {
     let b = p.as_os_str().as_encoded_bytes();
-    if SENSITIVE_WRITE_PREFIXES.iter().any(|s| b == *s) {
-        return true;
+    if PROTECTED_PATHS.iter().any(|s| b == *s)
+        || PROTECTED_CRED_SUFFIXES.iter().any(|suf| b.ends_with(suf))
+    {
+        return PathTier::Protected;
     }
-    // $HOME itself (e.g. /home/user or /root).
+    if GUARDED_PATHS.iter().any(|s| b == *s) {
+        return PathTier::Guarded;
+    }
+    // $HOME itself (non-root) is guarded — apps do legitimately write dotfiles there.
     if let Ok(home) = std::env::var("HOME") {
-        if b == home.as_bytes() {
-            return true;
+        if b == home.as_bytes() && home != "/root" {
+            return PathTier::Guarded;
         }
     }
-    // ~/.ssh, ~/.aws, ~/.kube, ~/.gnupg under any home directory.
-    const CRED_SUFFIXES: &[&[u8]] = &[b"/.ssh", b"/.aws", b"/.kube", b"/.gnupg"];
-    CRED_SUFFIXES.iter().any(|suf| b.ends_with(suf))
+    PathTier::Normal
 }
 
 /// Print immediate children of `dir` that the workload did NOT observe writing.
@@ -77,19 +80,22 @@ fn collapse_write_paths(writes: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
             continue;
         }
         let Some(ancestor) = p.ancestors().skip(1).find(|a| a.exists()) else { continue };
-        if ancestor.as_os_str().as_encoded_bytes() == b"/" {
-            eprintln!(
-                "sandlock learn: WARNING: write collapse for '{}' reaches filesystem root, skipping",
-                p.display()
-            );
-            continue;
-        }
-        if is_sensitive_write_target(&ancestor) {
-            eprintln!(
-                "sandlock learn: WARNING: write collapse '{}' to '{}' (sensitive directory)",
-                p.display(), ancestor.display()
-            );
-            print_observed_vs_granted_diff(&ancestor, writes);
+        match classify_path(&ancestor) {
+            PathTier::Protected => {
+                eprintln!(
+                    "sandlock learn: WARNING: write collapse for '{}' reaches protected path '{}', skipping",
+                    p.display(), ancestor.display()
+                );
+                continue;
+            }
+            PathTier::Guarded => {
+                eprintln!(
+                    "sandlock learn: WARNING: write collapse '{}' to '{}' (guarded directory)",
+                    p.display(), ancestor.display()
+                );
+                print_observed_vs_granted_diff(&ancestor, writes);
+            }
+            PathTier::Normal => {}
         }
         out.insert(ancestor.to_path_buf());
     }
@@ -107,6 +113,85 @@ fn dedup_subsumed(paths: Vec<PathBuf>) -> Vec<PathBuf> {
             !p.ancestors().skip(1).any(|a| set.contains(a))
         })
         .collect()
+}
+
+/// Collapse paths using the N-threshold heuristic and explicit prefixes.
+///
+/// Protected/guarded directories are never collapsed by the N-threshold.
+/// --collapse-prefix targeting a protected dir is always refused.
+/// --collapse-prefix targeting a guarded dir requires force_sensitive=true.
+fn collapse_by_threshold(
+    paths: Vec<PathBuf>,
+    n: usize,
+    force_prefixes: &[PathBuf],
+    force_sensitive: bool,
+    observed: &BTreeSet<PathBuf>,
+) -> Vec<PathBuf> {
+    // Validate force_prefixes upfront.
+    for prefix in force_prefixes {
+        match classify_path(prefix) {
+            PathTier::Normal => {}
+            _ if !force_sensitive => {
+                eprintln!(
+                    "sandlock learn: ERROR: --collapse-prefix '{}' targets a sensitive path; use --force-sensitive-collapse to proceed",
+                    prefix.display()
+                );
+                std::process::exit(1);
+            }
+            _ => {}
+        }
+    }
+
+    // Count how many paths share the same parent directory.
+    let mut dir_counts: std::collections::HashMap<PathBuf, usize> = Default::default();
+    for p in &paths {
+        if let Some(parent) = p.parent() {
+            *dir_counts.entry(parent.to_path_buf()).or_insert(0) += 1;
+        }
+    }
+
+    let mut out: BTreeSet<PathBuf> = BTreeSet::new();
+    for p in paths {
+        let forced = force_prefixes.iter()
+            .filter(|prefix| p.starts_with(prefix))
+            .max_by_key(|prefix| prefix.as_os_str().len());
+
+        let target: PathBuf = if let Some(prefix) = forced {
+            prefix.clone()
+        } else if let Some(parent) = p.parent() {
+            if dir_counts.get(parent).copied().unwrap_or(0) >= n {
+                parent.to_path_buf()
+            } else {
+                out.insert(p);
+                continue;
+            }
+        } else {
+            out.insert(p);
+            continue;
+        };
+
+        match classify_path(&target) {
+            PathTier::Normal => {
+                out.insert(target);
+            }
+            tier => {
+                if forced.is_some() {
+                    // Explicit --collapse-prefix + --force-sensitive-collapse: emit with warning + diff.
+                    let label = if tier == PathTier::Protected { "protected" } else { "guarded" };
+                    eprintln!(
+                        "sandlock learn: WARNING: collapse '{}' to '{}' ({label} directory)",
+                        p.display(), target.display()
+                    );
+                    print_observed_vs_granted_diff(&target, observed);
+                    out.insert(target);
+                } else {
+                    // N-threshold hit a sensitive dir: keep individual path.
+                    out.insert(p);
+                }
+            }
+        }
+    }
+    out.into_iter().collect()
 }
 
 /// Returns true for pid/session-specific paths that are meaningless across runs.
@@ -407,16 +492,37 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     profile_out.program.exec = Some(PathBuf::from(&args.cmd[0]));
     profile_out.program.args = args.cmd[1..].to_vec();
 
+    let reads_raw: Vec<PathBuf> = observer.reads.lock().unwrap().iter()
+        .filter(|p| p.exists() && !is_junk_path(p))
+        .cloned()
+        .collect();
+    let writes_raw = observer.writes.lock().unwrap();
+    let observed_all: BTreeSet<PathBuf> = reads_raw.iter()
+        .chain(writes_raw.iter())
+        .cloned()
+        .collect();
+
+    let fsc = args.force_sensitive_collapse;
+    let reads = if let Some(n) = args.collapse {
+        dedup_subsumed(collapse_by_threshold(reads_raw, n, &args.collapse_prefix, fsc, &observed_all))
+    } else if !args.collapse_prefix.is_empty() {
+        dedup_subsumed(collapse_by_threshold(reads_raw, usize::MAX, &args.collapse_prefix, fsc, &observed_all))
+    } else {
+        dedup_subsumed(reads_raw)
+    };
+
+    let writes_collapsed = collapse_write_paths(&writes_raw);
+    let writes = if let Some(n) = args.collapse {
+        dedup_subsumed(collapse_by_threshold(writes_collapsed, n, &args.collapse_prefix, fsc, &observed_all))
+    } else if !args.collapse_prefix.is_empty() {
+        dedup_subsumed(collapse_by_threshold(writes_collapsed, usize::MAX, &args.collapse_prefix, fsc, &observed_all))
+    } else {
+        dedup_subsumed(writes_collapsed)
+    };
+
     profile_out.filesystem = FilesystemSection {
-        // Filter reads by existence to drop failed PATH-probe openats.
-        // Executed binaries are merged into read.
-        read: dedup_subsumed(
-            observer.reads.lock().unwrap().iter()
-                .filter(|p| p.exists() && !is_junk_path(p))
-                .cloned()
-                .collect()
-        ),
-        write: dedup_subsumed(collapse_write_paths(&observer.writes.lock().unwrap())),
+        read: reads,
+        write: writes,
         ..Default::default()
     };
     profile_out.network.allow = observer.connects.lock().unwrap().iter().cloned().collect();

@@ -214,6 +214,18 @@ struct LearnArgs {
     #[arg(long, value_name = "SECS")]
     timeout: Option<u64>,
 
+    /// Collapse directories where N or more files were observed (default N=4 when flag is present)
+    #[arg(long, value_name = "N", default_missing_value = "4", num_args = 0..=1)]
+    collapse: Option<usize>,
+
+    /// Force collapse of all observed paths under PREFIX to that prefix (repeatable)
+    #[arg(long, value_name = "PREFIX")]
+    collapse_prefix: Vec<PathBuf>,
+
+    /// Allow --collapse-prefix to target sensitive directories (prints a warning and diff for each)
+    #[arg(long, requires = "collapse_prefix")]
+    force_sensitive_collapse: bool,
+
     /// Command to observe (everything after --)
     #[arg(last = true, required = true)]
     cmd: Vec<String>,

@@ -839,8 +839,7 @@ fn test_learn_captures_real_binary_path_via_maps() {
     );
 }
 
-/// Collapsing a new file whose ancestor walk reaches "/" must not emit "/"
-/// in the write list and must print a warning to stderr.
+/// [write collapse] "/" is protected — entry is skipped and an error is printed.
 #[test]
 fn test_write_collapse_skips_root() {
     let output = sandlock_bin()
@@ -860,14 +859,12 @@ fn test_write_collapse_skips_root() {
         "write list must not contain \"/\", got: {write_line}",
     );
     assert!(
-        stderr.contains("filesystem root"),
-        "expected 'filesystem root' warning in stderr, got: {stderr}",
+        stderr.contains("protected path"),
+        "expected 'protected path' warning in stderr, got: {stderr}",
     );
 }
 
-/// Collapsing a new file under a sensitive directory must emit a warning and an
-/// observed-vs-granted diff to stderr, and still include the directory in the write
-/// list (Landlock requires an existing path for non-existent files).
+/// [write collapse] guarded path (/etc) — emit + warning + diff (Landlock requires an existing path).
 #[test]
 fn test_write_collapse_warns_sensitive() {
     let output = sandlock_bin()
@@ -887,8 +884,8 @@ fn test_write_collapse_warns_sensitive() {
         "expected /etc in write list, got: {write_line}",
     );
     assert!(
-        stderr.contains("sensitive directory"),
-        "expected 'sensitive directory' warning in stderr, got: {stderr}",
+        stderr.contains("guarded directory"),
+        "expected 'guarded directory' warning in stderr, got: {stderr}",
     );
     assert!(
         stderr.contains("unobserved siblings now writable under"),
@@ -896,8 +893,7 @@ fn test_write_collapse_warns_sensitive() {
     );
 }
 
-/// When a directory and a file under it both appear in the reads list,
-/// dedup must remove the file — the directory's PATH_BENEATH grant already covers it.
+/// [read dedup] directory and file under it both in reads — file must be removed (PATH_BENEATH is recursive).
 #[test]
 fn test_read_dedup_removes_leaf_when_ancestor_present() {
     // ls opens /etc as a directory read; cat opens /etc/hostname as a file read.
@@ -920,5 +916,140 @@ fn test_read_dedup_removes_leaf_when_ancestor_present() {
     assert!(
         !read_line.contains("/etc/hostname"),
         "expected /etc/hostname removed by dedup (covered by /etc), got: {read_line}",
+    );
+}
+
+/// [read collapse] N-threshold collapses a normal directory once N files are observed under it.
+#[test]
+fn test_collapse_threshold_reads() {
+    let output = sandlock_bin()
+        .args(["learn", "--collapse", "--", "sh", "-c",
+               "cat /usr/bin/cat /usr/bin/sh /usr/bin/ls /usr/bin/env"])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let read_line = stdout.lines().find(|l| l.starts_with("read = [")).unwrap_or("");
+    assert!(
+        read_line.contains("/usr/bin\"") || read_line.contains("/usr/bin,"),
+        "expected /usr/bin collapsed in reads, got: {read_line}",
+    );
+    assert!(
+        !read_line.contains("/usr/bin/cat"),
+        "expected individual /usr/bin files removed after collapse, got: {read_line}",
+    );
+}
+
+/// [read collapse] --collapse-prefix forces collapse of all paths under the prefix regardless of N.
+#[test]
+fn test_collapse_prefix_forces_collapse() {
+    let output = sandlock_bin()
+        .args(["learn", "--collapse-prefix", "/usr/bin", "--", "cat", "/usr/bin/cat", "/usr/bin/sh"])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let read_line = stdout.lines().find(|l| l.starts_with("read = [")).unwrap_or("");
+    assert!(
+        read_line.contains("/usr/bin\"") || read_line.contains("/usr/bin,"),
+        "expected /usr/bin collapsed in reads, got: {read_line}",
+    );
+    assert!(
+        !read_line.contains("/usr/bin/cat"),
+        "expected /usr/bin/cat removed after prefix collapse, got: {read_line}",
+    );
+}
+
+/// [read collapse] guarded path (/etc) must NOT be collapsed by N-threshold — individual files kept.
+#[test]
+fn test_collapse_guarded_not_collapsed_by_threshold() {
+    let output = sandlock_bin()
+        .args(["learn", "--collapse", "--", "sh", "-c",
+               "cat /etc/hostname /etc/hosts /etc/resolv.conf /etc/passwd"])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(output.status.success(), "stderr={}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let read_line = stdout.lines().find(|l| l.starts_with("read = [")).unwrap_or("");
+    assert!(
+        read_line.contains("/etc/hostname"),
+        "expected individual /etc files kept (guarded, not collapsed), got: {read_line}",
+    );
+}
+
+/// [read collapse] --collapse-prefix on a guarded path without --force-sensitive-collapse must fail.
+#[test]
+fn test_collapse_prefix_guarded_requires_force() {
+    let output = sandlock_bin()
+        .args(["learn", "--collapse-prefix", "/etc", "--", "cat", "/etc/hostname"])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(
+        !output.status.success(),
+        "expected failure without --force-sensitive-collapse",
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--force-sensitive-collapse"),
+        "expected hint about --force-sensitive-collapse in stderr, got: {stderr}",
+    );
+}
+
+/// [read collapse] --collapse-prefix on a guarded path with --force-sensitive-collapse: collapse + warn + diff.
+#[test]
+fn test_collapse_prefix_guarded_with_force() {
+    let output = sandlock_bin()
+        .args(["learn", "--collapse-prefix", "/etc", "--force-sensitive-collapse",
+               "--", "cat", "/etc/hostname"])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(output.status.success(), "stderr={}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let read_line = stdout.lines().find(|l| l.starts_with("read = [")).unwrap_or("");
+    assert!(
+        read_line.contains("/etc\"") || read_line.contains("/etc,"),
+        "expected /etc in reads after forced collapse, got: {read_line}",
+    );
+    assert!(
+        !read_line.contains("/etc/hostname"),
+        "expected /etc/hostname removed after collapse, got: {read_line}",
+    );
+    assert!(
+        stderr.contains("guarded directory"),
+        "expected guarded directory warning, got: {stderr}",
+    );
+    assert!(
+        stderr.contains("unobserved siblings now writable under"),
+        "expected observed-vs-granted diff, got: {stderr}",
+    );
+}
+
+/// [write collapse] protected path (/root) — entry is skipped and an error is printed.
+#[test]
+fn test_write_collapse_skips_protected() {
+    let output = sandlock_bin()
+        .args(["learn", "--", "sh", "-c", "echo x > /root/sandlock_learn_protected_test_$$"])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(output.status.success(), "stderr={}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("");
+    assert!(
+        !write_line.contains("/root\"") && !write_line.contains("/root,"),
+        "write list must not contain /root (protected), got: {write_line}",
+    );
+    assert!(
+        stderr.contains("protected path"),
+        "expected 'protected path' error in stderr, got: {stderr}",
     );
 }
