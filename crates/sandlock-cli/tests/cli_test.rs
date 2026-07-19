@@ -839,3 +839,59 @@ fn test_learn_captures_real_binary_path_via_maps() {
     );
 }
 
+/// Collapsing a new file whose ancestor walk reaches "/" must not emit "/"
+/// in the write list and must print a warning to stderr.
+#[test]
+fn test_write_collapse_skips_root() {
+    let output = sandlock_bin()
+        .args(["learn", "--", "sh", "-c", "echo x > /sandlock_learn_root_test_$$"])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("");
+    assert!(
+        !write_line.contains("\"/\""),
+        "write list must not contain \"/\", got: {write_line}",
+    );
+    assert!(
+        stderr.contains("filesystem root"),
+        "expected 'filesystem root' warning in stderr, got: {stderr}",
+    );
+}
+
+/// Collapsing a new file under a sensitive directory must emit a warning and an
+/// observed-vs-granted diff to stderr, and still include the directory in the write
+/// list (Landlock requires an existing path for non-existent files).
+#[test]
+fn test_write_collapse_warns_sensitive() {
+    let output = sandlock_bin()
+        .args(["learn", "--", "sh", "-c", "echo x > /etc/sandlock_learn_sensitive_test_$$"])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("");
+    assert!(
+        write_line.contains("/etc"),
+        "expected /etc in write list, got: {write_line}",
+    );
+    assert!(
+        stderr.contains("sensitive directory"),
+        "expected 'sensitive directory' warning in stderr, got: {stderr}",
+    );
+    assert!(
+        stderr.contains("unobserved siblings now writable under"),
+        "expected observed-vs-granted diff in stderr, got: {stderr}",
+    );
+}

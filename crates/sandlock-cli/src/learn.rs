@@ -15,6 +15,87 @@ use sandlock_core::sandbox::BranchAction;
 use sandlock_core::Sandbox;
 
 
+/// Directories the write-collapser must never silently grant.
+/// Collapsing to any of these emits a warning and an observed-vs-granted diff.
+const SENSITIVE_WRITE_PREFIXES: &[&[u8]] = &[
+    b"/etc",
+    b"/proc",
+    b"/sys",
+    b"/dev",
+    b"/root",
+    b"/boot",
+    b"/run/secrets",
+];
+
+fn is_sensitive_write_target(p: &std::path::Path) -> bool {
+    let b = p.as_os_str().as_encoded_bytes();
+    if SENSITIVE_WRITE_PREFIXES.iter().any(|s| b == *s) {
+        return true;
+    }
+    // $HOME itself (e.g. /home/user or /root).
+    if let Ok(home) = std::env::var("HOME") {
+        if b == home.as_bytes() {
+            return true;
+        }
+    }
+    // ~/.ssh, ~/.aws, ~/.kube, ~/.gnupg under any home directory.
+    const CRED_SUFFIXES: &[&[u8]] = &[b"/.ssh", b"/.aws", b"/.kube", b"/.gnupg"];
+    CRED_SUFFIXES.iter().any(|suf| b.ends_with(suf))
+}
+
+/// Print immediate children of `dir` that the workload did NOT observe writing.
+fn print_observed_vs_granted_diff(dir: &std::path::Path, observed: &BTreeSet<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut unobserved: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| !observed.contains(p))
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .collect();
+    if unobserved.is_empty() { return }
+    unobserved.sort();
+    eprintln!(
+        "  unobserved siblings now writable under {}: {}",
+        dir.display(),
+        unobserved.join(", ")
+    );
+}
+
+/// Collapse write paths for the profile, with safety guards.
+///
+/// For paths that exist on the real FS: record as-is.
+/// For paths that don't exist (COW-created): walk up to the nearest existing
+/// ancestor, which is required for Landlock. Guards:
+/// - "/" → skip entirely and print an error
+/// - sensitive dirs → emit but print a warning + observed-vs-granted diff
+fn collapse_write_paths(writes: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
+    let mut out: BTreeSet<PathBuf> = BTreeSet::new();
+    for p in writes {
+        if is_junk_path(p) { continue; }
+        if p.exists() {
+            out.insert(p.clone());
+            continue;
+        }
+        let Some(ancestor) = p.ancestors().skip(1).find(|a| a.exists()) else { continue };
+        if ancestor.as_os_str().as_encoded_bytes() == b"/" {
+            eprintln!(
+                "sandlock learn: WARNING: write collapse for '{}' reaches filesystem root, skipping",
+                p.display()
+            );
+            continue;
+        }
+        if is_sensitive_write_target(&ancestor) {
+            eprintln!(
+                "sandlock learn: WARNING: write collapse '{}' to '{}' (sensitive directory)",
+                p.display(), ancestor.display()
+            );
+            print_observed_vs_granted_diff(&ancestor, writes);
+        }
+        out.insert(ancestor.to_path_buf());
+    }
+    out.into_iter().collect()
+}
+
 /// Returns true for pid/session-specific paths that are meaningless across runs.
 fn is_junk_path(p: &std::path::Path) -> bool {
     let b = p.as_os_str().as_encoded_bytes();
@@ -320,22 +401,7 @@ pub async fn run(args: LearnArgs) -> Result<()> {
             .filter(|p| p.exists() && !is_junk_path(p))
             .cloned()
             .collect(),
-        // For writes: if the file exists on the real FS, record the specific path
-        // (COW kept the original intact; the file was there before the run).
-        // If it doesn't exist (COW intercepted a create → new file in upper layer),
-        // record the parent directory instead; Landlock requires existing paths,
-        // and the program needs directory write access to create new files.
-        write: observer.writes.lock().unwrap().iter()
-            .filter(|p| !is_junk_path(p))
-            .filter_map(|p| {
-                if p.exists() {
-                    Some(p.clone())
-                } else {
-                    // Walk up to the nearest existing ancestor.
-                    p.ancestors().skip(1).find(|a| a.exists()).map(|a| a.to_path_buf())
-                }
-            })
-            .collect(),
+        write: collapse_write_paths(&observer.writes.lock().unwrap()),
         ..Default::default()
     };
     profile_out.network.allow = observer.connects.lock().unwrap().iter().cloned().collect();
