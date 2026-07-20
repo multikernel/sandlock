@@ -6,8 +6,6 @@ use anyhow::{Result, anyhow};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-mod network_registry;
-
 #[derive(Parser)]
 #[command(name = "sandlock", about = "Lightweight process sandbox", version)]
 struct Cli {
@@ -22,10 +20,18 @@ enum Command {
     /// Check kernel feature support
     Check,
     /// List all running sandboxes
-    List,
+    Ps,
+    /// Show effective policy for a running sandbox
+    Config {
+        /// Sandbox name (as shown by `sandlock ps`)
+        name: String,
+        /// Output TOML instead of JSON
+        #[arg(long)]
+        toml: bool,
+    },
     /// Kill a running sandbox by name
     Kill {
-        /// Sandbox name (as shown by `sandlock list`)
+        /// Sandbox name (as shown by `sandlock ps`)
         name: String,
     },
     /// Manage profiles
@@ -217,55 +223,89 @@ async fn main() -> Result<()> {
             std::process::exit(code);
         }
 
-        Command::List => {
-            match network_registry::list() {
-                Ok(reg) if reg.is_empty() => {
+        Command::Ps => {
+            match sandlock_core::control::list_live_sandboxes() {
+                Ok(sandboxes) if sandboxes.is_empty() => {
                     println!("No running sandboxes.");
                 }
-                Ok(reg) => {
-                    println!("{:<20} {:>6}  {:<30} {}", "NAME", "PID", "PORTS", "ALLOWED HOSTS");
-                    for (name, entry) in &reg {
-                        let ports: Vec<String> = entry.ports.iter()
-                            .map(|(v, r)| if v == r { format!("{}", v) } else { format!("{} -> {}", v, r) })
-                            .collect();
-                        let ports_str = if ports.is_empty() { "-".to_string() } else { ports.join(", ") };
-                        let hosts_str = if entry.allowed_hosts.is_empty() {
-                            "*".to_string()
-                        } else {
-                            entry.allowed_hosts.join(", ")
-                        };
-                        println!("{:<20} {:>6}  {:<30} {}", name, entry.pid, ports_str, hosts_str);
+                Ok(sandboxes) => {
+                    println!("{:<32} {:>8}  {:>12}  {}", "NAME", "PID", "UPTIME", "CMD");
+                    for (name, pid) in &sandboxes {
+                        let uptime = proc_uptime(*pid).unwrap_or_else(|| "?".to_string());
+                        let cmd = proc_cmdline(*pid).unwrap_or_else(|| "?".to_string());
+                        println!("{:<32} {:>8}  {:>12}  {}", name, pid, uptime, cmd);
                     }
                 }
                 Err(e) => {
-                    eprintln!("sandlock: failed to read registry: {}", e);
+                    eprintln!("sandlock: failed to list sandboxes: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Command::Config { name, toml } => {
+            match sandlock_core::control::send_control_request(
+                &name, "config", serde_json::Value::Object(Default::default()),
+            ) {
+                Ok(resp) if resp.ok => {
+                    if let Some(data) = resp.data {
+                        if toml {
+                            // Round-trip through ProfileInput -> TOML.
+                            let profile: sandlock_core::ProfileInput =
+                                serde_json::from_value(data)
+                                    .map_err(|e| anyhow!("parse config response: {}", e))?;
+                            let toml_str = toml::to_string_pretty(&profile)?;
+                            println!("{}", toml_str);
+                        } else {
+                            let json_str = serde_json::to_string_pretty(&data)?;
+                            println!("{}", json_str);
+                        }
+                    } else {
+                        eprintln!("sandlock: empty config response");
+                        std::process::exit(1);
+                    }
+                }
+                Ok(resp) => {
+                    eprintln!("sandlock: config error: {}", resp.err.as_deref().unwrap_or("unknown"));
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("sandlock: config failed: {}", e);
                     std::process::exit(1);
                 }
             }
         }
 
         Command::Kill { name } => {
-            match network_registry::list() {
-                Ok(reg) => {
-                    if let Some(entry) = reg.get(&name) {
-                        let ret = unsafe { libc::killpg(entry.pid, libc::SIGKILL) };
-                        if ret == 0 {
-                            let _ = network_registry::unregister(&name);
-                            println!("Killed sandbox '{}' (PID {})", name, entry.pid);
-                        } else {
-                            let err = std::io::Error::last_os_error();
-                            eprintln!("sandlock: failed to kill '{}' (PID {}): {}", name, entry.pid, err);
-                            std::process::exit(1);
-                        }
-                    } else {
-                        eprintln!("sandlock: no sandbox named '{}'", name);
-                        std::process::exit(1);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("sandlock: failed to read registry: {}", e);
+            // Read pid from the per-sandbox pid file (no socket round-trip).
+            let dir = sandlock_core::control::sandbox_dir(&name);
+            let pid_file = sandlock_core::control::pid_path(&dir);
+            let pid_str = match std::fs::read_to_string(&pid_file) {
+                Ok(s) => s,
+                Err(_) => {
+                    eprintln!("sandlock: no sandbox named '{}'", name);
                     std::process::exit(1);
                 }
+            };
+            let pid: i32 = match pid_str.trim().parse() {
+                Ok(p) => p,
+                Err(_) => {
+                    eprintln!("sandlock: invalid pid file for '{}'", name);
+                    std::process::exit(1);
+                }
+            };
+            // Liveness check.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                eprintln!("sandlock: sandbox '{}' (PID {}) is not running", name, pid);
+                std::process::exit(1);
+            }
+            let ret = unsafe { libc::killpg(pid, libc::SIGKILL) };
+            if ret == 0 {
+                println!("Killed sandbox '{}' (PID {})", name, pid);
+            } else {
+                let err = std::io::Error::last_os_error();
+                eprintln!("sandlock: failed to kill '{}' (PID {}): {}", name, pid, err);
+                std::process::exit(1);
             }
         }
 
@@ -372,10 +412,10 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         for p in &base.fs_writable { b = b.fs_write(p); }
         for p in &base.fs_denied { b = b.fs_deny(p); }
         for rule in &base.net_allow {
-            b = b.net_allow(format_net_rule(rule));
+            b = b.net_allow(sandlock_core::format_net_rule(rule));
         }
         for rule in &base.net_deny {
-            b = b.net_deny(format_net_rule(rule));
+            b = b.net_deny(sandlock_core::format_net_rule(rule));
         }
         match &base.net_allow_bind {
             sandlock_core::BindPorts::All => b = b.net_allow_bind("*"),
@@ -516,7 +556,9 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         }
     }
 
-    let sandbox_name = args.name.clone().unwrap_or_else(|| network_registry::next_name());
+    // Auto-generated names are handled by sandlock-core's sandbox_resolve_name
+    // (format: sandbox-<pid>-<counter>). Let core handle it when name is None.
+    let sandbox_name = args.name.clone();
 
     // Handle --image: extract rootfs, set chroot, get default cmd.
     // Auto-set workdir to the rootfs path when the user hasn't passed one,
@@ -589,7 +631,12 @@ async fn run_command(args: RunArgs) -> Result<i32> {
     };
 
     // Bake the instance name into the sandbox so all lifecycle methods use it.
-    let mut policy = policy.with_name(sandbox_name.clone());
+    // When name is None, core auto-generates sandbox-<pid>-<counter>.
+    let mut policy = if let Some(ref name) = sandbox_name {
+        policy.with_name(name.clone())
+    } else {
+        policy
+    };
 
     let result = if args.dry_run {
         if policy.workdir.is_none() {
@@ -619,53 +666,6 @@ async fn run_command(args: RunArgs) -> Result<i32> {
             }
         }
         dr.run_result
-    } else if policy.port_remap {
-        // Use spawn+wait so we can register/unregister network state.
-
-        // Set up callback to update registry on each port bind.
-        let reg_name = sandbox_name.clone();
-        policy.set_on_bind(move |ports| {
-            let _ = network_registry::update_ports(&reg_name, ports.clone());
-        });
-
-        policy.create_interactive(&cmd_strs).await?;
-        policy.start()?;
-
-        let pid = policy.pid().unwrap_or(0);
-        let registered_hosts: Vec<String> = policy
-            .net_allow
-            .iter()
-            .filter_map(|r| match &r.target {
-                sandlock_core::sandbox::NetTarget::Host(h) => Some(h.clone()),
-                sandlock_core::sandbox::NetTarget::Cidr(c) => Some(c.to_string()),
-                sandlock_core::sandbox::NetTarget::AnyIp => None,
-            })
-            .collect();
-        if let Err(e) = network_registry::register(
-            &sandbox_name, pid, std::collections::HashMap::new(),
-            registered_hosts,
-            None, // virtual_etc_hosts populated by core at runtime
-        ) {
-            eprintln!("sandlock: network registry: {}", e);
-        }
-
-        let result = if let Some(secs) = args.timeout {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(secs),
-                policy.wait(),
-            ).await {
-                Ok(r) => r?,
-                Err(_) => {
-                    let _ = network_registry::unregister(&sandbox_name);
-                    eprintln!("sandlock: timeout after {}s", secs);
-                    return Ok(124);
-                }
-            }
-        } else {
-            policy.wait().await?
-        };
-        let _ = network_registry::unregister(&sandbox_name);
-        result
     } else if let Some(secs) = args.timeout {
         match tokio::time::timeout(
             std::time::Duration::from_secs(secs),
@@ -725,7 +725,6 @@ fn validate_no_supervisor(args: &RunArgs) -> Result<()> {
     if pb.no_randomize_memory { bad.push("--no-randomize-memory"); }
     if pb.no_huge_pages { bad.push("--no-huge-pages"); }
     if pb.deterministic_dirs { bad.push("--deterministic-dirs"); }
-    if args.name.is_some() { bad.push("--name"); }
     if pb.chroot.is_some() { bad.push("--chroot"); }
     if args.image.is_some() { bad.push("--image"); }
     if pb.user.is_some() { bad.push("--user"); }
@@ -823,43 +822,6 @@ fn validate_no_supervisor_profile(profile: &Sandbox, source: &str) -> Result<()>
 /// single-protocol rule must carry its scheme to round-trip exactly.
 /// IPv6 is bracketed only when a port follows, and the all-ports case
 /// drops the redundant `:*`.
-fn format_net_rule(rule: &sandlock_core::sandbox::NetRule) -> String {
-    use sandlock_core::sandbox::{NetTarget, Protocol};
-    let target = match &rule.target {
-        NetTarget::AnyIp => "*".to_string(),
-        NetTarget::Host(h) => h.clone(),
-        NetTarget::Cidr(c) => {
-            // Bracket IPv6 only when a port suffix will follow, because a
-            // bare addr:port is itself a valid IPv6 address.
-            if matches!(c.addr, std::net::IpAddr::V6(_)) && !rule.all_ports {
-                format!("[{}]", c)
-            } else {
-                c.to_string()
-            }
-        }
-    };
-    match rule.protocol {
-        Protocol::Icmp => format!("icmp://{}", target),
-        proto => {
-            let scheme = if matches!(proto, Protocol::Udp) { "udp://" } else { "tcp://" };
-            if rule.all_ports {
-                format!("{}{}", scheme, target)
-            } else {
-                let ports = format_ports(&rule.ports);
-                format!("{}{}:{}", scheme, target, ports)
-            }
-        }
-    }
-}
-
-/// Render a concrete port list into the comma-separated port-suffix form
-/// (`80,443`). The all-ports case is handled by the callers, which drop the
-/// suffix entirely rather than emitting `:*`.
-fn format_ports(ports: &[u16]) -> String {
-    ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",")
-}
-
-/// Parse an ISO 8601 timestamp (e.g. "2000-01-01T00:00:00Z") into a SystemTime.
 fn parse_time_start(s: &str) -> Result<SystemTime> {
     let ts: jiff::Timestamp = s.parse()
         .map_err(|e| anyhow!("invalid --time-start '{}': {}", s, e))?;
@@ -875,15 +837,78 @@ fn parse_branch_action(flag: &str, s: &str) -> Result<BranchAction> {
     }
 }
 
+// ============================================================
+// /proc helpers for sandlock ps
+// ============================================================
+
+/// Read /proc/<pid>/stat and return a human-readable uptime string.
+fn proc_uptime(pid: i32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    // Field 22 (0-indexed) is starttime in clock ticks since boot.
+    let starttime: u64 = stat
+        .split(')')
+        .nth(1)?
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()?;
+    let ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+    let uptime_secs = if ticks_per_sec > 0 {
+        let boot_secs = proc_uptime_sys()?;
+        boot_secs.saturating_sub(starttime / ticks_per_sec)
+    } else {
+        return None;
+    };
+    if uptime_secs < 60 {
+        Some(format!("{}s", uptime_secs))
+    } else if uptime_secs < 3600 {
+        Some(format!("{}m", uptime_secs / 60))
+    } else if uptime_secs < 86400 {
+        Some(format!("{}h{}m", uptime_secs / 3600, (uptime_secs % 3600) / 60))
+    } else {
+        Some(format!("{}d{}h", uptime_secs / 86400, (uptime_secs % 86400) / 3600))
+    }
+}
+
+/// Read /proc/uptime (system uptime in seconds).
+fn proc_uptime_sys() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/uptime").ok()?;
+    let secs: f64 = s.split_whitespace().next()?.parse().ok()?;
+    Some(secs as u64)
+}
+
+/// Read /proc/<pid>/cmdline and return a human-readable command string.
+fn proc_cmdline(pid: i32) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{}/cmdline", pid)).ok()?;
+    if raw.is_empty() {
+        return Some("?".to_string());
+    }
+    let args: Vec<&str> = raw
+        .split(|b| *b == 0)
+        .filter_map(|chunk| std::str::from_utf8(chunk).ok())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if args.is_empty() {
+        Some("?".to_string())
+    } else {
+        // Truncate to ~60 chars for display.
+        let joined = args.join(" ");
+        if joined.len() > 60 {
+            Some(format!("{}…", &joined[..57]))
+        } else {
+            Some(joined)
+        }
+    }
+}
+
 #[cfg(test)]
 mod render_tests {
-    use super::*;
     use sandlock_core::sandbox::NetRule;
 
     #[test]
     fn render_allow_drops_redundant_all_ports_star() {
         let r = &NetRule::parse_allow("udp://*:*").unwrap()[0];
-        assert_eq!(format_net_rule(r), "udp://*");
+        assert_eq!(sandlock_core::format_net_rule(r), "udp://*");
     }
 
     #[test]
@@ -891,24 +916,24 @@ mod render_tests {
         // `:*` expands to a TCP + UDP pair; each rule renders its scheme
         // so the pair round-trips without widening.
         let rules = NetRule::parse_allow(":*").unwrap();
-        let rendered: Vec<String> = rules.iter().map(format_net_rule).collect();
+        let rendered: Vec<String> = rules.iter().map(sandlock_core::format_net_rule).collect();
         assert_eq!(rendered, vec!["tcp://*", "udp://*"]);
     }
 
     #[test]
     fn render_allow_host_ports() {
         let rules = NetRule::parse_allow("example.com:443").unwrap();
-        assert_eq!(format_net_rule(&rules[0]), "tcp://example.com:443");
-        assert_eq!(format_net_rule(&rules[1]), "udp://example.com:443");
+        assert_eq!(sandlock_core::format_net_rule(&rules[0]), "tcp://example.com:443");
+        assert_eq!(sandlock_core::format_net_rule(&rules[1]), "udp://example.com:443");
     }
 
     #[test]
     fn render_cidr_and_ipv6_round_trip() {
         // CIDR and IPv6-literal targets render identically for allow/deny.
-        assert_eq!(format_net_rule(&NetRule::parse_allow("10.0.0.0/8:80").unwrap()[0]), "tcp://10.0.0.0/8:80");
-        assert_eq!(format_net_rule(&NetRule::parse_deny("10.0.0.0/8").unwrap()[0]), "tcp://10.0.0.0/8");
-        assert_eq!(format_net_rule(&NetRule::parse_allow("[::1]:443").unwrap()[0]), "tcp://[::1]:443");
-        assert_eq!(format_net_rule(&NetRule::parse_allow("::1").unwrap()[0]), "tcp://::1");
+        assert_eq!(sandlock_core::format_net_rule(&NetRule::parse_allow("10.0.0.0/8:80").unwrap()[0]), "tcp://10.0.0.0/8:80");
+        assert_eq!(sandlock_core::format_net_rule(&NetRule::parse_deny("10.0.0.0/8").unwrap()[0]), "tcp://10.0.0.0/8");
+        assert_eq!(sandlock_core::format_net_rule(&NetRule::parse_allow("[::1]:443").unwrap()[0]), "tcp://[::1]:443");
+        assert_eq!(sandlock_core::format_net_rule(&NetRule::parse_allow("::1").unwrap()[0]), "tcp://::1");
     }
 
     #[test]
@@ -918,7 +943,7 @@ mod render_tests {
             "tcp://*", "10.0.0.0/8:80", "[fc00::/7]:443", "::1", "1.2.3.4",
         ] {
             for r in &NetRule::parse_allow(spec).unwrap() {
-                let rendered = format_net_rule(r);
+                let rendered = sandlock_core::format_net_rule(r);
                 // A rendered rule always carries its scheme, so it must
                 // reparse to exactly one rule equal to the original.
                 let reparsed = NetRule::parse_allow(&rendered).unwrap();

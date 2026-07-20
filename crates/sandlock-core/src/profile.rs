@@ -1,6 +1,6 @@
 use crate::sandbox::{ByteSize, Sandbox};
 use crate::error::SandlockError;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -14,7 +14,7 @@ pub struct ProgramSpec {
 }
 
 /// Top-level profile input. Each section maps to one schema section.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct ProfileInput {
     pub config: ConfigSection,
@@ -28,7 +28,7 @@ pub struct ProfileInput {
 }
 
 // Field names follow the schema vocabulary and match `Sandbox`'s field names 1:1.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct ConfigSection {
     pub http_ca: Option<PathBuf>,
@@ -39,7 +39,7 @@ pub struct ConfigSection {
     pub workdir: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct DeterminismSection {
     pub random_seed: Option<u64>,
@@ -49,7 +49,7 @@ pub struct DeterminismSection {
     pub no_randomize_memory: bool,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct ProgramSection {
     pub exec: Option<PathBuf>,
@@ -63,7 +63,7 @@ pub struct ProgramSection {
     pub no_huge_pages: bool,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct FilesystemSection {
     pub read: Vec<PathBuf>,
@@ -82,14 +82,14 @@ pub struct FilesystemSection {
 /// quoted string holding a comma list and/or `lo-hi` range (`"9000-9005"`).
 /// The untagged form lets a TOML array mix the two, e.g.
 /// `allow_bind = [8080, "9000-9005"]`.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum PortSpec {
     Port(u16),
     Spec(String),
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct NetworkSection {
     pub allow_bind: Vec<PortSpec>,
@@ -99,7 +99,7 @@ pub struct NetworkSection {
     pub port_remap: bool,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct HttpSection {
     pub ports: Vec<u16>,
@@ -107,7 +107,7 @@ pub struct HttpSection {
     pub deny: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct SyscallsSection {
     pub extra_allow: Vec<String>,
@@ -117,7 +117,7 @@ pub struct SyscallsSection {
 // Field names drop the `max_` prefix that `Sandbox` uses (`memory`, not
 // `max_memory`) — the section name `[limits]` makes the prefix redundant.
 // `parse_input` maps each of these to the corresponding `Sandbox::max_*` field.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct LimitsSection {
     /// `ByteSize` string, e.g. `"512M"` (suffixes K/M/G only; IEC `MiB`/`GiB`
@@ -282,6 +282,210 @@ fn parse_time_start(s: &str) -> Result<SystemTime, SandlockError> {
         ))
     })?;
     Ok(ts.into())
+}
+
+// ============================================================
+// Reverse serialization: Sandbox -> ProfileInput (and JSON/TOML)
+// ============================================================
+
+/// Render a `BranchAction` as the profile string form (`"commit"`/`"abort"`/`"keep"`).
+fn branch_action_str(a: &crate::sandbox::BranchAction) -> &'static str {
+    use crate::sandbox::BranchAction;
+    match a {
+        BranchAction::Commit => "commit",
+        BranchAction::Abort => "abort",
+        BranchAction::Keep => "keep",
+    }
+}
+
+/// Render a `NetRule` back into the `--net-allow`/`--net-deny` string grammar.
+/// This is the inverse of `SandboxBuilder::net_allow` / `net_deny` parsing.
+pub fn format_net_rule(rule: &crate::sandbox::NetRule) -> String {
+    use crate::sandbox::{NetTarget, Protocol};
+    let target = match &rule.target {
+        NetTarget::AnyIp => "*".to_string(),
+        NetTarget::Host(h) => h.clone(),
+        NetTarget::Cidr(c) => {
+            // Bracket IPv6 only when a port suffix will follow, because a
+            // bare addr:port is itself a valid IPv6 address.
+            if matches!(c.addr, std::net::IpAddr::V6(_)) && !rule.all_ports {
+                format!("[{}]", c)
+            } else {
+                c.to_string()
+            }
+        }
+    };
+    match rule.protocol {
+        Protocol::Icmp => format!("icmp://{}", target),
+        proto => {
+            let scheme = if matches!(proto, Protocol::Udp) { "udp://" } else { "tcp://" };
+            if rule.all_ports {
+                format!("{}{}", scheme, target)
+            } else {
+                let ports: String = rule.ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
+                format!("{}{}:{}", scheme, target, ports)
+            }
+        }
+    }
+}
+
+/// Render an `HttpRule` back into `"METHOD host/path"` form.
+pub fn format_http_rule(rule: &crate::http::HttpRule) -> String {
+    format!("{} {}{}", rule.method, rule.host, rule.path)
+}
+
+/// Render a `BindPorts` value into the `PortSpec` list used by `[network]`.
+fn bind_ports_to_specs(ports: &crate::sandbox::BindPorts) -> Vec<PortSpec> {
+    use crate::sandbox::BindPorts;
+    match ports {
+        BindPorts::All => vec![PortSpec::Spec("*".to_string())],
+        BindPorts::Ports(ps) => ps.iter().map(|p| PortSpec::Port(*p)).collect(),
+    }
+}
+
+/// Render a `ByteSize` as the profile string form (e.g. `"512M"`).
+fn byte_size_str(b: crate::sandbox::ByteSize) -> String {
+    let n = b.0;
+    if n == 0 {
+        return "0".to_string();
+    }
+    if n % (1024 * 1024 * 1024) == 0 {
+        format!("{}G", n / (1024 * 1024 * 1024))
+    } else if n % (1024 * 1024) == 0 {
+        format!("{}M", n / (1024 * 1024))
+    } else if n % 1024 == 0 {
+        format!("{}K", n / 1024)
+    } else {
+        format!("{}", n)
+    }
+}
+
+/// Render an RFC3339 timestamp from a `SystemTime` (inverse of `parse_time_start`).
+fn time_start_str(t: SystemTime) -> Option<String> {
+    let d = t.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+    let ts = jiff::Timestamp::from_second(d.as_secs() as i64).ok()?;
+    Some(ts.to_string())
+}
+
+/// Build a `ProfileInput` from a `Sandbox` (the effective policy).
+///
+/// This is the reverse of `parse_input`: it flattens the `Sandbox` dataclass
+/// back into the sectioned profile shape so it can be serialized to JSON (the
+/// control-socket `config` verb) or TOML (`sandlock config <name> --toml`).
+///
+/// Runtime-only kwargs (`policy_fn`, `init_fn`, `work_fn`) are not `Sandbox`
+/// fields and so do not appear; the `config` handler emits a `"<callback>"`
+/// marker for them separately.
+///
+/// `extra_denied` carries dynamic `policy_fn`-issued `deny_path()` calls so
+/// the effective policy reflects runtime mutations (RFC acceptance criterion).
+pub fn sandbox_to_profile(s: &Sandbox, extra_denied: &[String]) -> ProfileInput {
+    let mut mount_specs: Vec<String> = Vec::new();
+    for (virt, host) in &s.fs_mount {
+        let suffix = if s.fs_mount_ro.iter().any(|d| d == virt) { ":ro" } else { "" };
+        // Render paths lossy; profile mount specs are strings.
+        mount_specs.push(format!(
+            "{}:{}{}",
+            virt.to_string_lossy(),
+            host.to_string_lossy(),
+            suffix
+        ));
+    }
+
+    let mut fs_deny: Vec<PathBuf> = s.fs_denied.clone();
+    for d in extra_denied {
+        let p = PathBuf::from(d);
+        if !fs_deny.contains(&p) {
+            fs_deny.push(p);
+        }
+    }
+
+    let net_allow: Vec<String> = s.net_allow.iter().map(format_net_rule).collect();
+    let net_deny: Vec<String> = s.net_deny.iter().map(format_net_rule).collect();
+    let http_allow: Vec<String> = s.http_allow.iter().map(format_http_rule).collect();
+    let http_deny: Vec<String> = s.http_deny.iter().map(format_http_rule).collect();
+
+    ProfileInput {
+        config: ConfigSection {
+            http_ca: s.http_ca.clone(),
+            http_key: s.http_key.clone(),
+            http_inject_ca: s.http_inject_ca.clone(),
+            http_ca_out: s.http_ca_out.clone(),
+            fs_storage: s.fs_storage.clone(),
+            workdir: s.workdir.clone(),
+        },
+        determinism: DeterminismSection {
+            random_seed: s.random_seed,
+            time_start: s.time_start.and_then(time_start_str),
+            deterministic_dirs: s.deterministic_dirs,
+            no_randomize_memory: s.no_randomize_memory,
+        },
+        program: ProgramSection {
+            exec: None,
+            args: Vec::new(),
+            env: s.env.clone(),
+            cwd: s.cwd.clone(),
+            uid: s.user.map(|u| u.uid),
+            gid: s.user.map(|u| u.gid),
+            clean_env: s.clean_env,
+            no_coredump: s.no_coredump,
+            no_huge_pages: s.no_huge_pages,
+        },
+        filesystem: FilesystemSection {
+            read: s.fs_readable.clone(),
+            write: s.fs_writable.clone(),
+            deny: fs_deny,
+            chroot: s.chroot.clone(),
+            mount: mount_specs,
+            on_exit: Some(branch_action_str(&s.on_exit).to_string()),
+            on_error: Some(branch_action_str(&s.on_error).to_string()),
+        },
+        network: NetworkSection {
+            allow_bind: bind_ports_to_specs(&s.net_allow_bind),
+            deny_bind: s.net_deny_bind.iter().map(|p| PortSpec::Port(*p)).collect(),
+            allow: net_allow,
+            deny: net_deny,
+            port_remap: s.port_remap,
+        },
+        http: HttpSection {
+            ports: s.http_ports.clone(),
+            allow: http_allow,
+            deny: http_deny,
+        },
+        syscalls: SyscallsSection {
+            extra_allow: s.extra_allow_syscalls.clone(),
+            extra_deny: s.extra_deny_syscalls.clone(),
+        },
+        limits: LimitsSection {
+            memory: s.max_memory.map(byte_size_str),
+            // max_processes defaults to 64 when unset; emit it only when the
+            // user explicitly set a non-default value so the serialized profile
+            // stays minimal. The default round-trips either way.
+            processes: if s.max_processes == 64 { None } else { Some(s.max_processes) },
+            open_files: s.max_open_files,
+            cpu: s.max_cpu,
+            disk: s.max_disk.map(byte_size_str),
+            gpu_devices: s.gpu_devices.clone(),
+            cpu_cores: s.cpu_cores.clone(),
+            num_cpus: s.num_cpus,
+        },
+    }
+}
+
+/// Serialize a `Sandbox` to a TOML profile string.
+pub fn sandbox_to_toml(s: &Sandbox, extra_denied: &[String]) -> Result<String, SandlockError> {
+    let input = sandbox_to_profile(s, extra_denied);
+    toml::to_string_pretty(&input).map_err(|e| SandlockError::Sandbox(crate::error::SandboxError::Invalid(
+        format!("TOML serialize error: {e}"),
+    )))
+}
+
+/// Serialize a `Sandbox` to a pretty JSON string (the `config` verb body).
+pub fn sandbox_to_json(s: &Sandbox, extra_denied: &[String]) -> Result<String, SandlockError> {
+    let input = sandbox_to_profile(s, extra_denied);
+    serde_json::to_string_pretty(&input).map_err(|e| SandlockError::Sandbox(crate::error::SandboxError::Invalid(
+        format!("JSON serialize error: {e}"),
+    )))
 }
 
 /// Default profile directory.

@@ -253,6 +253,8 @@ struct Runtime {
     notif_handle: Option<JoinHandle<()>>,
     throttle_handle: Option<JoinHandle<()>>,
     loadavg_handle: Option<JoinHandle<()>>,
+    control_handle: Option<JoinHandle<()>>,
+    control_dir: Option<PathBuf>,
     _stdout_read: Option<std::os::fd::OwnedFd>,
     _stderr_read: Option<std::os::fd::OwnedFd>,
     // Parent-held write end of a piped stdin (popen). The caller takes it via
@@ -781,6 +783,12 @@ impl Sandbox {
         if let Some(h) = rt.notif_handle.take() { h.abort(); }
         if let Some(h) = rt.throttle_handle.take() { h.abort(); }
         if let Some(h) = rt.loadavg_handle.take() { h.abort(); }
+        if let Some(h) = rt.control_handle.take() { h.abort(); }
+
+        // Clean up the per-sandbox runtime dir on normal exit.
+        if let Some(ref dir) = rt.control_dir {
+            crate::control::cleanup_runtime_dir(dir);
+        }
 
         if let Some(ref cow_state) = self.rt().supervisor_cow.clone() {
             let mut cow = cow_state.lock().await;
@@ -1328,6 +1336,8 @@ impl Sandbox {
                 on_bind: None,
                 handlers: Vec::new(),
                 ready_w: None,
+                control_handle: None,
+                control_dir: None,
             }));
             clones.push(clone_sb);
         }
@@ -1407,6 +1417,8 @@ impl Sandbox {
             notif_handle: None,
             throttle_handle: None,
             loadavg_handle: None,
+            control_handle: None,
+            control_dir: None,
             _stdout_read: None,
             _stderr_read: None,
             _stdin_write: None,
@@ -1719,6 +1731,21 @@ impl Sandbox {
         // State remains `Created` until `do_start` writes ready_w to release
         // the child to execve.
 
+        // Even for --no-supervisor sandboxes, write a pid file so sandlock ps
+        // can discover and list them.  The control socket is only created when
+        // a supervisor exists (inside the if-let below).
+        if no_supervisor {
+            let sandbox_name = self.rt().name.clone();
+            let dir = crate::control::sandbox_dir(&sandbox_name);
+            if dir.exists() {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+            if std::fs::create_dir_all(&dir).is_ok() {
+                let _ = std::fs::write(crate::control::pid_path(&dir), format!("{}\n", pid));
+                self.rt_mut().control_dir = Some(dir);
+            }
+        }
+
         let pidfd = match syscall::pidfd_open(pid as u32, 0) {
             Ok(fd) => Some(fd),
             Err(_) => None,
@@ -1745,6 +1772,30 @@ impl Sandbox {
         };
 
         if let Some(notif_fd) = notif_fd {
+            // Set up the per-sandbox runtime dir and control socket.  Must
+            // happen before the notif supervisor is spawned so the socket
+            // exists when the child is released.
+            //
+            // Best-effort: in nested sandboxes /dev/shm may be restricted by
+            // the outer sandlock's landlock policy.  Warn and continue without
+            // a control socket rather than failing the sandbox.
+            let sandbox_name = self.rt().name.clone();
+            let control_listener: Option<std::os::unix::net::UnixListener>;
+            match crate::control::setup_runtime_dir(&sandbox_name, pid) {
+                Ok((listener, control_dir)) => {
+                    self.rt_mut().control_dir = Some(control_dir);
+                    control_listener = Some(listener);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "sandlock: control socket setup failed for '{}': {} \
+                         (introspection unavailable for this sandbox)",
+                        sandbox_name, e
+                    );
+                    control_listener = None;
+                }
+            }
+
             if self.time_start.is_some() || self.random_seed.is_some() {
                 let time_offset = self.time_start.map(|t| crate::time::calculate_time_offset(t));
                 if let Err(e) = crate::vdso::patch(pid, time_offset, self.random_seed.is_some()) {
@@ -1922,8 +1973,20 @@ impl Sandbox {
                 notif_fd: notif_raw_fd,
             });
 
+            // Snapshot the sandbox config for the control-socket `config`
+            // verb.  The control loop takes ownership; dynamic policy_fn
+            // mutations are read from ctx.policy_fn at request time.
+            let sandbox_snapshot = self.clone();
+
             let handlers = std::mem::take(&mut self.rt_mut().handlers);
             let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+
+            // Clone ctx for the control loop before moving the original into
+            // the notif supervisor.  Only set up if the control dir was
+            // successfully created above.
+            let control_ctx = Arc::clone(&ctx);
+            let control_dir_opt = self.rt().control_dir.clone();
+
             self.rt_mut().notif_handle = Some(tokio::spawn(
                 notif::supervisor(notif_fd, ctx, handlers, startup_tx),
             ));
@@ -1941,6 +2004,22 @@ impl Sandbox {
                         "seccomp supervisor exited during startup".into(),
                     ).into());
                 }
+            }
+
+            // Spawn the control-socket loop as a dedicated tokio task.
+            // Independent of the seccomp-notify loop so accept() never adds
+            // latency to syscall notification processing.
+            if let (Some(listener), Some(dir_path)) =
+                (control_listener, control_dir_opt)
+            {
+                self.rt_mut().control_handle = Some(
+                    crate::control::spawn_control_loop(
+                        listener,
+                        control_ctx,
+                        sandbox_snapshot,
+                        dir_path,
+                    )
+                );
             }
 
             let la_resource = Arc::clone(&res_state);
@@ -2079,6 +2158,12 @@ impl Drop for Sandbox {
             if let Some(h) = rt.notif_handle.take() { h.abort(); }
             if let Some(h) = rt.throttle_handle.take() { h.abort(); }
             if let Some(h) = rt.loadavg_handle.take() { h.abort(); }
+            if let Some(h) = rt.control_handle.take() { h.abort(); }
+
+            // Clean up the per-sandbox runtime dir on abnormal exit / Drop.
+            if let Some(ref dir) = rt.control_dir {
+                crate::control::cleanup_runtime_dir(dir);
+            }
 
             let is_error = matches!(
                 rt.state,

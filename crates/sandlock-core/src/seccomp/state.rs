@@ -509,6 +509,18 @@ impl DeniedSet {
         self.paths.read().map_or(true, |p| p.is_empty())
             && self.ids.read().map_or(true, |i| i.is_empty())
     }
+
+    /// Snapshot of the currently-denied path prefixes (sorted, deduped).
+    /// Used by the control-socket `config` verb to reflect dynamic
+    /// `policy_fn`-issued `deny_path()` calls in the effective policy.
+    pub fn denied_paths(&self) -> Vec<String> {
+        self.paths.read().map_or(Vec::new(), |p| {
+            let mut v: Vec<String> = p.iter().cloned().collect();
+            v.sort();
+            v.dedup();
+            v
+        })
+    }
 }
 
 // ============================================================

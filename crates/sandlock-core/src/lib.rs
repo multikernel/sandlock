@@ -30,6 +30,7 @@ pub mod fork;
 pub(crate) mod ca_inject;
 pub(crate) mod chroot;
 pub mod dry_run;
+pub mod control;
 mod transparent_proxy;
 
 pub use error::SandlockError;
@@ -44,7 +45,10 @@ pub use pipeline::{Stage, Pipeline, Gather};
 pub use dry_run::{Change, ChangeKind, DryRunResult};
 // Sectioned-profile parsing types: ProfileInput is the top-level deserialization
 // target; ProgramSpec carries [program].exec/args (not a Sandbox field).
-pub use crate::profile::{ProfileInput, ProgramSpec};
+pub use crate::profile::{
+    ProfileInput, ProgramSpec, format_net_rule, format_http_rule,
+    sandbox_to_profile, sandbox_to_toml, sandbox_to_json,
+};
 
 // Public extension API — see docs/extension-handlers.md.
 pub use seccomp::dispatch::{Handler, HandlerCtx, HandlerError};

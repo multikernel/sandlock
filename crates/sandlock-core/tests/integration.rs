@@ -58,6 +58,9 @@ mod test_http_acl;
 #[path = "integration/test_handlers.rs"]
 mod test_handlers;
 
+#[path = "integration/test_control.rs"]
+mod test_control;
+
 #[path = "integration/test_protection.rs"]
 mod test_protection;
 
