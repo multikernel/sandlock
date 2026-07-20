@@ -1533,6 +1533,7 @@ fn syscall_name(nr: i64) -> &'static str {
         n if Some(n) == arch::sys_symlink() => "symlinkat",
         n if Some(n) == arch::sys_link() => "linkat",
         n if Some(n) == arch::sys_rename() => "renameat2",
+        n if Some(n) == arch::sys_renameat() => "renameat2",
         _ => "unknown",
     }
 }
@@ -1548,7 +1549,12 @@ fn syscall_category(nr: i64) -> crate::policy_fn::SyscallCategory {
             || n == libc::SYS_truncate || n == libc::SYS_readlinkat
             || n == libc::SYS_newfstatat || n == libc::SYS_statx
             || n == libc::SYS_faccessat || n == libc::SYS_getdents64
-            || Some(n) == arch::sys_getdents() => SyscallCategory::File,
+            || Some(n) == arch::sys_getdents()
+            || Some(n) == arch::sys_open() || Some(n) == arch::sys_mkdir()
+            || Some(n) == arch::sys_rmdir() || Some(n) == arch::sys_unlink()
+            || Some(n) == arch::sys_symlink() || Some(n) == arch::sys_link()
+            || Some(n) == arch::sys_rename() || Some(n) == arch::sys_renameat()
+            => SyscallCategory::File,
         n if n == libc::SYS_connect || n == libc::SYS_sendto
             || n == libc::SYS_sendmsg || n == libc::SYS_sendmmsg
             || n == libc::SYS_bind
@@ -1657,9 +1663,9 @@ fn resolve_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Option<Strin
             let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
             resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
         }
-        // renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
+        // renameat2/renameat(olddirfd, oldpath, newdirfd, newpath[, flags])
         // Check the source (old) path — deny if a denied file is being renamed away.
-        n if n == libc::SYS_renameat2 => {
+        n if n == libc::SYS_renameat2 || Some(n) == arch::sys_renameat() => {
             let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
             resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
         }
@@ -1716,8 +1722,8 @@ fn resolve_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Option<Strin
 fn resolve_second_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Option<String> {
     let nr = notif.data.nr as i64;
     match nr {
-        // renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
-        n if n == libc::SYS_renameat2 => {
+        // renameat2/renameat(olddirfd, oldpath, newdirfd, newpath[, flags])
+        n if n == libc::SYS_renameat2 || Some(n) == arch::sys_renameat() => {
             let path = read_path_for_event(notif, notif.data.args[3], notif_fd)?;
             resolve_at_path_for_event(notif, notif.data.args[2] as i64, &path)
         }
@@ -1923,7 +1929,8 @@ async fn emit_policy_event(
         || nr == libc::SYS_renameat2 || nr == libc::SYS_linkat
         || Some(nr) == arch::sys_mkdir() || Some(nr) == arch::sys_rmdir()
         || Some(nr) == arch::sys_unlink() || Some(nr) == arch::sys_symlink()
-        || Some(nr) == arch::sys_link() || Some(nr) == arch::sys_rename();
+        || Some(nr) == arch::sys_link() || Some(nr) == arch::sys_rename()
+        || Some(nr) == arch::sys_renameat();
     if is_fs_mutating {
         path = resolve_path_for_notif(notif, notif_fd).map(std::path::PathBuf::from);
         path2 = resolve_second_path_for_notif(notif, notif_fd).map(std::path::PathBuf::from);

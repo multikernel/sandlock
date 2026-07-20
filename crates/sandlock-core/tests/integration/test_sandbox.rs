@@ -358,6 +358,47 @@ async fn test_denied_path_rename_blocked() {
     );
 }
 
+/// renameat(2), the middle-generation variant between rename(2) and
+/// renameat2(2), must be deny-gated like the other two: a raw
+/// syscall(SYS_renameat, ...) must not rename a denied file away.
+/// riscv64 has no renameat, so the test only exists where the ABI does.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[tokio::test]
+async fn test_denied_path_renameat_blocked() {
+    #[cfg(target_arch = "x86_64")]
+    const SYS_RENAMEAT: i64 = 264;
+    #[cfg(target_arch = "aarch64")]
+    const SYS_RENAMEAT: i64 = 38;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let secret = tmp.path().join("secret.txt");
+    std::fs::write(&secret, "TOP_SECRET").unwrap();
+    let renamed = tmp.path().join("renamed.txt");
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
+        .fs_read("/bin").fs_read("/proc").fs_read("/etc")
+        .fs_read(tmp.path())
+        .fs_write(tmp.path())
+        .fs_deny(&secret)
+        .build()
+        .unwrap();
+
+    let script = format!(
+        "import ctypes; libc = ctypes.CDLL(None, use_errno=True); \
+         libc.syscall({SYS_RENAMEAT}, -100, b'{}', -100, b'{}')",
+        secret.display(),
+        renamed.display(),
+    );
+    let _ = policy.clone().with_name("test").run(&["python3", "-c", &script]).await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&secret).unwrap_or_default(),
+        "TOP_SECRET",
+        "renameat bypass: sandbox allowed renaming a denied file via renameat(2)"
+    );
+    assert!(!renamed.exists(), "renameat bypass: denied file was renamed away");
+}
+
 /// truncate(2) takes a path, so the fd-based open deny never sees it; the
 /// deny precheck must gate it or a denied file inside a granted write tree
 /// can be wiped.

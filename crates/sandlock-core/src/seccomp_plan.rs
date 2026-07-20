@@ -261,6 +261,7 @@ pub(crate) fn fs_denied_path_syscalls() -> Vec<i64> {
             arch::sys_open(),
             arch::sys_link(),
             arch::sys_rename(),
+            arch::sys_renameat(),
             arch::sys_unlink(),
             arch::sys_rmdir(),
         ]
@@ -303,6 +304,7 @@ fn policy_event_syscalls() -> Vec<i64> {
             arch::sys_symlink(),
             arch::sys_link(),
             arch::sys_rename(),
+            arch::sys_renameat(),
         ]
         .into_iter()
         .flatten(),
