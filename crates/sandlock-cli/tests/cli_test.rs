@@ -582,7 +582,7 @@ fn test_learn_then_run_write() {
         .args(["learn", "-o", &profile_path, "--", "sh", "-c", &format!("echo hello > {write_path}")])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(learn.status.success() || learn.status.code() == Some(2),
+    assert!(learn.status.success(),
         "learn failed unexpectedly: {}", String::from_utf8_lossy(&learn.stderr));
     assert!(!std::path::Path::new(write_path).exists(), "COW isolation failed during learn");
 

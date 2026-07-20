@@ -67,6 +67,7 @@ and guarded paths. A warning and diff are still printed.
 ```bash
 # All learn tests
 cargo test -p sandlock-cli -- test_learn
+```
 
 Tests require Linux 5.6+ (seccomp notif) and Linux 5.13+ (Landlock). They run the real `sandlock` binary, so build first:
 

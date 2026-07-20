@@ -118,7 +118,8 @@ pub struct SyscallEvent {
     /// `O_WRONLY`, `O_CREAT`). `None` for non-openat syscalls.
     pub flags: Option<u64>,
     /// Socket protocol for network syscalls (connect, sendto, sendmsg, sendmmsg).
-    /// One of "tcp", "udp", "icmp". `None` for non-network syscalls or if
+    /// One of "tcp", "udp", "icmp". `None` for non-network syscalls or when
+    /// protocol resolution fails.
     pub protocol: Option<String>,
 }
 
