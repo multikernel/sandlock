@@ -1,0 +1,574 @@
+//! Implementation of `sandlock learn -o <output.toml>`.
+//!
+//! Runs a workload under observation and emits a sandlock profile TOML
+//! usable by `sandlock run -p`.
+
+use std::collections::{BTreeSet, HashSet};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use anyhow::{anyhow, Result};
+use sandlock_core::policy_fn::{SyscallEvent, Verdict};
+use sandlock_core::profile::{FilesystemSection, ProfileInput};
+use sandlock_core::sandbox::BranchAction;
+use sandlock_core::Sandbox;
+
+
+/// Protected: no legitimate sandboxed workload needs a recursive grant here.
+/// Write collapse to these is skipped + error. Read collapse never fires here.
+const PROTECTED_PATHS: &[&[u8]] = &[b"/", b"/root"];
+const PROTECTED_CRED_SUFFIXES: &[&[u8]] = &[b"/.ssh", b"/.aws", b"/.kube", b"/.gnupg"];
+
+/// Guarded: write grants are sometimes necessary but warrant operator awareness.
+/// Write collapse emits + warning + diff. Read collapse never fires here.
+const GUARDED_PATHS: &[&[u8]] = &[b"/etc", b"/proc", b"/sys", b"/dev", b"/boot", b"/run/secrets"];
+
+#[derive(PartialEq)]
+enum PathTier { Protected, Guarded, Normal }
+
+fn classify_path(p: &std::path::Path) -> PathTier {
+    let b = p.as_os_str().as_encoded_bytes();
+    if PROTECTED_PATHS.iter().any(|s| b == *s)
+        || PROTECTED_CRED_SUFFIXES.iter().any(|suf| b.ends_with(suf))
+    {
+        return PathTier::Protected;
+    }
+    if GUARDED_PATHS.iter().any(|s| b == *s) {
+        return PathTier::Guarded;
+    }
+    // $HOME itself (non-root) is guarded — apps do legitimately write dotfiles there.
+    if let Ok(home) = std::env::var("HOME") {
+        if b == home.as_bytes() && home != "/root" {
+            return PathTier::Guarded;
+        }
+    }
+    PathTier::Normal
+}
+
+/// Print immediate children of `dir` that the workload did NOT observe writing.
+fn print_observed_vs_granted_diff(dir: &std::path::Path, observed: &BTreeSet<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut unobserved: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| !observed.contains(p))
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .collect();
+    if unobserved.is_empty() { return }
+    unobserved.sort();
+    eprintln!(
+        "  unobserved siblings now writable under {}: {}",
+        dir.display(),
+        unobserved.join(", ")
+    );
+}
+
+/// Collapse write paths for the profile, with safety guards.
+///
+/// For paths that exist on the real FS: record as-is.
+/// For paths that don't exist (COW-created): walk up to the nearest existing
+/// ancestor, which is required for Landlock. Guards:
+/// - "/" → skip entirely and print an error
+/// - sensitive dirs → emit but print a warning + observed-vs-granted diff
+fn collapse_write_paths(writes: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
+    let mut out: BTreeSet<PathBuf> = BTreeSet::new();
+    for p in writes {
+        if is_junk_path(p) { continue; }
+        if p.exists() {
+            out.insert(p.clone());
+            continue;
+        }
+        let Some(ancestor) = p.ancestors().skip(1).find(|a| a.exists()) else { continue };
+        match classify_path(&ancestor) {
+            PathTier::Protected => {
+                eprintln!(
+                    "sandlock learn: WARNING: write collapse for '{}' reaches protected path '{}', skipping",
+                    p.display(), ancestor.display()
+                );
+                continue;
+            }
+            PathTier::Guarded => {
+                eprintln!(
+                    "sandlock learn: WARNING: write collapse '{}' to '{}' (guarded directory)",
+                    p.display(), ancestor.display()
+                );
+                print_observed_vs_granted_diff(&ancestor, writes);
+            }
+            PathTier::Normal => {}
+        }
+        out.insert(ancestor.to_path_buf());
+    }
+    out.into_iter().collect()
+}
+
+/// Remove paths that are already covered by a shorter ancestor in the same list.
+/// Landlock PATH_BENEATH grants are recursive, so if /usr/lib is in the list,
+/// /usr/lib/x86_64/libfoo.so is redundant and can be dropped.
+fn dedup_subsumed(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let set: std::collections::HashSet<PathBuf> = paths.iter().cloned().collect();
+    paths.into_iter()
+        .filter(|p| {
+            // Keep p unless one of its strict ancestors is already in the set.
+            !p.ancestors().skip(1).any(|a| set.contains(a))
+        })
+        .collect()
+}
+
+/// Collapse paths using the N-threshold heuristic and explicit prefixes.
+///
+/// Protected/guarded directories are never collapsed by the N-threshold.
+/// --collapse-prefix targeting a protected dir is always refused.
+/// --collapse-prefix targeting a guarded dir requires force_sensitive=true.
+fn collapse_by_threshold(
+    paths: Vec<PathBuf>,
+    n: usize,
+    force_prefixes: &[PathBuf],
+    force_sensitive: bool,
+    observed: &BTreeSet<PathBuf>,
+) -> Vec<PathBuf> {
+    // Validate force_prefixes upfront.
+    for prefix in force_prefixes {
+        match classify_path(prefix) {
+            PathTier::Normal => {}
+            _ if !force_sensitive => {
+                eprintln!(
+                    "sandlock learn: ERROR: --collapse-prefix '{}' targets a sensitive path; use --force-sensitive-collapse to proceed",
+                    prefix.display()
+                );
+                std::process::exit(1);
+            }
+            _ => {}
+        }
+    }
+
+    // Count how many paths share the same parent directory.
+    let mut dir_counts: std::collections::HashMap<PathBuf, usize> = Default::default();
+    for p in &paths {
+        if let Some(parent) = p.parent() {
+            *dir_counts.entry(parent.to_path_buf()).or_insert(0) += 1;
+        }
+    }
+
+    let mut out: BTreeSet<PathBuf> = BTreeSet::new();
+    for p in paths {
+        let forced = force_prefixes.iter()
+            .filter(|prefix| p.starts_with(prefix))
+            .max_by_key(|prefix| prefix.as_os_str().len());
+
+        let target: PathBuf = if let Some(prefix) = forced {
+            prefix.clone()
+        } else if let Some(parent) = p.parent() {
+            if dir_counts.get(parent).copied().unwrap_or(0) >= n {
+                parent.to_path_buf()
+            } else {
+                out.insert(p);
+                continue;
+            }
+        } else {
+            out.insert(p);
+            continue;
+        };
+
+        match classify_path(&target) {
+            PathTier::Normal => {
+                out.insert(target);
+            }
+            tier => {
+                if forced.is_some() {
+                    // Explicit --collapse-prefix + --force-sensitive-collapse: emit with warning + diff.
+                    let label = if tier == PathTier::Protected { "protected" } else { "guarded" };
+                    eprintln!(
+                        "sandlock learn: WARNING: collapse '{}' to '{}' ({label} directory)",
+                        p.display(), target.display()
+                    );
+                    print_observed_vs_granted_diff(&target, observed);
+                    out.insert(target);
+                } else {
+                    // N-threshold hit a sensitive dir: keep individual path.
+                    out.insert(p);
+                }
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// Returns true for pid/session-specific paths that are meaningless across runs.
+fn is_junk_path(p: &std::path::Path) -> bool {
+    let b = p.as_os_str().as_encoded_bytes();
+    // /proc/self/... and /proc/<pid>/... are pid-specific;
+    let proc_pid = b.starts_with(b"/proc/self")
+        || (b.starts_with(b"/proc/") && b.get(6).map_or(false, u8::is_ascii_digit));
+    proc_pid
+        || b.starts_with(b"/dev/pts/") || b == b"/dev/pts"
+        || b.starts_with(b"/dev/tty")
+}
+
+use crate::LearnArgs;
+
+// openat flags (from fcntl.h)
+const O_WRONLY: u64 = 0o1;
+const O_RDWR: u64 = 0o2;
+const O_CREAT: u64 = 0o100;
+
+fn is_write_open(flags: u64) -> bool {
+    // No valid open flag has bits 32+; a value that large is a pointer or
+    // garbage (e.g. from a mis-decoded syscall arg). Treat it as read-only
+    // so a misdecoded flag never puts a file in writes incorrectly.
+    if flags >> 32 != 0 {
+        return false;
+    }
+    flags & (O_WRONLY | O_RDWR | O_CREAT) != 0
+}
+
+/// Read all file-backed r-xp (executable) mappings from `/proc/<pid>/maps`.
+/// This captures the dynamic linker, all shared libraries, and the main binary
+/// as actually mapped by the kernel. 
+fn read_rx_mapped_files(pid: u32) -> Vec<PathBuf> {
+    use std::io::BufRead;
+    let Ok(file) = std::fs::File::open(format!("/proc/{pid}/maps")) else { return vec![] };
+    let mut out = Vec::new();
+    for line in std::io::BufReader::new(file).lines() {
+        let Ok(line) = line else { break };
+        // Format: "addr-addr perms offset dev inode pathname"
+        let mut parts = line.splitn(6, ' ');
+        let perms = parts.nth(1).unwrap_or("");
+        let pathname = parts.nth(3).map(str::trim).unwrap_or("");
+        if perms.contains('x') && !pathname.is_empty() && !pathname.starts_with('[') {
+            out.push(PathBuf::from(pathname));
+        }
+    }
+    out
+}
+
+
+/// Accumulated observations from the policy_fn callback during learn.
+#[derive(Clone)]
+struct LearnObserver {
+    reads: Arc<Mutex<BTreeSet<PathBuf>>>,
+    writes: Arc<Mutex<BTreeSet<PathBuf>>>,
+    connects: Arc<Mutex<BTreeSet<String>>>,
+    /// PIDs that just completed an execve — on the NEXT event from that PID,
+    /// /proc/<pid>/maps will reflect the new binary's dynamic linker.
+    pending_maps: Arc<Mutex<HashSet<u32>>>,
+}
+
+impl LearnObserver {
+    fn new() -> Self {
+        Self {
+            reads: Arc::new(Mutex::new(BTreeSet::new())),
+            writes: Arc::new(Mutex::new(BTreeSet::new())),
+            connects: Arc::new(Mutex::new(BTreeSet::new())),
+            pending_maps: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    /// The policy_fn callback: classifies each intercepted syscall into
+    /// reads, writes, or connects for profile generation.
+    fn on_event(&self, event: SyscallEvent) -> Verdict {
+        // After an execve, the NEXT event from that PID fires once the
+        // new binary is running — /proc/<pid>/maps now shows the dynamic
+        // linker loaded by the kernel (which bypassed seccomp).
+        if self.pending_maps.lock().unwrap().remove(&event.pid) {
+            let mut reads = self.reads.lock().unwrap();
+            // /proc/<pid>/exe is the canonical real binary path (symlinks resolved by the kernel),
+            // race-free at this point since the new image is already loaded.
+            if let Ok(exe) = std::fs::read_link(format!("/proc/{}/exe", event.pid)) {
+                reads.insert(exe);
+            }
+            for path in read_rx_mapped_files(event.pid) {
+                reads.insert(path);
+            }
+        }
+
+        match event.syscall.as_str() {
+            "execve" | "execveat" => {
+                // event.path may be a symlink; canonical real path comes from /proc/<pid>/exe in pending_maps.
+                if let Some(path) = event.path {
+                    self.reads.lock().unwrap().insert(path);
+                }
+                self.pending_maps.lock().unwrap().insert(event.pid);
+            }
+            "openat" | "open" => {
+                if let Some(path) = event.path {
+                    if let Some(fl) = event.flags {
+                        if is_write_open(fl) {
+                            self.writes.lock().unwrap().insert(path);
+                        } else {
+                            self.reads.lock().unwrap().insert(path);
+                        }
+                    }
+                }
+            }
+            // mkdir/unlink/rmdir/symlink: Landlock MAKE_*/REMOVE_* are directory
+            // rights, so the parent dir is what sandlock run needs, not the target.
+            "mkdirat" | "unlinkat" | "symlinkat" => {
+                if let Some(p) = event.path {
+                    if let Some(parent) = p.parent() {
+                        self.writes.lock().unwrap().insert(parent.to_path_buf());
+                    }
+                }
+            }
+            // rename: needs RENAME_OLD on parent of old path + RENAME_NEW on parent of new path.
+            "renameat2" => {
+                for p in [event.path, event.path2].into_iter().flatten() {
+                    if let Some(parent) = p.parent() {
+                        self.writes.lock().unwrap().insert(parent.to_path_buf());
+                    }
+                }
+            }
+            // link: source needs read access (ln doesn't open() it); dst parent needs MAKE_HARDLINK.
+            "linkat" => {
+                if let Some(src) = event.path {
+                    self.reads.lock().unwrap().insert(src);
+                }
+                if let Some(dst) = event.path2 {
+                    if let Some(parent) = dst.parent() {
+                        self.writes.lock().unwrap().insert(parent.to_path_buf());
+                    }
+                }
+            }
+            // truncate: LANDLOCK_ACCESS_FS_TRUNCATE applies to the file itself.
+            "truncate" => {
+                if let Some(p) = event.path {
+                    self.writes.lock().unwrap().insert(p);
+                }
+            }
+            "connect" | "sendto" | "sendmsg" | "sendmmsg" => {
+                if let (Some(ip), Some(port), Some(proto)) = (event.host, event.port, event.protocol) {
+                    if proto != "icmp" {
+                        self.connects.lock().unwrap().insert(format!("{proto}://{ip}:{port}"));
+                    }
+                }
+            }
+            _ => {}
+        }
+        Verdict::Allow
+    }
+}
+
+
+pub async fn run(args: LearnArgs) -> Result<()> {
+    if args.cmd.is_empty() {
+        anyhow::bail!("no command given — use: sandlock learn [flags] -- <cmd> [args...]");
+    }
+
+    let cmd_str = args.cmd.join(" ");
+    let cmd_refs: Vec<&str> = args.cmd.iter().map(String::as_str).collect();
+
+    // COW workdir="/" covers every path: seccomp fires before Landlock, so the
+    // supervisor intercepts every write openat and redirects it to an upper layer
+    // the real filesystem is untouched and no write is blocked.
+    let observer = LearnObserver::new();
+    let observer_cb = observer.clone();
+    let policy = Sandbox::builder()
+        .fs_read("/")
+        .workdir("/")
+        // Discard all COW changes after observation; learn is read-only from
+        // the real filesystem's perspective.
+        .on_exit(BranchAction::Abort)
+        .on_error(BranchAction::Abort)
+        .net_allow("*")
+        .net_allow("udp://*")
+        .net_allow("icmp://*")
+        .policy_fn(move |event, _ctx| observer_cb.on_event(event))
+        .build()
+        .map_err(|e| anyhow!("failed to build sandbox policy: {e}"))?;
+
+    eprintln!("sandlock learn: observing {cmd_str} ...");
+
+    // Use the three-step lifecycle (create/start/wait) so we can get the child
+    // PID from sandbox.pid() and sample /proc/<pid> for resource peaks.
+    let mut sandbox = policy.with_name("sandlock-learn");
+    sandbox.create_interactive(&cmd_refs).await
+        .map_err(|e| anyhow!("sandbox error: {e}"))?;
+    let child_pid = sandbox.pid().expect("child pid after create") as u32;
+    sandbox.start()
+        .map_err(|e| anyhow!("sandbox error: {e}"))?;
+
+    // Resource peak sampler: polls /proc/<pid> every 100ms until the process exits.
+    let max_threads = Arc::new(AtomicU64::new(0));
+    let max_fds = Arc::new(AtomicU64::new(0));
+    let peak_rss_kb_atomic = Arc::new(AtomicU64::new(0));
+    let (max_threads_s, max_fds_s, peak_rss_s) = (
+        Arc::clone(&max_threads), Arc::clone(&max_fds), Arc::clone(&peak_rss_kb_atomic),
+    );
+    let sampler = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            match std::fs::read_to_string(format!("/proc/{child_pid}/status")) {
+                Err(_) => break, // process gone
+                Ok(s) => {
+                    for line in s.lines() {
+                        if let Some(v) = line.strip_prefix("Threads:") {
+                            if let Ok(n) = v.trim().parse::<u64>() {
+                                max_threads_s.fetch_max(n, Ordering::Relaxed);
+                            }
+                        }
+                        if let Some(v) = line.strip_prefix("VmHWM:") {
+                            if let Ok(n) = v.trim().trim_end_matches("kB").trim().parse::<u64>() {
+                                peak_rss_s.fetch_max(n, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Ok(entries) = std::fs::read_dir(format!("/proc/{child_pid}/fd")) {
+                max_fds_s.fetch_max(entries.count() as u64, Ordering::Relaxed);
+            }
+        }
+    });
+
+    // Wait for the process, optionally with a timeout.
+    let timed_out = if let Some(secs) = args.timeout {
+        let deadline = std::time::Duration::from_secs(secs);
+        match tokio::time::timeout(deadline, sandbox.wait()).await {
+            Ok(r) => {
+                let result = r.map_err(|e| anyhow!("sandbox error: {e}"))?;
+                sampler.abort();
+                match result.exit_status {
+                    sandlock_core::ExitStatus::Code(0) => eprintln!("sandlock learn: done"),
+                    sandlock_core::ExitStatus::Code(n) => {
+                        eprintln!("sandlock learn: process exited with code {n}, not writing profile");
+                        std::process::exit(1);
+                    }
+                    sandlock_core::ExitStatus::Signal(sig) => {
+                        eprintln!("sandlock learn: process killed by signal {sig}, not writing profile");
+                        std::process::exit(1);
+                    }
+                    sandlock_core::ExitStatus::Killed | sandlock_core::ExitStatus::Timeout => {
+                        eprintln!("sandlock learn: process terminated abnormally, not writing profile");
+                        std::process::exit(1);
+                    }
+                }
+                false
+            }
+            Err(_elapsed) => {
+                // Timeout: kill the child, drain the supervisor, write a partial profile.
+                eprintln!("sandlock learn: timeout after {secs}s, killing process");
+                unsafe { libc::kill(child_pid as i32, libc::SIGKILL); }
+                // Drain without timeout so the supervisor releases its resources cleanly.
+                let _ = sandbox.wait().await;
+                sampler.abort();
+                true
+            }
+        }
+    } else {
+        let result = sandbox.wait().await
+            .map_err(|e| anyhow!("sandbox error: {e}"))?;
+        sampler.abort();
+        match result.exit_status {
+            sandlock_core::ExitStatus::Code(0) => eprintln!("sandlock learn: done"),
+            sandlock_core::ExitStatus::Code(n) => {
+                eprintln!("sandlock learn: process exited with code {n}, not writing profile");
+                std::process::exit(1);
+            }
+            sandlock_core::ExitStatus::Signal(sig) => {
+                eprintln!("sandlock learn: process killed by signal {sig}, not writing profile");
+                std::process::exit(1);
+            }
+            sandlock_core::ExitStatus::Killed | sandlock_core::ExitStatus::Timeout => {
+                eprintln!("sandlock learn: process terminated abnormally, not writing profile");
+                std::process::exit(1);
+            }
+        }
+        false
+    };
+
+    if timed_out {
+        eprintln!("sandlock learn: writing partial profile from observations before timeout");
+    }
+
+    let peak_rss_kb = peak_rss_kb_atomic.load(Ordering::Relaxed);
+    let threads = max_threads.load(Ordering::Relaxed);
+    let fds = max_fds.load(Ordering::Relaxed);
+
+    // Build the profile.
+    let mut profile_out = ProfileInput::default();
+
+    // Record the observed command so `sandlock run -p profile.toml` works
+    // without repeating the command on the CLI.
+    profile_out.program.exec = Some(PathBuf::from(&args.cmd[0]));
+    profile_out.program.args = args.cmd[1..].to_vec();
+
+    let reads_raw: Vec<PathBuf> = observer.reads.lock().unwrap().iter()
+        .filter(|p| p.exists() && !is_junk_path(p))
+        .cloned()
+        .collect();
+    let writes_raw = observer.writes.lock().unwrap();
+    let observed_all: BTreeSet<PathBuf> = reads_raw.iter()
+        .chain(writes_raw.iter())
+        .cloned()
+        .collect();
+
+    let fsc = args.force_sensitive_collapse;
+    let reads = if let Some(n) = args.collapse {
+        dedup_subsumed(collapse_by_threshold(reads_raw, n, &args.collapse_prefix, fsc, &observed_all))
+    } else if !args.collapse_prefix.is_empty() {
+        dedup_subsumed(collapse_by_threshold(reads_raw, usize::MAX, &args.collapse_prefix, fsc, &observed_all))
+    } else {
+        dedup_subsumed(reads_raw)
+    };
+
+    let writes_collapsed = collapse_write_paths(&writes_raw);
+    let writes = if let Some(n) = args.collapse {
+        dedup_subsumed(collapse_by_threshold(writes_collapsed, n, &args.collapse_prefix, fsc, &observed_all))
+    } else if !args.collapse_prefix.is_empty() {
+        dedup_subsumed(collapse_by_threshold(writes_collapsed, usize::MAX, &args.collapse_prefix, fsc, &observed_all))
+    } else {
+        dedup_subsumed(writes_collapsed)
+    };
+
+    profile_out.filesystem = FilesystemSection {
+        read: reads,
+        write: writes,
+        ..Default::default()
+    };
+    profile_out.network.allow = observer.connects.lock().unwrap().iter().cloned().collect();
+
+    // Fill limits with observed peaks + headroom so the profile is usable with sandlock run.
+    if peak_rss_kb > 0 {
+        let mib = (peak_rss_kb + 1023) / 1024;          // ceil to MiB
+        let headroom = (mib * 5 / 4).max(16);            // +25%, min 16M
+        profile_out.limits.memory = Some(format!("{headroom}M"));
+    }
+    if threads > 0 {
+        profile_out.limits.processes = Some((threads * 2).max(4) as u32);
+    }
+    if fds > 0 {
+        profile_out.limits.open_files = Some((fds * 2).max(32) as u32);
+    }
+
+    let kernel = std::fs::read_to_string("/proc/version")
+        .unwrap_or_default()
+        .split_whitespace()
+        .nth(2)
+        .unwrap_or("unknown")
+        .to_string();
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_default();
+    let header = format!(
+        "# generated by sandlock learn\n\
+         # command: {}\n\
+         # kernel: {kernel}\n\
+         # timestamp: {timestamp}\n\n",
+        cmd_str.replace('\n', " ")
+    );
+    let body = profile_out.to_toml()
+        .map_err(|e| anyhow!("failed to serialize profile: {e}"))?;
+    let toml_out = format!("{header}{body}");
+
+    match args.output {
+        Some(ref path) => {
+            std::fs::write(path, &toml_out)
+                .map_err(|e| anyhow!("failed to write {}: {e}", path.display()))?;
+            eprintln!("sandlock learn: profile written to {}", path.display());
+        }
+        None => print!("{toml_out}"),
+    }
+
+    Ok(())
+}

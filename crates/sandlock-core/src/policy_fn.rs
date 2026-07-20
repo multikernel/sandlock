@@ -105,6 +105,21 @@ pub struct SyscallEvent {
     pub argv: Option<Vec<String>>,
     /// Whether the supervisor denied this syscall.
     pub denied: bool,
+    /// Resolved absolute path for file syscalls (openat, execve/execveat,
+    /// mkdirat, unlinkat, symlinkat, truncate, renameat2 src, linkat src).
+    /// Read from child user memory, not TOCTOU-safe for enforcement but
+    /// sufficient for learn-mode observation.
+    /// `None` for non-file syscalls or when resolution fails.
+    pub path: Option<std::path::PathBuf>,
+    /// Second resolved path for two-path syscalls (renameat2 dst, linkat dst).
+    /// `None` for single-path syscalls.
+    pub path2: Option<std::path::PathBuf>,
+    /// Open flags for openat (the `flags` argument, e.g. `O_RDONLY`,
+    /// `O_WRONLY`, `O_CREAT`). `None` for non-openat syscalls.
+    pub flags: Option<u64>,
+    /// Socket protocol for network syscalls (connect, sendto, sendmsg, sendmmsg).
+    /// One of "tcp", "udp", "icmp". `None` for non-network syscalls or if
+    pub protocol: Option<String>,
 }
 
 impl SyscallEvent {
@@ -483,6 +498,10 @@ mod tests {
             size: None,
             argv: Some(vec!["python3".into(), "-c".into(), "print(1)".into()]),
             denied: false,
+            path: None,
+            path2: None,
+            flags: None,
+            protocol: None,
         };
         assert!(event.argv_contains("python3"));
         assert!(event.argv_contains("-c"));
@@ -502,6 +521,10 @@ mod tests {
             size: None,
             argv: None,
             denied: false,
+            path: None,
+            path2: None,
+            flags: None,
+            protocol: None,
         };
         assert!(!event.argv_contains("anything"));
     }

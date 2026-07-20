@@ -1,6 +1,6 @@
 use crate::sandbox::{ByteSize, Sandbox};
 use crate::error::SandlockError;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -14,67 +14,104 @@ pub struct ProgramSpec {
 }
 
 /// Top-level profile input. Each section maps to one schema section.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct ProfileInput {
+    #[serde(skip_serializing_if = "is_default")]
     pub config: ConfigSection,
+    #[serde(skip_serializing_if = "is_default")]
     pub determinism: DeterminismSection,
+    #[serde(skip_serializing_if = "is_default")]
     pub program: ProgramSection,
+    #[serde(skip_serializing_if = "is_default")]
     pub filesystem: FilesystemSection,
+    #[serde(skip_serializing_if = "is_default")]
     pub network: NetworkSection,
+    #[serde(skip_serializing_if = "is_default")]
     pub http: HttpSection,
+    #[serde(skip_serializing_if = "is_default")]
     pub syscalls: SyscallsSection,
+    #[serde(skip_serializing_if = "is_default")]
     pub limits: LimitsSection,
 }
 
+fn is_false(b: &bool) -> bool { !b }
+fn is_default<T: Default + PartialEq>(v: &T) -> bool { *v == T::default() }
+
 // Field names follow the schema vocabulary and match `Sandbox`'s field names 1:1.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct ConfigSection {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub http_ca: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub http_key: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub http_inject_ca: Vec<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub http_ca_out: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fs_storage: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub workdir: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct DeterminismSection {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub random_seed: Option<u64>,
     /// RFC3339 timestamp string. Maps to `Sandbox::time_start`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub time_start: Option<String>,
+    #[serde(skip_serializing_if = "is_false")]
     pub deterministic_dirs: bool,
+    #[serde(skip_serializing_if = "is_false")]
     pub no_randomize_memory: bool,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct ProgramSection {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub exec: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub env: HashMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub uid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub gid: Option<u32>,
+    #[serde(skip_serializing_if = "is_false")]
     pub clean_env: bool,
+    #[serde(skip_serializing_if = "is_false")]
     pub no_coredump: bool,
+    #[serde(skip_serializing_if = "is_false")]
     pub no_huge_pages: bool,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct FilesystemSection {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub read: Vec<PathBuf>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub write: Vec<PathBuf>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub chroot: Option<PathBuf>,
     /// Each entry has the form `"VIRTUAL:HOST"`, matching `--fs-mount` syntax.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub mount: Vec<String>,
     /// One of `"commit"`, `"abort"`, `"keep"`. Maps to `Sandbox::on_exit`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub on_exit: Option<String>,
     /// One of `"commit"`, `"abort"`, `"keep"`. Maps to `Sandbox::on_error`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub on_error: Option<String>,
 }
 
@@ -82,61 +119,86 @@ pub struct FilesystemSection {
 /// quoted string holding a comma list and/or `lo-hi` range (`"9000-9005"`).
 /// The untagged form lets a TOML array mix the two, e.g.
 /// `allow_bind = [8080, "9000-9005"]`.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum PortSpec {
     Port(u16),
     Spec(String),
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct NetworkSection {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub allow_bind: Vec<PortSpec>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub deny_bind: Vec<PortSpec>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<String>,
+    #[serde(skip_serializing_if = "is_false")]
     pub port_remap: bool,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct HttpSection {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<u16>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct SyscallsSection {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub extra_allow: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub extra_deny: Vec<String>,
 }
 
 // Field names drop the `max_` prefix that `Sandbox` uses (`memory`, not
 // `max_memory`) — the section name `[limits]` makes the prefix redundant.
 // `parse_input` maps each of these to the corresponding `Sandbox::max_*` field.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct LimitsSection {
     /// `ByteSize` string, e.g. `"512M"` (suffixes K/M/G only; IEC `MiB`/`GiB`
     /// not yet supported). Maps to `Sandbox::max_memory`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub processes: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub open_files: Option<u32>,
     /// CPU cap as a percentage (0–100). Maps to `Sandbox::max_cpu`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu: Option<u8>,
     /// `ByteSize` string, e.g. `"256M"` (suffixes K/M/G only; IEC `MiB`/`GiB`
     /// not yet supported). Maps to `Sandbox::max_disk`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub disk: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub gpu_devices: Option<Vec<u32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_cores: Option<Vec<u32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub num_cpus: Option<u32>,
 }
 
 /// Convert a parsed `ProfileInput` into a `(Sandbox, ProgramSpec)` pair.
 ///
+impl ProfileInput {
+    /// Serialize the profile to a TOML string.
+    pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
+        toml::to_string(self)
+    }
+}
+
 /// Forwards each schema section's fields to the corresponding `SandboxBuilder`
 /// method calls. The two private helpers (`parse_branch_action`,
 /// `parse_mount_spec`) handle string-to-typed-value conversions for fields

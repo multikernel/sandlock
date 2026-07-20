@@ -354,8 +354,11 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
     }
 
     // Dynamic policy callback: intercept key syscalls for event emission.
+    // Also includes the legacy open(2) syscall (absent on some arches) so
+    // path events fire on kernels that still dispatch it.
     if features.policy_fn {
         nrs.extend(POLICY_EVENT_SYSCALLS);
+        nrs.push_optional(arch::sys_open());
     }
 
     // Port remapping

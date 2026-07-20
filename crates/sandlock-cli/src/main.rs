@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 mod network_registry;
+mod learn;
 
 #[derive(Parser)]
 #[command(name = "sandlock", about = "Lightweight process sandbox", version)]
@@ -33,6 +34,8 @@ enum Command {
         #[command(subcommand)]
         action: ProfileAction,
     },
+    /// Observe a workload and emit a sandlock profile
+    Learn(LearnArgs),
 }
 
 /// Arguments for the `run` subcommand.
@@ -200,6 +203,34 @@ enum ProfileAction {
     Delete { name: String },
 }
 
+/// Arguments for the `learn` subcommand.
+#[derive(clap::Args)]
+struct LearnArgs {
+    /// Write observed profile to this file (default: print to stdout)
+    #[arg(short = 'o', long, value_name = "PATH")]
+    output: Option<PathBuf>,
+
+    /// Kill the observed process after this many seconds and write a partial profile
+    #[arg(long, value_name = "SECS")]
+    timeout: Option<u64>,
+
+    /// Collapse directories where N or more files were observed (default N=4 when flag is present)
+    #[arg(long, value_name = "N", default_missing_value = "4", num_args = 0..=1)]
+    collapse: Option<usize>,
+
+    /// Force collapse of all observed paths under PREFIX to that prefix (repeatable)
+    #[arg(long, value_name = "PREFIX")]
+    collapse_prefix: Vec<PathBuf>,
+
+    /// Allow --collapse-prefix to target sensitive directories (prints a warning and diff for each)
+    #[arg(long, requires = "collapse_prefix")]
+    force_sensitive_collapse: bool,
+
+    /// Command to observe (everything after --)
+    #[arg(last = true, required = true)]
+    cmd: Vec<String>,
+}
+
 #[derive(serde::Serialize)]
 struct SandboxStatus {
     exit_code: i32,
@@ -301,6 +332,10 @@ async fn main() -> Result<()> {
                 }
             }
             println!("  Platform: {}", std::env::consts::ARCH);
+        }
+
+        Command::Learn(args) => {
+            learn::run(args).await?;
         }
 
         Command::Profile { action } => {
