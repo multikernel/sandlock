@@ -267,10 +267,15 @@ impl LearnObserver {
     /// The policy_fn callback: classifies each intercepted syscall into
     /// reads, writes, or connects for profile generation.
     fn on_event(&self, event: SyscallEvent) -> Verdict {
-        // After an execve, the NEXT event from that PID fires once the
-        // new binary is running — /proc/<pid>/maps now shows the dynamic
-        // linker loaded by the kernel (which bypassed seccomp).
-        if self.pending_maps.lock().unwrap().remove(&event.pid) {
+        // After a successful execve, the NEXT event from that PID runs under
+        // the new image, so /proc/<pid>/maps shows the binary and dynamic
+        // linker the kernel loaded (which bypassed seccomp). Another exec
+        // event from a pending PID instead means the previous attempt failed
+        // (execvp walking $PATH; a successful execve never returns), so keep
+        // waiting: scanning then would record the old image, which for the
+        // workload's first exec is the sandbox runtime itself.
+        let is_exec = matches!(event.syscall.as_str(), "execve" | "execveat");
+        if !is_exec && self.pending_maps.lock().unwrap().remove(&event.pid) {
             let mut reads = self.reads.lock().unwrap();
             // /proc/<pid>/exe is the canonical real binary path (symlinks resolved by the kernel),
             // race-free at this point since the new image is already loaded.
