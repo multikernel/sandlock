@@ -231,11 +231,18 @@ fn chroot_path_syscalls() -> Vec<i64> {
     v
 }
 
-fn fs_denied_path_syscalls() -> Vec<i64> {
-    // symlinkat/symlink are intentionally absent: creating a symlink does not
-    // access its target, so there is nothing to deny at creation time. A later
-    // open through the symlink resolves to the real target and is denied
-    // race-free on the open path (issue #111).
+/// Syscalls gated by the deny-path precheck in `handle_notification`.
+///
+/// This is the single source of truth for deny-path enforcement scope: it
+/// decides both which syscalls enter the notif BPF list when deny paths are
+/// configured and which notifications run `is_path_denied_for_notif`.
+///
+/// symlinkat/symlink and mkdirat/mkdir are intentionally absent: creating a
+/// symlink does not access its target, and mkdir cannot touch existing
+/// content, so there is nothing to deny at creation time. A later open
+/// through the created name resolves to the real target and is denied
+/// race-free on the open path (issue #111).
+pub(crate) fn fs_denied_path_syscalls() -> Vec<i64> {
     let mut v = vec![
         libc::SYS_openat,
         arch::SYS_OPENAT2,
@@ -243,12 +250,19 @@ fn fs_denied_path_syscalls() -> Vec<i64> {
         libc::SYS_execveat,
         libc::SYS_linkat,
         libc::SYS_renameat2,
+        // A denied file must not be destroyed either: truncate(2) wipes its
+        // content and unlinkat(2) (incl. AT_REMOVEDIR) deletes it, and both
+        // take a path so the fd-based open deny never sees them.
+        libc::SYS_truncate,
+        libc::SYS_unlinkat,
     ];
     v.extend(
         [
             arch::sys_open(),
             arch::sys_link(),
             arch::sys_rename(),
+            arch::sys_unlink(),
+            arch::sys_rmdir(),
         ]
         .into_iter()
         .flatten(),

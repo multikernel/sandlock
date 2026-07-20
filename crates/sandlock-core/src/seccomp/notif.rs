@@ -332,7 +332,8 @@ impl NetworkPolicy {
 ///
 /// For two-path syscalls (renameat2, linkat), checks both source and
 /// destination paths — a denied file must not be linked, renamed, or
-/// overwritten.
+/// overwritten. Single-path destructive syscalls (truncate, unlinkat) are
+/// gated too: a denied file must not be wiped or deleted.
 ///
 /// Each resolved path is checked both as-is (lexical normalization) and
 /// after following symlinks via `canonicalize`.  This prevents bypass via
@@ -1626,6 +1627,13 @@ fn resolve_at_path_for_event(notif: &SeccompNotif, dirfd: i64, path: &str) -> Op
     Some(normalize_path(&base.join(path)))
 }
 
+/// Resolve the primary path argument of a path-bearing syscall.
+///
+/// Serves two callers with different scopes: `emit_policy_event` uses it for
+/// every syscall matched here (observation, e.g. `sandlock learn`), while
+/// deny enforcement via `is_path_denied_for_notif` only ever sees syscalls in
+/// `fs_denied_path_syscalls` — adding a match arm here does NOT widen deny
+/// gating.
 fn resolve_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Option<String> {
     let nr = notif.data.nr as i64;
     match nr {
@@ -1688,10 +1696,6 @@ fn resolve_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Option<Strin
             let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
             resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
         }
-        // symlinkat/symlink intentionally omitted from deny-path gating: creating
-        // a symlink does not access its target, so there is nothing to gate here.
-        // Any later open through the symlink resolves to the real target and is
-        // denied race-free on the open path (issue #111). See `on_behalf_open_for_deny`.
         // link(oldpath, newpath) — legacy, AT_FDCWD implied for both
         n if Some(n) == arch::sys_link() => {
             let path = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
@@ -2042,21 +2046,14 @@ async fn handle_notification(
         maybe_patch_vdso(notif.pid as i32, &mut pfs, policy);
     }
 
-    // Check dynamic path denials before dispatch
+    // Check dynamic path denials before dispatch. The gated syscall set is
+    // shared with the BPF notif list so enforcement scope cannot drift from
+    // interception scope; see `fs_denied_path_syscalls` for what is gated
+    // and why symlink/mkdir are not.
     let mut action = {
         let nr = notif.data.nr as i64;
-        // symlinkat/symlink are not gated: creating a symlink does not access
-        // its target (any open through it is denied race-free on the open
-        // path). See `resolve_path_for_notif`.
-        let mut path_check_nrs = vec![
-            libc::SYS_openat, arch::SYS_OPENAT2, libc::SYS_execve, libc::SYS_execveat,
-            libc::SYS_linkat, libc::SYS_renameat2,
-        ];
-        path_check_nrs.extend([
-            arch::sys_open(), arch::sys_link(), arch::sys_rename(),
-        ].into_iter().flatten());
         let should_precheck_denied = policy.chroot_root.is_none()
-            && path_check_nrs.contains(&nr);
+            && crate::seccomp_plan::fs_denied_path_syscalls().contains(&nr);
         if should_precheck_denied {
             let pfs = ctx.policy_fn.lock().await;
             if is_path_denied_for_notif(&pfs, &notif, fd) {

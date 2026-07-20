@@ -358,6 +358,61 @@ async fn test_denied_path_rename_blocked() {
     );
 }
 
+/// truncate(2) takes a path, so the fd-based open deny never sees it; the
+/// deny precheck must gate it or a denied file inside a granted write tree
+/// can be wiped.
+#[tokio::test]
+async fn test_denied_path_truncate_blocked() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let secret = tmp.path().join("secret.txt");
+    std::fs::write(&secret, "TOP_SECRET").unwrap();
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
+        .fs_read("/bin").fs_read("/proc").fs_read("/etc")
+        .fs_read(tmp.path())
+        .fs_write(tmp.path())
+        .fs_deny(&secret)
+        .build()
+        .unwrap();
+
+    // os.truncate on a path issues truncate(2), not open+ftruncate.
+    let script = format!("import os; os.truncate('{}', 0)", secret.display());
+    let _ = policy.clone().with_name("test").run(&["python3", "-c", &script]).await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&secret).unwrap(),
+        "TOP_SECRET",
+        "truncate bypass: sandbox allowed wiping a denied file via truncate(2)"
+    );
+}
+
+/// unlinkat(2) takes a path, so the fd-based open deny never sees it; the
+/// deny precheck must gate it or a denied file inside a granted write tree
+/// can be deleted.
+#[tokio::test]
+async fn test_denied_path_unlink_blocked() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let secret = tmp.path().join("secret.txt");
+    std::fs::write(&secret, "TOP_SECRET").unwrap();
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
+        .fs_read("/bin").fs_read("/proc").fs_read("/etc")
+        .fs_read(tmp.path())
+        .fs_write(tmp.path())
+        .fs_deny(&secret)
+        .build()
+        .unwrap();
+
+    let cmd = format!("rm -f {}", secret.display());
+    let _ = policy.clone().with_name("test").run(&["sh", "-c", &cmd]).await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&secret).unwrap_or_default(),
+        "TOP_SECRET",
+        "unlink bypass: sandbox allowed deleting a denied file via unlinkat(2)"
+    );
+}
+
 #[tokio::test]
 async fn test_denied_path_symlink_blocked() {
     let tmp = tempfile::TempDir::new().unwrap();
