@@ -1945,11 +1945,19 @@ async fn emit_policy_event(
         protocol,
     };
 
-    // Hold syscalls where the callback's verdict matters.
-    // The child is blocked until the callback returns.
+    // Hold syscalls where the callback's verdict matters: exec, every open
+    // variant (openat2 and legacy open emit the same "openat" event, so a
+    // deny that skipped them would be silently bypassable), and every
+    // network-send variant (same reasoning for sendmsg/sendmmsg vs sendto).
+    // The child is blocked until the callback returns. Filesystem-mutation
+    // events (mkdir/unlink/symlink/link/rename/truncate) are observation-only
+    // per the `PolicyCallback` contract; use `fs_deny` to block paths.
     let is_held = nr == libc::SYS_execve || nr == libc::SYS_execveat
-        || nr == libc::SYS_connect || nr == libc::SYS_sendto
-        || nr == libc::SYS_bind || nr == libc::SYS_openat;
+        || nr == libc::SYS_openat || nr == arch::SYS_OPENAT2
+        || Some(nr) == arch::sys_open()
+        || nr == libc::SYS_connect || nr == libc::SYS_bind
+        || nr == libc::SYS_sendto || nr == libc::SYS_sendmsg
+        || nr == libc::SYS_sendmmsg;
 
     if is_held {
         let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();

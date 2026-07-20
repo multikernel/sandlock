@@ -270,15 +270,45 @@ pub(crate) fn fs_denied_path_syscalls() -> Vec<i64> {
     v
 }
 
-const POLICY_EVENT_SYSCALLS: &[i64] = &[
-    libc::SYS_openat,
-    arch::SYS_OPENAT2,
-    libc::SYS_connect,
-    libc::SYS_sendto,
-    libc::SYS_bind,
-    libc::SYS_execve,
-    libc::SYS_execveat,
-];
+/// Syscalls intercepted for policy_fn event emission.
+///
+/// Must match what `emit_policy_event` can decode into a `SyscallEvent`, so
+/// every field documented there fires for a policy_fn-only sandbox instead of
+/// depending on COW, chroot, or network supervision happening to intercept
+/// the syscall.
+fn policy_event_syscalls() -> Vec<i64> {
+    let mut v = vec![
+        libc::SYS_openat,
+        arch::SYS_OPENAT2,
+        libc::SYS_connect,
+        libc::SYS_sendto,
+        libc::SYS_sendmsg,
+        libc::SYS_sendmmsg,
+        libc::SYS_bind,
+        libc::SYS_execve,
+        libc::SYS_execveat,
+        libc::SYS_mkdirat,
+        libc::SYS_unlinkat,
+        libc::SYS_symlinkat,
+        libc::SYS_linkat,
+        libc::SYS_renameat2,
+        libc::SYS_truncate,
+    ];
+    v.extend(
+        [
+            arch::sys_open(),
+            arch::sys_mkdir(),
+            arch::sys_rmdir(),
+            arch::sys_unlink(),
+            arch::sys_symlink(),
+            arch::sys_link(),
+            arch::sys_rename(),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    v
+}
 
 const PORT_REMAP_SYSCALLS: &[i64] = &[
     libc::SYS_bind,
@@ -367,12 +397,10 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
         nrs.extend(&fs_denied_path_syscalls());
     }
 
-    // Dynamic policy callback: intercept key syscalls for event emission.
-    // Also includes the legacy open(2) syscall (absent on some arches) so
-    // path events fire on kernels that still dispatch it.
+    // Dynamic policy callback: intercept every syscall the event emitter
+    // can decode.
     if features.policy_fn {
-        nrs.extend(POLICY_EVENT_SYSCALLS);
-        nrs.push_optional(arch::sys_open());
+        nrs.extend(&policy_event_syscalls());
     }
 
     // Port remapping

@@ -586,3 +586,120 @@ async fn test_policy_fn_fork_does_not_deadlock() {
     let out = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or(b""));
     assert!(out.contains("FORKS_OK 30"), "all 30 forks should complete, got: {}", out);
 }
+
+/// A policy_fn-only sandbox (no COW, no network supervision) must receive
+/// filesystem-mutation events with a resolved path: the policy_fn feature
+/// itself puts these syscalls in the notif list, not other features.
+#[tokio::test]
+async fn test_policy_fn_fs_mutation_events() {
+    let events: Arc<Mutex<Vec<(String, Option<PathBuf>)>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+
+    let policy = base_policy()
+        .policy_fn(move |event, _ctx| {
+            events_clone.lock().unwrap().push((event.syscall.clone(), event.path.clone()));
+            Verdict::Allow
+        })
+        .build()
+        .unwrap();
+
+    let dir = temp_file("mutations-dir");
+    let renamed = temp_file("mutations-renamed");
+    let cmd = format!(
+        "mkdir {dir} && mv {dir} {renamed} && rmdir {renamed}",
+        dir = dir.display(),
+        renamed = renamed.display(),
+    );
+    let result = policy.clone().with_name("test").run(&["sh", "-c", &cmd]).await.unwrap();
+    assert!(result.success());
+
+    let captured = events.lock().unwrap();
+    for name in ["mkdirat", "renameat2", "unlinkat"] {
+        assert!(
+            captured.iter().any(|(n, p)| n == name && p.is_some()),
+            "expected a {name} event with a resolved path, got: {:?}",
+            captured.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+        );
+    }
+}
+
+/// Verdict::Deny for an "openat" event must block openat2(2) too: openat2
+/// emits the same event name, so a callback cannot tell them apart and a
+/// held-gate that skipped openat2 would let opens bypass the deny.
+#[tokio::test]
+async fn test_policy_fn_deny_openat2() {
+    let secret = temp_file("deny-openat2-secret");
+    std::fs::write(&secret, "TOP_SECRET").unwrap();
+    let out = temp_file("deny-openat2-out");
+    let deny_path = secret.clone();
+
+    let policy = base_policy()
+        .fs_read("/tmp")
+        .policy_fn(move |event, _ctx| {
+            if event.syscall == "openat" && event.path.as_deref() == Some(deny_path.as_path()) {
+                return Verdict::Deny; // EPERM
+            }
+            Verdict::Allow
+        })
+        .build()
+        .unwrap();
+
+    // SYS_openat2 = 437 on all supported arches; struct open_how { flags, mode, resolve }.
+    let script = format!(concat!(
+        "import ctypes, os\n",
+        "libc = ctypes.CDLL(None, use_errno=True)\n",
+        "class How(ctypes.Structure):\n",
+        "  _fields_ = [('f', ctypes.c_uint64), ('m', ctypes.c_uint64), ('r', ctypes.c_uint64)]\n",
+        "how = How(f=os.O_RDONLY)\n",
+        "fd = libc.syscall(437, -100, b'{secret}', ctypes.byref(how), ctypes.sizeof(how))\n",
+        "if fd < 0:\n",
+        "  open('{out}', 'w').write('BLOCKED:%d' % ctypes.get_errno())\n",
+        "else:\n",
+        "  open('{out}', 'w').write(os.read(fd, 32).decode())\n",
+    ), secret = secret.display(), out = out.display());
+
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success());
+
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&secret);
+    assert_eq!(content, "BLOCKED:1", "openat2 must be denied by the policy_fn openat deny (EPERM)");
+}
+
+/// Verdict::Deny for a "sendmsg" event must block the send: sendto is held,
+/// so a datagram sent via sendmsg(2) must not bypass the verdict.
+#[tokio::test]
+async fn test_policy_fn_deny_sendmsg() {
+    let out = temp_file("deny-sendmsg-out");
+    let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = receiver.local_addr().unwrap().port();
+
+    let policy = base_policy()
+        .net_allow(format!("udp://127.0.0.1:{port}"))
+        .policy_fn(move |event, _ctx| {
+            if event.syscall == "sendmsg" {
+                return Verdict::Deny; // EPERM
+            }
+            Verdict::Allow
+        })
+        .build()
+        .unwrap();
+
+    let script = format!(concat!(
+        "import socket\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
+        "try:\n",
+        "  s.sendmsg([b'hi'], [], 0, ('127.0.0.1', {port}))\n",
+        "  open('{out}', 'w').write('SENT')\n",
+        "except OSError as e:\n",
+        "  open('{out}', 'w').write('BLOCKED:%d' % e.errno)\n",
+    ), port = port, out = out.display());
+
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success());
+
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(content, "BLOCKED:1", "sendmsg should be denied by policy_fn (EPERM)");
+}
