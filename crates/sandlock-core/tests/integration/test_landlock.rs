@@ -1178,14 +1178,22 @@ async fn test_named_unix_dgram_sendmsg_allowed_delivers() {
 /// Scope, stated precisely: this sandbox declares fs grants, so
 /// `has_unix_fs_gate` is true and the send takes the PRE-EXISTING named-unix
 /// gate arm (`sendto_named_unix_on_behalf`), not the non-IP fall-through this
-/// PR changes. It therefore guards one thing only — that turning
-/// `has_net_destination_policy` on does not divert a named unix datagram away
-/// from that gate — and it is NOT a witness for either hardening change:
-/// mutating the abstract-address refusal, the fall-through's fd pinning, or the
-/// `/proc/<pid>/root` resolution context all leave it green. Those are covered
-/// by `test_abstract_unix_dgram_sendto_refused_under_destination_policy`,
-/// `if_nameindex_works_under_destination_policy`, and the `child_root_path`
-/// unit tests respectively.
+/// PR changes. It therefore guards one thing only — that a named unix datagram
+/// is still DELIVERED while a destination policy is active. It does NOT pin
+/// down which arm delivers it: mutating the gate arm so the send falls through
+/// to `sendto_pinned_unix_on_behalf` (which pins and delivers too) leaves this
+/// test, all seven `named_unix_dgram` tests and the whole suite green.
+///
+/// It is likewise NOT a witness for either hardening change: mutating the
+/// abstract-address refusal, the fall-through's fd pinning, or the
+/// `/proc/<pid>/root` resolution context all leave it green. The first is
+/// covered by `test_abstract_unix_dgram_sendto_refused_under_destination_policy`
+/// and the third by the `child_root_path` unit tests.
+/// `if_nameindex_works_under_destination_policy` covers the fall-through only
+/// for the `RawDestOnBehalf` arm; the named-unix fall-through
+/// (`sendto_pinned_unix_on_behalf`) has NO test by design — it is unreachable
+/// in any configuration that can execute code, see the REACHABILITY note on
+/// that function.
 #[tokio::test]
 async fn test_named_unix_dgram_sendto_delivers_under_destination_policy() {
     dgram_allow_delivers("sendto", "to-netpolicy", Some("127.0.0.1:9")).await;

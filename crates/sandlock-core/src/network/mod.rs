@@ -150,8 +150,11 @@ fn socket_is_unix(fd: RawFd) -> bool {
 /// the supervisor). The Continue cases in this module are:
 ///   1. Non-IP families (AF_UNIX etc.) — the IP allowlist doesn't apply;
 ///      Landlock IPC scoping is the enforcement boundary. One sub-case is
-///      narrower: `sendto`'s non-IP fall-through (non-chroot) does NOT Continue
-///      once a destination policy is active. There the send goes on-behalf on a
+///      narrower: `sendto`'s non-IP fall-through does NOT Continue once a
+///      destination policy is active. That fall-through has no chroot check —
+///      it is whatever misses the named-path gate, i.e. a pathless AF_UNIX or a
+///      non-AF_UNIX destination — so it fails closed under `--chroot` too.
+///      There the send goes on-behalf on a
 ///      pinned fd — a named unix target resolved in the child's root view, or a
 ///      non-unix destination on a unix socket (the NETLINK_ROUTE
 ///      virtualization) — or fails closed with EAFNOSUPPORT for an AF_UNIX
