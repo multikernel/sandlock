@@ -148,8 +148,13 @@ fn socket_is_unix(fd: RawFd) -> bool {
 /// Continue safety (issue #27): the on-behalf paths don't return Continue
 /// at all (they return ReturnValue/Errno after performing the syscall in
 /// the supervisor). The Continue cases in this module are:
-///   1. Non-IP families (AF_UNIX etc.) — the IP allowlist doesn't apply;
-///      Landlock IPC scoping is the enforcement boundary.
+///   1. Non-IP families (AF_UNIX etc.) with NO destination policy — the IP
+///      allowlist doesn't apply; Landlock IPC scoping is the enforcement
+///      boundary. Under a destination policy these do NOT Continue: the send
+///      goes on-behalf on a pinned fd (a named unix target, resolved in the
+///      child's root view) or fails closed with EAFNOSUPPORT (everything else,
+///      including abstract unix addresses — the supervisor has no Landlock
+///      domain, so an on-behalf abstract send would escape the child's scope).
 ///   2. Connected sockets with addr_ptr == 0 — the address was already
 ///      validated at connect time, so the kernel re-read of (nothing) is
 ///      moot.

@@ -1033,8 +1033,10 @@ async fn test_named_unix_dgram_sendmsg_denied_without_fs_write() {
 // to a socket UNDER a write grant must not only be permitted but actually
 // deliver the payload (the supervisor performs the send on-behalf). Exercises
 // the success path of sendto_named_unix_on_behalf / sendmsg_named_unix_on_behalf
-// that the deny tests never reach. `which` selects the syscall.
-async fn dgram_allow_delivers(which: &str, tag: &str) {
+// that the deny tests never reach. `which` selects the syscall; `net_allow` adds
+// an IP destination rule so the same delivery can be asserted with a destination
+// policy active.
+async fn dgram_allow_delivers(which: &str, tag: &str, net_allow: Option<&str>) {
     if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 {
         eprintln!("Skipping: Landlock ABI v6 required");
         return;
@@ -1106,7 +1108,7 @@ async fn dgram_allow_delivers(which: &str, tag: &str) {
         out = out.display(),
     );
 
-    let policy = Sandbox::builder()
+    let builder = Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
@@ -1116,9 +1118,16 @@ async fn dgram_allow_delivers(which: &str, tag: &str) {
         .fs_read("/dev")
         .fs_write("/tmp")
         // socket dir is WRITE granted -> send permitted, on-behalf
-        .fs_write(sock_dir.to_str().unwrap())
-        .build()
-        .unwrap();
+        .fs_write(sock_dir.to_str().unwrap());
+    // A non-empty net_allow turns on the destination policy, which is what makes
+    // the sendto/sendmsg handlers take their on-behalf paths for every send —
+    // including this unix datagram, whose destination the IP allowlist cannot
+    // describe.
+    let builder = match net_allow {
+        Some(rule) => builder.net_allow(rule),
+        None => builder,
+    };
+    let policy = builder.build().unwrap();
 
     policy
         .clone()
@@ -1156,12 +1165,27 @@ async fn dgram_allow_delivers(which: &str, tag: &str) {
 
 #[tokio::test]
 async fn test_named_unix_dgram_sendto_allowed_delivers() {
-    dgram_allow_delivers("sendto", "to").await;
+    dgram_allow_delivers("sendto", "to", None).await;
 }
 
 #[tokio::test]
 async fn test_named_unix_dgram_sendmsg_allowed_delivers() {
-    dgram_allow_delivers("sendmsg", "msg").await;
+    dgram_allow_delivers("sendmsg", "msg", None).await;
+}
+
+/// Same delivery guarantee with an IP destination policy active. A non-empty
+/// `net_allow` makes `has_net_destination_policy` true, which is the switch that
+/// routes every sendto through the non-IP arm of `sendto_on_behalf` instead of
+/// letting it Continue — the arm that resolves the destination in the child's
+/// root view and pins the target inode. This is the happy path both hardening
+/// changes sit on: a named unix datagram must still be delivered, byte-for-byte,
+/// to the socket the child named. It is also the regression witness for the
+/// resolution context — a handler that hands the child's raw `sun_path` to the
+/// supervisor's `sendmsg` delivers to whatever that path names next to the
+/// supervisor, so a relative or child-relative destination silently misses.
+#[tokio::test]
+async fn test_named_unix_dgram_sendto_delivers_under_destination_policy() {
+    dgram_allow_delivers("sendto", "to-netpolicy", Some("127.0.0.1:9")).await;
 }
 
 // `sendmmsg()` (batched datagram send) is the last named-unix vector and Python

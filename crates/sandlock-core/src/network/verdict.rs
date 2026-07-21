@@ -78,10 +78,11 @@ pub(crate) fn path_under_any(path: &std::path::Path, prefixes: &[std::path::Path
 
 /// The send path selected for one message, from the already-parsed destination
 /// shape and the *stable* socket domain. Pure: the caller supplies whether the
-/// message is connected, the parsed IP (if any), and whether the pinned socket
-/// is `AF_UNIX`, so the decision is unit-testable and cannot re-read child state.
+/// message is connected, the parsed IP (if any), whether the pinned socket is
+/// `AF_UNIX`, and whether the destination is a NAMED (pathname) unix address, so
+/// the decision is unit-testable and cannot re-read child state.
 ///
-/// The unix-datagram arm sends on-behalf on the pinned fd rather than returning
+/// The named-unix arm sends on-behalf on the pinned fd rather than returning
 /// `Continue`: gating on the transient address family and Continuing would let a
 /// racing `dup2(inet_sock, sockfd)` + `msg_name` swap ride out on the kernel's
 /// re-read and reach a denied IP. Sending on the pinned fd we already checked
@@ -92,27 +93,48 @@ pub(crate) enum SendPath {
     ConnectedOnBehalf,
     /// IP destination: validate `ip` against the allowlist, then send on-behalf.
     IpChecked(IpAddr),
-    /// Non-IP address on a unix-domain socket: a unix datagram; send on-behalf on
-    /// the pinned fd with no IP check (the kernel constrains a unix socket to
-    /// unix peers, and we never Continue).
-    UnixOnBehalf,
-    /// Non-IP address on a non-unix socket: the address-family-swap shape; fail
-    /// closed with `EAFNOSUPPORT`.
+    /// Named (pathname) unix destination on a unix-domain socket: resolve the
+    /// target in the CHILD's root view, pin its inode, and send on-behalf to
+    /// `/proc/self/fd/<pin>` with no IP check (the kernel constrains a unix
+    /// socket to unix peers, and we never Continue).
+    NamedUnixOnBehalf,
+    /// Everything else, failed closed with `EAFNOSUPPORT`:
+    ///   - a non-IP address on a non-unix socket — the address-family-swap shape;
+    ///   - a unix destination we cannot pin in the child's context: an ABSTRACT
+    ///     address, an empty one, or a non-UTF-8 `sun_path`.
+    ///
+    /// Abstract addresses fail closed because an on-behalf send is executed by
+    /// the supervisor, which carries no Landlock domain, and
+    /// `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` is enforced against the credentials
+    /// of the process performing the send. Sending an abstract datagram
+    /// on-behalf would therefore hand the child every abstract socket on the
+    /// host, turning the child's scope boundary off whenever a destination
+    /// policy is active. Continuing instead (so the child runs the send inside
+    /// its own scoped domain) is not an option here — that is exactly the TOCTOU
+    /// this path closes — so the send is refused.
     Reject,
 }
 
 /// Classify a send destination into the [`SendPath`] the handler should take.
+///
+/// `named_unix_dest` is "the destination sockaddr is a pathname `AF_UNIX`
+/// address" (i.e. `named_unix_socket_path` returned `Some`), which is precisely
+/// the set of unix destinations the supervisor can re-resolve in the child's
+/// root view and pin. It is deliberately separate from `is_unix_socket` (the
+/// socket's stable `SO_DOMAIN`): the address is attacker-controlled per message,
+/// the domain is not, and both must hold to send on-behalf.
 pub(crate) fn classify_send_path(
     connected: bool,
     ip: Option<IpAddr>,
     is_unix_socket: bool,
+    named_unix_dest: bool,
 ) -> SendPath {
     if connected {
         return SendPath::ConnectedOnBehalf;
     }
     match ip {
         Some(ip) => SendPath::IpChecked(ip),
-        None if is_unix_socket => SendPath::UnixOnBehalf,
+        None if is_unix_socket && named_unix_dest => SendPath::NamedUnixOnBehalf,
         None => SendPath::Reject,
     }
 }
@@ -168,11 +190,11 @@ mod tests {
         // address and socket domain are irrelevant.
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         assert_eq!(
-            classify_send_path(true, Some(ip), false),
+            classify_send_path(true, Some(ip), false, false),
             SendPath::ConnectedOnBehalf
         );
         assert_eq!(
-            classify_send_path(true, None, true),
+            classify_send_path(true, None, true, false),
             SendPath::ConnectedOnBehalf
         );
     }
@@ -180,17 +202,37 @@ mod tests {
     #[test]
     fn send_path_ip_destination_is_checked() {
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
-        assert_eq!(classify_send_path(false, Some(ip), false), SendPath::IpChecked(ip));
+        assert_eq!(
+            classify_send_path(false, Some(ip), false, false),
+            SendPath::IpChecked(ip)
+        );
         // Socket domain does not override a parsed IP destination.
-        assert_eq!(classify_send_path(false, Some(ip), true), SendPath::IpChecked(ip));
+        assert_eq!(
+            classify_send_path(false, Some(ip), true, false),
+            SendPath::IpChecked(ip)
+        );
     }
 
     #[test]
-    fn send_path_non_ip_on_unix_socket_goes_on_behalf() {
-        // A non-IP address on a unix-domain socket is a unix datagram: send it
-        // on-behalf on the pinned fd (never Continue), so a raced fd/addr swap
+    fn send_path_named_unix_destination_goes_on_behalf() {
+        // A NAMED (pathname) address on a unix-domain socket is the one unix
+        // datagram the supervisor can re-resolve in the child's root view: send
+        // it on-behalf on the pinned fd (never Continue), so a raced fd/addr swap
         // cannot redirect it to a denied IP.
-        assert_eq!(classify_send_path(false, None, true), SendPath::UnixOnBehalf);
+        assert_eq!(
+            classify_send_path(false, None, true, true),
+            SendPath::NamedUnixOnBehalf
+        );
+    }
+
+    #[test]
+    fn send_path_abstract_unix_destination_is_rejected() {
+        // An abstract (or empty, or non-UTF-8) unix address has no pathname to
+        // pin: `named_unix_socket_path` returns None, so `named_unix_dest` is
+        // false. It must fail closed rather than be sent on-behalf — the
+        // supervisor carries no Landlock domain, so an on-behalf abstract send
+        // would escape the child's LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET.
+        assert_eq!(classify_send_path(false, None, true, false), SendPath::Reject);
     }
 
     #[test]
@@ -198,6 +240,9 @@ mod tests {
         // A non-IP address on a non-unix (IP) socket is the address-family-swap
         // shape; fail closed. Pre-fix logic returned Continue for this input, so
         // this assertion is the deterministic fail-without-fix witness.
-        assert_eq!(classify_send_path(false, None, false), SendPath::Reject);
+        assert_eq!(classify_send_path(false, None, false, false), SendPath::Reject);
+        // A pathname address does not rescue a non-unix socket: the stable
+        // domain decides, and only both together take the on-behalf arm.
+        assert_eq!(classify_send_path(false, None, false, true), SendPath::Reject);
     }
 }
