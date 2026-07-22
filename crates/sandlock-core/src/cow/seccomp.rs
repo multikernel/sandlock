@@ -1038,12 +1038,11 @@ impl SeccompCowBranch {
         // Collect the entries before merging: the loop unlinks from the upper as
         // it goes, and mutating a tree while walking it is not something walkdir
         // promises to survive.
-        let mut walk = walkdir::WalkDir::new(&self.upper)
+        let walk = walkdir::WalkDir::new(&self.upper)
             .min_depth(1)
-            .sort_by_file_name()
-            .into_iter();
+            .sort_by_file_name();
         let mut entries = Vec::new();
-        while let Some(entry) = walk.next() {
+        for entry in walk {
             entries.push(entry.map_err(|e| BranchError::Operation(format!("walk: {}", e)))?);
         }
 
