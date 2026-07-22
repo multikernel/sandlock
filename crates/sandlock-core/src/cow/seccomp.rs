@@ -992,14 +992,21 @@ impl SeccompCowBranch {
 
     /// Commit: merge upper into workdir.
     ///
-    /// The merge is file-by-file and not crash-atomic. If it fails partway
-    /// (`ENOSPC`, `EACCES`, an obstructing symlink, ...) the workdir is left
+    /// The merge is file-by-file and not crash-atomic. If it fails
+    /// (`ENOSPC`, `EACCES`, an obstructing symlink, ...) the workdir may be left
     /// partially merged and this returns `Err` — but the upper is **preserved**,
     /// holding exactly what did not make it across: each change is dropped from
     /// the upper as it lands, so after a failure `changes()` reports the
     /// REMAINDER and not the whole run. Call `commit()` again to retry it once
     /// the cause is cleared, or `abort()` to discard the remainder. Dropping the
     /// branch after a failed commit does NOT reclaim it.
+    ///
+    /// Deletions are applied first and as a group: if any one of them is still
+    /// outstanding afterwards the commit fails there, before a single addition
+    /// is copied. `Ok(())` therefore means every recorded change landed —
+    /// nothing else may return it, because the successful tail removes the
+    /// storage and a change reported as merged but left behind would have no
+    /// copy anywhere.
     ///
     /// A change is dropped from the upper only after its workdir side is in
     /// place, so the failure mode of that bookkeeping is a change reported (and
@@ -1021,18 +1028,42 @@ impl SeccompCowBranch {
         self.preserve(PreserveReason::MergeInterrupted);
 
         // Apply deletions, forgetting each one that is no longer outstanding so
-        // a retry (and `changes()`) sees only what is left to do.
+        // a retry (and `changes()`) sees only what is left to do. Whether the
+        // removal call succeeded is not the test — the entry being gone is —
+        // because a deletion of something the workdir no longer has is already
+        // applied.
         let pending_deletions: Vec<String> = self.deleted.iter().cloned().collect();
+        let mut deletion_failure: Option<String> = None;
         for rel_path in pending_deletions {
             let dest = self.workdir.join(&rel_path);
-            if dest.is_dir() {
-                let _ = crate::sys::fs::remove_dir_all_in_root(&self.workdir, &rel_path);
+            let removal = if dest.is_dir() {
+                crate::sys::fs::remove_dir_all_in_root(&self.workdir, &rel_path)
             } else if dest.exists() || dest.is_symlink() {
-                let _ = crate::sys::fs::unlinkat_in_root(&self.workdir, &rel_path, false);
-            }
+                crate::sys::fs::unlinkat_in_root(&self.workdir, &rel_path, false)
+            } else {
+                Ok(())
+            };
             if !dest.exists() && !dest.is_symlink() {
                 self.deleted.remove(&rel_path);
+            } else if deletion_failure.is_none() {
+                deletion_failure = Some(match removal {
+                    Err(e) => format!("{}: errno {}", rel_path, e),
+                    Ok(()) => format!("{}: still present after removal", rel_path),
+                });
             }
+        }
+        // A deletion left outstanding is a merge that did not happen. Stopping
+        // here — before a single entry is copied — is what keeps the merge
+        // all-or-nothing on the deletion side; running on would publish the
+        // additions, and the successful tail would then remove the storage and
+        // destroy the record of the deletion that never landed.
+        if !self.deleted.is_empty() {
+            let detail = deletion_failure.unwrap_or_else(|| "unknown".to_string());
+            return Err(BranchError::Operation(format!(
+                "delete: {} deletion(s) could not be applied to the workdir, first: {}",
+                self.deleted.len(),
+                detail
+            )));
         }
 
         // Collect the entries before merging: the loop unlinks from the upper as
@@ -1266,6 +1297,63 @@ mod tests {
         };
         assert!(kept.exists(), "a kept branch must survive drop");
         let _ = fs::remove_dir_all(&kept);
+    }
+
+    /// A deletion that could not be applied must FAIL the commit. Reporting
+    /// `Ok(())` here is worse than any other merge failure: it claims an
+    /// all-or-nothing merge that did not happen, and the successful tail then
+    /// removes the storage, so the record of the missing deletion is destroyed
+    /// along with the change set.
+    ///
+    /// The failure is injected the way it actually happens in the field, with no
+    /// permission games (so it fails as intended when the suite runs as root): a
+    /// symlinked parent component in the workdir. The child unlinked
+    /// `link/x.txt`, which the COW layer recorded as a deletion; applying it goes
+    /// through the confined `unlinkat`, which resolves `link` inside the workdir
+    /// root (issue #112) and so does not reach the file the host path names.
+    #[test]
+    fn commit_fails_when_a_deletion_could_not_be_applied() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("x.txt"), "survives").unwrap();
+        std::os::unix::fs::symlink(outside.path(), workdir.path().join("link")).unwrap();
+
+        let storage_dir;
+        {
+            let mut branch =
+                SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+            storage_dir = branch.storage_dir.clone();
+            fs::write(branch.upper.join("added.txt"), "payload").unwrap();
+            branch.mark_deleted("link/x.txt");
+
+            let err = branch
+                .commit()
+                .expect_err("a deletion that was not applied must fail the commit");
+            assert!(
+                matches!(err, BranchError::Operation(ref m) if m.starts_with("delete:")),
+                "expected the deletion step to fail, got: {err:?}"
+            );
+            assert!(
+                branch.is_deleted("link/x.txt"),
+                "an unapplied deletion must stay outstanding so a retry still sees it"
+            );
+        }
+
+        // All-or-nothing: the merge stopped before copying anything across.
+        assert!(
+            !workdir.path().join("added.txt").exists(),
+            "a commit that failed on a deletion must not have merged the additions"
+        );
+        // ...and the change set survives the drop, marked for recovery.
+        assert!(
+            storage_dir.join("upper").join("added.txt").exists(),
+            "the unmerged change set must be preserved, not destroyed by a bogus success"
+        );
+        assert!(
+            read_preserved(&storage_dir).is_some(),
+            "the preserved branch must be findable by an out-of-band sweep"
+        );
     }
 
     /// A commit that fails partway must PRESERVE the upper: the workdir is
