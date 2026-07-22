@@ -410,3 +410,50 @@ async fn etc_hosts_virtualization_resists_path_bypasses() {
     }
     assert!(result.success());
 }
+
+/// Regression guard for the netlink virtualization under a DESTINATION POLICY.
+///
+/// A non-empty `net_allow` sets `has_net_destination_policy`, which stops
+/// `sendto` from Continuing on a non-IP destination and routes it through the
+/// supervisor's on-behalf arm instead. The virtualized "netlink socket" the
+/// child holds is one end of a `socketpair(AF_UNIX, SOCK_SEQPACKET)`
+/// (`netlink::handlers::handle_socket`), and glibc addresses it with a
+/// `sockaddr_nl` — a NON-`AF_UNIX` destination on a unix-domain socket. That
+/// shape carries no pathname, exactly like an abstract unix address; a handler
+/// that keys on "did a pathname come out of it" instead of on the address
+/// family collapses the two and fails the send closed with `EAFNOSUPPORT`,
+/// taking every netlink query offline for any sandbox with a destination
+/// policy — `if_nameindex`, `getaddrinfo`'s `AI_ADDRCONFIG` probe, and so on.
+///
+/// `if_nameindex()` is the shortest observable consumer: glibc opens a
+/// NETLINK_ROUTE socket, `sendto`s an `RTM_GETLINK` dump request, and reads the
+/// reply. The assertion is the same one `if_nameindex_returns_only_lo` makes
+/// without a policy, so the two differ only in the switch under test.
+#[tokio::test]
+async fn if_nameindex_works_under_destination_policy() {
+    let out = temp_out("if-nameindex-netpolicy");
+    let _ = std::fs::remove_file(&out);
+    let script = format!(concat!(
+        "import socket\n",
+        "try:\n",
+        "  result = repr(socket.if_nameindex())\n",
+        "except OSError as e:\n",
+        "  result = 'ERRNO:%d' % e.errno\n",
+        "open('{out}', 'w').write(result)\n",
+    ), out = out.display());
+
+    // Any rule at all flips has_net_destination_policy on; the rule itself is
+    // irrelevant to a unix/netlink send.
+    let policy = base_policy().net_allow("127.0.0.1:9").build().unwrap();
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+        .await.unwrap();
+
+    let contents = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert!(
+        contents.contains("'lo'") && !contents.contains("'eth"),
+        "netlink must keep working under a destination policy; expected only lo, got: {}",
+        contents
+    );
+    assert!(result.success());
+}

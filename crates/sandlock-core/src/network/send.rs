@@ -12,16 +12,18 @@ use crate::seccomp::notif::{read_child_mem, NotifAction};
 use crate::sys::structs::{SeccompNotif, ECONNREFUSED};
 
 use super::materialize::{
-    materialize_msg, mmsg_entry_ptr, mmsg_msglen_addr, named_unix_socket_path,
-    parse_ip_from_sockaddr, parse_port_from_sockaddr, ChildMsghdr, MaterializedMsg,
-    MAX_SEND_BUF,
+    classify_dest_shape, materialize_msg, mmsg_entry_ptr, mmsg_msglen_addr,
+    named_unix_socket_path, parse_ip_from_sockaddr, parse_port_from_sockaddr, ChildMsghdr,
+    MaterializedMsg, MAX_SEND_BUF,
 };
 use super::send_engine::{batch_send_step, resolve_send, wants_blocking, BatchStep};
 use super::unix::{
     mmsg_entry_named_unix_path, sendmmsg_named_unix_on_behalf, sendto_named_unix_on_behalf,
-    unix_sendmsg_gate,
+    sendto_pinned_unix_on_behalf, unix_sendmsg_gate,
 };
-use super::verdict::{check_ip_destination, path_under_any};
+use super::verdict::{
+    check_ip_destination, classify_send_path, path_under_any, DestShape, SendPath,
+};
 use super::{query_socket_protocol, socket_is_unix, Protocol};
 
 // ============================================================
@@ -127,7 +129,95 @@ pub(super) async fn sendto_on_behalf(
                     )
                 }
             }
-            _ => NotifAction::Continue,
+            _ => {
+                // Non-IP destination with no fs-path gate: an abstract unix
+                // address, a named unix address with the fs-gate off, a non-unix
+                // family (AF_NETLINK/AF_PACKET/AF_VSOCK/...) on any socket. With
+                // NO destination policy there is nothing to bypass, so Continue
+                // (matching the connected fast path). Under a destination policy
+                // do NOT Continue: the kernel would re-read `sockfd` and the
+                // address after our decision, and a racing
+                // `dup2(inet_sock, sockfd)` + address swap could ride the Continue
+                // out to a denied IP. Pin the fd and gate on its STABLE socket
+                // domain instead. NOTE: this fails closed for non-IP sends on
+                // non-unix sockets and for AF_UNIX destinations we cannot pin in
+                // the child's context (abstract / empty / non-UTF-8 `sun_path`)
+                // under a destination policy — see the PR description.
+                if !ctx.policy.has_net_destination_policy {
+                    return NotifAction::Continue;
+                }
+                let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
+                    Ok(fd) => fd,
+                    Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
+                };
+                // The address is non-IP here (parse_ip_from_sockaddr returned
+                // None), so classify on the pinned socket's stable domain plus the
+                // destination's ADDRESS FAMILY. Family first: an abstract AF_UNIX
+                // address and a sockaddr_nl both carry no pathname but are not the
+                // same case (see DestShape).
+                let dest = classify_dest_shape(&addr_bytes);
+                match classify_send_path(
+                    false,
+                    None,
+                    socket_is_unix(dup_fd.as_raw_fd()),
+                    &dest,
+                ) {
+                    SendPath::NamedUnixOnBehalf => match &dest {
+                        // Resolve the target in the CHILD's root view and send to
+                        // the pinned inode: the supervisor performs the send, so
+                        // passing the child's raw `sun_path` through would resolve
+                        // it against the supervisor's cwd/root. No fs-grant check
+                        // here — this arm is only reachable with
+                        // `has_unix_fs_gate == false` (the gated case is handled
+                        // above), i.e. the sandbox declares no fs grants to check
+                        // against.
+                        DestShape::UnixNamed(path) => sendto_pinned_unix_on_behalf(
+                            notif, notif_fd, dup_fd, buf_ptr, buf_len, flags, path,
+                        ),
+                        // Unreachable: the classifier returns NamedUnixOnBehalf
+                        // only for DestShape::UnixNamed. Fail closed rather than
+                        // unwrap — see the panic note below.
+                        _ => NotifAction::Errno(libc::EAFNOSUPPORT),
+                    },
+                    // A non-AF_UNIX destination on a unix socket. Send on-behalf
+                    // on the pinned fd with the child's address bytes verbatim:
+                    // this is what sandlock's own NETLINK_ROUTE virtualization
+                    // produces (child fd = one end of a socketpair(AF_UNIX,
+                    // SOCK_SEQPACKET), addressed with a sockaddr_nl), and that
+                    // socket is connected, so the kernel ignores `msg_name`
+                    // outright. Nothing is widened: the fd was pinned before its
+                    // domain was read, so no dup2 can redirect the send, and for
+                    // any other family the kernel rejects the mismatch itself.
+                    SendPath::RawDestOnBehalf => {
+                        let data =
+                            match read_child_mem(notif_fd, notif.id, notif.pid, buf_ptr, buf_len) {
+                                Ok(b) => b,
+                                Err(_) => return NotifAction::Errno(libc::EIO),
+                            };
+                        let m = MaterializedMsg {
+                            data,
+                            control: None,
+                            addr: addr_bytes,
+                            _scm_fds: Vec::new(),
+                            _pinned: None,
+                        };
+                        let blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
+                        resolve_send(dup_fd, m, flags, blocking)
+                    }
+                    // Reject (a non-IP address on a non-unix socket — the
+                    // address-family-swap shape — or an AF_UNIX address with no
+                    // pathname to pin, notably an ABSTRACT one: the supervisor
+                    // carries no Landlock domain, so sending it on-behalf would
+                    // escape the child's LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET) and,
+                    // defensively, the connected/IP variants that
+                    // classify_send_path(false, None, ..) cannot return: fail
+                    // closed with an errno (parity with the sendmsg Reject arm)
+                    // rather than panic in the seccomp-notif supervisor — a panic
+                    // on this untrusted path would unwind the supervisor task and
+                    // DoS the whole sandbox.
+                    _ => NotifAction::Errno(libc::EAFNOSUPPORT),
+                }
+            }
         }
     }
 }

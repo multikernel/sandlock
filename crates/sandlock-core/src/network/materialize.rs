@@ -11,6 +11,8 @@ use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
 use crate::seccomp::notif::read_child_mem;
 use crate::sys::structs::{SeccompNotif, AF_INET, AF_INET6};
 
+use super::verdict::DestShape;
+
 /// Maximum buffer size for sendto/sendmsg on-behalf operations (64 MiB).
 /// Prevents a sandboxed process from triggering OOM in the supervisor.
 pub(crate) const MAX_SEND_BUF: usize = 64 << 20;
@@ -218,6 +220,30 @@ pub(crate) fn named_unix_socket_path(addr_bytes: &[u8]) -> Option<std::path::Pat
         return None;
     }
     std::str::from_utf8(raw).ok().map(std::path::PathBuf::from)
+}
+
+/// Classify a raw destination `sockaddr` into the [`DestShape`] the non-IP send
+/// arms key off. Pure function of the already-copied bytes: no child state is
+/// re-read, so the shape cannot change after the decision.
+///
+/// The distinction that matters is the destination's ADDRESS FAMILY, not just
+/// "did a pathname come out of it": an `AF_NETLINK` sockaddr and an abstract
+/// `AF_UNIX` sockaddr both yield no pathname, but they must take opposite
+/// paths — see [`DestShape`].
+pub(crate) fn classify_dest_shape(addr_bytes: &[u8]) -> DestShape {
+    // Below two bytes there is no family to read; fail closed by reporting the
+    // shape the caller refuses.
+    if addr_bytes.len() < 2 {
+        return DestShape::UnixNoPath;
+    }
+    let family = u16::from_ne_bytes([addr_bytes[0], addr_bytes[1]]);
+    if family != libc::AF_UNIX as u16 {
+        return DestShape::NotUnix;
+    }
+    match named_unix_socket_path(addr_bytes) {
+        Some(path) => DestShape::UnixNamed(path),
+        None => DestShape::UnixNoPath,
+    }
 }
 
 /// `struct msghdr` size on LP64 Linux (x86_64 / aarch64 / riscv64): four
@@ -505,5 +531,58 @@ mod tests {
         assert!(sockaddr_is_ipv6(&mapped));
         let v4_family = (AF_INET as u16).to_ne_bytes();
         assert!(!sockaddr_is_ipv6(&[v4_family[0], v4_family[1], 0, 0]));
+    }
+
+    /// Build a raw `sockaddr_un` image for `sun_path` (a leading NUL byte in
+    /// `sun_path` makes it an abstract address, exactly as the kernel reads it).
+    fn unix_sockaddr_bytes(sun_path: &[u8]) -> Vec<u8> {
+        let mut out = (libc::AF_UNIX as u16).to_ne_bytes().to_vec();
+        out.extend_from_slice(sun_path);
+        out
+    }
+
+    #[test]
+    fn dest_shape_named_unix_carries_the_path() {
+        assert_eq!(
+            classify_dest_shape(&unix_sockaddr_bytes(b"/run/svc.dgram\0")),
+            DestShape::UnixNamed(std::path::PathBuf::from("/run/svc.dgram"))
+        );
+    }
+
+    #[test]
+    fn dest_shape_pathless_unix_addresses_are_unix_no_path() {
+        // Abstract (leading NUL), unnamed (no path at all), and non-UTF-8
+        // sun_path all land in the arm that fails closed: there is nothing the
+        // supervisor can re-resolve in the child's root view.
+        assert_eq!(
+            classify_dest_shape(&unix_sockaddr_bytes(b"\0abstract-name")),
+            DestShape::UnixNoPath
+        );
+        assert_eq!(
+            classify_dest_shape(&unix_sockaddr_bytes(b"")),
+            DestShape::UnixNoPath
+        );
+        assert_eq!(
+            classify_dest_shape(&unix_sockaddr_bytes(b"/run/\xff\xfe\0")),
+            DestShape::UnixNoPath
+        );
+        // Too short to even carry a family: fail closed, do not guess.
+        assert_eq!(classify_dest_shape(&[1]), DestShape::UnixNoPath);
+    }
+
+    #[test]
+    fn dest_shape_netlink_is_not_unix() {
+        // sandlock's NETLINK_ROUTE virtualization hands the child a
+        // socketpair(AF_UNIX, ...) end that glibc addresses with a
+        // `sockaddr_nl`. That address has no pathname either, but it is NOT
+        // the abstract-unix case: classifying on the family keeps them apart.
+        let mut nl = (libc::AF_NETLINK as u16).to_ne_bytes().to_vec();
+        nl.extend_from_slice(&[0u8; 10]); // pad, nl_pid, nl_groups
+        assert_eq!(classify_dest_shape(&nl), DestShape::NotUnix);
+
+        // Same for any other non-unix, non-IP family.
+        let mut vsock = (libc::AF_VSOCK as u16).to_ne_bytes().to_vec();
+        vsock.extend_from_slice(&[0u8; 14]);
+        assert_eq!(classify_dest_shape(&vsock), DestShape::NotUnix);
     }
 }
