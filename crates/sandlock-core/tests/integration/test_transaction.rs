@@ -77,9 +77,22 @@ async fn test_txn_commits_on_success() {
     let _ = fs::remove_dir_all(&workdir);
 }
 
+/// Whether any branch under `storage` has `name` in its upper. Used to observe
+/// how far the stages have got from outside the transaction.
+fn upper_holds(storage: &Path, name: &str) -> bool {
+    fs::read_dir(storage)
+        .map(|rd| rd.flatten().any(|e| e.path().join("upper").join(name).exists()))
+        .unwrap_or(false)
+}
+
 /// The commit merge is serialized against another transaction's merge, and a
 /// transaction that finds the workdir locked WAITS for it rather than
-/// discarding a full run's work. The lock is released mid-run, so the
+/// discarding a full run's work.
+///
+/// The lock is held until the transaction is DEMONSTRABLY blocked on it: the
+/// test drives the transaction concurrently and fails the moment it finishes
+/// while the lock is still held, so it cannot pass by having the holder let go
+/// before the commit was ever reached. Only then is the lock released, and the
 /// transaction must still commit.
 #[tokio::test]
 async fn test_txn_waits_for_a_concurrent_commit_lock() {
@@ -87,39 +100,66 @@ async fn test_txn_waits_for_a_concurrent_commit_lock() {
         eprintln!("commit-lock-wait test skipped: sandbox unavailable");
         return;
     }
-    let workdir = temp_dir("commit-lock-wait");
-    let policy = stage_policy(&workdir);
+    let workdir = temp_dir("commit-lock-wait-wd");
+    let storage = temp_dir("commit-lock-wait-st");
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc")
+        .fs_write(&workdir).workdir(&workdir).cwd(&workdir)
+        .fs_storage(&storage)
+        .build()
+        .unwrap();
 
-    // Stand in for another transaction mid-merge by holding the workdir lock,
-    // then releasing it while this transaction's stages are still running.
+    // Stand in for another transaction mid-merge by holding the workdir lock.
     let held = std::fs::File::open(&workdir).unwrap();
     assert_eq!(
         unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
         0,
         "test setup: could not take the workdir lock"
     );
-    let releaser = tokio::task::spawn_blocking(move || {
-        std::thread::sleep(Duration::from_millis(400));
-        drop(held);
-    });
 
-    let outcome = Transaction::new([
+    let txn = Transaction::new([
         Stage::new(&policy, &["sh", "-c", "echo plan > a.txt"]),
         Stage::new(&policy, &["sh", "-c", "cat a.txt && echo built > b.txt"]),
     ])
-    .run(None)
-    .await
-    .expect("transaction should run");
-    releaser.await.unwrap();
+    .run(None);
+    tokio::pin!(txn);
 
+    // Drive the transaction while holding the lock. `b.txt` landing in the
+    // shared upper is the last stage's write, so from that point the only thing
+    // left for the transaction to do is the commit — and it must not get past
+    // it. Completing here at all, committed or not, is the failure.
+    let mut stages_done_at = None;
+    loop {
+        tokio::select! {
+            early = &mut txn => panic!(
+                "the transaction finished while the commit lock was held — it never waited: {early:?}"
+            ),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        match stages_done_at {
+            None if upper_holds(&storage, "b.txt") => {
+                stages_done_at = Some(std::time::Instant::now())
+            }
+            // Keep holding for a grace period after the stages are done, so the
+            // transaction has had time to reach the commit and block on it.
+            Some(t) if t.elapsed() >= Duration::from_millis(500) => break,
+            _ => {}
+        }
+    }
+    drop(held);
+
+    let outcome = txn.await.expect("transaction should run");
     assert!(
         outcome.committed,
         "a transaction must wait out a concurrent commit, not lose its work; abort_reason: {:?}",
         outcome.abort_reason
     );
-    assert!(workdir.join("a.txt").exists() && workdir.join("b.txt").exists());
+    assert_eq!(fs::read_to_string(workdir.join("a.txt")).unwrap(), "plan\n");
+    assert_eq!(fs::read_to_string(workdir.join("b.txt")).unwrap(), "built\n");
 
     let _ = fs::remove_dir_all(&workdir);
+    let _ = fs::remove_dir_all(&storage);
 }
 
 /// The wait is bounded, and expiring it must NOT throw the run away. Every stage
