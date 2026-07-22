@@ -858,10 +858,19 @@ impl SeccompCowBranch {
     /// The merge is file-by-file and not crash-atomic. If it fails partway
     /// (`ENOSPC`, `EACCES`, an obstructing symlink, ...) the workdir is left
     /// partially merged and this returns `Err` — but the upper is **preserved**,
-    /// still holding everything that did not make it across. Call `commit()`
-    /// again to retry the merge once the cause is cleared, `changes()` to
-    /// inspect what is outstanding, or `abort()` to deliberately discard the
-    /// remainder. Dropping the branch after a failed commit does NOT reclaim it.
+    /// holding exactly what did not make it across: each change is dropped from
+    /// the upper as it lands, so after a failure `changes()` reports the
+    /// REMAINDER and not the whole run. Call `commit()` again to retry it once
+    /// the cause is cleared, or `abort()` to discard the remainder. Dropping the
+    /// branch after a failed commit does NOT reclaim it.
+    ///
+    /// A change is dropped from the upper only after its workdir side is in
+    /// place, so the failure mode of that bookkeeping is a change reported (and
+    /// re-merged) twice, never one silently lost. Re-merging is idempotent: the
+    /// copy truncates and the symlink is recreated.
+    ///
+    /// Entries are merged in sorted order, so a partial merge is a prefix of a
+    /// deterministic sequence rather than an arbitrary subset.
     pub fn commit(&mut self) -> Result<(), BranchError> {
         if self.is_disposed() { return Ok(()); }
 
@@ -871,20 +880,36 @@ impl SeccompCowBranch {
         // cleared only by the successful tail of this function.
         self.preserve(PreserveReason::MergeInterrupted);
 
-        // Apply deletions
-        for rel_path in &self.deleted {
-            let dest = self.workdir.join(rel_path);
+        // Apply deletions, forgetting each one that is no longer outstanding so
+        // a retry (and `changes()`) sees only what is left to do.
+        let pending_deletions: Vec<String> = self.deleted.iter().cloned().collect();
+        for rel_path in pending_deletions {
+            let dest = self.workdir.join(&rel_path);
             if dest.is_dir() {
-                let _ = crate::sys::fs::remove_dir_all_in_root(&self.workdir, rel_path);
+                let _ = crate::sys::fs::remove_dir_all_in_root(&self.workdir, &rel_path);
             } else if dest.exists() || dest.is_symlink() {
-                let _ = crate::sys::fs::unlinkat_in_root(&self.workdir, rel_path, false);
+                let _ = crate::sys::fs::unlinkat_in_root(&self.workdir, &rel_path, false);
             }
+            if !dest.exists() && !dest.is_symlink() {
+                self.deleted.remove(&rel_path);
+            }
+        }
+
+        // Collect the entries before merging: the loop unlinks from the upper as
+        // it goes, and mutating a tree while walking it is not something walkdir
+        // promises to survive.
+        let mut walk = walkdir::WalkDir::new(&self.upper)
+            .min_depth(1)
+            .sort_by_file_name()
+            .into_iter();
+        let mut entries = Vec::new();
+        while let Some(entry) = walk.next() {
+            entries.push(entry.map_err(|e| BranchError::Operation(format!("walk: {}", e)))?);
         }
 
         // Copy upper to workdir
         let mut synced_dirs = HashSet::new();
-        for entry in walkdir::WalkDir::new(&self.upper).min_depth(1) {
-            let entry = entry.map_err(|e| BranchError::Operation(format!("walk: {}", e)))?;
+        for entry in entries {
             let rel = entry.path().strip_prefix(&self.upper).unwrap();
             let rel_str = match rel.to_str() {
                 Some(s) => s,
@@ -910,6 +935,7 @@ impl SeccompCowBranch {
                     &target.to_string_lossy(),
                 )
                 .map_err(|e| BranchError::Operation(format!("symlink: {}", e)))?;
+                self.drop_merged_entry(entry.path());
                 synced_dirs.insert(dest.parent().unwrap().to_path_buf());
             } else {
                 if let Some(p) = parent_rel(rel_str) {
@@ -928,6 +954,8 @@ impl SeccompCowBranch {
                 let mut dst = unsafe { fs::File::from_raw_fd(dst_fd) };
                 std::io::copy(&mut src, &mut dst)
                     .map_err(|e| BranchError::Operation(format!("copy: {}", e)))?;
+                drop((src, dst));
+                self.drop_merged_entry(entry.path());
                 synced_dirs.insert(dest.parent().unwrap().to_path_buf());
             }
         }
@@ -942,6 +970,22 @@ impl SeccompCowBranch {
         self.cleanup();
         self.state = BranchState::Finished;
         Ok(())
+    }
+
+    /// Forget an upper entry that is now in the workdir, so what is left in the
+    /// upper is the unmerged remainder.
+    ///
+    /// Best-effort: if the unlink fails the entry stays and is merged again on a
+    /// retry, which is harmless — the alternative (assuming it is gone) would
+    /// drop a change that never landed. Directories are left in place; they are
+    /// not changes (`changes()` skips them) and removing them here would have to
+    /// wait for their contents anyway.
+    fn drop_merged_entry(&mut self, upper_path: &Path) {
+        if let Ok(meta) = upper_path.symlink_metadata() {
+            if fs::remove_file(upper_path).is_ok() {
+                self.disk_used = self.disk_used.saturating_sub(meta.len());
+            }
+        }
     }
 
     /// Abort: discard all changes.
@@ -1135,6 +1179,66 @@ mod tests {
             "the retried commit must actually merge the remainder"
         );
         assert!(!storage_dir.exists(), "a completed commit reclaims its storage");
+    }
+
+    /// After a partial merge the upper must hold the REMAINDER, not the whole
+    /// run: `changes()` is what an operator recovering a half-merged workdir
+    /// reads to find out what is still outstanding, and it walks the upper. So
+    /// each change has to leave the upper as it lands — otherwise a 2-of-3 merge
+    /// reports the same three changes as a 0-of-3 merge and the answer is
+    /// useless.
+    #[test]
+    fn a_partial_merge_leaves_only_the_remainder_in_the_upper() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        // Merged in sorted order: a.txt lands, b.txt hits the obstruction
+        // (symlink vs regular file → ELOOP under O_NOFOLLOW), c.txt is never
+        // reached.
+        std::os::unix::fs::symlink("/dev/null", workdir.path().join("b.txt")).unwrap();
+        fs::write(workdir.path().join("gone.txt"), "delete me").unwrap();
+
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(branch.upper.join(name), name).unwrap();
+        }
+        branch.mark_deleted("gone.txt");
+
+        branch.commit().expect_err("the obstructed merge must fail");
+
+        assert_eq!(
+            fs::read_to_string(workdir.path().join("a.txt")).unwrap(),
+            "a.txt",
+            "a.txt was merged before the failure",
+        );
+        assert!(!branch.upper.join("a.txt").exists(), "a merged change must leave the upper");
+        assert!(
+            !workdir.path().join("gone.txt").exists(),
+            "the deletion was applied before the failure",
+        );
+
+        let mut outstanding: Vec<(crate::dry_run::ChangeKind, String)> = branch
+            .changes()
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.kind, c.path.display().to_string()))
+            .collect();
+        outstanding.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(
+            outstanding,
+            vec![
+                // b.txt is "modified" because the obstructing symlink is still
+                // there in the workdir; c.txt was never reached.
+                (crate::dry_run::ChangeKind::Modified, "b.txt".to_string()),
+                (crate::dry_run::ChangeKind::Added, "c.txt".to_string()),
+            ],
+            "changes() after a partial merge must report the remainder only",
+        );
+
+        // And the retry finishes exactly that remainder.
+        fs::remove_file(workdir.path().join("b.txt")).unwrap();
+        branch.commit().expect("the retry must complete the merge");
+        assert_eq!(fs::read_to_string(workdir.path().join("b.txt")).unwrap(), "b.txt");
+        assert_eq!(fs::read_to_string(workdir.path().join("c.txt")).unwrap(), "c.txt");
     }
 
     fn setup_workdir() -> (tempfile::TempDir, tempfile::TempDir) {
