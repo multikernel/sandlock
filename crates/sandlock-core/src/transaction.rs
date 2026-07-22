@@ -905,6 +905,33 @@ mod tests {
         assert_eq!(conflict.exit_code(), 75, "a conflict is EX_TEMPFAIL: retry it");
     }
 
+    /// A zero wait must give up on a held lock immediately, without sleeping
+    /// once: the deadline is checked before the poll sleeps, not after it.
+    ///
+    /// Asserted by counting sleeps. Timing it cannot carry this — the whole
+    /// difference between checking the deadline before and after the sleep is
+    /// one `COMMIT_LOCK_POLL`, and it still returns the same `Contended`.
+    #[test]
+    fn commit_lock_with_a_zero_wait_gives_up_without_sleeping() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = std::fs::File::open(dir.path()).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+
+        let mut polls = 0usize;
+        let err = acquire_commit_lock_polling(dir.path(), Duration::ZERO, |_| polls += 1)
+            .expect_err("a held lock with no wait budget cannot be taken");
+        drop(held);
+
+        assert_eq!(polls, 0, "a zero wait must not sleep before giving up");
+        assert!(
+            matches!(err, LockFailure::Contended(d) if d == Duration::ZERO),
+            "giving up on a held lock is contention even with no wait, got: {err:?}"
+        );
+    }
+
     /// An uncontended lock must not go through the poll loop's wait at all —
     /// the common case is every commit that is not racing another one.
     ///
@@ -922,5 +949,267 @@ mod tests {
         .unwrap();
         assert_eq!(polls, 0, "taking an uncontended lock must not sleep");
         drop(lock);
+    }
+
+    /// The whole commit channel — every way the shared upper's disposition can
+    /// fail other than contention — reports one exit code, EX_IOERR.
+    ///
+    /// The sibling test above pins the channels apart; this one pins them
+    /// together: a caller that keys "the change set is on disk, go recover it"
+    /// off 74 must get it from the merge failure, the lock failure, the branch
+    /// that could never be created and the commit that was abandoned alike.
+    #[test]
+    fn every_commit_channel_failure_reports_ex_ioerr() {
+        let failures = [
+            TxnError::Branch {
+                workdir: "/wd".into(),
+                source: crate::error::BranchError::Operation("create upper".into()),
+            },
+            TxnError::CommitLock {
+                workdir: "/wd".into(),
+                preserved_upper: "/st/upper".into(),
+                source: std::io::Error::other("flock"),
+            },
+            TxnError::Merge {
+                workdir: "/wd".into(),
+                preserved_upper: "/st/upper".into(),
+                source: crate::error::BranchError::Operation("copy".into()),
+            },
+            TxnError::CommitAbandoned("runtime shutting down".into()),
+        ];
+        for failure in failures {
+            assert_eq!(
+                failure.exit_code(),
+                74,
+                "the commit channel is EX_IOERR, but {failure:?} reported {}",
+                failure.exit_code()
+            );
+        }
+    }
+
+    fn aborted(reason: AbortReason) -> TxnOutcome {
+        TxnOutcome {
+            committed: false,
+            stages: Vec::new(),
+            changes: Vec::new(),
+            abort_reason: Some(reason),
+        }
+    }
+
+    /// An aborted transaction reports the number a caller fronting it with a
+    /// command-line tool would have got from the command itself: the failing
+    /// stage's own code, `128 + signal` for a signalled one, and 124 for a
+    /// timeout as `timeout(1)` reports it.
+    ///
+    /// Only `Code` is exercised end to end (a stage exiting 1); the signalled
+    /// and killed stages are what this pins, because collapsing them onto the
+    /// signal number — 9 instead of 137 — is both easy to write and
+    /// indistinguishable from a command that really exited 9.
+    #[test]
+    fn an_aborted_outcome_reports_the_failing_stage_status_as_a_shell_would() {
+        for (status, want) in [
+            (ExitStatus::Code(3), 3),
+            (ExitStatus::Signal(libc::SIGTERM), 128 + libc::SIGTERM),
+            (ExitStatus::Killed, 128 + libc::SIGKILL),
+            (ExitStatus::Timeout, 124),
+        ] {
+            let outcome = aborted(AbortReason::StageFailed { index: 1, status: status.clone() });
+            assert_eq!(
+                outcome.exit_code(),
+                want,
+                "a stage that ended as {status:?} must report {want}"
+            );
+        }
+        assert_eq!(
+            aborted(AbortReason::TimedOut).exit_code(),
+            124,
+            "a transaction timeout reports 124, as timeout(1) does"
+        );
+    }
+
+    /// A transaction that did what was asked reports success — including a dry
+    /// run, which does not commit but did not fail either.
+    #[test]
+    fn a_committed_transaction_and_a_completed_dry_run_both_report_success() {
+        let committed = TxnOutcome {
+            committed: true,
+            stages: Vec::new(),
+            changes: Vec::new(),
+            abort_reason: None,
+        };
+        assert_eq!(committed.exit_code(), 0, "a committed transaction succeeded");
+        assert_eq!(
+            aborted(AbortReason::DryRun).exit_code(),
+            0,
+            "a dry run reported its changes as asked; not committing is not a failure"
+        );
+    }
+
+    /// A branch over a fresh workdir whose upper already holds `a.txt`, as a
+    /// run whose stages all succeeded would have left it. The tempdirs are
+    /// returned because dropping them removes the workdir and the storage.
+    fn branch_holding_one_added_file(
+    ) -> (tempfile::TempDir, tempfile::TempDir, crate::cow::seccomp::SeccompCowBranch) {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let branch = crate::cow::seccomp::SeccompCowBranch::create(
+            workdir.path(),
+            Some(storage.path()),
+            0,
+        )
+        .unwrap();
+        std::fs::write(branch.upper_dir().join("a.txt"), "plan\n").unwrap();
+        (workdir, storage, branch)
+    }
+
+    /// Discarding the upper still reports what it held: the change set is read
+    /// off the branch BEFORE it is disposed of, because after the abort there
+    /// is nothing left on disk to read. This is what fills `TxnOutcome::changes`
+    /// on the abort and dry-run paths.
+    #[test]
+    fn finish_branch_discarding_the_upper_still_reports_what_it_held() {
+        let (workdir, _storage, branch) = branch_holding_one_added_file();
+        let branch_dir = branch.upper_dir().parent().unwrap().to_path_buf();
+
+        let finished = finish_branch(branch, workdir.path(), Duration::from_secs(30), false);
+
+        assert!(
+            finished.commit.is_none(),
+            "an upper that was discarded rather than merged reports no commit result"
+        );
+        let paths: Vec<_> = finished
+            .changes
+            .iter()
+            .map(|c| (c.kind.clone(), c.path.clone()))
+            .collect();
+        assert_eq!(
+            paths,
+            vec![(crate::dry_run::ChangeKind::Added, std::path::PathBuf::from("a.txt"))],
+            "the discarded change set must still be reported"
+        );
+        assert!(
+            !workdir.path().join("a.txt").exists(),
+            "a discarded upper must not reach the workdir"
+        );
+        assert!(!branch_dir.exists(), "a discarded upper must be reclaimed from disk");
+    }
+
+    /// The commit merges the upper into the workdir and does not keep the
+    /// workdir lock afterwards: the lock is mutual exclusion between merges, so
+    /// holding it past the merge would stall every later transaction for the
+    /// life of this process.
+    #[test]
+    fn finish_branch_merges_the_upper_and_leaves_the_workdir_unlocked() {
+        let (workdir, _storage, branch) = branch_holding_one_added_file();
+        let branch_dir = branch.upper_dir().parent().unwrap().to_path_buf();
+
+        let finished = finish_branch(branch, workdir.path(), Duration::from_secs(30), true);
+
+        assert!(
+            matches!(finished.commit, Some(Ok(()))),
+            "an uncontended commit of a mergeable upper must succeed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workdir.path().join("a.txt")).unwrap(),
+            "plan\n",
+            "the committed change set must be in the workdir, with its bytes"
+        );
+        assert!(!branch_dir.exists(), "a merged upper must be reclaimed from disk");
+
+        let after = std::fs::File::open(workdir.path()).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(after.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "the commit must release the workdir lock, not hold it past the merge"
+        );
+    }
+
+    /// Giving up on the commit lock hands the storage over instead of dropping
+    /// it: every stage exited 0, so the upper holds a complete change set that
+    /// only failed to be published.
+    ///
+    /// The marker says `CommitDeferred`, which is the part a recovery acts on —
+    /// it means the workdir was never touched and the whole change set is here,
+    /// unlike `MergeInterrupted`, where the workdir may already be half merged.
+    #[test]
+    fn finish_branch_preserves_the_upper_as_commit_deferred_when_the_lock_is_contended() {
+        let (workdir, _storage, branch) = branch_holding_one_added_file();
+        let branch_dir = branch.upper_dir().parent().unwrap().to_path_buf();
+
+        // Stand in for another transaction whose merge never finishes.
+        let held = std::fs::File::open(workdir.path()).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "test setup: could not take the workdir lock"
+        );
+
+        let finished = finish_branch(branch, workdir.path(), Duration::from_millis(50), true);
+        drop(held);
+
+        assert!(
+            matches!(
+                finished.commit,
+                Some(Err(CommitFailure::Lock(LockFailure::Contended(d)))) if d == Duration::from_millis(50)
+            ),
+            "a lock held for the whole wait must be reported as contention"
+        );
+        assert!(
+            !workdir.path().join("a.txt").exists(),
+            "nothing may be merged when the lock was never taken"
+        );
+        let survived = std::fs::read_to_string(branch_dir.join("upper").join("a.txt"))
+            .unwrap_or_else(|e| {
+                panic!("the unpublished change set must survive on disk, but reading it gave {e}")
+            });
+        assert_eq!(survived, "plan\n", "the preserved upper must still hold the stage's bytes");
+        let preserved = crate::cow::seccomp::read_preserved(&branch_dir)
+            .expect("a preserved upper must be findable through its marker");
+        assert_eq!(
+            preserved.reason,
+            crate::cow::seccomp::PreserveReason::CommitDeferred,
+            "the workdir is untouched and the whole change set is here: that is CommitDeferred"
+        );
+    }
+
+    /// A merge that fails partway leaves the remainder on disk rather than
+    /// reclaiming it, and marks it as an interrupted merge — the workdir may
+    /// hold part of the change set, so recovery cannot assume it is untouched.
+    ///
+    /// The merge is made to fail without any privilege trick: the upper holds a
+    /// regular file where the workdir already has a directory of the same name,
+    /// so the merge's `open(O_WRONLY|O_CREAT)` on it fails with `EISDIR`.
+    #[test]
+    fn finish_branch_preserves_the_remainder_when_the_merge_fails() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workdir.path().join("x")).unwrap();
+        let branch = crate::cow::seccomp::SeccompCowBranch::create(
+            workdir.path(),
+            Some(storage.path()),
+            0,
+        )
+        .unwrap();
+        let branch_dir = branch.upper_dir().parent().unwrap().to_path_buf();
+        std::fs::write(branch.upper_dir().join("x"), "built\n").unwrap();
+
+        let finished = finish_branch(branch, workdir.path(), Duration::from_secs(30), true);
+
+        assert!(
+            matches!(finished.commit, Some(Err(CommitFailure::Merge(_)))),
+            "a merge that cannot write an entry into the workdir must report a merge failure"
+        );
+        let remainder = std::fs::read_to_string(branch_dir.join("upper").join("x"))
+            .unwrap_or_else(|e| {
+                panic!("the change that did not land must survive on disk, but reading it gave {e}")
+            });
+        assert_eq!(remainder, "built\n", "the preserved remainder must still hold its bytes");
+        let preserved = crate::cow::seccomp::read_preserved(&branch_dir)
+            .expect("a preserved remainder must be findable through its marker");
+        assert_eq!(
+            preserved.reason,
+            crate::cow::seccomp::PreserveReason::MergeInterrupted,
+            "the workdir may be partially merged, so this is not CommitDeferred"
+        );
     }
 }
