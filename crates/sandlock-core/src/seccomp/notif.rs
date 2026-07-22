@@ -332,7 +332,8 @@ impl NetworkPolicy {
 ///
 /// For two-path syscalls (renameat2, linkat), checks both source and
 /// destination paths — a denied file must not be linked, renamed, or
-/// overwritten.
+/// overwritten. Single-path destructive syscalls (truncate, unlinkat) are
+/// gated too: a denied file must not be wiped or deleted.
 ///
 /// Each resolved path is checked both as-is (lexical normalization) and
 /// after following symlinks via `canonicalize`.  This prevents bypass via
@@ -1532,6 +1533,7 @@ fn syscall_name(nr: i64) -> &'static str {
         n if Some(n) == arch::sys_symlink() => "symlinkat",
         n if Some(n) == arch::sys_link() => "linkat",
         n if Some(n) == arch::sys_rename() => "renameat2",
+        n if Some(n) == arch::sys_renameat() => "renameat2",
         _ => "unknown",
     }
 }
@@ -1547,7 +1549,12 @@ fn syscall_category(nr: i64) -> crate::policy_fn::SyscallCategory {
             || n == libc::SYS_truncate || n == libc::SYS_readlinkat
             || n == libc::SYS_newfstatat || n == libc::SYS_statx
             || n == libc::SYS_faccessat || n == libc::SYS_getdents64
-            || Some(n) == arch::sys_getdents() => SyscallCategory::File,
+            || Some(n) == arch::sys_getdents()
+            || Some(n) == arch::sys_open() || Some(n) == arch::sys_mkdir()
+            || Some(n) == arch::sys_rmdir() || Some(n) == arch::sys_unlink()
+            || Some(n) == arch::sys_symlink() || Some(n) == arch::sys_link()
+            || Some(n) == arch::sys_rename() || Some(n) == arch::sys_renameat()
+            => SyscallCategory::File,
         n if n == libc::SYS_connect || n == libc::SYS_sendto
             || n == libc::SYS_sendmsg || n == libc::SYS_sendmmsg
             || n == libc::SYS_bind
@@ -1626,6 +1633,13 @@ fn resolve_at_path_for_event(notif: &SeccompNotif, dirfd: i64, path: &str) -> Op
     Some(normalize_path(&base.join(path)))
 }
 
+/// Resolve the primary path argument of a path-bearing syscall.
+///
+/// Serves two callers with different scopes: `emit_policy_event` uses it for
+/// every syscall matched here (observation, e.g. `sandlock learn`), while
+/// deny enforcement via `is_path_denied_for_notif` only ever sees syscalls in
+/// `fs_denied_path_syscalls` — adding a match arm here does NOT widen deny
+/// gating.
 fn resolve_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Option<String> {
     let nr = notif.data.nr as i64;
     match nr {
@@ -1649,9 +1663,9 @@ fn resolve_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Option<Strin
             let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
             resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
         }
-        // renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
+        // renameat2/renameat(olddirfd, oldpath, newdirfd, newpath[, flags])
         // Check the source (old) path — deny if a denied file is being renamed away.
-        n if n == libc::SYS_renameat2 => {
+        n if n == libc::SYS_renameat2 || Some(n) == arch::sys_renameat() => {
             let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
             resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
         }
@@ -1688,10 +1702,6 @@ fn resolve_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Option<Strin
             let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
             resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
         }
-        // symlinkat/symlink intentionally omitted from deny-path gating: creating
-        // a symlink does not access its target, so there is nothing to gate here.
-        // Any later open through the symlink resolves to the real target and is
-        // denied race-free on the open path (issue #111). See `on_behalf_open_for_deny`.
         // link(oldpath, newpath) — legacy, AT_FDCWD implied for both
         n if Some(n) == arch::sys_link() => {
             let path = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
@@ -1712,8 +1722,8 @@ fn resolve_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Option<Strin
 fn resolve_second_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Option<String> {
     let nr = notif.data.nr as i64;
     match nr {
-        // renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
-        n if n == libc::SYS_renameat2 => {
+        // renameat2/renameat(olddirfd, oldpath, newdirfd, newpath[, flags])
+        n if n == libc::SYS_renameat2 || Some(n) == arch::sys_renameat() => {
             let path = read_path_for_event(notif, notif.data.args[3], notif_fd)?;
             resolve_at_path_for_event(notif, notif.data.args[2] as i64, &path)
         }
@@ -1919,7 +1929,8 @@ async fn emit_policy_event(
         || nr == libc::SYS_renameat2 || nr == libc::SYS_linkat
         || Some(nr) == arch::sys_mkdir() || Some(nr) == arch::sys_rmdir()
         || Some(nr) == arch::sys_unlink() || Some(nr) == arch::sys_symlink()
-        || Some(nr) == arch::sys_link() || Some(nr) == arch::sys_rename();
+        || Some(nr) == arch::sys_link() || Some(nr) == arch::sys_rename()
+        || Some(nr) == arch::sys_renameat();
     if is_fs_mutating {
         path = resolve_path_for_notif(notif, notif_fd).map(std::path::PathBuf::from);
         path2 = resolve_second_path_for_notif(notif, notif_fd).map(std::path::PathBuf::from);
@@ -1941,11 +1952,19 @@ async fn emit_policy_event(
         protocol,
     };
 
-    // Hold syscalls where the callback's verdict matters.
-    // The child is blocked until the callback returns.
+    // Hold syscalls where the callback's verdict matters: exec, every open
+    // variant (openat2 and legacy open emit the same "openat" event, so a
+    // deny that skipped them would be silently bypassable), and every
+    // network-send variant (same reasoning for sendmsg/sendmmsg vs sendto).
+    // The child is blocked until the callback returns. Filesystem-mutation
+    // events (mkdir/unlink/symlink/link/rename/truncate) are observation-only
+    // per the `PolicyCallback` contract; use `fs_deny` to block paths.
     let is_held = nr == libc::SYS_execve || nr == libc::SYS_execveat
-        || nr == libc::SYS_connect || nr == libc::SYS_sendto
-        || nr == libc::SYS_bind || nr == libc::SYS_openat;
+        || nr == libc::SYS_openat || nr == arch::SYS_OPENAT2
+        || Some(nr) == arch::sys_open()
+        || nr == libc::SYS_connect || nr == libc::SYS_bind
+        || nr == libc::SYS_sendto || nr == libc::SYS_sendmsg
+        || nr == libc::SYS_sendmmsg;
 
     if is_held {
         let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
@@ -2042,21 +2061,14 @@ async fn handle_notification(
         maybe_patch_vdso(notif.pid as i32, &mut pfs, policy);
     }
 
-    // Check dynamic path denials before dispatch
+    // Check dynamic path denials before dispatch. The gated syscall set is
+    // shared with the BPF notif list so enforcement scope cannot drift from
+    // interception scope; see `fs_denied_path_syscalls` for what is gated
+    // and why symlink/mkdir are not.
     let mut action = {
         let nr = notif.data.nr as i64;
-        // symlinkat/symlink are not gated: creating a symlink does not access
-        // its target (any open through it is denied race-free on the open
-        // path). See `resolve_path_for_notif`.
-        let mut path_check_nrs = vec![
-            libc::SYS_openat, arch::SYS_OPENAT2, libc::SYS_execve, libc::SYS_execveat,
-            libc::SYS_linkat, libc::SYS_renameat2,
-        ];
-        path_check_nrs.extend([
-            arch::sys_open(), arch::sys_link(), arch::sys_rename(),
-        ].into_iter().flatten());
         let should_precheck_denied = policy.chroot_root.is_none()
-            && path_check_nrs.contains(&nr);
+            && crate::seccomp_plan::fs_denied_path_syscalls().contains(&nr);
         if should_precheck_denied {
             let pfs = ctx.policy_fn.lock().await;
             if is_path_denied_for_notif(&pfs, &notif, fd) {

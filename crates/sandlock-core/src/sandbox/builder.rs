@@ -217,7 +217,6 @@ pub struct SandboxBuilder {
     // COW fork work function: runs in each COW clone.
     #[cfg_attr(feature = "cli", clap(skip))]
     pub(crate) work_fn: Option<Arc<dyn Fn(u32) + Send + Sync + 'static>>,
-
 }
 
 impl std::fmt::Debug for SandboxBuilder {

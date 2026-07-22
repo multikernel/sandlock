@@ -118,30 +118,14 @@ fn dedup_subsumed(paths: Vec<PathBuf>) -> Vec<PathBuf> {
 /// Collapse paths using the N-threshold heuristic and explicit prefixes.
 ///
 /// Protected/guarded directories are never collapsed by the N-threshold.
-/// --collapse-prefix targeting a protected dir is always refused.
-/// --collapse-prefix targeting a guarded dir requires force_sensitive=true.
+/// Sensitive --collapse-prefix targets are refused up front in `run`, before
+/// the workload executes; prefixes reaching here are already vetted.
 fn collapse_by_threshold(
     paths: Vec<PathBuf>,
     n: usize,
     force_prefixes: &[PathBuf],
-    force_sensitive: bool,
     observed: &BTreeSet<PathBuf>,
 ) -> Vec<PathBuf> {
-    // Validate force_prefixes upfront.
-    for prefix in force_prefixes {
-        match classify_path(prefix) {
-            PathTier::Normal => {}
-            _ if !force_sensitive => {
-                eprintln!(
-                    "sandlock learn: ERROR: --collapse-prefix '{}' targets a sensitive path; use --force-sensitive-collapse to proceed",
-                    prefix.display()
-                );
-                std::process::exit(1);
-            }
-            _ => {}
-        }
-    }
-
     // Count how many paths share the same parent directory.
     let mut dir_counts: std::collections::HashMap<PathBuf, usize> = Default::default();
     for p in &paths {
@@ -200,12 +184,32 @@ fn is_junk_path(p: &std::path::Path) -> bool {
     // /proc/self/... and /proc/<pid>/... are pid-specific;
     let proc_pid = b.starts_with(b"/proc/self")
         || (b.starts_with(b"/proc/") && b.get(6).map_or(false, u8::is_ascii_digit));
+    // Only the controlling terminal is session-specific; hardware serial
+    // devices (/dev/ttyS*, /dev/ttyUSB*, ...) are stable paths a workload
+    // may legitimately need.
     proc_pid
         || b.starts_with(b"/dev/pts/") || b == b"/dev/pts"
-        || b.starts_with(b"/dev/tty")
+        || b == b"/dev/tty"
 }
 
 use crate::LearnArgs;
+
+/// Fail learn (writing no profile) unless the workload exited cleanly.
+fn require_clean_exit(status: &sandlock_core::ExitStatus) -> Result<()> {
+    match status {
+        sandlock_core::ExitStatus::Code(0) => {
+            eprintln!("sandlock learn: done");
+            Ok(())
+        }
+        sandlock_core::ExitStatus::Code(n) => {
+            Err(anyhow!("process exited with code {n}, not writing profile"))
+        }
+        sandlock_core::ExitStatus::Signal(sig) => {
+            Err(anyhow!("process killed by signal {sig}, not writing profile"))
+        }
+        _ => Err(anyhow!("process terminated abnormally, not writing profile")),
+    }
+}
 
 // openat flags (from fcntl.h)
 const O_WRONLY: u64 = 0o1;
@@ -249,9 +253,14 @@ struct LearnObserver {
     reads: Arc<Mutex<BTreeSet<PathBuf>>>,
     writes: Arc<Mutex<BTreeSet<PathBuf>>>,
     connects: Arc<Mutex<BTreeSet<String>>>,
-    /// PIDs that just completed an execve — on the NEXT event from that PID,
-    /// /proc/<pid>/maps will reflect the new binary's dynamic linker.
+    /// PIDs with an exec attempt observed but the post-exec maps scan still
+    /// pending; the scan runs on the pid's first non-exec event, which is
+    /// guaranteed to run under the new image.
     pending_maps: Arc<Mutex<HashSet<u32>>>,
+    /// Resolved path of the first binary the workload exec'd, from
+    /// /proc/<pid>/exe. Pins [program].exec to an absolute path; argv[0] may
+    /// be relative (resolved through $PATH by execvp) and useless to `run`.
+    first_exe: Arc<Mutex<Option<PathBuf>>>,
 }
 
 impl LearnObserver {
@@ -261,20 +270,30 @@ impl LearnObserver {
             writes: Arc::new(Mutex::new(BTreeSet::new())),
             connects: Arc::new(Mutex::new(BTreeSet::new())),
             pending_maps: Arc::new(Mutex::new(HashSet::new())),
+            first_exe: Arc::new(Mutex::new(None)),
         }
     }
 
     /// The policy_fn callback: classifies each intercepted syscall into
     /// reads, writes, or connects for profile generation.
     fn on_event(&self, event: SyscallEvent) -> Verdict {
-        // After an execve, the NEXT event from that PID fires once the
-        // new binary is running — /proc/<pid>/maps now shows the dynamic
-        // linker loaded by the kernel (which bypassed seccomp).
-        if self.pending_maps.lock().unwrap().remove(&event.pid) {
+        // After a successful execve, the NEXT event from that PID runs under
+        // the new image, so /proc/<pid>/maps shows the binary and dynamic
+        // linker the kernel loaded (which bypassed seccomp). Another exec
+        // event from a pending PID instead means the previous attempt failed
+        // (execvp walking $PATH; a successful execve never returns), so keep
+        // waiting: scanning then would record the old image, which for the
+        // workload's first exec is the sandbox runtime itself.
+        let is_exec = matches!(event.syscall.as_str(), "execve" | "execveat");
+        if !is_exec && self.pending_maps.lock().unwrap().remove(&event.pid) {
             let mut reads = self.reads.lock().unwrap();
             // /proc/<pid>/exe is the canonical real binary path (symlinks resolved by the kernel),
             // race-free at this point since the new image is already loaded.
             if let Ok(exe) = std::fs::read_link(format!("/proc/{}/exe", event.pid)) {
+                let mut first = self.first_exe.lock().unwrap();
+                if first.is_none() {
+                    *first = Some(exe.clone());
+                }
                 reads.insert(exe);
             }
             for path in read_rx_mapped_files(event.pid) {
@@ -351,7 +370,18 @@ impl LearnObserver {
 
 pub async fn run(args: LearnArgs) -> Result<()> {
     if args.cmd.is_empty() {
-        anyhow::bail!("no command given — use: sandlock learn [flags] -- <cmd> [args...]");
+        anyhow::bail!("no command given; use: sandlock learn [flags] -- <cmd> [args...]");
+    }
+
+    // Refuse bad flag combinations before the workload runs, not after a
+    // full observation pass.
+    for prefix in &args.collapse_prefix {
+        if classify_path(prefix) != PathTier::Normal && !args.force_sensitive_collapse {
+            anyhow::bail!(
+                "--collapse-prefix '{}' targets a sensitive path; use --force-sensitive-collapse to proceed",
+                prefix.display()
+            );
+        }
     }
 
     let cmd_str = args.cmd.join(" ");
@@ -427,21 +457,7 @@ pub async fn run(args: LearnArgs) -> Result<()> {
             Ok(r) => {
                 let result = r.map_err(|e| anyhow!("sandbox error: {e}"))?;
                 sampler.abort();
-                match result.exit_status {
-                    sandlock_core::ExitStatus::Code(0) => eprintln!("sandlock learn: done"),
-                    sandlock_core::ExitStatus::Code(n) => {
-                        eprintln!("sandlock learn: process exited with code {n}, not writing profile");
-                        std::process::exit(1);
-                    }
-                    sandlock_core::ExitStatus::Signal(sig) => {
-                        eprintln!("sandlock learn: process killed by signal {sig}, not writing profile");
-                        std::process::exit(1);
-                    }
-                    sandlock_core::ExitStatus::Killed | sandlock_core::ExitStatus::Timeout => {
-                        eprintln!("sandlock learn: process terminated abnormally, not writing profile");
-                        std::process::exit(1);
-                    }
-                }
+                require_clean_exit(&result.exit_status)?;
                 false
             }
             Err(_elapsed) => {
@@ -458,21 +474,7 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         let result = sandbox.wait().await
             .map_err(|e| anyhow!("sandbox error: {e}"))?;
         sampler.abort();
-        match result.exit_status {
-            sandlock_core::ExitStatus::Code(0) => eprintln!("sandlock learn: done"),
-            sandlock_core::ExitStatus::Code(n) => {
-                eprintln!("sandlock learn: process exited with code {n}, not writing profile");
-                std::process::exit(1);
-            }
-            sandlock_core::ExitStatus::Signal(sig) => {
-                eprintln!("sandlock learn: process killed by signal {sig}, not writing profile");
-                std::process::exit(1);
-            }
-            sandlock_core::ExitStatus::Killed | sandlock_core::ExitStatus::Timeout => {
-                eprintln!("sandlock learn: process terminated abnormally, not writing profile");
-                std::process::exit(1);
-            }
-        }
+        require_clean_exit(&result.exit_status)?;
         false
     };
 
@@ -488,8 +490,10 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     let mut profile_out = ProfileInput::default();
 
     // Record the observed command so `sandlock run -p profile.toml` works
-    // without repeating the command on the CLI.
-    profile_out.program.exec = Some(PathBuf::from(&args.cmd[0]));
+    // without repeating the command on the CLI. Prefer the observed absolute
+    // binary path over argv[0], which may be a bare name resolved via $PATH.
+    let first_exe = observer.first_exe.lock().unwrap().clone();
+    profile_out.program.exec = first_exe.or_else(|| Some(PathBuf::from(&args.cmd[0])));
     profile_out.program.args = args.cmd[1..].to_vec();
 
     let reads_raw: Vec<PathBuf> = observer.reads.lock().unwrap().iter()
@@ -502,20 +506,19 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         .cloned()
         .collect();
 
-    let fsc = args.force_sensitive_collapse;
     let reads = if let Some(n) = args.collapse {
-        dedup_subsumed(collapse_by_threshold(reads_raw, n, &args.collapse_prefix, fsc, &observed_all))
+        dedup_subsumed(collapse_by_threshold(reads_raw, n, &args.collapse_prefix, &observed_all))
     } else if !args.collapse_prefix.is_empty() {
-        dedup_subsumed(collapse_by_threshold(reads_raw, usize::MAX, &args.collapse_prefix, fsc, &observed_all))
+        dedup_subsumed(collapse_by_threshold(reads_raw, usize::MAX, &args.collapse_prefix, &observed_all))
     } else {
         dedup_subsumed(reads_raw)
     };
 
     let writes_collapsed = collapse_write_paths(&writes_raw);
     let writes = if let Some(n) = args.collapse {
-        dedup_subsumed(collapse_by_threshold(writes_collapsed, n, &args.collapse_prefix, fsc, &observed_all))
+        dedup_subsumed(collapse_by_threshold(writes_collapsed, n, &args.collapse_prefix, &observed_all))
     } else if !args.collapse_prefix.is_empty() {
-        dedup_subsumed(collapse_by_threshold(writes_collapsed, usize::MAX, &args.collapse_prefix, fsc, &observed_all))
+        dedup_subsumed(collapse_by_threshold(writes_collapsed, usize::MAX, &args.collapse_prefix, &observed_all))
     } else {
         dedup_subsumed(writes_collapsed)
     };

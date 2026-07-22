@@ -74,6 +74,13 @@ legacy_syscall!(sys_lchown, "lchown");
 legacy_syscall!(sys_vfork, "vfork");
 legacy_syscall!(sys_fork, "fork");
 
+/// `renameat` syscall number on this architecture, or `None` where the ABI
+/// omits it. Unlike the legacy syscalls above it survived into the generic
+/// ABI on aarch64; only riscv64 dropped it in favor of `renameat2` alone.
+pub fn sys_renameat() -> Option<i64> {
+    sysno("renameat")
+}
+
 /// Fork-class syscalls present on this architecture: `clone`/`clone3` always,
 /// plus `fork`/`vfork` only where the legacy ABI provides them. Single source
 /// of truth for callers enumerating fork-class syscalls (BPF notif
