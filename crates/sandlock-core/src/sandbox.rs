@@ -1190,12 +1190,18 @@ impl Sandbox {
     }
 
     /// Dry-run: create, start, wait, collect filesystem changes, then abort.
+    ///
+    /// The branch action is forced to `Abort`, not `Keep`: a dry run must never
+    /// merge, and must not leave its upper on disk either — the changes are read
+    /// out of the branch here and returned, so nothing needs preserving. `Keep`
+    /// would additionally ask the branch to survive an abandoned run (`?` on
+    /// create/wait below), which for a dry run is a pure leak.
     pub async fn dry_run(
         &mut self,
         cmd: &[&str],
     ) -> Result<crate::dry_run::DryRunResult, crate::error::SandlockError> {
-        self.on_exit = BranchAction::Keep;
-        self.on_error = BranchAction::Keep;
+        self.on_exit = BranchAction::Abort;
+        self.on_error = BranchAction::Abort;
         self.do_create(cmd, true).await?;
         self.do_start()?;
         let run_result = self.wait().await?;
@@ -1204,13 +1210,13 @@ impl Sandbox {
         Ok(crate::dry_run::DryRunResult { run_result, changes })
     }
 
-    /// Dry-run with inherited stdio.
+    /// Dry-run with inherited stdio. Same branch handling as [`Self::dry_run`].
     pub async fn dry_run_interactive(
         &mut self,
         cmd: &[&str],
     ) -> Result<crate::dry_run::DryRunResult, crate::error::SandlockError> {
-        self.on_exit = BranchAction::Keep;
-        self.on_error = BranchAction::Keep;
+        self.on_exit = BranchAction::Abort;
+        self.on_error = BranchAction::Abort;
         self.do_create(cmd, false).await?;
         self.do_start()?;
         let run_result = self.wait().await?;
@@ -1627,7 +1633,20 @@ impl Sandbox {
             let storage = self.fs_storage.clone();
             let max_disk = self.max_disk.map(|b| b.0).unwrap_or(0);
             match crate::cow::seccomp::SeccompCowBranch::create(&workdir, storage.as_deref(), max_disk) {
-                Ok(branch) => {
+                Ok(mut branch) => {
+                    // `Keep` must survive a sandbox that is never `wait()`ed:
+                    // the branch only reaches `Sandbox`'s own disposition after
+                    // a completed `wait()`, and the branch's `Drop` would
+                    // otherwise reclaim the upper the caller asked to keep.
+                    // Commit and Abort are NOT carried over that way — an
+                    // abandoned run has no exit status and merging its writes
+                    // is not something it can ask for, so those keep the
+                    // reclaiming default. With no exit status there is also no
+                    // choice between the two actions, so either one asking for
+                    // `Keep` preserves.
+                    branch.set_keep_if_abandoned(
+                        self.on_exit == BranchAction::Keep || self.on_error == BranchAction::Keep,
+                    );
                     self.fs_readable.push(branch.upper_dir().to_path_buf());
                     Some(branch)
                 }

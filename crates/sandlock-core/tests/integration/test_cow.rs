@@ -611,3 +611,76 @@ async fn test_seccomp_cow_exec_packed_argv_relocation() {
 
     let _ = fs::remove_dir_all(&workdir);
 }
+
+// ============================================================
+// Branch disposition on an abandoned sandbox
+// ============================================================
+
+/// Number of branch subdirectories under a `fs_storage` dir.
+fn branch_count(storage: &std::path::Path) -> usize {
+    fs::read_dir(storage).map(|rd| rd.count()).unwrap_or(0)
+}
+
+/// `BranchAction::Keep` means "preserve the changes for later inspection", and a
+/// sandbox that is abandoned without `wait()` IS the case worth inspecting.
+///
+/// A branch only reaches `Sandbox`'s own disposition after a completed `wait()`,
+/// so on this path the branch's `Drop` backstop is what decides. It must honour
+/// an explicit `Keep` — and must still reclaim under the default action, which
+/// is the leak the backstop exists to close.
+#[tokio::test]
+async fn test_abandoned_sandbox_honours_keep_and_still_reclaims_by_default() {
+    let workdir = temp_dir("abandon-wd");
+    let keep_store = temp_dir("abandon-keep-st");
+    let default_store = temp_dir("abandon-default-st");
+    for d in [&keep_store, &default_store] {
+        let _ = fs::remove_dir_all(d);
+        let _ = fs::create_dir_all(d);
+    }
+
+    let base = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc")
+        .fs_write(&workdir).workdir(&workdir).cwd(&workdir);
+
+    {
+        let mut sb = base.clone()
+            .fs_storage(&keep_store)
+            .on_exit(BranchAction::Keep)
+            .build()
+            .unwrap();
+        sb.create(&["sh", "-c", "echo kept > k.txt"]).await.unwrap();
+        sb.start().unwrap();
+        // Dropped here, with no wait(): the caller walked away from the run.
+    }
+    {
+        let mut sb = base.clone()
+            .fs_storage(&default_store)
+            .build()
+            .unwrap();
+        sb.create(&["sh", "-c", "echo gone > g.txt"]).await.unwrap();
+        sb.start().unwrap();
+    }
+
+    // Dropping the sandbox does not itself drop the branch: the shared COW state
+    // is also held by the aborted supervisor task, so the branch is dropped when
+    // the runtime reaps it. Wait for the default store to empty — that reclaim IS
+    // the proof that the branch drops have run, without which the Keep assertion
+    // below would pass on a branch that simply had not been dropped yet.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while branch_count(&default_store) != 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        branch_count(&default_store), 0,
+        "an abandoned sandbox with the default action must still reclaim its upper",
+    );
+    assert_eq!(
+        branch_count(&keep_store), 1,
+        "an abandoned sandbox configured on_exit(Keep) must still preserve its upper",
+    );
+
+    let _ = fs::remove_dir_all(&workdir);
+    let _ = fs::remove_dir_all(&keep_store);
+    let _ = fs::remove_dir_all(&default_store);
+}

@@ -125,6 +125,10 @@ pub struct SeccompCowBranch {
     deleted: HashSet<String>,
     has_changes: bool,
     state: BranchState,
+    /// What `Drop` does with a branch that was never disposed of: reclaim it
+    /// (the default) or preserve it. Set from `BranchAction::Keep`, whose
+    /// holder may never reach a disposition at all — see `Drop`.
+    keep_if_abandoned: bool,
     max_disk_bytes: u64,
     disk_used: u64,
 }
@@ -158,6 +162,7 @@ impl SeccompCowBranch {
             deleted: HashSet::new(),
             has_changes: false,
             state: BranchState::Open,
+            keep_if_abandoned: false,
             max_disk_bytes,
             disk_used: 0,
         })
@@ -958,6 +963,19 @@ impl SeccompCowBranch {
         self.preserve(PreserveReason::Kept);
     }
 
+    /// Record that this branch's holder asked for `BranchAction::Keep`, so an
+    /// abandoned branch (never committed, aborted or kept) is preserved by
+    /// `Drop` instead of reclaimed.
+    ///
+    /// The holder that configured `Keep` may never run a disposition at all: a
+    /// `Sandbox` only moves its branch into its own `Drop` handler after a
+    /// completed `wait()`, and a sandbox abandoned before that is exactly the
+    /// case `Keep` exists for. Without this the branch's `Drop` would silently
+    /// override the request and delete the upper.
+    pub(crate) fn set_keep_if_abandoned(&mut self, keep: bool) {
+        self.keep_if_abandoned = keep;
+    }
+
     /// Hand the branch's private storage over to whoever recovers it: `Drop`
     /// will not reclaim it and no other code path frees it either.
     ///
@@ -986,10 +1004,14 @@ impl Drop for SeccompCowBranch {
     /// Reclaims the branch's private storage when it was never disposed of.
     ///
     /// **Blast radius**: this applies to *every* holder of a `SeccompCowBranch`,
-    /// not only transactional pipelines. A `Sandbox` whose branch is abandoned
-    /// without `wait()` (or that panicked before its `Drop` ran a disposition)
-    /// no longer leaves its upper behind; scratch branches in tests likewise
-    /// vanish at end of scope. That is a behavior change, not a pure leak fix.
+    /// not only transactions. A `Sandbox` whose branch is abandoned without
+    /// `wait()` (or that panicked before its `Drop` ran a disposition) no longer
+    /// leaves its upper behind; scratch branches in tests likewise vanish at end
+    /// of scope. That is a behavior change, not a pure leak fix. The one thing it
+    /// deliberately does not override is an explicit `BranchAction::Keep`, which
+    /// the holder records with [`Self::set_keep_if_abandoned`] — "keep for later
+    /// inspection" has to survive the abandoned case, which *is* the forensic
+    /// case.
     ///
     /// It is deliberately **not** a "clean up on error" hook: anything the code
     /// marked [`BranchState::Preserved`] holds changes that must outlive the
@@ -1000,7 +1022,11 @@ impl Drop for SeccompCowBranch {
     /// never to a caller-supplied `fs_storage` base.
     fn drop(&mut self) {
         if self.state == BranchState::Open {
-            self.cleanup();
+            if self.keep_if_abandoned {
+                self.preserve(PreserveReason::Kept);
+            } else {
+                self.cleanup();
+            }
         }
     }
 }
