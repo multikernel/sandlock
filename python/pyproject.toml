@@ -7,7 +7,7 @@ name = "sandlock"
 dynamic = ["version"]
 readme = "README.md"
 description = "Lightweight process sandbox using Landlock, seccomp, and seccomp user notification"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 dependencies = ["tomli>=1.0; python_version < '3.11'"]
 license = {text = "Apache-2.0"}
 authors = [
