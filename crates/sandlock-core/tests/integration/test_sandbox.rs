@@ -399,6 +399,81 @@ async fn test_denied_path_renameat_blocked() {
     assert!(!renamed.exists(), "renameat bypass: denied file was renamed away");
 }
 
+/// The deny gate must also check the rename *destination*: a file the
+/// sandboxed process created inside its granted write tree must not be
+/// renameable onto a denied path. Unlike wiping or deleting (which fail
+/// closed at the next reader), substitution is silent and hands whoever
+/// reads the denied path attacker-chosen content.
+#[tokio::test]
+async fn test_denied_path_rename_onto_blocked() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let secret = tmp.path().join("secret.txt");
+    std::fs::write(&secret, "TOP_SECRET").unwrap();
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
+        .fs_read("/bin").fs_read("/proc").fs_read("/etc")
+        .fs_read(tmp.path())
+        .fs_write(tmp.path())
+        .fs_deny(&secret)
+        .build()
+        .unwrap();
+
+    let cmd = format!(
+        "echo ATTACKER > {dir}/planted.txt && mv {dir}/planted.txt {}",
+        secret.display(),
+        dir = tmp.path().display(),
+    );
+    let _ = policy.clone().with_name("test").run(&["sh", "-c", &cmd]).await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&secret).unwrap_or_default(),
+        "TOP_SECRET",
+        "rename-onto bypass: sandbox allowed substituting a denied file's content via rename"
+    );
+}
+
+/// Destination-direction gating for renameat(2) specifically: the second-path
+/// resolver must cover the middle-generation variant too, or a raw
+/// syscall(SYS_renameat, ...) substitutes attacker content at the denied path
+/// while rename(2)/renameat2(2) are refused. riscv64 has no renameat, so the
+/// test only exists where the ABI does.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[tokio::test]
+async fn test_denied_path_renameat_onto_blocked() {
+    #[cfg(target_arch = "x86_64")]
+    const SYS_RENAMEAT: i64 = 264;
+    #[cfg(target_arch = "aarch64")]
+    const SYS_RENAMEAT: i64 = 38;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let secret = tmp.path().join("secret.txt");
+    std::fs::write(&secret, "TOP_SECRET").unwrap();
+    let planted = tmp.path().join("planted.txt");
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
+        .fs_read("/bin").fs_read("/proc").fs_read("/etc")
+        .fs_read(tmp.path())
+        .fs_write(tmp.path())
+        .fs_deny(&secret)
+        .build()
+        .unwrap();
+
+    let script = format!(
+        "import ctypes; libc = ctypes.CDLL(None, use_errno=True); \
+         open('{planted}', 'w').write('ATTACKER'); \
+         libc.syscall({SYS_RENAMEAT}, -100, b'{planted}', -100, b'{}')",
+        secret.display(),
+        planted = planted.display(),
+    );
+    let _ = policy.clone().with_name("test").run(&["python3", "-c", &script]).await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&secret).unwrap_or_default(),
+        "TOP_SECRET",
+        "renameat-onto bypass: sandbox allowed substituting a denied file's content via renameat(2)"
+    );
+}
+
 /// truncate(2) takes a path, so the fd-based open deny never sees it; the
 /// deny precheck must gate it or a denied file inside a granted write tree
 /// can be wiped.
