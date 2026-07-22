@@ -628,12 +628,17 @@ fn branch_count(storage: &std::path::Path) -> usize {
 /// so on this path the branch's `Drop` backstop is what decides. It must honour
 /// an explicit `Keep` — and must still reclaim under the default action, which
 /// is the leak the backstop exists to close.
+///
+/// `Keep` is honoured from EITHER action. An abandoned run has no exit status,
+/// so there is no choosing between `on_exit` and `on_error`: a caller who asked
+/// to keep the changes in either case asked to keep them here.
 #[tokio::test]
 async fn test_abandoned_sandbox_honours_keep_and_still_reclaims_by_default() {
     let workdir = temp_dir("abandon-wd");
     let keep_store = temp_dir("abandon-keep-st");
+    let on_error_store = temp_dir("abandon-onerror-st");
     let default_store = temp_dir("abandon-default-st");
-    for d in [&keep_store, &default_store] {
+    for d in [&keep_store, &on_error_store, &default_store] {
         let _ = fs::remove_dir_all(d);
         let _ = fs::create_dir_all(d);
     }
@@ -652,6 +657,15 @@ async fn test_abandoned_sandbox_honours_keep_and_still_reclaims_by_default() {
         sb.create(&["sh", "-c", "echo kept > k.txt"]).await.unwrap();
         sb.start().unwrap();
         // Dropped here, with no wait(): the caller walked away from the run.
+    }
+    {
+        let mut sb = base.clone()
+            .fs_storage(&on_error_store)
+            .on_error(BranchAction::Keep)
+            .build()
+            .unwrap();
+        sb.create(&["sh", "-c", "echo kept > k.txt"]).await.unwrap();
+        sb.start().unwrap();
     }
     {
         let mut sb = base.clone()
@@ -679,8 +693,13 @@ async fn test_abandoned_sandbox_honours_keep_and_still_reclaims_by_default() {
         branch_count(&keep_store), 1,
         "an abandoned sandbox configured on_exit(Keep) must still preserve its upper",
     );
+    assert_eq!(
+        branch_count(&on_error_store), 1,
+        "an abandoned sandbox configured on_error(Keep) must still preserve its upper",
+    );
 
     let _ = fs::remove_dir_all(&workdir);
     let _ = fs::remove_dir_all(&keep_store);
+    let _ = fs::remove_dir_all(&on_error_store);
     let _ = fs::remove_dir_all(&default_store);
 }
