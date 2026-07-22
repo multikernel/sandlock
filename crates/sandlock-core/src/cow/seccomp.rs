@@ -1049,12 +1049,23 @@ impl SeccompCowBranch {
     /// that could be applied already has been — it is "no addition was
     /// published, and what is left in `deleted` is what still has to happen".
     ///
-    /// `Ok(())` means every recorded change landed. Nothing else may return it,
-    /// because the successful tail removes the storage and a change reported as
-    /// merged but left behind would have no copy anywhere. Two things the merge
-    /// still cannot carry across, and so must fail rather than claim: an entry
-    /// whose name is not UTF-8, and a workdir entry of the wrong type where the
-    /// upper holds a directory.
+    /// `Ok(())` from a merge means every recorded change landed: the successful
+    /// tail removes the storage, so a change reported as merged but left behind
+    /// would have no copy anywhere. Two things the merge cannot carry across,
+    /// and so fail rather than claim: an entry whose name is not UTF-8, and a
+    /// workdir entry of the wrong type where the upper holds a directory.
+    ///
+    /// The short-circuit below is the exception, and it is not a merge. On a
+    /// [`BranchState::Finished`] branch there is nothing left to merge — the
+    /// storage is already gone — so `Ok(())` is an idempotent no-op. On a
+    /// [`PreserveReason::Kept`] branch it is a **caller error reported as
+    /// success**: the upper still holds the change set, `Ok(())` comes back, and
+    /// nothing lands. `Kept` means the holder deliberately took the storage over
+    /// for later inspection, so committing it afterwards is a contradiction the
+    /// caller has to resolve; today this code answers it by doing nothing
+    /// quietly, which is a wart worth fixing before the surface is public
+    /// (either exclude `Kept` from the short-circuit, or return an error).
+    /// Guarded by `a_kept_branch_reports_a_commit_it_did_not_perform`.
     ///
     /// The mode of each merged file is the upper's, not the destination's.
     ///
@@ -1666,6 +1677,48 @@ mod tests {
     /// Deletions live only in the branch's in-RAM `deleted` set — there are no
     /// whiteout entries in the upper — so a recovery that reads the upper alone
     /// resurrects every file the run deleted. That is the worst case of all,
+    /// `commit()` on a `Kept` branch answers `Ok(())` without merging anything.
+    ///
+    /// This pins a WART, not a guarantee: `Ok(())` from `commit()` otherwise
+    /// means the whole change set landed, and here it means the opposite — the
+    /// upper still holds every byte. `is_disposed()` covers
+    /// `Preserved(Kept)`, so the short-circuit at the top of `commit()` fires
+    /// before any merge work. The test exists so the wart cannot be lost:
+    /// whichever way it is resolved (excluding `Kept` from the short-circuit, or
+    /// returning an error), this test must be updated deliberately rather than
+    /// keep passing by accident.
+    #[test]
+    fn a_kept_branch_reports_a_commit_it_did_not_perform() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        fs::write(branch.upper.join("added.txt"), "payload").unwrap();
+
+        branch.keep();
+        assert_eq!(branch.state, BranchState::Preserved(PreserveReason::Kept));
+
+        // Reported as a successful commit...
+        branch
+            .commit()
+            .expect("the short-circuit reports success on a Kept branch");
+
+        // ...while nothing was merged and the change set is still in the upper.
+        assert!(
+            !workdir.path().join("added.txt").exists(),
+            "commit() on a Kept branch must not be believed: it published nothing"
+        );
+        assert!(
+            branch.upper.join("added.txt").exists(),
+            "the Kept branch still holds the whole change set"
+        );
+        assert_eq!(
+            branch.state,
+            BranchState::Preserved(PreserveReason::Kept),
+            "the short-circuit must not move a Kept branch to Finished"
+        );
+    }
+
     /// because `TxnError::Merge` tells the operator that recovering the
     /// preserved storage IS how the transaction gets finished.
     #[test]
