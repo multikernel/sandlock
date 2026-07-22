@@ -195,9 +195,9 @@ pub enum TxnError {
     },
 
     /// The commit merge failed partway. The workdir is partially merged and the
-    /// shared upper is preserved at `preserved_upper` — see
-    /// [`SeccompCowBranch::commit`](crate::cow::seccomp::SeccompCowBranch::commit)
-    /// for what it holds and how to finish.
+    /// shared upper is preserved at `preserved_upper`, holding exactly the
+    /// changes that did not land; retrying the transaction is not the way to
+    /// finish it, recovering that upper is.
     #[error(
         "transaction: the commit merge into {workdir} failed: {source}. The workdir is partially \
          merged and what did not land was preserved at {preserved_upper}"

@@ -81,6 +81,10 @@ fn dir_size(dir: &Path) -> u64 {
     total
 }
 
+/// File name of the marker a preserved branch leaves in its storage dir. Lives
+/// next to `upper/`, never inside it, so it is not part of the change set.
+const PRESERVED_MARKER: &str = "PRESERVED";
+
 /// Why a branch's private storage was preserved instead of reclaimed.
 ///
 /// Every preserved branch is storage that nothing in this process will free
@@ -99,6 +103,138 @@ pub enum PreserveReason {
     Kept,
 }
 
+impl PreserveReason {
+    /// Stable token for this reason, as written into the on-disk marker.
+    fn as_token(self) -> &'static str {
+        match self {
+            PreserveReason::MergeInterrupted => "merge-interrupted",
+            PreserveReason::CommitDeferred => "commit-deferred",
+            PreserveReason::Kept => "kept",
+        }
+    }
+
+    fn from_token(token: &[u8]) -> Option<Self> {
+        match token {
+            b"merge-interrupted" => Some(PreserveReason::MergeInterrupted),
+            b"commit-deferred" => Some(PreserveReason::CommitDeferred),
+            b"kept" => Some(PreserveReason::Kept),
+            _ => None,
+        }
+    }
+}
+
+/// A branch whose storage was preserved, as read back off disk.
+///
+/// This is what an out-of-band recovery works from: the process that created
+/// the branch is gone, so the only thing tying an upper on disk to the workdir
+/// it belongs to is the marker this was parsed from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreservedBranch {
+    /// The branch's private storage dir, i.e. what to remove once recovered.
+    pub branch_dir: PathBuf,
+    /// The upper holding the preserved changes.
+    pub upper: PathBuf,
+    /// The workdir the changes belong to, canonicalized when the branch was
+    /// created.
+    pub workdir: PathBuf,
+    /// Why it was preserved, which says what state the workdir is in.
+    pub reason: PreserveReason,
+    /// The process that preserved it. Recorded for triage only — it may have
+    /// exited, and the pid may since have been reused.
+    pub pid: u32,
+}
+
+/// Escape a path's raw bytes for the line-based marker format: a path may
+/// legally contain a newline, and it need not be UTF-8, so the bytes go through
+/// verbatim with `\` and `\n` escaped.
+fn marker_escape(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    for &b in raw {
+        match b {
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            _ => out.push(b),
+        }
+    }
+    out
+}
+
+fn marker_unescape(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut it = raw.iter().copied();
+    while let Some(b) = it.next() {
+        if b != b'\\' {
+            out.push(b);
+            continue;
+        }
+        match it.next() {
+            Some(b'n') => out.push(b'\n'),
+            Some(other) => out.push(other),
+            None => out.push(b'\\'),
+        }
+    }
+    out
+}
+
+/// Read the preservation marker of one branch storage dir, if it has one.
+///
+/// `None` means the dir is not a preserved branch: either it is live storage of
+/// a running process, or it was orphaned by something that never marked it.
+pub fn read_preserved(branch_dir: &Path) -> Option<PreservedBranch> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let body = fs::read(branch_dir.join(PRESERVED_MARKER)).ok()?;
+    let mut reason = None;
+    let mut workdir = None;
+    let mut upper = None;
+    let mut pid = None;
+    for line in body.split(|&b| b == b'\n') {
+        let sep = match line.iter().position(|&b| b == b'=') {
+            Some(i) => i,
+            None => continue,
+        };
+        let (key, value) = (&line[..sep], &line[sep + 1..]);
+        let path = || PathBuf::from(std::ffi::OsString::from_vec(marker_unescape(value)));
+        match key {
+            b"reason" => reason = PreserveReason::from_token(value),
+            b"workdir" => workdir = Some(path()),
+            b"upper" => upper = Some(path()),
+            b"pid" => pid = std::str::from_utf8(value).ok().and_then(|s| s.parse().ok()),
+            _ => {}
+        }
+    }
+    Some(PreservedBranch {
+        branch_dir: branch_dir.to_path_buf(),
+        upper: upper?,
+        workdir: workdir?,
+        reason: reason?,
+        pid: pid?,
+    })
+}
+
+/// Enumerate every preserved branch directly under `storage_base` — the sweep
+/// primitive for recovering work this process (or a previous one) could not
+/// publish.
+///
+/// `storage_base` is one `fs_storage` dir. With the default storage the base is
+/// per-process (`$TMPDIR/sandlock-cow-<pid>`), so a sweep across process
+/// lifetimes has to enumerate those bases itself; pass an explicit `fs_storage`
+/// to keep every branch under one root.
+///
+/// Unreadable entries are skipped rather than failing the sweep: one broken
+/// branch dir must not hide the rest.
+pub fn list_preserved(storage_base: &Path) -> Vec<PreservedBranch> {
+    let mut found = Vec::new();
+    if let Ok(rd) = fs::read_dir(storage_base) {
+        for entry in rd.flatten() {
+            if let Some(p) = read_preserved(&entry.path()) {
+                found.push(p);
+            }
+        }
+    }
+    found
+}
+
 /// Disposition of a branch's private storage, which decides what `Drop` does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BranchState {
@@ -107,8 +243,9 @@ enum BranchState {
     Open,
     /// The upper holds changes that must outlive this branch, for the reason
     /// carried here. The storage MUST survive `Drop`: it is the only copy of
-    /// those changes and the only thing a retry or an out-of-band recovery can
-    /// work from.
+    /// those changes, and the only thing a retry (in this process) or a sweep
+    /// over [`list_preserved`] (after it is gone) can work from. Nothing frees
+    /// it automatically — see [`SeccompCowBranch::preserve`].
     Preserved(PreserveReason),
     /// `commit()` or `abort()` completed. Nothing is left to reclaim — both
     /// already removed the storage.
@@ -874,10 +1011,13 @@ impl SeccompCowBranch {
     pub fn commit(&mut self) -> Result<(), BranchError> {
         if self.is_disposed() { return Ok(()); }
 
-        // Enter the interrupted state BEFORE the first destructive operation.
-        // Every `?` below returns with the state still set, which is what keeps
-        // `Drop` from reclaiming an upper that holds unmerged data. It is
-        // cleared only by the successful tail of this function.
+        // Enter the interrupted state BEFORE the first destructive operation,
+        // which also puts the marker on disk before the workdir is touched, so a
+        // crash mid-merge still leaves a sweep something to find. Every `?`
+        // below returns with the state still set, which is what keeps `Drop`
+        // from reclaiming an upper that holds unmerged data. Both are cleared
+        // only by the successful tail of this function, which removes the whole
+        // storage dir.
         self.preserve(PreserveReason::MergeInterrupted);
 
         // Apply deletions, forgetting each one that is no longer outstanding so
@@ -1025,9 +1165,32 @@ impl SeccompCowBranch {
     ///
     /// This is a **deliberate leak** — the caller is asserting that the upper
     /// holds the only copy of changes that must survive this process. Reclaiming
-    /// it is out-of-band work.
+    /// it is out-of-band work, so a marker naming the workdir, the upper, the
+    /// reason and this pid is written alongside the upper: without it a
+    /// preserved upper is indistinguishable from any orphaned one and a sweep
+    /// cannot tell which workdir it belongs to. Read it back with
+    /// [`read_preserved`] / [`list_preserved`].
+    ///
+    /// Writing the marker is best-effort. If it fails the upper is still
+    /// preserved in this process — losing the data would be worse than losing
+    /// the record — but an out-of-band sweep will not find it.
     pub(crate) fn preserve(&mut self, reason: PreserveReason) {
         self.state = BranchState::Preserved(reason);
+        let _ = self.write_preserved_marker(reason);
+    }
+
+    fn write_preserved_marker(&self, reason: PreserveReason) -> std::io::Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+
+        let mut body = Vec::new();
+        body.extend_from_slice(b"reason=");
+        body.extend_from_slice(reason.as_token().as_bytes());
+        body.extend_from_slice(b"\nworkdir=");
+        body.extend_from_slice(&marker_escape(self.workdir.as_os_str().as_bytes()));
+        body.extend_from_slice(b"\nupper=");
+        body.extend_from_slice(&marker_escape(self.upper.as_os_str().as_bytes()));
+        body.extend_from_slice(format!("\npid={}\n", std::process::id()).as_bytes());
+        fs::write(self.storage_dir.join(PRESERVED_MARKER), body)
     }
 
     /// Whether a further `commit()`/`abort()` would be a no-op: the storage is
@@ -1239,6 +1402,84 @@ mod tests {
         branch.commit().expect("the retry must complete the merge");
         assert_eq!(fs::read_to_string(workdir.path().join("b.txt")).unwrap(), "b.txt");
         assert_eq!(fs::read_to_string(workdir.path().join("c.txt")).unwrap(), "c.txt");
+    }
+
+    /// Preserving is only half a guarantee if it lives in RAM: once the process
+    /// is gone a preserved upper is indistinguishable from any orphaned one and
+    /// nothing says which workdir it belongs to. A sweep must be able to find it
+    /// on disk, with the workdir, the reason and the payload.
+    #[test]
+    fn a_preserved_branch_is_findable_on_disk_after_its_process_forgets_it() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/dev/null", workdir.path().join("blocked.txt")).unwrap();
+
+        assert!(
+            list_preserved(storage.path()).is_empty(),
+            "nothing is preserved before anything has run"
+        );
+
+        {
+            let mut branch =
+                SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+            fs::write(branch.upper.join("blocked.txt"), "unmerged payload").unwrap();
+            branch.commit().expect_err("the obstructed merge must fail");
+            // Dropped here: everything the process knew about this branch is gone.
+        }
+
+        let found = list_preserved(storage.path());
+        assert_eq!(found.len(), 1, "the sweep must find the preserved branch, got {found:?}");
+        let b = &found[0];
+        assert_eq!(
+            b.reason,
+            PreserveReason::MergeInterrupted,
+            "the marker must say what state the workdir is in",
+        );
+        assert_eq!(
+            b.workdir,
+            workdir.path().canonicalize().unwrap(),
+            "the marker must name the workdir the changes belong to",
+        );
+        assert_eq!(b.pid, std::process::id());
+        assert_eq!(
+            fs::read_to_string(b.upper.join("blocked.txt")).unwrap(),
+            "unmerged payload",
+            "the sweep must reach the preserved payload through the marker",
+        );
+
+        // A branch that WAS disposed of leaves nothing behind for the sweep.
+        let mut clean = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        fs::write(clean.upper.join("fine.txt"), "merged").unwrap();
+        clean.abort().unwrap();
+        assert_eq!(
+            list_preserved(storage.path()).len(),
+            1,
+            "an aborted branch must not show up as work awaiting recovery",
+        );
+    }
+
+    /// The marker is a line-based format holding paths, and a path may contain a
+    /// newline (and need not be UTF-8). Round-trip one so the format cannot be
+    /// silently broken by a legal workdir name.
+    #[test]
+    fn the_preserved_marker_round_trips_a_path_with_a_newline() {
+        let root = tempfile::tempdir().unwrap();
+        let workdir = root.path().join("we\nird dir");
+        fs::create_dir(&workdir).unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/dev/null", workdir.join("blocked.txt")).unwrap();
+
+        let mut branch = SeccompCowBranch::create(&workdir, Some(storage.path()), 0).unwrap();
+        fs::write(branch.upper.join("blocked.txt"), "payload").unwrap();
+        branch.commit().expect_err("the obstructed merge must fail");
+
+        let found = list_preserved(storage.path());
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].workdir,
+            workdir.canonicalize().unwrap(),
+            "a workdir path with a newline must survive the marker round-trip",
+        );
     }
 
     fn setup_workdir() -> (tempfile::TempDir, tempfile::TempDir) {
