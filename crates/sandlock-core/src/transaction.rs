@@ -224,11 +224,16 @@ pub enum TxnError {
         source: std::io::Error,
     },
 
-    /// The commit merge failed. The workdir may be partially merged and the
-    /// change set that did not land is preserved — additions and modifications
-    /// under `preserved_upper`, deletions in the `PRESERVED` marker beside it
-    /// (see [`read_preserved`](crate::cow::seccomp::read_preserved)). Retrying
-    /// the transaction is not the way to finish it, recovering that storage is.
+    /// The commit merge failed. The change set that did not land is preserved —
+    /// additions and modifications under `preserved_upper`, deletions in the
+    /// `PRESERVED` marker beside it (see
+    /// [`read_preserved`](crate::cow::seccomp::read_preserved)).
+    ///
+    /// The merge is not rolled back, so the workdir may be partially merged and
+    /// re-running the stages is not the same thing as finishing this
+    /// transaction; recovering that storage is what completes it. How much
+    /// landed is not carried here — it is the difference between the workdir and
+    /// what the preserved storage still holds.
     #[error(
         "transaction: the commit merge into {workdir} failed: {source}. The workdir may be \
          partially merged; what did not land was preserved at {preserved_upper}, with any \

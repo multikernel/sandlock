@@ -151,8 +151,13 @@ pub struct PreservedBranch {
     pub deleted: Vec<PathBuf>,
     /// Why it was preserved, which says what state the workdir is in.
     pub reason: PreserveReason,
-    /// The process that preserved it. Recorded for triage only — it may have
-    /// exited, and the pid may since have been reused.
+    /// The process that preserved it.
+    ///
+    /// Load-bearing for one thing: a `MergeInterrupted` marker is written
+    /// *before* the merge, so a live merge and an interrupted one are the same
+    /// record and this pid is what tells them apart (see [`list_preserved`]).
+    /// Beyond that it is triage only — the process may have exited and the pid
+    /// may since have been reused.
     pub pid: u32,
 }
 
@@ -239,6 +244,14 @@ pub fn read_preserved(branch_dir: &Path) -> Option<PreservedBranch> {
 ///
 /// Unreadable entries are skipped rather than failing the sweep: one broken
 /// branch dir must not hide the rest.
+///
+/// **A merge that is still running looks exactly like one that was
+/// interrupted.** `commit()` writes the [`PreserveReason::MergeInterrupted`]
+/// marker before its first destructive step — it has to, or a crash mid-merge
+/// would leave nothing to find — so for the duration of the merge the live
+/// branch is listed here. The marker's `pid` is the only thing that separates
+/// the two: a sweep that acts on a branch, rather than only reporting it, must
+/// check that pid is not a live process first.
 pub fn list_preserved(storage_base: &Path) -> Vec<PreservedBranch> {
     let mut found = Vec::new();
     if let Ok(rd) = fs::read_dir(storage_base) {
@@ -1041,6 +1054,11 @@ impl SeccompCowBranch {
         // from reclaiming an upper that holds unmerged data. Both are cleared
         // only by the successful tail of this function, which removes the whole
         // storage dir.
+        //
+        // The cost is that a merge in flight is indistinguishable on disk from
+        // one that was interrupted, for as long as it runs. That is the right
+        // way round — the alternative loses the crash — and the marker's pid is
+        // what a sweep uses to tell them apart (see `list_preserved`).
         self.preserve(PreserveReason::MergeInterrupted);
 
         // Apply deletions, forgetting each one that is no longer outstanding so
