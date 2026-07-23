@@ -27,7 +27,7 @@ async fn test_stage_or_stage_returns_pipeline() {
     let policy = base_policy();
     let pipeline = Stage::new(&policy, &["echo", "hello"])
         | Stage::new(&policy, &["cat"]);
-    assert_eq!(pipeline.stages.len(), 2);
+    assert_eq!(pipeline.len(), 2);
 }
 
 #[tokio::test]
@@ -36,7 +36,7 @@ async fn test_stage_chaining() {
     let pipeline = Stage::new(&policy, &["echo", "a"])
         | Stage::new(&policy, &["cat"])
         | Stage::new(&policy, &["cat"]);
-    assert_eq!(pipeline.stages.len(), 3);
+    assert_eq!(pipeline.len(), 3);
 }
 
 // ============================================================

@@ -31,6 +31,9 @@ mod test_landlock;
 #[path = "integration/test_pipeline.rs"]
 mod test_pipeline;
 
+#[path = "integration/test_transaction.rs"]
+mod test_transaction;
+
 #[path = "integration/test_network.rs"]
 mod test_network;
 

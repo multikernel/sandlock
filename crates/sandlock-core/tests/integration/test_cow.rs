@@ -1,4 +1,4 @@
-use sandlock_core::{Sandbox};
+use sandlock_core::{Sandbox, SandboxBuilder};
 use sandlock_core::sandbox::BranchAction;
 use std::fs;
 use std::path::PathBuf;
@@ -608,6 +608,480 @@ async fn test_seccomp_cow_exec_packed_argv_relocation() {
         "argv[1] must survive the path rewrite, stdout={:?}",
         result.stdout_str()
     );
+
+    let _ = fs::remove_dir_all(&workdir);
+}
+
+// ============================================================
+// Branch disposition on an abandoned sandbox
+// ============================================================
+
+/// Number of branch subdirectories under a `fs_storage` dir.
+fn branch_count(storage: &std::path::Path) -> usize {
+    fs::read_dir(storage).map(|rd| rd.count()).unwrap_or(0)
+}
+
+/// `BranchAction::Keep` means "preserve the changes for later inspection", and a
+/// sandbox that is abandoned without `wait()` IS the case worth inspecting.
+///
+/// A branch only reaches `Sandbox`'s own disposition after a completed `wait()`,
+/// so on this path the branch's `Drop` backstop is what decides. It must honour
+/// an explicit `Keep` — and must still reclaim under the default action, which
+/// is the leak the backstop exists to close.
+///
+/// `Keep` is honoured from EITHER action. An abandoned run has no exit status,
+/// so there is no choosing between `on_exit` and `on_error`: a caller who asked
+/// to keep the changes in either case asked to keep them here.
+#[tokio::test]
+async fn test_abandoned_sandbox_honours_keep_and_still_reclaims_by_default() {
+    let workdir = temp_dir("abandon-wd");
+    let keep_store = temp_dir("abandon-keep-st");
+    let on_error_store = temp_dir("abandon-onerror-st");
+    let default_store = temp_dir("abandon-default-st");
+    for d in [&keep_store, &on_error_store, &default_store] {
+        let _ = fs::remove_dir_all(d);
+        let _ = fs::create_dir_all(d);
+    }
+
+    let base = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc")
+        .fs_write(&workdir).workdir(&workdir).cwd(&workdir);
+
+    {
+        let mut sb = base.clone()
+            .fs_storage(&keep_store)
+            .on_exit(BranchAction::Keep)
+            .build()
+            .unwrap();
+        sb.create(&["sh", "-c", "echo kept > k.txt"]).await.unwrap();
+        sb.start().unwrap();
+        // Dropped here, with no wait(): the caller walked away from the run.
+    }
+    {
+        let mut sb = base.clone()
+            .fs_storage(&on_error_store)
+            .on_error(BranchAction::Keep)
+            .build()
+            .unwrap();
+        sb.create(&["sh", "-c", "echo kept > k.txt"]).await.unwrap();
+        sb.start().unwrap();
+    }
+    {
+        let mut sb = base.clone()
+            .fs_storage(&default_store)
+            .build()
+            .unwrap();
+        sb.create(&["sh", "-c", "echo gone > g.txt"]).await.unwrap();
+        sb.start().unwrap();
+    }
+
+    // Dropping the sandbox does not itself drop the branch: the shared COW state
+    // is also held by the aborted supervisor task, so the branch is dropped when
+    // the runtime reaps it. Wait for the default store to empty — that reclaim IS
+    // the proof that the branch drops have run, without which the Keep assertion
+    // below would pass on a branch that simply had not been dropped yet.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while branch_count(&default_store) != 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        branch_count(&default_store), 0,
+        "an abandoned sandbox with the default action must still reclaim its upper",
+    );
+    assert_eq!(
+        branch_count(&keep_store), 1,
+        "an abandoned sandbox configured on_exit(Keep) must still preserve its upper",
+    );
+    assert_eq!(
+        branch_count(&on_error_store), 1,
+        "an abandoned sandbox configured on_error(Keep) must still preserve its upper",
+    );
+
+    let _ = fs::remove_dir_all(&workdir);
+    let _ = fs::remove_dir_all(&keep_store);
+    let _ = fs::remove_dir_all(&on_error_store);
+    let _ = fs::remove_dir_all(&default_store);
+}
+
+// ============================================================
+// Branch disposition on a completed run
+// ============================================================
+
+/// Build a COW sandbox over `workdir` with the two dispositions under test.
+fn disposition_sandbox(
+    workdir: &std::path::Path,
+    on_exit: BranchAction,
+    on_error: BranchAction,
+) -> Sandbox {
+    Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc")
+        .fs_write(workdir).workdir(workdir).cwd(workdir)
+        .on_exit(on_exit)
+        .on_error(on_error)
+        .build()
+        .unwrap()
+}
+
+/// Run `script` in a fresh COW workdir under the two dispositions and report
+/// the child's exit code together with whether its write reached the workdir.
+async fn run_and_report_landing(
+    tag: &str,
+    script: &str,
+    on_exit: BranchAction,
+    on_error: BranchAction,
+) -> (Option<i32>, bool) {
+    let workdir = temp_dir(tag);
+    let _ = fs::remove_dir_all(&workdir);
+    let _ = fs::create_dir_all(&workdir);
+
+    let code = {
+        let mut sb = disposition_sandbox(&workdir, on_exit, on_error);
+        let result = sb.run(&["sh", "-c", script]).await.unwrap();
+        result.code()
+        // Dropped here: the disposition runs in `Sandbox`'s Drop.
+    };
+    let landed = workdir.join("f.txt").exists();
+    let _ = fs::remove_dir_all(&workdir);
+    (code, landed)
+}
+
+/// Which branch action a completed run applies is selected by the child's exit
+/// status: `on_exit` for exit code 0, `on_error` for a non-zero one.
+///
+/// The two failing runs differ only in which way round the actions are wired,
+/// so an implementation that always took `on_exit` and one that always took
+/// `on_error` each contradict one of them; the succeeding run pins which of the
+/// two names goes with which status.
+#[tokio::test]
+async fn test_branch_action_is_selected_by_the_child_exit_status() {
+    let script_fail = "echo written > f.txt; exit 3";
+    let script_ok = "echo written > f.txt";
+
+    let (code, landed) = run_and_report_landing(
+        "disp-fail-abort", script_fail, BranchAction::Commit, BranchAction::Abort,
+    ).await;
+    assert_eq!(code, Some(3), "the failing script must actually have failed");
+    assert!(
+        !landed,
+        "a non-zero exit must apply on_error (Abort), so the write must not reach the workdir",
+    );
+
+    let (code, landed) = run_and_report_landing(
+        "disp-fail-commit", script_fail, BranchAction::Abort, BranchAction::Commit,
+    ).await;
+    assert_eq!(code, Some(3), "the failing script must actually have failed");
+    assert!(
+        landed,
+        "a non-zero exit must apply on_error (Commit), so the write must reach the workdir",
+    );
+
+    let (code, landed) = run_and_report_landing(
+        "disp-ok-commit", script_ok, BranchAction::Commit, BranchAction::Abort,
+    ).await;
+    assert_eq!(code, Some(0), "the succeeding script must actually have succeeded");
+    assert!(
+        landed,
+        "exit code 0 must apply on_exit (Commit), so the write must reach the workdir",
+    );
+
+    let (code, landed) = run_and_report_landing(
+        "disp-ok-abort", script_ok, BranchAction::Abort, BranchAction::Commit,
+    ).await;
+    assert_eq!(code, Some(0), "the succeeding script must actually have succeeded");
+    assert!(
+        !landed,
+        "exit code 0 must apply on_exit (Abort), so the write must not reach the workdir",
+    );
+}
+
+/// A run kept with `BranchAction::Keep` leaves a marker that records the
+/// deletions alongside the upper, so an out-of-band recovery restores the
+/// change set instead of resurrecting the files the run deleted.
+///
+/// The deletion here is the child's own `rm`, so this covers the marker written
+/// from the real supervisor path: the COW layer holds that deletion in RAM only
+/// and nothing in the upper represents it, which is why copying the upper back
+/// over the workdir is not by itself a recovery.
+#[tokio::test]
+async fn test_kept_branch_marker_records_the_runs_deletion_not_only_its_upper() {
+    let workdir = temp_dir("keep-marker-wd");
+    let storage = temp_dir("keep-marker-st");
+    for d in [&workdir, &storage] {
+        let _ = fs::remove_dir_all(d);
+        let _ = fs::create_dir_all(d);
+    }
+    fs::write(workdir.join("victim.txt"), "ORIGINAL").unwrap();
+
+    {
+        let mut sb = Sandbox::builder()
+            .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+            .fs_read("/proc")
+            .fs_write(&workdir).workdir(&workdir).cwd(&workdir)
+            .fs_storage(&storage)
+            .on_exit(BranchAction::Keep)
+            .build()
+            .unwrap();
+        let result = sb.run(&["sh", "-c", "rm victim.txt && echo NEW > added.txt"]).await.unwrap();
+        assert!(
+            result.success(),
+            "the child must have deleted and written, exit={:?}, stderr={}",
+            result.code(), result.stderr_str().unwrap_or(""),
+        );
+    }
+
+    let preserved = sandlock_core::list_preserved(&storage);
+    assert_eq!(preserved.len(), 1, "the kept branch must be findable by a sweep");
+    let branch = &preserved[0];
+    assert_eq!(branch.reason, sandlock_core::PreserveReason::Kept);
+    assert_eq!(
+        branch.workdir,
+        workdir.canonicalize().unwrap(),
+        "the marker must name the workdir the change set belongs to",
+    );
+    assert_eq!(
+        branch.deleted,
+        vec![PathBuf::from("victim.txt")],
+        "the marker must record the file the run deleted",
+    );
+    assert_eq!(
+        fs::read_to_string(branch.upper.join("added.txt")).unwrap(),
+        "NEW\n",
+        "the upper must hold the file the run added",
+    );
+
+    // Keep does not merge: the workdir still holds the pre-run state, so the
+    // marker's deletion is the only record that the file was removed.
+    assert_eq!(fs::read_to_string(workdir.join("victim.txt")).unwrap(), "ORIGINAL");
+    assert!(!workdir.join("added.txt").exists(), "Keep must not merge the upper");
+
+    let _ = fs::remove_dir_all(&workdir);
+    let _ = fs::remove_dir_all(&storage);
+}
+
+// ============================================================
+// Merge failure, storage layout, and the syscall error contract
+// ============================================================
+
+/// Build a COW sandbox over `workdir` that reads enough of the host to run a
+/// shell or python, and writes only inside the workdir.
+fn cow_sandbox(workdir: &std::path::Path, on_exit: BranchAction) -> SandboxBuilder {
+    Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc").fs_read("/dev")
+        .fs_write(workdir).workdir(workdir).cwd(workdir)
+        .on_exit(on_exit)
+}
+
+/// A merge that fails leaves the change set on disk under a `MergeInterrupted`
+/// marker, which on the plain-`Sandbox` path is the ONLY record that the
+/// workdir was never updated: the disposition runs in `Drop` and discards the
+/// `commit()` error, so the caller — who already has its `RunResult` in hand,
+/// reporting a successful run — is never told.
+///
+/// The merge is made to fail by removing the workdir between the run and the
+/// disposition, so the first copy has no root to open under.
+#[tokio::test]
+async fn test_failed_merge_on_the_drop_path_leaves_the_upper_recoverable() {
+    let workdir = temp_dir("merge-fail-wd");
+    let storage = temp_dir("merge-fail-st");
+    for d in [&workdir, &storage] {
+        let _ = fs::remove_dir_all(d);
+        let _ = fs::create_dir_all(d);
+    }
+
+    {
+        let mut sb = cow_sandbox(&workdir, BranchAction::Commit)
+            .fs_storage(&storage)
+            .build()
+            .unwrap();
+        let result = sb.run(&["sh", "-c", "echo NEW > added.txt"]).await.unwrap();
+        assert!(
+            result.success(),
+            "the child must have written, exit={:?}, stderr={}",
+            result.code(), result.stderr_str().unwrap_or(""),
+        );
+        // Out of band, as an unmount or another process would: the workdir the
+        // merge is about to copy into is gone.
+        fs::remove_dir_all(&workdir).unwrap();
+        // Dropped here: `Drop` commits, the merge fails, and the error is lost.
+    }
+
+    let preserved = sandlock_core::list_preserved(&storage);
+    assert_eq!(
+        preserved.len(), 1,
+        "a merge that could not run must leave exactly one branch for a sweep, got {:?}",
+        preserved,
+    );
+    let branch = &preserved[0];
+    assert_eq!(
+        branch.reason,
+        sandlock_core::PreserveReason::MergeInterrupted,
+        "the reason must say the workdir may have been touched, not that the caller kept the branch",
+    );
+    assert_eq!(
+        fs::read_to_string(branch.upper.join("added.txt")).unwrap(),
+        "NEW\n",
+        "the unpublished change must still be readable from the preserved upper",
+    );
+
+    let _ = fs::remove_dir_all(&storage);
+    let _ = fs::remove_dir_all(&workdir);
+}
+
+/// With no `fs_storage`, branch storage goes to the per-process default base
+/// `$TMPDIR/sandlock-cow-<pid>`, and `list_preserved` reads exactly one level:
+/// a sweep of `$TMPDIR` itself does not reach a branch under that base.
+///
+/// The two halves are the documented limitation of the default layout — a sweep
+/// across process lifetimes has to enumerate the per-process bases itself — and
+/// the reason a caller who wants one recoverable root must pass `fs_storage`.
+#[tokio::test]
+async fn test_default_storage_base_is_per_process_and_the_sweep_does_not_recurse() {
+    let workdir = temp_dir("default-base-wd");
+    let _ = fs::remove_dir_all(&workdir);
+    let _ = fs::create_dir_all(&workdir);
+
+    {
+        let mut sb = cow_sandbox(&workdir, BranchAction::Keep).build().unwrap();
+        let result = sb
+            .run(&["sh", "-c", "echo x > default-base-marker.txt"])
+            .await
+            .unwrap();
+        assert!(
+            result.success(),
+            "the child must have written, exit={:?}, stderr={}",
+            result.code(), result.stderr_str().unwrap_or(""),
+        );
+    }
+
+    let base = std::env::temp_dir().join(format!("sandlock-cow-{}", std::process::id()));
+    let ours: Vec<_> = sandlock_core::list_preserved(&base)
+        .into_iter()
+        .filter(|p| p.upper.join("default-base-marker.txt").exists())
+        .collect();
+    assert_eq!(
+        ours.len(), 1,
+        "the kept branch must be under the per-process default base {}",
+        base.display(),
+    );
+    assert_eq!(
+        ours[0].branch_dir.parent(),
+        Some(base.as_path()),
+        "the branch must sit directly under the base, one level down",
+    );
+
+    let from_tmp = sandlock_core::list_preserved(&std::env::temp_dir());
+    assert!(
+        !from_tmp.iter().any(|p| p.branch_dir == ours[0].branch_dir),
+        "the sweep must not descend from $TMPDIR into the per-process base, but it reached {}",
+        ours[0].branch_dir.display(),
+    );
+
+    let _ = fs::remove_dir_all(&ours[0].branch_dir);
+    let _ = fs::remove_dir_all(&workdir);
+}
+
+/// `O_CREAT|O_EXCL` reports EEXIST for a file that exists only in the workdir
+/// as well as for one this run created in the upper, and still creates a file
+/// whose name neither layer holds.
+///
+/// The existence check has to span both layers: against the upper alone a
+/// lock-file idiom would silently clobber a pre-existing workdir file, and
+/// against the workdir alone it would clobber one the same run had just made.
+#[tokio::test]
+async fn test_o_excl_sees_both_the_workdir_and_the_upper() {
+    let workdir = temp_dir("excl-layers");
+    let _ = fs::remove_dir_all(&workdir);
+    let _ = fs::create_dir_all(&workdir);
+    fs::write(workdir.join("lower.txt"), "LOWER").unwrap();
+
+    let script = concat!(
+        "import os, errno\n",
+        "def e(*a):\n",
+        "    try:\n",
+        "        os.close(os.open(*a)); return 'CREATED'\n",
+        "    except OSError as ex: return errno.errorcode.get(ex.errno, str(ex.errno))\n",
+        "flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY\n",
+        "open('upper.txt', 'w').write('UPPER')\n",
+        "print('lower', e('lower.txt', flags))\n",
+        "print('upper', e('upper.txt', flags))\n",
+        "print('fresh', e('fresh.txt', flags))\n",
+    );
+
+    let mut sb = cow_sandbox(&workdir, BranchAction::Abort).build().unwrap();
+    let result = sb.run(&["python3", "-c", script]).await.unwrap();
+    assert!(
+        result.success(),
+        "the probe must have run, exit={:?}, stderr={}",
+        result.code(), result.stderr_str().unwrap_or(""),
+    );
+    let out = result.stdout_str().unwrap_or("").to_string();
+    assert!(out.contains("lower EEXIST"), "O_EXCL must see the workdir file, stdout={:?}", out);
+    assert!(out.contains("upper EEXIST"), "O_EXCL must see the file this run created, stdout={:?}", out);
+    assert!(
+        out.contains("fresh CREATED"),
+        "O_EXCL must still create a name neither layer holds, stdout={:?}", out,
+    );
+
+    // Abort: the pre-existing file must be untouched by the probe.
+    drop(sb);
+    assert_eq!(fs::read_to_string(workdir.join("lower.txt")).unwrap(), "LOWER");
+
+    let _ = fs::remove_dir_all(&workdir);
+}
+
+/// `unlink` on a directory reaches the child as EISDIR and `rmdir` on a regular
+/// file as ENOTDIR, whether the path exists only in the workdir or was created
+/// by this run in the upper.
+///
+/// The COW layer answers both from the merged view rather than letting the
+/// kernel decide, so each layer is a separate arm of the type check and each
+/// needs its own case.
+#[tokio::test]
+async fn test_unlink_type_mismatches_reach_the_child_as_eisdir_and_enotdir() {
+    let workdir = temp_dir("unlink-errno");
+    let _ = fs::remove_dir_all(&workdir);
+    let _ = fs::create_dir_all(&workdir);
+    fs::create_dir_all(workdir.join("lower_dir")).unwrap();
+    fs::write(workdir.join("lower_file.txt"), "x").unwrap();
+
+    let script = concat!(
+        "import os, errno\n",
+        "def e(fn, *a):\n",
+        "    try:\n",
+        "        fn(*a); return 'OK'\n",
+        "    except OSError as ex: return errno.errorcode.get(ex.errno, str(ex.errno))\n",
+        "os.mkdir('upper_dir')\n",
+        "open('upper_file.txt', 'w').write('x')\n",
+        "print('unlink_lower_dir', e(os.unlink, 'lower_dir'))\n",
+        "print('rmdir_lower_file', e(os.rmdir, 'lower_file.txt'))\n",
+        "print('unlink_upper_dir', e(os.unlink, 'upper_dir'))\n",
+        "print('rmdir_upper_file', e(os.rmdir, 'upper_file.txt'))\n",
+    );
+
+    let mut sb = cow_sandbox(&workdir, BranchAction::Abort).build().unwrap();
+    let result = sb.run(&["python3", "-c", script]).await.unwrap();
+    assert!(
+        result.success(),
+        "the probe must have run, exit={:?}, stderr={}",
+        result.code(), result.stderr_str().unwrap_or(""),
+    );
+    let out = result.stdout_str().unwrap_or("").to_string();
+    for expected in [
+        "unlink_lower_dir EISDIR",
+        "rmdir_lower_file ENOTDIR",
+        "unlink_upper_dir EISDIR",
+        "rmdir_upper_file ENOTDIR",
+    ] {
+        assert!(out.contains(expected), "expected {:?} in stdout={:?}", expected, out);
+    }
+
+    // Abort: nothing the probe touched may reach the workdir.
+    drop(sb);
+    assert!(workdir.join("lower_dir").is_dir(), "a refused unlink must not have deleted the directory");
+    assert!(!workdir.join("upper_dir").exists(), "an aborted run must not publish its directory");
 
     let _ = fs::remove_dir_all(&workdir);
 }

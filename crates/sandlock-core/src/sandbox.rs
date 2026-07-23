@@ -271,6 +271,28 @@ struct Runtime {
     on_bind: Option<Box<dyn Fn(&HashMap<u16, u16>) + Send + Sync>>,
     handlers: Vec<(i64, Arc<dyn crate::seccomp::dispatch::Handler>)>,
     ready_w: Option<std::os::fd::OwnedFd>,
+    /// Set when this sandbox is a stage of a [`Transaction`](crate::transaction::Transaction)
+    /// that shares one COW upper across all stages. When present, `do_create_stdio`
+    /// reuses this `CowState` (instead of building its own branch), and neither
+    /// `wait()` nor `Drop` take/commit/abort the branch — the transaction
+    /// coordinator owns the single commit/abort. See [`SharedCow`].
+    shared_cow: Option<SharedCow>,
+}
+
+/// A COW branch (one `upper` over the workdir) shared by every stage of a
+/// [`Transaction`](crate::transaction::Transaction). Cloned into each stage's
+/// `Runtime` so sequential stages accumulate writes in the same upper
+/// (read-committed), while the coordinator retains the original to commit/abort
+/// once at the end.
+#[derive(Clone)]
+pub(crate) struct SharedCow {
+    /// The shared supervisor COW state (holds the single `SeccompCowBranch`).
+    pub(crate) state: Arc<tokio::sync::Mutex<crate::seccomp::state::CowState>>,
+    /// The branch's upper dir. Granted to each stage's Landlock ruleset for the
+    /// same reason a single sandbox grants its own upper: Landlock checks
+    /// EXECUTE against a file's real path, which for anything written inside the
+    /// workdir is the upper. Cached here to avoid locking `state` to read it.
+    pub(crate) upper_dir: PathBuf,
 }
 
 /// Lifecycle state for the runtime.
@@ -782,9 +804,15 @@ impl Sandbox {
         if let Some(h) = rt.throttle_handle.take() { h.abort(); }
         if let Some(h) = rt.loadavg_handle.take() { h.abort(); }
 
-        if let Some(ref cow_state) = self.rt().supervisor_cow.clone() {
-            let mut cow = cow_state.lock().await;
-            self.rt_mut().seccomp_cow = cow.branch.take();
+        // A transactional-pipeline stage leaves the branch in the shared COW
+        // state for the next stage / the coordinator's single commit — don't
+        // take it out (that would strip the upper from later stages) and don't
+        // let Drop commit/abort it (`seccomp_cow` stays None).
+        if self.rt().shared_cow.is_none() {
+            if let Some(ref cow_state) = self.rt().supervisor_cow.clone() {
+                let mut cow = cow_state.lock().await;
+                self.rt_mut().seccomp_cow = cow.branch.take();
+            }
         }
 
         let stdout = self.rt_mut()._stdout_read.take().map(sandbox_read_fd_to_end);
@@ -1162,12 +1190,18 @@ impl Sandbox {
     }
 
     /// Dry-run: create, start, wait, collect filesystem changes, then abort.
+    ///
+    /// The branch action is forced to `Abort`, not `Keep`: a dry run must never
+    /// merge, and must not leave its upper on disk either — the changes are read
+    /// out of the branch here and returned, so nothing needs preserving. `Keep`
+    /// would additionally ask the branch to survive an abandoned run (`?` on
+    /// create/wait below), which for a dry run is a pure leak.
     pub async fn dry_run(
         &mut self,
         cmd: &[&str],
     ) -> Result<crate::dry_run::DryRunResult, crate::error::SandlockError> {
-        self.on_exit = BranchAction::Keep;
-        self.on_error = BranchAction::Keep;
+        self.on_exit = BranchAction::Abort;
+        self.on_error = BranchAction::Abort;
         self.do_create(cmd, true).await?;
         self.do_start()?;
         let run_result = self.wait().await?;
@@ -1176,13 +1210,13 @@ impl Sandbox {
         Ok(crate::dry_run::DryRunResult { run_result, changes })
     }
 
-    /// Dry-run with inherited stdio.
+    /// Dry-run with inherited stdio. Same branch handling as [`Self::dry_run`].
     pub async fn dry_run_interactive(
         &mut self,
         cmd: &[&str],
     ) -> Result<crate::dry_run::DryRunResult, crate::error::SandlockError> {
-        self.on_exit = BranchAction::Keep;
-        self.on_error = BranchAction::Keep;
+        self.on_exit = BranchAction::Abort;
+        self.on_error = BranchAction::Abort;
         self.do_create(cmd, false).await?;
         self.do_start()?;
         let run_result = self.wait().await?;
@@ -1328,6 +1362,7 @@ impl Sandbox {
                 on_bind: None,
                 handlers: Vec::new(),
                 ready_w: None,
+                shared_cow: None,
             }));
             clones.push(clone_sb);
         }
@@ -1422,7 +1457,18 @@ impl Sandbox {
             on_bind: None,
             handlers: Vec::new(),
             ready_w: None,
+            shared_cow: None,
         }));
+        Ok(())
+    }
+
+    /// Attach a transaction's shared COW branch to this sandbox before `create`.
+    /// The stage reuses the shared upper instead of building its own, and leaves
+    /// commit/abort to the transaction coordinator. Internal — used only by
+    /// [`Transaction`](crate::transaction::Transaction).
+    pub(crate) fn set_shared_cow(&mut self, shared: SharedCow) -> Result<(), crate::error::SandlockError> {
+        self.ensure_runtime()?;
+        self.rt_mut().shared_cow = Some(shared);
         Ok(())
     }
 
@@ -1575,12 +1621,32 @@ impl Sandbox {
         // workdir live in the upper dir, and Landlock checks EXECUTE on the
         // file's real path at execve time — so the upper dir must be granted
         // read+execute (READ_ACCESS) or `./created-binary` fails with EACCES.
-        let seccomp_cow_branch = if !no_supervisor && self.workdir.is_some() {
+        // A transactional-pipeline stage reuses one shared upper across stages;
+        // it must not build its own branch. Grant Landlock read+exec on the
+        // shared upper so a binary created in the workdir stays executable.
+        let shared_cow = self.rt().shared_cow.clone();
+        let seccomp_cow_branch = if let Some(ref shared) = shared_cow {
+            self.fs_readable.push(shared.upper_dir.clone());
+            None
+        } else if !no_supervisor && self.workdir.is_some() {
             let workdir = self.workdir.as_ref().unwrap().clone();
             let storage = self.fs_storage.clone();
             let max_disk = self.max_disk.map(|b| b.0).unwrap_or(0);
             match crate::cow::seccomp::SeccompCowBranch::create(&workdir, storage.as_deref(), max_disk) {
-                Ok(branch) => {
+                Ok(mut branch) => {
+                    // `Keep` must survive a sandbox that is never `wait()`ed:
+                    // the branch only reaches `Sandbox`'s own disposition after
+                    // a completed `wait()`, and the branch's `Drop` would
+                    // otherwise reclaim the upper the caller asked to keep.
+                    // Commit and Abort are NOT carried over that way — an
+                    // abandoned run has no exit status and merging its writes
+                    // is not something it can ask for, so those keep the
+                    // reclaiming default. With no exit status there is also no
+                    // choice between the two actions, so either one asking for
+                    // `Keep` preserves.
+                    branch.set_keep_if_abandoned(
+                        self.on_exit == BranchAction::Keep || self.on_error == BranchAction::Keep,
+                    );
                     self.fs_readable.push(branch.upper_dir().to_path_buf());
                     Some(branch)
                 }
@@ -1847,6 +1913,10 @@ impl Sandbox {
 
             let mut cow_state = CowState::new();
             cow_state.branch = seccomp_cow_branch;
+            // A shared transactional-pipeline branch overrides the per-stage one:
+            // reuse the coordinator's single COW state so every stage writes into
+            // (and reads through) the same upper.
+            let shared_cow_state = shared_cow.as_ref().map(|s| Arc::clone(&s.state));
 
             let mut policy_fn_state = PolicyFnState::new();
 
@@ -1895,7 +1965,10 @@ impl Sandbox {
             let res_state = Arc::new(tokio::sync::Mutex::new(res_state));
             self.rt_mut().supervisor_resource = Some(Arc::clone(&res_state));
 
-            let cow_state = Arc::new(tokio::sync::Mutex::new(cow_state));
+            let cow_state = match shared_cow_state {
+                Some(shared) => shared,
+                None => Arc::new(tokio::sync::Mutex::new(cow_state)),
+            };
             self.rt_mut().supervisor_cow = Some(Arc::clone(&cow_state));
 
             let net_state = Arc::new(tokio::sync::Mutex::new(net_state));
@@ -2091,7 +2164,9 @@ impl Drop for Sandbox {
                 match action {
                     BranchAction::Commit => { let _ = cow.commit(); }
                     BranchAction::Abort => { let _ = cow.abort(); }
-                    BranchAction::Keep => {}
+                    // Mark kept so the branch's Drop backstop preserves the upper
+                    // instead of cleaning it as an undisposed leak.
+                    BranchAction::Keep => cow.keep(),
                 }
             }
         }

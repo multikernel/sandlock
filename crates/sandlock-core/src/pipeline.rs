@@ -4,6 +4,10 @@
 //! Data flows through kernel pipe buffers between stages; the parent process
 //! never reads inter-stage data.
 //!
+//! For stages that instead share a workspace and commit all-or-nothing, see
+//! [`Transaction`](crate::transaction::Transaction): different execution model,
+//! different type.
+//!
 //! ```ignore
 //! let result = (
 //!     Stage::new(&policy_a, &["echo", "hello"])
@@ -76,8 +80,12 @@ impl std::ops::BitOr<Stage> for Stage {
 ///
 /// Minimum 2 stages. Each stage runs concurrently in its own sandbox.
 /// Only the last stage's stdout and stderr are captured.
+///
+/// The stages are private: "these are connected by pipes" is the whole meaning
+/// of a `Pipeline`, and a bare `Vec<Stage>` has lost it. Taking them out is
+/// [`into_stages`](Self::into_stages), which a caller has to name.
 pub struct Pipeline {
-    pub stages: Vec<Stage>,
+    stages: Vec<Stage>,
 }
 
 impl Pipeline {
@@ -89,6 +97,28 @@ impl Pipeline {
             )));
         }
         Ok(Self { stages })
+    }
+
+    /// How many stages the chain has.
+    pub fn len(&self) -> usize {
+        self.stages.len()
+    }
+
+    /// Always false — a `Pipeline` has at least 2 stages by construction.
+    pub fn is_empty(&self) -> bool {
+        self.stages.is_empty()
+    }
+
+    /// Take the stages out of the chain, dropping the pipes between them.
+    ///
+    /// The pipes are not a property of a `Stage`; they exist only while the
+    /// stages are held as a `Pipeline`. Handing the result to something that
+    /// runs stages another way — [`Transaction`](crate::transaction::Transaction)
+    /// runs them sequentially over a shared workdir — therefore runs commands
+    /// that were written to stream into each other, without the stream. That is
+    /// a decision, so it has a name rather than a public field.
+    pub fn into_stages(self) -> Vec<Stage> {
+        self.stages
     }
 
     /// Run the pipeline. Returns the last stage's exit status and captured output.
