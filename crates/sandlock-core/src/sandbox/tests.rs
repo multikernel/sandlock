@@ -165,11 +165,55 @@ fn allows_sysv_ipc_reads_extra_allow_syscalls() {
     let p2 = Sandbox::builder().build().unwrap();
     assert!(!p2.allows_sysv_ipc());
 
-    let p3 = Sandbox::builder()
+    let err = Sandbox::builder()
         .extra_allow_syscalls(vec!["other_group".into()])
         .build()
+        .unwrap_err();
+    assert!(err.to_string().contains("unknown syscall group"));
+}
+
+#[test]
+fn extra_allow_rejects_individual_syscall_names() {
+    let err = Sandbox::builder()
+        .extra_allow_syscalls(vec!["io_uring_setup".into()])
+        .build()
+        .unwrap_err();
+    assert!(err.to_string().contains("unknown syscall group"));
+}
+
+#[test]
+fn extra_deny_accepts_group_names() {
+    let p = Sandbox::builder()
+        .extra_deny_syscalls(vec!["sysv_ipc".into()])
+        .build()
         .unwrap();
-    assert!(!p3.allows_sysv_ipc());
+    assert_eq!(p.extra_deny_syscalls, vec!["sysv_ipc".to_string()]);
+
+    let err = Sandbox::builder()
+        .extra_deny_syscalls(vec!["not_a_syscall_or_group".into()])
+        .build()
+        .unwrap_err();
+    assert!(err.to_string().contains("unknown syscall or group"));
+}
+
+#[test]
+fn extra_allow_and_deny_of_same_group_conflict() {
+    let err = Sandbox::builder()
+        .extra_allow_syscalls(vec!["sysv_ipc".into()])
+        .extra_deny_syscalls(vec!["sysv_ipc".into()])
+        .build()
+        .unwrap_err();
+    assert!(err.to_string().contains("both allowed and denied"));
+}
+
+#[test]
+fn extra_deny_of_member_syscall_conflicts_with_allowed_group() {
+    let err = Sandbox::builder()
+        .extra_allow_syscalls(vec!["sysv_ipc".into()])
+        .extra_deny_syscalls(vec!["shmget".into()])
+        .build()
+        .unwrap_err();
+    assert!(err.to_string().contains("belongs to allowed group"));
 }
 
 #[test]

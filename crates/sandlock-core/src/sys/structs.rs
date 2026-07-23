@@ -288,6 +288,22 @@ pub const SYSV_IPC_BLOCKLIST_SYSCALLS: &[&str] = &[
     "semtimedop",
 ];
 
+/// Named syscall groups shared by `--extra-deny-syscall` and
+/// `--extra-allow-syscall`. Deny accepts a group name (expanded to its
+/// members) or an individual syscall name; allow accepts group names only,
+/// because re-allowing arbitrary single syscalls from the default blocklist
+/// could punch holes in the mediation boundary (e.g. io_uring bypasses
+/// per-syscall seccomp entirely).
+pub const SYSCALL_GROUPS: &[(&str, &[&str])] = &[("sysv_ipc", SYSV_IPC_BLOCKLIST_SYSCALLS)];
+
+/// Look up a syscall group by name.
+pub fn syscall_group(name: &str) -> Option<&'static [&'static str]> {
+    SYSCALL_GROUPS
+        .iter()
+        .find(|(group, _)| *group == name)
+        .map(|(_, members)| *members)
+}
+
 pub const DEFAULT_BLOCKLIST_SYSCALLS: &[&str] = &[
     "mount",
     "umount2",

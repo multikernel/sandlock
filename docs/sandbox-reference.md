@@ -334,8 +334,8 @@ blocklist is applied unconditionally; the fields below alter it.
 
 | Python                 | TOML          | Type            | Default | Description                                                                          |
 | ---------------------- | ------------- | --------------- | ------- | ------------------------------------------------------------------------------------ |
-| `extra_allow_syscalls` | `extra_allow` | `Sequence[str]` | `()`    | Syscall group names to re-allow (e.g. `"sysv_ipc"`).                                 |
-| `extra_deny_syscalls`  | `extra_deny`  | `Sequence[str]` | `()`    | Additional syscall names to block on top of the default blocklist.                   |
+| `extra_allow_syscalls` | `extra_allow` | `Sequence[str]` | `()`    | Syscall group names to re-allow (groups: `"sysv_ipc"`). Unknown groups and individual syscall names are rejected. |
+| `extra_deny_syscalls`  | `extra_deny`  | `Sequence[str]` | `()`    | Additional syscall or syscall-group names to block on top of the default blocklist. Groups expand to their member syscalls. |
 
 ## `[limits]`
 

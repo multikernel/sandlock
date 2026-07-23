@@ -16,12 +16,15 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "fs-deny", value_name = "PATH"))]
     pub fs_denied: Vec<PathBuf>,
 
-    /// Extra syscall names to deny (in addition to Sandlock's default blocklist)
-    #[cfg_attr(feature = "cli", arg(long = "extra-deny-syscall", value_name = "NAME"))]
+    /// Extra syscall or syscall-group name to deny, in addition to Sandlock's
+    /// default blocklist (groups: sysv_ipc). Repeatable.
+    #[cfg_attr(feature = "cli", arg(long = "extra-deny-syscall", value_name = "NAME|GROUP"))]
     pub extra_deny_syscalls: Vec<String>,
 
-    /// Extra syscall group names to allow (e.g. sysv_ipc)
-    #[cfg_attr(feature = "cli", arg(long = "extra-allow-syscall", value_name = "NAME"))]
+    /// Syscall group name to allow back from the default blocklist
+    /// (groups: sysv_ipc). Individual syscalls cannot be re-allowed.
+    /// Repeatable.
+    #[cfg_attr(feature = "cli", arg(long = "extra-allow-syscall", value_name = "GROUP"))]
     pub extra_allow_syscalls: Vec<String>,
 
     /// Outbound endpoint allow rule. Repeatable. Each value is
@@ -775,6 +778,8 @@ impl SandboxBuilder {
     /// construct sandboxes violating cross-section invariants.
     pub fn build_unchecked(self) -> Result<Sandbox, SandboxError> {
         validate_syscall_names(&self.extra_deny_syscalls)?;
+        validate_allow_groups(&self.extra_allow_syscalls)?;
+        validate_allow_deny_disjoint(&self.extra_allow_syscalls, &self.extra_deny_syscalls)?;
 
         // Reject disable(FsRefer): the kernel denies REFER (cross-directory
         // rename/link) by default in every ruleset even when REFER is not

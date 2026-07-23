@@ -419,17 +419,24 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
 
 /// Resolve `base` syscall names plus policy extras (and SysV IPC syscalls when
 /// `policy.allows_sysv_ipc()` is false) to a deduplicated, ascending list of
-/// numbers for the current architecture.
+/// numbers for the current architecture. Extras naming a syscall group
+/// expand to the group's members.
 ///
 /// A `SysnoSet` accumulates the membership: it dedups inherently (so SysV IPC
 /// folds in with a plain `insert`) and iterates in ascending syscall order.
 /// Names that do not exist on this architecture resolve to nothing and are
 /// skipped, so the result stays arch-correct.
 fn resolve_blocklist(base: &[&str], policy: &Sandbox) -> Vec<u32> {
+    let extra_denies = policy.extra_deny_syscalls.iter().flat_map(|name| {
+        match crate::sys::structs::syscall_group(name) {
+            Some(members) => members.iter().copied().collect::<Vec<_>>(),
+            None => vec![name.as_str()],
+        }
+    });
     let mut set: SysnoSet = base
         .iter()
         .copied()
-        .chain(policy.extra_deny_syscalls.iter().map(String::as_str))
+        .chain(extra_denies)
         .filter_map(|n| n.parse::<Sysno>().ok())
         .collect();
     if !policy.allows_sysv_ipc() {

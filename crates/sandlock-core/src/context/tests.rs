@@ -225,6 +225,32 @@ fn test_blocklist_syscall_numbers_default_with_sysv_ipc_allowed() {
 }
 
 #[test]
+fn test_blocklist_syscall_numbers_expands_deny_group() {
+    let policy = Sandbox::builder()
+        .extra_deny_syscalls(vec!["sysv_ipc".into()])
+        .build()
+        .unwrap();
+    let nrs = blocklist_syscall_numbers(&policy);
+    assert!(nrs.contains(&(libc::SYS_shmget as u32)));
+    assert!(nrs.contains(&(libc::SYS_msgget as u32)));
+    assert!(nrs.contains(&(libc::SYS_semget as u32)));
+    assert!(nrs.contains(&(libc::SYS_semtimedop as u32)));
+}
+
+#[test]
+fn test_no_supervisor_blocklist_expands_deny_group() {
+    // The relaxed no-supervisor list omits SysV IPC append only when the
+    // group is allowed; an explicit group deny must still expand here.
+    let policy = Sandbox::builder()
+        .extra_deny_syscalls(vec!["sysv_ipc".into()])
+        .build()
+        .unwrap();
+    let nrs = no_supervisor_blocklist_syscall_numbers(&policy);
+    assert!(nrs.contains(&(libc::SYS_shmget as u32)));
+    assert!(nrs.contains(&(libc::SYS_msgctl as u32)));
+}
+
+#[test]
 fn test_no_supervisor_blocklist_includes_sysv_ipc_by_default() {
     let policy = Sandbox::builder().build().unwrap();
     let nrs = no_supervisor_blocklist_syscall_numbers(&policy);

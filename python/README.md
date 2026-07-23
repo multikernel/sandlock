@@ -192,8 +192,8 @@ sandbox = Sandbox(
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `extra_deny_syscalls` | `list[str]` | `[]` | Extra syscall names to block in addition to Sandlock defaults |
-| `extra_allow_syscalls` | `list[str]` | `[]` | Syscall groups to allow that are blocked by default (e.g. `"sysv_ipc"` to enable SysV shared memory, semaphores, and message queues) |
+| `extra_deny_syscalls` | `list[str]` | `[]` | Extra syscall or syscall-group names to block in addition to Sandlock defaults (groups expand to their member syscalls) |
+| `extra_allow_syscalls` | `list[str]` | `[]` | Syscall groups to allow that are blocked by default (e.g. `"sysv_ipc"` to enable SysV shared memory, semaphores, and message queues); unknown groups and individual syscall names are rejected |
 
 Sandlock always applies its default syscall blocklist.
 

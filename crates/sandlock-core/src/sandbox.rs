@@ -2839,16 +2839,78 @@ fn validate_syscall_names(names: &[String]) -> Result<(), SandboxError> {
     let unknown: Vec<&str> = names
         .iter()
         .map(String::as_str)
-        .filter(|name| crate::seccomp::syscall::syscall_name_to_nr(name).is_none())
+        .filter(|name| {
+            crate::sys::structs::syscall_group(name).is_none()
+                && crate::seccomp::syscall::syscall_name_to_nr(name).is_none()
+        })
         .collect();
     if unknown.is_empty() {
         Ok(())
     } else {
         Err(SandboxError::Invalid(format!(
-            "unknown syscall name(s): {}",
+            "unknown syscall or group name(s): {}",
             unknown.join(", ")
         )))
     }
+}
+
+fn known_group_names() -> String {
+    crate::sys::structs::SYSCALL_GROUPS
+        .iter()
+        .map(|(group, _)| *group)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn validate_allow_groups(names: &[String]) -> Result<(), SandboxError> {
+    let unknown: Vec<&str> = names
+        .iter()
+        .map(String::as_str)
+        .filter(|name| crate::sys::structs::syscall_group(name).is_none())
+        .collect();
+    if unknown.is_empty() {
+        Ok(())
+    } else {
+        Err(SandboxError::Invalid(format!(
+            "unknown syscall group name(s): {} (known groups: {}); \
+             individual syscalls cannot be re-allowed",
+            unknown.join(", "),
+            known_group_names()
+        )))
+    }
+}
+
+/// Reject a syscall appearing on both sides. The BPF layout places notif
+/// JEQs before deny JEQs, so a syscall that an allowed group routes to
+/// notif would silently bypass a kernel-level deny of the same syscall.
+fn validate_allow_deny_disjoint(
+    allow_groups: &[String],
+    deny: &[String],
+) -> Result<(), SandboxError> {
+    let denied: std::collections::HashSet<&str> = deny
+        .iter()
+        .flat_map(|name| match crate::sys::structs::syscall_group(name) {
+            Some(members) => members.iter().copied().collect::<Vec<_>>(),
+            None => vec![name.as_str()],
+        })
+        .collect();
+    for group in allow_groups {
+        if deny.iter().any(|d| d == group) {
+            return Err(SandboxError::Invalid(format!(
+                "syscall group `{}` is both allowed and denied",
+                group
+            )));
+        }
+        if let Some(members) = crate::sys::structs::syscall_group(group) {
+            if let Some(overlap) = members.iter().find(|m| denied.contains(**m)) {
+                return Err(SandboxError::Invalid(format!(
+                    "syscall `{}` is denied but belongs to allowed group `{}`",
+                    overlap, group
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Parse `--net-allow-bind` specs. Accepts the `*` wildcard (any port),
