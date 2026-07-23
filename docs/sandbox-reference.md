@@ -343,7 +343,7 @@ prefix redundant; the GPU and CPU placement fields keep their names.
 | Python           | TOML          | Type                    | Default | Description                                                                                                                  |
 | ---------------- | ------------- | ----------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------- |
 | `max_memory`     | `memory`      | `str \| int \| None`    | `None`  | Memory limit. Accepts strings such as `"512M"`, `"1G"`, or an integer byte count.                                            |
-| `max_processes`  | `processes`   | `int`                   | `64`    | Maximum **lifetime** fork count permitted in the sandbox (not concurrent). Also enables fork interception used by checkpoint freeze. |
+| `max_processes`  | `processes`   | `int`                   | `64`    | Maximum number of **concurrent** processes in the sandbox (peak, not lifetime; threads do not count). Also enables fork interception used by checkpoint freeze. |
 | `max_open_files` | `open_files`  | `int \| None`           | `None`  | Maximum number of open file descriptors. Enforced via `RLIMIT_NOFILE` (kernel, survives `exec`).                              |
 | `max_cpu`        | `cpu`         | `int \| None`           | `None`  | CPU throttle as a percentage of one core (1 to 100). Applied to the entire process group via `SIGSTOP`/`SIGCONT` cycling.    |
 | `max_disk`       | `disk`        | `str \| None`           | `None`  | COW storage quota (e.g. `"1G"`). Returned as `ENOSPC` when the upper layer exceeds it.                                       |

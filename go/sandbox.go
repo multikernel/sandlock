@@ -238,7 +238,7 @@ type Sandbox struct {
 	// Resource limits.
 	MaxMemory    string   // e.g. "512M"; empty = unlimited
 	MaxDisk      string   // disk quota for COW storage, e.g. "1G"
-	MaxProcesses uint32   // lifetime fork cap; 0 = sandlock default
+	MaxProcesses uint32   // peak concurrent process cap; 0 = sandlock default
 	MaxCPU       uint8    // CPU throttle, percent of one core (1-100); 0 = unset
 	MaxOpenFiles uint32   // RLIMIT_NOFILE; 0 = inherit system default
 	CPUCores     []uint32 // cores to pin to via sched_setaffinity
