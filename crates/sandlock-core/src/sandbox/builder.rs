@@ -104,6 +104,7 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", clap(skip))]
     pub max_memory: Option<ByteSize>,
 
+    /// Peak concurrent process limit; threads do not count [default: 64]
     #[cfg_attr(feature = "cli", arg(short = 'P', long = "max-processes"))]
     pub max_processes: Option<u32>,
 
