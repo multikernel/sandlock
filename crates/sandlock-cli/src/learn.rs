@@ -498,6 +498,19 @@ pub async fn run(args: LearnArgs) -> Result<()> {
 
     let reads_raw: Vec<PathBuf> = observer.reads.lock().unwrap().iter()
         .filter(|p| p.exists() && !is_junk_path(p))
+        .filter(|p| {
+            // Same guard the write side has: "/" is never a grant. A child
+            // whose cwd is the workdir root lists it routinely (python's -c
+            // puts the cwd on sys.path), and granting it would subsume every
+            // other read in the profile.
+            if p.as_path() == std::path::Path::new("/") {
+                eprintln!(
+                    "sandlock learn: WARNING: observed a read of '/', refusing to grant it"
+                );
+                return false;
+            }
+            true
+        })
         .cloned()
         .collect();
     let writes_raw = observer.writes.lock().unwrap();
