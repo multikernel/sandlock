@@ -234,7 +234,12 @@ impl SeccompCowBranch {
         let st = match crate::sys::fs::statat_in_root(&self.workdir, rel_path, false) {
             Ok(st) => st,
             // Absent or confined-out: treat as a new file created in upper.
-            Err(libc::ENOENT) => {
+            // EACCES gets the same disposition as execute_copy's source-open
+            // gives it: the supervisor cannot see inside the lower directory
+            // (e.g. /root under a workdir of "/"), so the write proceeds on
+            // an empty upper file rather than falling through to a real
+            // permission error the virtualized child was promised not to hit.
+            Err(libc::ENOENT) | Err(libc::EACCES) => {
                 self.check_quota(0)?;
                 return Ok(CowCopyPlan::Ready(upper_file));
             }
@@ -1704,5 +1709,30 @@ mod tests {
             !outside.path().join("sandlock_escape_dir").exists(),
             "upper write escaped through symlinked parent into the outside dir"
         );
+    }
+
+    #[test]
+    fn write_open_in_unreadable_dir_virtualizes() {
+        // The supervisor may not be able to stat inside a 0o000 lower dir
+        // (as with /root under learn's workdir="/"). The write must still
+        // virtualize onto an empty upper file instead of erroring out and
+        // letting the child hit the real permission wall.
+        use std::os::unix::fs::PermissionsExt;
+        let (workdir, storage) = setup_workdir();
+        fs::create_dir(workdir.path().join("locked")).unwrap();
+        fs::write(workdir.path().join("locked/f"), "x").unwrap();
+        let locked = workdir.path().join("locked");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let result = branch.ensure_cow_copy("locked/f");
+        // Restore before asserting so the tempdir can be cleaned up either way.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let upper = result.unwrap();
+        assert_eq!(upper, branch.upper_dir().join("locked/f"));
+        // Nothing was readable to copy, so the plan is a fresh (absent or
+        // empty) upper entry, never the lower bytes and never an error.
+        assert!(!upper.exists() || fs::read(&upper).unwrap().is_empty());
     }
 }
