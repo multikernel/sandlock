@@ -2138,6 +2138,14 @@ async fn handle_notification(
                     notif.pid, e
                 );
                 action = NotifAction::Errno(libc::EPERM);
+                // Rollback could not release tasks that had not entered
+                // ptrace-stop yet; carry them to the post-send reap.
+                if !e.pending_tids.is_empty() {
+                    exec_freeze = Some(crate::freeze::SandboxFreeze {
+                        pending_tids: e.pending_tids,
+                        ..Default::default()
+                    });
+                }
             }
         }
     }
@@ -2244,6 +2252,10 @@ async fn handle_notification(
         } else {
             crate::freeze::detach_all(&freeze);
         }
+        // Now that the response is out, the kernel wait holding any pending
+        // task (the vfork parent waiting on this very execve) can clear;
+        // reap the queued interrupts and detach.
+        crate::freeze::reap_pending(&freeze.pending_tids);
     }
 }
 
@@ -2329,6 +2341,15 @@ pub async fn supervisor(
                     let notif = match recv_notif(fd) {
                         Ok(n) => n,
                         Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                        // The notification the probe saw can be withdrawn
+                        // before RECV picks it up: the target was killed
+                        // while the notification was being generated
+                        // (seccomp_unotify(2), RECV ENOENT). Other tasks'
+                        // notifications may still be queued or coming, so
+                        // this is an empty probe, not a dead fd. Breaking
+                        // here retired the whole supervisor and parked
+                        // every later intercepted syscall forever.
+                        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue,
                         Err(_) => break 'outer,
                     };
                     handle_notification(notif, &ctx, &dispatch_table, fd, &defer_sem).await;

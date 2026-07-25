@@ -73,36 +73,49 @@ fn read_task_state(tid: i32) -> Option<char> {
     line.split_whitespace().nth(1).and_then(|s| s.chars().next())
 }
 
-/// `PTRACE_SEIZE` + `PTRACE_INTERRUPT` a single tid and wait for the
-/// confirmed ptrace-stop. Returns `Ok(true)` if the tid is now
-/// ptrace-stopped (and must be detached later), `Ok(false)` if the
-/// tid does not need to be ptrace-attached (already exited, or held
-/// in an uninterruptible kernel wait where it cannot mutate user
-/// memory), or an error if ptrace refused.
+/// What `seize_and_interrupt` did with one tid.
+#[derive(Debug, PartialEq, Eq)]
+enum SeizeOutcome {
+    /// Confirmed ptrace-stopped; must be detached later.
+    Frozen,
+    /// No attachment exists (already exited, or held in an uninterruptible
+    /// kernel wait without ever being seized): nothing to release.
+    NotNeeded,
+    /// Seized with the interrupt queued, but the task entered an
+    /// uninterruptible kernel wait before stopping. It cannot run user code
+    /// (so it cannot mutate argv), and it will trap into ptrace-stop the
+    /// moment its wait clears. The caller must reap and detach it AFTER the
+    /// execve response is sent — for the vfork parent, the wait clears only
+    /// once that very execve resolves.
+    PendingStop,
+}
+
+/// `PTRACE_SEIZE` + `PTRACE_INTERRUPT` a single tid and reap the confirmed
+/// ptrace-stop without ever blocking unboundedly.
 ///
-/// # Why we read `/proc/<tid>/status` first
+/// # Why the reap must be bounded
 ///
-/// A task in `TASK_UNINTERRUPTIBLE` (`State: D`) — most commonly the
-/// vfork parent of the execve caller, suspended in `kernel_clone`
-/// until its child execs — cannot enter ptrace-stop until its
-/// kernel wait clears. For vfork specifically, the wait won't clear
-/// until we send Continue, but we can't send Continue while we're
-/// blocked in `waitpid` for that exact task. Naively waitpid'ing
-/// would deadlock the supervisor.
-///
-/// Such tasks also don't *need* to be ptrace-attached: they can't
-/// run user code while in uninterruptible wait, and therefore can't
-/// mutate argv. The kernel is already holding them for us. We skip
-/// the seize entirely and return `Ok(false)` so the caller does not
-/// add them to the detach list.
+/// A task in `TASK_UNINTERRUPTIBLE` (`State: D`) — most commonly the vfork
+/// parent of the execve caller, suspended in `kernel_clone` until its child
+/// execs — cannot enter ptrace-stop until its kernel wait clears. For vfork
+/// specifically, the wait won't clear until we send Continue, but we can't
+/// send Continue while we're blocked in `waitpid` for that exact task: an
+/// unbounded waitpid here deadlocks the whole supervisor. The pre-check on
+/// `/proc/<tid>/status` catches a task already parked in `D`, but it RACES
+/// the tracee — the vfork parent can pass the check runnable and park
+/// before the interrupt lands (seen in the wild under CPU load). So after
+/// arming the interrupt the reap polls with `WNOHANG`, and a task observed
+/// in `D` is handed back as [`SeizeOutcome::PendingStop`] instead of being
+/// waited for.
 ///
 /// On a partial-progress failure (PTRACE_SEIZE succeeded but
 /// PTRACE_INTERRUPT did not), the function detaches itself before
 /// returning so the caller doesn't have to track partial state.
-fn seize_and_interrupt(tid: i32) -> io::Result<bool> {
-    // Skip tasks the kernel is already holding for us. See doc above.
+fn seize_and_interrupt(tid: i32) -> io::Result<SeizeOutcome> {
+    // Fast path: the kernel is already holding this task; it cannot mutate
+    // user memory and does not need an attachment.
     if read_task_state(tid) == Some('D') {
-        return Ok(false);
+        return Ok(SeizeOutcome::NotNeeded);
     }
 
     let ret = unsafe {
@@ -111,7 +124,7 @@ fn seize_and_interrupt(tid: i32) -> io::Result<bool> {
     if ret < 0 {
         let err = io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::ESRCH) {
-            return Ok(false); // already exited — nothing to freeze
+            return Ok(SeizeOutcome::NotNeeded); // already exited
         }
         return Err(err);
     }
@@ -125,19 +138,44 @@ fn seize_and_interrupt(tid: i32) -> io::Result<bool> {
         let err = io::Error::last_os_error();
         let _ = unsafe { libc::ptrace(libc::PTRACE_DETACH, tid, 0, 0) };
         if err.raw_os_error() == Some(libc::ESRCH) {
-            return Ok(false);
+            return Ok(SeizeOutcome::NotNeeded);
         }
         return Err(err);
     }
 
-    // Wait for the confirmed ptrace-stop. The task was not in
-    // uninterruptible wait when we checked, so PTRACE_INTERRUPT
-    // delivers within microseconds. `__WALL` is needed because
-    // siblings are threads (not children of the supervisor in the
-    // traditional fork sense) and waitpid(2) by default ignores them.
-    let mut status: i32 = 0;
-    let _ = unsafe { libc::waitpid(tid, &mut status, libc::__WALL) };
-    Ok(true)
+    // Bounded reap. A runnable task stops within a scheduling quantum; the
+    // budget only exists so a starved box still converges. `__WALL` because
+    // siblings are threads, which waitpid(2) ignores by default.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        let mut status: i32 = 0;
+        let r = unsafe { libc::waitpid(tid, &mut status, libc::__WALL | libc::WNOHANG) };
+        if r == tid {
+            if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+                return Ok(SeizeOutcome::NotNeeded);
+            }
+            if libc::WIFSTOPPED(status) {
+                return Ok(SeizeOutcome::Frozen);
+            }
+        } else if r < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EINTR) {
+                // Reaped elsewhere or gone: nothing left to hold.
+                return Ok(SeizeOutcome::NotNeeded);
+            }
+        }
+        if read_task_state(tid) == Some('D') {
+            return Ok(SeizeOutcome::PendingStop);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = unsafe { libc::ptrace(libc::PTRACE_DETACH, tid, 0, 0) };
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("tid {tid} did not enter ptrace-stop within the freeze budget"),
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
 }
 
 /// Detach a previously-frozen task. Used to roll back partial
@@ -200,6 +238,28 @@ pub(crate) struct SandboxFreeze {
     /// execve and must be detached so they can resume normal
     /// execution.
     pub peer_tids: Vec<i32>,
+    /// TIDs seized with a queued interrupt that had entered an
+    /// uninterruptible kernel wait before stopping (the vfork parent racing
+    /// the freeze). Kernel-held for the duration of the freeze window; must
+    /// be reaped with [`reap_pending`] after the execve response is sent.
+    pub pending_tids: Vec<i32>,
+}
+
+/// A freeze that could not be completed. Carries any tasks that were left
+/// with a queued interrupt and could not be released during rollback (they
+/// had not entered ptrace-stop yet); the caller must [`reap_pending`] them
+/// after sending its deny response, for the same reason the freeze itself
+/// could not wait for them.
+#[derive(Debug)]
+pub(crate) struct FreezeError {
+    pub error: io::Error,
+    pub pending_tids: Vec<i32>,
+}
+
+impl std::fmt::Display for FreezeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
 }
 
 /// Freeze every sandbox thread that could mutate execve argv before
@@ -224,13 +284,15 @@ pub(crate) struct SandboxFreeze {
 pub(crate) fn freeze_sandbox_for_execve(
     processes: &crate::seccomp::state::ProcessIndex,
     caller_tid: i32,
-) -> io::Result<SandboxFreeze> {
-    let caller_tgid = read_tgid_of_tid(caller_tid)?;
+) -> Result<SandboxFreeze, FreezeError> {
+    let no_pending = |error| FreezeError { error, pending_tids: Vec::new() };
+    let caller_tgid = read_tgid_of_tid(caller_tid).map_err(no_pending)?;
     let mut tgids: HashSet<i32> = processes.pids_snapshot();
     tgids.insert(caller_tgid);
 
     let mut sibling_tids: Vec<i32> = Vec::new();
     let mut peer_tids: Vec<i32> = Vec::new();
+    let mut pending_tids: Vec<i32> = Vec::new();
 
     for tgid in &tgids {
         // /proc/<tgid>/task may disappear if the TGID exited between
@@ -244,24 +306,28 @@ pub(crate) fn freeze_sandbox_for_execve(
                 continue;
             }
             match seize_and_interrupt(tid) {
-                Ok(true) => {
+                Ok(SeizeOutcome::Frozen) => {
                     if *tgid == caller_tgid {
                         sibling_tids.push(tid);
                     } else {
                         peer_tids.push(tid);
                     }
                 }
-                Ok(false) => continue, // already exited — fine
+                Ok(SeizeOutcome::PendingStop) => pending_tids.push(tid),
+                Ok(SeizeOutcome::NotNeeded) => continue,
                 Err(e) => {
                     // Roll back: detach every task we already froze
-                    // (siblings + peers) so they resume normally.
+                    // (siblings + peers) so they resume normally. Pending
+                    // tasks cannot be detached until they stop, which
+                    // requires the caller's response to go out first —
+                    // hand them back through the error.
                     for t in &sibling_tids {
                         detach(*t);
                     }
                     for t in &peer_tids {
                         detach(*t);
                     }
-                    return Err(e);
+                    return Err(FreezeError { error: e, pending_tids });
                 }
             }
         }
@@ -270,7 +336,46 @@ pub(crate) fn freeze_sandbox_for_execve(
     Ok(SandboxFreeze {
         sibling_tids,
         peer_tids,
+        pending_tids,
     })
+}
+
+/// Reap and detach tasks that were seized with a queued interrupt while in
+/// an uninterruptible kernel wait. Called strictly AFTER the execve
+/// response is sent: for the vfork parent the wait clears as soon as that
+/// execve resolves, so the queued interrupt fires promptly. Bounded so an
+/// unrelated long uninterruptible wait cannot stall the supervisor loop;
+/// on expiry the attachment is abandoned loudly rather than silently.
+pub(crate) fn reap_pending(pending: &[i32]) {
+    for &tid in pending {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let mut status: i32 = 0;
+            let r = unsafe { libc::waitpid(tid, &mut status, libc::__WALL | libc::WNOHANG) };
+            if r == tid {
+                if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+                    break;
+                }
+                if libc::WIFSTOPPED(status) {
+                    detach(tid);
+                    break;
+                }
+            } else if r < 0 {
+                let e = io::Error::last_os_error();
+                if e.raw_os_error() != Some(libc::EINTR) {
+                    break; // reaped elsewhere or gone
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                eprintln!(
+                    "sandlock: tid {tid} never left its kernel wait; \
+                     abandoning its ptrace attachment"
+                );
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
 }
 
 /// Detach peer TIDs after the kernel has re-read execve argv. Errors
