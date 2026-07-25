@@ -176,10 +176,22 @@ fn close_fds_above(min_fd: RawFd, keep: &[RawFd]) {
 /// `real_uid`/`real_gid` must be captured *before* unshare(CLONE_NEWUSER),
 /// since getuid()/getgid() return the overflow id (65534) after unshare.
 /// `target_uid`/`target_gid` are the UIDs visible inside the namespace.
-fn write_id_maps(real_uid: u32, real_gid: u32, target_uid: u32, target_gid: u32) {
-    let _ = std::fs::write("/proc/self/uid_map", format!("{} {} 1\n", target_uid, real_uid));
-    let _ = std::fs::write("/proc/self/setgroups", "deny\n");
-    let _ = std::fs::write("/proc/self/gid_map", format!("{} {} 1\n", target_gid, real_gid));
+///
+/// Errors must reach the caller: mapping only happens when the caller asked
+/// for a specific identity, and a failed write would otherwise leave the
+/// child running as the overflow uid (65534) with no indication. Ubuntu
+/// 24.04's default AppArmor restriction on unprivileged user namespaces
+/// produces exactly that: unshare succeeds, the map write fails.
+fn write_id_maps(
+    real_uid: u32,
+    real_gid: u32,
+    target_uid: u32,
+    target_gid: u32,
+) -> std::io::Result<()> {
+    std::fs::write("/proc/self/uid_map", format!("{} {} 1\n", target_uid, real_uid))?;
+    std::fs::write("/proc/self/setgroups", "deny\n")?;
+    std::fs::write("/proc/self/gid_map", format!("{} {} 1\n", target_gid, real_gid))?;
+    Ok(())
 }
 
 // ============================================================
@@ -362,7 +374,12 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
             if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
                 fail!("unshare(CLONE_NEWUSER)");
             }
-            write_id_maps(real_uid, real_gid, run_as.uid, run_as.gid);
+            if write_id_maps(real_uid, real_gid, run_as.uid, run_as.gid).is_err() {
+                fail!(
+                    "uid_map/gid_map write (is unprivileged userns restricted? \
+                     e.g. kernel.apparmor_restrict_unprivileged_userns=1)"
+                );
+            }
         }
     }
 
