@@ -27,11 +27,8 @@ jobs:
       - name: Build
         run: cargo build --release
 
-      - name: Run unit tests
-        run: cargo test --release --lib -- --test-threads=1
-
-      - name: Run integration tests
-        run: cargo test --release --test integration -- --test-threads=1
+      - name: Run all tests
+        run: cargo test --release --workspace --no-fail-fast -- --test-threads=1
 
   rust-low-abi:
     name: Rust low-ABI (ubuntu-22.04)
