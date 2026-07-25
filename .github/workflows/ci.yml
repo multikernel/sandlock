@@ -24,6 +24,13 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
+      # Ubuntu 24.04 images restrict unprivileged user namespaces via
+      # AppArmor: unshare(CLONE_NEWUSER) yields a capability-less namespace,
+      # the child's uid_map write fails, and the uid-mapping tests see the
+      # overflow uid (65534) instead of the mapped one.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: Build
         run: cargo build --release
 
