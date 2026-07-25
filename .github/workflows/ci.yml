@@ -34,7 +34,11 @@ jobs:
       - name: Build
         run: cargo build --release
 
+      # timeout-minutes: the suite finishes in a few minutes; a hang here is
+      # the known supervisor wedge under load, and should fail fast rather
+      # than hold the job for the 6-hour default.
       - name: Run all tests
+        timeout-minutes: 20
         run: cargo test --release --workspace --no-fail-fast -- --test-threads=1
 
   rust-low-abi:
