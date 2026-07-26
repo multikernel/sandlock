@@ -241,6 +241,14 @@ impl StdioSpec {
     fn inherit() -> Self {
         StdioSpec { stdin: StdioMode::Inherit, stdout: StdioMode::Inherit, stderr: StdioMode::Inherit }
     }
+
+    /// True when every stream inherits, i.e. the run is interactive and the
+    /// child may take the terminal foreground group.
+    fn all_inherit(&self) -> bool {
+        self.stdin == StdioMode::Inherit
+            && self.stdout == StdioMode::Inherit
+            && self.stderr == StdioMode::Inherit
+    }
 }
 
 /// Private runtime state.  Only allocated after `start()` / `run()` is
@@ -1780,6 +1788,7 @@ impl Sandbox {
                 sandbox_name: Some(sandbox_name.as_str()),
                 extra_syscalls: &extra_syscalls,
                 parent_pid,
+                foreground: stdio.all_inherit(),
             });
         }
 

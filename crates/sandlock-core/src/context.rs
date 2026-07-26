@@ -239,6 +239,11 @@ pub(crate) struct ChildSpawnArgs<'a> {
     /// parent death in the child without assuming PID 1 is always init
     /// (incorrect in containers where the entrypoint runs as PID 1).
     pub parent_pid: libc::pid_t,
+    /// Make the child the terminal's foreground process group before exec.
+    /// Only interactive (fully inherited) stdio wants this; a captured or
+    /// piped run taking the foreground demotes the embedding process to a
+    /// background job, and its next tty read stops it with SIGTTIN.
+    pub foreground: bool,
 }
 
 /// Set the calling thread/process name (`/proc/<pid>/comm`, shown by `ps`). The
@@ -263,6 +268,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         sandbox_name,
         extra_syscalls,
         parent_pid,
+        foreground,
     } = args;
     // Helper: abort child on error. Includes the OS error automatically.
     macro_rules! fail {
@@ -280,11 +286,13 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         fail!("setpgid");
     }
 
-    // 1b. If stdin is a terminal, become the foreground process group
-    //     so interactive shells can read from the TTY.
+    // 1b. Interactive runs only: if stdin is a terminal, become the
+    //     foreground process group so interactive shells can read from the
+    //     TTY. Captured/piped runs must not: the embedding process keeps
+    //     the terminal (issue #164).
     //     Must ignore SIGTTOU first — a background pgrp calling tcsetpgrp
     //     gets stopped by SIGTTOU otherwise.
-    if unsafe { libc::isatty(0) } == 1 {
+    if foreground && unsafe { libc::isatty(0) } == 1 {
         unsafe {
             libc::signal(libc::SIGTTOU, libc::SIG_IGN);
             libc::tcsetpgrp(0, libc::getpgrp());
