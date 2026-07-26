@@ -6,6 +6,7 @@ const EXIT_NOT_FOREGROUND_AT_START: i32 = 10;
 const EXIT_RUN_FAILED: i32 = 11;
 const EXIT_FOREGROUND_STOLEN: i32 = 12;
 const EXIT_FOREGROUND_NOT_TAKEN: i32 = 13;
+const EXIT_FOREGROUND_NOT_RESTORED: i32 = 14;
 
 /// Fork a child into a fresh session whose controlling terminal is a new
 /// pty (slave on stdin), then run `f` there and return its exit code.
@@ -107,11 +108,12 @@ fn captured_run_leaves_tty_foreground_with_caller() {
     );
 }
 
-/// Interactive runs hand the terminal to the sandboxed child so shells can
-/// read from the tty. The foreground group observed after the run is the
-/// child's, not the caller's.
+/// After an interactive run completes, the terminal foreground group must
+/// be back with the caller. The CLI's parent shell restores itself when the
+/// whole process exits, but an API user embedding an interactive run keeps
+/// living on the same terminal afterward.
 #[test]
-fn interactive_run_hands_tty_foreground_to_child() {
+fn interactive_run_returns_tty_foreground_after_exit() {
     let code = run_in_pty_session(|| {
         let mut policy = test_policy().with_name("tty-interactive");
         let result = block_on(policy.run_interactive(&["true"]));
@@ -119,14 +121,51 @@ fn interactive_run_hands_tty_foreground_to_child() {
             Ok(r) if r.success() => {}
             _ => return EXIT_RUN_FAILED,
         }
-        if unsafe { libc::tcgetpgrp(0) == libc::getpgrp() } {
-            return EXIT_FOREGROUND_NOT_TAKEN;
+        if unsafe { libc::tcgetpgrp(0) != libc::getpgrp() } {
+            return EXIT_FOREGROUND_NOT_RESTORED;
         }
         EXIT_OK
     });
     assert_eq!(
         code, EXIT_OK,
         "helper exit {code} (10=no tty foreground at start, 11=run failed, \
-         13=interactive run did not hand the tty foreground to the child)"
+         14=tty foreground not returned to the caller after the run)"
+    );
+}
+
+/// Interactive runs hand the terminal to the sandboxed child while it is
+/// alive (so shells can read from the tty), and return it to the caller
+/// once the child is reaped, including the kill path.
+#[test]
+fn interactive_run_hands_tty_foreground_to_child_while_alive() {
+    let code = run_in_pty_session(|| {
+        block_on(async {
+            let mut policy = test_policy().with_name("tty-handover");
+            if policy.spawn_interactive(&["sleep", "30"]).await.is_err() {
+                return EXIT_RUN_FAILED;
+            }
+            let child = match policy.pid() {
+                Some(p) => p,
+                None => return EXIT_RUN_FAILED,
+            };
+            if unsafe { libc::tcgetpgrp(0) } != child {
+                return EXIT_FOREGROUND_NOT_TAKEN;
+            }
+            if policy.kill().is_err() {
+                return EXIT_RUN_FAILED;
+            }
+            if policy.wait().await.is_err() {
+                return EXIT_RUN_FAILED;
+            }
+            if unsafe { libc::tcgetpgrp(0) != libc::getpgrp() } {
+                return EXIT_FOREGROUND_NOT_RESTORED;
+            }
+            EXIT_OK
+        })
+    });
+    assert_eq!(
+        code, EXIT_OK,
+        "helper exit {code} (10=no tty foreground at start, 11=spawn/kill/wait failed, \
+         13=child never got the tty foreground, 14=tty foreground not returned after reap)"
     );
 }

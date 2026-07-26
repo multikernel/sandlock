@@ -285,6 +285,9 @@ struct Runtime {
     on_bind: Option<Box<dyn Fn(&HashMap<u16, u16>) + Send + Sync>>,
     handlers: Vec<(i64, Arc<dyn crate::seccomp::dispatch::Handler>)>,
     ready_w: Option<std::os::fd::OwnedFd>,
+    // The interactive child took the terminal's foreground process group at
+    // spawn; whoever reaps it must hand the foreground back to this process.
+    tty_foreground_taken: bool,
 }
 
 /// Lifecycle state for the runtime.
@@ -833,6 +836,11 @@ impl Sandbox {
         };
 
         self.rt_mut().state = RuntimeState::Stopped(exit_status.clone());
+
+        if self.rt().tty_foreground_taken {
+            sandbox_restore_tty_foreground(pid);
+            self.rt_mut().tty_foreground_taken = false;
+        }
 
         let rt = self.rt_mut();
         if let Some(h) = rt.notif_handle.take() { h.abort(); }
@@ -1410,6 +1418,7 @@ impl Sandbox {
                 on_bind: None,
                 handlers: Vec::new(),
                 ready_w: None,
+                tty_foreground_taken: false,
             }));
             clones.push(clone_sb);
         }
@@ -1506,6 +1515,7 @@ impl Sandbox {
             on_bind: None,
             handlers: Vec::new(),
             ready_w: None,
+            tty_foreground_taken: false,
         }));
         Ok(())
     }
@@ -1710,6 +1720,12 @@ impl Sandbox {
         // without assuming PID 1 is always init (wrong in containers).
         let parent_pid = unsafe { libc::getpid() };
 
+        // Interactive (fully inherited) stdio on a terminal: the child will
+        // take the tty foreground group, and this process must take it back
+        // once the child is reaped.
+        let foreground = stdio.all_inherit();
+        let tty_foreground_taken = foreground && unsafe { libc::isatty(0) } == 1;
+
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             return Err(SandboxRuntimeError::Fork(std::io::Error::last_os_error()).into());
@@ -1788,7 +1804,7 @@ impl Sandbox {
                 sandbox_name: Some(sandbox_name.as_str()),
                 extra_syscalls: &extra_syscalls,
                 parent_pid,
-                foreground: stdio.all_inherit(),
+                foreground,
             });
         }
 
@@ -1801,6 +1817,7 @@ impl Sandbox {
         self.rt_mut()._stderr_read = stderr_p.map(|(r, _w)| r);
 
         self.rt_mut().child_pid = Some(pid);
+        self.rt_mut().tty_foreground_taken = tty_foreground_taken;
         // State remains `Created` until `do_start` writes ready_w to release
         // the child to execve.
 
@@ -2146,6 +2163,27 @@ impl Process<'_> {
     }
 }
 
+/// Hand the terminal's foreground process group back to this process after
+/// reaping an interactive child that took it. Restores only while the child's
+/// group still owns the terminal, so a foreground the caller has since given
+/// to someone else is left alone. SIGTTOU is blocked around `tcsetpgrp`:
+/// this process is a background group at that moment, and an unblocked
+/// SIGTTOU would stop it, which is the exact symptom being prevented.
+fn sandbox_restore_tty_foreground(child_pid: i32) {
+    unsafe {
+        if libc::isatty(0) != 1 || libc::tcgetpgrp(0) != child_pid {
+            return;
+        }
+        let mut block: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut block);
+        libc::sigaddset(&mut block, libc::SIGTTOU);
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old);
+        libc::tcsetpgrp(0, libc::getpgrp());
+        libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+    }
+}
+
 // ================================================================
 // Drop for Sandbox — kills and reaps child if still running
 // ================================================================
@@ -2158,6 +2196,10 @@ impl Drop for Sandbox {
                     unsafe { libc::killpg(pid, libc::SIGKILL) };
                     let mut status: i32 = 0;
                     unsafe { libc::waitpid(pid, &mut status, 0) };
+                }
+                if rt.tty_foreground_taken {
+                    sandbox_restore_tty_foreground(pid);
+                    rt.tty_foreground_taken = false;
                 }
             }
 
