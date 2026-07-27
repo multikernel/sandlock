@@ -49,6 +49,54 @@ fn test_run_echo() {
     assert!(stdout.contains("test123"));
 }
 
+/// Regression for ordinary (non-port-remapped) sandboxes being omitted from
+/// `sandlock ps`.
+#[test]
+fn test_list_shows_running_sandbox_without_port_remap() {
+    use std::time::{Duration, Instant};
+
+    let name = format!("list-test-{}", std::process::id());
+    let mut child = sandlock_bin()
+        .args(args_for_host(&[
+            "run", "--name", &name,
+            "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin",
+            "--", "sleep", "30",
+        ]))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to start long-running sandbox");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last_output = None;
+    let found = loop {
+        let output = sandlock_bin().arg("ps").output().expect("failed to list sandboxes");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if output.status.success() && stdout.contains(&name) {
+            break true;
+        }
+        last_output = Some(output);
+        if child.try_wait().expect("failed to poll sandbox").is_some()
+            || Instant::now() >= deadline
+        {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    let _ = child.kill();
+    let child_output = child.wait_with_output().expect("failed to reap sandbox CLI");
+    assert!(
+        found,
+        "running sandbox {name:?} was absent from `sandlock ps`; \
+         list stdout={:?}, list stderr={:?}, sandbox stderr={}",
+        last_output.as_ref().map(|o| String::from_utf8_lossy(&o.stdout)),
+        last_output.as_ref().map(|o| String::from_utf8_lossy(&o.stderr)),
+        String::from_utf8_lossy(&child_output.stderr),
+    );
+}
+
 #[test]
 fn test_run_exit_code() {
     let output = sandlock_bin()

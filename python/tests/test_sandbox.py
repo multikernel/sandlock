@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import os
+import pty
+import select
 import socket
 import statistics
 import sys
@@ -49,6 +51,64 @@ class TestSandboxRun:
         result = _policy().run(["python3", "-c", "print(42)"])
         assert result.success
         assert result.stdout.strip() == b"42"
+
+    def test_run_does_not_steal_callers_controlling_terminal(self, tmp_path):
+        """A blocking run from a REPL must leave the REPL in the foreground.
+
+        This needs a real controlling pseudo-terminal: without one, the
+        foreground-process-group bug cannot produce the user's ``Stopped
+        python`` symptom.
+        """
+        writable = tmp_path / "sandbox"
+        writable.mkdir()
+        source_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src"))
+        script = f"""
+import os, sys
+sys.path.insert(0, {source_root!r})
+from sandlock import Sandbox
+sandbox = Sandbox(
+    fs_writable=[{str(writable)!r}],
+    fs_readable=["/usr", "/lib", "/etc"],
+    max_memory="256M",
+    max_processes=10,
+    clean_env=True,
+)
+result = sandbox.run(["python3", "-c", "print('hello')"], timeout=30)
+print("RESULT", result.success, result.error, flush=True)
+print("FOREGROUND", os.tcgetpgrp(0) == os.getpgrp(), flush=True)
+"""
+        pid, master = pty.fork()
+        if pid == 0:
+            os.execv(sys.executable, [sys.executable, "-c", script])
+
+        output = bytearray()
+        status = None
+        deadline = time.monotonic() + 40
+        try:
+            while time.monotonic() < deadline:
+                ready, _, _ = select.select([master], [], [], 0.1)
+                if ready:
+                    try:
+                        output.extend(os.read(master, 4096))
+                    except OSError:
+                        pass
+                waited, child_status = os.waitpid(pid, os.WNOHANG | os.WUNTRACED)
+                if waited:
+                    status = child_status
+                    break
+        finally:
+            if status is None or os.WIFSTOPPED(status):
+                os.kill(pid, 9)
+                os.waitpid(pid, 0)
+            os.close(master)
+
+        text = output.decode(errors="replace")
+        assert status is not None, f"PTY child timed out; output={text!r}"
+        assert not os.WIFSTOPPED(status), (
+            f"Python was stopped by signal {os.WSTOPSIG(status)}; output={text!r}"
+        )
+        assert os.waitstatus_to_exitcode(status) == 0, text
+        assert "FOREGROUND True" in text, text
 
     def test_command_failure(self):
         result = _policy().run(["false"])
