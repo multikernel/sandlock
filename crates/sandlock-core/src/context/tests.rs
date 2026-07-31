@@ -224,12 +224,19 @@ fn test_blocklist_syscall_numbers_default_with_sysv_ipc_allowed() {
     assert!(!nrs.contains(&(libc::SYS_semget as u32)));
 }
 
+// The expansion tests below inject the group deny after build(): with
+// allow "sysv_ipc" set, the !allows_sysv_ipc() fallback in
+// resolve_blocklist is skipped, so the members can appear only through
+// group expansion of the deny entry. Going through build() instead
+// would either trip the allow/deny conflict check or (deny-only) let
+// the fallback add the members and mask a broken expansion.
 #[test]
 fn test_blocklist_syscall_numbers_expands_deny_group() {
-    let policy = Sandbox::builder()
-        .extra_deny_syscalls(vec!["sysv_ipc".into()])
+    let mut policy = Sandbox::builder()
+        .extra_allow_syscalls(vec!["sysv_ipc".into()])
         .build()
         .unwrap();
+    policy.extra_deny_syscalls = vec!["sysv_ipc".into()];
     let nrs = blocklist_syscall_numbers(&policy);
     assert!(nrs.contains(&(libc::SYS_shmget as u32)));
     assert!(nrs.contains(&(libc::SYS_msgget as u32)));
@@ -239,12 +246,11 @@ fn test_blocklist_syscall_numbers_expands_deny_group() {
 
 #[test]
 fn test_no_supervisor_blocklist_expands_deny_group() {
-    // The relaxed no-supervisor list omits SysV IPC append only when the
-    // group is allowed; an explicit group deny must still expand here.
-    let policy = Sandbox::builder()
-        .extra_deny_syscalls(vec!["sysv_ipc".into()])
+    let mut policy = Sandbox::builder()
+        .extra_allow_syscalls(vec!["sysv_ipc".into()])
         .build()
         .unwrap();
+    policy.extra_deny_syscalls = vec!["sysv_ipc".into()];
     let nrs = no_supervisor_blocklist_syscall_numbers(&policy);
     assert!(nrs.contains(&(libc::SYS_shmget as u32)));
     assert!(nrs.contains(&(libc::SYS_msgctl as u32)));
