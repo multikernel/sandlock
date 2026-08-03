@@ -1,0 +1,222 @@
+{
+  "about": [
+    "One corpus of values, four surfaces.",
+    "",
+    "sandlock owns two small grammars: a byte size (limits.memory, limits.disk)",
+    "and an RFC 3339 instant (determinism.time_start). Both are reachable four",
+    "ways: a command-line flag, a profile key, the Python SDK and the Go SDK.",
+    "Until the C ABI setters started taking strings, the last two parsed the",
+    "value themselves. They agreed with each other and both disagreed with the",
+    "core they were feeding, accepting 1.5G and 1T that no flag and no profile",
+    "has ever accepted. The entries marked sdk_only below are exactly those.",
+    "",
+    "This file is the one list those surfaces are measured against. It lives",
+    "above all of them on purpose: a corpus pasted into each language would be",
+    "the very failure being fixed, one table per surface, free to drift.",
+    "",
+    "Read by:",
+    "  python/tests/test_setter_grammar_parity.py (the flag, the profile, the",
+    "    C ABI setter called through ctypes, and the Python SDK)",
+    "  go/grammar_parity_linux_test.go (the Go SDK)",
+    "",
+    "knobs: one grammar carrier, and how each surface spells it.",
+    "  flag     the command-line flag",
+    "  profile  [section, key] in a profile, and where the value lands in the",
+    "           canonical document sandlock_profile_parse returns",
+    "  setter   the C ABI setter",
+    "  python   the Python SDK field",
+    "  go       the Go SDK field",
+    "  labels   the knob name each surface passes to the core so the core can",
+    "           name it in a diagnosis. Absent when the grammar's message names",
+    "           no knob, in which case every surface must say the same words.",
+    "",
+    "accepted: values every surface must take.",
+    "  resolved  what the value means, as the canonical profile document reports",
+    "            it: a count of bytes, or {seconds, nanoseconds} since the epoch.",
+    "            This pins the grammar, not merely that the surfaces agree.",
+    "  renders   how a live sandbox spells the value back over `sandlock",
+    "            inspect`, or null when that document cannot carry it.",
+    "  live      false for a policy whose guest cannot survive to be inspected.",
+    "            Such a value is still driven through every surface, one step",
+    "            earlier: all of them have to accept it.",
+    "",
+    "rejected: values no surface may take.",
+    "  diagnosis  what the core's sentence has to start with, once the surface's",
+    "             own envelope is peeled and the knob label is folded to <knob>.",
+    "             A prefix rather than the whole sentence because the timestamp",
+    "             parser continues it with wording that belongs to jiff. The",
+    "             surfaces are separately required to produce one identical full",
+    "             sentence, so the prefix pins the verdict and the comparison",
+    "             pins that nobody reworded the rest of it.",
+    "  sdk_only   true for a value a deleted SDK parser used to accept. These",
+    "             are the regression this corpus exists to guard.",
+    "",
+    "unreachable: a surface that cannot carry the value at all, with the reason.",
+    "  Only ever a limit of the host language, never a policy choice: Go spells",
+    "  an unset string field as \"\", so an empty MaxMemory is Go's way of saying",
+    "  nothing was configured and never reaches the core. The surfaces that can",
+    "  carry the value still have to agree on it, and the claim itself is pinned",
+    "  by a test of its own rather than taken on trust."
+  ],
+
+  "knobs": {
+    "max_memory": {
+      "flag": "--max-memory",
+      "profile": ["limits", "memory"],
+      "setter": "sandlock_sandbox_builder_max_memory",
+      "python": "max_memory",
+      "go": "MaxMemory"
+    },
+    "max_disk": {
+      "flag": "--max-disk",
+      "profile": ["limits", "disk"],
+      "setter": "sandlock_sandbox_builder_max_disk",
+      "python": "max_disk",
+      "go": "MaxDisk"
+    },
+    "time_start": {
+      "flag": "--time-start",
+      "profile": ["determinism", "time_start"],
+      "setter": "sandlock_sandbox_builder_time_start",
+      "python": "time_start",
+      "go": "TimeStart",
+      "labels": {
+        "flag": "--time-start",
+        "profile": "[determinism].time_start",
+        "setter": "time_start",
+        "python": "time_start",
+        "go": "time_start"
+      }
+    }
+  },
+
+  "accepted": [
+    {
+      "comment": "One quantity, six spellings: either case of the suffix, the whitespace the core trims around and inside the value, and the bare count of bytes a caller who already has a number writes. Whitespace inside the value is the detail a hand-written parser gets wrong in one direction or the other.",
+      "knob": "max_memory", "value": "512M", "resolved": 536870912, "renders": "512M"
+    },
+    { "knob": "max_memory", "value": "512m", "resolved": 536870912, "renders": "512M" },
+    { "knob": "max_memory", "value": "  512M  ", "resolved": 536870912, "renders": "512M" },
+    { "knob": "max_memory", "value": "512 M", "resolved": 536870912, "renders": "512M" },
+    { "knob": "max_memory", "value": "536870912", "resolved": 536870912, "renders": "512M" },
+    { "knob": "max_memory", "value": "1G", "resolved": 1073741824, "renders": "1G" },
+    {
+      "comment": "A one-byte ceiling is a policy the grammar spells out and no guest survives (the dynamic loader's first anonymous mmap is over it), so this one is compared on acceptance instead of on a live document. It is here to keep the two layers apart: the grammar reads a quantity, and what the sandbox then does with it is not the grammar's business, which is why 0 sits in the rejected list under a message from the builder rather than from the parser.",
+      "knob": "max_memory", "value": "1", "resolved": 1, "renders": null, "live": false
+    },
+    {
+      "comment": "The largest quantity the grammar can carry: one more gibibyte overflows u64, which is the rejected 17179869184G below.",
+      "knob": "max_memory", "value": "17179869183G", "resolved": 18446744072635809792, "renders": "17179869183G"
+    },
+    {
+      "comment": "The second size knob has a setter of its own and could be wired to the wrong field without anything above noticing.",
+      "knob": "max_disk", "value": "1K", "resolved": 1024, "renders": "1K"
+    },
+    { "knob": "max_disk", "value": "1G", "resolved": 1073741824, "renders": "1G" },
+    {
+      "comment": "The same text the memory knob refuses. Zero is the documented spelling of an unlimited disk quota, and the grammar reads it identically for both; what differs is the policy each knob can express with it. Two verdicts on one spelling is the case a surface with a parser of its own would be most tempted to smooth over, so it is here, and all four surfaces have to disagree in the same direction.",
+      "knob": "max_disk", "value": "0", "resolved": 0, "renders": "0"
+    },
+    {
+      "comment": "Not a whole multiple of any unit, so the document has to spell it in bytes; a size that rendered as 1M would hide a rounding difference.",
+      "knob": "max_disk", "value": "1048577", "resolved": 1048577, "renders": "1048577"
+    },
+    {
+      "comment": "The same instant written three ways has to resolve to one value, so the offset is applied rather than ignored.",
+      "knob": "time_start", "value": "2026-01-01T00:00:00Z",
+      "resolved": { "seconds": 1767225600, "nanoseconds": 0, "rfc3339": "2026-01-01T00:00:00Z" },
+      "renders": "2026-01-01T00:00:00Z"
+    },
+    {
+      "knob": "time_start", "value": "2026-01-01T00:00:00+00:00",
+      "resolved": { "seconds": 1767225600, "nanoseconds": 0, "rfc3339": "2026-01-01T00:00:00Z" },
+      "renders": "2026-01-01T00:00:00Z"
+    },
+    {
+      "knob": "time_start", "value": "2025-12-31T19:00:00-05:00",
+      "resolved": { "seconds": 1767225600, "nanoseconds": 0, "rfc3339": "2026-01-01T00:00:00Z" },
+      "renders": "2026-01-01T00:00:00Z"
+    },
+    {
+      "comment": "The two instants the old uint64 epoch-seconds parameter could not carry at all. The effective policy document still cannot spell them (it renders whole seconds and drops a pre-epoch stamp entirely), which is a property of that document rather than of any surface; the exact resolution is pinned through the canonical profile instead.",
+      "knob": "time_start", "value": "2026-01-01T00:00:00.5Z",
+      "resolved": { "seconds": 1767225600, "nanoseconds": 500000000, "rfc3339": "2026-01-01T00:00:00.5Z" },
+      "renders": "2026-01-01T00:00:00Z"
+    },
+    {
+      "knob": "time_start", "value": "1969-07-20T20:17:00Z",
+      "resolved": { "seconds": -14182980, "nanoseconds": 0, "rfc3339": "1969-07-20T20:17:00Z" },
+      "renders": null
+    }
+  ],
+
+  "rejected": [
+    {
+      "comment": "An empty value, which Go alone cannot express, and a blank one, which it can.",
+      "knob": "max_memory", "value": "", "diagnosis": "empty byte size string",
+      "unreachable": { "go": "an empty MaxMemory is Go's spelling of \"unset\"" }
+    },
+    { "knob": "max_memory", "value": " ", "diagnosis": "empty byte size string" },
+    {
+      "comment": "Zero parses: it is a perfectly good quantity, and the builder refuses it one layer further in, because zero is also the sentinel the supervisor carries for \"no ceiling\". So this entry checks something the parse cases cannot, that a surface forwards the value far enough to collect a verdict from beyond the parser as well.",
+      "knob": "max_memory", "value": "0",
+      "diagnosis": "max_memory must be greater than 0; omit it to leave memory unlimited"
+    },
+    { "knob": "max_memory", "value": "not_a_size", "diagnosis": "invalid byte size: not_a_size" },
+    {
+      "comment": "A bare suffix with no quantity, and a negative count.",
+      "knob": "max_memory", "value": "M", "diagnosis": "invalid byte size: M"
+    },
+    { "knob": "max_memory", "value": "-1", "diagnosis": "invalid byte size: -1" },
+    {
+      "comment": "One gibibyte past the largest accepted value: the multiplication overflows u64.",
+      "knob": "max_memory", "value": "17179869184G", "diagnosis": "byte size out of range: 17179869184G"
+    },
+    {
+      "comment": "The fraction both deleted SDK parsers took. Python's parse_memory_size and Go's ParseMemory each ran the quantity through a float, so 1.5G built a sandbox with 1610612736 bytes that no profile carrying the same text could ever have built.",
+      "knob": "max_memory", "value": "1.5G", "diagnosis": "invalid byte size: 1.5G", "sdk_only": true
+    },
+    {
+      "comment": "The same fraction below one unit, which the float parsers silently truncated to 512 rather than refusing.",
+      "knob": "max_memory", "value": "0.5K", "diagnosis": "invalid byte size: 0.5K", "sdk_only": true
+    },
+    {
+      "comment": "The terabyte suffix the two SDKs invented between them. The core's units stop at G.",
+      "knob": "max_memory", "value": "1T", "diagnosis": "unknown byte size suffix: T", "sdk_only": true
+    },
+    {
+      "knob": "max_disk", "value": "", "diagnosis": "empty byte size string",
+      "unreachable": { "go": "an empty MaxDisk is Go's spelling of \"unset\"" }
+    },
+    { "knob": "max_disk", "value": " ", "diagnosis": "empty byte size string" },
+    {
+      "comment": "The core reports the suffix it looked up, which it upper-cases first, so this is also a check that the surfaces quote the core rather than the input.",
+      "knob": "max_disk", "value": "12x", "diagnosis": "unknown byte size suffix: X"
+    },
+    { "knob": "max_disk", "value": "1.5G", "diagnosis": "invalid byte size: 1.5G", "sdk_only": true },
+    { "knob": "max_disk", "value": "512T", "diagnosis": "unknown byte size suffix: T", "sdk_only": true },
+    {
+      "knob": "time_start", "value": "", "diagnosis": "invalid <knob> \"\": failed to parse year in date: ",
+      "unreachable": { "go": "an empty TimeStart is Go's spelling of \"unset\"" }
+    },
+    { "knob": "time_start", "value": "nope", "diagnosis": "invalid <knob> \"nope\": failed to parse year in date: " },
+    {
+      "comment": "A wall-clock reading with no offset is not an instant, so a naive stamp is refused rather than being read in some local zone.",
+      "knob": "time_start", "value": "2026-01-01T00:00:00",
+      "diagnosis": "invalid <knob> \"2026-01-01T00:00:00\": failed to find offset component"
+    },
+    {
+      "knob": "time_start", "value": "2026-13-01T00:00:00Z",
+      "diagnosis": "invalid <knob> \"2026-13-01T00:00:00Z\": failed to parse month in date: "
+    },
+    {
+      "comment": "A bare epoch count, which is exactly what the timestamp setter used to be handed: both SDKs resolved the text to seconds themselves and passed a number, so this reached a live policy through a binding while the identical text in a profile was refused. The number still has a door of its own (the Python SDK forwards an int to sandlock_sandbox_builder_time_start_epoch), which is the resolved instant rather than a second grammar; as text it is not an RFC 3339 stamp and is refused everywhere.",
+      "knob": "time_start", "value": "1700000000",
+      "diagnosis": "invalid <knob> \"1700000000\": ", "sdk_only": true
+    },
+    {
+      "knob": "time_start", "value": "1700000000.5",
+      "diagnosis": "invalid <knob> \"1700000000.5\": ", "sdk_only": true
+    }
+  ]
+}

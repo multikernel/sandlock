@@ -86,10 +86,16 @@ fn valid_profile_returns_resolved_json() {
     );
     // Sizes come back as integer bytes.
     assert_eq!(v["limits"]["memory"], serde_json::json!(536870912u64));
-    // time_start comes back as epoch time.
+    // time_start comes back as epoch time, with the instant re-rendered so a
+    // consumer whose scalar type cannot hold both halves has something exact
+    // to forward to the string setter.
     assert_eq!(
         v["determinism"]["time_start"],
-        serde_json::json!({"seconds": 1767225600i64, "nanoseconds": 0})
+        serde_json::json!({
+            "seconds": 1767225600i64,
+            "nanoseconds": 0,
+            "rfc3339": "2026-01-01T00:00:00Z",
+        })
     );
     // Bind port ranges come back expanded.
     assert_eq!(

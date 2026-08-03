@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import json
+import math
 import os
 import signal
 import sys
@@ -84,8 +85,8 @@ _b_fs_mount = _builder_fn("sandlock_sandbox_builder_fs_mount", ctypes.c_char_p, 
 _b_fs_mount_ro = _builder_fn("sandlock_sandbox_builder_fs_mount_ro", ctypes.c_char_p, ctypes.c_char_p)
 _b_on_exit = _builder_fn("sandlock_sandbox_builder_on_exit", ctypes.c_uint8)
 _b_on_error = _builder_fn("sandlock_sandbox_builder_on_error", ctypes.c_uint8)
-_b_max_memory = _builder_fn("sandlock_sandbox_builder_max_memory", ctypes.c_uint64)
-_b_max_disk = _builder_fn("sandlock_sandbox_builder_max_disk", ctypes.c_uint64)
+_b_max_memory = _builder_fn("sandlock_sandbox_builder_max_memory", ctypes.c_char_p)
+_b_max_disk = _builder_fn("sandlock_sandbox_builder_max_disk", ctypes.c_char_p)
 _b_max_processes = _builder_fn("sandlock_sandbox_builder_max_processes", ctypes.c_uint32)
 _b_max_cpu = _builder_fn("sandlock_sandbox_builder_max_cpu", ctypes.c_uint8)
 _b_num_cpus = _builder_fn("sandlock_sandbox_builder_num_cpus", ctypes.c_uint32)
@@ -105,7 +106,10 @@ _b_user = _builder_fn("sandlock_sandbox_builder_user", ctypes.c_uint32, ctypes.c
 _b_random_seed = _builder_fn("sandlock_sandbox_builder_random_seed", ctypes.c_uint64)
 _b_clean_env = _builder_fn("sandlock_sandbox_builder_clean_env", ctypes.c_bool)
 _b_env_var = _builder_fn("sandlock_sandbox_builder_env_var", ctypes.c_char_p, ctypes.c_char_p)
-_b_time_start = _builder_fn("sandlock_sandbox_builder_time_start", ctypes.c_uint64)
+_b_time_start = _builder_fn("sandlock_sandbox_builder_time_start", ctypes.c_char_p)
+_b_time_start_epoch = _builder_fn(
+    "sandlock_sandbox_builder_time_start_epoch", ctypes.c_int64, ctypes.c_uint32
+)
 _b_extra_deny_syscalls = _builder_fn("sandlock_sandbox_builder_extra_deny_syscalls", ctypes.c_char_p)
 _b_extra_allow_syscalls = _builder_fn("sandlock_sandbox_builder_extra_allow_syscalls", ctypes.c_char_p)
 _b_max_open_files = _builder_fn("sandlock_sandbox_builder_max_open_files", ctypes.c_uint32)
@@ -148,22 +152,6 @@ _b_disable = _builder_fn(
     "sandlock_sandbox_builder_disable", ctypes.c_uint32
 )
 
-
-def _validate_protection(p: int, *, field: str) -> int:
-    """Coerce a caller-supplied protection value to a known discriminant
-    or raise :class:`ValueError`. Centralises the range check so the FFI
-    is never invoked with an unknown integer (the Rust setters silently
-    no-op on bad input, which is the wrong UX for the Python caller —
-    we want a loud failure at the SDK boundary instead).
-    """
-    try:
-        return int(Protection(int(p)))
-    except (ValueError, TypeError) as e:
-        valid = ", ".join(f"{m.name}={int(m)}" for m in Protection)
-        raise ValueError(
-            f"{field}: {p!r} is not a known Protection discriminant "
-            f"(valid: {valid})"
-        ) from e
 
 # Policy callback (policy_fn).
 # Path strings absent (issue #27 — path-based control belongs in Landlock).
@@ -284,6 +272,26 @@ _lib.sandlock_sandbox_free.argtypes = [_c_policy_p]
 # this function rather than ctypes' own deallocator.
 _lib.sandlock_string_free.restype = None
 _lib.sandlock_string_free.argtypes = [ctypes.c_char_p]
+
+
+def _free_builder(b) -> None:
+    """Release a builder that will never be built.
+
+    The C ABI has no `sandlock_sandbox_builder_free`; `sandlock_sandbox_build`
+    is the only entry point that consumes a builder, so an abandoned one is
+    released by building it and throwing the result away. Whatever verdict the
+    build reaches is irrelevant here: the caller is already unwinding with the
+    reason it stopped. The Go SDK carried the same helper for the same reason.
+    """
+    if not b:
+        return
+    err = ctypes.c_int(0)
+    err_msg = ctypes.c_char_p()
+    ptr = _lib.sandlock_sandbox_build(b, ctypes.byref(err), ctypes.byref(err_msg))
+    if err_msg.value:
+        _lib.sandlock_string_free(err_msg)
+    if ptr:
+        _lib.sandlock_sandbox_free(ptr)
 
 # Profile parsing. The return type is c_void_p rather than c_char_p on
 # purpose: ctypes converts a c_char_p result to `bytes` and drops the
@@ -726,7 +734,10 @@ class SyscallEvent:
     cost.
     """
     syscall: str
-    category: str  # "file", "network", "process", "memory"
+    category: str | int
+    """``"file"``, ``"network"``, ``"process"`` or ``"memory"``; a category
+    this SDK has no name for is the raw discriminant the core sent, rather
+    than one of the four names it is not."""
     pid: int
     parent_pid: int = 0
     host: str | None = None
@@ -791,43 +802,100 @@ def _encode(s: str) -> bytes:
     return result
 
 
-def _bytes_limit(value, field: str) -> int:
-    """Validate a byte-count policy field for the ``uint64`` C ABI setter."""
+def _fits(value, field: str, *, bits: int, signed: bool = False) -> int:
+    """Check that an integer survives the C ABI parameter that carries it.
+
+    A representation check, and the one kind the core cannot make for us: the
+    setter's parameter is a fixed-width integer, Python's is not, and ctypes
+    converts by masking rather than by failing. Without this, ``max_cpu=300``
+    arrives as 44 and is accepted as a perfectly ordinary throttle, and
+    ``uid=-1`` arrives as 4294967295. The value the core would have judged is
+    gone before it gets there, so refusing here is what keeps its verdict
+    reachable, not a second opinion on the policy.
+
+    ``bool`` is rejected outright: it is an ``int`` subclass, so ``True``
+    would otherwise pass silently as 1.
+    """
     if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError(
-            f"{field} must be an integer number of bytes, got {value!r}"
+        raise TypeError(f"{field} must be an integer, got {value!r}")
+    lo, hi = (-(1 << (bits - 1)), (1 << (bits - 1)) - 1) if signed else (0, (1 << bits) - 1)
+    if not lo <= value <= hi:
+        raise ValueError(
+            f"{field}={value} does not fit the {'int' if signed else 'uint'}{bits} "
+            f"parameter of its C ABI setter (permitted: {lo}..{hi})"
         )
-    if not 0 <= value <= 0xFFFF_FFFF_FFFF_FFFF:
-        raise ValueError(f"{field} out of range for a 64-bit byte count: {value}")
     return value
 
 
-def _epoch_seconds(value) -> int:
-    """Validate ``time_start`` for the ``uint64`` epoch-seconds C ABI setter.
+def _branch_action(value, field: str) -> int:
+    """Render a branch action as the discriminant its C ABI setter takes.
 
-    The setter carries whole, non-negative seconds. The profile grammar is
-    wider than that (it accepts pre-1970 stamps and fractional seconds), so
-    the values it cannot carry are refused here: passing them on would make
-    the same profile mean one thing through the CLI and another through this
-    SDK, and a negative value would additionally wrap to a date in the far
-    future instead of failing.
+    A :class:`~sandlock.BranchAction`, or one of the three spellings it is
+    built from, becomes its own discriminant. A number is passed through
+    untouched, so an action this SDK does not know still reaches the core and
+    is refused there by value, where it used to be replaced by Commit or Abort
+    through a ``.get(value, default)``: a typo became a decision about the
+    caller's writes.
+
+    A word the enum does not know cannot be forwarded at all, because the
+    setter's parameter is a ``uint8_t``. That is a limit of the ABI, not a
+    second opinion on the policy, and it is the only case answered here.
     """
+    from .sandbox import BranchAction
+
+    if isinstance(value, BranchAction):
+        return value.abi
+    if isinstance(value, int) and not isinstance(value, bool):
+        return _fits(value, field, bits=8)
+    try:
+        return BranchAction(value).abi
+    except ValueError:
+        raise ValueError(
+            f"{field}: {value!r} is not a branch action; "
+            f"the C ABI setter carries a discriminant, so a word it does not "
+            f"name ({', '.join(a.value for a in BranchAction)}) cannot be "
+            f"forwarded to the core to be judged there"
+        ) from None
+
+
+def _epoch_split(value: float) -> tuple[int, int]:
+    """Split epoch seconds into the ``(seconds, nanoseconds)`` pair the ABI takes.
+
+    Not a grammar: the unit is fixed on both sides, so this only moves the
+    sub-second part into its own field, flooring the way
+    ``sandlock_profile_parse`` does so the remainder is never negative. A
+    string is never routed through here; it goes to the core verbatim.
+    """
+    seconds = math.floor(value)
+    nanoseconds = round((value - seconds) * 1_000_000_000)
+    if nanoseconds == 1_000_000_000:  # the remainder rounded up to a full second
+        seconds += 1
+        nanoseconds = 0
+    return seconds, nanoseconds
+
+
+def _b_time_start_from(b, value):
+    """Send ``time_start`` through whichever of its two setters fits the value.
+
+    Text goes to ``sandlock_sandbox_builder_time_start`` untouched, so the RFC
+    3339 grammar is read once, by the core, exactly as it is for a profile key
+    and a command-line flag. A number is an instant that has already been
+    resolved (it is what ``sandlock_profile_parse`` reports) and goes to
+    ``..._time_start_epoch``, which takes the resolved form directly; rendering
+    it back into a stamp here would be this SDK writing the grammar it just
+    stopped reading.
+    """
+    if isinstance(value, str):
+        return _b_time_start(b, _encode(value))
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(
-            f"time_start must be Unix epoch seconds, got {value!r}"
+            "time_start must be an RFC 3339 string or epoch seconds, got "
+            f"{value!r}"
         )
-    if value < 0:
-        raise ValueError(
-            "time_start before the Unix epoch is not supported by the "
-            f"sandlock_sandbox_builder_time_start ABI: {value}"
-        )
-    if value != int(value):
-        raise ValueError(
-            "time_start carries sub-second precision, which the "
-            "sandlock_sandbox_builder_time_start ABI cannot represent: "
-            f"{value}"
-        )
-    return int(value)
+    seconds, nanoseconds = _epoch_split(value)
+    return _b_time_start_epoch(
+        b, _fits(seconds, "time_start seconds", bits=64, signed=True), nanoseconds
+    )
 
 
 def _make_argv(cmd: Sequence[str]):
@@ -1118,7 +1186,7 @@ class _NativePolicy:
         "port_remap",
         "http_allow", "http_deny", "http_ports", "http_ca", "http_key",
         "http_inject_ca", "http_ca_out",
-        "uid", "gid",
+        "user",
         "random_seed", "time_start", "clean_env", "env",
         "extra_deny_syscalls", "extra_allow_syscalls", "max_open_files",
         "no_randomize_memory", "no_huge_pages", "no_coredump", "deterministic_dirs",
@@ -1134,147 +1202,187 @@ class _NativePolicy:
     def _build_from_policy(policy: PolicyDataclass):
         """Build a native builder from a Python Sandbox dataclass. Returns builder pointer."""
         b = _lib.sandlock_sandbox_builder_new()
+        try:
 
-        for p in (policy.fs_readable or []):
-            if str(p) == "/lib64" and not os.path.exists("/lib64"):
-                continue
-            b = _b_fs_read(b, _encode(str(p)))
-        for p in (policy.fs_writable or []):
-            b = _b_fs_write(b, _encode(str(p)))
-        for p in (policy.fs_denied or []):
-            b = _b_fs_deny(b, _encode(str(p)))
+            # Every requested grant is forwarded, including one whose path is
+            # not there. This used to drop `/lib64` and only `/lib64`, which
+            # answered a portability question for the caller, silently, for one
+            # hardcoded path. It is the caller who knows whether a missing
+            # /lib64 is a portability detail or a typo.
+            #
+            # What the caller gets instead is late and thin: `build()` does not
+            # check existence, so the policy builds, and the rule is installed
+            # in the child, where Landlock has to open the path. A missing one
+            # comes back as `Result(success=False, error='sandlock_create
+            # failed')` with the path nowhere in it, and under `chroot` it is
+            # skipped without a word. Filter system paths on the way in if the
+            # set varies by host, the way `sandlock.mcp` does for its default
+            # policy.
+            for p in (policy.fs_readable or []):
+                b = _b_fs_read(b, _encode(str(p)))
+            for p in (policy.fs_writable or []):
+                b = _b_fs_write(b, _encode(str(p)))
+            for p in (policy.fs_denied or []):
+                b = _b_fs_deny(b, _encode(str(p)))
 
-        if policy.fs_storage:
-            b = _b_fs_storage(b, _encode(str(policy.fs_storage)))
+            if policy.fs_storage:
+                b = _b_fs_storage(b, _encode(str(policy.fs_storage)))
 
-        if policy.gpu_devices is not None:
-            arr = (ctypes.c_uint32 * len(policy.gpu_devices))(*policy.gpu_devices)
-            b = _b_gpu_devices(b, arr, len(policy.gpu_devices))
+            if policy.gpu_devices is not None:
+                devices = [_fits(d, "gpu_devices entry", bits=32) for d in policy.gpu_devices]
+                arr = (ctypes.c_uint32 * len(devices))(*devices)
+                b = _b_gpu_devices(b, arr, len(devices))
 
-        if policy.workdir:
-            b = _b_workdir(b, _encode(str(policy.workdir)))
-        if policy.cwd:
-            b = _b_cwd(b, _encode(str(policy.cwd)))
-        if policy.chroot:
-            b = _b_chroot(b, _encode(str(policy.chroot)))
-        for mount in (policy.fs_mount or []):
-            setter = _b_fs_mount_ro if mount.ro else _b_fs_mount
-            b = setter(b, _encode(str(mount.virt)), _encode(str(mount.host)))
+            if policy.workdir:
+                b = _b_workdir(b, _encode(str(policy.workdir)))
+            if policy.cwd:
+                b = _b_cwd(b, _encode(str(policy.cwd)))
+            if policy.chroot:
+                b = _b_chroot(b, _encode(str(policy.chroot)))
+            for mount in (policy.fs_mount or []):
+                setter = _b_fs_mount_ro if mount.ro else _b_fs_mount
+                b = setter(b, _encode(str(mount.virt)), _encode(str(mount.host)))
 
-        # COW branch actions (0=Commit, 1=Abort, 2=Keep)
-        _action_map = {"commit": 0, "abort": 1, "keep": 2}
-        on_exit_val = policy.on_exit.value if hasattr(policy.on_exit, 'value') else str(policy.on_exit)
-        on_error_val = policy.on_error.value if hasattr(policy.on_error, 'value') else str(policy.on_error)
-        b = _b_on_exit(b, _action_map.get(on_exit_val, 0))
-        b = _b_on_error(b, _action_map.get(on_error_val, 1))
+            # COW branch actions. An unknown value is forwarded as the number the
+            # ABI carries, so the core answers it by name ("unrecognized branch
+            # action 7"). It used to be mapped to Commit or Abort by `.get(v, 0)`,
+            # which turned a typo into a decision about the caller's writes.
+            if policy.on_exit is not None:
+                b = _b_on_exit(b, _branch_action(policy.on_exit, "on_exit"))
+            if policy.on_error is not None:
+                b = _b_on_error(b, _branch_action(policy.on_error, "on_error"))
 
-        if policy.max_memory is not None:
-            b = _b_max_memory(b, _bytes_limit(policy.max_memory, "max_memory"))
+            # Byte sizes go to the core as text, whichever way they were written.
+            # `'512M'` is the grammar's own spelling and a bare number is the same
+            # grammar's count of bytes, which is what a loaded profile resolves to,
+            # so both spellings meet at the one parser instead of being judged here.
+            if policy.max_memory is not None:
+                b = _b_max_memory(b, _encode(policy.max_memory))
 
-        if policy.max_disk is not None:
-            b = _b_max_disk(b, _bytes_limit(policy.max_disk, "max_disk"))
+            if policy.max_disk is not None:
+                b = _b_max_disk(b, _encode(policy.max_disk))
 
-        if policy.max_processes != 64:
-            b = _b_max_processes(b, policy.max_processes)
-        if policy.max_cpu is not None:
-            b = _b_max_cpu(b, policy.max_cpu)
-        if policy.num_cpus is not None:
-            b = _b_num_cpus(b, policy.num_cpus)
-        if policy.cpu_cores is not None:
-            arr = (ctypes.c_uint32 * len(policy.cpu_cores))(*policy.cpu_cores)
-            b = _b_cpu_cores(b, arr, len(policy.cpu_cores))
+            if policy.max_processes is not None:
+                b = _b_max_processes(b, _fits(policy.max_processes, "max_processes", bits=32))
+            if policy.max_cpu is not None:
+                b = _b_max_cpu(b, _fits(policy.max_cpu, "max_cpu", bits=8))
+            if policy.num_cpus is not None:
+                b = _b_num_cpus(b, _fits(policy.num_cpus, "num_cpus", bits=32))
+            if policy.cpu_cores is not None:
+                cores = [_fits(c, "cpu_cores", bits=32) for c in policy.cpu_cores]
+                arr = (ctypes.c_uint32 * len(cores))(*cores)
+                b = _b_cpu_cores(b, arr, len(cores))
 
-        # net_allow: list of endpoint specs. Bare `host:port` means TCP
-        # and UDP; `tcp://`/`udp://`/`icmp://` schemes pin one protocol.
-        # Empty = deny all outbound. net_deny is the inverse (default-allow
-        # denylist of IP/CIDR/port specs); the two are mutually exclusive.
-        # Validation of each spec happens in the native build().
-        for spec in (policy.net_allow or []):
-            b = _b_net_allow(b, _encode(str(spec)))
-        for spec in (policy.net_deny or []):
-            b = _b_net_deny(b, _encode(str(spec)))
-        for spec in (policy.net_allow_bind or []):
-            b = _b_net_allow_bind(b, _encode(str(spec)))
-        for spec in (policy.net_deny_bind or []):
-            b = _b_net_deny_bind(b, _encode(str(spec)))
+            # net_allow: list of endpoint specs. Bare `host:port` means TCP
+            # and UDP; `tcp://`/`udp://`/`icmp://` schemes pin one protocol.
+            # Empty = deny all outbound. net_deny is the inverse (default-allow
+            # denylist of IP/CIDR/port specs); the two are mutually exclusive.
+            # Validation of each spec happens in the native build().
+            for spec in (policy.net_allow or []):
+                b = _b_net_allow(b, _encode(str(spec)))
+            for spec in (policy.net_deny or []):
+                b = _b_net_deny(b, _encode(str(spec)))
+            for spec in (policy.net_allow_bind or []):
+                b = _b_net_allow_bind(b, _encode(str(spec)))
+            for spec in (policy.net_deny_bind or []):
+                b = _b_net_deny_bind(b, _encode(str(spec)))
 
-        for rule in (policy.http_allow or []):
-            b = _b_http_allow(b, _encode(str(rule)))
-        for rule in (policy.http_deny or []):
-            b = _b_http_deny(b, _encode(str(rule)))
-        for port in (policy.http_ports or []):
-            b = _b_http_port(b, int(port))
-        if policy.http_ca:
-            b = _b_http_ca(b, _encode(str(policy.http_ca)))
-        if policy.http_key:
-            b = _b_http_key(b, _encode(str(policy.http_key)))
-        for path in (policy.http_inject_ca or []):
-            b = _b_http_inject_ca(b, _encode(str(path)))
-        if policy.http_ca_out:
-            b = _b_http_ca_out(b, _encode(str(policy.http_ca_out)))
+            for rule in (policy.http_allow or []):
+                b = _b_http_allow(b, _encode(str(rule)))
+            for rule in (policy.http_deny or []):
+                b = _b_http_deny(b, _encode(str(rule)))
+            for port in (policy.http_ports or []):
+                b = _b_http_port(b, _fits(port, "http_ports entry", bits=16))
+            if policy.http_ca:
+                b = _b_http_ca(b, _encode(str(policy.http_ca)))
+            if policy.http_key:
+                b = _b_http_key(b, _encode(str(policy.http_key)))
+            for path in (policy.http_inject_ca or []):
+                b = _b_http_inject_ca(b, _encode(str(path)))
+            if policy.http_ca_out:
+                b = _b_http_ca_out(b, _encode(str(policy.http_ca_out)))
 
-        if policy.port_remap:
-            b = _b_port_remap(b, True)
+            if policy.port_remap:
+                b = _b_port_remap(b, True)
 
-        if policy.uid is not None or policy.gid is not None:
-            if policy.uid is None or policy.gid is None:
-                raise ValueError("uid and gid must both be set (or both unset)")
-            b = _b_user(b, policy.uid, policy.gid)
-
-        if policy.random_seed is not None:
-            b = _b_random_seed(b, policy.random_seed)
-        if policy.time_start is not None:
-            b = _b_time_start(b, _epoch_seconds(policy.time_start))
-        if policy.clean_env:
-            b = _b_clean_env(b, True)
-        for k, v in (policy.env or {}).items():
-            b = _b_env_var(b, _encode(k), _encode(v))
-
-        if policy.extra_deny_syscalls:
-            b = _b_extra_deny_syscalls(b, _encode(",".join(policy.extra_deny_syscalls or [])))
-        if policy.extra_allow_syscalls:
-            b = _b_extra_allow_syscalls(b, _encode(",".join(policy.extra_allow_syscalls or [])))
-        if policy.max_open_files is not None:
-            b = _b_max_open_files(b, policy.max_open_files)
-
-        if policy.no_randomize_memory:
-            b = _b_no_randomize_memory(b, True)
-        if policy.no_huge_pages:
-            b = _b_no_huge_pages(b, True)
-        if policy.no_coredump:
-            b = _b_no_coredump(b, True)
-        if policy.deterministic_dirs:
-            b = _b_deterministic_dirs(b, True)
-
-        # Landlock protection opt-out. The C ABI setters use move-semantics
-        # and return the (possibly relocated) builder pointer — mirror that
-        # by rebinding `b` on each call. Idempotent / last-wins: if the
-        # same Protection appears in both lists, the later call wins
-        # (matching the underlying `ProtectionPolicy::set` semantics).
-        for p in (policy.allow_degraded or ()):
-            b = _b_allow_degraded(b, _validate_protection(p, field="allow_degraded"))
-        for p in (policy.disable or ()):
-            b = _b_disable(b, _validate_protection(p, field="disable"))
-
-        # Guard: warn if any dataclass field was set to a non-default value
-        # but is not in _HANDLED_FIELDS (i.e. silently dropped).
-        import dataclasses as _dc
-        import warnings as _w
-        from .sandbox import Sandbox as _Sandbox
-        _defaults = _Sandbox()
-        for f in _dc.fields(policy):
-            if f.name in _NativePolicy._HANDLED_FIELDS:
-                continue
-            val = getattr(policy, f.name)
-            default_val = getattr(_defaults, f.name)
-            if val != default_val:
-                _w.warn(
-                    f"Policy field {f.name!r} is set but not wired through "
-                    f"FFI — it will have no effect (value: {val!r})",
-                    stacklevel=3,
+            # One setter call, one value: `User` carries both ids, so there is no
+            # half-set state left for this SDK to have an opinion about.
+            if policy.user is not None:
+                b = _b_user(
+                    b,
+                    _fits(policy.user.uid, "user.uid", bits=32),
+                    _fits(policy.user.gid, "user.gid", bits=32),
                 )
 
-        return b
+            if policy.random_seed is not None:
+                b = _b_random_seed(b, _fits(policy.random_seed, "random_seed", bits=64))
+            if policy.time_start is not None:
+                b = _b_time_start_from(b, policy.time_start)
+            if policy.clean_env:
+                b = _b_clean_env(b, True)
+            for k, v in (policy.env or {}).items():
+                b = _b_env_var(b, _encode(k), _encode(v))
+
+            if policy.extra_deny_syscalls:
+                b = _b_extra_deny_syscalls(b, _encode(",".join(policy.extra_deny_syscalls or [])))
+            if policy.extra_allow_syscalls:
+                b = _b_extra_allow_syscalls(b, _encode(",".join(policy.extra_allow_syscalls or [])))
+            if policy.max_open_files is not None:
+                b = _b_max_open_files(b, _fits(policy.max_open_files, "max_open_files", bits=32))
+
+            if policy.no_randomize_memory:
+                b = _b_no_randomize_memory(b, True)
+            if policy.no_huge_pages:
+                b = _b_no_huge_pages(b, True)
+            if policy.no_coredump:
+                b = _b_no_coredump(b, True)
+            if policy.deterministic_dirs:
+                b = _b_deterministic_dirs(b, True)
+
+            # Landlock protection opt-out. The C ABI setters use move-semantics
+            # and return the (possibly relocated) builder pointer, so mirror that
+            # by rebinding `b` on each call. Idempotent / last-wins: if the
+            # same Protection appears in both lists, the later call wins
+            # (matching the underlying `ProtectionPolicy::set` semantics).
+            # A discriminant this SDK does not know is the core's to refuse,
+            # by value, exactly as an unknown branch action is. Only the width
+            # is checked here: ctypes converts to uint32 by masking, so a value
+            # that does not fit would arrive as a different, plausible one and
+            # the core would never see what the caller wrote.
+            for p in (policy.allow_degraded or ()):
+                b = _b_allow_degraded(b, _fits(p, "allow_degraded", bits=32))
+            for p in (policy.disable or ()):
+                b = _b_disable(b, _fits(p, "disable", bits=32))
+
+            # Guard: warn if any dataclass field was set to a non-default value
+            # but is not in _HANDLED_FIELDS (i.e. silently dropped).
+            import dataclasses as _dc
+            import warnings as _w
+            from .sandbox import Sandbox as _Sandbox
+            _defaults = _Sandbox()
+            for f in _dc.fields(policy):
+                if f.name in _NativePolicy._HANDLED_FIELDS:
+                    continue
+                val = getattr(policy, f.name)
+                default_val = getattr(_defaults, f.name)
+                if val != default_val:
+                    _w.warn(
+                        f"Policy field {f.name!r} is set but not wired through "
+                        f"FFI, so it will have no effect (value: {val!r})",
+                        stacklevel=3,
+                    )
+
+            return b
+        except BaseException:
+            # Every setter consumes the pointer it is given and returns a new
+            # one, so the only builder that still exists is the one `b` holds
+            # right now. There is no `sandlock_sandbox_builder_free` in the C
+            # ABI, and `sandlock_sandbox_build` is the only entry point that
+            # consumes a builder, so the release runs through it. Without
+            # this, a caller that validates policies it did not write leaks a
+            # fully loaded builder for every one it rejects.
+            _free_builder(b)
+            raise
 
     @classmethod
     def from_dataclass(cls, policy: PolicyDataclass, policy_fn=None) -> _NativePolicy:
@@ -1293,10 +1401,14 @@ class _NativePolicy:
                         for i in range(ev.argc)
                         if ev.argv[i]
                     )
+                # A category this SDK does not know is reported as the number
+                # the core sent. Naming it "file" instead would hand the
+                # callback a category the syscall does not belong to, and a
+                # policy that keys on "file" would then act on it.
                 _CATEGORIES = {0: "file", 1: "network", 2: "process", 3: "memory"}
                 py_event = SyscallEvent(
                     syscall=ev.syscall.decode("utf-8") if ev.syscall else "",
-                    category=_CATEGORIES.get(ev.category, "file"),
+                    category=_CATEGORIES.get(ev.category, ev.category),
                     pid=ev.pid,
                     parent_pid=ev.parent_pid,
                     host=ev.host.decode("utf-8") if ev.host else None,

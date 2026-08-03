@@ -92,11 +92,22 @@ pub struct CanonicalDeterminism {
 /// Normalization: `nanoseconds` is always in `[0, 1_000_000_000)`, so
 /// `seconds` floors rather than truncating towards zero. Half a second before
 /// the epoch is `{seconds: -1, nanoseconds: 500000000}`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CanonicalTimestamp {
     pub seconds: i64,
     pub nanoseconds: u32,
+    /// The instant re-rendered as RFC 3339, for the same reason as
+    /// [`CanonicalNetRule::spec`]: the builder ABI takes `time_start` as a
+    /// string, so a consumer holding this form has something to forward that
+    /// it did not have to render itself.
+    ///
+    /// Without it, a binding whose scalar type cannot hold both halves is
+    /// pushed back into a lossy one. The Python SDK collapsed the pair into a
+    /// double, which has about 238ns of spacing at 2026 epoch values, so
+    /// `"...T00:00:00.9999999Z"` rounded up to the next whole second and the
+    /// profile ran one second later through the SDK than through the CLI.
+    pub rfc3339: String,
 }
 
 /// `[program]`: process knobs plus the program identity (`exec`/`args`),
@@ -346,7 +357,9 @@ fn resolve(input: &ProfileInput) -> Result<CanonicalProfile, SandlockError> {
     }
 
     let time_start = match input.determinism.time_start.as_deref() {
-        Some(s) => Some(CanonicalTimestamp::from(super::parse_timestamp(s)?)),
+        Some(s) => Some(CanonicalTimestamp::from(
+            super::parse_timestamp(s, super::TIME_START_LABEL).map_err(SandlockError::Sandbox)?,
+        )),
         None => None,
     };
 
@@ -442,6 +455,7 @@ impl From<jiff::Timestamp> for CanonicalTimestamp {
         CanonicalTimestamp {
             seconds,
             nanoseconds: nanoseconds as u32,
+            rfc3339: ts.to_string(),
         }
     }
 }
@@ -669,7 +683,11 @@ mod tests {
         let v = json("[determinism]\ntime_start = \"2026-01-01T00:00:00Z\"");
         assert_eq!(
             v["determinism"]["time_start"],
-            serde_json::json!({"seconds": 1767225600i64, "nanoseconds": 0})
+            serde_json::json!({
+                "seconds": 1767225600i64,
+                "nanoseconds": 0,
+                "rfc3339": "2026-01-01T00:00:00Z",
+            })
         );
     }
 
@@ -687,7 +705,11 @@ mod tests {
         let v = json("[determinism]\ntime_start = \"2026-01-01T00:00:00.25Z\"");
         assert_eq!(
             v["determinism"]["time_start"],
-            serde_json::json!({"seconds": 1767225600i64, "nanoseconds": 250000000u32})
+            serde_json::json!({
+                "seconds": 1767225600i64,
+                "nanoseconds": 250000000u32,
+                "rfc3339": "2026-01-01T00:00:00.25Z",
+            })
         );
     }
 
@@ -696,8 +718,39 @@ mod tests {
         let v = json("[determinism]\ntime_start = \"1969-12-31T23:59:59.5Z\"");
         assert_eq!(
             v["determinism"]["time_start"],
-            serde_json::json!({"seconds": -1i64, "nanoseconds": 500000000u32})
+            serde_json::json!({
+                "seconds": -1i64,
+                "nanoseconds": 500000000u32,
+                "rfc3339": "1969-12-31T23:59:59.5Z",
+            })
         );
+    }
+
+    #[test]
+    fn the_rendered_time_start_parses_back_to_the_same_instant() {
+        // The point of carrying the text: a consumer forwards it to the string
+        // setter instead of rendering RFC 3339 itself, which would be a second
+        // grammar in the binding. That only holds if what we render is what
+        // the grammar reads.
+        for text in [
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00.25Z",
+            "2026-01-01T00:00:00+03:00",
+            "1969-12-31T23:59:59.5Z",
+            "1969-07-20T20:17:00Z",
+            // Finer than a double can hold at these magnitudes: the case that
+            // made a consumer that re-derived the text from the pair round to
+            // the next whole second.
+            "2026-01-01T00:00:00.9999999Z",
+        ] {
+            let v = json(&format!("[determinism]\ntime_start = \"{text}\""));
+            let rendered = v["determinism"]["time_start"]["rfc3339"].as_str().unwrap();
+            assert_eq!(
+                super::super::parse_timestamp(rendered, "time_start").unwrap(),
+                super::super::parse_timestamp(text, "time_start").unwrap(),
+                "{text} rendered as {rendered}, which is a different instant",
+            );
+        }
     }
 
     #[test]

@@ -13,10 +13,20 @@ pip install sandlock
 ## Quick start
 
 ```python
+import os
 from sandlock import Sandbox
 
+# Every readable path is forwarded to the core, which refuses one that is not
+# there: whether a missing path is a portability detail or a typo is the
+# caller's call, not the SDK's. `/lib64` is absent on arm64 and on musl, so
+# this example decides for itself and filters.
+system_readable = [
+    p for p in ("/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev")
+    if os.path.isdir(p)
+]
+
 sandbox = Sandbox(
-    fs_readable=["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev"],
+    fs_readable=system_readable,
     fs_writable=["/tmp"],
 )
 result = sandbox.run(["echo", "hello"], timeout=10)
@@ -186,8 +196,8 @@ sandbox = Sandbox(
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `max_memory` | `int \| None` | `None` | Memory limit in bytes, e.g. `512 * 1024 ** 2` |
-| `max_processes` | `int` | `64` | Peak concurrent process limit |
+| `max_memory` | `str \| int \| None` | `None` | Memory limit: a size string (`"512M"`) or a count of bytes. Resolved by the core, the same parser the CLI and profiles use |
+| `max_processes` | `int \| None` | `None` | Peak concurrent process limit; `None` uses the core's default |
 | `max_open_files` | `int \| None` | `None` | Max file descriptors (RLIMIT_NOFILE) |
 | `max_cpu` | `int \| None` | `None` | CPU throttle as percentage of one core (1-100) |
 | `cpu_cores` | `list[int] \| None` | `None` | CPU cores to pin sandbox to |
@@ -207,7 +217,7 @@ Sandlock always applies its default syscall blocklist.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `random_seed` | `int \| None` | `None` | Seed for deterministic getrandom() |
-| `time_start` | `float \| None` | `None` | Start timestamp for time virtualization, as Unix epoch seconds |
+| `time_start` | `str \| int \| float \| None` | `None` | Start timestamp: an RFC 3339 stamp (`"2026-01-01T00:00:00Z"`) or Unix epoch seconds |
 | `no_randomize_memory` | `bool` | `False` | Disable ASLR |
 | `no_huge_pages` | `bool` | `False` | Disable Transparent Huge Pages |
 | `deterministic_dirs` | `bool` | `False` | Sort directory entries lexicographically |
@@ -229,8 +239,7 @@ Sandlock always applies its default syscall blocklist.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `uid` | `int \| None` | `None` | Map to given UID inside a user namespace (e.g. `0` for fake root). Set together with `gid` |
-| `gid` | `int \| None` | `None` | Map to given GID inside the user namespace. Must be set together with `uid` (both or neither) |
+| `user` | `User \| None` | `None` | Identity inside a user namespace: `User(uid, gid)`, e.g. `User(0, 0)` for fake root. One value carrying both ids, mirroring the core, so a uid without a gid cannot be written |
 | `no_coredump` | `bool` | `False` | Disable core dumps |
 
 #### COW filesystem isolation
@@ -238,9 +247,9 @@ Sandlock always applies its default syscall blocklist.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `fs_storage` | `str \| None` | `None` | Storage directory for the seccomp COW upper layer / deltas |
-| `max_disk` | `int \| None` | `None` | Disk quota for COW storage in bytes (e.g. `1024 ** 3`) |
-| `on_exit` | `BranchAction` | `COMMIT` | `COMMIT`, `ABORT`, or `KEEP` |
-| `on_error` | `BranchAction` | `ABORT` | `COMMIT`, `ABORT`, or `KEEP` |
+| `max_disk` | `str \| int \| None` | `None` | Disk quota for COW storage: a size string (`"1G"`) or a count of bytes |
+| `on_exit` | `BranchAction \| None` | `None` | `COMMIT`, `ABORT`, or `KEEP`; `None` uses the core's default (commit) |
+| `on_error` | `BranchAction \| None` | `None` | `COMMIT`, `ABORT`, or `KEEP`; `None` uses the core's default (commit) |
 
 #### Protection opt-out
 
@@ -632,6 +641,11 @@ becomes `Mount("/data", "/srv", ro=True)`, `memory = "512M"` becomes
 `536870912`, and `time_start = "2026-01-01T00:00:00Z"` becomes epoch
 seconds. A profile therefore means the same thing here as it does to
 `sandlock run --profile-file`, including the message it fails with.
+
+The same fields also take the spellings a profile is written in
+(`max_memory="512M"`, `time_start="2026-01-01T00:00:00Z"`), and those are not
+parsed here either: they go to the core's setters as written, so a profile and
+a hand-built `Sandbox` reach the same policy through the same parser.
 
 ### Exceptions
 

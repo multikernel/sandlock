@@ -1,5 +1,5 @@
 use crate::sandbox::{ByteSize, Sandbox};
-use crate::error::SandlockError;
+use crate::error::{SandboxError, SandlockError};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::collections::HashMap;
@@ -219,7 +219,7 @@ pub fn parse_input(input: ProfileInput) -> Result<(Sandbox, ProgramSpec), Sandlo
     // [determinism]
     if let Some(s) = input.determinism.random_seed { b = b.random_seed(s); }
     if let Some(s) = input.determinism.time_start.as_deref() {
-        b = b.time_start(parse_time_start(s)?);
+        b = b.time_start(parse_time_start(s, TIME_START_LABEL).map_err(SandlockError::Sandbox)?);
     }
     if input.determinism.deterministic_dirs        { b = b.deterministic_dirs(true); }
     if input.determinism.no_randomize_memory       { b = b.no_randomize_memory(true); }
@@ -337,9 +337,23 @@ pub fn parse_mount_spec(s: &str) -> Result<(PathBuf, PathBuf, bool), SandlockErr
     Ok((PathBuf::from(virt), PathBuf::from(host), read_only))
 }
 
+/// The knob name the profile loader puts in a rejected `time_start`.
+///
+/// Shared by both profile paths (`parse_input` and the canonical resolver) so
+/// the two cannot drift: `parse_error_text_matches_what_the_cli_prints` asserts
+/// they produce the same text.
+pub(crate) const TIME_START_LABEL: &str = "[determinism].time_start";
+
 /// Parses an RFC3339 timestamp string into `SystemTime`.
-fn parse_time_start(s: &str) -> Result<SystemTime, SandlockError> {
-    Ok(parse_timestamp(s)?.into())
+///
+/// This is the one place the `time_start` grammar lives: the profile loader,
+/// the CLI's `--time-start` and the C ABI setter all resolve their string
+/// through it, so a rejected value reads the same wherever it was typed.
+/// `label` names the knob that carried the value, the way
+/// [`crate::sandbox::NetRule::parse_allow`] names `--net-allow`; it is the only
+/// part of the message that differs between surfaces.
+pub fn parse_time_start(s: &str, label: &str) -> Result<SystemTime, SandboxError> {
+    Ok(parse_timestamp(s, label)?.into())
 }
 
 /// Parses an RFC3339 timestamp string, keeping the `jiff::Timestamp`.
@@ -347,13 +361,47 @@ fn parse_time_start(s: &str) -> Result<SystemTime, SandlockError> {
 /// `SystemTime` cannot represent a pre-epoch instant as a plain second count,
 /// so the canonical form resolves the string through this instead and does its
 /// own epoch split.
-fn parse_timestamp(s: &str) -> Result<jiff::Timestamp, SandlockError> {
-    use crate::error::SandboxError;
-    s.parse().map_err(|e| {
-        SandlockError::Sandbox(SandboxError::Invalid(
-            format!("invalid [determinism].time_start {s:?}: {e}"),
-        ))
-    })
+pub(crate) fn parse_timestamp(s: &str, label: &str) -> Result<jiff::Timestamp, SandboxError> {
+    s.parse()
+        .map_err(|e| SandboxError::Invalid(format!("invalid {label} {s:?}: {e}")))
+}
+
+/// Resolves an epoch split into `SystemTime`, without going through a grammar.
+///
+/// This is the numeric door to the instant [`parse_time_start`] reaches through
+/// RFC 3339, and it takes exactly the pair
+/// [`CanonicalTimestamp`](canonical::CanonicalTimestamp) hands out: whole
+/// seconds, which may be negative, plus a non-negative sub-second remainder.
+///
+/// It exists because the two halves have to meet. A binding that consumes
+/// `sandlock_profile_parse` holds a resolved instant, not the text it came
+/// from, and the string setter is the only other way back into a builder; so
+/// without this door every such binding would have to render RFC 3339 itself,
+/// which is a grammar in the binding and the exact drift this module removes.
+///
+/// `nanoseconds` at or above a full second is rejected rather than carried
+/// into the seconds: the canonical form normalizes, so a caller that has not
+/// is working from a different contract, and quietly agreeing with it would
+/// hide that.
+pub fn time_start_from_epoch(
+    seconds: i64,
+    nanoseconds: u32,
+    label: &str,
+) -> Result<SystemTime, SandboxError> {
+    if nanoseconds >= 1_000_000_000 {
+        return Err(SandboxError::Invalid(format!(
+            "invalid {label}: nanoseconds must be below 1000000000, got {nanoseconds}"
+        )));
+    }
+    // i64 seconds times a billion is about 9.2e27, well inside i128.
+    let total = i128::from(seconds) * 1_000_000_000 + i128::from(nanoseconds);
+    jiff::Timestamp::from_nanosecond(total)
+        .map_err(|e| {
+            SandboxError::Invalid(format!(
+                "invalid {label} {{seconds: {seconds}, nanoseconds: {nanoseconds}}}: {e}"
+            ))
+        })
+        .map(Into::into)
 }
 
 // ============================================================
@@ -852,6 +900,49 @@ mod tests {
         let err = parse_profile(toml).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("time_start"), "got: {msg}");
+    }
+
+    /// The two doors into `time_start` have to reach the same instant, or a
+    /// profile means one thing when it is loaded as text and another when a
+    /// binding feeds the resolved form back.
+    #[test]
+    fn epoch_door_and_grammar_door_reach_the_same_instant() {
+        for text in [
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00.5Z",
+            "1969-07-20T20:17:00Z",
+            // Half a second before the epoch: the case where the canonical
+            // split borrows, so seconds is -1 and the remainder is positive.
+            "1969-12-31T23:59:59.5Z",
+            "1970-01-01T00:00:00Z",
+        ] {
+            let ts = parse_timestamp(text, "time_start").unwrap();
+            let split = canonical::CanonicalTimestamp::from(ts);
+            let through_epoch =
+                time_start_from_epoch(split.seconds, split.nanoseconds, "time_start").unwrap();
+            assert_eq!(
+                through_epoch,
+                parse_time_start(text, "time_start").unwrap(),
+                "{text} resolved differently through the epoch door"
+            );
+        }
+    }
+
+    #[test]
+    fn epoch_door_rejects_an_unnormalized_remainder() {
+        let err = time_start_from_epoch(0, 1_000_000_000, "time_start").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("nanoseconds must be below 1000000000"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn epoch_door_rejects_an_instant_outside_the_supported_range() {
+        let err = time_start_from_epoch(i64::MAX, 0, "time_start").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("invalid time_start"), "got: {msg}");
     }
 
     #[test]

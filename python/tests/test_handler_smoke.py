@@ -253,8 +253,13 @@ import sandlock
 
 
 # Standard readable paths for a sandboxed python3 child, mirroring
-# tests/test_sandbox.py's _PYTHON_READABLE helper.
-_PYTHON_READABLE = ["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev"]
+# tests/test_sandbox.py's _PYTHON_READABLE helper, including its filter: the
+# core refuses a readable path that is not there, and `/lib64` is not there on
+# arm64 or on musl.
+_PYTHON_READABLE = [
+    p for p in ("/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev")
+    if os.path.isdir(p)
+]
 
 # Use a system interpreter that lives inside the readable tree above.
 # sys.executable may point at a venv outside the sandbox (e.g. under

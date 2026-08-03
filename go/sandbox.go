@@ -37,20 +37,28 @@ import (
 	"unsafe"
 )
 
+// Ptr returns a pointer to v. The Sandbox fields whose "unset" state is not
+// expressible in the value itself are pointers, and Go has no address-of for
+// a literal, so this is the spelling for setting one:
+//
+//	sb := &sandlock.Sandbox{MaxCPU: sandlock.Ptr[uint8](50)}
+func Ptr[T any](v T) *T { return &v }
+
 // BranchAction is the action taken on a copy-on-write working-directory
-// branch when the sandbox exits. The zero value, BranchActionDefault, leaves
-// the choice to sandlock's own defaults (commit on success, abort on error).
+// branch when the sandbox exits. The values are the stable ABI discriminants
+// shared with the C/Rust core, and are passed through unchanged: a value
+// outside this set is rejected by the core, naming the number the caller
+// wrote. The Sandbox fields are pointers, so "leave it to sandlock's own
+// default" is nil rather than a sentinel member of this type.
 type BranchAction uint8
 
 const (
-	// BranchActionDefault defers to sandlock's built-in default.
-	BranchActionDefault BranchAction = iota
 	// BranchActionCommit merges the branch's writes into the parent on exit.
-	BranchActionCommit
+	BranchActionCommit BranchAction = 0
 	// BranchActionAbort discards all of the branch's writes on exit.
-	BranchActionAbort
+	BranchActionAbort BranchAction = 1
 	// BranchActionKeep leaves the branch in place for the caller to handle.
-	BranchActionKeep
+	BranchActionKeep BranchAction = 2
 )
 
 // SyscallCategory is the high-level category of an intercepted syscall event.
@@ -166,6 +174,18 @@ const (
 	ProtectionAbstractUnixSocketScope Protection = 5 // abstract UNIX socket scoping (ABI v6)
 )
 
+// RunAs is the identity the sandboxed process runs as, applied through a
+// single-entry user-namespace map. Both ids are always present because that is
+// what the core models: an unprivileged user namespace can map exactly one uid
+// and one gid, so "a uid without a gid" is not a state it can represent, and
+// this type does not let a caller spell it. The ids are uint32 for the same
+// reason: that is the width the kernel and the C ABI carry, so a value outside
+// it cannot be silently truncated on the way down.
+type RunAs struct {
+	UID uint32
+	GID uint32
+}
+
 // Sandbox holds the policy configuration for confining a process. Every field
 // is optional; an unset field means "no restriction" unless documented
 // otherwise. sandlock's default syscall blocklist is always applied.
@@ -231,48 +251,71 @@ type Sandbox struct {
 	// HTTP ACL (method + host + path rules via a transparent proxy).
 	HTTPAllow   []string // allow rules, "METHOD host/path"
 	HTTPDeny    []string // deny rules, checked before allow rules
-	HTTPPorts   []int    // ports to intercept (defaults to 80, plus 443 with a CA)
+	HTTPPorts   []uint16 // ports to intercept (defaults to 80, plus 443 with a CA)
 	HTTPCAFile  string   // PEM CA certificate for HTTPS MITM
 	HTTPKeyFile string   // PEM CA private key (required with HTTPCAFile)
 
 	// Resource limits.
-	MaxMemory    string   // e.g. "512M"; empty = unlimited
-	MaxDisk      string   // disk quota for COW storage, e.g. "1G"
-	MaxProcesses uint32   // peak concurrent process cap; 0 = sandlock default
-	MaxCPU       uint8    // CPU throttle, percent of one core (1-100); 0 = unset
-	MaxOpenFiles uint32   // RLIMIT_NOFILE soft+hard in the child, clamped to sandlock's own limits; 0 = inherit
-	CPUCores     []uint32 // cores to pin to via sched_setaffinity
-	NumCPUs      uint32   // synthetic /proc/cpuinfo processor count; 0 = unset
-	GPUDevices   []uint32 // GPU device indices to expose; nil = none
+	//
+	// MaxMemory and MaxDisk are byte-size strings parsed by sandlock itself,
+	// with the grammar it accepts everywhere else: a decimal integer and an
+	// optional K/M/G suffix (case-insensitive), a bare number being a count of
+	// bytes. Fractions and a T suffix are not part of it; a value outside the
+	// grammar is reported by the core when the sandbox is built.
+	//
+	// The numeric caps are pointers because zero is a value the core has an
+	// opinion about (it rejects a cap of zero processes, CPU percent,
+	// descriptors, or processors), so it must not double as "unset". Use Ptr
+	// to set one.
+	// An empty MaxMemory is the only spelling of "unlimited": "0" is refused,
+	// because zero is what the supervisor already carries for "no ceiling",
+	// and setting the field at all is what installs the memory handler. An
+	// empty CPUCores is refused for the same reason in reverse: it is an
+	// affinity mask with no bits, not "every core", which is what leaving the
+	// field nil already means. MaxDisk is the exception: zero is its
+	// documented spelling of "unlimited".
+	MaxMemory    string   // e.g. "512M"; empty = unlimited, "0" is refused
+	MaxDisk      string   // disk quota for COW storage, e.g. "1G"; "0" = unlimited
+	MaxProcesses *uint32  // peak concurrent process cap; nil = sandlock default
+	MaxCPU       *uint8   // CPU throttle, percent of one core (1-100); nil = unset
+	MaxOpenFiles *uint32  // RLIMIT_NOFILE soft+hard in the child, clamped to sandlock's own limits; nil = inherit
+	CPUCores     []uint32 // cores to pin to via sched_setaffinity; nil = unset, empty is refused
+	NumCPUs      *uint32  // synthetic /proc/cpuinfo processor count; nil = unset
+	// GPUDevices lists the GPU device indices to expose. nil means none; an
+	// empty (non-nil) slice means every GPU present on the host.
+	GPUDevices []uint32
 
 	// Syscall filtering (on top of sandlock's default blocklist).
 	ExtraAllowSyscalls []string // syscall groups to allow, e.g. "sysv_ipc"
 	ExtraDenySyscalls  []string // extra syscall names to block
 
 	// Determinism.
-	RandomSeed        *uint64 // seed getrandom() deterministically
-	TimeStart         string  // virtual clock start: RFC3339 or unix seconds
-	NoRandomizeMemory bool    // disable ASLR
-	NoHugePages       bool    // disable transparent huge pages
-	DeterministicDirs bool    // sort readdir() entries
+	RandomSeed *uint64 // seed getrandom() deterministically
+	// TimeStart is the virtual clock start as an RFC3339 timestamp
+	// ("2026-01-01T00:00:00Z"), parsed by sandlock itself with the same
+	// grammar as a profile's [determinism].time_start. Empty = unset.
+	TimeStart         string
+	NoRandomizeMemory bool // disable ASLR
+	NoHugePages       bool // disable transparent huge pages
+	DeterministicDirs bool // sort readdir() entries
 
 	// Environment.
 	CleanEnv bool              // start from a minimal environment
 	Env      map[string]string // variables to set/override in the child
 
 	// Misc.
-	UID        *int // map to this UID inside a user namespace; nil = unset
-	GID        *int // map to this GID inside the user namespace; must be set together with UID
-	NoCoredump bool // disable core dumps and restrict /proc/pid access
+	User       *RunAs // identity inside a user namespace; nil = unset
+	NoCoredump bool   // disable core dumps and restrict /proc/pid access
 
 	// Copy-on-write branch handling.
-	FSStorage string       // storage directory for COW deltas
-	OnExit    BranchAction // branch action on normal exit
-	OnError   BranchAction // branch action on error exit
+	FSStorage string        // storage directory for COW deltas
+	OnExit    *BranchAction // branch action on normal exit; nil = sandlock's default
+	OnError   *BranchAction // branch action on error exit; nil = sandlock's default
 
 	// Name is the sandbox name and its virtual hostname inside the sandbox.
-	// Empty auto-generates "sandbox-{pid}".
-	Name string
+	// nil auto-generates "sandbox-{pid}"; any other value is passed to
+	// sandlock verbatim, including the empty string, which it rejects.
+	Name *string
 
 	// PolicyFn receives dynamic syscall events and may return an allow/deny
 	// decision or modify live policy through the supplied context.

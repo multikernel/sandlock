@@ -30,14 +30,14 @@ sandbox = Sandbox(
     deterministic_dirs=False, no_randomize_memory=False,
 
     # [program]  (process knobs only; exec/args are arguments to .run/.cmd)
-    env={}, cwd=None, uid=None, gid=None,
+    env={}, cwd=None, user=None,
     clean_env=False, no_coredump=False, no_huge_pages=False,
     no_supervisor=False,
 
     # [filesystem]
     fs_readable=(), fs_writable=(), fs_denied=(),
     chroot=None, fs_mount=(),
-    on_exit=BranchAction.COMMIT, on_error=BranchAction.ABORT,
+    on_exit=None, on_error=None,
 
     # [network]
     net_allow_bind=(), net_allow=(), port_remap=False,
@@ -49,7 +49,7 @@ sandbox = Sandbox(
     extra_allow_syscalls=(), extra_deny_syscalls=(),
 
     # [limits]
-    max_memory=None, max_processes=64, max_open_files=None,
+    max_memory=None, max_processes=None, max_open_files=None,
     max_cpu=None, max_disk=None,
     gpu_devices=None, cpu_cores=None, num_cpus=None,
 
@@ -238,7 +238,7 @@ Knobs that pin sources of non-determinism in the child process.
 | Python                  | TOML                  | Type                  | Default | Description                                                                                                  |
 | ----------------------- | --------------------- | --------------------- | ------- | ------------------------------------------------------------------------------------------------------------ |
 | `random_seed`           | `random_seed`         | `int \| None`         | `None`  | Seed for deterministic `getrandom()`. Identical seeds yield identical byte streams.                          |
-| `time_start`            | `time_start`          | `float \| None`       | `None`  | Frozen start time as Unix epoch seconds. The TOML key takes an RFC 3339 stamp with an explicit offset (`"2026-01-01T00:00:00Z"`), which the core parser resolves to epoch seconds at load time. Time advances at real speed from the given epoch. |
+| `time_start`            | `time_start`          | `str \| int \| float \| None` | `None`  | Frozen start time. Both surfaces take the RFC 3339 stamp with an explicit offset (`"2026-01-01T00:00:00Z"`), resolved by one parser in the core; the Python field also takes the epoch seconds a loaded profile resolves to, which reach the core through the epoch setter rather than being rendered back into a stamp. Time advances at real speed from the given epoch. |
 | `deterministic_dirs`    | `deterministic_dirs`  | `bool`                | `False` | Sort `readdir()` entries lexicographically so that `ls`, `glob`, and `os.listdir` return a stable order.     |
 | `no_randomize_memory`   | `no_randomize_memory` | `bool`                | `False` | Disable ASLR via `personality(ADDR_NO_RANDOMIZE)`.                                                           |
 
@@ -253,8 +253,7 @@ fields on `Sandbox`.
 | --------------- | --------------- | ------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `env`           | `env`           | `Mapping[str, str]` | `{}`    | Variables to set or override in the child. Applied after `clean_env`.                                                                                |
 | `cwd`           | `cwd`           | `str \| None`       | `None`  | Child working directory (`chdir` target). Independent of `workdir`.                                                                                  |
-| `uid`           | `uid`           | `int \| None`       | `None`  | UID to map the child to inside a user namespace (e.g. `0` for fake root). Must be set together with `gid` (both or neither). The child retains no host privileges regardless of the mapped UID. Requires user namespaces to be available. |
-| `gid`           | `gid`           | `int \| None`       | `None`  | GID to map the child to inside the user namespace. Must be set together with `uid`. An unprivileged user namespace maps a single id, so supplementary groups are not available. |
+| `user`          | `uid` + `gid`   | `User \| None`      | `None`  | Identity to map the child to inside a user namespace: `User(uid, gid)`, e.g. `User(0, 0)` for fake root. One value carrying both ids, mirroring the core's own pair, so half-set is not a state the Python field can hold; the two TOML keys must still both be present, which the core checks when the profile is loaded. The child retains no host privileges regardless of the mapped ids, an unprivileged user namespace maps a single pair (so supplementary groups are not available), and user namespaces must be available. |
 | `clean_env`     | `clean_env`     | `bool`              | `False` | When `True`, start with a minimal environment (`PATH`, `HOME`, `USER`, `TERM`, `LANG`) instead of inheriting the parent's.                            |
 | `no_coredump`   | `no_coredump`   | `bool`              | `False` | Apply `prctl(PR_SET_DUMPABLE, 0)`. Disables core dumps and restricts `/proc/<pid>` access from other processes. Breaks `gdb`, `strace`, and `perf`.   |
 | `no_huge_pages` | `no_huge_pages` | `bool`              | `False` | Disable transparent huge pages via `prctl(PR_SET_THP_DISABLE)`.                                                                                      |
@@ -280,8 +279,8 @@ filesystem isolation.
 | `fs_denied`    | `deny`      | `Sequence[str]`     | `()`                    | Paths explicitly denied (neither read nor write), even if implied by a broader rule.                                         |
 | `chroot`       | `chroot`    | `str \| None`       | `None`                  | Path to `chroot` into before applying other confinement.                                                                     |
 | `fs_mount`     | `mount`     | `Sequence[Mount]`   | `()`                    | Map virtual paths inside the chroot to host directories. Python form: `[Mount("/work", "/host/sandbox/work"), Mount("/ref", "/host/ref", ro=True)]`. TOML form: list of `"VIRTUAL:HOST"` strings, where a trailing `:ro` (or the default `:rw`) selects a read-only mount. Loading such a profile resolves each spec to a `Mount`, so `ro` survives into the SDK; `sandlock inspect --toml` writes `:ro` back out. Read-only is keyed by the virtual path, so mounts that share one share a single verdict: if any of them asks for `:ro`, writes through that virtual path are denied for all of them, and that is the `ro` a loaded profile reports. An empty virtual or host path is refused at build time: an empty virtual path is a prefix of every guest path, so it would match the whole tree. |
-| `on_exit`      | `on_exit`   | `BranchAction`      | `BranchAction.COMMIT`   | Branch action on normal sandbox exit.                                                                                        |
-| `on_error`     | `on_error`  | `BranchAction`      | see note                | Branch action on sandbox error or exception. A `Sandbox()` built in Python defaults to `BranchAction.ABORT`; a profile that omits `on_error` resolves to `commit`, which is what the CLI has always applied. Set the key explicitly to avoid depending on either default. |
+| `on_exit`      | `on_exit`   | `BranchAction \| None` | `None`               | Branch action on normal sandbox exit. `None` means unset and the core applies its default, `commit`, which is also what a profile that omits the key resolves to. |
+| `on_error`     | `on_error`  | `BranchAction \| None` | `None`               | Branch action on sandbox error or exception. `None` means unset and the core applies its default, `commit`, which is also what a profile that omits the key resolves to. The Python field used to default to `BranchAction.ABORT`, a second default that disagreed with the one the core applies to the same field. |
 
 Landlock rules are kernel-evaluated and TOCTOU-immune.
 
@@ -352,13 +351,13 @@ prefix redundant; the GPU and CPU placement fields keep their names.
 
 | Python           | TOML          | Type                    | Default | Description                                                                                                                  |
 | ---------------- | ------------- | ----------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `max_memory`     | `memory`      | `int \| None`           | `None`  | Memory limit in bytes. The Python field takes a byte count; the size suffix grammar (`"512M"`, `"1G"`) belongs to the TOML key and is resolved by the core parser at load time. `0` is refused at build time: it is also the supervisor's sentinel for "no ceiling", so an explicit zero would install a ceiling of zero while the synthetic `/proc/meminfo` reported the sandbox unlimited. Omit the field to leave memory unlimited. |
-| `max_processes`  | `processes`   | `int`                   | `64`    | Maximum number of **concurrent** processes in the sandbox (peak, not lifetime; threads do not count). Also enables fork interception used by checkpoint freeze. `0` is refused at build time: the supervisor compares `proc_count >= limit`, so a limit of zero denies every fork with `EAGAIN` however few processes are alive. Omit the field for the default cap. |
+| `max_memory`     | `memory`      | `str \| int \| None`     | `None`  | Memory limit. Both surfaces take the same size grammar (`"512M"`, `"1G"`, or a bare count of bytes), resolved by one parser in the core; a loaded profile carries the resolved count. `None` is the only spelling of "unlimited": a ceiling of zero is refused, because zero is what the supervisor already carries for "no ceiling" while setting the field at all is what installs the memory handler. |
+| `max_processes`  | `processes`   | `int \| None`           | `None`  | Maximum number of **concurrent** processes in the sandbox (peak, not lifetime; threads do not count). Also enables fork interception used by checkpoint freeze. `None` means unset and the core applies its default of 64, which is not repeated on the Python side. `0` is refused at build time: the supervisor compares `proc_count >= limit`, so a limit of zero denies every fork with `EAGAIN` however few processes are alive. |
 | `max_open_files` | `open_files`  | `int \| None`           | `None`  | Maximum number of open file descriptors. Enforced via `RLIMIT_NOFILE` (kernel, survives `exec`), set in the child right before it execs. Both the soft and the hard limit are lowered, and descendants inherit the cap. Clamped to **both** limits sandlock itself inherited, so it is an upper bound, never a grant: a request above the inherited soft limit gives the guest the inherited limit, not more; raise the limit on sandlock itself (`prlimit`, systemd `LimitNOFILE=`) if a guest needs a bigger budget. Lowering the hard limit makes the cap one-way only for an *unprivileged* sandlock; a sandbox launched by root (or with `CAP_SYS_RESOURCE`) can raise it back, since sandlock does not drop capabilities; treat it as a resource budget, not as confinement. The limit must also cover process startup (stdio, the dynamic loader's per-library descriptors, and under `chroot` the injected exec fd); too low a value fails the exec and exits 127, reporting `EMFILE` on a plain exec but `EIO` under `chroot`. Past startup the errno likewise depends on who services the `open`: `EMFILE` from the kernel, `EACCES` when the supervisor mediates it (`chroot`, COW, procfs virtualisation). Measured floors for a trivial command: 4 for a plain dynamically linked exec, about 12 under `chroot` (varies slightly by host); programs linking more libraries need more. `0` is refused at build time; omit the field to inherit the system limit. |
 | `max_cpu`        | `cpu`         | `int \| None`           | `None`  | CPU throttle as a percentage of one core (1 to 100). Applied to the entire process group via `SIGSTOP`/`SIGCONT` cycling.    |
-| `max_disk`       | `disk`        | `int \| None`           | `None`  | COW storage quota in bytes; the TOML key also accepts a suffixed size such as `"1G"`. Returned as `ENOSPC` when the upper layer exceeds it. `0` is accepted, unlike `max_memory`: for a disk quota zero is the documented spelling of "unlimited" and has no second reading. |
+| `max_disk`       | `disk`        | `str \| int \| None`     | `None`  | COW storage quota, in the same size grammar as `max_memory` on both surfaces. Returned as `ENOSPC` when the upper layer exceeds it. Zero is its documented spelling of "unlimited", unlike `max_memory`. |
 | `gpu_devices`    | `gpu_devices` | `Sequence[int] \| None` | `None`  | GPU device indices to expose. `None` denies GPU access entirely; `[]` exposes every GPU; a list exposes only those devices. Adds Landlock rules for `/dev/nvidia*` and `/dev/dri/*` and sets `CUDA_VISIBLE_DEVICES` / `ROCR_VISIBLE_DEVICES`. |
-| `cpu_cores`      | `cpu_cores`   | `Sequence[int] \| None` | `None`  | CPU cores to pin the sandbox to via `sched_setaffinity` in the child. An empty sequence is refused at build time: an affinity mask with no bits is what `sched_setaffinity(2)` rejects with `EINVAL`, and unlike `gpu_devices` there is no cpu set it could stand for, since `None` already means "every core". |
+| `cpu_cores`      | `cpu_cores`   | `Sequence[int] \| None` | `None`  | CPU cores to pin the sandbox to via `sched_setaffinity` in the child. Unlike `gpu_devices`, an empty list is refused rather than read as "every core": it is an affinity mask with no bits, and "every core" is what `None` already means. |
 | `num_cpus`       | `num_cpus`    | `int \| None`           | `None`  | Visible CPU count in `/proc/cpuinfo` (renumbered `0..N-1`). Also virtualizes `/proc/meminfo` when `max_memory` is set. `0` is refused at build time: it reaches the synthetic procfs as an empty `/proc/cpuinfo` and an affinity mask with no bits, so the guest reads `nproc = 0`. Omit the field to expose the host processor count. |
 
 ## Runtime kwargs (Python-only)

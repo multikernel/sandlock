@@ -230,11 +230,19 @@ def demo_xoa_sandboxed(client: OpenAI, csv_path: str, exfil_port: int):
     #
     # Data flows: planner stdout ──pipe──▶ executor stdin
 
+    # Present system paths only: /lib64 is absent on arm64 and /sbin is a
+    # symlink into /usr on merged-usr hosts. A grant on a path that is not
+    # there fails when the child installs its Landlock rules, and the failure
+    # does not name the path, so filter here rather than debug it there.
+    system_paths = [
+        p for p in ("/usr", "/lib", "/lib64", "/etc", "/bin", "/sbin", "/dev")
+        if os.path.exists(p)
+    ]
+
     planner = Sandbox(
-        fs_readable=list(dict.fromkeys([
-            "/usr", "/lib", "/lib64", "/etc", "/bin", "/sbin",
-            "/dev", python_prefix,
-        ] + python_paths)),
+        fs_readable=list(dict.fromkeys(
+            system_paths + [python_prefix] + python_paths
+        )),
         net_allow=["api.openai.com:443"],  # only OpenAI HTTPS
         clean_env=True,
         env={"OPENAI_API_KEY": os.environ["OPENAI_API_KEY"]},
@@ -242,10 +250,12 @@ def demo_xoa_sandboxed(client: OpenAI, csv_path: str, exfil_port: int):
     )
 
     executor = Sandbox(
-        fs_readable=list(dict.fromkeys([
-            workspace, "/usr", "/lib", "/lib64", "/etc",
-            "/bin", "/sbin", python_prefix,
-        ] + python_paths)),
+        fs_readable=list(dict.fromkeys(
+            [workspace]
+            + [p for p in system_paths if p != "/dev"]
+            + [python_prefix]
+            + python_paths
+        )),
         net_allow=[],            # No network at all
         clean_env=True,
         env={"DATA_FILE": csv_path},

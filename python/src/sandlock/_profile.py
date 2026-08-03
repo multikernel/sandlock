@@ -15,7 +15,7 @@ Section to field mapping::
                      fs_storage, workdir
     [determinism] -> random_seed, time_start, deterministic_dirs,
                      no_randomize_memory
-    [program]     -> env, cwd, uid, gid, clean_env, no_coredump,
+    [program]     -> env, cwd, user (uid + gid), clean_env, no_coredump,
                      no_huge_pages (``exec`` and ``args`` are runtime program
                      identity and are ignored here; pass them to
                      ``sandbox.run(cmd)`` instead)
@@ -39,14 +39,15 @@ from typing import Any
 
 from ._sdk import profile_parse
 from .exceptions import PolicyError
-from .sandbox import BranchAction, Mount, Sandbox
+from .sandbox import BranchAction, Mount, Sandbox, User
 
 
 _PROFILES_DIR = Path("~/.config/sandlock/profiles").expanduser()
 
 
 # Canonical-form key -> Sandbox attribute, per section. ``None`` marks a key
-# that is deliberately dropped (program identity, which is not policy).
+# the field-for-field loop does not carry: program identity, which is not
+# policy, and the two ids that are joined into ``user`` afterwards.
 #
 # The key sets are exhaustive on purpose: the core emits every canonical field
 # unconditionally, so a key that appears, disappears or is renamed on the other
@@ -72,8 +73,9 @@ _SECTIONS: dict[str, dict[str, str | None]] = {
         "args": None,
         "env": "env",
         "cwd": "cwd",
-        "uid": "uid",
-        "gid": "gid",
+        # Two canonical keys, one Sandbox field: joined by `_user` below.
+        "uid": None,
+        "gid": None,
         "clean_env": "clean_env",
         "no_coredump": "no_coredump",
         "no_huge_pages": "no_huge_pages",
@@ -189,7 +191,31 @@ def _from_canonical(canonical: dict) -> Sandbox:
             if value is not None:
                 kwargs[attr] = value
 
+    user = _user(canonical["program"])
+    if user is not None:
+        kwargs["user"] = user
+
     return Sandbox(**kwargs)
+
+
+def _user(program: dict) -> User | None:
+    """Join the canonical ``uid``/``gid`` pair into one :class:`User`.
+
+    The core refuses a profile that sets one without the other, and the
+    canonical form is produced by that same builder, so a half-set pair here
+    means the two sides disagree about the contract rather than that the
+    profile was wrong. That is reported as such, the way a missing key is.
+    """
+    uid, gid = program["uid"], program["gid"]
+    if uid is None and gid is None:
+        return None
+    if uid is None or gid is None:
+        raise PolicyError(
+            "[program]: canonical profile carries uid without gid or the "
+            f"other way round (uid={uid!r}, gid={gid!r}); core and SDK are "
+            "out of sync"
+        )
+    return User(uid=uid, gid=gid)
 
 
 def _check_keys(data: Any, expected: Iterable[str], where: str) -> None:
@@ -253,12 +279,26 @@ def _bind_ports(value: Any) -> list:
     return ["*"] if value["any"] else list(value["ports"])
 
 
-def _timestamp(value: Any) -> float | int:
-    _check_keys(value, ("seconds", "nanoseconds"), "time_start")
-    seconds, nanos = value["seconds"], value["nanoseconds"]
-    if nanos == 0:
-        return seconds
-    return seconds + nanos / 1_000_000_000
+def _timestamp(value: Any) -> str | int:
+    """Take the rendered stamp, not the pair, whenever there is a remainder.
+
+    ``seconds + nanos / 1e9`` is a double, and a double has about 238ns of
+    spacing at 2026 epoch values, so it cannot hold the pair the core just
+    resolved. ``"...T00:00:00.9999999Z"`` rounded up to the next whole second
+    through here, and the core floors ``time_start`` to whole seconds, so the
+    same profile ran one second later through this SDK than through the CLI:
+    the drift the canonical form exists to remove, re-created one line after
+    it arrives. The core renders the instant for us for exactly this reason,
+    the way it renders net and HTTP rules back into spec strings.
+
+    A whole second still comes back as an ``int``: it is exact, and it keeps
+    the numeric door (``sandlock_sandbox_builder_time_start_epoch``) exercised
+    by the common case.
+    """
+    _check_keys(value, ("seconds", "nanoseconds", "rfc3339"), "time_start")
+    if value["nanoseconds"] == 0:
+        return value["seconds"]
+    return value["rfc3339"]
 
 
 def merge_cli_overrides(policy: Sandbox, overrides: dict) -> Sandbox:

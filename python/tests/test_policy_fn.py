@@ -14,10 +14,16 @@ import pytest
 from sandlock import Sandbox, SyscallEvent, PolicyContext
 
 
-_PYTHON_READABLE = list(dict.fromkeys([
-    "/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev",
-    sys.prefix,
-]))
+# The SDK forwards every readable path to the core, which refuses one that
+# does not exist, so the list filters rather than naming `/lib64` on a host
+# (arm64, musl) that has none.
+_PYTHON_READABLE = [
+    p for p in dict.fromkeys([
+        "/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev",
+        sys.prefix,
+    ])
+    if os.path.isdir(p)
+]
 
 
 def _policy(**overrides):

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import platform
 import shutil
 import subprocess
@@ -16,10 +17,16 @@ from sandlock import Sandbox, Checkpoint, SkippedFd
 from sandlock._sdk import _encode, _lib, _make_argv
 
 
-_PYTHON_READABLE = list(dict.fromkeys([
-    "/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev",
-    sys.prefix,
-]))
+# The SDK forwards every readable path to the core, which refuses one that
+# does not exist, so the list filters rather than naming `/lib64` on a host
+# (arm64, musl) that has none.
+_PYTHON_READABLE = [
+    p for p in dict.fromkeys([
+        "/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev",
+        sys.prefix,
+    ])
+    if os.path.isdir(p)
+]
 
 
 def _policy(**overrides):

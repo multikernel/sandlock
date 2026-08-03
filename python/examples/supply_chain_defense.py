@@ -73,8 +73,15 @@ print("[agent] done")
 """)
 
         python_paths = [p for p in sys.path if p and os.path.isdir(p)]
-        fs_readable = ["/usr", "/lib", "/lib64", "/bin",
-                       "/etc", "/dev", "/tmp", workspace] + python_paths
+        # Present system paths only: /lib64 is absent on arm64 and /sbin is a
+        # symlink into /usr on merged-usr hosts. A grant on a path that is not
+        # there fails when the child installs its Landlock rules, and the failure
+        # does not name the path, so filter here rather than debug it there.
+        system_paths = [
+            p for p in ("/usr", "/lib", "/lib64", "/bin", "/etc", "/dev", "/tmp")
+            if os.path.exists(p)
+        ]
+        fs_readable = system_paths + [workspace] + python_paths
         fs_writable = [workspace, "/tmp"]
 
         # --- Run 1: no defense ---

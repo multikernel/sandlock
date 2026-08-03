@@ -451,29 +451,39 @@ sandlock_builder_t *sandlock_sandbox_builder_on_exit(sandlock_builder_t *b, uint
 sandlock_builder_t *sandlock_sandbox_builder_on_error(sandlock_builder_t *b, uint8_t action);
 
 /**
- * Set the memory ceiling, in bytes.
+ * Set the memory limit from a byte-size string, e.g. `"512M"`.
  *
- * Zero is refused, reported by `sandlock_sandbox_build`: it is also the
- * sentinel the supervisor carries for "no ceiling", so an explicit zero would
- * install a ceiling of zero while the synthetic `/proc/meminfo` reports the
- * sandbox unlimited. Omit the call to leave memory unlimited.
+ * `size` uses the grammar the core accepts everywhere else: a decimal integer
+ * with an optional `K`/`M`/`G` suffix (case-insensitive), where a bare number
+ * is a count of bytes. The core parses it, so a binding does not have to
+ * carry a grammar of its own and cannot drift from this one.
+ *
+ * A value the core rejects is latched in the builder and reported by
+ * `sandlock_sandbox_build`, which returns -1 with the core's own message.
+ * `"0"` is one of them: zero is also the sentinel the supervisor carries for
+ * "no ceiling", so an explicit zero would install a ceiling of zero while the
+ * synthetic `/proc/meminfo` reported the sandbox unlimited. Omit the call to
+ * leave memory unlimited.
  *
  * # Safety
- * `b` must be a valid builder pointer.
+ * `b` must be a valid builder pointer. `size` must be null or a
+ * NUL-terminated string.
  */
-sandlock_builder_t *sandlock_sandbox_builder_max_memory(sandlock_builder_t *b, uint64_t bytes);
+sandlock_builder_t *sandlock_sandbox_builder_max_memory(sandlock_builder_t *b, const char *size);
 
 /**
- * Set the COW storage quota, in bytes.
+ * Set the disk limit from a byte-size string, e.g. `"10G"`.
  *
- * Zero is accepted here, unlike `sandlock_sandbox_builder_max_memory`: for a
- * disk quota zero is the documented spelling of "unlimited" and has no second
- * reading.
+ * Same grammar and same error path as
+ * [`sandlock_sandbox_builder_max_memory`], with one difference: `"0"` is
+ * accepted, because for a COW storage quota zero is the documented spelling
+ * of "unlimited" and has no second reading.
  *
  * # Safety
- * `b` must be a valid builder pointer.
+ * `b` must be a valid builder pointer. `size` must be null or a
+ * NUL-terminated string.
  */
-sandlock_builder_t *sandlock_sandbox_builder_max_disk(sandlock_builder_t *b, uint64_t bytes);
+sandlock_builder_t *sandlock_sandbox_builder_max_disk(sandlock_builder_t *b, const char *size);
 
 /**
  * Set the peak concurrent process limit.
@@ -664,10 +674,55 @@ sandlock_builder_t *sandlock_sandbox_builder_env_var(sandlock_builder_t *b,
                                                      const char *value);
 
 /**
+ * Set the sandbox start time from an RFC3339 timestamp, e.g.
+ * `"2026-01-01T00:00:00Z"`.
+ *
+ * The core parses it, the same way it parses `[determinism].time_start` in a
+ * profile and `--time-start` on the command line. This takes a string rather
+ * than an epoch count so the ABI can carry what the grammar can express:
+ * sub-second precision, an explicit offset, and instants before 1970, none of
+ * which fit in the unsigned second count this setter used to take.
+ *
+ * A value the core rejects is latched in the builder and reported by
+ * `sandlock_sandbox_build`, which returns -1 with the core's own message.
+ *
  * # Safety
- * `b` must be a valid builder pointer. `epoch_secs` is seconds since UNIX epoch.
+ * `b` must be a valid builder pointer. `timestamp` must be null or a
+ * NUL-terminated string.
  */
-sandlock_builder_t *sandlock_sandbox_builder_time_start(sandlock_builder_t *b, uint64_t epoch_secs);
+sandlock_builder_t *sandlock_sandbox_builder_time_start(sandlock_builder_t *b,
+                                                        const char *timestamp);
+
+/**
+ * Set the sandbox start time from an already-resolved epoch instant.
+ *
+ * `seconds` is a signed count of whole seconds since 1970-01-01T00:00:00Z and
+ * `nanoseconds` is a sub-second remainder below one second, which is exactly
+ * the pair `sandlock_profile_parse` reports under
+ * `[determinism].time_start`. Note the normalization: half a second before
+ * the epoch is `{-1, 500000000}`, not `{0, -500000000}`.
+ *
+ * This is the numeric counterpart of
+ * [`sandlock_sandbox_builder_time_start`], not a second grammar. It exists
+ * for the caller whose value is a number and never was text: an epoch count
+ * out of `datetime.timestamp()`, out of arithmetic on one, or out of a parsed
+ * profile. Without it such a caller would have to render RFC 3339 itself
+ * before it could pass anything, which is a grammar *writer* in the binding,
+ * with its own ways to be wrong about offsets and sub-second digits, one line
+ * away from the reader the string setter exists to abolish. A caller that
+ * still has the user's text must use the string setter instead, so the
+ * grammar is read once, by the core.
+ *
+ * A pair the core rejects (an unnormalized remainder, an instant outside the
+ * supported range) is latched in the builder and reported by
+ * `sandlock_sandbox_build`, which returns -1 with the core's own message.
+ *
+ * # Safety
+ * `b` must be a valid builder pointer.
+ */
+sandlock_builder_t *sandlock_sandbox_builder_time_start_epoch(sandlock_builder_t *b,
+                                                              int64_t seconds,
+                                                              uint32_t nanoseconds);
 
 /**
  * # Safety
@@ -829,7 +884,7 @@ void sandlock_sandbox_free(sandlock_sandbox_t *p);
  * The returned document has the same section layout as the profile, but every
  * string micro-grammar is already resolved: mounts are
  * `{"virt", "host", "ro"}` objects, `[limits]` sizes are integer bytes,
- * `[determinism].time_start` is `{"seconds", "nanoseconds"}` since the epoch,
+ * `[determinism].time_start` is `{"seconds", "nanoseconds", "rfc3339"}`,
  * bind ports are expanded integer lists, and net/HTTP rules are structured
  * records. A binding only has to map fields, so it never grows a second copy
  * of a grammar that can drift from this one.

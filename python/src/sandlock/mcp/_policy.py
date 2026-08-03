@@ -83,7 +83,7 @@ def policy_for_tool(
             - ``fs_writable: ["/tmp/workspace"]``
             - ``net_allow: ["api.example.com:443"]``
             - ``env: {"KEY": "value"}``
-            - ``max_memory: 268435456`` (bytes)
+            - ``max_memory: "256M"`` (or a count of bytes)
 
     Returns:
         A frozen :class:`Sandbox` instance.
@@ -91,10 +91,22 @@ def policy_for_tool(
     # Fields that users cannot override — always enforced.
     _ENFORCED = {"clean_env"}
 
+    # The system paths are filtered to the ones this host actually has: a
+    # readable path that does not exist fails when the child installs its
+    # Landlock rules, and it fails as a bare "sandlock_create failed" without
+    # naming the path. The set differs between distributions and architectures
+    # (/lib64 is absent on arm64, /sbin is a symlink into /usr on merged-usr
+    # systems), so this policy would break by host. This is a choice about
+    # *this* default policy, so it is made here; the paths a caller names in
+    # `extra_readable` are theirs and are forwarded whether they exist or not.
+    system_readable = [
+        p for p in ("/usr", "/lib", "/lib64", "/etc", "/bin", "/sbin")
+        if os.path.isdir(p)
+    ]
     kwargs: dict[str, Any] = {
         "fs_writable": [],
         "fs_readable": list(dict.fromkeys([
-            workspace, "/usr", "/lib", "/lib64", "/etc", "/bin", "/sbin",
+            workspace, *system_readable,
             _PYTHON_PREFIX, *_INTERP_READABLE, *extra_readable,
         ])),
         "net_allow_bind": [],

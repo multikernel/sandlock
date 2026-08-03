@@ -41,7 +41,7 @@ import pytest
 
 from sandlock._profile import policy_from_toml
 from sandlock.exceptions import PolicyError
-from sandlock.sandbox import BranchAction, Mount
+from sandlock.sandbox import BranchAction, Mount, Sandbox
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -571,7 +571,12 @@ def _cli_effective_policy(cli: str, profile: Path) -> dict:
 
 def _sdk_effective_policy(cli: str, text: str) -> dict:
     """Load a profile through the SDK and read back the same document."""
-    policy = dataclasses.replace(policy_from_toml(text), name=_unique_name("parity-sdk"))
+    return _live_policy(cli, policy_from_toml(text))
+
+
+def _live_policy(cli: str, policy) -> dict:
+    """Spawn a Sandbox and read its effective policy back over the control plane."""
+    policy = dataclasses.replace(policy, name=_unique_name("parity-sdk"))
     policy.spawn([SLEEP, "30"])
     try:
         return _inspect(cli, policy.name)
@@ -661,22 +666,99 @@ def test_rejected_by_both_with_the_same_message(cli, tmp_path, name, text):
     assert str(excinfo.value).rstrip("\n") == from_cli
 
 
-def test_time_start_the_c_abi_cannot_carry_is_refused_loudly(cli, tmp_path):
-    """Two timestamps the CLI accepts and the SDK cannot apply.
+def test_a_timestamp_the_cli_runs_can_also_be_applied_by_the_sdk(cli, tmp_path):
+    """The parity gap the epoch-seconds parameter used to open.
 
-    `sandlock_sandbox_builder_time_start` takes a `uint64` of seconds, so a
-    sub-second or pre-epoch stamp cannot be handed to it, while core keeps a
-    full timestamp and the CLI runs both. That is a real parity gap, reported
-    upstream. What is pinned here is that the SDK says so instead of wrapping
-    a negative value through the unsigned setter (a pre-epoch stamp used to
-    land in year 584942417355), and that the profile itself still loads, so
-    the gap stays visible as an ABI limit rather than a parse difference.
+    `sandlock_sandbox_builder_time_start` took a `uint64` of seconds, so a
+    sub-second or pre-epoch stamp could not be handed to it at all: the core
+    kept the full instant and the CLI ran both, while this SDK loaded the same
+    profile and then refused to apply it. (Before that it was worse, and a
+    pre-epoch stamp wrapped through the unsigned parameter into year
+    584942417355.) The setter takes the stamp itself now, with the epoch pair
+    as its numeric counterpart, so loading and applying no longer disagree.
     """
     for text in (
         '[determinism]\ntime_start = "2026-01-01T00:00:00.5Z"\n',
         '[determinism]\ntime_start = "1960-01-01T00:00:00Z"\n',
     ):
         assert _cli_load_error(cli, _write(tmp_path, text)) is None
-        policy = policy_from_toml(text)
-        with pytest.raises(ValueError, match="sandlock_sandbox_builder_time_start"):
-            policy.create(["/bin/true"])
+        policy_from_toml(text)._ensure_native()
+
+
+#: One policy, written the two ways a Sandbox can come to hold it: resolved by
+#: the profile parser, or spelled out by a caller. `[limits].memory` resolves to
+#: an integer count of bytes and `[determinism].time_start` to an epoch pair,
+#: while a caller writes the size and the stamp the way the grammar spells them.
+#: Both have to end up at the same sandbox, or a profile and the documentation
+#: for these fields describe different things.
+CONVERGENT = (
+    """
+    [filesystem]
+    read = {base_read}
+    [limits]
+    memory = "512M"
+    disk = "1G"
+    [determinism]
+    time_start = "2026-01-01T00:00:00Z"
+    """,
+    dict(max_memory="512M", max_disk="1G", time_start="2026-01-01T00:00:00Z"),
+)
+
+
+def test_the_two_ways_a_sandbox_is_configured_meet_at_the_same_policy(cli, tmp_path):
+    """The profile path and the literal path converge, in both directions.
+
+    The profile hands the SDK numbers (536870912 bytes, and seconds plus
+    nanoseconds since the epoch); a caller hands it "512M" and an RFC 3339
+    stamp. Neither is parsed here: the numbers go to the epoch and byte-count
+    doors of the ABI, the text goes to the grammar door, and the core resolves
+    both. What that has to be worth is one effective policy, which is what this
+    compares.
+    """
+    text, literal = CONVERGENT
+    rendered = _render(text, tmp_path)
+
+    from_profile = policy_from_toml(rendered)
+    # The resolved forms are what the profile path actually carries, and they
+    # are what makes this comparison non-trivial: if the SDK had parsed the
+    # strings itself, both sides would hold the same value already and the
+    # documents would match for the wrong reason.
+    assert from_profile.max_memory == 512 * 1024 * 1024
+    assert from_profile.time_start == 1767225600
+    assert literal["max_memory"] == "512M"
+
+    by_hand = Sandbox(fs_readable=list(BASE_READ), **literal)
+
+    assert _live_policy(cli, from_profile) == _live_policy(cli, by_hand)
+
+
+def test_a_grant_is_forwarded_whether_or_not_its_path_is_there(cli, monkeypatch):
+    """`/lib64` used to be dropped from `fs_readable` when it was missing.
+
+    One hardcoded path, filtered by the SDK on the caller's behalf. sandlock
+    refuses a readable path that does not exist, so the effect was to turn that
+    refusal into silence for exactly one path, and only for callers of this
+    SDK: the CLI, a profile and the Go SDK all still failed. Whether a missing
+    `/lib64` is a portability detail or a typo is the caller's to decide, and
+    the list they wrote is what goes to the core.
+
+    The absence is simulated rather than waited for, because the filter only
+    ever fired on a host without `/lib64` (arm64, musl) and this one has it.
+    """
+    import sandlock._sdk as sdk
+
+    real_exists = sdk.os.path.exists
+    monkeypatch.setattr(
+        sdk.os.path, "exists", lambda p: False if p == "/lib64" else real_exists(p)
+    )
+
+    policy = _live_policy(cli, Sandbox(fs_readable=list(BASE_READ)))
+    assert policy["filesystem"]["read"] == list(BASE_READ)
+
+
+def test_a_grant_on_a_path_that_is_not_there_reaches_the_core(cli):
+    """The verdict the filter above was hiding, on any host."""
+    missing = "/sandlock-parity-no-such-directory"
+    assert not os.path.exists(missing)
+    result = Sandbox(fs_readable=[*BASE_READ, missing]).run(["/bin/true"])
+    assert not result.success

@@ -16,10 +16,16 @@ import pytest
 from sandlock import Sandbox, Change, DryRunResult
 
 
-_PYTHON_READABLE = list(dict.fromkeys([
-    "/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev",
-    sys.prefix,
-]))
+# The SDK forwards every readable path to the core, which refuses one that
+# does not exist, so the fixture filters rather than naming `/lib64` on a host
+# (arm64, musl) that has none.
+_PYTHON_READABLE = [
+    p for p in dict.fromkeys([
+        "/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev",
+        sys.prefix,
+    ])
+    if os.path.isdir(p)
+]
 
 def _policy(**overrides):
     """Minimal policy with standard readable paths."""
@@ -940,3 +946,86 @@ class TestDiskQuota:
             ["sh", "-c", f"echo x >> {workdir}/big.bin"]
         )
         assert not result.success
+
+
+class TestAnUnsetCapIsNeverSent:
+    """The other half of the zero-cap rule, observed from inside the guest.
+
+    ``None`` must reach no setter at all, so the child sees the host's own
+    value rather than anything this SDK chose for it. Both knobs here are
+    readable from inside the sandbox, so the assertion is on what the child
+    actually got, not on the build succeeding.
+    """
+
+    def _read(self, script: str, **overrides) -> str:
+        result = _policy(**overrides).run(["sh", "-c", script])
+        assert result.success, f"stderr={result.stderr!r}"
+        return result.stdout.decode().strip()
+
+    def test_an_unset_num_cpus_leaves_the_host_count_visible(self):
+        assert self._read("nproc") == str(os.cpu_count())
+        assert self._read("nproc", num_cpus=2) == "2"
+
+    def test_an_unset_max_open_files_inherits_the_host_limit(self):
+        import resource as _resource
+
+        soft, _hard = _resource.getrlimit(_resource.RLIMIT_NOFILE)
+        assert self._read("ulimit -n") == str(soft)
+        assert self._read("ulimit -n", max_open_files=32) == "32"
+
+
+class TestConfine:
+    """``confine()`` applies Landlock to the calling process, irreversibly.
+
+    Every case runs in a forked child, because there is no way back out.
+    """
+
+    @staticmethod
+    def _in_child(body: str) -> str:
+        """Run ``body`` in a fresh interpreter and return what it reported.
+
+        A separate process rather than a fork: pytest is multi-threaded, and
+        forking one is its own hazard, quite apart from the confinement.
+        """
+        import subprocess
+
+        script = (
+            "from sandlock import BranchAction, Sandbox, confine\n"
+            "try:\n"
+            f"    {body}\n"
+            "    print('OK')\n"
+            "except BaseException as exc:\n"
+            "    print(f'{type(exc).__name__}: {exc}')\n"
+        )
+        done = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True, timeout=60,
+        )
+        assert done.returncode == 0, f"child died: {done.stderr}"
+        return done.stdout.strip()
+
+    def test_a_default_sandbox_confines(self):
+        """The policy in this package's README, verbatim.
+
+        Nothing here says anything about the COW branch, and a confinement has
+        no branch to say anything about. It used to be refused all the same,
+        because the core demanded ``on_error == ABORT`` while ``build()``
+        resolved an unset ``on_error`` to ``COMMIT``.
+        """
+        assert self._in_child(
+            "confine(Sandbox(fs_readable=['/usr', '/lib'], fs_writable=['/tmp']))"
+        ) == "OK"
+
+    @pytest.mark.parametrize("action", ["COMMIT", "ABORT", "KEEP"])
+    def test_any_branch_action_still_confines(self, action):
+        assert self._in_child(
+            "confine(Sandbox(fs_readable=['/usr'], "
+            f"on_exit=BranchAction.{action}, on_error=BranchAction.{action}))"
+        ) == "OK"
+
+    def test_a_field_confinement_cannot_honor_is_still_refused(self):
+        """The guard rail: the unsupported list itself must not have loosened."""
+        out = self._in_child(
+            "confine(Sandbox(fs_readable=['/usr'], cwd='/tmp'))"
+        )
+        assert out.startswith("ConfinementError"), out

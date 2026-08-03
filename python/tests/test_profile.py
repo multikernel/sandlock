@@ -24,7 +24,7 @@ from sandlock._profile import (
 )
 from sandlock._sdk import profile_parse
 from sandlock.exceptions import PolicyError
-from sandlock.sandbox import BranchAction, Mount, Sandbox
+from sandlock.sandbox import BranchAction, Mount, Sandbox, User
 
 
 class TestSectionMapping:
@@ -33,7 +33,7 @@ class TestSectionMapping:
         # default so that an absent key cannot mean one thing to the CLI and
         # another to a binding. Core's default is commit for both.
         p = policy_from_toml("")
-        assert p == Sandbox(on_error=BranchAction.COMMIT)
+        assert p == Sandbox(on_exit=BranchAction.COMMIT, on_error=BranchAction.COMMIT)
 
     def test_filesystem_section(self):
         p = policy_from_toml(textwrap.dedent("""\
@@ -60,8 +60,10 @@ class TestSectionMapping:
             no_huge_pages = true
         """))
         assert p.env == {"FOO": "bar", "BAZ": "qux"}
-        assert p.uid == 1000
-        assert p.gid == 1000
+        # Two canonical keys, one field: the core models the identity as a
+        # pair, and so does this SDK, which is why there is no half-set state
+        # left for the profile mapping to answer for.
+        assert p.user == User(uid=1000, gid=1000)
         assert p.cwd == "/work"
         assert p.clean_env is True
         assert p.no_coredump is True
@@ -77,7 +79,11 @@ class TestSectionMapping:
             uid = 1000
             gid = 1000
         """))
-        assert p == Sandbox(uid=1000, gid=1000, on_error=BranchAction.COMMIT)
+        assert p == Sandbox(
+            user=User(1000, 1000),
+            on_exit=BranchAction.COMMIT,
+            on_error=BranchAction.COMMIT,
+        )
 
     def test_limits_section(self):
         p = policy_from_toml(textwrap.dedent("""\
@@ -100,12 +106,14 @@ class TestSectionMapping:
         assert p.num_cpus == 2
         assert list(p.gpu_devices) == [0]
 
-    def test_absent_limits_keep_sandbox_defaults(self):
-        # `processes` is null in the canonical form when unset, and the
-        # Sandbox default for it is 64, not None: a null must be skipped
-        # rather than assigned.
+    def test_absent_limits_stay_absent(self):
+        # A null leaf means the profile did not set the key, and it stays
+        # unset here. The cap it would have taken is the core's default, and
+        # 64 is not written down on this side any more: repeating it here is
+        # how a profile that says nothing could have come to mean something
+        # different from what the CLI makes of the same silence.
         p = policy_from_toml("[limits]\ncpu = 50\n")
-        assert p.max_processes == 64
+        assert p.max_processes is None
         assert p.max_memory is None
         assert p.gpu_devices is None
 
@@ -303,16 +311,47 @@ class TestCoreParity:
         assert p.time_start == 1767225600 - 3 * 3600
 
     def test_time_start_keeps_sub_second_precision(self):
+        """A remainder comes back as the core's own text, not as a double.
+
+        ``seconds + nanos / 1e9`` cannot hold the pair the core resolved: a
+        double has about 238ns of spacing at 2026 epoch values. The stamp is
+        carried instead, so nothing is re-derived on this side.
+        """
         p = policy_from_toml(
             '[determinism]\ntime_start = "2026-01-01T00:00:00.25Z"\n'
         )
-        assert p.time_start == 1767225600.25
+        assert p.time_start == "2026-01-01T00:00:00.25Z"
+
+    def test_a_remainder_finer_than_a_double_survives(self):
+        """The case that changed what the profile meant, not just its precision.
+
+        Through the float the remainder rounded up to a whole second, and the
+        core floors ``time_start`` to whole seconds, so this profile ran one
+        second later through the SDK than through the CLI.
+        """
+        p = policy_from_toml(
+            '[determinism]\ntime_start = "2026-01-01T00:00:00.9999999Z"\n'
+        )
+        assert p.time_start == "2026-01-01T00:00:00.9999999Z"
+        # The whole second the core reads out of it, which is the one the CLI
+        # reads out of the same file.
+        from sandlock._sdk import profile_parse
+
+        canonical = profile_parse(
+            '[determinism]\ntime_start = "2026-01-01T00:00:00.9999999Z"\n'
+        )
+        assert canonical["determinism"]["time_start"]["seconds"] == 1767225600
 
     def test_pre_epoch_time_start_stays_negative(self):
         p = policy_from_toml(
             '[determinism]\ntime_start = "1969-12-31T23:59:59.5Z"\n'
         )
-        assert p.time_start == -0.5
+        assert p.time_start == "1969-12-31T23:59:59.5Z"
+
+    def test_a_whole_second_still_comes_back_as_a_number(self):
+        """The numeric door stays exercised by the case that is exact."""
+        p = policy_from_toml('[determinism]\ntime_start = "1969-07-20T20:17:00Z"\n')
+        assert p.time_start == -14182980
 
     def test_naive_time_start_is_rejected(self):
         # A binding that assumed UTC here would disagree with the CLI about
@@ -563,10 +602,10 @@ class TestListProfiles:
 
 class TestMergeCliOverrides:
     def test_scalar_override(self):
-        base = Sandbox(max_memory=256 * 1024 ** 2, uid=0, gid=0)
-        result = merge_cli_overrides(base, {"max_memory": 1024 ** 3})
-        assert result.max_memory == 1024 ** 3
-        assert result.uid == 0  # unchanged
+        base = Sandbox(max_memory="256M", user=User(0, 0))
+        result = merge_cli_overrides(base, {"max_memory": "1G"})
+        assert result.max_memory == "1G"
+        assert result.user == User(0, 0)  # unchanged
 
     def test_list_append(self):
         base = Sandbox(fs_readable=["/usr", "/lib"])

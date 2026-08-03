@@ -2968,7 +2968,11 @@ pub(crate) fn parse_allow_bind_ports(specs: &[String], label: &str) -> Result<Bi
 
 /// Expand `--net-allow-bind` specs into a sorted, deduplicated port list.
 /// Each spec is a comma-separated list of single ports (`8080`) or inclusive
-/// `lo-hi` ranges (`8000-8010`). Mirrors the Python SDK's `parse_ports`.
+/// `lo-hi` ranges (`8000-8010`).
+///
+/// This is the definition of that grammar. Every surface forwards its specs
+/// here as written; none of them re-implements it, and this function does not
+/// follow any of them.
 pub(crate) fn parse_bind_ports(specs: &[String], label: &str) -> Result<Vec<u16>, SandboxError> {
     let mut ports: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
     for spec in specs {

@@ -264,10 +264,17 @@ def demo_xoa_sandboxed(client: OpenAI, data_path: str):
     ))
     python_paths = [p for p in sys.path if p and os.path.isdir(p)]
 
-    base_readable = list(dict.fromkeys([
-        "/usr", "/lib", "/lib64", "/etc", "/bin", "/sbin",
-        "/dev", python_prefix,
-    ] + python_paths))
+    # Present system paths only: /lib64 is absent on arm64 and /sbin is a
+    # symlink into /usr on merged-usr hosts. A grant on a path that is not
+    # there fails when the child installs its Landlock rules, and the failure
+    # does not name the path, so filter here rather than debug it there.
+    system_paths = [
+        p for p in ("/usr", "/lib", "/lib64", "/etc", "/bin", "/sbin", "/dev")
+        if os.path.exists(p)
+    ]
+    base_readable = list(dict.fromkeys(
+        system_paths + [python_prefix] + python_paths
+    ))
 
     # Planner sandbox (shared by planner1 + planner2): reach OpenAI,
     # NO filesystem access to the data file.
