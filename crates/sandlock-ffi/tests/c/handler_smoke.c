@@ -74,6 +74,48 @@ static int check_inject_bytes(void) {
     return 0;
 }
 
+/* Exercise sandlock_profile_parse() through the cdylib: a valid profile
+ * yields JSON with the micro-grammars already resolved, and an unknown key
+ * yields err=-1 plus a message. Returns 0 on success, non-zero on failure. */
+static int check_profile_parse(void) {
+    int err = 7;
+    char *err_msg = NULL;
+    char *json = sandlock_profile_parse(
+        "[filesystem]\nmount = [\"/data:/srv:ro\"]\n"
+        "[limits]\nmemory = \"512M\"\n",
+        &err, &err_msg);
+    if (json == NULL || err != 0 || err_msg != NULL) {
+        fprintf(stderr, "profile_parse: valid profile failed (err=%d, msg=%s)\n",
+                err, err_msg ? err_msg : "(none)");
+        sandlock_string_free(err_msg);
+        sandlock_string_free(json);
+        return 1;
+    }
+    /* Structured mounts and integer bytes, not "V:H:ro" and "512M". */
+    if (strstr(json, "\"ro\"") == NULL || strstr(json, "536870912") == NULL) {
+        fprintf(stderr, "profile_parse: unresolved JSON: %s\n", json);
+        sandlock_string_free(json);
+        return 1;
+    }
+    sandlock_string_free(json);
+
+    err = 7;
+    json = sandlock_profile_parse("[program]\nbogus = 1\n", &err, &err_msg);
+    if (json != NULL || err != -1 || err_msg == NULL) {
+        fprintf(stderr, "profile_parse: unknown key not reported (err=%d)\n", err);
+        sandlock_string_free(json);
+        sandlock_string_free(err_msg);
+        return 1;
+    }
+    if (strstr(err_msg, "unknown field") == NULL) {
+        fprintf(stderr, "profile_parse: unexpected message: %s\n", err_msg);
+        sandlock_string_free(err_msg);
+        return 1;
+    }
+    sandlock_string_free(err_msg);
+    return 0;
+}
+
 static int force_getpid_to_777(
     void *ud,
     const sandlock_notif_data_t *notif,
@@ -158,6 +200,9 @@ int main(void) {
         return 1;
     }
     if (check_policy_fn_user_data_drop() != 0) {
+        return 1;
+    }
+    if (check_profile_parse() != 0) {
         return 1;
     }
 

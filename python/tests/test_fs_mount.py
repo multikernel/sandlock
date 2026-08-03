@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from sandlock import Sandbox
+from sandlock import Mount, Sandbox
 
 
 _HELPER_BIN = Path(__file__).resolve().parent.parent.parent / "tests" / "rootfs-helper"
@@ -54,7 +54,7 @@ def _mount_policy(rootfs, work_dir, cwd="/", extra_fs_readable=None):
         readable.extend(extra_fs_readable)
     return Sandbox(
         chroot=str(rootfs),
-        fs_mount={"/work": str(work_dir)},
+        fs_mount=[Mount("/work", str(work_dir))],
         fs_readable=readable,
         clean_env=True,
         cwd=cwd,
@@ -153,7 +153,7 @@ class TestFsMount:
         # readable-only, so build a writable policy here.
         policy = Sandbox(
             chroot=str(rootfs),
-            fs_mount={"/work": str(work_dir)},
+            fs_mount=[Mount("/work", str(work_dir))],
             fs_readable=list(_FS_READABLE),
             fs_writable=["/work"],
             clean_env=True,
@@ -162,6 +162,47 @@ class TestFsMount:
         result = policy.run(["setxattr", "/work/f.txt", "user.color", "blue"])
         assert result.success, f"failed: {result.stderr.decode(errors='replace')}"
         assert os.getxattr(target, "user.color") == b"blue"
+
+    def test_fs_mount_read_only_allows_reads(self, rootfs, tmp_path):
+        """A read-only mount still serves reads."""
+        work_dir = tmp_path / "hostwork"
+        work_dir.mkdir()
+        (work_dir / "hello.txt").write_text("hello from host\n")
+
+        policy = Sandbox(
+            chroot=str(rootfs),
+            fs_mount=[Mount("/work", str(work_dir), ro=True)],
+            fs_readable=list(_FS_READABLE),
+            fs_writable=["/work"],
+            clean_env=True,
+            env={"PATH": "/bin:/usr/bin"},
+        )
+        result = policy.run(["cat", "/work/hello.txt"])
+        assert result.success, f"failed: {result.stderr}"
+        assert b"hello from host" in result.stdout
+
+    def test_fs_mount_read_only_refuses_writes(self, rootfs, tmp_path):
+        """``Mount(..., ro=True)`` is honoured even when /work is writable.
+
+        The old mount representation was a virtual-to-host mapping with no
+        room for the flag, so a profile's ':ro' suffix could not be applied
+        at all. Granting fs_writable here means only the mount's read-only
+        flag can be what refuses the write.
+        """
+        work_dir = tmp_path / "hostwork"
+        work_dir.mkdir()
+
+        policy = Sandbox(
+            chroot=str(rootfs),
+            fs_mount=[Mount("/work", str(work_dir), ro=True)],
+            fs_readable=list(_FS_READABLE),
+            fs_writable=["/work"],
+            clean_env=True,
+            env={"PATH": "/bin:/usr/bin"},
+        )
+        result = policy.run(["write", "/work/output.txt", "should be refused"])
+        assert not result.success
+        assert not (work_dir / "output.txt").exists()
 
     def test_fs_mount_cwd(self, rootfs, tmp_path):
         """Set cwd=/work, verify cat with relative path works."""
@@ -241,7 +282,7 @@ class TestFsMountCow:
         """Build a policy combining fs_mount with COW."""
         kwargs = dict(
             chroot=str(rootfs),
-            fs_mount={"/work": str(work_dir)},
+            fs_mount=[Mount("/work", str(work_dir))],
             workdir=str(work_dir),
             fs_storage=str(storage_dir),
             fs_writable=[str(work_dir)],
@@ -302,7 +343,7 @@ class TestFsMountCow:
         (work_dir / "big.bin").write_bytes(b"\x00" * 8192)
 
         policy = self._cow_mount_policy(rootfs, work_dir, storage_dir,
-                                        on_exit="abort", max_disk="1K")
+                                        on_exit="abort", max_disk=1024)
         # The write applet opens the file with O_WRONLY|O_CREAT|O_TRUNC,
         # triggering a COW copy of the 8 KiB file against a 1 KiB quota.
         result = policy.run(["write", "/work/big.bin", "overwrite"])

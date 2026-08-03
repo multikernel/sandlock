@@ -81,7 +81,7 @@ _TOOL_DEFS: list[dict] = [
             "Execute Python code and return stdout. "
             "No filesystem or network access."
         ),
-        "capabilities_extra": lambda ws: {"max_memory": "256M"},
+        "capabilities_extra": lambda ws: {"max_memory": 256 * 1024 ** 2},
         "input_schema": {
             "type": "object",
             "properties": {

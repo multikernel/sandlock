@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import json
 import os
 import signal
 import sys
@@ -80,6 +81,7 @@ _b_workdir = _builder_fn("sandlock_sandbox_builder_workdir", ctypes.c_char_p)
 _b_cwd = _builder_fn("sandlock_sandbox_builder_cwd", ctypes.c_char_p)
 _b_chroot = _builder_fn("sandlock_sandbox_builder_chroot", ctypes.c_char_p)
 _b_fs_mount = _builder_fn("sandlock_sandbox_builder_fs_mount", ctypes.c_char_p, ctypes.c_char_p)
+_b_fs_mount_ro = _builder_fn("sandlock_sandbox_builder_fs_mount_ro", ctypes.c_char_p, ctypes.c_char_p)
 _b_on_exit = _builder_fn("sandlock_sandbox_builder_on_exit", ctypes.c_uint8)
 _b_on_error = _builder_fn("sandlock_sandbox_builder_on_error", ctypes.c_uint8)
 _b_max_memory = _builder_fn("sandlock_sandbox_builder_max_memory", ctypes.c_uint64)
@@ -282,6 +284,54 @@ _lib.sandlock_sandbox_free.argtypes = [_c_policy_p]
 # this function rather than ctypes' own deallocator.
 _lib.sandlock_string_free.restype = None
 _lib.sandlock_string_free.argtypes = [ctypes.c_char_p]
+
+# Profile parsing. The return type is c_void_p rather than c_char_p on
+# purpose: ctypes converts a c_char_p result to `bytes` and drops the
+# pointer, leaving nothing to hand back to sandlock_string_free.
+_lib.sandlock_profile_parse.restype = ctypes.c_void_p
+_lib.sandlock_profile_parse.argtypes = [
+    ctypes.c_char_p,
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.POINTER(ctypes.c_char_p),
+]
+
+
+def profile_parse(toml_text: str) -> dict:
+    """Parse a TOML profile with the core parser, returning its canonical form.
+
+    Every micro-grammar in the profile (mount specs, byte sizes, timestamps,
+    port specs, net/HTTP rules, branch actions) is resolved by the same code
+    path the CLI runs, so a profile either loads identically in both or fails
+    in both with the same message.
+
+    Raises:
+        PolicyError: With the core parser's own message.
+    """
+    from .exceptions import PolicyError
+
+    encoded = toml_text.encode("utf-8")
+    if b"\0" in encoded:
+        # The C ABI takes a NUL-terminated string, so a NUL inside the profile
+        # would truncate it and parse a prefix as if it were the whole file.
+        raise PolicyError("profile contains a NUL byte")
+
+    err = ctypes.c_int(0)
+    err_msg = ctypes.c_char_p()
+    ptr = _lib.sandlock_profile_parse(encoded, ctypes.byref(err), ctypes.byref(err_msg))
+    if not ptr or err.value != 0:
+        # err_msg.value copies the bytes; the allocation itself still has to
+        # be released. When the FFI leaves it null (an internal binding bug,
+        # not a profile problem) there is no diagnosis to report, so raise
+        # without one rather than inventing a message.
+        msg = err_msg.value.decode("utf-8", "replace") if err_msg.value else None
+        if err_msg.value:
+            _lib.sandlock_string_free(err_msg)
+        raise PolicyError(msg) if msg else PolicyError()
+    try:
+        return json.loads(ctypes.cast(ptr, ctypes.c_char_p).value.decode("utf-8"))
+    finally:
+        _lib.sandlock_string_free(ctypes.cast(ptr, ctypes.c_char_p))
+
 
 # Run
 _lib.sandlock_run.restype = _c_result_p
@@ -740,6 +790,46 @@ def _encode(s: str) -> bytes:
         raise ValueError(f"NUL byte in string argument: {result!r}")
     return result
 
+
+def _bytes_limit(value, field: str) -> int:
+    """Validate a byte-count policy field for the ``uint64`` C ABI setter."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(
+            f"{field} must be an integer number of bytes, got {value!r}"
+        )
+    if not 0 <= value <= 0xFFFF_FFFF_FFFF_FFFF:
+        raise ValueError(f"{field} out of range for a 64-bit byte count: {value}")
+    return value
+
+
+def _epoch_seconds(value) -> int:
+    """Validate ``time_start`` for the ``uint64`` epoch-seconds C ABI setter.
+
+    The setter carries whole, non-negative seconds. The profile grammar is
+    wider than that (it accepts pre-1970 stamps and fractional seconds), so
+    the values it cannot carry are refused here: passing them on would make
+    the same profile mean one thing through the CLI and another through this
+    SDK, and a negative value would additionally wrap to a date in the far
+    future instead of failing.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(
+            f"time_start must be Unix epoch seconds, got {value!r}"
+        )
+    if value < 0:
+        raise ValueError(
+            "time_start before the Unix epoch is not supported by the "
+            f"sandlock_sandbox_builder_time_start ABI: {value}"
+        )
+    if value != int(value):
+        raise ValueError(
+            "time_start carries sub-second precision, which the "
+            "sandlock_sandbox_builder_time_start ABI cannot represent: "
+            f"{value}"
+        )
+    return int(value)
+
+
 def _make_argv(cmd: Sequence[str]):
     """Create a (c_char_p array, argc) pair from a list of strings."""
     argc = len(cmd)
@@ -1027,7 +1117,8 @@ class _NativePolicy:
         "net_allow", "net_deny", "net_allow_bind", "net_deny_bind",
         "port_remap",
         "http_allow", "http_deny", "http_ports", "http_ca", "http_key",
-        "uid",
+        "http_inject_ca", "http_ca_out",
+        "uid", "gid",
         "random_seed", "time_start", "clean_env", "env",
         "extra_deny_syscalls", "extra_allow_syscalls", "max_open_files",
         "no_randomize_memory", "no_huge_pages", "no_coredump", "deterministic_dirs",
@@ -1042,8 +1133,6 @@ class _NativePolicy:
     @staticmethod
     def _build_from_policy(policy: PolicyDataclass):
         """Build a native builder from a Python Sandbox dataclass. Returns builder pointer."""
-        from .sandbox import parse_memory_size
-
         b = _lib.sandlock_sandbox_builder_new()
 
         for p in (policy.fs_readable or []):
@@ -1068,8 +1157,9 @@ class _NativePolicy:
             b = _b_cwd(b, _encode(str(policy.cwd)))
         if policy.chroot:
             b = _b_chroot(b, _encode(str(policy.chroot)))
-        for vp, hp in (policy.fs_mount or {}).items():
-            b = _b_fs_mount(b, _encode(str(vp)), _encode(str(hp)))
+        for mount in (policy.fs_mount or []):
+            setter = _b_fs_mount_ro if mount.ro else _b_fs_mount
+            b = setter(b, _encode(str(mount.virt)), _encode(str(mount.host)))
 
         # COW branch actions (0=Commit, 1=Abort, 2=Keep)
         _action_map = {"commit": 0, "abort": 1, "keep": 2}
@@ -1079,18 +1169,10 @@ class _NativePolicy:
         b = _b_on_error(b, _action_map.get(on_error_val, 1))
 
         if policy.max_memory is not None:
-            if isinstance(policy.max_memory, str):
-                mem_bytes = parse_memory_size(policy.max_memory)
-            else:
-                mem_bytes = int(policy.max_memory)
-            b = _b_max_memory(b, mem_bytes)
+            b = _b_max_memory(b, _bytes_limit(policy.max_memory, "max_memory"))
 
         if policy.max_disk is not None:
-            if isinstance(policy.max_disk, str):
-                disk_bytes = parse_memory_size(policy.max_disk)
-            else:
-                disk_bytes = int(policy.max_disk)
-            b = _b_max_disk(b, disk_bytes)
+            b = _b_max_disk(b, _bytes_limit(policy.max_disk, "max_disk"))
 
         if policy.max_processes != 64:
             b = _b_max_processes(b, policy.max_processes)
@@ -1142,8 +1224,7 @@ class _NativePolicy:
         if policy.random_seed is not None:
             b = _b_random_seed(b, policy.random_seed)
         if policy.time_start is not None:
-            epoch_secs = int(policy.time_start.timestamp()) if hasattr(policy.time_start, 'timestamp') else int(policy.time_start)
-            b = _b_time_start(b, epoch_secs)
+            b = _b_time_start(b, _epoch_seconds(policy.time_start))
         if policy.clean_env:
             b = _b_clean_env(b, True)
         for k, v in (policy.env or {}).items():

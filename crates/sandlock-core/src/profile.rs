@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use std::collections::HashMap;
 use std::time::SystemTime;
 
+pub mod canonical;
+
 /// Program identity supplied by a profile alongside the policy.
 /// Not a `Sandbox` field — passed separately to the sandbox runner.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -337,13 +339,21 @@ pub fn parse_mount_spec(s: &str) -> Result<(PathBuf, PathBuf, bool), SandlockErr
 
 /// Parses an RFC3339 timestamp string into `SystemTime`.
 fn parse_time_start(s: &str) -> Result<SystemTime, SandlockError> {
+    Ok(parse_timestamp(s)?.into())
+}
+
+/// Parses an RFC3339 timestamp string, keeping the `jiff::Timestamp`.
+///
+/// `SystemTime` cannot represent a pre-epoch instant as a plain second count,
+/// so the canonical form resolves the string through this instead and does its
+/// own epoch split.
+fn parse_timestamp(s: &str) -> Result<jiff::Timestamp, SandlockError> {
     use crate::error::SandboxError;
-    let ts: jiff::Timestamp = s.parse().map_err(|e| {
+    s.parse().map_err(|e| {
         SandlockError::Sandbox(SandboxError::Invalid(
             format!("invalid [determinism].time_start {s:?}: {e}"),
         ))
-    })?;
-    Ok(ts.into())
+    })
 }
 
 // ============================================================
@@ -565,13 +575,20 @@ fn dirs_or_fallback() -> PathBuf {
         .join("sandlock")
 }
 
-/// Parse a TOML profile string into a Sandbox + ProgramSpec.
-pub fn parse_profile(content: &str) -> Result<(Sandbox, ProgramSpec), SandlockError> {
-    let input: ProfileInput = toml::from_str(content)
+/// Deserialize a TOML profile string into the raw schema.
+///
+/// Shared by `parse_profile` and `canonical::parse` so both report a syntax or
+/// unknown-key problem with the same wording.
+fn deserialize_profile(content: &str) -> Result<ProfileInput, SandlockError> {
+    toml::from_str(content)
         .map_err(|e| SandlockError::Sandbox(crate::error::SandboxError::Invalid(
             format!("TOML parse error: {e}"),
-        )))?;
-    parse_input(input)
+        )))
+}
+
+/// Parse a TOML profile string into a Sandbox + ProgramSpec.
+pub fn parse_profile(content: &str) -> Result<(Sandbox, ProgramSpec), SandlockError> {
+    parse_input(deserialize_profile(content)?)
 }
 
 /// Load a profile by name.

@@ -5,45 +5,56 @@ from __future__ import annotations
 
 import pytest
 
+import sandlock.sandbox as sandbox_module
+from sandlock._sdk import _bytes_limit, _epoch_seconds
 from sandlock.sandbox import (
+    Mount,
     Sandbox,
-    parse_memory_size,
     parse_ports,
 )
 
 
-class TestParseMemorySize:
-    def test_plain_bytes(self):
-        assert parse_memory_size("1024") == 1024
+class TestNoSecondGrammar:
+    """The profile grammars live in the core parser, and only there.
 
-    def test_kilobytes(self):
-        assert parse_memory_size("100K") == 100 * 1024
+    Every helper named here used to be a second implementation of a grammar
+    the core already owns, and each one disagreed with it somewhere: sizes
+    accepted ``'1.5G'``/``'1T'`` that the core rejects, and the timestamp
+    helper read a naive stamp as UTC while the core requires an offset.
+    """
 
-    def test_megabytes(self):
-        assert parse_memory_size("512M") == 512 * 1024 ** 2
+    def test_size_grammar_is_gone(self):
+        assert not hasattr(sandbox_module, "parse_memory_size")
+        assert not hasattr(Sandbox, "memory_bytes")
 
-    def test_gigabytes(self):
-        assert parse_memory_size("1G") == 1024 ** 3
+    def test_timestamp_grammar_is_gone(self):
+        assert not hasattr(Sandbox, "time_start_timestamp")
 
-    def test_terabytes(self):
-        assert parse_memory_size("2T") == 2 * 1024 ** 4
+    @pytest.mark.parametrize("field", ["max_memory", "max_disk"])
+    def test_size_strings_are_refused_at_construction(self, field):
+        with pytest.raises(TypeError, match="integer number of bytes"):
+            Sandbox(**{field: "512M"})
 
-    def test_case_insensitive(self):
-        assert parse_memory_size("512m") == 512 * 1024 ** 2
+    def test_time_start_strings_are_refused_at_construction(self):
+        with pytest.raises(TypeError, match="epoch seconds"):
+            Sandbox(time_start="2026-01-01T00:00:00Z")
 
-    def test_fractional(self):
-        assert parse_memory_size("1.5G") == int(1.5 * 1024 ** 3)
 
-    def test_whitespace(self):
-        assert parse_memory_size("  512M  ") == 512 * 1024 ** 2
+class TestFsMountField:
+    def test_mount_entries(self):
+        p = Sandbox(fs_mount=[Mount("/work", "/host"), Mount("/ro", "/h", ro=True)])
+        assert p.fs_mount[0].ro is False
+        assert p.fs_mount[1].ro is True
 
-    def test_invalid(self):
-        with pytest.raises(ValueError):
-            parse_memory_size("not_a_size")
+    def test_mapping_is_refused(self):
+        # The old representation was dict[virt, host], which had no channel
+        # for the read-only flag at all.
+        with pytest.raises(TypeError, match="not a mapping"):
+            Sandbox(fs_mount={"/work": "/host"})
 
-    def test_empty(self):
-        with pytest.raises(ValueError):
-            parse_memory_size("")
+    def test_non_mount_entries_are_refused(self):
+        with pytest.raises(TypeError, match="must be Mount"):
+            Sandbox(fs_mount=[("/work", "/host")])
 
 
 class TestEnsureNative:
@@ -84,21 +95,9 @@ class TestPolicy:
 
     def test_mutable_config(self):
         # Sandbox is no longer frozen — it holds runtime state too.
-        p = Sandbox(max_memory="512M")
-        p.max_memory = "1G"
-        assert p.max_memory == "1G"
-
-    def test_memory_bytes_string(self):
-        p = Sandbox(max_memory="512M")
-        assert p.memory_bytes() == 512 * 1024 ** 2
-
-    def test_memory_bytes_int(self):
-        p = Sandbox(max_memory=1024)
-        assert p.memory_bytes() == 1024
-
-    def test_memory_bytes_none(self):
-        p = Sandbox()
-        assert p.memory_bytes() is None
+        p = Sandbox(max_memory=512 * 1024 ** 2)
+        p.max_memory = 1024 ** 3
+        assert p.max_memory == 1024 ** 3
 
     def test_cpu_pct(self):
         p = Sandbox(max_cpu=50)
@@ -118,20 +117,15 @@ class TestDiskQuotaPolicy:
         p = Sandbox()
         assert p.max_disk is None
 
-    def test_string_value(self):
-        p = Sandbox(max_disk="1G")
-        assert p.max_disk == "1G"
+    def test_byte_value(self):
+        p = Sandbox(max_disk=1024 ** 3)
+        assert p.max_disk == 1024 ** 3
 
     def test_mutable_config(self):
         # Sandbox is no longer frozen — it holds runtime state too.
-        p = Sandbox(max_disk="512M")
-        p.max_disk = "1G"
-        assert p.max_disk == "1G"
-
-    def test_parse_memory_size_for_disk(self):
-        assert parse_memory_size("1G") == 1024 ** 3
-        assert parse_memory_size("512M") == 512 * 1024 ** 2
-        assert parse_memory_size("100K") == 100 * 1024
+        p = Sandbox(max_disk=512 * 1024 ** 2)
+        p.max_disk = 1024 ** 3
+        assert p.max_disk == 1024 ** 3
 
 
 class TestParsePorts:
@@ -256,3 +250,41 @@ class TestNetDeny:
         p = Sandbox(net_deny=["10.0.0.0/8", "169.254.169.254:80", "udp://*"])
         assert list(p.net_deny) == ["10.0.0.0/8", "169.254.169.254:80", "udp://*"]
 
+
+
+class TestBuilderBoundary:
+    """Values the C ABI setters cannot carry are refused, not truncated.
+
+    ``sandlock_sandbox_builder_time_start`` takes whole non-negative epoch
+    seconds while the profile grammar accepts pre-epoch and fractional
+    stamps, so those two cases have to fail loudly: passing them on would
+    make the same profile mean one thing through the CLI and another here,
+    and a negative value would wrap to a date in the far future.
+    """
+
+    def test_whole_epoch_seconds_pass(self):
+        assert _epoch_seconds(1767225600) == 1767225600
+        assert _epoch_seconds(1767225600.0) == 1767225600
+
+    def test_pre_epoch_time_start_is_refused(self):
+        with pytest.raises(ValueError, match="before the Unix epoch"):
+            _epoch_seconds(-0.5)
+
+    def test_sub_second_time_start_is_refused(self):
+        with pytest.raises(ValueError, match="sub-second"):
+            _epoch_seconds(1767225600.25)
+
+    def test_non_numeric_time_start_is_refused(self):
+        with pytest.raises(TypeError, match="epoch seconds"):
+            _epoch_seconds("1767225600")
+
+    def test_byte_limits_must_be_integers(self):
+        assert _bytes_limit(512, "max_memory") == 512
+        with pytest.raises(TypeError, match="integer number of bytes"):
+            _bytes_limit(1.5, "max_memory")
+
+    def test_byte_limits_must_fit_the_abi(self):
+        with pytest.raises(ValueError, match="out of range"):
+            _bytes_limit(2 ** 64, "max_memory")
+        with pytest.raises(ValueError, match="out of range"):
+            _bytes_limit(-1, "max_disk")
