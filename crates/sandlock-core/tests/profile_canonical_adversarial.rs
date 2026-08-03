@@ -350,7 +350,10 @@ fn the_largest_legal_values_are_still_accepted() {
         ok("[limits]\nmemory = \"18446744073709551615\"\n")["limits"]["memory"],
         u64::MAX
     );
-    assert_eq!(ok("[limits]\nmemory = \"0\"\n")["limits"]["memory"], 0);
+    // The smallest legal size, on the knob that takes it: zero is the disk
+    // quota's spelling of "unlimited", while the memory ceiling refuses it
+    // because zero is what the supervisor already carries for "no ceiling".
+    assert_eq!(ok("[limits]\ndisk = \"0\"\n")["limits"]["disk"], 0);
     assert_eq!(ok("[limits]\ncpu = 100\n")["limits"]["cpu"], 100);
     let ports = ok("[network]\nallow_bind = [\"0-65535\"]\n");
     assert_eq!(ports["network"]["allow_bind"]["ports"][0], 0);

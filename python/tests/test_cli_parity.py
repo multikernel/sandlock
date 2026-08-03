@@ -186,17 +186,18 @@ CASES: list[Case] = [
         expect={"max_disk": 16777215 * 1024 * 1024 * 1024},
     ),
     Case(
-        name="byte_size_zero",
-        # A zero memory limit is a valid policy that kills the guest as soon as
-        # it faults a page in, so it is only compared at load time.
+        name="byte_size_zero_disk",
+        # "0" is a size the grammar reads, and the disk quota is the knob that
+        # takes it: zero is its spelling of "unlimited". The memory ceiling
+        # refuses the same text (see the memory_zero reject), so the grammar
+        # and the policy are pinned apart rather than together.
         toml="""
             [filesystem]
             read = {base_read}
             [limits]
-            memory = "0"
+            disk = "0"
         """,
-        compare="load",
-        expect={"max_memory": 0},
+        expect={"max_disk": 0},
     ),
     Case(
         name="limits_scalars",
@@ -464,6 +465,10 @@ REJECTS: list[tuple[str, str]] = [
     ("cpu_zero", "[limits]\ncpu = 0\n"),
     ("cpu_above_hundred", "[limits]\ncpu = 101\n"),
     ("open_files_zero", "[limits]\nopen_files = 0\n"),
+    ("processes_zero", "[limits]\nprocesses = 0\n"),
+    ("num_cpus_zero", "[limits]\nnum_cpus = 0\n"),
+    ("memory_zero", '[limits]\nmemory = "0"\n'),
+    ("cpu_cores_empty", "[limits]\ncpu_cores = []\n"),
     ("http_rule_without_space", '[http]\nallow = ["GETexample.com"]\n'),
     ("http_port_out_of_range", "[http]\nports = [70000]\n"),
     ("unknown_key", '[limits]\nmemry = "1G"\n'),

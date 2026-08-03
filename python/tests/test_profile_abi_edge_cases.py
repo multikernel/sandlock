@@ -260,7 +260,10 @@ class TestMalformedProfiles:
         # The range checks above would also be satisfied by a parser that
         # rejected everything.
         assert policy_from_toml('[limits]\nmemory = "18446744073709551615"\n').max_memory == 2 ** 64 - 1
-        assert policy_from_toml('[limits]\nmemory = "0"\n').max_memory == 0
+        # The smallest legal size, on the knob that takes it: zero is the disk
+        # quota's spelling of "unlimited", while the memory ceiling refuses it
+        # because zero is what the supervisor already carries for "no ceiling".
+        assert policy_from_toml('[limits]\ndisk = "0"\n').max_disk == 0
         assert policy_from_toml("[limits]\ncpu = 100\n").max_cpu == 100
         assert policy_from_toml('[network]\nallow_bind = ["0-65535"]\n').net_allow_bind[-1] == 65535
 

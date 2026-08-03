@@ -252,11 +252,22 @@ class TestCoreParity:
 
     @pytest.mark.parametrize(
         "size,expected",
-        [("512M", 512 * 1024 ** 2), ("1G", 1024 ** 3), ("512", 512), ("0", 0)],
+        [("512M", 512 * 1024 ** 2), ("1G", 1024 ** 3), ("512", 512)],
     )
     def test_sizes_resolve_the_way_core_resolves_them(self, size, expected):
         p = policy_from_toml(f'[limits]\nmemory = "{size}"\n')
         assert p.max_memory == expected
+
+    def test_zero_is_a_size_the_grammar_reads_and_a_ceiling_it_refuses(self):
+        # "0" parses: it is a well-formed count of bytes, and the disk quota
+        # takes it as its spelling of "unlimited". The memory ceiling does not,
+        # because zero is what the supervisor already carries for "no ceiling",
+        # so the two readings are told apart at the one place that can tell
+        # them apart. Both verdicts come from the core, not from here.
+        assert policy_from_toml('[limits]\ndisk = "0"\n').max_disk == 0
+        with pytest.raises(PolicyError) as excinfo:
+            policy_from_toml('[limits]\nmemory = "0"\n')
+        assert "max_memory must be greater than 0" in str(excinfo.value)
 
     @pytest.mark.parametrize(
         "size,fragment",
