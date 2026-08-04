@@ -228,6 +228,18 @@ pub struct SandboxBuilder {
     // COW fork work function: runs in each COW clone.
     #[cfg_attr(feature = "cli", clap(skip))]
     pub(crate) work_fn: Option<Arc<dyn Fn(u32) + Send + Sync + 'static>>,
+
+    /// First error latched by a setter that had no way to report it, surfaced
+    /// at `build()`. Setters return `Self`, not `Result`, so a value the core
+    /// cannot accept (an unrecognized C ABI discriminant, for example) is
+    /// recorded here instead of being coerced to a default. First write wins:
+    /// the earliest bad input is the one that explains the rest, and reporting
+    /// it alone keeps the message pointing at the caller's first mistake.
+    ///
+    /// Private on purpose: only the core writes here, and surfaces reach it
+    /// through [`SandboxBuilder::reject`].
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pending_error: Option<String>,
 }
 
 impl std::fmt::Debug for SandboxBuilder {
@@ -238,6 +250,7 @@ impl std::fmt::Debug for SandboxBuilder {
             .field("max_memory", &self.max_memory)
             .field("max_processes", &self.max_processes)
             .field("policy_fn", &self.policy_fn.as_ref().map(|_| "<callback>"))
+            .field("pending_error", &self.pending_error)
             .finish_non_exhaustive()
     }
 }
@@ -296,6 +309,7 @@ impl Default for SandboxBuilder {
             name: None,
             init_fn: None,
             work_fn: None,
+            pending_error: None,
         }
     }
 }
@@ -360,6 +374,9 @@ impl Clone for SandboxBuilder {
             init_fn: None,
             // work_fn is Arc-wrapped; clone bumps the reference count.
             work_fn: self.work_fn.clone(),
+            // A latched error survives cloning. Dropping it here would make
+            // `.clone().build()` a laundering channel for rejected input.
+            pending_error: self.pending_error.clone(),
         }
     }
 }
@@ -661,15 +678,22 @@ impl SandboxBuilder {
     }
 
     pub fn fs_mount(mut self, virtual_path: impl Into<PathBuf>, host_path: impl Into<PathBuf>) -> Self {
-        self.fs_mount.push((virtual_path.into(), host_path.into()));
+        let (virtual_path, host_path) = (virtual_path.into(), host_path.into());
+        if let Some(reason) = empty_mount_half("fs_mount", &virtual_path, &host_path) {
+            return self.reject(reason);
+        }
+        self.fs_mount.push((virtual_path, host_path));
         self
     }
 
     /// Add a read-only mount: the host path is visible at `virtual_path` for
     /// reading, but writes through it are denied (e.g. the host procfs mount).
     pub fn fs_mount_ro(mut self, virtual_path: impl Into<PathBuf>, host_path: impl Into<PathBuf>) -> Self {
-        let virtual_path = virtual_path.into();
-        self.fs_mount.push((virtual_path.clone(), host_path.into()));
+        let (virtual_path, host_path) = (virtual_path.into(), host_path.into());
+        if let Some(reason) = empty_mount_half("fs_mount_ro", &virtual_path, &host_path) {
+            return self.reject(reason);
+        }
+        self.fs_mount.push((virtual_path.clone(), host_path));
         self.fs_mount_ro.push(virtual_path);
         self
     }
@@ -772,11 +796,58 @@ impl SandboxBuilder {
         self
     }
 
+    /// Record a value the core cannot accept, to be reported by `build()`.
+    ///
+    /// Setters return `Self`, so they have no error channel of their own. A
+    /// surface that receives input the core rejects (an unrecognized C ABI
+    /// discriminant, for instance) latches the reason here instead of coercing
+    /// the value to a default: coercion runs a configuration the caller never
+    /// wrote, and does it silently.
+    ///
+    /// The first call wins. Later rejections are dropped, so the message names
+    /// the earliest mistake rather than whichever one happened to be last.
+    ///
+    /// `reason` should name the setter and quote the offending value, e.g.
+    /// `"on_exit: unrecognized branch action 7"`.
+    pub fn reject(mut self, reason: impl Into<String>) -> Self {
+        self.pending_error.get_or_insert_with(|| reason.into());
+        self
+    }
+
+    /// Latch an error a core parser produced for a setter argument.
+    ///
+    /// Keeps the parser's own text rather than the wrapped `Display`, because
+    /// `build()` puts the reason back into [`SandboxError::Invalid`]: a
+    /// consumer then reads exactly the message a CLI user sees for the same
+    /// value, not a doubled `invalid sandbox: invalid sandbox: ...`.
+    ///
+    /// Use this whenever the core already diagnosed the value. [`reject`]
+    /// stays for the conditions only a surface can see (a null pointer, a byte
+    /// string that is not UTF-8, a discriminant with no variant), which have no
+    /// core error to carry.
+    ///
+    /// [`reject`]: Self::reject
+    pub fn reject_error(self, err: SandboxError) -> Self {
+        match err {
+            SandboxError::Invalid(reason) => self.reject(reason),
+            other => self.reject(other.to_string()),
+        }
+    }
+
     /// Build a `Sandbox`, parsing all string fields and running per-field
     /// validation, but **without** the cross-section checks that
     /// `Sandbox::validate` performs. Use this in tests that deliberately
     /// construct sandboxes violating cross-section invariants.
-    pub fn build_unchecked(self) -> Result<Sandbox, SandboxError> {
+    pub fn build_unchecked(mut self) -> Result<Sandbox, SandboxError> {
+        // A setter recorded input the core could not accept. The builder no
+        // longer describes what the caller asked for, so every check below
+        // would be diagnosing a configuration nobody wrote. This lives here
+        // rather than in `build()` because `build_unchecked` is public and is
+        // the entry point used by sandlock-oci and by tests.
+        if let Some(reason) = self.pending_error.take() {
+            return Err(SandboxError::Invalid(reason));
+        }
+
         validate_syscall_names(&self.extra_deny_syscalls)?;
         validate_allow_groups(&self.extra_allow_syscalls)?;
         validate_allow_deny_disjoint(&self.extra_allow_syscalls, &self.extra_deny_syscalls)?;
@@ -807,21 +878,86 @@ impl SandboxBuilder {
             }
         }
 
+        // Validate: max_processes must be non-zero. The cap is enforced by the
+        // seccomp supervisor as `proc_count >= limit`, so a limit of zero
+        // fails *every* fork/clone with EAGAIN, no matter how few processes
+        // are alive. The workload sees "Resource temporarily unavailable" from
+        // the first subprocess it starts, with nothing naming the setting
+        // responsible.
+        if self.max_processes == Some(0) {
+            return Err(SandboxError::Invalid(
+                "max_processes must be greater than 0; omit it to use the \
+                 default cap"
+                    .into(),
+            ));
+        }
+
+        // Validate: num_cpus must be non-zero. Zero is accepted all the way
+        // down into the synthetic procfs, where it produces an empty
+        // /proc/cpuinfo and an affinity mask with no bits set, so the guest
+        // reads `nproc` = 0 and nothing points at the setting that caused it.
+        if self.num_cpus == Some(0) {
+            return Err(SandboxError::Invalid(
+                "num_cpus must be greater than 0; omit it to expose the host \
+                 processor count"
+                    .into(),
+            ));
+        }
+
         // Validate: max_open_files must be non-zero. A zero cap cannot be
         // honoured: the child needs descriptors to reach `main` at all, so it
         // would die before it and exit 127 with an errno far from the setting
         // that caused it (EMFILE from the dynamic loader on a plain exec, EIO
         // from the exec-fd injection under chroot). Catching it here keeps the
-        // check in one place instead of one per binding: the C ABI and the CLI
-        // both pass the value straight through, and only the Go SDK filters
-        // zero, which it must, because a Go struct field cannot express "unset"
-        // any other way.
+        // check in one place instead of one per binding, which is where it had
+        // drifted to: the comment this replaces claimed a binding "must" filter
+        // zero itself. It must not. The Python SDK forwards whatever is not
+        // `None`, zero included, so a zero reaches this verdict; the Go SDK
+        // still drops one of its own accord (`if s.MaxOpenFiles > 0` in
+        // go/sandlock_linux.go), so a Go caller who writes zero gets a sandbox
+        // with no cap at all and no diagnosis. Reducing Go to forwarding needs
+        // its field to spell "unset" without using the value, which is a later
+        // commit; the verdict lives here either way.
         if self.max_open_files == Some(0) {
             return Err(SandboxError::Invalid(
                 "max_open_files must be greater than 0; omit it to inherit the \
                  system limit. Note that a workable floor is well above 1: a \
                  plain dynamically linked exec needs about 4 descriptors, and \
                  about 12 under chroot."
+                    .into(),
+            ));
+        }
+
+        // Validate: max_memory must be non-zero. Zero is the sentinel the
+        // supervisor carries for "no ceiling" (`max_memory.map(..).unwrap_or(0)`
+        // in Sandbox::run, read back as `max_memory_bytes > 0` by the synthetic
+        // /proc/meminfo), but the memory handler is registered on
+        // `max_memory.is_some()`, so an explicit zero installs the handler with
+        // a ceiling of zero and the first anonymous mmap, the dynamic loader's,
+        // is SIGKILLed. The caller gets a guest that dies before `main` with no
+        // exit status and nothing naming the setting. The two readings of the
+        // same value cannot both stand; refusing the value here is what lets
+        // the sentinel keep meaning "unset", which is what the comment in
+        // resource::handle_memory already assumes it does.
+        if self.max_memory == Some(ByteSize(0)) {
+            return Err(SandboxError::Invalid(
+                "max_memory must be greater than 0; omit it to leave memory \
+                 unlimited"
+                    .into(),
+            ));
+        }
+
+        // Validate: cpu_cores must name at least one core. An empty set asks
+        // for an affinity mask with no bits, which sched_setaffinity(2) refuses
+        // with EINVAL; the child setup skipped the call instead, so the pinning
+        // the caller asked for silently did not happen and the sandbox ran on
+        // every core. Unlike `gpu_devices`, where an empty list is the spelling
+        // of "every device present", there is no cpu set an empty list could
+        // stand for: "every core" is what omitting the field already means.
+        if self.cpu_cores.as_deref() == Some(&[][..]) {
+            return Err(SandboxError::Invalid(
+                "cpu_cores must name at least one core; omit it to leave the \
+                 child on the host's default affinity mask"
                     .into(),
             ));
         }
@@ -1058,6 +1194,29 @@ struct Exposure {
     deny_target: std::path::PathBuf,
 }
 
+/// Refuse a mount whose virtual or host half is the empty path.
+///
+/// Neither half has a reading as "unset": an empty host path names nothing to
+/// expose, and an empty virtual path is a prefix of every guest path, so the
+/// read-only marking of `fs_mount_ro` would cover the whole guest view. The
+/// profile grammar already refuses both halves when it splits a
+/// `VIRTUAL:HOST` spec, so this is the same verdict reached through the
+/// setter, which is the path a binding takes.
+fn empty_mount_half(
+    setter: &str,
+    virtual_path: &std::path::Path,
+    host_path: &std::path::Path,
+) -> Option<String> {
+    let half = if virtual_path.as_os_str().is_empty() {
+        "virtual path"
+    } else if host_path.as_os_str().is_empty() {
+        "host path"
+    } else {
+        return None;
+    };
+    Some(format!("{setter}: {half} must not be empty"))
+}
+
 /// The first fs grant that exposes `secret` to the sandboxed child, or `None`
 /// when no grant reaches it or an fs-deny covers it (the deny closes the hole,
 /// so no warning is due). Best-effort: canonicalize where possible.
@@ -1121,6 +1280,8 @@ fn exposing_grant<'a>(
 #[cfg(test)]
 mod tests {
     use super::exposing_grant;
+    use super::ByteSize;
+    use super::SandboxError;
     use std::path::PathBuf;
 
     #[test]
@@ -1152,6 +1313,225 @@ mod tests {
             .max_open_files(64)
             .build()
             .expect("a non-zero cap must build");
+    }
+
+    #[test]
+    fn max_processes_zero_is_rejected_at_build() {
+        // The supervisor compares `proc_count >= limit`, so a limit of zero
+        // denies every fork with EAGAIN and the workload never learns why.
+        let err = super::SandboxBuilder::default()
+            .max_processes(0)
+            .build()
+            .expect_err("a zero process cap must not build");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_processes"),
+            "the error must name the setting, got: {msg}"
+        );
+
+        // Unset stays valid (it means "use the default cap"), and so does a
+        // usable value: the check must reject only zero.
+        super::SandboxBuilder::default()
+            .build()
+            .expect("an unset cap must still build");
+        super::SandboxBuilder::default()
+            .max_processes(8)
+            .build()
+            .expect("a non-zero cap must build");
+    }
+
+    #[test]
+    fn num_cpus_zero_is_rejected_at_build() {
+        // Zero reaches the synthetic procfs, where it yields an empty
+        // /proc/cpuinfo and an affinity mask with no bits set.
+        let err = super::SandboxBuilder::default()
+            .num_cpus(0)
+            .build()
+            .expect_err("a zero processor count must not build");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("num_cpus"),
+            "the error must name the setting, got: {msg}"
+        );
+
+        super::SandboxBuilder::default()
+            .build()
+            .expect("an unset processor count must still build");
+        super::SandboxBuilder::default()
+            .num_cpus(2)
+            .build()
+            .expect("a non-zero processor count must build");
+    }
+
+    #[test]
+    fn max_memory_zero_is_rejected_at_build() {
+        // Zero doubles as the "no ceiling" sentinel the supervisor carries,
+        // but the memory handler is registered on `is_some()`, so an explicit
+        // zero enforces a ceiling of zero and SIGKILLs the loader's first
+        // anonymous mmap while /proc/meminfo reports the sandbox unlimited.
+        let err = super::SandboxBuilder::default()
+            .max_memory(ByteSize(0))
+            .build()
+            .expect_err("a zero memory ceiling must not build");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_memory"),
+            "the error must name the setting, got: {msg}"
+        );
+        assert!(
+            msg.contains("omit"),
+            "the error must say how to get an unlimited sandbox, got: {msg}"
+        );
+
+        // Unset stays valid, and so does a usable ceiling: the check must
+        // reject only the value that turns the sentinel ambiguous.
+        super::SandboxBuilder::default()
+            .build()
+            .expect("an unset ceiling must still build");
+        super::SandboxBuilder::default()
+            .max_memory(ByteSize(1024 * 1024))
+            .build()
+            .expect("a non-zero ceiling must build");
+
+        // max_disk is deliberately not the same: zero is its documented
+        // spelling of "unlimited" (see cow::seccomp::check_quota), and one
+        // reading is all it has.
+        super::SandboxBuilder::default()
+            .max_disk(ByteSize(0))
+            .build()
+            .expect("a zero disk quota still means unlimited and must build");
+    }
+
+    #[test]
+    fn empty_cpu_cores_is_rejected_at_build() {
+        // An empty set asks for an affinity mask with no bits, which
+        // sched_setaffinity refuses; the child setup used to skip the call
+        // instead and run on every core without saying so.
+        let err = super::SandboxBuilder::default()
+            .cpu_cores(Vec::new())
+            .build()
+            .expect_err("an empty core set must not build");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cpu_cores"),
+            "the error must name the setting, got: {msg}"
+        );
+
+        super::SandboxBuilder::default()
+            .build()
+            .expect("an unset core set must still build");
+        super::SandboxBuilder::default()
+            .cpu_cores(vec![0])
+            .build()
+            .expect("a core set with one core must build");
+
+        // gpu_devices reads an empty list as "every device present", so the
+        // same shape must stay accepted there: the two are not one rule.
+        super::SandboxBuilder::default()
+            .gpu_devices(Vec::new())
+            .build()
+            .expect("an empty gpu list means every GPU and must build");
+    }
+
+    #[test]
+    fn reject_error_hands_back_the_parser_text_a_cli_user_would_read() {
+        // What `reject_error` is for: a surface that ran a core parser on a
+        // setter argument has an error already, and the value must read the
+        // same however it arrived. `reject` would wrap it a second time,
+        // because build() puts the reason back into SandboxError::Invalid.
+        let parser_error = ByteSize::parse("1.5G").expect_err("the grammar takes no fractions");
+        let from_cli = parser_error.to_string();
+
+        let err = super::SandboxBuilder::default()
+            .reject_error(parser_error)
+            .build()
+            .expect_err("a latched parser error must not build");
+        assert_eq!(
+            err.to_string(),
+            from_cli,
+            "the message must be the parser's own, not a doubled wrapping"
+        );
+        assert!(
+            !err.to_string().contains("invalid sandbox: invalid sandbox:"),
+            "got: {err}"
+        );
+
+        // A variant that carries no free-form reason keeps its own Display,
+        // which is the only text it has.
+        let err = super::SandboxBuilder::default()
+            .reject_error(SandboxError::InvalidCpuPercent(0))
+            .build()
+            .expect_err("a latched parser error must not build");
+        assert!(
+            err.to_string().contains("max_cpu must be 1-100, got 0"),
+            "got: {err}"
+        );
+
+        // It shares the latch with `reject`, first write wins, and it stops
+        // `build_unchecked` too.
+        let err = super::SandboxBuilder::default()
+            .reject("first")
+            .reject_error(SandboxError::Invalid("second".into()))
+            .build_unchecked()
+            .expect_err("a latched error must not build_unchecked either");
+        assert!(err.to_string().contains("first"), "got: {err}");
+        assert!(!err.to_string().contains("second"), "got: {err}");
+    }
+
+    #[test]
+    fn an_empty_mount_half_is_rejected_at_build() {
+        // Neither half has a reading as "unset". An empty virtual path is the
+        // dangerous one: it is a prefix of every guest path, so `fs_mount_ro`
+        // would mark the whole guest view read-only and `is_mounted` would
+        // match every path. The verdict lives here rather than in a binding,
+        // so the C ABI can forward whatever bytes it was handed.
+        for (setter, err) in [
+            (
+                "fs_mount",
+                super::SandboxBuilder::default().fs_mount("", "/srv").build(),
+            ),
+            (
+                "fs_mount_ro",
+                super::SandboxBuilder::default().fs_mount_ro("", "/srv").build(),
+            ),
+            (
+                "fs_mount",
+                super::SandboxBuilder::default().fs_mount("/data", "").build(),
+            ),
+            (
+                "fs_mount_ro",
+                super::SandboxBuilder::default().fs_mount_ro("/data", "").build(),
+            ),
+        ] {
+            let err = err.expect_err("an empty mount half must not build");
+            let msg = err.to_string();
+            assert!(msg.contains(setter), "the error must name the setter, got: {msg}");
+            assert!(msg.contains("empty"), "the error must say what is wrong, got: {msg}");
+        }
+
+        // The message names which half, so a caller knows which pointer to fix.
+        let msg = super::SandboxBuilder::default()
+            .fs_mount("", "/srv")
+            .build()
+            .expect_err("empty virtual path")
+            .to_string();
+        assert!(msg.contains("virtual path"), "got: {msg}");
+        let msg = super::SandboxBuilder::default()
+            .fs_mount("/data", "")
+            .build()
+            .expect_err("empty host path")
+            .to_string();
+        assert!(msg.contains("host path"), "got: {msg}");
+
+        // An ordinary pair is untouched, and a read-only one still records the
+        // virtual path as read-only.
+        let sandbox = super::SandboxBuilder::default()
+            .fs_mount("/data", "/srv/data")
+            .fs_mount_ro("/ref", "/srv/ref")
+            .build()
+            .expect("two well-formed mounts must build");
+        assert_eq!(sandbox.fs_mount.len(), 2);
+        assert_eq!(sandbox.fs_mount_ro, vec![PathBuf::from("/ref")]);
     }
 
     #[test]

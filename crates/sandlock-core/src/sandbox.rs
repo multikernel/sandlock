@@ -51,12 +51,18 @@ impl ByteSize {
                 .trim()
                 .parse()
                 .map_err(|_| SandboxError::Invalid(format!("invalid byte size: {}", s)))?;
-            match suffix.to_ascii_uppercase().as_str() {
-                "K" => Ok(ByteSize::kib(n)),
-                "M" => Ok(ByteSize::mib(n)),
-                "G" => Ok(ByteSize::gib(n)),
-                other => Err(SandboxError::Invalid(format!("unknown byte size suffix: {}", other))),
-            }
+            let scale: u64 = match suffix.to_ascii_uppercase().as_str() {
+                "K" => 1024,
+                "M" => 1024 * 1024,
+                "G" => 1024 * 1024 * 1024,
+                other => return Err(SandboxError::Invalid(format!("unknown byte size suffix: {}", other))),
+            };
+            // Checked: an unchecked multiply wraps in release builds, so a
+            // large-but-parseable value like "17179869184G" would come back as
+            // a limit of zero bytes with no error at all.
+            n.checked_mul(scale).map(ByteSize).ok_or_else(|| {
+                SandboxError::Invalid(format!("byte size out of range: {}", s))
+            })
         } else {
             let n: u64 = s
                 .parse()
@@ -165,8 +171,14 @@ impl TryFrom<&Sandbox> for Confinement {
         if sandbox.cwd.is_some() { unsupported.push("cwd"); }
         if sandbox.fs_storage.is_some() { unsupported.push("fs_storage"); }
         if sandbox.max_disk.is_some() { unsupported.push("max_disk"); }
-        if sandbox.on_exit != BranchAction::Commit { unsupported.push("on_exit"); }
-        if sandbox.on_error != BranchAction::Abort { unsupported.push("on_error"); }
+        // `on_exit` and `on_error` are deliberately absent from this list. They
+        // name what happens to a COW branch, and a confinement has no branch:
+        // it is applied in place, and `fs_storage`/`workdir` (the two knobs
+        // that create one) are already refused above. Rejecting them here only
+        // ever refused a field that could not have changed the outcome, and it
+        // did so by comparing against two hardcoded actions rather than the one
+        // `build()` resolves an unset field to, so a caller who said nothing
+        // about the error path was refused a confinement its policy allowed.
         if !sandbox.fs_mount.is_empty() { unsupported.push("fs_mount"); }
         if sandbox.chroot.is_some() { unsupported.push("chroot"); }
         if sandbox.clean_env { unsupported.push("clean_env"); }
@@ -190,12 +202,36 @@ impl TryFrom<&Sandbox> for Confinement {
 }
 
 /// Action to take on branch exit.
+///
+/// The discriminants are a stable contract: the FFI/Python/Go bindings pass
+/// them as a `u8`, so they are pinned with `#[repr(u8)]` and translated back
+/// by [`BranchAction::from_repr`]. Serde is unaffected (a data-less enum is
+/// serialized by variant name, not by discriminant).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[repr(u8)]
 pub enum BranchAction {
     #[default]
-    Commit,
-    Abort,
-    Keep,
+    Commit = 0,
+    Abort = 1,
+    Keep = 2,
+}
+
+impl BranchAction {
+    /// Translate a raw C ABI discriminant into a `BranchAction`.
+    ///
+    /// Returns `None` for anything outside the documented set. Bindings must
+    /// surface that as an error rather than coercing it to a default: an
+    /// unrecognized discriminant is a static bug in the binding, and coercing
+    /// it to `Commit` or `Abort` silently applies a branch policy nobody asked
+    /// for.
+    pub fn from_repr(raw: u8) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Commit),
+            1 => Some(Self::Abort),
+            2 => Some(Self::Keep),
+            _ => None,
+        }
+    }
 }
 
 // ============================================================
@@ -2916,7 +2952,7 @@ fn validate_allow_deny_disjoint(
 /// Parse `--net-allow-bind` specs. Accepts the `*` wildcard (any port),
 /// which cannot be combined with port lists; repeating the bare wildcard
 /// is idempotent.
-fn parse_allow_bind_ports(specs: &[String], label: &str) -> Result<BindPorts, SandboxError> {
+pub(crate) fn parse_allow_bind_ports(specs: &[String], label: &str) -> Result<BindPorts, SandboxError> {
     let mut parts = specs.iter().flat_map(|s| s.split(',')).map(str::trim);
     if !parts.clone().any(|part| part == "*") {
         return Ok(BindPorts::Ports(parse_bind_ports(specs, label)?));
@@ -2933,7 +2969,7 @@ fn parse_allow_bind_ports(specs: &[String], label: &str) -> Result<BindPorts, Sa
 /// Expand `--net-allow-bind` specs into a sorted, deduplicated port list.
 /// Each spec is a comma-separated list of single ports (`8080`) or inclusive
 /// `lo-hi` ranges (`8000-8010`). Mirrors the Python SDK's `parse_ports`.
-fn parse_bind_ports(specs: &[String], label: &str) -> Result<Vec<u16>, SandboxError> {
+pub(crate) fn parse_bind_ports(specs: &[String], label: &str) -> Result<Vec<u16>, SandboxError> {
     let mut ports: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
     for spec in specs {
         for part in spec.split(',') {

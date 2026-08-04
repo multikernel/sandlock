@@ -83,7 +83,7 @@ def policy_for_tool(
             - ``fs_writable: ["/tmp/workspace"]``
             - ``net_allow: ["api.example.com:443"]``
             - ``env: {"KEY": "value"}``
-            - ``max_memory: "256M"``
+            - ``max_memory: 268435456`` (bytes)
 
     Returns:
         A frozen :class:`Sandbox` instance.

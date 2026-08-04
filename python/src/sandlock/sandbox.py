@@ -8,6 +8,7 @@ time; runtime state (``_native``, ``_handle``) is initialized lazily.
 
 from __future__ import annotations
 
+import collections.abc
 import inspect
 import itertools
 import os
@@ -26,40 +27,6 @@ _name_counter = itertools.count(1)
 if TYPE_CHECKING:
     from ._notif_policy import NotifPolicy
     from ._sdk import ExitReason  # DryRunResult.reason annotation (runtime import is circular)
-
-
-# --- Memory size parsing (from branching/process/limits.py) ---
-
-_UNITS = {
-    "K": 1024,
-    "M": 1024 ** 2,
-    "G": 1024 ** 3,
-    "T": 1024 ** 4,
-}
-
-_SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([KMGT])?\s*$", re.IGNORECASE)
-
-
-def parse_memory_size(s: str) -> int:
-    """Parse a human-friendly memory size string to bytes.
-
-    Accepts plain integers (bytes) or suffixed values: ``'512M'``, ``'1G'``,
-    ``'100K'``.  The suffix is case-insensitive.
-
-    Returns:
-        Size in bytes (integer).
-
-    Raises:
-        ValueError: If the string cannot be parsed.
-    """
-    m = _SIZE_RE.match(s)
-    if m is None:
-        raise ValueError(f"invalid memory size: {s!r}")
-    value = float(m.group(1))
-    suffix = m.group(2)
-    if suffix is not None:
-        value *= _UNITS[suffix.upper()]
-    return int(value)
 
 
 _PORT_RANGE_RE = re.compile(r"^(\d+)(?:-(\d+))?$")
@@ -114,6 +81,25 @@ class StdioMode(IntEnum):
     """Connect to a pipe; the caller owns the returned end via :class:`Process`."""
     NULL = 2
     """Connect the stream to ``/dev/null``."""
+
+
+@dataclass(frozen=True)
+class Mount:
+    """One entry of :attr:`Sandbox.fs_mount`: a host directory exposed at a
+    virtual path inside the chroot.
+
+    Field names mirror the canonical profile form emitted by the core parser,
+    so loading a profile is a field-for-field copy.
+    """
+
+    virt: str
+    """Path the sandbox sees (inside the chroot)."""
+
+    host: str
+    """Host path the virtual path resolves to."""
+
+    ro: bool = False
+    """Mount read-only. Writes through the virtual path are refused."""
 
 
 @dataclass(frozen=True)
@@ -264,8 +250,10 @@ class Sandbox:
     private key. Useful for NODE_EXTRA_CA_CERTS and similar."""
 
     # Resource limits
-    max_memory: str | int | None = None
-    """Memory limit. String like '512M' or int bytes."""
+    max_memory: int | None = None
+    """Memory limit in bytes, e.g. ``512 * 1024 ** 2``. Size strings
+    (``'512M'``) belong to the profile grammar and are resolved by the core
+    parser; this field is the resolved value."""
 
     max_processes: int = 64
     """Maximum total forks allowed in the sandbox (lifetime count,
@@ -310,11 +298,15 @@ class Sandbox:
     """Seed for deterministic randomness. When set, getrandom() returns
     deterministic bytes from a seeded PRNG. Same seed = same output."""
 
-    time_start: float | str | None = None
-    """Start timestamp for time virtualization. When set, clock_gettime()
-    and gettimeofday() return shifted time starting from this epoch.
-    Accepts a Unix timestamp (float) or ISO 8601 string.
-    Time ticks at real speed from the given start point."""
+    time_start: float | None = None
+    """Start timestamp for time virtualization, as Unix epoch seconds.
+    When set, clock_gettime() and gettimeofday() return shifted time
+    starting from this epoch. Time ticks at real speed from the given
+    start point. RFC 3339 stamps belong to the profile grammar and are
+    resolved by the core parser; this field is the resolved value.
+    For a :class:`datetime.datetime`, pass ``dt.timestamp()``: an aware
+    datetime converts unambiguously, and a naive one has to be given a
+    timezone first rather than silently assumed to be UTC."""
 
     no_randomize_memory: bool = False
     """Disable Address Space Layout Randomization (ASLR) inside the sandbox.
@@ -345,10 +337,13 @@ class Sandbox:
     chroot: str | None = None
     """Path to chroot into before applying other confinement."""
 
-    fs_mount: Mapping[str, str] = field(default_factory=dict)
-    """Map virtual paths to host directories inside chroot.
-    Example: {"/work": "/host/sandbox/work"} makes /work inside the
-    chroot resolve to /host/sandbox/work on the host."""
+    fs_mount: Sequence[Mount] = field(default_factory=list)
+    """Host directories exposed at virtual paths inside the chroot.
+    Example: ``[Mount("/work", "/host/sandbox/work")]`` makes /work inside
+    the chroot resolve to /host/sandbox/work on the host; pass ``ro=True``
+    for a read-only mount. A list rather than a mapping because the same
+    virtual path may be listed twice with different read-only flags, which
+    is what the profile grammar (``"VIRTUAL:HOST[:ro]"``) allows."""
 
     # Environment
     clean_env: bool = False
@@ -389,8 +384,8 @@ class Sandbox:
     fs_storage: str | None = None
     """Separate storage directory for the seccomp COW upper layer / deltas."""
 
-    max_disk: str | None = None
-    """Disk quota for COW storage (e.g. ``'1G'``).
+    max_disk: int | None = None
+    """Disk quota for COW storage, in bytes (e.g. ``1024 ** 3``).
     Enforced by the COW layer (returns ENOSPC)."""
 
     on_exit: BranchAction = BranchAction.COMMIT
@@ -444,6 +439,46 @@ class Sandbox:
                 raise ValueError("sandbox name must not contain '/'")
             if self.name in (".", ".."):
                 raise ValueError("sandbox name must not be '.' or '..'")
+        # Fields whose representation is the *resolved* value, not the profile
+        # syntax it came from. Accepting the syntax here would mean a second
+        # parser for the same grammar, which is what made a profile mean one
+        # thing through the CLI and another through this SDK.
+        for attr in ("max_memory", "max_disk"):
+            value = getattr(self, attr)
+            if isinstance(value, str):
+                raise TypeError(
+                    f"{attr} must be an integer number of bytes, got {value!r}; "
+                    "size strings like '512M' are profile syntax, resolved by "
+                    "the core parser when a profile is loaded"
+                )
+        if isinstance(self.time_start, str):
+            raise TypeError(
+                "time_start must be Unix epoch seconds, got "
+                f"{self.time_start!r}; RFC 3339 stamps are profile syntax, "
+                "resolved by the core parser when a profile is loaded"
+            )
+        if isinstance(self.fs_mount, dict):
+            raise TypeError(
+                "fs_mount is a sequence of Mount entries, not a mapping; "
+                "use [Mount('/virt', '/host')] or Mount(..., ro=True) for a "
+                "read-only mount"
+            )
+        if not isinstance(self.fs_mount, collections.abc.Sequence) or isinstance(
+            self.fs_mount, (str, bytes)
+        ):
+            # Rejected rather than materialized: a one-shot iterable would be
+            # emptied by the check below and the sandbox would silently run
+            # with no mounts.
+            raise TypeError(
+                "fs_mount must be a list or tuple of Mount entries, got "
+                f"{type(self.fs_mount).__name__}"
+            )
+        for entry in self.fs_mount:
+            if not isinstance(entry, Mount):
+                raise TypeError(
+                    "fs_mount entries must be Mount, got "
+                    f"{type(entry).__name__}: {entry!r}"
+                )
         # Runtime state — not dataclass fields, not serialized
         self._native = None   # _NativePolicy created lazily on first use
         self._handle = None   # live sandbox handle during start()/run()
@@ -479,29 +514,6 @@ class Sandbox:
     # ------------------------------------------------------------------
     # Config helper methods
     # ------------------------------------------------------------------
-
-    def memory_bytes(self) -> int | None:
-        """Return max_memory as bytes, or None if unset."""
-        if self.max_memory is None:
-            return None
-        if isinstance(self.max_memory, int):
-            return self.max_memory
-        return parse_memory_size(self.max_memory)
-
-    def time_start_timestamp(self) -> float | None:
-        """Return time_start as a Unix timestamp float, or None if unset."""
-        if self.time_start is None:
-            return None
-        if isinstance(self.time_start, (int, float)):
-            return float(self.time_start)
-        from datetime import datetime, timezone
-        s = self.time_start
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.timestamp()
 
     def cpu_pct(self) -> int | None:
         """Return max_cpu as a clamped percentage (1–100), or None."""

@@ -119,129 +119,104 @@ fn builder_mount_setters_chain_and_stay_distinguishable() {
 }
 
 #[test]
-fn builder_fs_mount_ro_tolerates_null_arguments() {
+fn builder_fs_mount_ro_tolerates_a_null_builder() {
+    // Null builder in, null out: the convention every other
+    // `sandlock_sandbox_builder_*` setter follows. The builder pointer is the
+    // only argument that still gets that treatment, because it is the thing a
+    // reason would have been latched on.
     let (vp, hp) = (cstr("/work"), cstr("/host/work"));
-
-    // Null in, builder out unchanged: the convention every other
-    // `sandlock_sandbox_builder_*` setter follows.
     let out =
         unsafe { sandlock_sandbox_builder_fs_mount_ro(ptr::null_mut(), vp.as_ptr(), hp.as_ptr()) };
     assert!(out.is_null(), "fs_mount_ro(null, _, _) must return null");
+}
 
-    let sandbox = build_via_ffi(|b| unsafe {
-        sandlock_sandbox_builder_fs_mount_ro(b, ptr::null(), hp.as_ptr())
-    });
-    assert!(
-        sandbox.fs_mount.is_empty() && sandbox.fs_mount_ro.is_empty(),
-        "a null virtual_path must add no mount, got {:?} / {:?}",
-        sandbox.fs_mount,
-        sandbox.fs_mount_ro,
-    );
-
-    let sandbox = build_via_ffi(|b| unsafe {
-        sandlock_sandbox_builder_fs_mount_ro(b, vp.as_ptr(), ptr::null())
-    });
-    assert!(
-        sandbox.fs_mount.is_empty() && sandbox.fs_mount_ro.is_empty(),
-        "a null host_path must add no mount, got {:?} / {:?}",
-        sandbox.fs_mount,
-        sandbox.fs_mount_ro,
-    );
+/// Run `builder_new` + the supplied setter chain + `build()`, returning the
+/// error text a caller of `sandlock_sandbox_build` would read.
+fn build_error_via_ffi<F>(configure: F) -> String
+where
+    F: FnOnce(
+        *mut sandlock_core::sandbox::SandboxBuilder,
+    ) -> *mut sandlock_core::sandbox::SandboxBuilder,
+{
+    let b = sandlock_sandbox_builder_new();
+    assert!(!b.is_null(), "builder_new returned null");
+    let b = configure(b);
+    assert!(!b.is_null(), "configure returned null builder");
+    // SAFETY: `b` is a valid Box pointer produced by builder_new and possibly
+    // relocated through builder setters.
+    let builder = unsafe { *Box::from_raw(b) };
+    builder
+        .build()
+        .expect_err("a mount path the setter cannot use must fail the build")
+        .to_string()
 }
 
 #[test]
-fn builder_fs_mount_ro_refuses_empty_paths() {
-    // An empty virtual path is a prefix of *every* path, so recording it
-    // would mount the whole tree and make ChrootCtx::can_read return true
-    // everywhere, and the read allowlist would be gone. Core's
-    // parse_mount_spec rejects empty components for the same reason, so
-    // the C ABI must not be the one door that accepts them.
-    let (vp, hp) = (cstr("/work"), cstr("/host/work"));
-    let empty = cstr("");
-
-    let sandbox = build_via_ffi(|b| unsafe {
-        sandlock_sandbox_builder_fs_mount_ro(b, empty.as_ptr(), hp.as_ptr())
-    });
-    assert!(
-        sandbox.fs_mount.is_empty() && sandbox.fs_mount_ro.is_empty(),
-        "an empty virtual_path must add no mount, got {:?} / {:?}",
-        sandbox.fs_mount,
-        sandbox.fs_mount_ro,
-    );
-
-    let sandbox = build_via_ffi(|b| unsafe {
-        sandlock_sandbox_builder_fs_mount_ro(b, vp.as_ptr(), empty.as_ptr())
-    });
-    assert!(
-        sandbox.fs_mount.is_empty() && sandbox.fs_mount_ro.is_empty(),
-        "an empty host_path must add no mount, got {:?} / {:?}",
-        sandbox.fs_mount,
-        sandbox.fs_mount_ro,
-    );
-}
-
-#[test]
-fn builder_fs_mount_ro_refuses_non_utf8_paths() {
-    // A lossy conversion would have collapsed these to "", i.e. to the
-    // tree-wide mount above; dropping the mount is the fail-closed choice
-    // for a setter with no error channel.
-    let (vp, hp) = (cstr("/work"), cstr("/host/work"));
-    let bad = CString::new(vec![b'/', 0xff, b'x']).unwrap();
-
-    let sandbox = build_via_ffi(|b| unsafe {
-        sandlock_sandbox_builder_fs_mount_ro(b, bad.as_ptr(), hp.as_ptr())
-    });
-    assert!(
-        sandbox.fs_mount.is_empty() && sandbox.fs_mount_ro.is_empty(),
-        "a non-UTF-8 virtual_path must add no mount, got {:?} / {:?}",
-        sandbox.fs_mount,
-        sandbox.fs_mount_ro,
-    );
-
-    let sandbox = build_via_ffi(|b| unsafe {
-        sandlock_sandbox_builder_fs_mount_ro(b, vp.as_ptr(), bad.as_ptr())
-    });
-    assert!(
-        sandbox.fs_mount.is_empty() && sandbox.fs_mount_ro.is_empty(),
-        "a non-UTF-8 host_path must add no mount, got {:?} / {:?}",
-        sandbox.fs_mount,
-        sandbox.fs_mount_ro,
-    );
-}
-
-#[test]
-fn builder_fs_mount_refuses_unusable_paths_exactly_like_fs_mount_ro() {
-    // The plain setter is the *more* dangerous door for the same input:
-    // an empty virtual path there voids the write allowlist as well as the
-    // read one (`ChrootCtx::can_write` short-circuits on `is_mounted`),
-    // with no read-only marking left to hold writes closed. Both setters
-    // must therefore drop the mount rather than degrade the path to "".
-    // `sandlock_sandbox_builder_fs_mount` is what the Go binding
-    // (go/sandlock_linux.go) and the Python `Sandbox` dataclass
-    // (python/src/sandlock/_sdk.py) call, so this is the reachable one.
+fn both_mount_setters_report_a_path_they_cannot_use() {
+    // These four inputs used to add no mount and say nothing, which is the
+    // worst of the two outcomes for either setter. For `fs_mount_ro` the
+    // caller believes a subtree is read-only and it is writable; for
+    // `fs_mount` the caller believes a host directory is exposed and it is
+    // not. Both now travel back through the builder's pending-error latch, so
+    // `sandlock_sandbox_build` returns -1 with the reason.
+    //
+    // Which layer answers which question: a null pointer and non-UTF-8 bytes
+    // are representation problems the core cannot see once the value is a
+    // `&str`, so the C ABI diagnoses them; emptiness is a policy question and
+    // the core's setter answers it, the same way `parse_mount_spec` answers it
+    // for a `VIRTUAL:HOST` profile spec. An empty virtual path is the one that
+    // matters: it is a prefix of every guest path, so `ChrootCtx::is_mounted`
+    // would match the whole tree and short-circuit `can_read` and `can_write`.
     let good = cstr("/work");
-    let bad_utf8 = CString::new(vec![b'/', 0xff, b'x']).unwrap();
+    let host = cstr("/host/work");
     let empty = cstr("");
+    let bad_utf8 = CString::new(vec![b'/', 0xff, b'x']).unwrap();
 
-    let cases: [(&str, &CString, &CString); 4] = [
-        ("empty virtual_path", &empty, &good),
-        ("empty host_path", &good, &empty),
-        ("non-UTF-8 virtual_path", &bad_utf8, &good),
-        ("non-UTF-8 host_path", &good, &bad_utf8),
-    ];
+    type MountSetter = unsafe extern "C" fn(
+        *mut sandlock_core::sandbox::SandboxBuilder,
+        *const c_char,
+        *const c_char,
+    ) -> *mut sandlock_core::sandbox::SandboxBuilder;
 
-    for (label, vp, hp) in cases {
-        let sandbox = build_via_ffi(|b| unsafe {
-            sandlock_sandbox_builder_fs_mount(b, vp.as_ptr(), hp.as_ptr())
-        });
-        assert!(
-            sandbox.fs_mount.is_empty(),
-            "fs_mount with {label} must add no mount, got {:?}",
-            sandbox.fs_mount,
-        );
-        // Nothing marks it read-only either, so a recorded mount here would
-        // be a tree-wide read-write mapping.
-        assert!(sandbox.fs_mount_ro.is_empty());
+    for (setter_name, setter) in [
+        (
+            "fs_mount",
+            sandlock_sandbox_builder_fs_mount as MountSetter,
+        ),
+        (
+            "fs_mount_ro",
+            sandlock_sandbox_builder_fs_mount_ro as MountSetter,
+        ),
+    ] {
+        let cases: [(&str, *const c_char, *const c_char, &str); 6] = [
+            ("empty virtual path", empty.as_ptr(), host.as_ptr(), "empty"),
+            ("empty host path", good.as_ptr(), empty.as_ptr(), "empty"),
+            ("non-UTF-8 virtual path", bad_utf8.as_ptr(), host.as_ptr(), "UTF-8"),
+            ("non-UTF-8 host path", good.as_ptr(), bad_utf8.as_ptr(), "UTF-8"),
+            ("null virtual path", ptr::null(), host.as_ptr(), "NULL"),
+            ("null host path", good.as_ptr(), ptr::null(), "NULL"),
+        ];
+
+        for (label, vp, hp, expected) in cases {
+            let msg = build_error_via_ffi(|b| unsafe { setter(b, vp, hp) });
+            assert!(
+                msg.contains(setter_name),
+                "{setter_name} with {label} must name the setter, got: {msg}",
+            );
+            assert!(
+                msg.contains(expected),
+                "{setter_name} with {label} must say what is wrong, got: {msg}",
+            );
+            let half = if label.ends_with("virtual path") {
+                "virtual path"
+            } else {
+                "host path"
+            };
+            assert!(
+                msg.contains(half),
+                "{setter_name} with {label} must name the half to fix, got: {msg}",
+            );
+        }
     }
 }
 

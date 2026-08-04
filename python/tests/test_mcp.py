@@ -44,9 +44,9 @@ class TestCapabilities:
     def test_max_memory(self):
         policy = policy_for_tool(
             workspace="/tmp/ws",
-            capabilities={"max_memory": "512M"},
+            capabilities={"max_memory": 512 * 1024 ** 2},
         )
-        assert policy.max_memory == "512M"
+        assert policy.max_memory == 512 * 1024 ** 2
 
     def test_multiple(self):
         policy = policy_for_tool(
@@ -54,13 +54,13 @@ class TestCapabilities:
             capabilities={
                 "fs_writable": ["/data"],
                 "net_allow": ["api.example.com:443", ":8080"],
-                "max_memory": "256M",
+                "max_memory": 256 * 1024 ** 2,
             },
         )
         assert policy.fs_writable == ["/data"]
         assert "api.example.com:443" in policy.net_allow
         assert ":8080" in policy.net_allow
-        assert policy.max_memory == "256M"
+        assert policy.max_memory == 256 * 1024 ** 2
 
     def test_unknown_field_ignored(self):
         policy = policy_for_tool(
@@ -84,9 +84,9 @@ class TestCapabilitiesFromMcpTool:
         assert caps == {"net_allow": ["api.example.com:443"]}
 
     def test_from_meta(self):
-        tool = self._tool(meta={"sandlock:max_memory": "128M"})
+        tool = self._tool(meta={"sandlock:max_memory": 128 * 1024 ** 2})
         caps = capabilities_from_mcp_tool(tool)
-        assert caps == {"max_memory": "128M"}
+        assert caps == {"max_memory": 128 * 1024 ** 2}
 
     def test_standard_hints_ignored(self):
         tool = self._tool({"readOnlyHint": True, "openWorldHint": True})

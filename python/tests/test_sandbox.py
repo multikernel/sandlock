@@ -661,8 +661,9 @@ class TestNewPolicyFields:
 
     def test_time_start(self):
         from datetime import datetime, timezone
-        # Freeze time to 2000-06-15
-        t = datetime(2000, 6, 15, tzinfo=timezone.utc)
+        # Freeze time to 2000-06-15. time_start is epoch seconds; an aware
+        # datetime converts without a second timestamp grammar in the SDK.
+        t = datetime(2000, 6, 15, tzinfo=timezone.utc).timestamp()
         p = _policy(time_start=t)
         result = p.run(["date", "+%Y"])
         assert result.success
@@ -781,7 +782,7 @@ class TestDiskQuota:
         p = _policy(
             fs_writable=[str(workdir)],
             workdir=str(workdir),
-            max_disk="1M",
+            max_disk=1024 ** 2,
         )
         # Opening for write triggers COW copy of the 5-byte file.
         result = p.run(
@@ -798,7 +799,7 @@ class TestDiskQuota:
         p = _policy(
             fs_writable=[str(workdir)],
             workdir=str(workdir),
-            max_disk="1K",  # 1024 bytes — smaller than the 8 KiB file
+            max_disk=1024,  # smaller than the 8 KiB file
         )
         # Trying to open big.bin for write triggers COW copy → ENOSPC.
         result = p.run(
@@ -816,7 +817,7 @@ class TestDiskQuota:
         p = _policy(
             fs_writable=[str(workdir)],
             workdir=str(workdir),
-            max_disk="1000",
+            max_disk=1000,
         )
         # First open succeeds (600 <= 1000), second fails (600+600 > 1000).
         result = p.run(
@@ -833,7 +834,7 @@ class TestDiskQuota:
         p = _policy(
             fs_writable=[str(workdir)],
             workdir=str(workdir),
-            max_disk="512",
+            max_disk=512,
         )
         result = p.run(
             ["sh", "-c", f"echo x >> {workdir}/big.bin 2>&1"]
@@ -864,18 +865,18 @@ class TestDiskQuota:
         p = _policy(
             fs_writable=[str(workdir)],
             workdir=str(workdir),
-            max_disk="1K",
+            max_disk=1024,
         )
         result = p.dry_run(
             ["sh", "-c", f"echo x >> {workdir}/big.bin"]
         )
         assert not result.success
 
-    def test_quota_accepts_various_units(self, tmp_path):
-        """String sizes like '1G', '512M', '100K' are accepted."""
+    def test_quota_accepts_various_sizes(self, tmp_path):
+        """A range of byte counts is accepted."""
         workdir = tmp_path / "units"
         workdir.mkdir()
-        for size in ("100K", "10M", "1G"):
+        for size in (100 * 1024, 10 * 1024 ** 2, 1024 ** 3):
             p = _policy(
                 fs_writable=[str(workdir)],
                 workdir=str(workdir),
@@ -892,7 +893,7 @@ class TestDiskQuota:
         p = _policy(
             fs_writable=[str(workdir)],
             workdir=str(workdir),
-            max_disk="100",  # tiny quota
+            max_disk=100,  # tiny quota
         )
         result = p.run(
             ["cat", f"{workdir}/big.bin"]
@@ -933,7 +934,7 @@ class TestDiskQuota:
             fs_writable=[str(workdir)],
             workdir=str(workdir),
             fs_storage=str(storage),
-            max_disk="512",
+            max_disk=512,
         )
         result = p.run(
             ["sh", "-c", f"echo x >> {workdir}/big.bin"]
