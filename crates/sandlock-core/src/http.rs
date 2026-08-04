@@ -179,6 +179,12 @@ pub fn http_acl_check(
 /// allowed to reach the original destination on the intercepted ports. Concrete
 /// HTTP rule hosts tighten the IP allowlist to those hosts; wildcard hosts or
 /// explicit HTTP ports with no rules allow any IP on the HTTP ports.
+///
+/// Derived entries a caller already carries are not added twice. A policy can
+/// be taken apart and rebuilt (`sandlock run --profile-file` rebuilds a builder
+/// from the parsed profile, then applies flag overrides on top), and the
+/// rebuilt net allowlist arrives here already holding the entries this
+/// function added on the first build.
 pub(crate) fn extend_net_allow_for_http(
     net_allow: &mut Vec<NetAllow>,
     http_allow: &[HttpRule],
@@ -187,6 +193,12 @@ pub(crate) fn extend_net_allow_for_http(
 ) {
     if http_ports.is_empty() {
         return;
+    }
+
+    fn push_unique(net_allow: &mut Vec<NetAllow>, rule: NetAllow) {
+        if !net_allow.contains(&rule) {
+            net_allow.push(rule);
+        }
     }
 
     let mut wildcard_seen = false;
@@ -203,7 +215,7 @@ pub(crate) fn extend_net_allow_for_http(
     }
 
     if wildcard_seen || (http_allow.is_empty() && http_deny.is_empty()) {
-        net_allow.push(NetAllow {
+        push_unique(net_allow, NetAllow {
             protocol: Protocol::Tcp,
             target: NetTarget::AnyIp,
             ports: http_ports.to_vec(),
@@ -212,7 +224,7 @@ pub(crate) fn extend_net_allow_for_http(
     }
 
     for host in concrete_hosts {
-        net_allow.push(NetAllow {
+        push_unique(net_allow, NetAllow {
             protocol: Protocol::Tcp,
             target: NetTarget::Host(host),
             ports: http_ports.to_vec(),
@@ -479,6 +491,29 @@ mod tests {
         assert_eq!(net_allow[1].protocol, Protocol::Tcp);
         assert!(matches!(&net_allow[1].target, NetTarget::Host(h) if h == "admin.example.com"));
         assert_eq!(net_allow[1].ports, vec![80, 443]);
+    }
+
+    #[test]
+    fn extend_net_allow_for_http_is_idempotent() {
+        // A policy that is taken apart and rebuilt feeds the already derived
+        // entries back in as plain net-allow specs (that is what
+        // `sandlock run --profile-file` does before applying flag overrides),
+        // so a second pass must not grow the allowlist.
+        let allow = vec![HttpRule::parse("GET api.example.com/v1/*").unwrap()];
+        let mut net_allow = Vec::new();
+
+        extend_net_allow_for_http(&mut net_allow, &allow, &[], &[80]);
+        let first = net_allow.clone();
+        extend_net_allow_for_http(&mut net_allow, &allow, &[], &[80]);
+
+        assert_eq!(net_allow, first);
+
+        // Same for the any-IP entry, which comes from a different branch.
+        let mut wide = Vec::new();
+        extend_net_allow_for_http(&mut wide, &[], &[], &[8080]);
+        let first_wide = wide.clone();
+        extend_net_allow_for_http(&mut wide, &[], &[], &[8080]);
+        assert_eq!(wide, first_wide);
     }
 
     #[test]

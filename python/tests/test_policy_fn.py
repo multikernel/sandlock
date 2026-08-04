@@ -210,7 +210,7 @@ class TestPolicyFnRestrict:
             return 0
 
         # Restricted: 128 MiB exceeds the tightened 64 MiB limit -> killed.
-        restricted = _policy(max_memory="256M", policy_fn=restrict_to_64mb).run(
+        restricted = _policy(max_memory=256 * 1024 * 1024, policy_fn=restrict_to_64mb).run(
             [sys.executable, "-c", alloc_128mb], timeout=15
         )
         assert b"STARTED" in restricted.stdout, restricted.stdout
@@ -218,7 +218,7 @@ class TestPolicyFnRestrict:
         assert not restricted.success, "128 MiB must exceed the 64 MiB dynamic limit"
 
         # Control: same 128 MiB under the un-restricted 256 MiB ceiling -> OK.
-        baseline = _policy(max_memory="256M").run(
+        baseline = _policy(max_memory=256 * 1024 * 1024).run(
             [sys.executable, "-c", alloc_128mb], timeout=15
         )
         assert b"ALLOC_OK" in baseline.stdout, baseline.stdout

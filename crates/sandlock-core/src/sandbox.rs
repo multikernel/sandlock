@@ -51,12 +51,18 @@ impl ByteSize {
                 .trim()
                 .parse()
                 .map_err(|_| SandboxError::Invalid(format!("invalid byte size: {}", s)))?;
-            match suffix.to_ascii_uppercase().as_str() {
-                "K" => Ok(ByteSize::kib(n)),
-                "M" => Ok(ByteSize::mib(n)),
-                "G" => Ok(ByteSize::gib(n)),
-                other => Err(SandboxError::Invalid(format!("unknown byte size suffix: {}", other))),
-            }
+            let scale: u64 = match suffix.to_ascii_uppercase().as_str() {
+                "K" => 1024,
+                "M" => 1024 * 1024,
+                "G" => 1024 * 1024 * 1024,
+                other => return Err(SandboxError::Invalid(format!("unknown byte size suffix: {}", other))),
+            };
+            // Checked: an unchecked multiply wraps in release builds, so a
+            // large-but-parseable value like "17179869184G" would come back as
+            // a limit of zero bytes with no error at all.
+            n.checked_mul(scale).map(ByteSize).ok_or_else(|| {
+                SandboxError::Invalid(format!("byte size out of range: {}", s))
+            })
         } else {
             let n: u64 = s
                 .parse()
@@ -2916,7 +2922,7 @@ fn validate_allow_deny_disjoint(
 /// Parse `--net-allow-bind` specs. Accepts the `*` wildcard (any port),
 /// which cannot be combined with port lists; repeating the bare wildcard
 /// is idempotent.
-fn parse_allow_bind_ports(specs: &[String], label: &str) -> Result<BindPorts, SandboxError> {
+pub(crate) fn parse_allow_bind_ports(specs: &[String], label: &str) -> Result<BindPorts, SandboxError> {
     let mut parts = specs.iter().flat_map(|s| s.split(',')).map(str::trim);
     if !parts.clone().any(|part| part == "*") {
         return Ok(BindPorts::Ports(parse_bind_ports(specs, label)?));
@@ -2933,7 +2939,7 @@ fn parse_allow_bind_ports(specs: &[String], label: &str) -> Result<BindPorts, Sa
 /// Expand `--net-allow-bind` specs into a sorted, deduplicated port list.
 /// Each spec is a comma-separated list of single ports (`8080`) or inclusive
 /// `lo-hi` ranges (`8000-8010`). Mirrors the Python SDK's `parse_ports`.
-fn parse_bind_ports(specs: &[String], label: &str) -> Result<Vec<u16>, SandboxError> {
+pub(crate) fn parse_bind_ports(specs: &[String], label: &str) -> Result<Vec<u16>, SandboxError> {
     let mut ports: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
     for spec in specs {
         for part in spec.split(',') {

@@ -103,7 +103,7 @@ with Sandbox(fs_readable=["/usr", "/lib"]) as sb:
 | `fs_denied` | `list[str]` | `[]` | Paths explicitly denied |
 | `workdir` | `str \| None` | `None` | Working directory; enables COW protection |
 | `chroot` | `str \| None` | `None` | Path to chroot into before confinement |
-| `fs_mount` | `dict[str, str]` | `{}` | Map virtual paths to host directories inside chroot |
+| `fs_mount` | `list[Mount]` | `[]` | Host directories exposed at virtual paths inside chroot; `Mount(virt, host, ro=False)` |
 | `cwd` | `str \| None` | `None` | Child working directory |
 
 #### Network
@@ -154,24 +154,29 @@ but without kernel bind mounts or root privileges. Each sandbox gets its
 own persistent workspace while sharing a read-only rootfs.
 
 ```python
+from sandlock import Mount, Sandbox
+
 sandbox = Sandbox(
     chroot="/opt/rootfs",
-    fs_mount={"/work": "/tmp/sandbox-1/work"},
+    fs_mount=[Mount("/work", "/tmp/sandbox-1/work")],
     fs_readable=["/usr", "/bin", "/lib", "/etc"],
     cwd="/work",
 )
 result = sandbox.run(["python3", "task.py"])
 ```
 
+Pass `ro=True` for a read-only mount: `Mount("/data", "/srv/data", ro=True)`
+exposes the host directory but refuses writes through it.
+
 Combine with `workdir` + `max_disk` for quota-enforced writes:
 
 ```python
 sandbox = Sandbox(
     chroot="/opt/rootfs",
-    fs_mount={"/work": "/tmp/sandbox-1/work"},
+    fs_mount=[Mount("/work", "/tmp/sandbox-1/work")],
     workdir="/tmp/sandbox-1/work",
     fs_storage="/tmp/sandbox-1/cow",
-    max_disk="100M",
+    max_disk=100 * 1024 ** 2,
     on_exit="commit",
     fs_readable=["/usr", "/bin", "/lib", "/etc"],
 )
@@ -181,7 +186,7 @@ sandbox = Sandbox(
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `max_memory` | `str \| int \| None` | `None` | Memory limit, e.g. `"512M"` or int bytes |
+| `max_memory` | `int \| None` | `None` | Memory limit in bytes, e.g. `512 * 1024 ** 2` |
 | `max_processes` | `int` | `64` | Peak concurrent process limit |
 | `max_open_files` | `int \| None` | `None` | Max file descriptors (RLIMIT_NOFILE) |
 | `max_cpu` | `int \| None` | `None` | CPU throttle as percentage of one core (1-100) |
@@ -202,7 +207,7 @@ Sandlock always applies its default syscall blocklist.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `random_seed` | `int \| None` | `None` | Seed for deterministic getrandom() |
-| `time_start` | `datetime \| float \| str \| None` | `None` | Start timestamp for time virtualization |
+| `time_start` | `float \| None` | `None` | Start timestamp for time virtualization, as Unix epoch seconds |
 | `no_randomize_memory` | `bool` | `False` | Disable ASLR |
 | `no_huge_pages` | `bool` | `False` | Disable Transparent Huge Pages |
 | `deterministic_dirs` | `bool` | `False` | Sort directory entries lexicographically |
@@ -233,7 +238,7 @@ Sandlock always applies its default syscall blocklist.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `fs_storage` | `str \| None` | `None` | Storage directory for the seccomp COW upper layer / deltas |
-| `max_disk` | `str \| None` | `None` | Disk quota for COW storage (e.g. `"1G"`) |
+| `max_disk` | `int \| None` | `None` | Disk quota for COW storage in bytes (e.g. `1024 ** 3`) |
 | `on_exit` | `BranchAction` | `COMMIT` | `COMMIT`, `ABORT`, or `KEEP` |
 | `on_error` | `BranchAction` | `ABORT` | `COMMIT`, `ABORT`, or `KEEP` |
 
@@ -621,6 +626,13 @@ sandbox = load_profile("web-scraper")
 names = list_profiles()
 ```
 
+Profile text is parsed by the core parser, the same one the CLI runs, and
+comes back with every micro-grammar resolved: `mount = ["/data:/srv:ro"]`
+becomes `Mount("/data", "/srv", ro=True)`, `memory = "512M"` becomes
+`536870912`, and `time_start = "2026-01-01T00:00:00Z"` becomes epoch
+seconds. A profile therefore means the same thing here as it does to
+`sandlock run --profile-file`, including the message it fails with.
+
 ### Exceptions
 
 ```
@@ -710,7 +722,7 @@ permissions explicitly:
 | `fs_writable` | `["/tmp/agent"]` | Paths the tool can write to |
 | `net_allow` | `["api.example.com:443", "udp://1.1.1.1:53"]` | Outbound endpoints. Bare `host:port` is TCP; `udp://...` / `icmp://...` schemes opt UDP / ICMP echo in. |
 | `env` | `{"KEY": "val"}` | Environment variables to pass |
-| `max_memory` | `"256M"` | Memory limit |
+| `max_memory` | `256 * 1024 ** 2` | Memory limit in bytes |
 
 Any `Sandbox` field name is accepted as a capability key.
 
