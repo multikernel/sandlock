@@ -1372,7 +1372,6 @@ version = "0.8.5"
 dependencies = [
  "anyhow",
  "clap",
- "jiff",
  "libc",
  "sandlock-core",
  "serde",

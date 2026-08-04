@@ -7,6 +7,7 @@ they run — the Python counterpart of crates/sandlock-ffi/tests/popen.rs.
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import time
@@ -16,9 +17,15 @@ import pytest
 from sandlock import Sandbox, StdioMode, Process
 
 
-_READABLE = list(dict.fromkeys([
-    "/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev", sys.prefix,
-]))
+# The SDK forwards every readable path to the core, which refuses one that
+# does not exist, so the list filters rather than naming `/lib64` on a host
+# (arm64, musl) that has none.
+_READABLE = [
+    p for p in dict.fromkeys([
+        "/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev", sys.prefix,
+    ])
+    if os.path.isdir(p)
+]
 
 
 def _policy(**overrides):

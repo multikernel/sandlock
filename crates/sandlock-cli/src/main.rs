@@ -4,7 +4,6 @@ use sandlock_core::sandbox::{BranchAction, ByteSize, SandboxBuilder};
 use sandlock_core::profile;
 use anyhow::{Result, anyhow};
 use std::path::PathBuf;
-use std::time::SystemTime;
 
 mod learn;
 #[derive(Parser)]
@@ -608,7 +607,7 @@ async fn run_command(args: RunArgs) -> Result<i32> {
     // CLI overrides — non-clap-friendly fields (still parsed here)
     if let Some(ref m) = args.max_memory { builder = builder.max_memory(ByteSize::parse(m)?); }
     if let Some(ref ts) = args.time_start {
-        let t = parse_time_start(ts)?;
+        let t = profile::parse_time_start(ts, "--time-start")?;
         builder = builder.time_start(t);
     }
     if let Some(ref s) = args.max_disk { builder = builder.max_disk(ByteSize::parse(s)?); }
@@ -915,19 +914,6 @@ fn validate_no_supervisor_profile(profile: &Sandbox, source: &str) -> Result<()>
     }
 
     Ok(())
-}
-
-/// Render a parsed `NetRule` back into a `--net-allow` / `--net-deny` spec
-/// string, so a profile loaded via `--profile-file` round-trips through the
-/// builder. Allow and deny share one grammar. The scheme is always
-/// rendered: a scheme-less spec parses as a TCP + UDP pair, so a
-/// single-protocol rule must carry its scheme to round-trip exactly.
-/// IPv6 is bracketed only when a port follows, and the all-ports case
-/// drops the redundant `:*`.
-fn parse_time_start(s: &str) -> Result<SystemTime> {
-    let ts: jiff::Timestamp = s.parse()
-        .map_err(|e| anyhow!("invalid --time-start '{}': {}", s, e))?;
-    Ok(ts.into())
 }
 
 fn parse_branch_action(flag: &str, s: &str) -> Result<BranchAction> {

@@ -2,10 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Basic Sandlock sandbox examples."""
 
+import os
+
 from sandlock import Sandbox
 
 # Minimum filesystem readable to exec common binaries.
-_BASE_READ = ["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev"]
+# Present system paths only: /lib64 is absent on arm64 and /sbin is a
+# symlink into /usr on merged-usr hosts. A grant on a path that is not
+# there fails when the child installs its Landlock rules, and the failure
+# does not name the path, so filter here rather than debug it there.
+_BASE_READ = [
+    p for p in ("/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev")
+    if os.path.exists(p)
+]
 
 
 def example_run_command():

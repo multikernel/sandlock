@@ -86,7 +86,7 @@ async def run_agent(user_prompt: str, workspace: str):
     mcp.add_tool(
         "run_python", run_python,
         description="Run Python code and return stdout. No filesystem or network access.",
-        capabilities={"max_memory": "128M"},
+        capabilities={"max_memory": 128 * 1024 ** 2},
         input_schema={
             "type": "object",
             "properties": {"code": {"type": "string", "description": "Python code to execute"}},

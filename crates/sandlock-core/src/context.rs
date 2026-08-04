@@ -348,24 +348,25 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         }
     }
 
-    // 4b. Optional: CPU core binding
+    // 4b. Optional: CPU core binding. A set that reached here is non-empty:
+    // the builder refuses an empty one by name. This used to skip the call for
+    // an empty set instead, which turned "pin me to no core" into "pinning did
+    // not happen" without anyone being told.
     if let Some(ref cores) = sandbox.cpu_cores {
-        if !cores.is_empty() {
-            let mut set = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
-            unsafe { libc::CPU_ZERO(&mut set) };
-            for &core in cores {
-                unsafe { libc::CPU_SET(core as usize, &mut set) };
-            }
-            if unsafe {
-                libc::sched_setaffinity(
-                    0,
-                    std::mem::size_of::<libc::cpu_set_t>(),
-                    &set,
-                )
-            } != 0
-            {
-                fail!("sched_setaffinity");
-            }
+        let mut set = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+        unsafe { libc::CPU_ZERO(&mut set) };
+        for &core in cores {
+            unsafe { libc::CPU_SET(core as usize, &mut set) };
+        }
+        if unsafe {
+            libc::sched_setaffinity(
+                0,
+                std::mem::size_of::<libc::cpu_set_t>(),
+                &set,
+            )
+        } != 0
+        {
+            fail!("sched_setaffinity");
         }
     }
 

@@ -346,7 +346,13 @@ if __name__ == "__main__":
     # A real client implementing head()/get() drops in here unchanged.
 
     ns = Namespace(backend)
-    sandbox = Sandbox(fs_readable=["/usr", "/lib", "/lib64", "/etc", "/bin"])
+    # Present system paths only: /lib64 is absent on arm64. A grant on a path
+    # that is not there fails when the child installs its Landlock rules, and
+    # the failure does not name the path.
+    system_paths = [
+        p for p in ("/usr", "/lib", "/lib64", "/etc", "/bin") if os.path.exists(p)
+    ]
+    sandbox = Sandbox(fs_readable=system_paths)
     result = sandbox.run_with_handlers(
         cmd,
         [

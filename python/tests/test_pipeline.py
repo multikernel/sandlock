@@ -18,13 +18,23 @@ from sandlock import Sandbox, Stage, Pipeline, NamedStage, Gather, GatherPipelin
 
 _PYTHON_PREFIX = sys.prefix
 
+
+def _readable(*paths):
+    """Deduplicate readable paths and drop the ones this host does not have.
+
+    The SDK forwards every readable path to the core, which refuses one that
+    does not exist, so a fixture naming `/lib64` on a host without it (arm64,
+    musl) would fail the build rather than the behaviour under test.
+    """
+    return [p for p in dict.fromkeys(paths) if os.path.isdir(p)]
+
 def _policy(**overrides):
     """Minimal policy for testing."""
     defaults = {
-        "fs_readable": list(dict.fromkeys([
+        "fs_readable": _readable(
             "/usr", "/lib", "/lib64", "/etc", "/bin", "/sbin",
             _PYTHON_PREFIX,
-        ])),
+        ),
         "clean_env": True,
     }
     defaults.update(overrides)
@@ -92,9 +102,9 @@ class TestPipeline:
                 f.write("sensitive data")
 
             # Stage 1: can read the file
-            reader_policy = _policy(fs_readable=[
+            reader_policy = _policy(fs_readable=_readable(
                 tmp, "/usr", "/lib", "/lib64", "/etc", "/bin", "/sbin",
-            ])
+            ))
             # Stage 2: cannot read the file (no tmp in readable)
             processor_policy = _policy()
 
@@ -190,10 +200,10 @@ class TestXOA:
 
             # Executor: can read workspace, no network
             executor_policy = _policy(
-                fs_readable=list(dict.fromkeys([
+                fs_readable=_readable(
                     workspace, "/usr", "/lib", "/lib64", "/etc", "/bin", "/sbin",
                     _PYTHON_PREFIX,
-                ])),
+                ),
                 net_allow=[],
             )
 
@@ -301,10 +311,10 @@ class TestGather:
         # the .so picked up by _find_lib() rather than assuming a
         # fixed layout.
         lib_dir = str(Path(_find_lib()).parent)
-        policy = _policy(fs_readable=list(dict.fromkeys([
+        policy = _policy(fs_readable=_readable(
             "/usr", "/lib", "/lib64", "/etc", "/bin", "/sbin",
-            lib_dir, _PYTHON_PREFIX,
-        ] + python_paths)))
+            lib_dir, _PYTHON_PREFIX, *python_paths,
+        ))
 
         result = (
             policy.cmd(
@@ -332,10 +342,10 @@ class TestGather:
             with open(secret, "w") as f:
                 f.write("sensitive data")
 
-            data_policy = _policy(fs_readable=list(dict.fromkeys([
+            data_policy = _policy(fs_readable=_readable(
                 tmp, "/usr", "/lib", "/lib64", "/etc", "/bin", "/sbin",
                 _PYTHON_PREFIX,
-            ])))
+            ))
             code_policy = _policy()
             consumer_policy = _policy()
 

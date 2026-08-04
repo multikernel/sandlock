@@ -17,13 +17,26 @@ import (
 	sandlock "github.com/multikernel/sandlock/go"
 )
 
+// present keeps the system paths this host actually has. /lib64 is absent on
+// arm64, and sandlock refuses a readable path that is not there, so filter
+// here rather than hardcode one architecture's layout.
+func present(paths ...string) []string {
+	var out []string
+	for _, p := range paths {
+		if _, err := os.Stat(p); err == nil {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func main() {
 	if v, min := sandlock.LandlockABIVersion(), sandlock.MinLandlockABI(); v < min {
 		log.Fatalf("kernel Landlock ABI v%d < required v%d", v, min)
 	}
 
 	sb := &sandlock.Sandbox{
-		FSReadable: []string{"/usr", "/lib", "/lib64", "/bin", "/etc"},
+		FSReadable: present("/usr", "/lib", "/lib64", "/bin", "/etc"),
 		FSWritable: []string{"/tmp"},
 		MaxMemory:  "256M",
 	}
