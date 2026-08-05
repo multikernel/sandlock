@@ -1047,6 +1047,7 @@ impl SandboxBuilder {
             policy_fn: self.policy_fn,
             name: self.name,
             mode: self.mode,
+            cow_upper: None,
             init_fn: self.init_fn,
             work_fn: self.work_fn,
             runtime: None,

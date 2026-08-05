@@ -470,6 +470,13 @@ pub struct Sandbox {
     pub no_coredump: bool,
     pub deterministic_dirs: bool,
 
+    /// The COW upper dir granted read+exec at spawn time so Landlock can
+    /// execute binaries the workload creates in the workdir. An internal
+    /// grant, not user policy: recorded here so `sandbox_to_profile` can
+    /// keep it out of inspect output. Spawn-time state, not serialized.
+    #[serde(skip)]
+    pub(crate) cow_upper: Option<PathBuf>,
+
     // Filesystem branch
     pub workdir: Option<PathBuf>,
     pub cwd: Option<PathBuf>,
@@ -617,6 +624,9 @@ impl Clone for Sandbox {
             no_huge_pages: self.no_huge_pages,
             no_coredump: self.no_coredump,
             deterministic_dirs: self.deterministic_dirs,
+            // Cloned for the control-loop snapshot, which is taken after the
+            // spawn-time upper grant lands in fs_readable.
+            cow_upper: self.cow_upper.clone(),
             workdir: self.workdir.clone(),
             cwd: self.cwd.clone(),
             fs_storage: self.fs_storage.clone(),
@@ -1785,6 +1795,7 @@ impl Sandbox {
         let shared_cow = self.rt().shared_cow.clone();
         let seccomp_cow_branch = if let Some(ref shared) = shared_cow {
             self.fs_readable.push(shared.upper_dir.clone());
+            self.cow_upper = Some(shared.upper_dir.clone());
             None
         } else if !no_supervisor && self.workdir.is_some() {
             let workdir = self.workdir.as_ref().unwrap().clone();
@@ -1806,6 +1817,7 @@ impl Sandbox {
                         self.on_exit == BranchAction::Keep || self.on_error == BranchAction::Keep,
                     );
                     self.fs_readable.push(branch.upper_dir().to_path_buf());
+                    self.cow_upper = Some(branch.upper_dir().to_path_buf());
                     Some(branch)
                 }
                 Err(e) => {

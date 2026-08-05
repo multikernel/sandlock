@@ -503,7 +503,11 @@ pub fn sandbox_to_profile(s: &Sandbox, extra_denied: &[String]) -> ProfileInput 
             no_huge_pages: s.no_huge_pages,
         },
         filesystem: FilesystemSection {
-            read: s.fs_readable.clone(),
+            // The COW upper dir grant is spawn-time plumbing, not user policy.
+            read: s.fs_readable.iter()
+                .filter(|p| Some(p.as_path()) != s.cow_upper.as_deref())
+                .cloned()
+                .collect(),
             write: s.fs_writable.clone(),
             deny: fs_deny,
             chroot: s.chroot.clone(),
@@ -615,6 +619,24 @@ pub fn list_profiles() -> Result<Vec<String>, SandlockError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sandbox_to_profile_hides_cow_upper_grant() {
+        // Simulate the spawn-time upper grant: pushed into fs_readable with
+        // cow_upper recording which entry is internal.
+        let mut sb = crate::Sandbox::builder().fs_read("/usr").build().unwrap();
+        let upper = PathBuf::from("/run/user/1000/sandlock-cow/deadbeef/upper");
+        sb.fs_readable.push(upper.clone());
+        sb.cow_upper = Some(upper.clone());
+
+        let profile = sandbox_to_profile(&sb, &[]);
+        assert!(profile.filesystem.read.contains(&PathBuf::from("/usr")));
+        assert!(
+            !profile.filesystem.read.contains(&upper),
+            "internal COW upper grant leaked into profile: {:?}",
+            profile.filesystem.read
+        );
+    }
 
     #[test]
     fn list_profiles_empty_dir() {
