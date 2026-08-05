@@ -533,6 +533,14 @@ pub struct Sandbox {
     #[serde(skip)]
     pub name: Option<String>,
 
+    /// Operating-mode marker (e.g. "learn") written to the runtime dir at
+    /// spawn time and shown as STATUS by `sandlock ps`, so an operator sees
+    /// why a sandbox exists (learn's read-everything observation run would
+    /// otherwise be indistinguishable from a dangerously permissive one).
+    /// Instance metadata like `name`, not policy — never serialized.
+    #[serde(skip)]
+    pub mode: Option<String>,
+
     // COW fork init function — runs once in the child before COW cloning.
     // Not serialized; not cloned (FnOnce can't be cloned — drops to None on clone).
     #[serde(skip)]
@@ -630,6 +638,7 @@ impl Clone for Sandbox {
             user: self.user,
             policy_fn: self.policy_fn.clone(),
             name: self.name.clone(),
+            mode: self.mode.clone(),
             // init_fn (FnOnce) cannot be cloned — the clone gets None.
             // If the clone also needs an init function, set it explicitly.
             init_fn: None,
@@ -1973,6 +1982,7 @@ impl Sandbox {
                 &sandbox_name,
                 pid,
                 supervisor_pid,
+                self.mode.as_deref(),
             ) {
                 Ok(dir) => {
                     self.rt_mut().control_dir = Some(dir);
@@ -2032,6 +2042,7 @@ impl Sandbox {
                     &sandbox_name,
                     pid,
                     supervisor_pid,
+                    self.mode.as_deref(),
                 ) {
                     Ok((listener, control_dir)) => {
                         self.rt_mut().control_dir = Some(control_dir);

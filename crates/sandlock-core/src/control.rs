@@ -62,6 +62,14 @@ pub fn sock_path(dir: &Path) -> PathBuf {
     dir.join("control.sock")
 }
 
+/// Read a sandbox's operating-mode marker (e.g. "learn") from its runtime
+/// dir. `None` for ordinary runs, which write no mode file.
+pub fn sandbox_mode(name: &str) -> Option<String> {
+    let s = std::fs::read_to_string(sandbox_dir(name).join("mode")).ok()?;
+    let s = s.trim();
+    if s.is_empty() { None } else { Some(s.to_string()) }
+}
+
 /// Read the supervisor PID from a runtime dir's pid file.
 /// Returns `None` if the file is missing, unparseable, or does not
 /// contain two lines (child_pid\nsupervisor_pid\n).
@@ -94,8 +102,9 @@ pub(crate) fn setup_runtime_dir(
     name: &str,
     child_pid: i32,
     supervisor_pid: i32,
+    mode: Option<&str>,
 ) -> Result<(UnixListener, PathBuf), std::io::Error> {
-    let dir = setup_runtime_dir_no_socket(name, child_pid, supervisor_pid)?;
+    let dir = setup_runtime_dir_no_socket(name, child_pid, supervisor_pid, mode)?;
 
     // Bind control socket.
     let sp = sock_path(&dir);
@@ -118,6 +127,7 @@ pub(crate) fn setup_runtime_dir_no_socket(
     name: &str,
     child_pid: i32,
     supervisor_pid: i32,
+    mode: Option<&str>,
 ) -> Result<PathBuf, std::io::Error> {
     let dir = sandbox_dir(name);
 
@@ -146,6 +156,12 @@ pub(crate) fn setup_runtime_dir_no_socket(
 
     // Write pid file atomically via temp + rename so list_live_sandboxes
     // never sees a partially-written or empty pid file.
+    // Operating-mode marker for the `sandlock ps` STATUS column. Written
+    // before the pid file so a listing never sees the sandbox without it.
+    if let Some(m) = mode {
+        std::fs::write(dir.join("mode"), m)?;
+    }
+
     let pid_path = pid_path(&dir);
     let tmp_path = dir.join(".pid.tmp");
     std::fs::write(&tmp_path, format!("{}\n{}\n", child_pid, supervisor_pid))?;
@@ -633,6 +649,21 @@ mod tests {
         let dir = sandbox_dir("test-sandbox");
         assert!(dir.to_string_lossy().contains("test-sandbox"));
         assert!(dir.to_string_lossy().contains("sandlock-"));
+    }
+
+    #[test]
+    fn test_runtime_dir_mode_file_roundtrip() {
+        // Unique name: sandbox names are uid-wide, never reuse a fixed one.
+        let name = format!("test-mode-{}", std::process::id());
+        let pid = std::process::id() as i32;
+
+        let dir = setup_runtime_dir_no_socket(&name, pid, pid, Some("learn")).unwrap();
+        assert_eq!(sandbox_mode(&name).as_deref(), Some("learn"));
+        cleanup_runtime_dir(&dir);
+
+        let dir = setup_runtime_dir_no_socket(&name, pid, pid, None).unwrap();
+        assert_eq!(sandbox_mode(&name), None);
+        cleanup_runtime_dir(&dir);
     }
 
     #[test]

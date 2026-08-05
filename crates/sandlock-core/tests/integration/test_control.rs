@@ -268,6 +268,25 @@ fn test_control_sandbox_to_profile() {
 }
 
 #[test]
+fn test_control_mode_stays_out_of_profile() {
+    // The mode marker is ps metadata, not policy: inspect output (a
+    // ProfileInput) must not carry it.
+    let sb = sandlock_core::Sandbox::builder()
+        .fs_read("/usr")
+        .mode("learn")
+        .build()
+        .unwrap();
+
+    let toml_str = sandlock_core::profile::sandbox_to_toml(&sb, &[]).unwrap();
+    assert!(!toml_str.contains("mode"), "mode leaked into profile: {toml_str}");
+}
+
+#[test]
+fn test_control_sandbox_mode_absent_for_plain_runs() {
+    assert_eq!(sandlock_core::control::sandbox_mode("no-such-sandbox-mode"), None);
+}
+
+#[test]
 fn test_control_sandbox_to_profile_merges_dynamic_denies() {
     let sb = sandlock_core::Sandbox::builder()
         .fs_read("/usr")

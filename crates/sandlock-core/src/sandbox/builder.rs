@@ -221,6 +221,12 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", clap(skip))]
     pub name: Option<String>,
 
+    // Operating-mode marker (e.g. "learn") shown as STATUS by `sandlock ps`:
+    // gives operators context for otherwise alarming sandboxes like learn's
+    // read-everything observation run.
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub mode: Option<String>,
+
     // COW fork init function: runs once in the child before COW cloning.
     #[cfg_attr(feature = "cli", clap(skip))]
     pub(crate) init_fn: Option<Box<dyn FnOnce() + Send + 'static>>,
@@ -294,6 +300,7 @@ impl Default for SandboxBuilder {
             protection_policy: ProtectionPolicy::default(),
             policy_fn: None,
             name: None,
+            mode: None,
             init_fn: None,
             work_fn: None,
         }
@@ -356,6 +363,7 @@ impl Clone for SandboxBuilder {
             protection_policy: self.protection_policy.clone(),
             policy_fn: self.policy_fn.clone(),
             name: self.name.clone(),
+            mode: self.mode.clone(),
             // init_fn (FnOnce) cannot be cloned; drop to None.
             init_fn: None,
             // work_fn is Arc-wrapped; clone bumps the reference count.
@@ -754,6 +762,13 @@ impl SandboxBuilder {
         self
     }
 
+    /// Set the operating-mode marker shown as STATUS in `sandlock ps`
+    /// output (e.g. `"learn"`).
+    pub fn mode(mut self, mode: impl Into<String>) -> Self {
+        self.mode = Some(mode.into());
+        self
+    }
+
     /// Set the COW-fork init function.
     ///
     /// The init function runs once in the child process before any COW clones
@@ -1031,6 +1046,7 @@ impl SandboxBuilder {
             user: self.user,
             policy_fn: self.policy_fn,
             name: self.name,
+            mode: self.mode,
             init_fn: self.init_fn,
             work_fn: self.work_fn,
             runtime: None,

@@ -265,16 +265,18 @@ async fn main() -> Result<()> {
                 }
                 Ok(sandboxes) => {
                     println!(
-                        "{:<32} {:>8}  {:>12}  {:<24}  {}",
-                        "NAME", "PID", "UPTIME", "PORTS", "CMD"
+                        "{:<32} {:>8}  {:>12}  {:<10}  {:<24}  {}",
+                        "NAME", "PID", "UPTIME", "STATUS", "PORTS", "CMD"
                     );
                     for (name, pid) in &sandboxes {
                         let uptime = proc_uptime(*pid).unwrap_or_else(|| "?".to_string());
                         let cmd = proc_cmdline(*pid).unwrap_or_else(|| "?".to_string());
                         let ports = query_ports(name);
+                        let status = sandlock_core::control::sandbox_mode(name)
+                            .unwrap_or_else(|| "running".to_string());
                         println!(
-                            "{:<32} {:>8}  {:>12}  {:<24}  {}",
-                            name, pid, uptime, ports, cmd
+                            "{:<32} {:>8}  {:>12}  {:<10}  {:<24}  {}",
+                            name, pid, uptime, status, ports, cmd
                         );
                     }
                 }

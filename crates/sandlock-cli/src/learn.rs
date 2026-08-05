@@ -500,6 +500,12 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     let observer = LearnObserver::new();
     let observer_cb = observer.clone();
     let policy = Sandbox::builder()
+        // Name + mode mark this as a learning sandbox in `sandlock ps`: the
+        // observation policy below (read "/", allow-all network) would
+        // otherwise look like a dangerously permissive run. One learn
+        // sandbox per CLI process, so the pid keeps names unique.
+        .name(format!("learn-{}", std::process::id()))
+        .mode("learn")
         .fs_read("/")
         .workdir("/")
         // Discard all COW changes after observation; learn is read-only from
@@ -518,8 +524,6 @@ pub async fn run(args: LearnArgs) -> Result<()> {
 
     // Use the three-step lifecycle (create/start/wait) so we can get the child
     // PID from sandbox.pid() and sample /proc/<pid> for resource peaks.
-    // No explicit name: the auto-generated sandbox-<pid>-<counter> is unique,
-    // so concurrent learn invocations never collide on the runtime dir.
     let mut sandbox = policy;
     sandbox.create_interactive(&cmd_refs).await
         .map_err(|e| anyhow!("sandbox error: {e}"))?;
