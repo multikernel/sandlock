@@ -441,6 +441,12 @@ fn time_start_str(t: SystemTime) -> Option<String> {
 ///
 /// `extra_denied` carries dynamic `policy_fn`-issued `deny_path()` calls so
 /// the effective policy reflects runtime mutations (RFC acceptance criterion).
+/// Collect rendered rule specs, dropping duplicates while preserving order.
+fn dedup_rendered(rules: impl Iterator<Item = String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    rules.filter(|r| seen.insert(r.clone())).collect()
+}
+
 pub fn sandbox_to_profile(s: &Sandbox, extra_denied: &[String]) -> ProfileInput {
     let mut mount_specs: Vec<String> = Vec::new();
     for (virt, host) in &s.fs_mount {
@@ -462,8 +468,11 @@ pub fn sandbox_to_profile(s: &Sandbox, extra_denied: &[String]) -> ProfileInput 
         }
     }
 
-    let net_allow: Vec<String> = s.net_allow.iter().map(format_net_rule).collect();
-    let net_deny: Vec<String> = s.net_deny.iter().map(format_net_rule).collect();
+    // Distinct rules can render to the same spec: a scheme-less "*" expands
+    // to a tcp://* + udp://* pair at parse time, so an explicit udp://* rule
+    // next to it repeats the rendered form. List each spec once.
+    let net_allow = dedup_rendered(s.net_allow.iter().map(format_net_rule));
+    let net_deny = dedup_rendered(s.net_deny.iter().map(format_net_rule));
     let http_allow: Vec<String> = s.http_allow.iter().map(format_http_rule).collect();
     let http_deny: Vec<String> = s.http_deny.iter().map(format_http_rule).collect();
 

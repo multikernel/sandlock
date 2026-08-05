@@ -287,6 +287,25 @@ fn test_control_sandbox_mode_absent_for_plain_runs() {
 }
 
 #[test]
+fn test_control_sandbox_to_profile_dedups_net_rules() {
+    // "*" expands to tcp://* + udp://* at parse time, so the explicit
+    // udp://* renders as a duplicate spec.
+    let sb = sandlock_core::Sandbox::builder()
+        .net_allow("*")
+        .net_allow("udp://*")
+        .net_allow("icmp://*")
+        .build()
+        .unwrap();
+
+    let profile = sandlock_core::profile::sandbox_to_profile(&sb, &[]);
+    let allow = &profile.network.allow;
+    let unique: std::collections::HashSet<&String> = allow.iter().collect();
+    assert_eq!(allow.len(), unique.len(), "duplicate net rules in {allow:?}");
+    assert!(allow.contains(&"udp://*".to_string()));
+    assert!(allow.contains(&"icmp://*".to_string()));
+}
+
+#[test]
 fn test_control_sandbox_to_profile_merges_dynamic_denies() {
     let sb = sandlock_core::Sandbox::builder()
         .fs_read("/usr")

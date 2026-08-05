@@ -512,8 +512,8 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         // the real filesystem's perspective.
         .on_exit(BranchAction::Abort)
         .on_error(BranchAction::Abort)
+        // A scheme-less "*" covers TCP and UDP; ICMP always needs its own rule.
         .net_allow("*")
-        .net_allow("udp://*")
         .net_allow("icmp://*")
         .max_memory(sandlock_core::sandbox::ByteSize(1 << 43)) // 8 TiB
         .policy_fn(move |event, _ctx| observer_cb.on_event(event))
