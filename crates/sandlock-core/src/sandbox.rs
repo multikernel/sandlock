@@ -51,12 +51,23 @@ impl ByteSize {
                 .trim()
                 .parse()
                 .map_err(|_| SandboxError::Invalid(format!("invalid byte size: {}", s)))?;
-            match suffix.to_ascii_uppercase().as_str() {
-                "K" => Ok(ByteSize::kib(n)),
-                "M" => Ok(ByteSize::mib(n)),
-                "G" => Ok(ByteSize::gib(n)),
-                other => Err(SandboxError::Invalid(format!("unknown byte size suffix: {}", other))),
-            }
+            let scale: u64 = match suffix.to_ascii_uppercase().as_str() {
+                "K" => 1024,
+                "M" => 1024 * 1024,
+                "G" => 1024 * 1024 * 1024,
+                other => {
+                    return Err(SandboxError::Invalid(format!(
+                        "unknown byte size suffix: {}",
+                        other
+                    )))
+                }
+            };
+            // Checked: the multiply wraps in a release build, so a value that
+            // parses cleanly but does not fit, such as "17179869184G", used to
+            // come back as a ceiling of zero bytes rather than as an error.
+            n.checked_mul(scale)
+                .map(ByteSize)
+                .ok_or_else(|| SandboxError::Invalid(format!("byte size out of range: {}", s)))
         } else {
             let n: u64 = s
                 .parse()

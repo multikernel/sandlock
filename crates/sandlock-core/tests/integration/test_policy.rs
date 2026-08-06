@@ -111,6 +111,29 @@ fn test_bytesize_parse_invalid() {
 }
 
 #[test]
+fn test_bytesize_that_does_not_fit_is_an_error_not_a_ceiling_of_zero() {
+    // The digits parse and the suffix is known, so the value reaches the
+    // multiply. In a release build that multiply wrapped, and every one of
+    // these came back as a byte count the caller never asked for: 17179869184G
+    // is exactly 2^64 bytes, which wrapped to 0 and installed a ceiling of
+    // nothing. A memory ceiling of zero is not inert, the guest is SIGKILLed on
+    // its first allocation, and nothing anywhere named the setting.
+    for spec in ["17179869184G", "17592186044416M", "18014398509481984K"] {
+        let err = ByteSize::parse(spec).expect_err(&format!("{spec} must not parse"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("out of range") && msg.contains(spec),
+            "{spec} must be refused by name and by reason, got {msg:?}"
+        );
+    }
+
+    // The largest value each suffix can carry still parses, so the check
+    // refuses what does not fit rather than trimming the usable range.
+    assert_eq!(ByteSize::parse("17179869183G").unwrap().0, 17179869183 * 1024 * 1024 * 1024);
+    assert_eq!(ByteSize::parse("18446744073709551615").unwrap().0, u64::MAX);
+}
+
+#[test]
 fn test_clean_env() {
     let p = Sandbox::builder().build().unwrap();
     assert!(!p.clean_env, "clean_env should default to false");
