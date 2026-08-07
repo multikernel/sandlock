@@ -54,8 +54,8 @@ fn read_maps(pid: i32) -> Vec<(u64, u64, String)> {
 /// stack and heap stayed mapped and reachable.
 #[tokio::test]
 async fn test_restore_glibc_vdso_program_resumes() {
-    if cfg!(not(target_arch = "x86_64")) {
-        eprintln!("skipping: the restore engine is x86_64-only");
+    if cfg!(not(any(target_arch = "x86_64", target_arch = "riscv64"))) {
+        eprintln!("skipping: the restore engine is x86_64/riscv64 only");
         return;
     }
 

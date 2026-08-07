@@ -908,6 +908,33 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "riscv64")]
+    fn restart_sentinel_rewinds_pc_onto_the_ecall() {
+        // a0 = -ERESTARTNOHAND with a7 = pause(34): the restored context
+        // must re-enter the syscall rather than resume past it with the sentinel.
+        let mut regs = vec![0u64; 32];
+        regs[10] = (-514i64) as u64; // a0
+        regs[17] = 34;               // a7 (original syscall number)
+        regs[0] = 0x4010_0000;       // pc, just past the `ecall`
+        rearm_restartable_syscall(&mut regs);
+        assert_eq!(regs[10], 34, "a0 reloaded with the original syscall number");
+        assert_eq!(regs[0], 0x4010_0000 - 4, "pc rewound onto the 4-byte ecall");
+    }
+
+    #[test]
+    #[cfg(target_arch = "riscv64")]
+    fn non_restart_errno_is_left_alone() {
+        // -515 (ENOIOCTLCMD) looks like a sentinel but is not one.
+        let mut regs = vec![0u64; 32];
+        regs[10] = (-515i64) as u64;
+        regs[17] = 34;
+        regs[0] = 0x4010_0000;
+        rearm_restartable_syscall(&mut regs);
+        assert_eq!(regs[10], (-515i64) as u64);
+        assert_eq!(regs[0], 0x4010_0000);
+    }
+
+    #[test]
     #[cfg(target_arch = "x86_64")]
     fn fpstate_image_frames_a_full_xstate_for_xrstor() {
         // An xsave-sized capture must come back framed so the kernel takes the
@@ -957,6 +984,19 @@ mod tests {
         let img = build_fpstate_image(&vec![0xFFu8; 512]);
         assert_eq!(img.len(), 512);
         assert!(img[464..512].iter().all(|&b| b == 0), "sw_reserved cleared");
+    }
+
+    #[test]
+    #[cfg(target_arch = "riscv64")]
+    fn fpstate_image_passes_through_raw_fpregs() {
+        // riscv64 has no xstate framing: the kernel stores
+        // __riscv_d_ext_state directly in sc_fpregs. build_fpstate_image
+        // returns the capture verbatim so the stub copies it as-is into the
+        // ucontext's fp slot.
+        let fp = vec![0xA5u8; 264];
+        let img = build_fpstate_image(&fp);
+        assert_eq!(img, fp, "riscv64 fpstate is a raw passthrough");
+        assert_eq!(img.len(), 264);
     }
 
     #[test]
