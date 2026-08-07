@@ -589,10 +589,12 @@ impl SandboxBuilder {
     /// is running: an `open` the kernel services returns `EMFILE`, but one the
     /// supervisor services (`chroot`, COW, procfs virtualisation) is refused
     /// with `EACCES`, indistinguishable from a policy denial. Measured floors
-    /// for a trivial command: 4 for a plain dynamically linked exec, about 12
-    /// under `chroot`. Treat those as the shape of the constraint, not a
-    /// guarantee: the chroot figure varies slightly by host, and a program
-    /// linking more libraries needs more.
+    /// for a trivial command: 4 for a plain dynamically linked exec, and the
+    /// same 4 under `chroot` for a static binary (the injected exec fd needs
+    /// one free slot below the cap; a dynamically linked binary needs a second
+    /// slot for the injected interpreter fd). Treat those as the shape of the
+    /// constraint, not a guarantee: a program linking more libraries needs
+    /// more.
     pub fn max_open_files(mut self, n: u32) -> Self {
         self.max_open_files = Some(n);
         self
@@ -835,8 +837,7 @@ impl SandboxBuilder {
             return Err(SandboxError::Invalid(
                 "max_open_files must be greater than 0; omit it to inherit the \
                  system limit. Note that a workable floor is well above 1: a \
-                 plain dynamically linked exec needs about 4 descriptors, and \
-                 about 12 under chroot."
+                 trivial command needs about 4 descriptors, plain or chroot."
                     .into(),
             ));
         }

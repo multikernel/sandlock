@@ -894,7 +894,7 @@ async fn test_max_open_files_chroot_exec_error_is_eio() {
 
     // Too low to install the injected exec fd: the guest never reaches `main`.
     let too_low = minimal_exec_policy(&rootfs)
-        .max_open_files(4)
+        .max_open_files(3)
         .build()
         .unwrap()
         .run(&["rootfs-helper", "true"])
@@ -911,6 +911,43 @@ async fn test_max_open_files_chroot_exec_error_is_eio() {
         stderr.contains("Input/output error") || stderr.contains("os error 5"),
         "the chroot exec failure is reported as EIO, not EMFILE, got: {stderr}"
     );
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// A dense parent fd table must not raise the chroot startup floor.
+///
+/// Regression test: `close_fds_above` used to enumerate `/proc/self/fd`, which
+/// the already-installed confinement denies under chroot, so it silently closed
+/// nothing and the child carried the parent's whole fd table into exec. The
+/// injected exec fd then had to land above all of them, and a parent holding
+/// descriptors past the cap (a busy parallel test run) turned the exec into
+/// EMFILE-reported-as-EIO. The floor must depend on the sandbox, not on how
+/// many files the embedding process happens to have open.
+#[tokio::test]
+async fn test_max_open_files_chroot_ignores_parent_fd_density() {
+    let rootfs = build_test_rootfs("max-open-files-density");
+
+    // Occupy fd numbers well past the cap for the duration of the spawn.
+    let _hold: Vec<fs::File> = (0..80)
+        .map(|_| fs::File::open("/dev/null").expect("open /dev/null"))
+        .collect();
+
+    let result = minimal_exec_policy(&rootfs)
+        .max_open_files(64)
+        .build()
+        .unwrap()
+        .run(&["rootfs-helper", "true"])
+        .await;
+    match result {
+        Ok(r) => assert!(
+            r.success(),
+            "a 64-descriptor cap must not fail just because the parent holds \
+             more fds than the cap, stderr: {}",
+            r.stderr_str().unwrap_or("")
+        ),
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
 
     cleanup_rootfs(&rootfs);
 }

@@ -145,27 +145,25 @@ pub fn arg_filters(policy: &Sandbox) -> Vec<crate::sys::structs::SockFilter> {
 // ============================================================
 
 /// Close all file descriptors above `min_fd`, except those in `keep`.
+///
+/// Must not touch /proc: this runs after confinement is installed, which
+/// denies that read under chroot and silently turned the sweep into a no-op.
 fn close_fds_above(min_fd: RawFd, keep: &[RawFd]) {
-    // Read /proc/self/fd to enumerate open fds.
-    // Collect all fd numbers first, then close them after dropping the directory
-    // iterator. This avoids closing the directory fd during iteration.
-    let fds_to_close: Vec<RawFd> = {
-        let dir = match std::fs::read_dir("/proc/self/fd") {
-            Ok(d) => d,
-            Err(_) => return,
-        };
-        dir.flatten()
-            .filter_map(|entry| {
-                entry.file_name().into_string().ok()
-                    .and_then(|name| name.parse::<RawFd>().ok())
-            })
-            .filter(|&fd| fd > min_fd && !keep.contains(&fd))
-            .collect()
+    let mut kept: Vec<RawFd> = keep.iter().copied().filter(|&fd| fd > min_fd).collect();
+    kept.sort_unstable();
+    kept.dedup();
+
+    let close_span = |first: RawFd, last: libc::c_uint| {
+        unsafe { libc::syscall(libc::SYS_close_range, first as libc::c_uint, last, 0) };
     };
-    // The directory is now closed; safe to close the collected fds.
-    for fd in fds_to_close {
-        unsafe { libc::close(fd) };
+    let mut next = min_fd + 1;
+    for fd in kept {
+        if fd > next {
+            close_span(next, (fd - 1) as libc::c_uint);
+        }
+        next = fd + 1;
     }
+    close_span(next, libc::c_uint::MAX);
 }
 
 // ============================================================
@@ -570,16 +568,10 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
 
     // 13c. Optional: cap the file-descriptor table.
     //
-    // Deliberately the *last* confinement step: RLIMIT_NOFILE bounds the fd
-    // *number* the kernel may hand out, not the count of live descriptors, and
-    // every earlier step still needs to open files: Landlock takes an O_PATH
-    // fd per rule path plus the ruleset fd (step 8), seccomp allocates the
-    // notify listener (step 9), and `close_fds_above` reads /proc/self/fd
-    // (step 12). Setting the limit before those turns them into EMFILE and the
-    // child dies with a message blaming Landlock instead of the limit. After
-    // step 12 the table is {0,1,2} + keep_fds, which is what a caller means by
-    // "at most N open files". Placing it before the `entry` match applies it to
-    // the in-process entrypoint too, not only to the exec path.
+    // Deliberately the last confinement step: Landlock (step 8) and seccomp
+    // (step 9) still need to open fds, so an earlier cap kills the child with
+    // a misleading EMFILE. Before the `entry` match so the in-process
+    // entrypoint is capped too.
     if let Some(n) = sandbox.max_open_files {
         // Lower both the soft and the hard limit. setrlimit/prlimit64 are not
         // blocked by the seccomp filter, so a soft-only cap would be advisory:
