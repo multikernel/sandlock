@@ -1079,9 +1079,9 @@ impl Sandbox {
         use crate::checkpoint::{restore_blob, resume};
         use crate::error::SandboxRuntimeError;
 
-        if cfg!(not(target_arch = "x86_64")) {
+        if cfg!(not(any(target_arch = "x86_64", target_arch = "riscv64"))) {
             return Err(SandboxRuntimeError::Child(
-                "checkpoint restore is only implemented on x86_64".into(),
+                "checkpoint restore is only implemented on x86_64 and riscv64".into(),
             )
             .into());
         }

@@ -27,13 +27,32 @@ fn main() {
     // text and stack have to sit outside the address range programs occupy. The
     // default -no-pie base (0x400000) is exactly where a static ET_EXEC workload
     // loads, so the checkpoint's own text would be mapped over the running stub.
+    //
+    // Cross-compilation: when TARGET is riscv64gc-unknown-linux-gnu (or any
+    // riscv64* variant), look for a riscv64 cross-compiler. On the host it
+    // uses plain `cc` as before.
     let stub_src = manifest_dir.join("src/checkpoint/restore-stub.c");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let stub_bin = out_dir.join("restore-stub");
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let (ccs, warn) = if target.starts_with("riscv64")
+        || target.starts_with("riscv64gc")
+    {
+        (
+            &["riscv64-linux-gnu-gcc", "riscv64-unknown-linux-gnu-gcc"][..],
+            "cannot compile restore-stub for riscv64: its restore tests will be \
+             skipped. Install a riscv64 cross-compiler (e.g. riscv64-linux-gnu-gcc).",
+        )
+    } else {
+        (
+            &["cc"][..],
+            "cannot compile restore-stub: its restore tests will be skipped.",
+        )
+    };
     build_static(
         &stub_src,
         &stub_bin,
-        &["cc"],
+        ccs,
         &[
             "-static",
             "-nostdlib",
@@ -47,7 +66,7 @@ fn main() {
             "-fno-tree-loop-distribute-patterns",
             "-Wl,-Ttext-segment=0x30000000000",
         ],
-        "cannot compile restore-stub: its restore tests will be skipped.",
+        warn,
     );
     // Emit the path every run (rustc-env is not cached across build-script runs),
     // whether or not the binary was just (re)built.

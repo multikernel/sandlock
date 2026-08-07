@@ -345,15 +345,15 @@ fn to_child_path(
 /// Re-arm an interrupted, restartable syscall in the saved register file.
 ///
 /// When the checkpoint was taken (via `PTRACE_INTERRUPT`) while the process sat
-/// in a syscall, the kernel aborted it with a restart sentinel in rax
-/// (-ERESTARTSYS / -ERESTARTNOINTR / -ERESTARTNOHAND / -ERESTART_RESTARTBLOCK).
-/// At the ptrace stop, rip still points just PAST the `syscall` instruction. The
-/// kernel's restart fixup (rewind rip onto the 2-byte `syscall`, reload rax with
-/// the original syscall number) normally runs on the syscall-return path, which a
-/// restore bypasses. Without it, userspace resumes one instruction past the
-/// syscall with the raw sentinel (e.g. -514) in rax and faults. Applying the
-/// fixup here re-executes the syscall cleanly with its arguments still in
-/// registers (this is what CRIU does).
+/// in a syscall, the kernel aborted it with a restart sentinel in the return
+/// register (-ERESTARTSYS / -ERESTARTNOINTR / -ERESTARTNOHAND /
+/// -ERESTART_RESTARTBLOCK). At the ptrace stop, the PC still points just PAST
+/// the syscall instruction. The kernel's restart fixup (rewind PC, reload return
+/// register with the original syscall number) normally runs on the syscall-return
+/// path, which a restore bypasses. Without it, userspace resumes one instruction
+/// past the syscall with the raw sentinel (e.g. -514) in the return register and
+/// faults. Applying the fixup here re-executes the syscall cleanly with its
+/// arguments still in registers (this is what CRIU does).
 ///
 /// -515 (ENOIOCTLCMD) is NOT a restart code and must not be matched. For
 /// ERESTART_RESTARTBLOCK (-516) the original syscall is re-run rather than the
@@ -370,6 +370,21 @@ fn rearm_restartable_syscall(regs: &mut [u64]) {
         if matches!(rax as i64, -512 | -513 | -514 | -516) {
             regs[RAX] = orig_rax;
             regs[RIP] = regs[RIP].wrapping_sub(2);
+        }
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+fn rearm_restartable_syscall(regs: &mut [u64]) {
+    // riscv64 user_regs_struct layout indices (32 u64):
+    //   pc, ra, sp, gp, tp, t0-t2, s0-s1, a0-a7, s2-s11, t3-t6
+    const A0: usize = 10;
+    const A7: usize = 17;
+    const PC: usize = 0;
+    if let (Some(&a0), Some(&a7)) = (regs.get(A0), regs.get(A7)) {
+        if matches!(a0 as i64, -512 | -513 | -514 | -516) {
+            regs[A0] = a7;                         // restore original syscall number
+            regs[PC] = regs[PC].wrapping_sub(4);   // rewind past ecall (4 bytes)
         }
     }
 }
@@ -440,12 +455,26 @@ fn build_fpstate_image(fpregs: &[u8]) -> Vec<u8> {
     img
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+/// Build the FP image for the riscv64 signal frame. Unlike x86_64, riscv64 has
+/// no xstate/magic framing — the kernel stores the FPU context inline in
+/// `uc.uc_mcontext.__fpregs` as a raw `struct __riscv_d_ext_state` (or
+/// `__riscv_f_ext_state` for single-precision). The stub copies it verbatim into
+/// the ucontext's fp slot; the kernel reads it back from the signal frame on
+/// rt_sigreturn.
+#[cfg(target_arch = "riscv64")]
+fn build_fpstate_image(fpregs: &[u8]) -> Vec<u8> {
+    if fpregs.is_empty() {
+        return Vec::new();
+    }
+    fpregs.to_vec()
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
 fn build_fpstate_image(_fpregs: &[u8]) -> Vec<u8> {
     Vec::new()
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
 fn rearm_restartable_syscall(_regs: &mut [u64]) {}
 
 /// Interns NUL-terminated strings into the blob's string table, deduplicating
