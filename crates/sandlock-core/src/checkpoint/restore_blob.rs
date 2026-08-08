@@ -49,6 +49,8 @@ const SRC_FILE: u8 = 1;
 pub(crate) const STUB_BASE: u64 = 0x300_0000_0000;
 #[cfg(target_arch = "riscv64")]
 pub(crate) const STUB_BASE: u64 = 0x30_0000_0000;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+pub(crate) const STUB_BASE: u64 = 0;
 pub(crate) const STUB_SPAN: u64 = 0x40_0000;
 
 /// x86_64 signal-frame FP image constants. `FP_XSTATE_MAGIC1` in the

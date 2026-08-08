@@ -21,6 +21,8 @@ fn helper_binary() -> PathBuf {
 const STUB_BASE: u64 = 0x300_0000_0000;
 #[cfg(target_arch = "riscv64")]
 const STUB_BASE: u64 = 0x30_0000_0000;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+const STUB_BASE: u64 = 0;
 const STUB_SPAN: u64 = 0x40_0000;
 
 /// Parse `/proc/<pid>/maps` into `(start, end, path)` triples.
