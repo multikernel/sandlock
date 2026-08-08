@@ -1064,7 +1064,7 @@ impl Sandbox {
     /// [`Sandbox::popen`], the returned [`Process`] is the handle to it (no
     /// `start()` step). Fds that could not be transparently recreated are
     /// recorded on this `Sandbox`; query them with [`Sandbox::restore_skipped`].
-    /// x86_64 restore engine only.
+    /// x86_64 and riscv64 restore engines supported.
     ///
     /// The kernel vDSO is relocated onto the checkpoint-recorded base during
     /// restore, so ordinary libc/glibc programs that call vDSO functions (e.g.

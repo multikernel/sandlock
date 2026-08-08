@@ -253,7 +253,7 @@ void _start(void){{
 #[tokio::test(flavor = "multi_thread")]
 async fn oci_restore_resumes_vdso_free_program() {
     if cfg!(not(target_arch = "x86_64")) {
-        eprintln!("skipping: checkpoint restore is x86_64-only");
+        eprintln!("skipping: this test is x86_64-only (counter program)");
         return;
     }
     if sandlock_core::landlock_abi_version().is_err() {
@@ -415,7 +415,7 @@ fn build_counter(bin: &Path, src: &Path, out_path: &str) -> bool {
 #[tokio::test(flavor = "multi_thread")]
 async fn oci_checkpoint_of_running_container() {
     if cfg!(not(target_arch = "x86_64")) {
-        eprintln!("skipping: checkpoint/restore is x86_64-only");
+        eprintln!("skipping: this test is x86_64-only (counter program)");
         return;
     }
     if sandlock_core::landlock_abi_version().is_err() {

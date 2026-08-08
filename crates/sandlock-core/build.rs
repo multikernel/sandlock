@@ -34,20 +34,35 @@ fn main() {
     let stub_src = manifest_dir.join("src/checkpoint/restore-stub.c");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let stub_bin = out_dir.join("restore-stub");
+    let host = std::env::var("HOST").unwrap_or_default();
     let target = std::env::var("TARGET").unwrap_or_default();
-    let (ccs, warn) = if target.starts_with("riscv64")
-        || target.starts_with("riscv64gc")
-    {
-        (
-            &["riscv64-linux-gnu-gcc", "riscv64-unknown-linux-gnu-gcc"][..],
-            "cannot compile restore-stub for riscv64: its restore tests will be \
-             skipped. Install a riscv64 cross-compiler (e.g. riscv64-linux-gnu-gcc).",
-        )
+    let is_riscv64 = target.starts_with("riscv64");
+    let (ccs, warn) = if is_riscv64 {
+        if host.starts_with("riscv64") {
+            (
+                &["cc", "riscv64-linux-gnu-gcc", "riscv64-unknown-linux-gnu-gcc"][..],
+                "cannot compile restore-stub for riscv64: its restore tests will be \
+                 skipped. Install gcc.",
+            )
+        } else {
+            (
+                &["riscv64-linux-gnu-gcc", "riscv64-unknown-linux-gnu-gcc"][..],
+                "cannot compile restore-stub for riscv64: its restore tests will be \
+                 skipped. Install a riscv64 cross-compiler (e.g. riscv64-linux-gnu-gcc).",
+            )
+        }
     } else {
         (
             &["cc"][..],
             "cannot compile restore-stub: its restore tests will be skipped.",
         )
+    };
+    // The link address must match restore_blob::STUB_BASE and must sit below
+    // the Sv39 user ceiling (256 GiB) on riscv64.  x86_64 uses 0x300_0000_0000.
+    let text_segment = if is_riscv64 {
+        "-Wl,-Ttext-segment=0x3000000000"
+    } else {
+        "-Wl,-Ttext-segment=0x30000000000"
     };
     build_static(
         &stub_src,
@@ -58,19 +73,12 @@ fn main() {
             "-nostdlib",
             "-no-pie",
             "-O2",
-            // Without these, loop-idiom recognition rewrites the stub's own
-            // hand-written memset/memcpy bodies into calls to memset/memcpy,
-            // i.e. into infinite self-recursion. There is no libc to fall back
-            // on, so the stub must keep its byte loops as byte loops.
             "-ffreestanding",
             "-fno-tree-loop-distribute-patterns",
-            "-Wl,-Ttext-segment=0x30000000000",
+            text_segment,
         ],
         warn,
     );
-    // Emit the path every run (rustc-env is not cached across build-script runs),
-    // whether or not the binary was just (re)built.
-    println!("cargo:rustc-env=RESTORE_STUB_PATH={}", stub_bin.display());
 }
 
 /// Compile `src` to `bin` with the first working compiler in `ccs`, skipping the

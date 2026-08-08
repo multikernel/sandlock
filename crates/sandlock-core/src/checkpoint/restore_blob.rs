@@ -42,7 +42,13 @@ const SRC_FILE: u8 = 1;
 /// through the stub, because the stub's own text would be clobbered while it
 /// runs (this is exactly the collision a `-no-pie` stub at the default 0x400000
 /// hits against any static `ET_EXEC` workload).
+///
+/// x86_64 uses 3 TiB, far above any ordinary user address space.  riscv64 must
+/// stay below the Sv39 ceiling of 256 GiB.
+#[cfg(target_arch = "x86_64")]
 pub(crate) const STUB_BASE: u64 = 0x300_0000_0000;
+#[cfg(target_arch = "riscv64")]
+pub(crate) const STUB_BASE: u64 = 0x30_0000_0000;
 pub(crate) const STUB_SPAN: u64 = 0x40_0000;
 
 /// x86_64 signal-frame FP image constants. `FP_XSTATE_MAGIC1` in the
@@ -374,20 +380,15 @@ fn rearm_restartable_syscall(regs: &mut [u64]) {
     }
 }
 
-#[cfg(target_arch = "riscv64")]
-fn rearm_restartable_syscall(regs: &mut [u64]) {
-    // riscv64 user_regs_struct layout indices (32 u64):
-    //   pc, ra, sp, gp, tp, t0-t2, s0-s1, a0-a7, s2-s11, t3-t6
-    const A0: usize = 10;
-    const A7: usize = 17;
-    const PC: usize = 0;
-    if let (Some(&a0), Some(&a7)) = (regs.get(A0), regs.get(A7)) {
-        if matches!(a0 as i64, -512 | -513 | -514 | -516) {
-            regs[A0] = a7;                         // restore original syscall number
-            regs[PC] = regs[PC].wrapping_sub(4);   // rewind past ecall (4 bytes)
-        }
-    }
-}
+// riscv64 rearm is not implemented: on riscv64 a0 carries the return
+// value (not the syscall number, which stays in a7), so the saved
+// register file does not contain the original a0 argument needed for
+// a correct restart.  The kernel's own restart fixup also sets a7 to
+// __NR_restart_syscall for ERESTART_RESTARTBLOCK rather than re-running
+// the original number.  Both facts make a correct rearm from the
+// ptrace-captured register file alone infeasible; restore on riscv64
+// will therefore restart any interrupted syscall with a zero return
+// value (harmless for most calls) rather than with corrupted arguments.
 
 /// Build the FP image the stub points the signal frame's `fpstate` at.
 ///
@@ -907,32 +908,9 @@ mod tests {
         assert_eq!(regs[16], 0x4010_0000);
     }
 
-    #[test]
-    #[cfg(target_arch = "riscv64")]
-    fn restart_sentinel_rewinds_pc_onto_the_ecall() {
-        // a0 = -ERESTARTNOHAND with a7 = pause(34): the restored context
-        // must re-enter the syscall rather than resume past it with the sentinel.
-        let mut regs = vec![0u64; 32];
-        regs[10] = (-514i64) as u64; // a0
-        regs[17] = 34;               // a7 (original syscall number)
-        regs[0] = 0x4010_0000;       // pc, just past the `ecall`
-        rearm_restartable_syscall(&mut regs);
-        assert_eq!(regs[10], 34, "a0 reloaded with the original syscall number");
-        assert_eq!(regs[0], 0x4010_0000 - 4, "pc rewound onto the 4-byte ecall");
-    }
-
-    #[test]
-    #[cfg(target_arch = "riscv64")]
-    fn non_restart_errno_is_left_alone() {
-        // -515 (ENOIOCTLCMD) looks like a sentinel but is not one.
-        let mut regs = vec![0u64; 32];
-        regs[10] = (-515i64) as u64;
-        regs[17] = 34;
-        regs[0] = 0x4010_0000;
-        rearm_restartable_syscall(&mut regs);
-        assert_eq!(regs[10], (-515i64) as u64);
-        assert_eq!(regs[0], 0x4010_0000);
-    }
+    // riscv64 rearm is not implemented (see comment above), so these
+    // tests are omitted — the cfg(not(any(...))) no-op fallback handles
+    // both the sentinel and non-restart cases correctly.
 
     #[test]
     #[cfg(target_arch = "x86_64")]

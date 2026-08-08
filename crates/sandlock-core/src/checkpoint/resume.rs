@@ -584,9 +584,9 @@ mod tests {
 
         // riscv64 Sv39 gives 256 GiB of user virtual space, so the addresses
         // must stay below 0x40_0000_0000.  Pick a region that stays clear of
-        // the stub (0x300_0000_0000) and the vDSO (near the top).
-        const CODE: u64 = 0x200_0000_0000;
-        const STACK: u64 = 0x200_0001_0000;
+        // the stub (0x30_0000_0000) and the vDSO (near the top).
+        const CODE: u64 = 0x2000_0000;
+        const STACK: u64 = 0x2001_0000;
         const OUT_FD: i32 = 10; // sentinel pipe write end, inherited by the child
         const SENTINEL: u8 = 0x5A;
         const PAGE: u64 = 0x1000;

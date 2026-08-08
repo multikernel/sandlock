@@ -59,10 +59,14 @@
 /* The window this stub is linked into, mirroring restore_blob::STUB_BASE and
  * STUB_SPAN and the -Wl,-Ttext-segment= flag in build.rs. Used only to refuse a
  * sweep entry that would unmap the stub out from under itself. */
+#ifdef __riscv
+#define STUB_BASE 0x3000000000UL
+#else
 #define STUB_BASE 0x30000000000UL
+#endif
 #define STUB_SPAN 0x400000UL
 
-#ifdef __riscv
+#if defined(__riscv) && __riscv_xlen == 64
 #define SYS_read 63
 #define SYS_write 64
 #define SYS_close 57
@@ -116,11 +120,12 @@
  * path. Rust fails the restore rather than truncating if a blob exceeds it. */
 #define CTRL_MAX (1 << 20)
 /* Upper bound on a signal-frame FP image. x86_64: AMX-sized xstate plus
- * magic2. riscv64: 544 bytes for Q-extension __riscv_fp_state. */
+ * magic2. riscv64: 516 bytes, the last safe byte before sc_extdesc.reserved;
+ * the kernel union __riscv_fp_state is 528 bytes. */
 #if defined(__x86_64__)
 #define FP_MAX 16384
-#elif defined(__riscv)
-#define FP_MAX 544
+#elif defined(__riscv) && __riscv_xlen == 64
+#define FP_MAX 516
 #endif
 #define STACK_SIZE 65536
 /* Leftover mappings the supervisor may ask the stub to unmap. A freshly
@@ -136,6 +141,7 @@
 typedef unsigned long u64;
 typedef unsigned int u32;
 typedef long i64;
+typedef unsigned char u8;
 
 #ifdef __x86_64__
 static i64 sc6(long n, u64 a, u64 b, u64 c, u64 d, u64 e, u64 f) {
@@ -148,7 +154,7 @@ static i64 sc6(long n, u64 a, u64 b, u64 c, u64 d, u64 e, u64 f) {
         : "rcx", "r11", "memory");
     return r;
 }
-#elif defined(__riscv)
+#elif defined(__riscv) && __riscv_xlen == 64
 static i64 sc6(long n, u64 a, u64 b, u64 c, u64 d, u64 e, u64 f) {
     register long nr __asm__("a7") = n;
     register u64 a0 __asm__("a0") = a;
@@ -240,18 +246,19 @@ enum { UR_R15=0,UR_R14,UR_R13,UR_R12,UR_RBP,UR_RBX,UR_R11,UR_R10,UR_R9,UR_R8,
        UR_RAX,UR_RCX,UR_RDX,UR_RSI,UR_RDI,UR_ORIG_RAX,UR_RIP,UR_CS,UR_EFLAGS,
        UR_RSP,UR_SS,UR_FS_BASE,UR_GS_BASE,UR_DS,UR_ES,UR_FS,UR_GS };
 
-#elif defined(__riscv)
+#elif defined(__riscv) && __riscv_xlen == 64
 
 /* riscv64: rt_sigreturn reads frame at sp = (struct rt_sigframe *)sp.
- * siginfo (128 bytes) + ucontext. uc_mcontext is at uc+0xA8 (168).
- * sc_regs[32] at sigcontext+0x00, sc_fpregs at sigcontext+0x100.
+ * siginfo (128 bytes) + ucontext. uc_mcontext is at uc+0xB0 (176).
+ * sc_regs[32] at sigcontext+0x00, sc_fpregs at sigcontext+0x100;
+ * sigcontext is 16-aligned, hence the pad from 0xA8 to 0xB0.
  * The gp[] blob order is ptrace: pc=0, ra=1, sp=2, gp=3, tp=4, t0-t2=5-7,
  * s0-s1=8-9, a0-a7=10-17, s2-s11=18-27, t3-t6=28-31 — a 1:1 mapping to
  * sc_regs[32], so no remap is needed. tp (thread pointer) is carried by the
  * signal frame's sc_regs[4]; nothing needs arch_prctl. */
 struct sigctx {
     u64 gregs[32];           /* sc_regs: 32 gregs, 256 bytes */
-    u8  fpregs[544];         /* sc_fpregs: union __riscv_fp_state (max Q ext) */
+    u8  fpregs[528];         /* sc_fpregs: union __riscv_fp_state (kernel 528 byte union) */
 };
 
 struct uctx {
@@ -262,8 +269,8 @@ struct uctx {
     u32 _pad;                /* 0x1C */
     u64 ss_size;             /* 0x20 */
     u64 uc_sigmask;          /* 0x28 */
-    u8  __unused[120];       /* 0x30 */
-    struct sigctx mc;        /* 0xA8 (168) */
+    u8  __unused[128];       /* 0x30 */
+    struct sigctx mc;        /* 0xB0 (176) */
 };
 
 /* rt_sigframe: struct siginfo (zeroed, 128 bytes) + ucontext. */
@@ -439,7 +446,7 @@ static void _start_c(u64 *sp) {
         i64 fd = SC4(SYS_openat, AT_FDCWD, strings + f->path_off, f->flags, 0);
         if (fd < 0) die(10);
         if ((u32)fd != f->fd) {
-#ifdef __riscv
+#if defined(__riscv) && __riscv_xlen == 64
             /* riscv64 has no SYS_dup2 — use dup3 with flags=0. */
             if (SC3(SYS_dup3, fd, f->fd, 0) != (i64)f->fd) die(10);
 #else
@@ -506,7 +513,7 @@ static void _start_c(u64 *sp) {
         : "r"(&uc), "r"(rax)
         : "memory");
 
-#elif defined(__riscv)
+#elif defined(__riscv) && __riscv_xlen == 64
     /* riscv64: build a struct rt_sigframe on the stack. gp[] order is 1:1 with
      * sc_regs (both ptrace order), so copy the register file directly.
      * The FP state is embedded inline in sc_fpregs (no pointer indirection,
@@ -518,8 +525,6 @@ static void _start_c(u64 *sp) {
     if (nregs > 32) nregs = 32;
     memcpy(sf.uc.mc.gregs, gp, nregs * sizeof(u64));
     if (h->fpstate_len) {
-        if (h->fpstate_len > sizeof(sf.uc.mc.fpregs))
-            h->fpstate_len = (u32)sizeof(sf.uc.mc.fpregs);
         memcpy(sf.uc.mc.fpregs, ctrl_buf + h->fpstate_off, h->fpstate_len);
     }
 
@@ -551,7 +556,7 @@ __asm__(
     "   call _start_c\n"
     "   hlt\n"
 );
-#elif defined(__riscv)
+#elif defined(__riscv) && __riscv_xlen == 64
 /* riscv64: a0 = sp (first argument), switch to stub_stack, align, call. */
 __asm__(
     ".global _start\n"
