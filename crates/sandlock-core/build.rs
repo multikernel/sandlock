@@ -79,6 +79,9 @@ fn main() {
         ],
         warn,
     );
+    // Emit the path every run (rustc-env is not cached across build-script runs),
+    // whether or not the binary was just (re)built.
+    println!("cargo:rustc-env=RESTORE_STUB_PATH={}", stub_bin.display());
 }
 
 /// Compile `src` to `bin` with the first working compiler in `ccs`, skipping the
