@@ -1,5 +1,5 @@
 /*
- * restore-stub: freestanding self-restore stub (x86_64).
+ * restore-stub: freestanding self-restore stub (x86_64, riscv64).
  *
  * This is a core component of the checkpoint restore engine, not a test
  * fixture: the supervisor execs this stub into a fresh, fully-sandboxed process
@@ -21,7 +21,8 @@
  *   6. mprotect the anonymous regions down to their checkpointed protections;
  *   7. unmap the leftovers of its own startup that the image did not overwrite;
  *   8. reopen the fd table at its saved numbers and offsets;
- *   9. restore the thread pointer, which the signal frame cannot carry;
+ *   9. (x86_64) restore fs_base/gs_base via arch_prctl; (riscv64) tp is carried
+ *      in the signal frame gregs, so nothing to do;
  *  10. rt_sigreturn into the checkpoint's register context.
  *
  * Two address-space hazards drive the layout, and both are why this file avoids
@@ -48,8 +49,8 @@
  *
  * Exit codes (all _exit): 2 blob read, 3 bad magic/version/size, 4 map region,
  * 5 open region file, 6 ready write, 7 go read, 8 mprotect, 9 vdso mremap,
- * 10 fd reopen, 12 sweep entry overlapping the stub's own image, 13 arch_prctl.
- * rt_sigreturn does not return; if it does, exit 11.
+ * 10 fd reopen, 12 sweep entry overlapping the stub's own image, 13 arch_prctl
+ * (x86_64 only). rt_sigreturn does not return; if it does, exit 11.
  */
 #define CTRL_FD 3
 #define READY_FD 4
@@ -58,9 +59,28 @@
 /* The window this stub is linked into, mirroring restore_blob::STUB_BASE and
  * STUB_SPAN and the -Wl,-Ttext-segment= flag in build.rs. Used only to refuse a
  * sweep entry that would unmap the stub out from under itself. */
+#ifdef __riscv
+#define STUB_BASE 0x3000000000UL
+#else
 #define STUB_BASE 0x30000000000UL
+#endif
 #define STUB_SPAN 0x400000UL
 
+#if defined(__riscv) && __riscv_xlen == 64
+#define SYS_read 63
+#define SYS_write 64
+#define SYS_close 57
+#define SYS_lseek 62
+#define SYS_mmap 222
+#define SYS_mprotect 226
+#define SYS_munmap 215
+#define SYS_mremap 216
+#define SYS_dup3 24
+#define SYS_exit 93
+#define SYS_openat 56
+#define SYS_rt_sigreturn 139
+/* No SYS_arch_prctl on riscv64 — tp is in the signal frame gregs. */
+#elif __x86_64__
 #define SYS_read 0
 #define SYS_write 1
 #define SYS_close 3
@@ -74,9 +94,15 @@
 #define SYS_openat 257
 #define SYS_rt_sigreturn 15
 #define SYS_arch_prctl 158
+#else
+#error "unsupported architecture"
+#endif
 
+/* x86_64 only: thread-pointer restore constants. */
+#ifdef __x86_64__
 #define ARCH_SET_GS 0x1001
 #define ARCH_SET_FS 0x1002
+#endif
 
 #define PROT_READ 0x1
 #define PROT_WRITE 0x2
@@ -93,8 +119,14 @@
  * bytes per mapping and the string table one copy of each distinct mapped
  * path. Rust fails the restore rather than truncating if a blob exceeds it. */
 #define CTRL_MAX (1 << 20)
-/* Upper bound on a signal-frame FP image: AMX-sized xstate plus magic2. */
+/* Upper bound on a signal-frame FP image. x86_64: AMX-sized xstate plus
+ * magic2. riscv64: 516 bytes, the last safe byte before sc_extdesc.reserved;
+ * the kernel union __riscv_fp_state is 528 bytes. */
+#if defined(__x86_64__)
 #define FP_MAX 16384
+#elif defined(__riscv) && __riscv_xlen == 64
+#define FP_MAX 516
+#endif
 #define STACK_SIZE 65536
 /* Leftover mappings the supervisor may ask the stub to unmap. A freshly
  * execve'd stub has only its own image and its startup stack, so this is far
@@ -109,7 +141,9 @@
 typedef unsigned long u64;
 typedef unsigned int u32;
 typedef long i64;
+typedef unsigned char u8;
 
+#ifdef __x86_64__
 static i64 sc6(long n, u64 a, u64 b, u64 c, u64 d, u64 e, u64 f) {
     i64 r;
     register u64 r10 __asm__("r10") = d;
@@ -120,6 +154,21 @@ static i64 sc6(long n, u64 a, u64 b, u64 c, u64 d, u64 e, u64 f) {
         : "rcx", "r11", "memory");
     return r;
 }
+#elif defined(__riscv) && __riscv_xlen == 64
+static i64 sc6(long n, u64 a, u64 b, u64 c, u64 d, u64 e, u64 f) {
+    register long nr __asm__("a7") = n;
+    register u64 a0 __asm__("a0") = a;
+    register u64 a1 __asm__("a1") = b;
+    register u64 a2 __asm__("a2") = c;
+    register u64 a3 __asm__("a3") = d;
+    register u64 a4 __asm__("a4") = e;
+    register u64 a5 __asm__("a5") = f;
+    __asm__ volatile("ecall" : "+r"(a0)
+        : "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(nr)
+        : "memory");
+    return (i64)a0;
+}
+#endif
 #define SC1(n,a) sc6(n,(u64)(a),0,0,0,0,0)
 #define SC2(n,a,b) sc6(n,(u64)(a),(u64)(b),0,0,0,0)
 #define SC3(n,a,b,c) sc6(n,(u64)(a),(u64)(b),(u64)(c),0,0,0)
@@ -144,8 +193,8 @@ void *memcpy(void *d, const void *s, unsigned long n) {
     return d;
 }
 
-/* Blob layout mirror (little-endian; we run on x86_64 LE so struct reads work).
- * Must match checkpoint/restore_blob.rs byte for byte. */
+/* Blob layout mirror (little-endian; both x86_64 and riscv64 are LE, so native
+ * struct reads work). Must match checkpoint/restore_blob.rs byte for byte. */
 struct blob_header {
     u32 magic, version, n_regions, n_fds;
     u64 regs_off; u32 regs_len, fpstate_len;
@@ -165,11 +214,15 @@ struct blob_vdso { i64 delta; u64 len; u64 target; };
 #define SRC_ANON 0
 #define SRC_FILE 1
 
-/* ---- x86_64 rt_sigreturn frame -------------------------------------------
- * rt_sigreturn reads the ucontext at rsp (kernel does frame = rsp - 8; uc is at
- * frame+8 = rsp). We build a ucontext, set rsp to &uc, and syscall rt_sigreturn.
- * mcontext gregs order (x86_64): see REG_* below.
- */
+/* ---- Architecture-specific signal frame layouts --------------------------
+ * The stub builds the frame on its private stack and rt_sigreturns into it.
+ * Registers in the blob are in ptrace order (capture::ptrace_getregs). */
+
+#ifdef __x86_64__
+
+/* x86_64: rt_sigreturn reads the ucontext at rsp (kernel does frame = rsp - 8;
+ * uc is at frame+8 = rsp). We build a ucontext, set rsp to &uc, and syscall
+ * rt_sigreturn. mcontext gregs order: see REG_* below. */
 enum { R8=0,R9,R10,R11,R12,R13,R14,R15,RDI,RSI,RBP,RBX,RDX,RAX,RCX,RSP,RIP,
        EFL,CSGSFS,ERR,TRAPNO,OLDMASK,CR2 }; /* 23 gregs */
 struct sigctx { u64 gregs[23]; u64 fpstate; u64 reserved[8]; };
@@ -193,11 +246,48 @@ enum { UR_R15=0,UR_R14,UR_R13,UR_R12,UR_RBP,UR_RBX,UR_R11,UR_R10,UR_R9,UR_R8,
        UR_RAX,UR_RCX,UR_RDX,UR_RSI,UR_RDI,UR_ORIG_RAX,UR_RIP,UR_CS,UR_EFLAGS,
        UR_RSP,UR_SS,UR_FS_BASE,UR_GS_BASE,UR_DS,UR_ES,UR_FS,UR_GS };
 
+#elif defined(__riscv) && __riscv_xlen == 64
+
+/* riscv64: rt_sigreturn reads frame at sp = (struct rt_sigframe *)sp.
+ * siginfo (128 bytes) + ucontext. uc_mcontext is at uc+0xB0 (176).
+ * sc_regs[32] at sigcontext+0x00, sc_fpregs at sigcontext+0x100;
+ * sigcontext is 16-aligned, hence the pad from 0xA8 to 0xB0.
+ * The gp[] blob order is ptrace: pc=0, ra=1, sp=2, gp=3, tp=4, t0-t2=5-7,
+ * s0-s1=8-9, a0-a7=10-17, s2-s11=18-27, t3-t6=28-31 — a 1:1 mapping to
+ * sc_regs[32], so no remap is needed. tp (thread pointer) is carried by the
+ * signal frame's sc_regs[4]; nothing needs arch_prctl. */
+struct sigctx {
+    u64 gregs[32];           /* sc_regs: 32 gregs, 256 bytes */
+    u8  fpregs[528];         /* sc_fpregs: union __riscv_fp_state (kernel 528 byte union) */
+};
+
+struct uctx {
+    u64 uc_flags;            /* 0x00 */
+    u64 uc_link;             /* 0x08 */
+    u64 ss_sp;               /* 0x10 */
+    u32 ss_flags;            /* 0x18 */
+    u32 _pad;                /* 0x1C */
+    u64 ss_size;             /* 0x20 */
+    u64 uc_sigmask;          /* 0x28 */
+    u8  __unused[128];       /* 0x30 */
+    struct sigctx mc;        /* 0xB0 (176) */
+};
+
+/* rt_sigframe: struct siginfo (zeroed, 128 bytes) + ucontext. */
+struct rt_sf {
+    u8 info[128];
+    struct uctx uc;
+};
+
+#endif
+
 /* These all live in .bss at STUB_BASE, out of reach of any MAP_FIXED region.
  * stub_stack is global so the module-level asm below can reference it. */
 static char ctrl_buf[CTRL_MAX] __attribute__((aligned(16)));
+#ifdef __x86_64__
 /* xrstor requires the signal frame's FP image to be 64-byte aligned. */
 static char fp_buf[FP_MAX] __attribute__((aligned(64)));
+#endif
 /* Interleaved (start, len) pairs of the mappings to shed. */
 static u64 sweep[MAX_SWEEP * 2];
 char stub_stack[STACK_SIZE];
@@ -356,12 +446,18 @@ static void _start_c(u64 *sp) {
         i64 fd = SC4(SYS_openat, AT_FDCWD, strings + f->path_off, f->flags, 0);
         if (fd < 0) die(10);
         if ((u32)fd != f->fd) {
+#if defined(__riscv) && __riscv_xlen == 64
+            /* riscv64 has no SYS_dup2 — use dup3 with flags=0. */
+            if (SC3(SYS_dup3, fd, f->fd, 0) != (i64)f->fd) die(10);
+#else
             if (SC2(SYS_dup2, fd, f->fd) != (i64)f->fd) die(10);
+#endif
             SC1(SYS_close, fd);
         }
         SC3(SYS_lseek, f->fd, f->offset, SEEK_SET);
     }
 
+#ifdef __x86_64__
     /* 9. Restore the thread pointer. The x86_64 signal frame has 23 gregs and
      * none of them is fs_base, so rt_sigreturn cannot carry it and the resumed
      * program would inherit this stub's, which is zero because a -nostdlib
@@ -373,10 +469,12 @@ static void _start_c(u64 *sp) {
      * ordinary user programs; set it only when the checkpoint recorded one. */
     if (SC2(SYS_arch_prctl, ARCH_SET_FS, gp[UR_FS_BASE]) != 0) die(13);
     if (gp[UR_GS_BASE] && SC2(SYS_arch_prctl, ARCH_SET_GS, gp[UR_GS_BASE]) != 0) die(13);
+#endif
 
     /* 10. Build the rt_sigframe on our private stack and rt_sigreturn into the
      * checkpoint. The frame must be readable when the kernel consumes it; the
      * stub stack is a plain .bss mapping at STUB_BASE, so it always is. */
+#ifdef __x86_64__
     struct uctx uc;
     memset(&uc, 0, sizeof uc);
     struct sigctx *m = &uc.mc;
@@ -414,6 +512,31 @@ static void _start_c(u64 *sp) {
         :
         : "r"(&uc), "r"(rax)
         : "memory");
+
+#elif defined(__riscv) && __riscv_xlen == 64
+    /* riscv64: build a struct rt_sigframe on the stack. gp[] order is 1:1 with
+     * sc_regs (both ptrace order), so copy the register file directly.
+     * The FP state is embedded inline in sc_fpregs (no pointer indirection,
+     * no magic framing — restore_blob.rs sends the raw __riscv_d_ext_state). */
+    struct rt_sf sf;
+    memset(&sf, 0, sizeof sf);
+    /* gp has regs_len / 8 entries; copy all of them into sc_regs[32]. */
+    u32 nregs = h->regs_len / 8;
+    if (nregs > 32) nregs = 32;
+    memcpy(sf.uc.mc.gregs, gp, nregs * sizeof(u64));
+    if (h->fpstate_len) {
+        memcpy(sf.uc.mc.fpregs, ctrl_buf + h->fpstate_off, h->fpstate_len);
+    }
+
+    /* Set sp = &sf, then ecall rt_sigreturn. */
+    register u64 a7 __asm__("a7") = SYS_rt_sigreturn;
+    __asm__ volatile(
+        "mv sp, %0\n\t"
+        "ecall\n\t"
+        :
+        : "r"(&sf), "r"(a7)
+        : "memory");
+#endif
     die(11); /* rt_sigreturn must not return */
 }
 
@@ -421,6 +544,7 @@ static void _start_c(u64 *sp) {
  * _start_c as its argument (auxv lives there), then switch to the private .bss
  * stack, because the checkpoint's [stack] region is mapped over the address the
  * kernel picked for ours. */
+#ifdef __x86_64__
 __asm__(
     ".global _start\n"
     "_start:\n"
@@ -432,3 +556,17 @@ __asm__(
     "   call _start_c\n"
     "   hlt\n"
 );
+#elif defined(__riscv) && __riscv_xlen == 64
+/* riscv64: a0 = sp (first argument), switch to stub_stack, align, call. */
+__asm__(
+    ".global _start\n"
+    "_start:\n"
+    "   mv a0, sp\n"
+    "   la sp, stub_stack\n"
+    "   li t0, " STR(STACK_SIZE) "\n"
+    "   add sp, sp, t0\n"
+    "   andi sp, sp, -16\n"
+    "   call _start_c\n"
+    "   unimp\n"
+);
+#endif

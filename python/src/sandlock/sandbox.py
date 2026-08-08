@@ -1315,7 +1315,7 @@ class Sandbox:
         could not be transparently restored are reported by
         :attr:`restore_skipped`.
 
-        x86_64 only. The checkpoint is rebuilt by ``execve``-ing a
+        x86_64 and riscv64. The checkpoint is rebuilt by ``execve``-ing a
         freestanding restore stub into a fresh, already-confined process, so
         the restored program gets an address space holding only its own image
         and a fresh kernel vDSO. The vDSO is relocated onto the

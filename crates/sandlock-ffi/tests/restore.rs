@@ -90,7 +90,7 @@ fn read_counter(path: &str) -> Option<u64> {
 #[test]
 fn restore_interactive_resumes_via_c_abi() {
     if cfg!(not(target_arch = "x86_64")) {
-        eprintln!("skipping: checkpoint restore is x86_64-only");
+        eprintln!("skipping: this test's counter program is x86_64-only");
         return;
     }
     let cc = if which("cc") {

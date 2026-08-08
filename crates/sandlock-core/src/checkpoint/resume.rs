@@ -394,7 +394,7 @@ mod tests {
     /// it. If the two ever drift apart, a restore silently maps a checkpoint
     /// region over the running stub instead of being refused.
     #[test]
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
     fn stub_links_at_the_reserved_base() {
         use crate::checkpoint::restore_blob::{STUB_BASE, STUB_SPAN};
 
@@ -571,5 +571,139 @@ mod tests {
              {st:#x} (payload exits with write()'s return value), /proc syscall {stalled_in}",
         );
         assert_eq!(got[0], SENTINEL, "the restored program ran from its checkpoint rip");
+    }
+
+    /// End-to-end proof for riscv64: same protocol as the x86_64 test above,
+    /// but with riscv64 machine code (a7+ecall convention), a 32-register file,
+    /// and addresses within the Sv39 256 GiB user-space ceiling.
+    #[test]
+    #[cfg(target_arch = "riscv64")]
+    fn restore_stub_reconstructs_a_synthetic_image() {
+        use crate::checkpoint::{Checkpoint, MemoryMap, MemorySegment, ProcessState};
+        use crate::checkpoint::restore_blob;
+
+        // riscv64 Sv39 gives 256 GiB of user virtual space, so the addresses
+        // must stay below 0x40_0000_0000.  Pick a region that stays clear of
+        // the stub (0x30_0000_0000) and the vDSO (near the top).
+        const CODE: u64 = 0x2000_0000;
+        const STACK: u64 = 0x2001_0000;
+        const OUT_FD: i32 = 10; // sentinel pipe write end, inherited by the child
+        const SENTINEL: u8 = 0x5A;
+        const PAGE: u64 = 0x1000;
+
+        let stub = stub_path();
+        if !stub.exists() {
+            eprintln!("skip: restore-stub not built ({})", stub.display());
+            return;
+        }
+
+        // riscv64: write(OUT_FD, CODE+64, 1); exit(write-retval).
+        //
+        //   addi a0, zero, OUT_FD    # a0 = fd
+        //   lui  a1, 0x20000         # upper 20 bits of CODE+64
+        //   addi a1, a1, 0x040       # lower 12 bits of CODE+64
+        //   addi a2, zero, 1         # count
+        //   addi a7, zero, 64        # __NR_write
+        //   ecall
+        //   addi a7, zero, 93        # __NR_exit  (a0 still holds write's ret)
+        //   ecall
+        let mut code_page = vec![0u8; PAGE as usize];
+        {
+            let c = &mut code_page;
+            let mut w = 0usize;
+            let mut put = |bytes: &[u8]| { c[w..w + bytes.len()].copy_from_slice(bytes); w += bytes.len(); };
+            put(&0x00A00513u32.to_le_bytes()); // addi a0, zero, 10
+            put(&0x200005B7u32.to_le_bytes()); // lui  a1, 0x20000
+            put(&0x04058593u32.to_le_bytes()); // addi a1, a1, 0x40
+            put(&0x00100613u32.to_le_bytes()); // addi a2, zero, 1
+            put(&0x04000893u32.to_le_bytes()); // addi a7, zero, 64
+            put(&0x00000073u32.to_le_bytes()); // ecall
+            put(&0x05D00893u32.to_le_bytes()); // addi a7, zero, 93
+            put(&0x00000073u32.to_le_bytes()); // ecall
+        }
+        code_page[64] = SENTINEL;
+
+        // riscv64 user_regs_struct: 32 × u64.
+        // Index 0=pc, 2=sp; all others zero.
+        let mut regs = vec![0u64; 32];
+        regs[0] = CODE;                 // pc
+        regs[2] = STACK + 0xF00;        // sp
+
+        // The code page is r-x in the checkpoint, so the stub has to map it
+        // writable for the fill and mprotect it back before handing control over.
+        let cp = Checkpoint {
+            name: String::new(),
+            policy: crate::Sandbox::builder().build().unwrap(),
+            process_state: ProcessState {
+                pid: 0,
+                cwd: "/".into(),
+                exe: String::new(),
+                regs,
+                fpregs: Vec::new(),
+                memory_maps: vec![
+                    MemoryMap { start: CODE, end: CODE + PAGE, perms: "r-xp".into(), offset: 0, path: None },
+                    MemoryMap { start: STACK, end: STACK + PAGE, perms: "rw-p".into(), offset: 0, path: None },
+                ],
+                memory_data: vec![
+                    MemorySegment { start: CODE, data: code_page },
+                    MemorySegment { start: STACK, data: vec![0u8; PAGE as usize] },
+                ],
+            },
+            fd_table: Vec::new(),
+            cow_snapshot: None,
+            app_state: None,
+        };
+
+        let plan = restore_blob::plan(&cp, None, &[]).expect("plan");
+        let channel = StubChannel::new(&plan.blob).expect("channel");
+
+        let stub_path = std::ffi::CString::new(stub.to_str().unwrap()).unwrap();
+
+        let mut pipefd = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(pipefd.as_mut_ptr()) }, 0);
+        let pipe_r = relocate_above(pipefd[0], OUT_FD + 1).expect("relocate pipe read end");
+        let pipe_w = relocate_above(pipefd[1], OUT_FD + 1).expect("relocate pipe write end");
+        let (pipe_r, pipe_w) = (pipe_r.into_raw_fd(), pipe_w.into_raw_fd());
+
+        let (ctrl, ready, go) =
+            (channel.ctrl.as_raw_fd(), channel.ready.as_raw_fd(), channel.go_r.as_raw_fd());
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork");
+        if child == 0 {
+            unsafe {
+                libc::dup2(ctrl, CTRL_FD);
+                libc::dup2(ready, READY_FD);
+                libc::dup2(go, GO_FD);
+                libc::dup2(pipe_w, OUT_FD);
+                let argv = [stub_path.as_ptr(), std::ptr::null()];
+                let envp = [std::ptr::null()];
+                libc::execve(stub_path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+                libc::_exit(127);
+            }
+        }
+        unsafe { libc::close(pipe_w) };
+
+        let restored = finish_restore(child, &channel, &plan);
+
+        let mut got = [0u8; 1];
+        let n = if restored.is_ok() && wait_readable(pipe_r, 5000).unwrap_or(false) {
+            unsafe { libc::read(pipe_r, got.as_mut_ptr() as *mut libc::c_void, 1) }
+        } else {
+            0
+        };
+        let stalled_in = std::fs::read_to_string(format!("/proc/{child}/syscall"))
+            .unwrap_or_else(|e| e.to_string());
+        unsafe { libc::kill(child, libc::SIGKILL) };
+        let mut st = 0i32;
+        unsafe { libc::waitpid(child, &mut st, 0) };
+        unsafe { libc::close(pipe_r) };
+
+        restored.expect("finish_restore");
+        assert_eq!(
+            n, 1,
+            "restored code must write exactly one sentinel byte; child exit status \
+             {st:#x} (payload exits with write()'s return value), /proc syscall {stalled_in}",
+        );
+        assert_eq!(got[0], SENTINEL, "the restored program ran from its checkpoint pc");
     }
 }

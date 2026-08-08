@@ -214,7 +214,7 @@ void _start(void){
 def _build_counter(tmp_dir):
     """Compile the vDSO-free counter program, or skip if this host can't."""
     if platform.machine() != "x86_64":
-        pytest.skip("checkpoint restore is x86_64-only")
+        pytest.skip("this test is x86_64-only (counter program)")
     cc = shutil.which("cc") or shutil.which("gcc")
     if cc is None:
         pytest.skip("no C compiler (cc/gcc) available")
