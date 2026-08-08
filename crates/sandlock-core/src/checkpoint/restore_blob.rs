@@ -475,7 +475,7 @@ fn build_fpstate_image(_fpregs: &[u8]) -> Vec<u8> {
     Vec::new()
 }
 
-#[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+#[cfg(not(target_arch = "x86_64"))]
 fn rearm_restartable_syscall(_regs: &mut [u64]) {}
 
 /// Interns NUL-terminated strings into the blob's string table, deduplicating
