@@ -106,12 +106,15 @@ pub(crate) struct RestorePlan {
 /// whether a mapping falls inside one recorded range would call that merged VMA
 /// a stray and unmap the restored program's own memory.
 pub(crate) fn plan_sweep(current: &[MemoryMap], cp: &[MemoryMap]) -> Vec<(u64, u64)> {
-    // Keep set: every recorded region plus the stub's reserved window, merged
-    // into disjoint ascending intervals.
+    let base: Vec<(u64, u64)> = if STUB_BASE > 0 {
+        vec![(STUB_BASE, STUB_BASE + STUB_SPAN)]
+    } else {
+        Vec::new()
+    };
     let mut keep: Vec<(u64, u64)> = cp
         .iter()
         .map(|m| (m.start, m.end))
-        .chain(std::iter::once((STUB_BASE, STUB_BASE + STUB_SPAN)))
+        .chain(base)
         .filter(|(lo, hi)| lo < hi)
         .collect();
     keep.sort_unstable();
@@ -517,17 +520,17 @@ pub(crate) fn plan(
     let regions = build_memory_plan(&ps.memory_maps, &ps.memory_data);
 
     // The stub's own text/data/bss/stack live at a fixed far base. A checkpoint
-    // that occupies that window would have its region mapped over the running
-    // stub, so refuse rather than crash mid-restore.
-    if let Some(r) = regions
-        .iter()
-        .find(|r| r.start() < STUB_BASE + STUB_SPAN && STUB_BASE < r.end())
-    {
-        return Err(format!(
-            "checkpoint region {:#x}-{:#x} overlaps the restore-stub's reserved \
-             window {:#x}-{:#x}",
-            r.start(), r.end(), STUB_BASE, STUB_BASE + STUB_SPAN,
-        ));
+    if STUB_BASE > 0 {
+        if let Some(r) = regions
+            .iter()
+            .find(|r| r.start() < STUB_BASE + STUB_SPAN && STUB_BASE < r.end())
+        {
+            return Err(format!(
+                "checkpoint region {:#x}-{:#x} overlaps the restore-stub's reserved \
+                 window {:#x}-{:#x}",
+                r.start(), r.end(), STUB_BASE, STUB_BASE + STUB_SPAN,
+            ));
+        }
     }
 
     let (restorable_fds, skipped) = build_fd_plan(&cp.fd_table);
@@ -724,6 +727,7 @@ mod tests {
         assert!(verify_special_mappings(&current, &cp).is_ok());
     }
 
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
     #[test]
     fn sweep_removes_a_leftover_stack_but_spares_the_image_and_the_stub() {
         // The layout the stub is in at READY: the checkpoint's regions, the
@@ -869,7 +873,7 @@ mod tests {
         let strings_len = u32::from_le_bytes(blob[48..52].try_into().unwrap()) as usize;
         assert_eq!(&blob[strings_off..strings_off + strings_len], b"/bin/app\0");
     }
-
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
     #[test]
     fn plan_rejects_a_checkpoint_overlapping_the_stub_window() {
         let cp = tiny_checkpoint(
