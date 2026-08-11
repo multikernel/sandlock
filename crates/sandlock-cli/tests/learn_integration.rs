@@ -4,9 +4,51 @@
 //   cargo test -p sandlock-cli --test learn_integration -- --test-threads=4
 
 use std::process::Command;
+use std::time::Duration;
 
 fn sandlock_bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_sandlock"))
+}
+
+fn udp_sink(expected_datagrams: usize) -> (u16, std::thread::JoinHandle<usize>) {
+    let sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("udp sink bind");
+    sock.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("udp sink timeout");
+    let port = sock.local_addr().expect("udp sink addr").port();
+    let handle = std::thread::spawn(move || {
+        let mut buf = [0_u8; 64];
+        let mut received = 0;
+        while received < expected_datagrams {
+            match sock.recv_from(&mut buf) {
+                Ok(_) => received += 1,
+                Err(_) => break,
+            }
+        }
+        received
+    });
+    (port, handle)
+}
+
+fn learn_then_run_script(profile_path: &str, script: &str) {
+    let learn = sandlock_bin()
+        .args(["learn", "-o", profile_path, "--", "python3", "-c", script])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(
+        learn.status.success(),
+        "learn failed: {}",
+        String::from_utf8_lossy(&learn.stderr)
+    );
+
+    let run = sandlock_bin()
+        .args(["run", "--profile-file", profile_path, "--", "python3", "-c", script])
+        .output()
+        .expect("failed to run sandlock run");
+    assert!(
+        run.status.success(),
+        "run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
 }
 
 /// Learn → run with a read-only workload.
@@ -30,6 +72,56 @@ fn test_learn_then_run() {
         "run failed: stderr={}", String::from_utf8_lossy(&run.stderr));
     assert!(!String::from_utf8_lossy(&run.stdout).trim().is_empty(),
         "expected output from cat /etc/hostname");
+}
+
+/// Connected UDP send: an address-less send confirms the earlier UDP connect
+/// as real traffic, so the generated profile must replay.
+#[test]
+fn test_learn_then_run_connected_udp_send() {
+    let (port, sink) = udp_sink(2);
+    let profile = tempfile::NamedTempFile::new().expect("tempfile");
+    let profile_path = profile.path().to_str().unwrap().to_owned();
+    let script = format!(
+        "import socket\n\
+         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n\
+         s.connect(('127.0.0.1', {port}))\n\
+         s.send(b'x')\n\
+         s.close()\n"
+    );
+
+    learn_then_run_script(&profile_path, &script);
+    let profile_toml = std::fs::read_to_string(&profile_path).expect("profile");
+    assert!(
+        profile_toml.contains(&format!("udp://127.0.0.1:{port}")),
+        "expected connected UDP endpoint in profile:\n{profile_toml}"
+    );
+    assert_eq!(sink.join().unwrap(), 2, "learn and run should each send one UDP datagram");
+}
+
+/// A connect observed on one thread and a send observed on a sibling thread
+/// still refer to the same process fd table.
+#[test]
+fn test_learn_then_run_connected_udp_send_from_thread() {
+    let (port, sink) = udp_sink(2);
+    let profile = tempfile::NamedTempFile::new().expect("tempfile");
+    let profile_path = profile.path().to_str().unwrap().to_owned();
+    let script = format!(
+        "import socket, threading\n\
+         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n\
+         s.connect(('127.0.0.1', {port}))\n\
+         t = threading.Thread(target=lambda: s.send(b'x'))\n\
+         t.start()\n\
+         t.join()\n\
+         s.close()\n"
+    );
+
+    learn_then_run_script(&profile_path, &script);
+    let profile_toml = std::fs::read_to_string(&profile_path).expect("profile");
+    assert!(
+        profile_toml.contains(&format!("udp://127.0.0.1:{port}")),
+        "expected connected UDP endpoint in profile:\n{profile_toml}"
+    );
+    assert_eq!(sink.join().unwrap(), 2, "learn and run should each send one UDP datagram");
 }
 
 /// Write path: COW isolates during learn; run creates the file for real.

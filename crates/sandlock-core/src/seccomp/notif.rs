@@ -275,6 +275,18 @@ pub enum NetworkPolicy {
 }
 
 impl NetworkPolicy {
+    /// True iff no destination can ever match: the allowlist for a protocol
+    /// nothing was granted to. Distinguishes "deny all" from `Unrestricted`
+    /// and from a `DenyList` (both default-allow).
+    pub fn denies_everything(&self) -> bool {
+        match self {
+            NetworkPolicy::AllowList { per_ip, cidrs, any_ip_ports } => {
+                per_ip.is_empty() && cidrs.is_empty() && any_ip_ports.is_empty()
+            }
+            _ => false,
+        }
+    }
+
     /// True iff a connection to (ip, port) should be permitted.
     pub fn allows(&self, ip: IpAddr, port: u16) -> bool {
         // `::ffff:a.b.c.d` is the same destination as `a.b.c.d` (a

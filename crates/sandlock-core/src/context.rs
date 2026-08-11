@@ -14,7 +14,7 @@ use crate::arch;
 #[cfg(test)]
 use crate::sys::structs::{
     AF_INET, AF_INET6, CLONE_NS_FLAGS, DEFAULT_BLOCKLIST_SYSCALLS, PR_SET_DUMPABLE,
-    SIOCGIFCONF, SIOCETHTOOL, SOCK_DGRAM, SOCK_RAW, SOCK_TYPE_MASK, TIOCLINUX, TIOCSTI,
+    SIOCGIFCONF, SIOCETHTOOL, SOCK_RAW, SOCK_TYPE_MASK, TIOCLINUX, TIOCSTI,
 };
 
 // ============================================================

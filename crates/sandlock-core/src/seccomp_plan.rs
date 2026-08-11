@@ -570,17 +570,21 @@ pub(crate) fn arg_filters_resolved(resolved: &ResolvedSandbox) -> Vec<SockFilter
     // header). Workloads that need ping should use the kernel ping
     // socket (SOCK_DGRAM + IPPROTO_ICMP) via an `icmp://...` rule.
     //
-    // SOCK_DGRAM is denied unless a UDP or ICMP rule exists in
-    // net_allow. The kernel ping socket uses SOCK_DGRAM with
-    // IPPROTO_ICMP, so the same type bit gates both; destination
-    // filtering at sendto (Phase 2) is what separates them per-rule.
-    // `--net-deny` is default-allow, so UDP and the kernel ping socket
-    // (both SOCK_DGRAM) must be creatable; without this the sandbox
-    // could not even do DNS over UDP. Per-destination UDP/ICMP denial
-    // is still enforced on the sendto on-behalf path via the DenyList.
+    // SOCK_DGRAM is denied only when no net rule exists at all. Once any
+    // `--net-allow`/`--net-deny` rule is present, connect/sendto/sendmsg/
+    // sendmmsg are trapped and destination-checked per protocol, and a
+    // protocol with no rule resolves to an empty allowlist that denies
+    // every destination — so creation itself is harmless and must be
+    // permitted: glibc's getaddrinfo creates UDP sockets for its RFC 3484
+    // address-sorting probes (connect, never send), and blocking those
+    // breaks name resolution for TCP-only rule sets. Gating stays at
+    // socket() only for the no-rules sandbox, where nothing traps sends.
+    // This must NOT widen to HTTP-ACL-only or policy_fn-only configs:
+    // their empty net_allow resolves the UDP policy to Unrestricted, so
+    // creation would mean unrestricted UDP egress.
     let mut blocked_types: Vec<u32> = Vec::new();
     blocked_types.push(SOCK_RAW);
-    if !features.udp_or_icmp_allowed && !features.net_deny {
+    if !features.net_allow_present && !features.net_deny {
         blocked_types.push(SOCK_DGRAM);
     }
 

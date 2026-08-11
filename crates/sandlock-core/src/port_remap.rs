@@ -151,6 +151,24 @@ pub(crate) async fn handle_bind(
         Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
     };
 
+    // A UDP bind is an inbound grant that Landlock cannot express
+    // (BIND_TCP is TCP-only). With no UDP rule the protocol is
+    // send-time deny-all, and a bound socket would still be a
+    // receive-only channel — so the bind is refused outright. Checked
+    // before the port extraction so ephemeral (port 0) binds are
+    // covered too.
+    let udp_deny_all = {
+        let ns = network.lock().await;
+        ns.effective_network_policy(notif.pid, crate::network::Protocol::Udp, None)
+            .denies_everything()
+    };
+    if udp_deny_all
+        && crate::network::query_socket_protocol(dup_fd.as_raw_fd())
+            == Some(crate::network::Protocol::Udp)
+    {
+        return NotifAction::Errno(libc::EACCES);
+    }
+
     // Non-IP family or ephemeral (port == 0): bind verbatim — nothing to
     // track or remap. extract_port returns None for non-IP families and
     // for truncated buffers; in both cases the kernel will validate.

@@ -303,6 +303,66 @@ async fn test_udp_denied_by_default() {
 }
 
 // ------------------------------------------------------------------
+// 6b. With a TCP-only rule set, UDP moves to send-time gating: the
+//     socket is creatable (glibc getaddrinfo needs that for its
+//     address-sorting probes, or name resolution breaks on TCP-only
+//     profiles), but every send, connect, and bind on it is denied —
+//     no UDP rule means the protocol's allowlist is empty.
+// ------------------------------------------------------------------
+#[tokio::test]
+async fn test_udp_send_time_gating_with_tcp_only_rules() {
+    let out = temp_out("udp-send-gated");
+    let script = format!(concat!(
+        "import socket, json\n",
+        "res = {{}}\n",
+        "try:\n",
+        "  s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
+        "  res['create'] = 'ok'\n",
+        "except OSError as e:\n",
+        "  res['create'] = 'err:%d' % e.errno\n",
+        "  s = None\n",
+        "if s is not None:\n",
+        "  try:\n",
+        "    s.sendto(b'x', ('127.0.0.1', 53))\n",
+        "    res['sendto'] = 'ok'\n",
+        "  except OSError as e:\n",
+        "    res['sendto'] = 'err:%d' % e.errno\n",
+        "  try:\n",
+        "    s.connect(('127.0.0.1', 53))\n",
+        "    res['connect'] = 'ok'\n",
+        "  except OSError as e:\n",
+        "    res['connect'] = 'err:%d' % e.errno\n",
+        "  try:\n",
+        "    s.bind(('127.0.0.1', 0))\n",
+        "    res['bind'] = 'ok'\n",
+        "  except OSError as e:\n",
+        "    res['bind'] = 'err:%d' % e.errno\n",
+        "  s.close()\n",
+        "open('{out}', 'w').write(json.dumps(res))\n",
+    ), out = out.display());
+
+    let policy = base_policy()
+        .net_allow("tcp://127.0.0.1:9")
+        .build()
+        .unwrap();
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+
+    let contents = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert!(contents.contains("\"create\": \"ok\""),
+        "UDP socket creation must succeed with net rules present; got: {contents}");
+    assert!(contents.contains("\"sendto\": \"err:111\""),
+        "UDP sendto must be denied with ECONNREFUSED; got: {contents}");
+    assert!(contents.contains("\"connect\": \"err:111\""),
+        "UDP connect must be denied with ECONNREFUSED; got: {contents}");
+    assert!(contents.contains("\"bind\": \"err:13\""),
+        "UDP bind must be denied with EACCES; got: {contents}");
+    assert!(result.success());
+}
+
+// ------------------------------------------------------------------
 // 7. SysV IPC (shmget) denied by default — sandlock has no IPC
 //    namespace, so the deny is the only thing isolating shm
 //    keyspaces between sandboxes.

@@ -1,4 +1,4 @@
-use crate::sandbox::{Protocol, Sandbox};
+use crate::sandbox::Sandbox;
 
 /// Internal normalized view of a sandbox configuration.
 ///
@@ -46,7 +46,7 @@ pub(crate) struct SandboxFeatures {
     pub(crate) http_acl: bool,
     pub(crate) argv_safety_required: bool,
     pub(crate) sysv_ipc_allowed: bool,
-    pub(crate) udp_or_icmp_allowed: bool,
+    pub(crate) net_allow_present: bool,
     pub(crate) net_deny: bool,
 }
 
@@ -84,10 +84,7 @@ impl SandboxFeatures {
             http_acl,
             argv_safety_required: sandbox.policy_fn.is_some() || exec_handler,
             sysv_ipc_allowed: sandbox.allows_sysv_ipc(),
-            udp_or_icmp_allowed: sandbox
-                .net_allow
-                .iter()
-                .any(|r| matches!(r.protocol, Protocol::Udp | Protocol::Icmp)),
+            net_allow_present: !sandbox.net_allow.is_empty(),
             net_deny: !sandbox.net_deny.is_empty(),
         }
     }

@@ -332,13 +332,36 @@ fn test_arg_filters_raw_sockets() {
 
 #[test]
 fn test_arg_filters_udp_denied_by_default() {
-    use crate::sys::structs::{BPF_JEQ, BPF_JMP, BPF_K};
-    // UDP is denied by default: no `udp://...` rule in net_allow.
+    // SOCK_DGRAM creation is denied when no net rule exists: nothing traps
+    // sends, so socket() is the only enforcement point.
     let policy = Sandbox::builder().build().unwrap();
-    let filters = arg_filters(&policy);
-    // Should have JEQ SOCK_DGRAM
-    assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
-        && f.k == SOCK_DGRAM));
+    assert_eq!(count_jeq_2(&arg_filters(&policy)), 2);
+}
+
+/// AF_INET and SOCK_DGRAM share the constant 2, so presence of the
+/// SOCK_DGRAM JEQ is observed as the JEQ-with-k==2 count: the AF_INET
+/// domain check contributes one in every socket filter, the type check
+/// contributes the second only when SOCK_DGRAM is in the blocked set.
+fn count_jeq_2(filters: &[crate::sys::structs::SockFilter]) -> usize {
+    use crate::sys::structs::{BPF_JEQ, BPF_JMP, BPF_K};
+    filters.iter()
+        .filter(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K) && f.k == 2)
+        .count()
+}
+
+#[test]
+fn test_arg_filters_udp_creatable_with_tcp_only_rules() {
+    // Any net rule moves UDP enforcement to send time: the on-behalf
+    // handlers deny destinations for rule-less protocols, so socket()
+    // must succeed (glibc getaddrinfo probes create UDP sockets).
+    let policy = Sandbox::builder().net_allow("1.1.1.1:443").build().unwrap();
+    assert_eq!(count_jeq_2(&arg_filters(&policy)), 1);
+}
+
+#[test]
+fn test_arg_filters_udp_creatable_with_net_deny() {
+    let policy = Sandbox::builder().net_deny("10.0.0.0/8").build().unwrap();
+    assert_eq!(count_jeq_2(&arg_filters(&policy)), 1);
 }
 
 #[test]
