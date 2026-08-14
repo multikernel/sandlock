@@ -105,8 +105,8 @@ cargo install --path crates/sandlock-cli
 # Basic confinement
 sandlock run -r /usr -r /lib -w /tmp -- ls /tmp
 
-# Interactive shell
-sandlock run -i -r /usr -r /lib -r /lib64 -r /bin -r /etc -w /tmp -- /bin/sh
+# Interactive shell (the sandboxed command inherits the terminal)
+sandlock run -r /usr -r /lib -r /lib64 -r /bin -r /etc -w /tmp -- /bin/sh
 
 # Resource limits + timeout
 sandlock run -m 512M -P 20 -t 30 -- ./compute.sh

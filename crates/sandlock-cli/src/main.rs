@@ -140,9 +140,6 @@ struct RunArgs {
     #[arg(short = 'e', long = "exec-shell", value_name = "CMD")]
     exec_shell: Option<String>,
 
-    #[arg(short = 'i', long)]
-    interactive: bool,
-
     /// Use a local Docker image as chroot rootfs, given by reference
     /// (e.g. `python:3.12-slim`, a digest, or an image id). The image
     /// must already be present in local Docker storage; sandlock never
