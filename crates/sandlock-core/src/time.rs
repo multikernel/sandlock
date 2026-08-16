@@ -15,20 +15,32 @@ const CLOCK_MONOTONIC_RAW: u32 = 4;
 const CLOCK_MONOTONIC_COARSE: u32 = 6;
 const CLOCK_BOOTTIME: u32 = 7;
 
+/// Whole seconds between `t` and the UNIX epoch, negative before it.
+///
+/// `SystemTime::duration_since` reports an earlier instant as `Err`, so the
+/// usual `.unwrap_or_default()` collapses every pre-1970 instant to the epoch.
+/// The grammar the profile, the CLI and the C ABI all share accepts such an
+/// instant (`"1969-07-20T20:17:00Z"` parses), so swallowing the sign here made
+/// the sandbox run a clock the caller never asked for, with no error anywhere.
+///
+/// Rounding is floor in both directions, matching `CanonicalTimestamp`: half a
+/// second before the epoch is second -1, not second 0.
+fn epoch_seconds(t: SystemTime) -> i64 {
+    match t.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(e) => {
+            let d = e.duration();
+            let whole = d.as_secs() as i64;
+            if d.subsec_nanos() > 0 { -whole - 1 } else { -whole }
+        }
+    }
+}
+
 /// Calculate the time offset in seconds.
 /// offset = desired_start_time - current_real_time
 /// So that: virtual_time = real_time + offset
 pub(crate) fn calculate_time_offset(time_start: SystemTime) -> i64 {
-    let now = SystemTime::now();
-    let desired = time_start
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let actual = now
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    desired - actual
+    epoch_seconds(time_start) - epoch_seconds(SystemTime::now())
 }
 
 /// Handle clock_nanosleep/timerfd_settime/timer_settime with TIMER_ABSTIME.
@@ -136,5 +148,52 @@ mod tests {
         let shifted_deadline: i64 = 1700000000;
         let adjusted = shifted_deadline - offset;
         assert_eq!(adjusted, 1700003600);
+    }
+
+    #[test]
+    fn a_pre_epoch_instant_keeps_its_sign() {
+        // `--time-start 1969-07-20T20:17:00Z` and its profile and C ABI
+        // spellings all parse. `duration_since(UNIX_EPOCH).unwrap_or_default()`
+        // used to report this instant as second 0, so the guest ran at
+        // 1970-01-01T00:00:00Z instead, silently and 14182980 seconds off.
+        let moon_landing = SystemTime::UNIX_EPOCH - Duration::from_secs(14_182_980);
+        assert_eq!(epoch_seconds(moon_landing), -14_182_980);
+    }
+
+    #[test]
+    fn the_epoch_itself_is_second_zero() {
+        // Boundary between the two arms: `duration_since` returns `Ok(0)`
+        // here, so the sign flip must not fire and produce `-0` by the
+        // sub-second path.
+        assert_eq!(epoch_seconds(SystemTime::UNIX_EPOCH), 0);
+    }
+
+    #[test]
+    fn a_sub_second_pre_epoch_instant_floors_like_the_canonical_form() {
+        // `CanonicalTimestamp` documents half a second before the epoch as
+        // `{seconds: -1, nanoseconds: 500000000}`. This agrees, so the same
+        // stamp means the same second whichever surface read it.
+        assert_eq!(
+            epoch_seconds(SystemTime::UNIX_EPOCH - Duration::from_millis(500)),
+            -1,
+        );
+        assert_eq!(
+            epoch_seconds(SystemTime::UNIX_EPOCH + Duration::from_millis(500)),
+            0,
+        );
+    }
+
+    #[test]
+    fn a_pre_epoch_start_reaches_the_guest_as_itself() {
+        // What the guest's clock reads: real_time + offset. Within a second,
+        // because `calculate_time_offset` samples `now` itself.
+        let moon_landing = SystemTime::UNIX_EPOCH - Duration::from_secs(14_182_980);
+        let offset = calculate_time_offset(moon_landing);
+        let now = epoch_seconds(SystemTime::now());
+        let landed = now + offset;
+        assert!(
+            (landed - -14_182_980).abs() <= 1,
+            "a pre-epoch start must reach the guest as itself, not as the epoch; got {landed}",
+        );
     }
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"runtime"
 	"strings"
 	"testing"
@@ -454,11 +455,33 @@ func TestPopenKillAfterWaitIsNil(t *testing.T) {
 }
 
 func TestPopenInvalidStdioMode(t *testing.T) {
-	// An out-of-range discriminant is rejected before the child is spawned, so
-	// this needs no Landlock.
+	// sandlock_popen does diagnose an out-of-range discriminant, but it has no
+	// error out-param: it writes the text to this process's stderr and returns
+	// null, so a caller that only has the returned error got "popen failed"
+	// and nothing to act on. The returned error has to name the stream and the
+	// number, which is also what the Python SDK raises for the same input.
+	// Rejection happens before the child is spawned, so this needs no Landlock.
 	sb := &sandlock.Sandbox{FSReadable: rootfs}
-	if _, err := sb.Popen(sandlock.Stdio{Stdout: sandlock.StdioMode(99)}, "echo", "x"); err == nil {
-		t.Fatal("an out-of-range StdioMode must be rejected")
+	for _, tc := range []struct {
+		field string
+		stdio sandlock.Stdio
+	}{
+		{"Stdin", sandlock.Stdio{Stdin: sandlock.StdioMode(99)}},
+		{"Stdout", sandlock.Stdio{Stdout: sandlock.StdioMode(3)}},
+		{"Stderr", sandlock.Stdio{Stderr: sandlock.StdioMode(^uint32(0))}},
+	} {
+		t.Run(tc.field, func(t *testing.T) {
+			_, err := sb.Popen(tc.stdio, "echo", "x")
+			if err == nil {
+				t.Fatal("an out-of-range StdioMode must be rejected")
+			}
+			if !strings.Contains(err.Error(), tc.field) {
+				t.Fatalf("error = %q, want it to name the %s stream", err, tc.field)
+			}
+			if !strings.Contains(err.Error(), "invalid StdioMode") {
+				t.Fatalf("error = %q, want it to name the offending mode", err)
+			}
+		})
 	}
 }
 
@@ -602,6 +625,54 @@ func TestSyscallNr(t *testing.T) {
 	}
 	if _, err := sandlock.SyscallNr("definitely_not_a_real_syscall"); err == nil {
 		t.Fatal("expected error for unknown syscall")
+	}
+}
+
+// confineHelperEnv marks the re-executed copy of this test binary that
+// actually performs a confinement. Confinement is irreversible, so it cannot
+// run in the process that is running the rest of the suite.
+const confineHelperEnv = "SANDLOCK_GO_CONFINE_HELPER"
+
+func TestConfineHelperProcess(t *testing.T) {
+	spec := os.Getenv(confineHelperEnv)
+	if spec == "" {
+		t.Skip("helper for TestConfineAcceptsADefaultSandbox")
+	}
+	sb := &sandlock.Sandbox{FSReadable: rootfs, FSWritable: []string{"/tmp"}}
+	switch spec {
+	case "default":
+		// Nothing said about the COW branch, which is the shape every caller
+		// who does not care about it produces.
+	case "abort":
+		sb.OnExit = sandlock.Ptr(sandlock.BranchActionAbort)
+		sb.OnError = sandlock.Ptr(sandlock.BranchActionAbort)
+	case "keep":
+		sb.OnExit = sandlock.Ptr(sandlock.BranchActionKeep)
+		sb.OnError = sandlock.Ptr(sandlock.BranchActionKeep)
+	default:
+		t.Fatalf("unknown helper spec %q", spec)
+	}
+	if err := sandlock.Confine(sb); err != nil {
+		t.Fatalf("Confine: %v", err)
+	}
+}
+
+func TestConfineAcceptsADefaultSandbox(t *testing.T) {
+	// A confinement has no COW branch, so no branch action can change what it
+	// does. The core used to demand `on_error == Abort` all the same, which no
+	// default-built sandbox has, so this rejected the policy in the SDK
+	// quickstarts. Run in a re-executed copy of this binary: confinement is
+	// irreversible.
+	requireLandlock(t)
+	for _, spec := range []string{"default", "abort", "keep"} {
+		t.Run(spec, func(t *testing.T) {
+			cmd := exec.Command(os.Args[0], "-test.run=TestConfineHelperProcess", "-test.v")
+			cmd.Env = append(os.Environ(), confineHelperEnv+"="+spec)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("helper failed: %v\n%s", err, out)
+			}
+		})
 	}
 }
 

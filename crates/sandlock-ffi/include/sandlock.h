@@ -313,25 +313,33 @@ sandlock_builder_t *sandlock_sandbox_builder_new(void);
 
 /**
  * # Safety
- * `b` and `path` must be valid pointers.
+ * `b` must be a valid builder pointer. `path` must be null or point at a
+ * NUL-terminated string; a null or non-UTF-8 `path` is reported by
+ * `sandlock_sandbox_build` rather than dereferenced or coerced.
  */
 sandlock_builder_t *sandlock_sandbox_builder_fs_read(sandlock_builder_t *b, const char *path);
 
 /**
  * # Safety
- * `b` and `path` must be valid pointers.
+ * `b` must be a valid builder pointer. `path` must be null or point at a
+ * NUL-terminated string; a null or non-UTF-8 `path` is reported by
+ * `sandlock_sandbox_build` rather than dereferenced or coerced.
  */
 sandlock_builder_t *sandlock_sandbox_builder_fs_write(sandlock_builder_t *b, const char *path);
 
 /**
  * # Safety
- * `b` and `path` must be valid pointers.
+ * `b` must be a valid builder pointer. `path` must be null or point at a
+ * NUL-terminated string; a null or non-UTF-8 `path` is reported by
+ * `sandlock_sandbox_build` rather than dereferenced or coerced.
  */
 sandlock_builder_t *sandlock_sandbox_builder_fs_deny(sandlock_builder_t *b, const char *path);
 
 /**
  * # Safety
- * `b` and `path` must be valid pointers.
+ * `b` must be a valid builder pointer. `path` must be null or point at a
+ * NUL-terminated string; a null or non-UTF-8 `path` is reported by
+ * `sandlock_sandbox_build` rather than dereferenced or coerced.
  */
 sandlock_builder_t *sandlock_sandbox_builder_fs_storage(sandlock_builder_t *b, const char *path);
 
@@ -345,30 +353,38 @@ sandlock_builder_t *sandlock_sandbox_builder_gpu_devices(sandlock_builder_t *b,
 
 /**
  * # Safety
- * `b` and `path` must be valid pointers.
+ * `b` must be a valid builder pointer. `path` must be null or point at a
+ * NUL-terminated string; a null or non-UTF-8 `path` is reported by
+ * `sandlock_sandbox_build` rather than dereferenced or coerced.
  */
 sandlock_builder_t *sandlock_sandbox_builder_workdir(sandlock_builder_t *b, const char *path);
 
 /**
  * # Safety
- * `b` and `path` must be valid pointers.
+ * `b` must be a valid builder pointer. `path` must be null or point at a
+ * NUL-terminated string; a null or non-UTF-8 `path` is reported by
+ * `sandlock_sandbox_build` rather than dereferenced or coerced.
  */
 sandlock_builder_t *sandlock_sandbox_builder_cwd(sandlock_builder_t *b, const char *path);
 
 /**
  * # Safety
- * `b` and `path` must be valid pointers.
+ * `b` must be a valid builder pointer. `path` must be null or point at a
+ * NUL-terminated string; a null or non-UTF-8 `path` is reported by
+ * `sandlock_sandbox_build` rather than dereferenced or coerced.
  */
 sandlock_builder_t *sandlock_sandbox_builder_chroot(sandlock_builder_t *b, const char *path);
 
 /**
  * Add a filesystem mount mapping (virtual_path -> host_path).
  *
- * Both paths must be non-empty UTF-8; anything else is ignored and adds no
- * mount (an empty virtual path would match every guest path).
+ * A null or non-UTF-8 path, and a path that is empty, are reported by
+ * `sandlock_sandbox_build` rather than dropped: a mount that silently did not
+ * happen leaves the guest a filesystem view nobody asked for.
  *
  * # Safety
- * `b`, `virtual_path`, and `host_path` must be valid pointers.
+ * `b` must be a valid builder pointer. Each path must be null or point at a
+ * NUL-terminated string.
  */
 sandlock_builder_t *sandlock_sandbox_builder_fs_mount(sandlock_builder_t *b,
                                                       const char *virtual_path,
@@ -392,11 +408,15 @@ sandlock_builder_t *sandlock_sandbox_builder_fs_mount(sandlock_builder_t *b,
  * when [`sandlock_sandbox_builder_chroot`] is also set; without a chroot this
  * call has no effect on the guest's filesystem view.
  *
- * Both paths must be non-empty UTF-8; anything else is ignored and adds no
- * mount (an empty virtual path would match every guest path).
+ * A null or non-UTF-8 path, and a path that is empty, are reported by
+ * `sandlock_sandbox_build` rather than dropped. An empty virtual path is the
+ * sharper case here: it is a prefix of every guest path, so dropping the call
+ * and dropping the read-only marking are the two things the caller cannot tell
+ * apart, and one of them is a fully writable guest.
  *
  * # Safety
- * `b`, `virtual_path`, and `host_path` must be valid pointers.
+ * `b` must be a valid builder pointer. Each path must be null or point at a
+ * NUL-terminated string.
  */
 sandlock_builder_t *sandlock_sandbox_builder_fs_mount_ro(sandlock_builder_t *b,
                                                          const char *virtual_path,
@@ -405,6 +425,11 @@ sandlock_builder_t *sandlock_sandbox_builder_fs_mount_ro(sandlock_builder_t *b,
 /**
  * Set the COW branch action on successful exit.
  * `action`: 0 = Commit, 1 = Abort, 2 = Keep.
+ *
+ * Any other value is a static bug in the calling binding, not a runtime
+ * condition. It is latched in the builder and reported by
+ * `sandlock_sandbox_build`, which returns -1 with a message naming this
+ * setter and the offending value.
  *
  * # Safety
  * `b` must be a valid builder pointer.
@@ -415,24 +440,58 @@ sandlock_builder_t *sandlock_sandbox_builder_on_exit(sandlock_builder_t *b, uint
  * Set the COW branch action on error exit.
  * `action`: 0 = Commit, 1 = Abort, 2 = Keep.
  *
+ * Any other value is a static bug in the calling binding, not a runtime
+ * condition. It is latched in the builder and reported by
+ * `sandlock_sandbox_build`, which returns -1 with a message naming this
+ * setter and the offending value.
+ *
  * # Safety
  * `b` must be a valid builder pointer.
  */
 sandlock_builder_t *sandlock_sandbox_builder_on_error(sandlock_builder_t *b, uint8_t action);
 
 /**
+ * Set the memory limit from a byte-size string, e.g. `"512M"`.
+ *
+ * `size` uses the grammar the core accepts everywhere else: a decimal integer
+ * with an optional `K`/`M`/`G` suffix (case-insensitive), where a bare number
+ * is a count of bytes. The core parses it, so a binding does not have to
+ * carry a grammar of its own and cannot drift from this one.
+ *
+ * A value the core rejects is latched in the builder and reported by
+ * `sandlock_sandbox_build`, which returns -1 with the core's own message.
+ * `"0"` is one of them: zero is also the sentinel the supervisor carries for
+ * "no ceiling", so an explicit zero would install a ceiling of zero while the
+ * synthetic `/proc/meminfo` reported the sandbox unlimited. Omit the call to
+ * leave memory unlimited.
+ *
  * # Safety
- * `b` must be a valid builder pointer.
+ * `b` must be a valid builder pointer. `size` must be null or a
+ * NUL-terminated string.
  */
-sandlock_builder_t *sandlock_sandbox_builder_max_memory(sandlock_builder_t *b, uint64_t bytes);
+sandlock_builder_t *sandlock_sandbox_builder_max_memory(sandlock_builder_t *b, const char *size);
 
 /**
+ * Set the disk limit from a byte-size string, e.g. `"10G"`.
+ *
+ * Same grammar and same error path as
+ * [`sandlock_sandbox_builder_max_memory`], with one difference: `"0"` is
+ * accepted, because for a COW storage quota zero is the documented spelling
+ * of "unlimited" and has no second reading.
+ *
  * # Safety
- * `b` must be a valid builder pointer.
+ * `b` must be a valid builder pointer. `size` must be null or a
+ * NUL-terminated string.
  */
-sandlock_builder_t *sandlock_sandbox_builder_max_disk(sandlock_builder_t *b, uint64_t bytes);
+sandlock_builder_t *sandlock_sandbox_builder_max_disk(sandlock_builder_t *b, const char *size);
 
 /**
+ * Set the peak concurrent process limit.
+ *
+ * Zero is refused, reported by `sandlock_sandbox_build`: the supervisor
+ * compares `proc_count >= limit`, so a limit of zero denies every fork with
+ * EAGAIN however few processes are alive. Omit the call for the default cap.
+ *
  * # Safety
  * `b` must be a valid builder pointer.
  */
@@ -445,12 +504,27 @@ sandlock_builder_t *sandlock_sandbox_builder_max_processes(sandlock_builder_t *b
 sandlock_builder_t *sandlock_sandbox_builder_max_cpu(sandlock_builder_t *b, uint8_t pct);
 
 /**
+ * Set the processor count the guest sees.
+ *
+ * Zero is refused, reported by `sandlock_sandbox_build`: it reaches the
+ * synthetic procfs as an empty `/proc/cpuinfo` and an affinity mask with no
+ * bits, so the guest reads `nproc = 0`. Omit the call to expose the host
+ * processor count.
+ *
  * # Safety
  * `b` must be a valid builder pointer.
  */
 sandlock_builder_t *sandlock_sandbox_builder_num_cpus(sandlock_builder_t *b, uint32_t n);
 
 /**
+ * Pin the guest to the listed CPU cores.
+ *
+ * A `len` of zero is refused, reported by `sandlock_sandbox_build`: an
+ * affinity mask with no bits is what `sched_setaffinity(2)` rejects with
+ * EINVAL, and unlike `sandlock_sandbox_builder_gpu_devices`, where an empty
+ * list means "every device present", omitting this call is already how "every
+ * core" is spelled. Omit it rather than passing an empty list.
+ *
  * # Safety
  * `b` must be a valid builder pointer.  `cores` must point to `len` u32 values.
  */
@@ -464,13 +538,17 @@ sandlock_builder_t *sandlock_sandbox_builder_cpu_cores(sandlock_builder_t *b,
  * invalid specs surface as a build error.
  *
  * # Safety
- * `b` and `spec` must be valid pointers.
+ * `b` must be a valid builder pointer. `spec` must be null or point at a
+ * NUL-terminated string; a null or non-UTF-8 `spec` is reported by
+ * `sandlock_sandbox_build` rather than dereferenced or coerced.
  */
 sandlock_builder_t *sandlock_sandbox_builder_net_allow(sandlock_builder_t *b, const char *spec);
 
 /**
  * # Safety
- * `b` and `spec` must be valid pointers.
+ * `b` must be a valid builder pointer. `spec` must be null or point at a
+ * NUL-terminated string; a null or non-UTF-8 `spec` is reported by
+ * `sandlock_sandbox_build` rather than dereferenced or coerced.
  */
 sandlock_builder_t *sandlock_sandbox_builder_net_deny(sandlock_builder_t *b, const char *spec);
 
@@ -481,7 +559,9 @@ sandlock_builder_t *sandlock_sandbox_builder_net_deny(sandlock_builder_t *b, con
  * (including `"*"` mixed with port lists) surface as a build error.
  *
  * # Safety
- * `b` and `spec` must be valid pointers.
+ * `b` must be a valid builder pointer. `spec` must be null or point at a
+ * NUL-terminated string; a null or non-UTF-8 `spec` is reported by
+ * `sandlock_sandbox_build` rather than dereferenced or coerced.
  */
 sandlock_builder_t *sandlock_sandbox_builder_net_allow_bind(sandlock_builder_t *b,
                                                             const char *spec);
@@ -493,7 +573,9 @@ sandlock_builder_t *sandlock_sandbox_builder_net_allow_bind(sandlock_builder_t *
  * surface as a build error.
  *
  * # Safety
- * `b` and `spec` must be valid pointers.
+ * `b` must be a valid builder pointer. `spec` must be null or point at a
+ * NUL-terminated string; a null or non-UTF-8 `spec` is reported by
+ * `sandlock_sandbox_build` rather than dereferenced or coerced.
  */
 sandlock_builder_t *sandlock_sandbox_builder_net_deny_bind(sandlock_builder_t *b, const char *spec);
 
@@ -516,13 +598,17 @@ sandlock_builder_t *sandlock_sandbox_builder_user(sandlock_builder_t *b,
 
 /**
  * # Safety
- * `b` and `rule` must be valid pointers.
+ * `b` must be a valid builder pointer. `rule` must be null or point at a
+ * NUL-terminated string; a null or non-UTF-8 `rule` is reported by
+ * `sandlock_sandbox_build` rather than dereferenced or coerced.
  */
 sandlock_builder_t *sandlock_sandbox_builder_http_allow(sandlock_builder_t *b, const char *rule);
 
 /**
  * # Safety
- * `b` and `rule` must be valid pointers.
+ * `b` must be a valid builder pointer. `rule` must be null or point at a
+ * NUL-terminated string; a null or non-UTF-8 `rule` is reported by
+ * `sandlock_sandbox_build` rather than dereferenced or coerced.
  */
 sandlock_builder_t *sandlock_sandbox_builder_http_deny(sandlock_builder_t *b, const char *rule);
 
@@ -534,26 +620,34 @@ sandlock_builder_t *sandlock_sandbox_builder_http_port(sandlock_builder_t *b, ui
 
 /**
  * # Safety
- * `b` and `path` must be valid pointers.
+ * `b` must be a valid builder pointer. `path` must be null or point at a
+ * NUL-terminated string; a null or non-UTF-8 `path` is reported by
+ * `sandlock_sandbox_build` rather than dereferenced or coerced.
  */
 sandlock_builder_t *sandlock_sandbox_builder_http_ca(sandlock_builder_t *b, const char *path);
 
 /**
  * # Safety
- * `b` and `path` must be valid pointers.
+ * `b` must be a valid builder pointer. `path` must be null or point at a
+ * NUL-terminated string; a null or non-UTF-8 `path` is reported by
+ * `sandlock_sandbox_build` rather than dereferenced or coerced.
  */
 sandlock_builder_t *sandlock_sandbox_builder_http_key(sandlock_builder_t *b, const char *path);
 
 /**
  * # Safety
- * `b` and `path` must be valid pointers.
+ * `b` must be a valid builder pointer. `path` must be null or point at a
+ * NUL-terminated string; a null or non-UTF-8 `path` is reported by
+ * `sandlock_sandbox_build` rather than dereferenced or coerced.
  */
 sandlock_builder_t *sandlock_sandbox_builder_http_inject_ca(sandlock_builder_t *b,
                                                             const char *path);
 
 /**
  * # Safety
- * `b` and `path` must be valid pointers.
+ * `b` must be a valid builder pointer. `path` must be null or point at a
+ * NUL-terminated string; a null or non-UTF-8 `path` is reported by
+ * `sandlock_sandbox_build` rather than dereferenced or coerced.
  */
 sandlock_builder_t *sandlock_sandbox_builder_http_ca_out(sandlock_builder_t *b, const char *path);
 
@@ -571,28 +665,79 @@ sandlock_builder_t *sandlock_sandbox_builder_clean_env(sandlock_builder_t *b, bo
 
 /**
  * # Safety
- * `b`, `key`, and `value` must be valid pointers.
+ * `b` must be a valid builder pointer. `key` and `value` must each be null
+ * or point at a NUL-terminated string; a null or non-UTF-8 half is reported
+ * by `sandlock_sandbox_build` rather than dereferenced or coerced.
  */
 sandlock_builder_t *sandlock_sandbox_builder_env_var(sandlock_builder_t *b,
                                                      const char *key,
                                                      const char *value);
 
 /**
+ * Set the sandbox start time from an RFC3339 timestamp, e.g.
+ * `"2026-01-01T00:00:00Z"`.
+ *
+ * The core parses it, the same way it parses `[determinism].time_start` in a
+ * profile and `--time-start` on the command line. This takes a string rather
+ * than an epoch count so the ABI can carry what the grammar can express:
+ * sub-second precision, an explicit offset, and instants before 1970, none of
+ * which fit in the unsigned second count this setter used to take.
+ *
+ * A value the core rejects is latched in the builder and reported by
+ * `sandlock_sandbox_build`, which returns -1 with the core's own message.
+ *
  * # Safety
- * `b` must be a valid builder pointer. `epoch_secs` is seconds since UNIX epoch.
+ * `b` must be a valid builder pointer. `timestamp` must be null or a
+ * NUL-terminated string.
  */
-sandlock_builder_t *sandlock_sandbox_builder_time_start(sandlock_builder_t *b, uint64_t epoch_secs);
+sandlock_builder_t *sandlock_sandbox_builder_time_start(sandlock_builder_t *b,
+                                                        const char *timestamp);
+
+/**
+ * Set the sandbox start time from an already-resolved epoch instant.
+ *
+ * `seconds` is a signed count of whole seconds since 1970-01-01T00:00:00Z and
+ * `nanoseconds` is a sub-second remainder below one second, which is exactly
+ * the pair `sandlock_profile_parse` reports under
+ * `[determinism].time_start`. Note the normalization: half a second before
+ * the epoch is `{-1, 500000000}`, not `{0, -500000000}`.
+ *
+ * This is the numeric counterpart of
+ * [`sandlock_sandbox_builder_time_start`], not a second grammar. It exists
+ * for the caller whose value is a number and never was text: an epoch count
+ * out of `datetime.timestamp()`, out of arithmetic on one, or out of a parsed
+ * profile. Without it such a caller would have to render RFC 3339 itself
+ * before it could pass anything, which is a grammar *writer* in the binding,
+ * with its own ways to be wrong about offsets and sub-second digits, one line
+ * away from the reader the string setter exists to abolish. A caller that
+ * still has the user's text must use the string setter instead, so the
+ * grammar is read once, by the core.
+ *
+ * A pair the core rejects (an unnormalized remainder, an instant outside the
+ * supported range) is latched in the builder and reported by
+ * `sandlock_sandbox_build`, which returns -1 with the core's own message.
+ *
+ * # Safety
+ * `b` must be a valid builder pointer.
+ */
+sandlock_builder_t *sandlock_sandbox_builder_time_start_epoch(sandlock_builder_t *b,
+                                                              int64_t seconds,
+                                                              uint32_t nanoseconds);
 
 /**
  * # Safety
- * `b` must be a valid builder pointer. `names` is a comma-separated NUL-terminated string.
+ * `b` must be a valid builder pointer. `names` must be null or point at a
+ * comma-separated NUL-terminated string; a null or non-UTF-8 `names` is
+ * reported by `sandlock_sandbox_build` rather than dereferenced or coerced.
  */
 sandlock_builder_t *sandlock_sandbox_builder_extra_deny_syscalls(sandlock_builder_t *b,
                                                                  const char *names);
 
 /**
  * # Safety
- * `b` must be a valid builder pointer. `names` is a comma-separated NUL-terminated string.
+ * `b` must be a valid builder pointer. `names` must be null or point at a
+ * comma-separated NUL-terminated string; a null or non-UTF-8 `names` is
+ * reported by `sandlock_sandbox_build` rather than dereferenced or coerced.
  */
 sandlock_builder_t *sandlock_sandbox_builder_extra_allow_syscalls(sandlock_builder_t *b,
                                                                   const char *names);
@@ -616,6 +761,13 @@ sandlock_builder_t *sandlock_sandbox_builder_extra_allow_syscalls(sandlock_build
 int64_t sandlock_syscall_nr(const char *name);
 
 /**
+ * Set the open file-descriptor limit (RLIMIT_NOFILE, soft and hard).
+ *
+ * Zero is refused, reported by `sandlock_sandbox_build`: the child needs
+ * descriptors to reach `main`, so a zero cap kills it before the workload
+ * starts with an errno far from the setting responsible. A workable floor is
+ * well above 1. Omit the call to inherit the system limit.
+ *
  * # Safety
  * `b` must be a valid builder pointer.
  */
@@ -663,8 +815,15 @@ uint32_t sandlock_protection_min_abi(uint32_t protection);
  * Returns the (possibly relocated) builder pointer, mirroring the
  * move-semantics convention used by every other
  * `sandlock_sandbox_builder_*` setter. A null `b` is returned
- * unchanged. An unknown `protection` discriminant is treated as a
- * no-op: the builder is returned untouched.
+ * unchanged.
+ *
+ * An unknown `protection` discriminant is a static bug in the calling
+ * binding, not a runtime condition, exactly as it is for
+ * `sandlock_sandbox_builder_on_exit`. It is latched in the builder and
+ * reported by `sandlock_sandbox_build`, which returns -1 with a message
+ * naming this setter and the offending value. It used to be dropped, so a
+ * binding built against a newer header was told nothing when an older
+ * library did not recognise what it sent.
  *
  * # Safety
  * `b` must be a valid builder pointer returned by
@@ -681,8 +840,15 @@ sandlock_builder_t *sandlock_sandbox_builder_allow_degraded(sandlock_builder_t *
  * Returns the (possibly relocated) builder pointer, mirroring the
  * move-semantics convention used by every other
  * `sandlock_sandbox_builder_*` setter. A null `b` is returned
- * unchanged. An unknown `protection` discriminant is treated as a
- * no-op: the builder is returned untouched.
+ * unchanged.
+ *
+ * An unknown `protection` discriminant is a static bug in the calling
+ * binding, not a runtime condition, exactly as it is for
+ * `sandlock_sandbox_builder_on_exit`. It is latched in the builder and
+ * reported by `sandlock_sandbox_build`, which returns -1 with a message
+ * naming this setter and the offending value. It used to be dropped, so a
+ * binding built against a newer header was told nothing when an older
+ * library did not recognise what it sent.
  *
  * # Safety
  * `b` must be a valid builder pointer returned by
@@ -711,6 +877,34 @@ sandlock_sandbox_t *sandlock_sandbox_build(sandlock_builder_t *b, int *err, char
  * `p` must be null or a valid pointer from `sandlock_sandbox_build`.
  */
 void sandlock_sandbox_free(sandlock_sandbox_t *p);
+
+/**
+ * Parse a TOML profile into canonical JSON.
+ *
+ * The returned document has the same section layout as the profile, but every
+ * string micro-grammar is already resolved: mounts are
+ * `{"virt", "host", "ro"}` objects, `[limits]` sizes are integer bytes,
+ * `[determinism].time_start` is `{"seconds", "nanoseconds", "rfc3339"}`,
+ * bind ports are expanded integer lists, and net/HTTP rules are structured
+ * records. A binding only has to map fields, so it never grows a second copy
+ * of a grammar that can drift from this one.
+ *
+ * The profile is validated exactly as `sandlock run --profile` validates it,
+ * including the cross-section checks that normally run at build time, so a
+ * bad profile fails here with the message a CLI user sees for the same file.
+ *
+ * On success, `*err` is 0 and a heap-allocated JSON string is returned; the
+ * caller must release it with [`sandlock_string_free`]. On failure, `*err` is
+ * -1, null is returned, and `*err_msg` (if non-null) is set to a
+ * heap-allocated C string describing the error, released the same way. Pass
+ * `null` for `err_msg` to discard it. A null return always means failure.
+ *
+ * # Safety
+ * `toml` must be a valid NUL-terminated C string. `err` and `err_msg` may
+ * both be null. When `err_msg` is non-null, it must point to writable storage
+ * for one `*mut c_char`.
+ */
+char *sandlock_profile_parse(const char *toml, int *err, char **err_msg);
 
 /**
  * Confine the calling process with Landlock filesystem rules.
@@ -946,10 +1140,16 @@ const uint8_t *sandlock_result_stderr_bytes(const sandlock_result_t *r, uintptr_
 void sandlock_result_free(sandlock_result_t *r);
 
 /**
- * Free a string returned by `sandlock_result_stdout` or `sandlock_result_stderr`.
+ * Free a string returned by this library.
+ *
+ * Every function in this header that hands back a `char *` (capture buffers,
+ * `sandlock_profile_parse`, checkpoint names, change paths, port mappings, and
+ * the `err_msg` out-parameters) allocates it the same way and releases it
+ * here.
  *
  * # Safety
- * `s` must be null or a pointer from a `sandlock_result_std*` function.
+ * `s` must be null or a `char *` returned by one of those functions, and must
+ * not have been freed already.
  */
 void sandlock_string_free(char *s);
 

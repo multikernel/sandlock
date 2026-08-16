@@ -97,9 +97,28 @@ fresh native policy on each call.
 | Syscalls | `ExtraAllowSyscalls`, `ExtraDenySyscalls` |
 | Determinism | `RandomSeed`, `TimeStart`, `NoRandomizeMemory`, `NoHugePages`, `DeterministicDirs` |
 | Environment | `CleanEnv`, `Env` |
-| Misc | `UID`, `GID`, `NoCoredump`, `Name` |
+| Misc | `User`, `NoCoredump`, `Name` |
 | COW branch | `FSStorage`, `OnExit`, `OnError` |
 | Dynamic policy | `PolicyFn` |
+
+Values are forwarded to sandlock as written; sandlock parses them and reports
+what it cannot accept. So a field whose "unset" state is not expressible in the
+value itself is a pointer, set with `sandlock.Ptr`:
+
+```go
+sb := &sandlock.Sandbox{
+    MaxCPU:  sandlock.Ptr[uint8](50),          // 0 is a value sandlock rejects, not "unset"
+    User:    &sandlock.RunAs{UID: 0, GID: 0},  // both ids or neither, as the kernel maps them
+    OnExit:  sandlock.Ptr(sandlock.BranchActionKeep),
+}
+```
+
+`MaxMemory` and `MaxDisk` are byte-size strings in sandlock's own grammar: a
+decimal integer with an optional `K`/`M`/`G` suffix, case-insensitive, a bare
+number being bytes (`"512M"`, `"1G"`, `"1048576"`). Fractions and a `T` suffix
+are not part of it. `TimeStart` is an RFC3339 timestamp
+(`"2026-01-01T00:00:00Z"`), which unlike a plain epoch count can carry
+sub-second precision, an explicit offset, and instants before 1970.
 
 `NetAllow` entries follow sandlock's rule grammar: bare `host:port` is TCP
 (`"api.openai.com:443"`, `"github.com:22,443"`, `":53"`); a target may be a

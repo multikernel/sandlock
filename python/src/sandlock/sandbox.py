@@ -8,6 +8,7 @@ time; runtime state (``_native``, ``_handle``) is initialized lazily.
 
 from __future__ import annotations
 
+import collections.abc
 import inspect
 import itertools
 import os
@@ -28,51 +29,23 @@ if TYPE_CHECKING:
     from ._sdk import ExitReason  # DryRunResult.reason annotation (runtime import is circular)
 
 
-# --- Memory size parsing (from branching/process/limits.py) ---
-
-_UNITS = {
-    "K": 1024,
-    "M": 1024 ** 2,
-    "G": 1024 ** 3,
-    "T": 1024 ** 4,
-}
-
-_SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([KMGT])?\s*$", re.IGNORECASE)
-
-
-def parse_memory_size(s: str) -> int:
-    """Parse a human-friendly memory size string to bytes.
-
-    Accepts plain integers (bytes) or suffixed values: ``'512M'``, ``'1G'``,
-    ``'100K'``.  The suffix is case-insensitive.
-
-    Returns:
-        Size in bytes (integer).
-
-    Raises:
-        ValueError: If the string cannot be parsed.
-    """
-    m = _SIZE_RE.match(s)
-    if m is None:
-        raise ValueError(f"invalid memory size: {s!r}")
-    value = float(m.group(1))
-    suffix = m.group(2)
-    if suffix is not None:
-        value *= _UNITS[suffix.upper()]
-    return int(value)
-
-
 _PORT_RANGE_RE = re.compile(r"^(\d+)(?:-(\d+))?$")
 
 
 def parse_ports(specs: Sequence[int | str]) -> list[int]:
-    """Parse port specifications into a sorted list of unique port numbers.
+    """Expand port specifications into a sorted list of unique port numbers.
 
     Each spec is an int (single port) or a string holding a comma-separated
     list of single ports / inclusive ``"lo-hi"`` ranges, e.g. ``"80"``,
-    ``"8000-9000"``, or ``"8080,9000-9005"`` (matching the CLI's
-    ``--net-allow-bind`` grammar).  Raises ValueError on out-of-range or bad
-    format.
+    ``"8000-9000"``, or ``"8080,9000-9005"``.  Raises ValueError on
+    out-of-range or bad format.
+
+    This is a convenience for a caller that wants the expansion in Python. It
+    is **not** the ``--net-allow-bind`` grammar and must not be used to
+    pre-expand a list before assigning it to :attr:`Sandbox.net_allow_bind`:
+    it does not accept the ``"*"`` wildcard, and it does not accept space
+    around the dash (``"80 - 90"``), both of which the core takes. Bind specs
+    are forwarded to the core as written and parsed once, there.
     """
     ports: set[int] = set()
     for spec in specs:
@@ -95,11 +68,33 @@ def parse_ports(specs: Sequence[int | str]) -> list[int]:
 
 
 class BranchAction(Enum):
-    """Action to take on the COW branch when sandbox exits."""
+    """Action to take on the COW branch when sandbox exits.
+
+    The member values are the profile spellings; :attr:`abi` is the
+    discriminant the C ABI setters carry.
+    """
 
     COMMIT = "commit"    # Merge writes into parent branch
     ABORT = "abort"      # Discard all writes
     KEEP = "keep"        # Leave branch as-is (caller decides)
+
+    @property
+    def abi(self) -> int:
+        """The discriminant ``sandlock_sandbox_builder_on_exit`` takes.
+
+        Shared with ``sandlock_core::BranchAction`` and the ``uint8_t``
+        documented in the C header. Kept here rather than as a lookup table at
+        the call site so there is one place to change if the ABI ever grows a
+        fourth action.
+        """
+        return _BRANCH_ACTION_ABI[self]
+
+
+_BRANCH_ACTION_ABI = {
+    BranchAction.COMMIT: 0,
+    BranchAction.ABORT: 1,
+    BranchAction.KEEP: 2,
+}
 
 
 class StdioMode(IntEnum):
@@ -114,6 +109,43 @@ class StdioMode(IntEnum):
     """Connect to a pipe; the caller owns the returned end via :class:`Process`."""
     NULL = 2
     """Connect the stream to ``/dev/null``."""
+
+
+@dataclass(frozen=True)
+class Mount:
+    """One entry of :attr:`Sandbox.fs_mount`: a host directory exposed at a
+    virtual path inside the chroot.
+
+    Field names mirror the canonical profile form emitted by the core parser,
+    so loading a profile is a field-for-field copy.
+    """
+
+    virt: str
+    """Path the sandbox sees (inside the chroot)."""
+
+    host: str
+    """Host path the virtual path resolves to."""
+
+    ro: bool = False
+    """Mount read-only. Writes through the virtual path are refused."""
+
+
+@dataclass(frozen=True)
+class User:
+    """The identity :attr:`Sandbox.user` maps the child to.
+
+    One value carrying both ids, mirroring the core's own ``RunAs``: an
+    unprivileged user namespace maps a single pair, so a uid without a gid is
+    not a policy the core has any way to apply. Two separate optional fields
+    would let a caller write that state and oblige this SDK to answer for it;
+    one required pair means there is nothing left to answer for.
+    """
+
+    uid: int
+    """UID inside the user namespace. ``0`` is fake root."""
+
+    gid: int
+    """GID inside the user namespace. Supplementary groups are not available."""
 
 
 @dataclass(frozen=True)
@@ -265,12 +297,22 @@ class Sandbox:
 
     # Resource limits
     max_memory: str | int | None = None
-    """Memory limit. String like '512M' or int bytes."""
+    """Memory limit: a size string (``'512M'``) or a count of bytes
+    (``536870912``).  Both spellings go to the core exactly as written and are
+    resolved by the one parser that also reads ``[limits].memory`` in a profile
+    and ``--max-memory`` on the command line, so ``'512M'`` means here what it
+    means there and a value it refuses is refused here with its message.
+    A bare number is that grammar's spelling for a count of bytes, which is
+    what a loaded profile resolves to.  ``None`` is the only spelling of
+    "unlimited": a ceiling of zero is refused, because zero is what the
+    supervisor already carries for "no ceiling"."""
 
-    max_processes: int = 64
+    max_processes: int | None = None
     """Maximum total forks allowed in the sandbox (lifetime count,
     not concurrent).  Enforced by the seccomp notif supervisor.
-    Also enables fork interception needed for checkpoint freeze."""
+    Also enables fork interception needed for checkpoint freeze.
+    ``None`` leaves the limit to the core, which is the only place its
+    default is written down."""
 
     max_open_files: int | None = None
     """Maximum number of open file descriptors.  Enforced via
@@ -291,7 +333,9 @@ class Sandbox:
     cpu_cores: Sequence[int] | None = None
     """CPU cores to pin the sandbox to.  When set, sched_setaffinity()
     is called in the child to restrict it to the specified cores.
-    None = inherit parent affinity (unrestricted)."""
+    None = inherit parent affinity (unrestricted).  Unlike
+    :attr:`gpu_devices`, an empty list is not "all cores" but an affinity
+    mask with no bits, so the core refuses it: omit the field instead."""
 
     num_cpus: int | None = None
     """Visible CPU count in /proc/cpuinfo.  When set, the sandbox sees
@@ -310,11 +354,22 @@ class Sandbox:
     """Seed for deterministic randomness. When set, getrandom() returns
     deterministic bytes from a seeded PRNG. Same seed = same output."""
 
-    time_start: float | str | None = None
-    """Start timestamp for time virtualization. When set, clock_gettime()
-    and gettimeofday() return shifted time starting from this epoch.
-    Accepts a Unix timestamp (float) or ISO 8601 string.
-    Time ticks at real speed from the given start point."""
+    time_start: str | int | float | None = None
+    """Start timestamp for time virtualization: an RFC 3339 stamp
+    (``'2026-01-01T00:00:00Z'``) or Unix epoch seconds (``1767225600``).
+    When set, clock_gettime() and gettimeofday() return shifted time
+    starting from this epoch. Time ticks at real speed from the given
+    start point.
+
+    A string is handed to the core verbatim and parsed by the same routine
+    that reads ``[determinism].time_start`` in a profile and ``--time-start``
+    on the command line, so an offset (``'...-05:00'``), sub-second precision
+    and a pre-1970 instant all mean here what they mean there.  A number is an
+    already-resolved instant, the form a loaded profile carries, and reaches
+    the core through the epoch setter without being rendered back into text.
+    For a :class:`datetime.datetime`, either spelling works: ``dt.isoformat()``
+    for an aware datetime, or ``dt.timestamp()``.  A naive datetime has to be
+    given a timezone first rather than silently assumed to be UTC."""
 
     no_randomize_memory: bool = False
     """Disable Address Space Layout Randomization (ASLR) inside the sandbox.
@@ -345,10 +400,13 @@ class Sandbox:
     chroot: str | None = None
     """Path to chroot into before applying other confinement."""
 
-    fs_mount: Mapping[str, str] = field(default_factory=dict)
-    """Map virtual paths to host directories inside chroot.
-    Example: {"/work": "/host/sandbox/work"} makes /work inside the
-    chroot resolve to /host/sandbox/work on the host."""
+    fs_mount: Sequence[Mount] = field(default_factory=list)
+    """Host directories exposed at virtual paths inside the chroot.
+    Example: ``[Mount("/work", "/host/sandbox/work")]`` makes /work inside
+    the chroot resolve to /host/sandbox/work on the host; pass ``ro=True``
+    for a read-only mount. A list rather than a mapping because the same
+    virtual path may be listed twice with different read-only flags, which
+    is what the profile grammar (``"VIRTUAL:HOST[:ro]"``) allows."""
 
     # Environment
     clean_env: bool = False
@@ -359,16 +417,11 @@ class Sandbox:
     """Variables to set or override in the child.  Applied after clean_env."""
 
 
-    uid: int | None = None
-    """Map to the given UID inside a user namespace.  For example,
-    ``uid=0`` gives fake root, ``uid=1000`` maps to UID 1000.
-    The child has no real host privileges regardless of the mapped UID.
-    Only effective when user namespaces are available."""
-
-    gid: int | None = None
-    """Map to the given GID inside the user namespace.  Must be set together
-    with ``uid`` (both or neither).  An unprivileged user namespace maps a
-    single id, so supplementary groups are not available."""
+    user: User | None = None
+    """Identity to run as inside a user namespace, or ``None`` to keep the
+    caller's.  ``User(0, 0)`` gives fake root, ``User(1000, 1000)`` maps to
+    that pair.  The child has no real host privileges regardless of the mapped
+    ids.  Only effective when user namespaces are available."""
 
     # Seccomp user notification (filesystem virtualization)
     notif_policy: NotifPolicy | None = None
@@ -389,15 +442,25 @@ class Sandbox:
     fs_storage: str | None = None
     """Separate storage directory for the seccomp COW upper layer / deltas."""
 
-    max_disk: str | None = None
-    """Disk quota for COW storage (e.g. ``'1G'``).
+    max_disk: str | int | None = None
+    """Disk quota for COW storage: a size string (``'1G'``) or a count of
+    bytes (``1073741824``), resolved by the core exactly as ``max_memory`` is.
     Enforced by the COW layer (returns ENOSPC)."""
 
-    on_exit: BranchAction = BranchAction.COMMIT
-    """Branch action on normal sandbox exit."""
+    on_exit: BranchAction | str | int | None = None
+    """Branch action on normal sandbox exit.  ``None`` leaves it to the core.
 
-    on_error: BranchAction = BranchAction.ABORT
-    """Branch action on sandbox error/exception."""
+    This used to default to ``COMMIT`` here as well, which agreed with the
+    core by coincidence rather than by construction."""
+
+    on_error: BranchAction | str | int | None = None
+    """Branch action on sandbox error/exception.  ``None`` leaves it to the
+    core, which commits.
+
+    It used to default to ``ABORT`` here, a second default that disagreed with
+    the one the core applies to the very same field, so a policy that said
+    nothing about the error path discarded the guest's writes through this SDK
+    and kept them through the CLI, a profile, or the Go SDK."""
 
     # Landlock protection opt-out — relax strict enforcement for the
     # named protections. See ``sandlock.Protection`` (the IntEnum mirror
@@ -444,6 +507,34 @@ class Sandbox:
                 raise ValueError("sandbox name must not contain '/'")
             if self.name in (".", ".."):
                 raise ValueError("sandbox name must not be '.' or '..'")
+        # max_memory, max_disk and time_start are deliberately not checked
+        # here. Their grammars live in the core, which now takes them as text
+        # through its own setters, so `'512M'`, `'1.5G'` and
+        # `'2026-01-01T00:00:00Z'` are all questions for the parser that also
+        # answers them for a profile and for the command line. Judging them
+        # here would put a second opinion in front of the only one that counts.
+        if isinstance(self.fs_mount, dict):
+            raise TypeError(
+                "fs_mount is a sequence of Mount entries, not a mapping; "
+                "use [Mount('/virt', '/host')] or Mount(..., ro=True) for a "
+                "read-only mount"
+            )
+        if not isinstance(self.fs_mount, collections.abc.Sequence) or isinstance(
+            self.fs_mount, (str, bytes)
+        ):
+            # Rejected rather than materialized: a one-shot iterable would be
+            # emptied by the check below and the sandbox would silently run
+            # with no mounts.
+            raise TypeError(
+                "fs_mount must be a list or tuple of Mount entries, got "
+                f"{type(self.fs_mount).__name__}"
+            )
+        for entry in self.fs_mount:
+            if not isinstance(entry, Mount):
+                raise TypeError(
+                    "fs_mount entries must be Mount, got "
+                    f"{type(entry).__name__}: {entry!r}"
+                )
         # Runtime state — not dataclass fields, not serialized
         self._native = None   # _NativePolicy created lazily on first use
         self._handle = None   # live sandbox handle during start()/run()
@@ -475,39 +566,6 @@ class Sandbox:
         from ._sdk import _NativePolicy
         self._native = _NativePolicy.from_dataclass(self, policy_fn=self.policy_fn)
         return self._native
-
-    # ------------------------------------------------------------------
-    # Config helper methods
-    # ------------------------------------------------------------------
-
-    def memory_bytes(self) -> int | None:
-        """Return max_memory as bytes, or None if unset."""
-        if self.max_memory is None:
-            return None
-        if isinstance(self.max_memory, int):
-            return self.max_memory
-        return parse_memory_size(self.max_memory)
-
-    def time_start_timestamp(self) -> float | None:
-        """Return time_start as a Unix timestamp float, or None if unset."""
-        if self.time_start is None:
-            return None
-        if isinstance(self.time_start, (int, float)):
-            return float(self.time_start)
-        from datetime import datetime, timezone
-        s = self.time_start
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.timestamp()
-
-    def cpu_pct(self) -> int | None:
-        """Return max_cpu as a clamped percentage (1–100), or None."""
-        if self.max_cpu is None:
-            return None
-        return max(1, min(100, self.max_cpu))
 
     # ------------------------------------------------------------------
     # Context manager

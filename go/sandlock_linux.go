@@ -24,19 +24,35 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
-
-	"github.com/multikernel/sandlock/go/internal/policy"
 )
 
 // hasNUL reports whether s contains an interior NUL byte, which cannot survive
 // the conversion to a C string.
 func hasNUL(s string) bool { return strings.IndexByte(s, 0) >= 0 }
+
+// checkCommand rejects an empty command before any C entry point is reached.
+//
+// The core makes the same call (Sandbox::create rejects an empty command), but
+// it cannot make it here: the C ABI takes argv as a pointer plus a count and
+// treats a null pointer as invalid input, and Go has no pointer to give for an
+// empty slice. So the call would come back as a null handle from an entry
+// point that carries no error text, and the caller would read "failed to
+// create sandbox" for a mistake the core can name exactly. Until the create
+// family grows an error out-param the way sandlock_sandbox_build has one, this
+// stays, with the core's own wording.
+func checkCommand(cmd []string) error {
+	if len(cmd) == 0 {
+		return fmt.Errorf("sandlock: empty command")
+	}
+	return nil
+}
 
 func cbool(v bool) C.bool { return C.bool(v) }
 
@@ -123,9 +139,14 @@ func goPolicyDrop(userData unsafe.Pointer) {
 }
 
 // validateStrings rejects any configuration string carrying a NUL byte before
-// a builder is allocated. The FFI has no builder-free entry point, so a failure
-// partway through building would leak the builder; validating up front keeps
-// buildPolicy infallible with respect to string conversion.
+// a builder is allocated. This is the one verdict the Go binding must reach on
+// its own: a Go string with an interior NUL cannot become a C string, so the
+// value the core would see is a silently truncated prefix of what the caller
+// wrote, and no core-side check can recover the difference. Every other
+// rejection in this file belongs to the core.
+//
+// It also keeps buildPolicy infallible: the FFI has no builder-free entry
+// point, so a failure partway through building would leak the builder.
 func (s *Sandbox) validateStrings() error {
 	groups := [][]string{
 		s.FSReadable, s.FSWritable, s.FSDenied,
@@ -133,7 +154,10 @@ func (s *Sandbox) validateStrings() error {
 		s.HTTPAllow, s.HTTPDeny,
 		s.ExtraAllowSyscalls, s.ExtraDenySyscalls,
 		{s.Workdir, s.Cwd, s.Chroot, s.FSStorage, s.MaxMemory, s.MaxDisk,
-			s.TimeStart, s.HTTPCAFile, s.HTTPKeyFile, s.Name},
+			s.TimeStart, s.HTTPCAFile, s.HTTPKeyFile},
+	}
+	if s.Name != nil && hasNUL(*s.Name) {
+		return ErrInvalidString
 	}
 	for _, g := range groups {
 		for _, v := range g {
@@ -229,9 +253,7 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 			return C.sandlock_sandbox_builder_net_deny_bind(b, c)
 		}, spec)
 	}
-	if s.PortRemap {
-		b = C.sandlock_sandbox_builder_port_remap(b, cbool(true))
-	}
+	b = C.sandlock_sandbox_builder_port_remap(b, cbool(s.PortRemap))
 
 	// Protection opt-out (Landlock per-protection posture).
 	for _, p := range s.AllowDegraded {
@@ -252,6 +274,10 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 			return C.sandlock_sandbox_builder_http_deny(b, c)
 		}, r)
 	}
+	// []uint16 rather than []int: the C ABI carries a u16, so a wider Go type
+	// would wrap silently on the way down (70000 arriving as 4464) and the
+	// core would never see the value the caller wrote. The type carries the
+	// ABI's range instead of a check doing it.
 	for _, p := range s.HTTPPorts {
 		b = C.sandlock_sandbox_builder_http_port(b, C.uint16_t(p))
 	}
@@ -266,44 +292,47 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 		}, s.HTTPKeyFile)
 	}
 
-	// Resource limits.
+	// Resource limits. The byte-size strings go to the core verbatim: it owns
+	// the grammar (ByteSize::parse in crates/sandlock-core/src/sandbox.rs) and
+	// latches its own message for a value it cannot accept, which
+	// sandlock_sandbox_build returns below.
 	if s.MaxMemory != "" {
-		v, err := policy.ParseMemory(s.MaxMemory)
-		if err != nil {
-			freeBuilderViaBuild(b)
-			return nil, err
-		}
-		b = C.sandlock_sandbox_builder_max_memory(b, C.uint64_t(v))
+		str(func(b *C.sandlock_builder_t, c *C.char) *C.sandlock_builder_t {
+			return C.sandlock_sandbox_builder_max_memory(b, c)
+		}, s.MaxMemory)
 	}
 	if s.MaxDisk != "" {
-		v, err := policy.ParseMemory(s.MaxDisk)
-		if err != nil {
-			freeBuilderViaBuild(b)
-			return nil, err
-		}
-		b = C.sandlock_sandbox_builder_max_disk(b, C.uint64_t(v))
+		str(func(b *C.sandlock_builder_t, c *C.char) *C.sandlock_builder_t {
+			return C.sandlock_sandbox_builder_max_disk(b, c)
+		}, s.MaxDisk)
 	}
-	if s.MaxProcesses > 0 {
-		b = C.sandlock_sandbox_builder_max_processes(b, C.uint32_t(s.MaxProcesses))
+	// Every cap below is forwarded whenever it is set, zero included: the core
+	// rejects a zero cap for each of them (crates/sandlock-core/src/sandbox/
+	// builder.rs, the max_processes / max_cpu / max_open_files / num_cpus
+	// checks in build_unchecked), and filtering zero here would replace that
+	// verdict with a silently ignored field.
+	if s.MaxProcesses != nil {
+		b = C.sandlock_sandbox_builder_max_processes(b, C.uint32_t(*s.MaxProcesses))
 	}
-	if s.MaxCPU > 0 {
-		b = C.sandlock_sandbox_builder_max_cpu(b, C.uint8_t(s.MaxCPU))
+	if s.MaxCPU != nil {
+		b = C.sandlock_sandbox_builder_max_cpu(b, C.uint8_t(*s.MaxCPU))
 	}
-	if s.MaxOpenFiles > 0 {
-		b = C.sandlock_sandbox_builder_max_open_files(b, C.uint(s.MaxOpenFiles))
+	if s.MaxOpenFiles != nil {
+		b = C.sandlock_sandbox_builder_max_open_files(b, C.uint(*s.MaxOpenFiles))
 	}
-	if s.NumCPUs > 0 {
-		b = C.sandlock_sandbox_builder_num_cpus(b, C.uint32_t(s.NumCPUs))
+	if s.NumCPUs != nil {
+		b = C.sandlock_sandbox_builder_num_cpus(b, C.uint32_t(*s.NumCPUs))
 	}
-	if len(s.CPUCores) > 0 {
-		b = C.sandlock_sandbox_builder_cpu_cores(b, (*C.uint32_t)(unsafe.Pointer(&s.CPUCores[0])), C.uint32_t(len(s.CPUCores)))
+	// nil and empty are distinct for both slices, so both use the same rule:
+	// nil is "unset", and an empty slice is forwarded as an empty list. The
+	// core reads an empty GPU list as "every GPU present"
+	// (crates/sandlock-core/src/landlock.rs), which is a grant Go must be able
+	// to express.
+	if s.CPUCores != nil {
+		b = C.sandlock_sandbox_builder_cpu_cores(b, sliceHead(s.CPUCores), C.uint32_t(len(s.CPUCores)))
 	}
 	if s.GPUDevices != nil {
-		var ptr *C.uint32_t
-		if len(s.GPUDevices) > 0 {
-			ptr = (*C.uint32_t)(unsafe.Pointer(&s.GPUDevices[0]))
-		}
-		b = C.sandlock_sandbox_builder_gpu_devices(b, ptr, C.uint32_t(len(s.GPUDevices)))
+		b = C.sandlock_sandbox_builder_gpu_devices(b, sliceHead(s.GPUDevices), C.uint32_t(len(s.GPUDevices)))
 	}
 
 	// Syscall filtering.
@@ -318,32 +347,26 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 		}, strings.Join(s.ExtraAllowSyscalls, ","))
 	}
 
-	// Determinism.
+	// Determinism. The timestamp goes to the core verbatim, which parses it
+	// with the same grammar it uses for a profile's [determinism].time_start
+	// (parse_time_start in crates/sandlock-core/src/profile.rs).
 	if s.RandomSeed != nil {
 		b = C.sandlock_sandbox_builder_random_seed(b, C.uint64_t(*s.RandomSeed))
 	}
 	if s.TimeStart != "" {
-		secs, err := policy.ParseTimeStart(s.TimeStart)
-		if err != nil {
-			freeBuilderViaBuild(b)
-			return nil, err
-		}
-		b = C.sandlock_sandbox_builder_time_start(b, C.uint64_t(secs))
+		str(func(b *C.sandlock_builder_t, c *C.char) *C.sandlock_builder_t {
+			return C.sandlock_sandbox_builder_time_start(b, c)
+		}, s.TimeStart)
 	}
-	if s.NoRandomizeMemory {
-		b = C.sandlock_sandbox_builder_no_randomize_memory(b, cbool(true))
-	}
-	if s.NoHugePages {
-		b = C.sandlock_sandbox_builder_no_huge_pages(b, cbool(true))
-	}
-	if s.DeterministicDirs {
-		b = C.sandlock_sandbox_builder_deterministic_dirs(b, cbool(true))
-	}
+	// The bool setters are called unconditionally. Sending them only when true
+	// would leave the false side inexpressible from Go and pin the binding to
+	// today's core defaults; the core owns what an unset flag means.
+	b = C.sandlock_sandbox_builder_no_randomize_memory(b, cbool(s.NoRandomizeMemory))
+	b = C.sandlock_sandbox_builder_no_huge_pages(b, cbool(s.NoHugePages))
+	b = C.sandlock_sandbox_builder_deterministic_dirs(b, cbool(s.DeterministicDirs))
 
 	// Environment.
-	if s.CleanEnv {
-		b = C.sandlock_sandbox_builder_clean_env(b, cbool(true))
-	}
+	b = C.sandlock_sandbox_builder_clean_env(b, cbool(s.CleanEnv))
 	for k, v := range s.Env {
 		ck, cv := C.CString(k), C.CString(v)
 		b = C.sandlock_sandbox_builder_env_var(b, ck, cv)
@@ -351,17 +374,14 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 		C.free(unsafe.Pointer(cv))
 	}
 
-	// Misc.
-	if s.UID != nil || s.GID != nil {
-		if s.UID == nil || s.GID == nil {
-			freeBuilderViaBuild(b)
-			return nil, fmt.Errorf("UID and GID must both be set (or both unset)")
-		}
-		b = C.sandlock_sandbox_builder_user(b, C.uint32_t(*s.UID), C.uint32_t(*s.GID))
+	// Misc. RunAs carries both ids, so there is no "uid without gid" state for
+	// this binding to check for: the core models the same thing as a single
+	// Option<RunAs> (crates/sandlock-core/src/sandbox/builder.rs), and the
+	// type now matches it.
+	if s.User != nil {
+		b = C.sandlock_sandbox_builder_user(b, C.uint32_t(s.User.UID), C.uint32_t(s.User.GID))
 	}
-	if s.NoCoredump {
-		b = C.sandlock_sandbox_builder_no_coredump(b, cbool(true))
-	}
+	b = C.sandlock_sandbox_builder_no_coredump(b, cbool(s.NoCoredump))
 
 	// Copy-on-write branch handling.
 	if s.FSStorage != "" {
@@ -369,11 +389,15 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 			return C.sandlock_sandbox_builder_fs_storage(b, c)
 		}, s.FSStorage)
 	}
-	if s.OnExit != BranchActionDefault {
-		b = C.sandlock_sandbox_builder_on_exit(b, C.uint8_t(s.OnExit-1))
+	// The discriminants are the ABI's, so they travel unshifted: a value with
+	// no variant is reported by the core naming the number the caller wrote
+	// (the on_exit / on_error setters in crates/sandlock-ffi/src/lib.rs latch
+	// "unrecognized branch action N").
+	if s.OnExit != nil {
+		b = C.sandlock_sandbox_builder_on_exit(b, C.uint8_t(*s.OnExit))
 	}
-	if s.OnError != BranchActionDefault {
-		b = C.sandlock_sandbox_builder_on_error(b, C.uint8_t(s.OnError-1))
+	if s.OnError != nil {
+		b = C.sandlock_sandbox_builder_on_error(b, C.uint8_t(*s.OnError))
 	}
 	if s.PolicyFn != nil {
 		b = C.sandlock_sandbox_builder_policy_fn(
@@ -398,21 +422,15 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 	return policyPtr, nil
 }
 
-// freeBuilderViaBuild consumes a builder that will not be used, so it is not
-// leaked. The FFI exposes no builder-free entry point; build() is the only
-// consumer, so we build and immediately free the resulting policy (or discard
-// a build error). Reached only on the rare numeric-parse error paths after the
-// builder already exists.
-func freeBuilderViaBuild(b *C.sandlock_builder_t) {
-	var errCode C.int
-	var errMsg *C.char
-	p := C.sandlock_sandbox_build(b, &errCode, &errMsg)
-	if errMsg != nil {
-		C.sandlock_string_free(errMsg)
+// sliceHead returns a C pointer to the first element of vals, or nil for an
+// empty slice (Go cannot address element zero of one). The length travels
+// separately, so nil-with-zero-length and a real pointer describe the same
+// empty list to the core.
+func sliceHead(vals []uint32) *C.uint32_t {
+	if len(vals) == 0 {
+		return nil
 	}
-	if p != nil {
-		C.sandlock_sandbox_free(p)
-	}
+	return (*C.uint32_t)(unsafe.Pointer(&vals[0]))
 }
 
 // cArgv converts a command into a C argv array. Each element and the array
@@ -542,13 +560,16 @@ func argvPtr(argv []*C.char) (**C.char, C.uint) {
 	return (**C.char)(unsafe.Pointer(&argv[0])), C.uint(len(argv))
 }
 
-// cName converts the sandbox name to a C string, returning nil for the empty
-// name (which tells the FFI to auto-generate one).
+// cName converts the sandbox name to a C string. Only an unset Name (nil)
+// becomes the NULL that tells the FFI to auto-generate one; a name the caller
+// did set is forwarded as written, empty string included, so the core's own
+// verdict on it reaches the caller instead of being turned into a random name
+// here.
 func (s *Sandbox) cName() *C.char {
-	if s.Name == "" {
+	if s.Name == nil {
 		return nil
 	}
-	return C.CString(s.Name)
+	return C.CString(*s.Name)
 }
 
 func freeName(c *C.char) {
@@ -610,8 +631,8 @@ func (s *Sandbox) Run(ctx context.Context, cmd ...string) (*Result, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if len(cmd) == 0 {
-		return nil, fmt.Errorf("sandlock: empty command")
+	if err := checkCommand(cmd); err != nil {
+		return nil, err
 	}
 	policyPtr, err := s.buildPolicy()
 	if err != nil {
@@ -654,8 +675,8 @@ func (s *Sandbox) RunInteractive(ctx context.Context, cmd ...string) (int, error
 	if err := ctx.Err(); err != nil {
 		return -1, err
 	}
-	if len(cmd) == 0 {
-		return -1, fmt.Errorf("sandlock: empty command")
+	if err := checkCommand(cmd); err != nil {
+		return -1, err
 	}
 	policyPtr, err := s.buildPolicy()
 	if err != nil {
@@ -672,6 +693,12 @@ func (s *Sandbox) RunInteractive(ctx context.Context, cmd ...string) (int, error
 	name := s.cName()
 	defer freeName(name)
 
+	// sandlock_run_interactive returns the child's exit code, and also -1 for
+	// every failure to get that far (null policy, bad name, no runtime, run
+	// failed), with no way to tell the two apart and no message. The code is
+	// handed back as the core reported it rather than guessing a verdict here;
+	// the fix is an error out-param on that C entry point, not a rule invented
+	// in this binding.
 	code := int(C.sandlock_run_interactive(policyPtr, name, ap, ac))
 	return code, nil
 }
@@ -683,8 +710,8 @@ func (s *Sandbox) DryRun(ctx context.Context, cmd ...string) (*DryRunResult, err
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if len(cmd) == 0 {
-		return nil, fmt.Errorf("sandlock: empty command")
+	if err := checkCommand(cmd); err != nil {
+		return nil, err
 	}
 	policyPtr, err := s.buildPolicy()
 	if err != nil {
@@ -703,7 +730,11 @@ func (s *Sandbox) DryRun(ctx context.Context, cmd ...string) (*DryRunResult, err
 
 	r := C.sandlock_dry_run(policyPtr, name, ap, ac)
 	if r == nil {
-		return nil, fmt.Errorf("sandlock: dry run failed (Workdir is required; check that readable paths exist)")
+		// sandlock_dry_run signals every failure the same way, with a null
+		// pointer and no message, so this says only what the binding actually
+		// knows. Naming a probable cause here would attribute a missing
+		// runtime or a failed fork to whichever field this text guessed at.
+		return nil, fmt.Errorf("sandlock: dry run failed")
 	}
 	defer C.sandlock_dry_run_result_free(r)
 
@@ -806,8 +837,8 @@ type Process struct {
 // Spawn forks the sandboxed child, installs the policy, and releases it to
 // exec cmd without waiting. Use the returned Process to manage its lifecycle.
 func (s *Sandbox) Spawn(cmd ...string) (*Process, error) {
-	if len(cmd) == 0 {
-		return nil, fmt.Errorf("sandlock: empty command")
+	if err := checkCommand(cmd); err != nil {
+		return nil, err
 	}
 	policyPtr, err := s.buildPolicy()
 	if err != nil {
@@ -863,13 +894,8 @@ func fdFile(fd C.int, name string) *os.File {
 // goroutine interrupts a blocked Wait; Close reaps the child and closes the
 // streams. Wait closes a still-open piped Stdin for you to deliver EOF.
 func (s *Sandbox) Popen(stdio Stdio, cmd ...string) (*Process, error) {
-	if len(cmd) == 0 {
-		return nil, fmt.Errorf("sandlock: empty command")
-	}
-	for _, m := range []StdioMode{stdio.Stdin, stdio.Stdout, stdio.Stderr} {
-		if m > StdioNull {
-			return nil, fmt.Errorf("sandlock: invalid StdioMode %d", uint32(m))
-		}
+	if err := checkCommand(cmd); err != nil {
+		return nil, err
 	}
 	policyPtr, err := s.buildPolicy()
 	if err != nil {
@@ -885,6 +911,28 @@ func (s *Sandbox) Popen(stdio Stdio, cmd ...string) (*Process, error) {
 	ap, ac := argvPtr(argv)
 	name := s.cName()
 	defer freeName(name)
+
+	// A StdioMode with no variant is a representation problem, not a policy
+	// one: sandlock_popen does diagnose it, and names the stream, but it has
+	// no error out-param, so it writes that diagnosis to this process's
+	// stderr and returns null. The caller would get "popen failed" and the
+	// only actionable text would land somewhere a server or a test harness
+	// cannot capture. Until that entry point grows the err/err_msg pair
+	// sandlock_sandbox_build has, name it here, the way the Python SDK does
+	// with StdioMode(...) for the same input.
+	for _, stream := range []struct {
+		field string
+		mode  StdioMode
+	}{
+		{"Stdin", stdio.Stdin}, {"Stdout", stdio.Stdout}, {"Stderr", stdio.Stderr},
+	} {
+		if stream.mode > StdioNull {
+			return nil, fmt.Errorf(
+				"sandlock: %s: invalid StdioMode %d (valid: %d=inherit, %d=piped, %d=null)",
+				stream.field, uint32(stream.mode), StdioInherit, StdioPiped, StdioNull,
+			)
+		}
+	}
 
 	fdIn, fdOut, fdErr := C.int(-1), C.int(-1), C.int(-1)
 	h := C.sandlock_popen(
@@ -1048,10 +1096,14 @@ func (p *Process) Ports() (map[int]int, error) {
 	}
 	out := make(map[int]int, len(m))
 	for k, v := range m {
-		var vp int
-		if _, err := fmt.Sscanf(k, "%d", &vp); err == nil {
-			out[vp] = v
+		// A key the core emitted that does not parse is malformed data, the
+		// same as a malformed document; report it rather than dropping the
+		// mapping and handing back a table that quietly lost an entry.
+		vp, err := strconv.Atoi(k)
+		if err != nil {
+			return nil, fmt.Errorf("sandlock: parsing port mappings: virtual port %q: %w", k, err)
 		}
+		out[vp] = v
 	}
 	return out, nil
 }

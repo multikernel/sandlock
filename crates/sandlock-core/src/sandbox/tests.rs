@@ -437,3 +437,63 @@ async fn a_finished_capture_survives_a_cancellation_at_the_sibling_join() {
         "a capture that finished before the cancellation must still be parked",
     );
 }
+
+// ---------------------------------------------------------------
+// Confinement::try_from
+// ---------------------------------------------------------------
+
+#[test]
+fn a_default_sandbox_confines() {
+    // The shape every binding produces when the caller says nothing about the
+    // COW branch: `build()` resolves both branch actions to the core's
+    // default. `Confinement::try_from` used to demand `on_error == Abort`,
+    // which no default-built sandbox has, so `confine()` failed for the
+    // policy in the SDK quickstarts.
+    let sb = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_write("/tmp")
+        .build()
+        .expect("a read/write-only policy builds");
+    let c = Confinement::try_from(&sb).expect("a default sandbox must be confinable");
+    assert_eq!(c.fs_readable, vec![PathBuf::from("/usr")]);
+    assert_eq!(c.fs_writable, vec![PathBuf::from("/tmp")]);
+}
+
+#[test]
+fn branch_actions_do_not_block_a_confinement() {
+    // A confinement has no COW branch to act on, so neither action can change
+    // what it does. Every spelling has to be accepted, not just the two that
+    // the removed check happened to name.
+    for on_exit in [BranchAction::Commit, BranchAction::Abort, BranchAction::Keep] {
+        for on_error in [BranchAction::Commit, BranchAction::Abort, BranchAction::Keep] {
+            let sb = Sandbox::builder()
+                .fs_read("/usr")
+                .on_exit(on_exit.clone())
+                .on_error(on_error.clone())
+                .build()
+                .expect("branch actions alone do not make a policy invalid");
+            assert!(
+                Confinement::try_from(&sb).is_ok(),
+                "on_exit={:?} on_error={:?} must still confine",
+                on_exit,
+                on_error,
+            );
+        }
+    }
+}
+
+#[test]
+fn a_field_a_confinement_cannot_honor_is_still_refused() {
+    // The guard rail for the test above: dropping the branch-action rows must
+    // not have loosened the list itself.
+    let sb = Sandbox::builder()
+        .fs_read("/usr")
+        .cwd("/tmp")
+        .build()
+        .expect("cwd alone is a valid sandbox");
+    let err = Confinement::try_from(&sb).expect_err("cwd cannot be applied in place");
+    assert!(
+        matches!(err, SandboxError::UnsupportedForConfine(ref f) if f.contains("cwd")),
+        "expected cwd to be named, got {err:?}",
+    );
+}

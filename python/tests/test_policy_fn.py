@@ -14,10 +14,16 @@ import pytest
 from sandlock import Sandbox, SyscallEvent, PolicyContext
 
 
-_PYTHON_READABLE = list(dict.fromkeys([
-    "/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev",
-    sys.prefix,
-]))
+# The SDK forwards every readable path to the core, which refuses one that
+# does not exist, so the list filters rather than naming `/lib64` on a host
+# (arm64, musl) that has none.
+_PYTHON_READABLE = [
+    p for p in dict.fromkeys([
+        "/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev",
+        sys.prefix,
+    ])
+    if os.path.isdir(p)
+]
 
 
 def _policy(**overrides):
@@ -210,7 +216,7 @@ class TestPolicyFnRestrict:
             return 0
 
         # Restricted: 128 MiB exceeds the tightened 64 MiB limit -> killed.
-        restricted = _policy(max_memory="256M", policy_fn=restrict_to_64mb).run(
+        restricted = _policy(max_memory=256 * 1024 * 1024, policy_fn=restrict_to_64mb).run(
             [sys.executable, "-c", alloc_128mb], timeout=15
         )
         assert b"STARTED" in restricted.stdout, restricted.stdout
@@ -218,7 +224,7 @@ class TestPolicyFnRestrict:
         assert not restricted.success, "128 MiB must exceed the 64 MiB dynamic limit"
 
         # Control: same 128 MiB under the un-restricted 256 MiB ceiling -> OK.
-        baseline = _policy(max_memory="256M").run(
+        baseline = _policy(max_memory=256 * 1024 * 1024).run(
             [sys.executable, "-c", alloc_128mb], timeout=15
         )
         assert b"ALLOC_OK" in baseline.stdout, baseline.stdout

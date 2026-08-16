@@ -1,9 +1,11 @@
 use crate::sandbox::{ByteSize, Sandbox};
-use crate::error::SandlockError;
+use crate::error::{SandboxError, SandlockError};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::collections::HashMap;
 use std::time::SystemTime;
+
+pub mod canonical;
 
 /// Program identity supplied by a profile alongside the policy.
 /// Not a `Sandbox` field — passed separately to the sandbox runner.
@@ -217,7 +219,7 @@ pub fn parse_input(input: ProfileInput) -> Result<(Sandbox, ProgramSpec), Sandlo
     // [determinism]
     if let Some(s) = input.determinism.random_seed { b = b.random_seed(s); }
     if let Some(s) = input.determinism.time_start.as_deref() {
-        b = b.time_start(parse_time_start(s)?);
+        b = b.time_start(parse_time_start(s, TIME_START_LABEL).map_err(SandlockError::Sandbox)?);
     }
     if input.determinism.deterministic_dirs        { b = b.deterministic_dirs(true); }
     if input.determinism.no_randomize_memory       { b = b.no_randomize_memory(true); }
@@ -335,15 +337,71 @@ pub fn parse_mount_spec(s: &str) -> Result<(PathBuf, PathBuf, bool), SandlockErr
     Ok((PathBuf::from(virt), PathBuf::from(host), read_only))
 }
 
+/// The knob name the profile loader puts in a rejected `time_start`.
+///
+/// Shared by both profile paths (`parse_input` and the canonical resolver) so
+/// the two cannot drift: `parse_error_text_matches_what_the_cli_prints` asserts
+/// they produce the same text.
+pub(crate) const TIME_START_LABEL: &str = "[determinism].time_start";
+
 /// Parses an RFC3339 timestamp string into `SystemTime`.
-fn parse_time_start(s: &str) -> Result<SystemTime, SandlockError> {
-    use crate::error::SandboxError;
-    let ts: jiff::Timestamp = s.parse().map_err(|e| {
-        SandlockError::Sandbox(SandboxError::Invalid(
-            format!("invalid [determinism].time_start {s:?}: {e}"),
-        ))
-    })?;
-    Ok(ts.into())
+///
+/// This is the one place the `time_start` grammar lives: the profile loader,
+/// the CLI's `--time-start` and the C ABI setter all resolve their string
+/// through it, so a rejected value reads the same wherever it was typed.
+/// `label` names the knob that carried the value, the way
+/// [`crate::sandbox::NetRule::parse_allow`] names `--net-allow`; it is the only
+/// part of the message that differs between surfaces.
+pub fn parse_time_start(s: &str, label: &str) -> Result<SystemTime, SandboxError> {
+    Ok(parse_timestamp(s, label)?.into())
+}
+
+/// Parses an RFC3339 timestamp string, keeping the `jiff::Timestamp`.
+///
+/// `SystemTime` cannot represent a pre-epoch instant as a plain second count,
+/// so the canonical form resolves the string through this instead and does its
+/// own epoch split.
+pub(crate) fn parse_timestamp(s: &str, label: &str) -> Result<jiff::Timestamp, SandboxError> {
+    s.parse()
+        .map_err(|e| SandboxError::Invalid(format!("invalid {label} {s:?}: {e}")))
+}
+
+/// Resolves an epoch split into `SystemTime`, without going through a grammar.
+///
+/// This is the numeric door to the instant [`parse_time_start`] reaches through
+/// RFC 3339, and it takes exactly the pair
+/// [`CanonicalTimestamp`](canonical::CanonicalTimestamp) hands out: whole
+/// seconds, which may be negative, plus a non-negative sub-second remainder.
+///
+/// It exists because the two halves have to meet. A binding that consumes
+/// `sandlock_profile_parse` holds a resolved instant, not the text it came
+/// from, and the string setter is the only other way back into a builder; so
+/// without this door every such binding would have to render RFC 3339 itself,
+/// which is a grammar in the binding and the exact drift this module removes.
+///
+/// `nanoseconds` at or above a full second is rejected rather than carried
+/// into the seconds: the canonical form normalizes, so a caller that has not
+/// is working from a different contract, and quietly agreeing with it would
+/// hide that.
+pub fn time_start_from_epoch(
+    seconds: i64,
+    nanoseconds: u32,
+    label: &str,
+) -> Result<SystemTime, SandboxError> {
+    if nanoseconds >= 1_000_000_000 {
+        return Err(SandboxError::Invalid(format!(
+            "invalid {label}: nanoseconds must be below 1000000000, got {nanoseconds}"
+        )));
+    }
+    // i64 seconds times a billion is about 9.2e27, well inside i128.
+    let total = i128::from(seconds) * 1_000_000_000 + i128::from(nanoseconds);
+    jiff::Timestamp::from_nanosecond(total)
+        .map_err(|e| {
+            SandboxError::Invalid(format!(
+                "invalid {label} {{seconds: {seconds}, nanoseconds: {nanoseconds}}}: {e}"
+            ))
+        })
+        .map(Into::into)
 }
 
 // ============================================================
@@ -423,10 +481,16 @@ fn byte_size_str(b: crate::sandbox::ByteSize) -> String {
 }
 
 /// Render an RFC3339 timestamp from a `SystemTime` (inverse of `parse_time_start`).
+///
+/// Both halves of the grammar have to survive the round trip, so this goes
+/// through the same signed conversion `parse_time_start` comes back on rather
+/// than through `duration_since`, which is unsigned and errors before 1970,
+/// and rather than through whole seconds, which drops the sub-second part.
+/// Rendering either of those away would make the effective policy this prints
+/// (`sandlock inspect --toml`, the control-socket `config` verb, `learn`)
+/// disagree with the policy that is actually running.
 fn time_start_str(t: SystemTime) -> Option<String> {
-    let d = t.duration_since(SystemTime::UNIX_EPOCH).ok()?;
-    let ts = jiff::Timestamp::from_second(d.as_secs() as i64).ok()?;
-    Some(ts.to_string())
+    jiff::Timestamp::try_from(t).ok().map(|ts| ts.to_string())
 }
 
 /// Build a `ProfileInput` from a `Sandbox` (the effective policy).
@@ -578,13 +642,20 @@ fn dirs_or_fallback() -> PathBuf {
         .join("sandlock")
 }
 
-/// Parse a TOML profile string into a Sandbox + ProgramSpec.
-pub fn parse_profile(content: &str) -> Result<(Sandbox, ProgramSpec), SandlockError> {
-    let input: ProfileInput = toml::from_str(content)
+/// Deserialize a TOML profile string into the raw schema.
+///
+/// Shared by `parse_profile` and `canonical::parse` so both report a syntax or
+/// unknown-key problem with the same wording.
+fn deserialize_profile(content: &str) -> Result<ProfileInput, SandlockError> {
+    toml::from_str(content)
         .map_err(|e| SandlockError::Sandbox(crate::error::SandboxError::Invalid(
             format!("TOML parse error: {e}"),
-        )))?;
-    parse_input(input)
+        )))
+}
+
+/// Parse a TOML profile string into a Sandbox + ProgramSpec.
+pub fn parse_profile(content: &str) -> Result<(Sandbox, ProgramSpec), SandlockError> {
+    parse_input(deserialize_profile(content)?)
 }
 
 /// Load a profile by name.
@@ -636,6 +707,28 @@ mod tests {
             "internal COW upper grant leaked into profile: {:?}",
             profile.filesystem.read
         );
+    }
+
+    #[test]
+    fn time_start_round_trips_through_the_effective_policy() {
+        // The two spellings the grammar accepts and a `SystemTime` cannot
+        // carry as a plain second count: an instant before 1970, and a
+        // sub-second remainder. Both reach `Sandbox::time_start` from a
+        // profile, so both have to come back out of one.
+        for stamp in [
+            "1969-07-20T20:17:00Z",
+            "2026-01-01T00:00:00.5Z",
+            "1969-12-31T23:59:59.5Z",
+            "2026-01-01T00:00:00Z",
+        ] {
+            let (sb, _) = parse_profile(&format!("[determinism]\ntime_start = \"{stamp}\"\n"))
+                .unwrap_or_else(|e| panic!("{stamp} must parse: {e}"));
+            assert_eq!(
+                sandbox_to_profile(&sb, &[]).determinism.time_start.as_deref(),
+                Some(stamp),
+                "{stamp} did not survive the round trip through the effective policy",
+            );
+        }
     }
 
     #[test]
@@ -866,6 +959,49 @@ mod tests {
         let err = parse_profile(toml).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("time_start"), "got: {msg}");
+    }
+
+    /// The two doors into `time_start` have to reach the same instant, or a
+    /// profile means one thing when it is loaded as text and another when a
+    /// binding feeds the resolved form back.
+    #[test]
+    fn epoch_door_and_grammar_door_reach_the_same_instant() {
+        for text in [
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00.5Z",
+            "1969-07-20T20:17:00Z",
+            // Half a second before the epoch: the case where the canonical
+            // split borrows, so seconds is -1 and the remainder is positive.
+            "1969-12-31T23:59:59.5Z",
+            "1970-01-01T00:00:00Z",
+        ] {
+            let ts = parse_timestamp(text, "time_start").unwrap();
+            let split = canonical::CanonicalTimestamp::from(ts);
+            let through_epoch =
+                time_start_from_epoch(split.seconds, split.nanoseconds, "time_start").unwrap();
+            assert_eq!(
+                through_epoch,
+                parse_time_start(text, "time_start").unwrap(),
+                "{text} resolved differently through the epoch door"
+            );
+        }
+    }
+
+    #[test]
+    fn epoch_door_rejects_an_unnormalized_remainder() {
+        let err = time_start_from_epoch(0, 1_000_000_000, "time_start").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("nanoseconds must be below 1000000000"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn epoch_door_rejects_an_instant_outside_the_supported_range() {
+        let err = time_start_from_epoch(i64::MAX, 0, "time_start").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("invalid time_start"), "got: {msg}");
     }
 
     #[test]

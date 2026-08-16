@@ -12,7 +12,13 @@ from sandlock import Sandbox, ExitReason
 from sandlock._sdk import _lib
 
 
-_BIN_READABLE = ["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc"]
+# The SDK forwards every readable path to the core, which refuses one that
+# does not exist, so the list filters rather than naming `/lib64` on a host
+# (arm64, musl) that has none.
+_BIN_READABLE = [
+    p for p in ("/usr", "/lib", "/lib64", "/bin", "/etc", "/proc")
+    if os.path.isdir(p)
+]
 
 
 def _policy(**overrides):

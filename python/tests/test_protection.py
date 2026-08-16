@@ -117,14 +117,22 @@ def test_sandbox_build_with_idempotent_protection_kwargs():
 
 
 def test_sandbox_build_rejects_out_of_range_protection_int():
-    """An integer outside the known `Protection` enum range raises
-    `ValueError` at build time — before reaching the FFI."""
+    """A discriminant this SDK does not know gets the core's verdict.
+
+    It used to be caught here by a local range check whose own docstring
+    explained why: the Rust setter dropped an unrecognized value and the
+    build succeeded, so a caller was told nothing. The setter now latches it
+    and the check is the core's, which is where it can also serve the Go
+    caller and any other binding.
+    """
     import pytest
 
     from sandlock._sdk import _NativePolicy
 
     sb = Sandbox(fs_readable=["/usr"], allow_degraded=[99])
-    with pytest.raises(ValueError, match="allow_degraded"):
+    with pytest.raises(
+        RuntimeError, match="allow_degraded: unrecognized protection 99"
+    ):
         _NativePolicy.from_dataclass(sb)
 
 
@@ -135,26 +143,29 @@ def test_sandbox_build_rejects_out_of_range_in_disable():
     from sandlock._sdk import _NativePolicy
 
     sb = Sandbox(fs_readable=["/usr"], disable=[100, 200])
-    with pytest.raises(ValueError, match="disable"):
+    with pytest.raises(RuntimeError, match="disable: unrecognized protection 100"):
         _NativePolicy.from_dataclass(sb)
 
 
 def test_sandbox_build_rejects_negative_protection_int():
-    """Negative ints are not valid Protection discriminants — must
-    raise rather than wrap to a large unsigned value at the FFI."""
+    """Negative ints must raise rather than wrap to a large unsigned value.
+
+    This one stays on this side: ctypes converts to uint32 by masking, so -1
+    would arrive as 4294967295 and the core would answer for a value the
+    caller never wrote.
+    """
     import pytest
 
     from sandlock._sdk import _NativePolicy
 
     sb = Sandbox(fs_readable=["/usr"], allow_degraded=[-1])
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="uint32 parameter"):
         _NativePolicy.from_dataclass(sb)
 
 
 def test_sandbox_build_accepts_plain_int_in_valid_range():
     """Callers using plain `int` (not the `Protection` IntEnum) for
-    values in the valid range must still succeed — the validator
-    coerces through `Protection(int)`."""
+    values in the valid range must still succeed."""
     from sandlock._sdk import _NativePolicy
 
     sb = Sandbox(fs_readable=["/usr"], allow_degraded=[4])  # 4 == SIGNAL_SCOPE

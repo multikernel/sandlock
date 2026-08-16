@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Result};
 use sandlock_core::policy_fn::{SyscallEvent, Verdict};
 use sandlock_core::profile::{FilesystemSection, ProfileInput};
-use sandlock_core::sandbox::BranchAction;
+use sandlock_core::sandbox::{BranchAction, ByteSize};
 use sandlock_core::Sandbox;
 
 
@@ -709,7 +709,10 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         profile_out.network.allow_bind = merged_bind;
 
         // Limits: take the max of old vs observed.
-        profile_out.limits.memory = max_bytesize(existing.limits.memory.as_deref(), observed.limits.memory.as_deref());
+        profile_out.limits.memory = max_bytesize(
+            existing.limits.memory.as_deref(),
+            observed.limits.memory.as_deref(),
+        )?;
         profile_out.limits.processes = max_opt(existing.limits.processes, observed.limits.processes);
         profile_out.limits.open_files = max_opt(existing.limits.open_files, observed.limits.open_files);
     }
@@ -750,32 +753,29 @@ pub async fn run(args: LearnArgs) -> Result<()> {
 }
 
 
-/// Parse a bytesize string like "128M", "1G", "512K" into bytes.
-fn parse_bytesize_bytes(s: &str) -> Option<u64> {
-    let s = s.trim();
-    let (num, mult) = if let Some(n) = s.strip_suffix('G') {
-        (n, 1024 * 1024 * 1024u64)
-    } else if let Some(n) = s.strip_suffix('M') {
-        (n, 1024 * 1024u64)
-    } else if let Some(n) = s.strip_suffix('K') {
-        (n, 1024u64)
-    } else {
-        (s, 1u64)
-    };
-    num.trim().parse::<u64>().ok().map(|n| n * mult)
-}
-
 /// Return the larger of two optional bytesize strings.
-fn max_bytesize(a: Option<&str>, b: Option<&str>) -> Option<String> {
-    match (a, b) {
+///
+/// Both sides are read with the core's own grammar. A merge file is written by
+/// hand, so a size it carries is whatever the flag and the profile accept, and
+/// a second grammar here would disagree with them: this one was case sensitive
+/// where `ByteSize::parse` is not, so `512m` resolved to nothing, and the
+/// caller's `unwrap_or(0)` then made it the smaller of the two. A profile
+/// merged against `1M` came back with a ceiling five hundred times lower than
+/// the one it went in with, and nothing said so.
+fn max_bytesize(a: Option<&str>, b: Option<&str>) -> Result<Option<String>> {
+    let parse = |s: &str| {
+        ByteSize::parse(s)
+            .map(|b| b.0)
+            .map_err(|e| anyhow!("[limits].memory in the merge file: {e}"))
+    };
+    Ok(match (a, b) {
         (None, None) => None,
         (Some(s), None) | (None, Some(s)) => Some(s.to_string()),
         (Some(sa), Some(sb)) => {
-            let va = parse_bytesize_bytes(sa).unwrap_or(0);
-            let vb = parse_bytesize_bytes(sb).unwrap_or(0);
+            let (va, vb) = (parse(sa)?, parse(sb)?);
             Some(if va >= vb { sa.to_string() } else { sb.to_string() })
         }
-    }
+    })
 }
 
 /// Return the larger of two optional u32 values.
@@ -784,5 +784,55 @@ fn max_opt(a: Option<u32>, b: Option<u32>) -> Option<u32> {
         (None, None) => None,
         (Some(v), None) | (None, Some(v)) => Some(v),
         (Some(va), Some(vb)) => Some(va.max(vb)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merging_a_size_reads_it_with_the_cores_grammar() {
+        // A lowercase suffix is what the flag and the profile both accept, so
+        // it has to mean the same here. The private parser this replaced was
+        // case sensitive, resolved "512m" to nothing, and the caller turned
+        // that into 0, so merging a 512MiB profile against a 1MiB observation
+        // silently rewrote the ceiling down to 1MiB.
+        let merged = max_bytesize(Some("512m"), Some("1M")).unwrap();
+        assert_eq!(merged.as_deref(), Some("512m"));
+
+        // The same pair spelled the way the old parser could read, to show the
+        // comparison itself is unchanged.
+        assert_eq!(
+            max_bytesize(Some("512M"), Some("1M")).unwrap().as_deref(),
+            Some("512M")
+        );
+        assert_eq!(
+            max_bytesize(Some("1M"), Some("512M")).unwrap().as_deref(),
+            Some("512M")
+        );
+    }
+
+    #[test]
+    fn a_size_the_core_refuses_stops_the_merge_instead_of_becoming_zero() {
+        // Out of range and plain nonsense both used to read as 0 and lose the
+        // comparison. Naming the section matters: the value comes from a file
+        // the caller wrote, not from a flag they just typed.
+        for spec in ["17179869184G", "not-a-size", "1.5G"] {
+            let err = max_bytesize(Some(spec), Some("1M"))
+                .expect_err(&format!("{spec} must stop the merge"))
+                .to_string();
+            assert!(
+                err.contains("[limits].memory"),
+                "the error must name the field, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_sided_and_absent_limits_are_carried_through() {
+        assert_eq!(max_bytesize(None, None).unwrap(), None);
+        assert_eq!(max_bytesize(Some("8M"), None).unwrap().as_deref(), Some("8M"));
+        assert_eq!(max_bytesize(None, Some("8M")).unwrap().as_deref(), Some("8M"));
     }
 }

@@ -246,7 +246,7 @@ sandlock run --no-supervisor -r /proc -r /usr -r /lib -r /lib64 -r /bin -r /etc 
 ### Python API
 
 ```python
-from sandlock import Sandbox, confine
+from sandlock import Mount, Sandbox, confine
 
 sandbox = Sandbox(
     fs_writable=["/tmp/sandbox"],
@@ -272,7 +272,7 @@ result = agent.run(["python3", "agent.py"])
 # Chroot with per-sandbox mount (Docker-style -v, no root needed)
 chrooted = Sandbox(
     chroot="/opt/rootfs",
-    fs_mount={"/work": "/tmp/sandbox-1/work"},  # maps /work inside chroot
+    fs_mount=[Mount("/work", "/tmp/sandbox-1/work")],  # maps /work inside chroot
     fs_readable=["/usr", "/bin", "/lib", "/etc"],
     cwd="/work",
 )
