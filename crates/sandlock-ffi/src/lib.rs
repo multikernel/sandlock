@@ -58,6 +58,37 @@ pub struct sandlock_pipeline_t {
     stages: Vec<(Sandbox, Vec<String>)>,
 }
 
+/// Borrow a setter argument that the core is about to parse.
+///
+/// Reports the two conditions the core cannot see once the value is a Rust
+/// string: a null pointer, and bytes that are not UTF-8. Both are static bugs
+/// in the calling binding, and both are representation problems rather than
+/// policy ones, so this is the only diagnosis the C ABI writes itself; the
+/// grammar's verdict comes from the core untouched.
+///
+/// The reason travels back through the builder's pending-error latch and
+/// surfaces at `sandlock_sandbox_build`. Every `*const c_char` builder setter
+/// goes through here, the two-argument ones (`env_var`, `fs_mount`,
+/// `fs_mount_ro`) once per half so the message names the pointer to fix. The
+/// alternative, `to_str().unwrap_or("")`,
+/// hands the core an empty string and makes it diagnose a value the caller
+/// never passed: a path read off `readdir()` is an arbitrary byte string on
+/// Linux, so this is reachable without any bug in the caller, and the resulting
+/// empty path is a prefix of every guest path. It survives only in the entry
+/// points that take no builder, and so have nothing to latch the reason on.
+///
+/// # Safety
+/// `s` must be null or point to a NUL-terminated string that stays valid for
+/// as long as the returned borrow is used.
+unsafe fn setter_arg<'a>(s: *const c_char, setter: &str) -> Result<&'a str, String> {
+    if s.is_null() {
+        return Err(format!("{setter}: value must not be NULL"));
+    }
+    CStr::from_ptr(s)
+        .to_str()
+        .map_err(|_| format!("{setter}: value is not valid UTF-8"))
+}
+
 // ----------------------------------------------------------------
 // Sandbox Builder — filesystem
 // ----------------------------------------------------------------
@@ -68,63 +99,83 @@ pub extern "C" fn sandlock_sandbox_builder_new() -> *mut SandboxBuilder {
 }
 
 /// # Safety
-/// `b` and `path` must be valid pointers.
+/// `b` must be a valid builder pointer. `path` must be null or point at a
+/// NUL-terminated string; a null or non-UTF-8 `path` is reported by
+/// `sandlock_sandbox_build` rather than dereferenced or coerced.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_fs_read(
     b: *mut SandboxBuilder,
     path: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || path.is_null() {
+    if b.is_null() {
         return b;
     }
-    let path = CStr::from_ptr(path).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.fs_read(path)))
+    let builder = match setter_arg(path, "fs_read") {
+        Ok(path) => builder.fs_read(path),
+        Err(reason) => builder.reject(reason),
+    };
+    Box::into_raw(Box::new(builder))
 }
 
 /// # Safety
-/// `b` and `path` must be valid pointers.
+/// `b` must be a valid builder pointer. `path` must be null or point at a
+/// NUL-terminated string; a null or non-UTF-8 `path` is reported by
+/// `sandlock_sandbox_build` rather than dereferenced or coerced.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_fs_write(
     b: *mut SandboxBuilder,
     path: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || path.is_null() {
+    if b.is_null() {
         return b;
     }
-    let path = CStr::from_ptr(path).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.fs_write(path)))
+    let builder = match setter_arg(path, "fs_write") {
+        Ok(path) => builder.fs_write(path),
+        Err(reason) => builder.reject(reason),
+    };
+    Box::into_raw(Box::new(builder))
 }
 
 /// # Safety
-/// `b` and `path` must be valid pointers.
+/// `b` must be a valid builder pointer. `path` must be null or point at a
+/// NUL-terminated string; a null or non-UTF-8 `path` is reported by
+/// `sandlock_sandbox_build` rather than dereferenced or coerced.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_fs_deny(
     b: *mut SandboxBuilder,
     path: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || path.is_null() {
+    if b.is_null() {
         return b;
     }
-    let path = CStr::from_ptr(path).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.fs_deny(path)))
+    let builder = match setter_arg(path, "fs_deny") {
+        Ok(path) => builder.fs_deny(path),
+        Err(reason) => builder.reject(reason),
+    };
+    Box::into_raw(Box::new(builder))
 }
 
 /// # Safety
-/// `b` and `path` must be valid pointers.
+/// `b` must be a valid builder pointer. `path` must be null or point at a
+/// NUL-terminated string; a null or non-UTF-8 `path` is reported by
+/// `sandlock_sandbox_build` rather than dereferenced or coerced.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_fs_storage(
     b: *mut SandboxBuilder,
     path: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || path.is_null() {
+    if b.is_null() {
         return b;
     }
-    let path = CStr::from_ptr(path).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.fs_storage(path)))
+    let builder = match setter_arg(path, "fs_storage") {
+        Ok(path) => builder.fs_storage(path),
+        Err(reason) => builder.reject(reason),
+    };
+    Box::into_raw(Box::new(builder))
 }
 
 /// # Safety
@@ -148,95 +199,110 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_gpu_devices(
 }
 
 /// # Safety
-/// `b` and `path` must be valid pointers.
+/// `b` must be a valid builder pointer. `path` must be null or point at a
+/// NUL-terminated string; a null or non-UTF-8 `path` is reported by
+/// `sandlock_sandbox_build` rather than dereferenced or coerced.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_workdir(
     b: *mut SandboxBuilder,
     path: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || path.is_null() {
+    if b.is_null() {
         return b;
     }
-    let path = CStr::from_ptr(path).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.workdir(path)))
+    let builder = match setter_arg(path, "workdir") {
+        Ok(path) => builder.workdir(path),
+        Err(reason) => builder.reject(reason),
+    };
+    Box::into_raw(Box::new(builder))
 }
 
 /// # Safety
-/// `b` and `path` must be valid pointers.
+/// `b` must be a valid builder pointer. `path` must be null or point at a
+/// NUL-terminated string; a null or non-UTF-8 `path` is reported by
+/// `sandlock_sandbox_build` rather than dereferenced or coerced.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_cwd(
     b: *mut SandboxBuilder,
     path: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || path.is_null() {
+    if b.is_null() {
         return b;
     }
-    let path = CStr::from_ptr(path).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.cwd(path)))
+    let builder = match setter_arg(path, "cwd") {
+        Ok(path) => builder.cwd(path),
+        Err(reason) => builder.reject(reason),
+    };
+    Box::into_raw(Box::new(builder))
 }
 
 /// # Safety
-/// `b` and `path` must be valid pointers.
+/// `b` must be a valid builder pointer. `path` must be null or point at a
+/// NUL-terminated string; a null or non-UTF-8 `path` is reported by
+/// `sandlock_sandbox_build` rather than dereferenced or coerced.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_chroot(
     b: *mut SandboxBuilder,
     path: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || path.is_null() {
+    if b.is_null() {
         return b;
     }
-    let path = CStr::from_ptr(path).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.chroot(path)))
+    let builder = match setter_arg(path, "chroot") {
+        Ok(path) => builder.chroot(path),
+        Err(reason) => builder.reject(reason),
+    };
+    Box::into_raw(Box::new(builder))
 }
 
-/// Validate one mount pair coming in over the C ABI.
+/// Borrow both halves of a mount pair, naming whichever one it cannot take.
 ///
-/// Returns `None` (meaning "add no mount") for anything that is not a pair
-/// of non-empty UTF-8 strings. The usual `to_str().unwrap_or("")` degradation
-/// is unsafe here specifically: an empty virtual path is a prefix of *every*
-/// guest path, so `ChrootCtx::is_mounted` would match the whole tree and
-/// short-circuit both `can_read` and `can_write` to true, voiding the read
-/// and write allowlists. Core's `parse_mount_spec` enforces the same
-/// non-empty rule for `--fs-mount` specs.
+/// The same two representation verdicts as [`setter_arg`], reported per half so
+/// the message says which pointer the caller has to fix. Emptiness is not
+/// checked here: it is a policy question (an empty virtual path is a prefix of
+/// every guest path, so the read-only marking would cover the whole guest view)
+/// and the core's setter answers it, the same way `parse_mount_spec` answers it
+/// for a `VIRTUAL:HOST` profile spec.
 ///
 /// # Safety
-/// Both pointers must be non-null and point at valid NUL-terminated strings.
+/// Both pointers must be null or point at valid NUL-terminated strings.
 unsafe fn mount_pair<'a>(
+    setter: &str,
     virtual_path: *const c_char,
     host_path: *const c_char,
-) -> Option<(&'a str, &'a str)> {
-    let vp = CStr::from_ptr(virtual_path).to_str().ok()?;
-    let hp = CStr::from_ptr(host_path).to_str().ok()?;
-    if vp.is_empty() || hp.is_empty() {
-        return None;
-    }
-    Some((vp, hp))
+) -> Result<(&'a str, &'a str), String> {
+    let vp = setter_arg(virtual_path, &format!("{setter} virtual path"))?;
+    let hp = setter_arg(host_path, &format!("{setter} host path"))?;
+    Ok((vp, hp))
 }
 
 /// Add a filesystem mount mapping (virtual_path -> host_path).
 ///
-/// Both paths must be non-empty UTF-8; anything else is ignored and adds no
-/// mount (an empty virtual path would match every guest path).
+/// A null or non-UTF-8 path, and a path that is empty, are reported by
+/// `sandlock_sandbox_build` rather than dropped: a mount that silently did not
+/// happen leaves the guest a filesystem view nobody asked for.
 ///
 /// # Safety
-/// `b`, `virtual_path`, and `host_path` must be valid pointers.
+/// `b` must be a valid builder pointer. Each path must be null or point at a
+/// NUL-terminated string.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_fs_mount(
     b: *mut SandboxBuilder,
     virtual_path: *const c_char,
     host_path: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || virtual_path.is_null() || host_path.is_null() {
+    if b.is_null() {
         return b;
     }
-    let Some((vp, hp)) = mount_pair(virtual_path, host_path) else {
-        return b;
-    };
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.fs_mount(vp, hp)))
+    let builder = match mount_pair("fs_mount", virtual_path, host_path) {
+        Ok((vp, hp)) => builder.fs_mount(vp, hp),
+        Err(reason) => builder.reject(reason),
+    };
+    Box::into_raw(Box::new(builder))
 }
 
 /// Add a read-only filesystem mount mapping (virtual_path -> host_path).
@@ -256,29 +322,39 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_fs_mount(
 /// when [`sandlock_sandbox_builder_chroot`] is also set; without a chroot this
 /// call has no effect on the guest's filesystem view.
 ///
-/// Both paths must be non-empty UTF-8; anything else is ignored and adds no
-/// mount (an empty virtual path would match every guest path).
+/// A null or non-UTF-8 path, and a path that is empty, are reported by
+/// `sandlock_sandbox_build` rather than dropped. An empty virtual path is the
+/// sharper case here: it is a prefix of every guest path, so dropping the call
+/// and dropping the read-only marking are the two things the caller cannot tell
+/// apart, and one of them is a fully writable guest.
 ///
 /// # Safety
-/// `b`, `virtual_path`, and `host_path` must be valid pointers.
+/// `b` must be a valid builder pointer. Each path must be null or point at a
+/// NUL-terminated string.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_fs_mount_ro(
     b: *mut SandboxBuilder,
     virtual_path: *const c_char,
     host_path: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || virtual_path.is_null() || host_path.is_null() {
+    if b.is_null() {
         return b;
     }
-    let Some((vp, hp)) = mount_pair(virtual_path, host_path) else {
-        return b;
-    };
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.fs_mount_ro(vp, hp)))
+    let builder = match mount_pair("fs_mount_ro", virtual_path, host_path) {
+        Ok((vp, hp)) => builder.fs_mount_ro(vp, hp),
+        Err(reason) => builder.reject(reason),
+    };
+    Box::into_raw(Box::new(builder))
 }
 
 /// Set the COW branch action on successful exit.
 /// `action`: 0 = Commit, 1 = Abort, 2 = Keep.
+///
+/// Any other value is a static bug in the calling binding, not a runtime
+/// condition. It is latched in the builder and reported by
+/// `sandlock_sandbox_build`, which returns -1 with a message naming this
+/// setter and the offending value.
 ///
 /// # Safety
 /// `b` must be a valid builder pointer.
@@ -291,16 +367,20 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_on_exit(
         return b;
     }
     let builder = *Box::from_raw(b);
-    let action = match action {
-        1 => BranchAction::Abort,
-        2 => BranchAction::Keep,
-        _ => BranchAction::Commit,
+    let builder = match BranchAction::from_repr(action) {
+        Some(a) => builder.on_exit(a),
+        None => builder.reject(format!("on_exit: unrecognized branch action {action}")),
     };
-    Box::into_raw(Box::new(builder.on_exit(action)))
+    Box::into_raw(Box::new(builder))
 }
 
 /// Set the COW branch action on error exit.
 /// `action`: 0 = Commit, 1 = Abort, 2 = Keep.
+///
+/// Any other value is a static bug in the calling binding, not a runtime
+/// condition. It is latched in the builder and reported by
+/// `sandlock_sandbox_build`, which returns -1 with a message naming this
+/// setter and the offending value.
 ///
 /// # Safety
 /// `b` must be a valid builder pointer.
@@ -313,18 +393,24 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_on_error(
         return b;
     }
     let builder = *Box::from_raw(b);
-    let action = match action {
-        1 => BranchAction::Abort,
-        2 => BranchAction::Keep,
-        _ => BranchAction::Commit,
+    let builder = match BranchAction::from_repr(action) {
+        Some(a) => builder.on_error(a),
+        None => builder.reject(format!("on_error: unrecognized branch action {action}")),
     };
-    Box::into_raw(Box::new(builder.on_error(action)))
+    Box::into_raw(Box::new(builder))
 }
 
 // ----------------------------------------------------------------
 // Sandbox Builder — resource limits
 // ----------------------------------------------------------------
 
+/// Set the memory ceiling, in bytes.
+///
+/// Zero is refused, reported by `sandlock_sandbox_build`: it is also the
+/// sentinel the supervisor carries for "no ceiling", so an explicit zero would
+/// install a ceiling of zero while the synthetic `/proc/meminfo` reports the
+/// sandbox unlimited. Omit the call to leave memory unlimited.
+///
 /// # Safety
 /// `b` must be a valid builder pointer.
 #[no_mangle]
@@ -339,6 +425,12 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_max_memory(
     Box::into_raw(Box::new(builder.max_memory(ByteSize(bytes))))
 }
 
+/// Set the COW storage quota, in bytes.
+///
+/// Zero is accepted here, unlike `sandlock_sandbox_builder_max_memory`: for a
+/// disk quota zero is the documented spelling of "unlimited" and has no second
+/// reading.
+///
 /// # Safety
 /// `b` must be a valid builder pointer.
 #[no_mangle]
@@ -353,6 +445,12 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_max_disk(
     Box::into_raw(Box::new(builder.max_disk(ByteSize(bytes))))
 }
 
+/// Set the peak concurrent process limit.
+///
+/// Zero is refused, reported by `sandlock_sandbox_build`: the supervisor
+/// compares `proc_count >= limit`, so a limit of zero denies every fork with
+/// EAGAIN however few processes are alive. Omit the call for the default cap.
+///
 /// # Safety
 /// `b` must be a valid builder pointer.
 #[no_mangle]
@@ -381,6 +479,13 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_max_cpu(
     Box::into_raw(Box::new(builder.max_cpu(pct)))
 }
 
+/// Set the processor count the guest sees.
+///
+/// Zero is refused, reported by `sandlock_sandbox_build`: it reaches the
+/// synthetic procfs as an empty `/proc/cpuinfo` and an affinity mask with no
+/// bits, so the guest reads `nproc = 0`. Omit the call to expose the host
+/// processor count.
+///
 /// # Safety
 /// `b` must be a valid builder pointer.
 #[no_mangle]
@@ -395,6 +500,14 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_num_cpus(
     Box::into_raw(Box::new(builder.num_cpus(n)))
 }
 
+/// Pin the guest to the listed CPU cores.
+///
+/// A `len` of zero is refused, reported by `sandlock_sandbox_build`: an
+/// affinity mask with no bits is what `sched_setaffinity(2)` rejects with
+/// EINVAL, and unlike `sandlock_sandbox_builder_gpu_devices`, where an empty
+/// list means "every device present", omitting this call is already how "every
+/// core" is spelled. Omit it rather than passing an empty list.
+///
 /// # Safety
 /// `b` must be a valid builder pointer.  `cores` must point to `len` u32 values.
 #[no_mangle]
@@ -424,33 +537,43 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_cpu_cores(
 /// invalid specs surface as a build error.
 ///
 /// # Safety
-/// `b` and `spec` must be valid pointers.
+/// `b` must be a valid builder pointer. `spec` must be null or point at a
+/// NUL-terminated string; a null or non-UTF-8 `spec` is reported by
+/// `sandlock_sandbox_build` rather than dereferenced or coerced.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_net_allow(
     b: *mut SandboxBuilder,
     spec: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || spec.is_null() {
+    if b.is_null() {
         return b;
     }
-    let spec = CStr::from_ptr(spec).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.net_allow(spec)))
+    let builder = match setter_arg(spec, "net_allow") {
+        Ok(spec) => builder.net_allow(spec),
+        Err(reason) => builder.reject(reason),
+    };
+    Box::into_raw(Box::new(builder))
 }
 
 /// # Safety
-/// `b` and `spec` must be valid pointers.
+/// `b` must be a valid builder pointer. `spec` must be null or point at a
+/// NUL-terminated string; a null or non-UTF-8 `spec` is reported by
+/// `sandlock_sandbox_build` rather than dereferenced or coerced.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_net_deny(
     b: *mut SandboxBuilder,
     spec: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || spec.is_null() {
+    if b.is_null() {
         return b;
     }
-    let spec = CStr::from_ptr(spec).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.net_deny(spec)))
+    let builder = match setter_arg(spec, "net_deny") {
+        Ok(spec) => builder.net_deny(spec),
+        Err(reason) => builder.reject(reason),
+    };
+    Box::into_raw(Box::new(builder))
 }
 
 /// Append a `--net-allow-bind` port spec: a comma-separated list of single
@@ -459,18 +582,23 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_net_deny(
 /// (including `"*"` mixed with port lists) surface as a build error.
 ///
 /// # Safety
-/// `b` and `spec` must be valid pointers.
+/// `b` must be a valid builder pointer. `spec` must be null or point at a
+/// NUL-terminated string; a null or non-UTF-8 `spec` is reported by
+/// `sandlock_sandbox_build` rather than dereferenced or coerced.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_net_allow_bind(
     b: *mut SandboxBuilder,
     spec: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || spec.is_null() {
+    if b.is_null() {
         return b;
     }
-    let spec = CStr::from_ptr(spec).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.net_allow_bind(spec)))
+    let builder = match setter_arg(spec, "net_allow_bind") {
+        Ok(spec) => builder.net_allow_bind(spec),
+        Err(reason) => builder.reject(reason),
+    };
+    Box::into_raw(Box::new(builder))
 }
 
 /// Append a `--net-deny-bind` port spec: a comma-separated list of single
@@ -479,18 +607,23 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_net_allow_bind(
 /// surface as a build error.
 ///
 /// # Safety
-/// `b` and `spec` must be valid pointers.
+/// `b` must be a valid builder pointer. `spec` must be null or point at a
+/// NUL-terminated string; a null or non-UTF-8 `spec` is reported by
+/// `sandlock_sandbox_build` rather than dereferenced or coerced.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_net_deny_bind(
     b: *mut SandboxBuilder,
     spec: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || spec.is_null() {
+    if b.is_null() {
         return b;
     }
-    let spec = CStr::from_ptr(spec).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.net_deny_bind(spec)))
+    let builder = match setter_arg(spec, "net_deny_bind") {
+        Ok(spec) => builder.net_deny_bind(spec),
+        Err(reason) => builder.reject(reason),
+    };
+    Box::into_raw(Box::new(builder))
 }
 
 /// # Safety
@@ -536,33 +669,43 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_user(
 // ----------------------------------------------------------------
 
 /// # Safety
-/// `b` and `rule` must be valid pointers.
+/// `b` must be a valid builder pointer. `rule` must be null or point at a
+/// NUL-terminated string; a null or non-UTF-8 `rule` is reported by
+/// `sandlock_sandbox_build` rather than dereferenced or coerced.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_http_allow(
     b: *mut SandboxBuilder,
     rule: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || rule.is_null() {
+    if b.is_null() {
         return b;
     }
-    let rule = CStr::from_ptr(rule).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.http_allow(rule)))
+    let builder = match setter_arg(rule, "http_allow") {
+        Ok(rule) => builder.http_allow(rule),
+        Err(reason) => builder.reject(reason),
+    };
+    Box::into_raw(Box::new(builder))
 }
 
 /// # Safety
-/// `b` and `rule` must be valid pointers.
+/// `b` must be a valid builder pointer. `rule` must be null or point at a
+/// NUL-terminated string; a null or non-UTF-8 `rule` is reported by
+/// `sandlock_sandbox_build` rather than dereferenced or coerced.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_http_deny(
     b: *mut SandboxBuilder,
     rule: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || rule.is_null() {
+    if b.is_null() {
         return b;
     }
-    let rule = CStr::from_ptr(rule).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.http_deny(rule)))
+    let builder = match setter_arg(rule, "http_deny") {
+        Ok(rule) => builder.http_deny(rule),
+        Err(reason) => builder.reject(reason),
+    };
+    Box::into_raw(Box::new(builder))
 }
 
 /// # Safety
@@ -580,63 +723,83 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_http_port(
 }
 
 /// # Safety
-/// `b` and `path` must be valid pointers.
+/// `b` must be a valid builder pointer. `path` must be null or point at a
+/// NUL-terminated string; a null or non-UTF-8 `path` is reported by
+/// `sandlock_sandbox_build` rather than dereferenced or coerced.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_http_ca(
     b: *mut SandboxBuilder,
     path: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || path.is_null() {
+    if b.is_null() {
         return b;
     }
-    let path = CStr::from_ptr(path).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.http_ca(path)))
+    let builder = match setter_arg(path, "http_ca") {
+        Ok(path) => builder.http_ca(path),
+        Err(reason) => builder.reject(reason),
+    };
+    Box::into_raw(Box::new(builder))
 }
 
 /// # Safety
-/// `b` and `path` must be valid pointers.
+/// `b` must be a valid builder pointer. `path` must be null or point at a
+/// NUL-terminated string; a null or non-UTF-8 `path` is reported by
+/// `sandlock_sandbox_build` rather than dereferenced or coerced.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_http_key(
     b: *mut SandboxBuilder,
     path: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || path.is_null() {
+    if b.is_null() {
         return b;
     }
-    let path = CStr::from_ptr(path).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.http_key(path)))
+    let builder = match setter_arg(path, "http_key") {
+        Ok(path) => builder.http_key(path),
+        Err(reason) => builder.reject(reason),
+    };
+    Box::into_raw(Box::new(builder))
 }
 
 /// # Safety
-/// `b` and `path` must be valid pointers.
+/// `b` must be a valid builder pointer. `path` must be null or point at a
+/// NUL-terminated string; a null or non-UTF-8 `path` is reported by
+/// `sandlock_sandbox_build` rather than dereferenced or coerced.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_http_inject_ca(
     b: *mut SandboxBuilder,
     path: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || path.is_null() {
+    if b.is_null() {
         return b;
     }
-    let path = CStr::from_ptr(path).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.http_inject_ca(path)))
+    let builder = match setter_arg(path, "http_inject_ca") {
+        Ok(path) => builder.http_inject_ca(path),
+        Err(reason) => builder.reject(reason),
+    };
+    Box::into_raw(Box::new(builder))
 }
 
 /// # Safety
-/// `b` and `path` must be valid pointers.
+/// `b` must be a valid builder pointer. `path` must be null or point at a
+/// NUL-terminated string; a null or non-UTF-8 `path` is reported by
+/// `sandlock_sandbox_build` rather than dereferenced or coerced.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_http_ca_out(
     b: *mut SandboxBuilder,
     path: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || path.is_null() {
+    if b.is_null() {
         return b;
     }
-    let path = CStr::from_ptr(path).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.http_ca_out(path)))
+    let builder = match setter_arg(path, "http_ca_out") {
+        Ok(path) => builder.http_ca_out(path),
+        Err(reason) => builder.reject(reason),
+    };
+    Box::into_raw(Box::new(builder))
 }
 
 // ----------------------------------------------------------------
@@ -672,20 +835,24 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_clean_env(
 }
 
 /// # Safety
-/// `b`, `key`, and `value` must be valid pointers.
+/// `b` must be a valid builder pointer. `key` and `value` must each be null
+/// or point at a NUL-terminated string; a null or non-UTF-8 half is reported
+/// by `sandlock_sandbox_build` rather than dereferenced or coerced.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_env_var(
     b: *mut SandboxBuilder,
     key: *const c_char,
     value: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || key.is_null() || value.is_null() {
+    if b.is_null() {
         return b;
     }
-    let key = CStr::from_ptr(key).to_str().unwrap_or("");
-    let value = CStr::from_ptr(value).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.env_var(key, value)))
+    let builder = match (setter_arg(key, "env_var key"), setter_arg(value, "env_var value")) {
+        (Ok(key), Ok(value)) => builder.env_var(key, value),
+        (Err(reason), _) | (_, Err(reason)) => builder.reject(reason),
+    };
+    Box::into_raw(Box::new(builder))
 }
 
 /// # Safety
@@ -704,43 +871,53 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_time_start(
 }
 
 /// # Safety
-/// `b` must be a valid builder pointer. `names` is a comma-separated NUL-terminated string.
+/// `b` must be a valid builder pointer. `names` must be null or point at a
+/// comma-separated NUL-terminated string; a null or non-UTF-8 `names` is
+/// reported by `sandlock_sandbox_build` rather than dereferenced or coerced.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_extra_deny_syscalls(
     b: *mut SandboxBuilder,
     names: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || names.is_null() {
+    if b.is_null() {
         return b;
     }
     let builder = *Box::from_raw(b);
-    let s = CStr::from_ptr(names).to_str().unwrap_or("");
-    let calls: Vec<String> = s
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    Box::into_raw(Box::new(builder.extra_deny_syscalls(calls)))
+    let builder = match setter_arg(names, "extra_deny_syscalls") {
+        Ok(s) => builder.extra_deny_syscalls(
+            s.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<String>>(),
+        ),
+        Err(reason) => builder.reject(reason),
+    };
+    Box::into_raw(Box::new(builder))
 }
 
 /// # Safety
-/// `b` must be a valid builder pointer. `names` is a comma-separated NUL-terminated string.
+/// `b` must be a valid builder pointer. `names` must be null or point at a
+/// comma-separated NUL-terminated string; a null or non-UTF-8 `names` is
+/// reported by `sandlock_sandbox_build` rather than dereferenced or coerced.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_extra_allow_syscalls(
     b: *mut SandboxBuilder,
     names: *const c_char,
 ) -> *mut SandboxBuilder {
-    if b.is_null() || names.is_null() {
+    if b.is_null() {
         return b;
     }
     let builder = *Box::from_raw(b);
-    let s = CStr::from_ptr(names).to_str().unwrap_or("");
-    let names: Vec<String> = s
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    Box::into_raw(Box::new(builder.extra_allow_syscalls(names)))
+    let builder = match setter_arg(names, "extra_allow_syscalls") {
+        Ok(s) => builder.extra_allow_syscalls(
+            s.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<String>>(),
+        ),
+        Err(reason) => builder.reject(reason),
+    };
+    Box::into_raw(Box::new(builder))
 }
 
 /// Resolve a syscall name (e.g. `"openat"`) to its kernel syscall
@@ -772,6 +949,13 @@ pub unsafe extern "C" fn sandlock_syscall_nr(name: *const c_char) -> i64 {
     }
 }
 
+/// Set the open file-descriptor limit (RLIMIT_NOFILE, soft and hard).
+///
+/// Zero is refused, reported by `sandlock_sandbox_build`: the child needs
+/// descriptors to reach `main`, so a zero cap kills it before the workload
+/// starts with an errno far from the setting responsible. A workable floor is
+/// well above 1. Omit the call to inherit the system limit.
+///
 /// # Safety
 /// `b` must be a valid builder pointer.
 #[no_mangle]
@@ -899,8 +1083,15 @@ pub extern "C" fn sandlock_protection_min_abi(protection: u32) -> u32 {
 /// Returns the (possibly relocated) builder pointer, mirroring the
 /// move-semantics convention used by every other
 /// `sandlock_sandbox_builder_*` setter. A null `b` is returned
-/// unchanged. An unknown `protection` discriminant is treated as a
-/// no-op: the builder is returned untouched.
+/// unchanged.
+///
+/// An unknown `protection` discriminant is a static bug in the calling
+/// binding, not a runtime condition, exactly as it is for
+/// `sandlock_sandbox_builder_on_exit`. It is latched in the builder and
+/// reported by `sandlock_sandbox_build`, which returns -1 with a message
+/// naming this setter and the offending value. It used to be dropped, so a
+/// binding built against a newer header was told nothing when an older
+/// library did not recognise what it sent.
 ///
 /// # Safety
 /// `b` must be a valid builder pointer returned by
@@ -914,12 +1105,14 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_allow_degraded(
     if b.is_null() {
         return b;
     }
-    let p = match try_protection_from_raw(protection) {
-        Some(p) => p,
-        None => return b,
-    };
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.allow_degraded(p)))
+    let builder = match try_protection_from_raw(protection) {
+        Some(p) => builder.allow_degraded(p),
+        None => builder.reject(format!(
+            "allow_degraded: unrecognized protection {protection}"
+        )),
+    };
+    Box::into_raw(Box::new(builder))
 }
 
 /// Mark `protection` as disabled on the builder: never enforced, even
@@ -928,8 +1121,15 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_allow_degraded(
 /// Returns the (possibly relocated) builder pointer, mirroring the
 /// move-semantics convention used by every other
 /// `sandlock_sandbox_builder_*` setter. A null `b` is returned
-/// unchanged. An unknown `protection` discriminant is treated as a
-/// no-op: the builder is returned untouched.
+/// unchanged.
+///
+/// An unknown `protection` discriminant is a static bug in the calling
+/// binding, not a runtime condition, exactly as it is for
+/// `sandlock_sandbox_builder_on_exit`. It is latched in the builder and
+/// reported by `sandlock_sandbox_build`, which returns -1 with a message
+/// naming this setter and the offending value. It used to be dropped, so a
+/// binding built against a newer header was told nothing when an older
+/// library did not recognise what it sent.
 ///
 /// # Safety
 /// `b` must be a valid builder pointer returned by
@@ -943,12 +1143,14 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_disable(
     if b.is_null() {
         return b;
     }
-    let p = match try_protection_from_raw(protection) {
-        Some(p) => p,
-        None => return b,
-    };
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.disable(p)))
+    let builder = match try_protection_from_raw(protection) {
+        Some(p) => builder.disable(p),
+        None => builder.reject(format!(
+            "disable: unrecognized protection {protection}"
+        )),
+    };
+    Box::into_raw(Box::new(builder))
 }
 
 // ----------------------------------------------------------------
@@ -1018,6 +1220,99 @@ pub unsafe extern "C" fn sandlock_sandbox_build(
 pub unsafe extern "C" fn sandlock_sandbox_free(p: *mut sandlock_sandbox_t) {
     if !p.is_null() {
         drop(Box::from_raw(p));
+    }
+}
+
+// ----------------------------------------------------------------
+// Profile parsing
+// ----------------------------------------------------------------
+
+/// Parse a TOML profile into canonical JSON.
+///
+/// The returned document has the same section layout as the profile, but every
+/// string micro-grammar is already resolved: mounts are
+/// `{"virt", "host", "ro"}` objects, `[limits]` sizes are integer bytes,
+/// `[determinism].time_start` is `{"seconds", "nanoseconds"}` since the epoch,
+/// bind ports are expanded integer lists, and net/HTTP rules are structured
+/// records. A binding only has to map fields, so it never grows a second copy
+/// of a grammar that can drift from this one.
+///
+/// The profile is validated exactly as `sandlock run --profile` validates it,
+/// including the cross-section checks that normally run at build time, so a
+/// bad profile fails here with the message a CLI user sees for the same file.
+///
+/// On success, `*err` is 0 and a heap-allocated JSON string is returned; the
+/// caller must release it with [`sandlock_string_free`]. On failure, `*err` is
+/// -1, null is returned, and `*err_msg` (if non-null) is set to a
+/// heap-allocated C string describing the error, released the same way. Pass
+/// `null` for `err_msg` to discard it. A null return always means failure.
+///
+/// # Safety
+/// `toml` must be a valid NUL-terminated C string. `err` and `err_msg` may
+/// both be null. When `err_msg` is non-null, it must point to writable storage
+/// for one `*mut c_char`.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_profile_parse(
+    toml: *const c_char,
+    err: *mut c_int,
+    err_msg: *mut *mut c_char,
+) -> *mut c_char {
+    if !err_msg.is_null() {
+        *err_msg = ptr::null_mut();
+    }
+    let fail = |msg: Option<String>| -> *mut c_char {
+        if !err.is_null() {
+            *err = -1;
+        }
+        if !err_msg.is_null() {
+            if let Some(msg) = msg {
+                // Unlike every other export, this one's messages quote text the
+                // parser decoded rather than text a caller handed in as a C
+                // string, so they really can contain a NUL: TOML accepts the
+                // `\u0000` escape, so `memory = "1\u0000G"` lands verbatim in
+                // "invalid byte size: 1\0G". A C string cannot carry that, and
+                // dropping the message would report the failure with no
+                // diagnosis at all, so escape it the way core's own
+                // Debug-formatted messages already render a NUL and keep the
+                // text. After the replacement CString::new cannot fail; the
+                // guard stays because unwrapping here would panic across the C
+                // boundary.
+                let msg = if msg.contains('\0') {
+                    msg.replace('\0', "\\0")
+                } else {
+                    msg
+                };
+                if let Ok(c) = CString::new(msg) {
+                    *err_msg = c.into_raw();
+                }
+            }
+        }
+        ptr::null_mut()
+    };
+
+    if toml.is_null() {
+        // A null profile is a programmer error in the binding layer, not a
+        // profile problem, so there is no user-actionable message to report.
+        return fail(None);
+    }
+    let content = match CStr::from_ptr(toml).to_str() {
+        Ok(s) => s,
+        // Not a hard-coded literal: the message comes from the decode error
+        // itself. Silently substituting "" here would report an empty profile
+        // as valid.
+        Err(e) => return fail(Some(format!("{}", e))),
+    };
+    match sandlock_core::profile::canonical::parse_to_json(content) {
+        Ok(json) => match CString::new(json) {
+            Ok(c) => {
+                if !err.is_null() {
+                    *err = 0;
+                }
+                c.into_raw()
+            }
+            Err(_) => fail(None),
+        },
+        Err(e) => fail(Some(format!("{}", e))),
     }
 }
 
@@ -1690,10 +1985,16 @@ pub unsafe extern "C" fn sandlock_result_free(r: *mut sandlock_result_t) {
     }
 }
 
-/// Free a string returned by `sandlock_result_stdout` or `sandlock_result_stderr`.
+/// Free a string returned by this library.
+///
+/// Every function in this header that hands back a `char *` (capture buffers,
+/// `sandlock_profile_parse`, checkpoint names, change paths, port mappings, and
+/// the `err_msg` out-parameters) allocates it the same way and releases it
+/// here.
 ///
 /// # Safety
-/// `s` must be null or a pointer from a `sandlock_result_std*` function.
+/// `s` must be null or a `char *` returned by one of those functions, and must
+/// not have been freed already.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_string_free(s: *mut c_char) {
     if !s.is_null() {

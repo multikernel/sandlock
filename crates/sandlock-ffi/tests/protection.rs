@@ -109,6 +109,27 @@ where
     builder.build().expect("build failed")
 }
 
+/// Same as [`build_via_ffi`], for a configuration the build must refuse.
+/// Returns the error text so the test can assert on what it names.
+fn build_err_via_ffi<F>(configure: F) -> String
+where
+    F: FnOnce(
+        *mut sandlock_core::sandbox::SandboxBuilder,
+    ) -> *mut sandlock_core::sandbox::SandboxBuilder,
+{
+    let b = sandlock_sandbox_builder_new();
+    assert!(!b.is_null(), "builder_new returned null");
+    let b = configure(b);
+    assert!(!b.is_null(), "configure returned null builder");
+    // SAFETY: `b` is a valid Box pointer produced by builder_new and
+    // possibly relocated through builder setters.
+    let builder = unsafe { *Box::from_raw(b) };
+    builder
+        .build()
+        .expect_err("build must refuse a discriminant the library does not know")
+        .to_string()
+}
+
 #[test]
 fn builder_allow_degraded_marks_protection_degradable() {
     let sandbox =
@@ -209,52 +230,45 @@ fn protection_min_abi_returns_zero_sentinel_for_unknown_discriminant() {
 }
 
 #[test]
-fn allow_degraded_with_unknown_discriminant_is_a_noop() {
-    // The builder pointer must be returned untouched, and the
-    // resulting Sandbox must have no `Degradable` state set.
+fn allow_degraded_with_unknown_discriminant_is_reported() {
+    // It used to be dropped and the build used to succeed, so a binding built
+    // against a newer header was told nothing when an older library did not
+    // recognise the protection it asked to be degradable: the caller believed
+    // it had opted out, and the protection stayed strict.
     for &raw in INVALID_DISCRIMINANTS {
-        let sandbox = build_via_ffi(|b| unsafe { sandlock_sandbox_builder_allow_degraded(b, raw) });
-        for p in Protection::all() {
-            assert_eq!(
-                sandbox.protection_policy.state(p),
-                ProtectionState::Strict,
-                "raw discriminant {} must leave {:?} at the default Strict state",
-                raw,
-                p,
-            );
-        }
+        let err = build_err_via_ffi(|b| unsafe { sandlock_sandbox_builder_allow_degraded(b, raw) });
+        assert!(
+            err.contains("allow_degraded") && err.contains(&raw.to_string()),
+            "discriminant {raw} must be named by the build error, got {err:?}",
+        );
     }
 }
 
 #[test]
-fn disable_with_unknown_discriminant_is_a_noop() {
+fn disable_with_unknown_discriminant_is_reported() {
     for &raw in INVALID_DISCRIMINANTS {
-        let sandbox = build_via_ffi(|b| unsafe { sandlock_sandbox_builder_disable(b, raw) });
-        for p in Protection::all() {
-            assert_eq!(
-                sandbox.protection_policy.state(p),
-                ProtectionState::Strict,
-                "raw discriminant {} must leave {:?} at the default Strict state",
-                raw,
-                p,
-            );
-        }
+        let err = build_err_via_ffi(|b| unsafe { sandlock_sandbox_builder_disable(b, raw) });
+        assert!(
+            err.contains("disable") && err.contains(&raw.to_string()),
+            "discriminant {raw} must be named by the build error, got {err:?}",
+        );
     }
 }
 
 #[test]
-fn unknown_discriminant_does_not_corrupt_subsequent_valid_calls() {
-    // A bad call must not poison the builder — a following valid call
-    // must succeed normally. Catches a class of bug where the bad path
-    // leaks/double-frees the builder allocation.
-    let sandbox = build_via_ffi(|b| unsafe {
+fn a_later_valid_call_does_not_wash_out_an_unknown_discriminant() {
+    // The latch survives every setter that follows it, so a binding cannot
+    // hide a discriminant the library did not understand behind a call it did.
+    // This also still covers the memory-safety property the previous version
+    // of this test watched: the rejecting path must hand back a builder the
+    // following setters can keep using, with no leak or double free.
+    let err = build_err_via_ffi(|b| unsafe {
         let b = sandlock_sandbox_builder_allow_degraded(b, 9999);
         let b = sandlock_sandbox_builder_disable(b, u32::MAX);
         sandlock_sandbox_builder_disable(b, PROT_SIGNAL_SCOPE)
     });
-    assert_eq!(
-        sandbox.protection_policy.state(Protection::SignalScope),
-        ProtectionState::Disabled,
-        "valid call after two invalid ones must still take effect",
+    assert!(
+        err.contains("9999"),
+        "the first unrecognized discriminant must be the one reported, got {err:?}",
     );
 }
