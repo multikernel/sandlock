@@ -1022,6 +1022,99 @@ pub unsafe extern "C" fn sandlock_sandbox_free(p: *mut sandlock_sandbox_t) {
 }
 
 // ----------------------------------------------------------------
+// Profile parsing
+// ----------------------------------------------------------------
+
+/// Parse a TOML profile into canonical JSON.
+///
+/// The returned document has the same section layout as the profile, but every
+/// string micro-grammar is already resolved: mounts are
+/// `{"virt", "host", "ro"}` objects, `[limits]` sizes are integer bytes,
+/// `[determinism].time_start` is `{"seconds", "nanoseconds"}` since the epoch,
+/// bind ports are expanded integer lists, and net/HTTP rules are structured
+/// records. A binding only has to map fields, so it never grows a second copy
+/// of a grammar that can drift from this one.
+///
+/// The profile is validated exactly as `sandlock run --profile` validates it,
+/// including the cross-section checks that normally run at build time, so a
+/// bad profile fails here with the message a CLI user sees for the same file.
+///
+/// On success, `*err` is 0 and a heap-allocated JSON string is returned; the
+/// caller must release it with [`sandlock_string_free`]. On failure, `*err` is
+/// -1, null is returned, and `*err_msg` (if non-null) is set to a
+/// heap-allocated C string describing the error, released the same way. Pass
+/// `null` for `err_msg` to discard it. A null return always means failure.
+///
+/// # Safety
+/// `toml` must be a valid NUL-terminated C string. `err` and `err_msg` may
+/// both be null. When `err_msg` is non-null, it must point to writable storage
+/// for one `*mut c_char`.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_profile_parse(
+    toml: *const c_char,
+    err: *mut c_int,
+    err_msg: *mut *mut c_char,
+) -> *mut c_char {
+    if !err_msg.is_null() {
+        *err_msg = ptr::null_mut();
+    }
+    let fail = |msg: Option<String>| -> *mut c_char {
+        if !err.is_null() {
+            *err = -1;
+        }
+        if !err_msg.is_null() {
+            if let Some(msg) = msg {
+                // Unlike every other export, this one's messages quote text the
+                // parser decoded rather than text a caller handed in as a C
+                // string, so they really can contain a NUL: TOML accepts the
+                // `\u0000` escape, so `memory = "1\u0000G"` lands verbatim in
+                // "invalid byte size: 1\0G". A C string cannot carry that, and
+                // dropping the message would report the failure with no
+                // diagnosis at all, so escape it the way core's own
+                // Debug-formatted messages already render a NUL and keep the
+                // text. After the replacement CString::new cannot fail; the
+                // guard stays because unwrapping here would panic across the C
+                // boundary.
+                let msg = if msg.contains('\0') {
+                    msg.replace('\0', "\\0")
+                } else {
+                    msg
+                };
+                if let Ok(c) = CString::new(msg) {
+                    *err_msg = c.into_raw();
+                }
+            }
+        }
+        ptr::null_mut()
+    };
+
+    if toml.is_null() {
+        // A null profile is a programmer error in the binding layer, not a
+        // profile problem, so there is no user-actionable message to report.
+        return fail(None);
+    }
+    let content = match CStr::from_ptr(toml).to_str() {
+        Ok(s) => s,
+        // Not a hard-coded literal: the message comes from the decode error
+        // itself. Silently substituting "" here would report an empty profile
+        // as valid.
+        Err(e) => return fail(Some(format!("{}", e))),
+    };
+    match sandlock_core::profile::canonical::parse_to_json(content) {
+        Ok(json) => match CString::new(json) {
+            Ok(c) => {
+                if !err.is_null() {
+                    *err = 0;
+                }
+                c.into_raw()
+            }
+            Err(_) => fail(None),
+        },
+        Err(e) => fail(Some(format!("{}", e))),
+    }
+}
+
+// ----------------------------------------------------------------
 // Confine current process
 // ----------------------------------------------------------------
 
@@ -1690,10 +1783,16 @@ pub unsafe extern "C" fn sandlock_result_free(r: *mut sandlock_result_t) {
     }
 }
 
-/// Free a string returned by `sandlock_result_stdout` or `sandlock_result_stderr`.
+/// Free a string returned by this library.
+///
+/// Every function in this header that hands back a `char *` (capture buffers,
+/// `sandlock_profile_parse`, checkpoint names, change paths, port mappings, and
+/// the `err_msg` out-parameters) allocates it the same way and releases it
+/// here.
 ///
 /// # Safety
-/// `s` must be null or a pointer from a `sandlock_result_std*` function.
+/// `s` must be null or a `char *` returned by one of those functions, and must
+/// not have been freed already.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_string_free(s: *mut c_char) {
     if !s.is_null() {
