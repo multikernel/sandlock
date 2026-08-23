@@ -674,7 +674,7 @@ impl DeniedSet {
 /// Dynamic policy callback state.
 pub struct PolicyFnState {
     /// Event sender for dynamic policy callback (None if no policy_fn).
-    pub event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::policy_fn::PolicyEvent>>,
+    pub event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::policy_fn::PolicyMsg>>,
     /// Shared live policy for dynamic updates (None if no policy_fn).
     pub live_policy: Option<std::sync::Arc<std::sync::RwLock<crate::policy_fn::LivePolicy>>>,
     /// Dynamically denied paths and inode identities from policy_fn / fs_deny.

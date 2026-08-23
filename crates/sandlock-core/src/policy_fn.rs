@@ -351,24 +351,52 @@ pub struct PolicyEvent {
 // Policy callback runner
 // ============================================================
 
+/// What the supervisor pushes to the policy thread.
+pub enum PolicyMsg {
+    Event(PolicyEvent),
+    Shutdown,
+}
+
+/// Owns the policy-callback thread. Dropping it is the guarantee that no
+/// callback runs afterwards: the supervisor's sender clones outlive an
+/// `abort()`, so shutdown is an in-band message rather than channel closure,
+/// and the drop joins the thread.
+pub(crate) struct PolicyFnWorker {
+    tx: tokio::sync::mpsc::UnboundedSender<PolicyMsg>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PolicyFnWorker {
+    pub(crate) fn sender(&self) -> tokio::sync::mpsc::UnboundedSender<PolicyMsg> {
+        self.tx.clone()
+    }
+}
+
+impl Drop for PolicyFnWorker {
+    fn drop(&mut self) {
+        let _ = self.tx.send(PolicyMsg::Shutdown);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
 /// Spawn a thread that receives syscall events and calls the policy callback.
-///
-/// Returns a sender for the supervisor to push events into.
 pub(crate) fn spawn_policy_fn(
     callback: PolicyCallback,
     live: Arc<RwLock<LivePolicy>>,
     ceiling: LivePolicy,
     pid_overrides: Arc<RwLock<HashMap<u32, HashSet<IpAddr>>>>,
     denied: Arc<crate::seccomp::state::DeniedSet>,
-) -> tokio::sync::mpsc::UnboundedSender<PolicyEvent> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PolicyEvent>();
+) -> PolicyFnWorker {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PolicyMsg>();
 
-    std::thread::Builder::new()
+    let thread = std::thread::Builder::new()
         .name("sandlock-policy-fn".to_string())
         .spawn(move || {
             let mut ctx = PolicyContext::new(live, ceiling, pid_overrides, denied);
 
-            while let Some(pe) = rx.blocking_recv() {
+            while let Some(PolicyMsg::Event(pe)) = rx.blocking_recv() {
                 let verdict = callback(pe.event, &mut ctx);
 
                 // Signal the supervisor with the verdict.
@@ -380,7 +408,7 @@ pub(crate) fn spawn_policy_fn(
         })
         .expect("failed to spawn policy-fn thread");
 
-    tx
+    PolicyFnWorker { tx, thread: Some(thread) }
 }
 
 // ============================================================
@@ -390,6 +418,46 @@ pub(crate) fn spawn_policy_fn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_drop_waits_for_queued_callbacks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let callback: PolicyCallback = Arc::new(move |_e, _c| {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            seen.fetch_add(1, Ordering::SeqCst);
+            Verdict::Allow
+        });
+        let live = Arc::new(RwLock::new(test_live()));
+        let worker = spawn_policy_fn(
+            callback,
+            live,
+            test_live(),
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(crate::seccomp::state::DeniedSet::default()),
+        );
+        let tx = worker.sender();
+        let event = SyscallEvent {
+            syscall: "close".into(),
+            category: SyscallCategory::File,
+            pid: 1,
+            parent_pid: None,
+            host: None,
+            port: None,
+            size: None,
+            argv: None,
+            denied: false,
+            path: None,
+            path2: None,
+            fd: None,
+            flags: None,
+            protocol: None,
+        };
+        tx.send(PolicyMsg::Event(PolicyEvent { event, gate: None })).unwrap();
+        drop(worker);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 
     fn test_live() -> LivePolicy {
         LivePolicy {

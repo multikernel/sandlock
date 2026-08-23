@@ -2068,26 +2068,28 @@ async fn emit_policy_event(
 
     let verdict = if is_held {
         let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
-        let _ = tx.send(crate::policy_fn::PolicyEvent {
+        let _ = tx.send(crate::policy_fn::PolicyMsg::Event(crate::policy_fn::PolicyEvent {
             event,
             gate: Some(gate_tx),
-        });
+        }));
         let received = match tokio::time::timeout(std::time::Duration::from_secs(5), gate_rx).await {
             Ok(Ok(verdict)) => Some(verdict),
             _ => None, // timeout or channel closed
         };
         resolve_held_gate(received)
     } else {
-        let _ = tx.send(crate::policy_fn::PolicyEvent {
+        let _ = tx.send(crate::policy_fn::PolicyMsg::Event(crate::policy_fn::PolicyEvent {
             event,
             gate: None,
-        });
+        }));
         None
     };
     // Emit the remaining sendmmsg destinations as observation-only events.
     // The verdict above already covers the whole syscall; gate: None is correct.
     for extra in sendmmsg_extras {
-        let _ = tx.send(crate::policy_fn::PolicyEvent { event: extra, gate: None });
+        let _ = tx.send(crate::policy_fn::PolicyMsg::Event(
+            crate::policy_fn::PolicyEvent { event: extra, gate: None },
+        ));
     }
 
     verdict

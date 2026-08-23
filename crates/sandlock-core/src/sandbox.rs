@@ -270,6 +270,7 @@ struct Runtime {
     child_pid: Option<i32>,
     pidfd: Option<std::os::fd::OwnedFd>,
     notif_handle: Option<JoinHandle<()>>,
+    policy_fn_worker: Option<crate::policy_fn::PolicyFnWorker>,
     throttle_handle: Option<JoinHandle<()>>,
     loadavg_handle: Option<JoinHandle<()>>,
     control_handle: Option<JoinHandle<()>>,
@@ -930,6 +931,7 @@ impl Sandbox {
 
         let rt = self.rt_mut();
         if let Some(h) = rt.notif_handle.take() { h.abort(); }
+        rt.policy_fn_worker = None;
         if let Some(h) = rt.throttle_handle.take() { h.abort(); }
         if let Some(h) = rt.loadavg_handle.take() { h.abort(); }
         if let Some(h) = rt.control_handle.take() { h.abort(); }
@@ -1514,6 +1516,7 @@ impl Sandbox {
                 child_pid: Some(clone_pid),
                 pidfd: None,
                 notif_handle: None,
+                policy_fn_worker: None,
                 throttle_handle: None,
                 loadavg_handle: None,
                 _stdout_read: None,
@@ -1614,6 +1617,7 @@ impl Sandbox {
             child_pid: None,
             pidfd: None,
             notif_handle: None,
+            policy_fn_worker: None,
             throttle_handle: None,
             loadavg_handle: None,
             control_handle: None,
@@ -2240,10 +2244,11 @@ impl Sandbox {
                 let denied = policy_fn_state.denied.clone();
                 let pid_overrides = net_state.pid_ip_overrides.clone();
                 policy_fn_state.live_policy = Some(live.clone());
-                let tx = crate::policy_fn::spawn_policy_fn(
+                let worker = crate::policy_fn::spawn_policy_fn(
                     callback.clone(), live, ceiling, pid_overrides, denied,
                 );
-                policy_fn_state.event_tx = Some(tx);
+                policy_fn_state.event_tx = Some(worker.sender());
+                self.rt_mut().policy_fn_worker = Some(worker);
             }
 
             let chroot_state = ChrootState::new();
@@ -2492,6 +2497,7 @@ impl Drop for Sandbox {
             }
 
             if let Some(h) = rt.notif_handle.take() { h.abort(); }
+            rt.policy_fn_worker = None;
             if let Some(h) = rt.throttle_handle.take() { h.abort(); }
             if let Some(h) = rt.loadavg_handle.take() { h.abort(); }
             if let Some(h) = rt.control_handle.take() { h.abort(); }
