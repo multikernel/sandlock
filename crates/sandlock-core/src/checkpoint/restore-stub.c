@@ -261,6 +261,10 @@ struct sigctx {
     u8  fpregs[528];         /* sc_fpregs: union __riscv_fp_state (kernel 528 byte union) */
 };
 
+/* The sc_fpregs memcpy is bounded only by validate's FP_MAX check. */
+_Static_assert(FP_MAX <= sizeof((struct sigctx){0}.fpregs),
+               "FP_MAX must not exceed sc_fpregs");
+
 struct uctx {
     u64 uc_flags;            /* 0x00 */
     u64 uc_link;             /* 0x08 */
