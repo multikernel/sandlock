@@ -372,12 +372,27 @@ fn is_restart_sentinel(v: i64) -> bool {
 /// `user_regs_struct`, so neither capture nor restore can recover it. Callers
 /// reject the checkpoint rather than resume with a corrupt return value.
 #[cfg(target_arch = "riscv64")]
-pub(crate) fn restart_sentinel_in_a0(regs: &[u64]) -> Option<i64> {
+fn restart_sentinel_in_a0(regs: &[u64]) -> Option<i64> {
     // riscv64 user_regs_struct order: pc, ra, sp, gp, tp, t0-t2, s0-s1,
     // a0-a7, s2-s11, t3-t6 — so a0 is index 10.
     const A0: usize = 10;
     let a0 = *regs.get(A0)? as i64;
     if is_restart_sentinel(a0) { Some(a0) } else { None }
+}
+
+/// Refuse a riscv64 register file whose `a0` holds a restart sentinel, with
+/// the shared error text; both capture and restore reject through here.
+#[cfg(target_arch = "riscv64")]
+pub(crate) fn reject_restart_sentinel(regs: &[u64]) -> Result<(), String> {
+    match restart_sentinel_in_a0(regs) {
+        Some(sentinel) => Err(format!(
+            "checkpoint captured an interrupted restartable syscall \
+             (a0 = {sentinel}); riscv64 cannot recover its original argument, \
+             so restore would resume with a corrupt return value; retry the \
+             checkpoint while the workload is not blocked in a syscall"
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Re-arm an interrupted, restartable syscall in the saved register file.
@@ -420,15 +435,7 @@ fn rearm_restartable_syscall(regs: &mut [u64]) -> Result<(), String> {
 /// syscall result.
 #[cfg(target_arch = "riscv64")]
 fn rearm_restartable_syscall(regs: &mut [u64]) -> Result<(), String> {
-    if let Some(sentinel) = restart_sentinel_in_a0(regs) {
-        return Err(format!(
-            "checkpoint captured an interrupted restartable syscall \
-             (a0 = {sentinel}); riscv64 cannot recover its original argument, \
-             so restore would resume with a corrupt return value. Retry the \
-             checkpoint while the workload is not blocked in a syscall"
-        ));
-    }
-    Ok(())
+    reject_restart_sentinel(regs)
 }
 
 /// Build the FP image the stub points the signal frame's `fpstate` at.
