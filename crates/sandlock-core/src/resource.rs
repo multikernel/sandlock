@@ -780,6 +780,32 @@ pub(crate) async fn handle_memory(
 mod memory_range_tests {
     use super::*;
 
+    /// A process whose measured footprint cannot move while a test reads it:
+    /// a forked child parked in `pause()`, its address space frozen at fork.
+    struct QuietChild(i32);
+
+    impl QuietChild {
+        fn spawn() -> Self {
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                loop {
+                    unsafe { libc::pause() };
+                }
+            }
+            QuietChild(pid)
+        }
+    }
+
+    impl Drop for QuietChild {
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(self.0, libc::SIGKILL);
+                libc::waitpid(self.0, std::ptr::null_mut(), 0);
+            }
+        }
+    }
+
     /// The measured footprint follows anonymous memory and ignores file
     /// mappings, which is what makes it a trustworthy floor: a workload
     /// can't lower it by mapping and unmapping a file.
@@ -840,25 +866,25 @@ mod memory_range_tests {
     /// never charged) is restored before the next allocation is judged.
     #[test]
     fn reconcile_raises_a_laundered_ledger_to_the_measured_footprint() {
-        let pid = std::process::id() as i32;
+        // Measure a quiet child rather than this process: sibling tests move
+        // the shared footprint, a paused fork's cannot move at all.
+        let child = QuietChild::spawn();
         let mut st = ResourceState::new(0, 0);
         let mut per = PerProcessState::default(); // laundered to zero
 
-        reconcile_floor(&mut st, Some(&mut per), pid);
+        reconcile_floor(&mut st, Some(&mut per), child.0);
 
-        // Sibling tests move this process's footprint while the test
-        // runs, so the restored figure is checked for being real and
-        // consistent rather than against a separately-taken reading.
+        let measured = read_private_anon_bytes(child.0).expect("read child statm");
         assert!(per.mem_charged > 0, "ledger not restored from the measure");
+        assert_eq!(per.mem_charged, measured);
         assert_eq!(st.mem_used, per.mem_charged);
 
         // A ledger above the measure is left alone: mmap charges PROT_NONE
-        // reservations that the kernel's measure excludes. A gigabyte of
-        // headroom keeps this clear of any sibling's allocations.
+        // reservations that the kernel's measure excludes.
         let inflated = per.mem_charged + (1 << 30);
         per.mem_charged = inflated;
         st.mem_used = inflated;
-        reconcile_floor(&mut st, Some(&mut per), pid);
+        reconcile_floor(&mut st, Some(&mut per), child.0);
         assert_eq!(per.mem_charged, inflated);
         assert_eq!(st.mem_used, inflated);
     }
