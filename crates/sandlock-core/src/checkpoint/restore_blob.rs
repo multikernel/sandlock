@@ -57,12 +57,16 @@ pub(crate) const STUB_SPAN: u64 = 0x40_0000;
 /// `sw_reserved` area of the 512-byte fxsave block tells the kernel the buffer
 /// holds a full xstate; without it the kernel falls back to `fxrstor` of the
 /// legacy area only.
+#[cfg(target_arch = "x86_64")]
 const FP_XSTATE_MAGIC1: u32 = 0x4650_5853;
+#[cfg(target_arch = "x86_64")]
 const FP_XSTATE_MAGIC2: u32 = 0x4650_5845;
 /// Offset of `struct _fpx_sw_bytes` within the 512-byte fxsave block.
+#[cfg(target_arch = "x86_64")]
 const SW_RESERVED_OFF: usize = 464;
 /// fxsave block + xstate header: the smallest buffer the kernel accepts as a
 /// full xstate image.
+#[cfg(target_arch = "x86_64")]
 const MIN_XSTATE_SIZE: usize = 512 + 64;
 
 /// A restore reduced to the three things the supervisor needs: the control blob
