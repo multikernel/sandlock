@@ -35,7 +35,7 @@ use crate::arch;
 use crate::cow::result::link_result;
 use crate::cow::seccomp::SeccompCowBranch;
 use crate::procfs::{build_dirent64, DT_DIR, DT_LNK, DT_REG};
-use crate::seccomp::notif::{read_child_mem, write_child_mem, write_child_mem_force, NotifAction};
+use crate::seccomp::notif::{decode_open_args, read_child_mem, write_child_mem, write_child_mem_force, NotifAction};
 use crate::seccomp::state::{CowState, PerProcessState, ProcessIndex};
 use crate::sys::structs::SeccompNotif;
 
@@ -186,8 +186,7 @@ fn open_confined(
     crate::sys::fs::openat2_in_root(root, &rel, flags, mode)
 }
 
-/// Handle openat under workdir: redirect to COW upper/lower.
-/// openat(dirfd, pathname, flags, mode): args[0]=dirfd, args[1]=path, args[2]=flags
+/// Handle open/openat/openat2 under workdir: redirect to COW upper/lower.
 pub(crate) async fn handle_cow_open(
     notif: &SeccompNotif,
     cow_state: &Arc<Mutex<CowState>>,
@@ -196,14 +195,9 @@ pub(crate) async fn handle_cow_open(
 ) -> NotifAction {
     use crate::cow::seccomp::CowOpenPlan;
 
-    let nr = notif.data.nr as i64;
-
-    // open(path, flags, mode):         args[0]=path, args[1]=flags, args[2]=mode
-    // openat(dirfd, path, flags, mode): args[0]=dirfd, args[1]=path, args[2]=flags, args[3]=mode
-    let (path_ptr, dirfd, flags, mode) = if Some(nr) == arch::sys_open() {
-        (notif.data.args[0], libc::AT_FDCWD as i64, notif.data.args[1], notif.data.args[2])
-    } else {
-        (notif.data.args[1], notif.data.args[0] as i64, notif.data.args[2], notif.data.args[3])
+    let (dirfd, path_ptr, flags, mode) = match decode_open_args(notif, notif_fd) {
+        Some(a) => (a.dirfd, a.path_ptr, a.flags, a.mode),
+        None => return NotifAction::Continue,
     };
 
     let rel_path = match read_path(notif, path_ptr, notif_fd) {

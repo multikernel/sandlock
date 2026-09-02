@@ -1034,9 +1034,7 @@ fn register_cow_handlers(table: &mut DispatchTable, ctx: &Arc<SupervisorCtx>) {
         table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_access));
     }
 
-    let mut open_nrs = vec![libc::SYS_openat];
-    open_nrs.extend(arch::sys_open());
-    for nr in open_nrs {
+    for nr in open_family_syscalls() {
         table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_open));
     }
 

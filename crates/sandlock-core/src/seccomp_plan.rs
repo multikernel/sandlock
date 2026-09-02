@@ -133,6 +133,8 @@ const NETLINK_NOTIF_SYSCALLS: &[i64] = &[
 fn cow_path_syscalls() -> Vec<i64> {
     let mut v = vec![
         libc::SYS_openat,
+        // Left to the kernel, openat2 writes straight into the real workdir.
+        arch::SYS_OPENAT2,
         libc::SYS_execve,
         libc::SYS_execveat,
         libc::SYS_unlinkat,

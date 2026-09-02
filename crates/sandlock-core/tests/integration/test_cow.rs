@@ -313,6 +313,58 @@ async fn test_seccomp_cow_legacy_open_syscall() {
     let _ = fs::remove_file(&out_file);
 }
 
+/// openat2 must land in the COW layer like open/openat.
+///
+/// Regression test: COW registered only openat and legacy open, so a raw
+/// openat2(O_CREAT|O_TRUNC) under the workdir went straight to the kernel and
+/// mutated the real directory, surviving an abort. openat2 also keeps flags
+/// and mode in a struct open_how rather than in the syscall args.
+#[tokio::test]
+async fn test_seccomp_cow_openat2_syscall() {
+    let workdir = temp_dir("seccomp-openat2");
+    let out_file = std::env::temp_dir().join(format!(
+        "sandlock-test-openat2-{}", std::process::id()
+    ));
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc").fs_read("/dev")
+        .fs_write(&workdir).fs_write("/tmp")
+        .workdir(&workdir)
+        .cwd(&workdir)
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+
+    // SYS_openat2 = 437 on every supported arch; open_how = {flags, mode, resolve}.
+    let script = format!(concat!(
+        "import ctypes, os\n",
+        "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
+        "class OpenHow(ctypes.Structure):\n",
+        "    _fields_ = [('flags', ctypes.c_uint64), ('mode', ctypes.c_uint64), ('resolve', ctypes.c_uint64)]\n",
+        "O_WRONLY = 1; O_CREAT = 64; O_TRUNC = 512\n",
+        "how = OpenHow(O_WRONLY | O_CREAT | O_TRUNC, 0o644, 0)\n",
+        "fd = libc.syscall(437, -100, b'{wd}/newfile.txt', ctypes.byref(how), ctypes.sizeof(how))\n",
+        "err = ctypes.get_errno()\n",
+        "if fd >= 0:\n",
+        "    os.write(fd, b'created via raw openat2')\n",
+        "    os.close(fd)\n",
+        "    content = open('{wd}/newfile.txt').read()\n",
+        "    open('{out}', 'w').write(content)\n",
+        "else:\n",
+        "    open('{out}', 'w').write(f'FAILED:errno={{err}}')\n",
+    ), wd = workdir.display(), out = out_file.display());
+
+    let result = policy.clone().run(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "exit={:?}, stderr={}", result.code(), result.stderr_str().unwrap_or(""));
+    let content = fs::read_to_string(&out_file).unwrap_or_default();
+    assert_eq!(content, "created via raw openat2", "raw openat2 should work with COW");
+    assert!(!workdir.join("newfile.txt").exists(), "newfile.txt should not exist after abort");
+
+    let _ = fs::remove_dir_all(&workdir);
+    let _ = fs::remove_file(&out_file);
+}
+
 /// Legacy stat/lstat/access must honor whiteouts.
 ///
 /// Regression test: handle_cow_stat parsed every syscall with the at-variant
