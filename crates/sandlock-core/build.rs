@@ -83,6 +83,10 @@ fn main() {
             "-O2",
             "-ffreestanding",
             "-fno-tree-loop-distribute-patterns",
+            // A compiler with default SSP (vanilla GCC; Ubuntu's exempts
+            // -ffreestanding) reads the canary at %fs:0x28, and the stub's
+            // thread pointer is zero until it restores the checkpoint's.
+            "-fno-stack-protector",
             text_segment,
         ],
     ) {
@@ -97,8 +101,9 @@ fn main() {
 }
 
 /// Compile `src` to `bin` with the first working compiler in `ccs`, skipping the
-/// work when `bin` is newer than `src`. Returns `false` only when the source is
-/// present, newer than `bin`, and no compiler in `ccs` succeeded; a missing
+/// work when `bin` is newer than both `src` and this build script (the flags
+/// live here, so a flag change must recompile). Returns `false` only when the
+/// source is present, stale, and no compiler in `ccs` succeeded; a missing
 /// source (a packaged crate) or an up-to-date `bin` reports success. The caller
 /// decides whether that failure is a hard error or a warning.
 fn build_static(src: &Path, bin: &Path, ccs: &[&str], args: &[&str]) -> bool {
@@ -106,13 +111,11 @@ fn build_static(src: &Path, bin: &Path, ccs: &[&str], args: &[&str]) -> bool {
     if !src.exists() {
         return true;
     }
-    if bin.exists() {
-        if let (Ok(s), Ok(b)) = (src.metadata(), bin.metadata()) {
-            if let (Ok(st), Ok(bt)) = (s.modified(), b.modified()) {
-                if bt >= st {
-                    return true;
-                }
-            }
+    let mtime = |p: &Path| p.metadata().and_then(|m| m.modified()).ok();
+    let build_rs = Path::new(env!("CARGO_MANIFEST_DIR")).join("build.rs");
+    if let (Some(bt), Some(st), Some(rt)) = (mtime(bin), mtime(src), mtime(&build_rs)) {
+        if bt >= st && bt >= rt {
+            return true;
         }
     }
     for cc in ccs {

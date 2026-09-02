@@ -427,6 +427,25 @@ mod tests {
         assert!(loads > 0, "stub has no PT_LOAD segments");
     }
 
+    /// The stub runs with a zero thread pointer until it restores the
+    /// checkpoint's, so a stack-protector prologue (`mov %fs:0x28,%rax`) faults
+    /// at address 0x28 before the handshake. Ubuntu's gcc exempts freestanding
+    /// builds from its default SSP; a vanilla gcc does not, so build.rs has to
+    /// disable it explicitly.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn stub_carries_no_stack_protector() {
+        let Ok(elf) = std::fs::read(stub_path()) else {
+            eprintln!("skip: restore-stub not built");
+            return;
+        };
+        const CANARY_LOAD: &[u8] = &[0x64, 0x48, 0x8b, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00];
+        assert!(
+            !elf.windows(CANARY_LOAD.len()).any(|w| w == CANARY_LOAD),
+            "restore-stub reads the %fs:0x28 canary; build.rs must pass -fno-stack-protector"
+        );
+    }
+
     /// End-to-end proof that the serializer and the stub agree: build a real
     /// control blob for a hand-assembled one-page "program", exec the stub with
     /// the inherited fds, drive the handshake, and read the sentinel byte the
