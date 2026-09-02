@@ -396,7 +396,7 @@ fn parse_cow_write(
             dev:  notif.data.args[3],
         });
     }
-    if nr == libc::SYS_renameat2 {
+    if nr == libc::SYS_renameat2 || Some(nr) == arch::sys_renameat() {
         let old_path = read_resolved(notif, 1, Some(0), notif_fd, virtual_cwd)?;
         let new_path = read_resolved(notif, 3, Some(2), notif_fd, virtual_cwd)?;
         return Some(CowWriteOp::Rename { old_path, new_path });

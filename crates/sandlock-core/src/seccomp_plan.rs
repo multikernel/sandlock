@@ -164,6 +164,8 @@ fn cow_path_syscalls() -> Vec<i64> {
             arch::sys_mkdir(),
             arch::sys_mknod(),
             arch::sys_rename(),
+            // libc's rename() lands here on aarch64, which has no rename(2).
+            arch::sys_renameat(),
             arch::sys_symlink(),
             arch::sys_link(),
             arch::sys_chmod(),

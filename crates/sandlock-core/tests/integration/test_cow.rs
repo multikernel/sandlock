@@ -365,6 +365,61 @@ async fn test_seccomp_cow_openat2_syscall() {
     let _ = fs::remove_file(&out_file);
 }
 
+/// renameat must land in the COW layer like rename and renameat2.
+///
+/// Regression test: COW registered renameat2 and legacy rename but not
+/// renameat, so a raw renameat under the workdir renamed the real file and
+/// survived an abort. On aarch64 libc's rename() compiles to renameat, so
+/// there every ordinary rename escaped the branch. riscv64 has no renameat,
+/// so the test runs the same check through renameat2 with no flags.
+#[tokio::test]
+async fn test_seccomp_cow_renameat_syscall() {
+    let workdir = temp_dir("seccomp-renameat");
+    fs::write(workdir.join("orig.txt"), "keep").unwrap();
+    let out_file = std::env::temp_dir().join(format!(
+        "sandlock-test-renameat-{}", std::process::id()
+    ));
+
+    let mut policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc").fs_read("/dev")
+        .fs_write(&workdir).fs_write("/tmp")
+        .workdir(&workdir)
+        .cwd(&workdir)
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+
+    // renameat is 264 on x86_64 and 38 on aarch64; riscv64 only has renameat2 (276).
+    let script = format!(concat!(
+        "import ctypes, os, platform\n",
+        "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
+        "old = b'{wd}/orig.txt'; new = b'{wd}/moved.txt'\n",
+        "m = platform.machine()\n",
+        "if m == 'x86_64':\n",
+        "    r = libc.syscall(264, -100, old, -100, new)\n",
+        "elif m == 'aarch64':\n",
+        "    r = libc.syscall(38, -100, old, -100, new)\n",
+        "else:\n",
+        "    r = libc.syscall(276, -100, old, -100, new, 0)\n",
+        "err = ctypes.get_errno()\n",
+        "if r == 0 and not os.path.exists(old) and open(new).read() == 'keep':\n",
+        "    open('{out}', 'w').write('renamed')\n",
+        "else:\n",
+        "    open('{out}', 'w').write(f'FAILED:ret={{r}},errno={{err}}')\n",
+    ), wd = workdir.display(), out = out_file.display());
+
+    let result = policy.run(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "exit={:?}, stderr={}", result.code(), result.stderr_str().unwrap_or(""));
+    let content = fs::read_to_string(&out_file).unwrap_or_default();
+    assert_eq!(content, "renamed", "raw renameat should work with COW");
+    assert!(workdir.join("orig.txt").exists(), "orig.txt should be back after abort");
+    assert!(!workdir.join("moved.txt").exists(), "moved.txt should not exist after abort");
+
+    let _ = fs::remove_dir_all(&workdir);
+    let _ = fs::remove_file(&out_file);
+}
+
 /// Legacy stat/lstat/access must honor whiteouts.
 ///
 /// Regression test: handle_cow_stat parsed every syscall with the at-variant

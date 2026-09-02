@@ -1019,8 +1019,8 @@ fn register_cow_handlers(table: &mut DispatchTable, ctx: &Arc<SupervisorCtx>) {
     ];
     write_nrs.extend([
         arch::sys_unlink(), arch::sys_rmdir(), arch::sys_mkdir(), arch::sys_mknod(),
-        arch::sys_rename(), arch::sys_symlink(), arch::sys_link(), arch::sys_chmod(),
-        arch::sys_chown(), arch::sys_lchown(),
+        arch::sys_rename(), arch::sys_renameat(), arch::sys_symlink(), arch::sys_link(),
+        arch::sys_chmod(), arch::sys_chown(), arch::sys_lchown(),
     ].into_iter().flatten());
     for nr in write_nrs {
         table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_write));
