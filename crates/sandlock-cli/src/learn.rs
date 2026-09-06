@@ -203,8 +203,21 @@ fn collapse_by_threshold(
 /// Returns true for pid-specific paths that are meaningless across runs.
 fn is_junk_path(p: &std::path::Path) -> bool {
     let b = p.as_os_str().as_encoded_bytes();
-    b.starts_with(b"/proc/self")
-        || (b.starts_with(b"/proc/") && b.get(6).map_or(false, u8::is_ascii_digit))
+    // /proc/<pid>/... are pid-specific across runs.
+    let proc_numeric_pid = b.starts_with(b"/proc/")
+        && b.get(6).map_or(false, u8::is_ascii_digit);
+    // Under /proc/self, only sub-trees with volatile numeric components are
+    // junk. Stable entries like /proc/self/maps are legitimately needed
+    // across runs (e.g. V8 reads maps on every startup).
+    let proc_self_volatile = b.starts_with(b"/proc/self/fd/")
+        || b.starts_with(b"/proc/self/fdinfo/")
+        || b.starts_with(b"/proc/self/task/")
+        || b.starts_with(b"/proc/self/map_files/")
+        || b == b"/proc/self/fd"
+        || b == b"/proc/self/fdinfo"
+        || b == b"/proc/self/task"
+        || b == b"/proc/self/map_files";
+    proc_numeric_pid || proc_self_volatile
 }
 
 /// A pty's number changes between sessions; granting the directory is
@@ -502,7 +515,13 @@ impl LearnObserver {
 /// Resolve symlinks to get the canonical path. Falls back to the original
 /// if the path doesn't exist yet (e.g. COW-intercepted creates).
 ///
+/// /proc/self is deliberately not resolved: canonicalize would turn
+/// /proc/self/maps into /proc/<pid>/maps, making it look like a volatile
+/// pid-specific path and causing is_junk_path to drop it.
 fn canonicalize_or_keep(p: PathBuf) -> PathBuf {
+    if p.as_os_str().as_encoded_bytes().starts_with(b"/proc/self") {
+        return p;
+    }
     std::fs::canonicalize(&p).unwrap_or(p)
 }
 
