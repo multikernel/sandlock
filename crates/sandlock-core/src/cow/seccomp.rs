@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -2137,6 +2138,22 @@ impl SeccompCowBranch {
                     &target.to_string_lossy(),
                 )
                 .map_err(|e| BranchError::Operation(format!("symlink: {}", e)))?;
+                self.drop_merged_entry(entry.path());
+                synced_dirs.insert(dest.parent().unwrap().to_path_buf());
+            } else if entry.file_type().is_fifo() || entry.file_type().is_socket() {
+                // A node the workload mknod'ed carries no bytes, and opening a
+                // FIFO to copy it would block on a peer that never comes.
+                if let Some(p) = parent_rel(rel_str) {
+                    let _ = crate::sys::fs::mkdirp_in_root(&self.workdir, p, 0o755);
+                }
+                let mode = entry
+                    .metadata()
+                    .map(|m| m.mode())
+                    .map_err(|e| BranchError::Operation(format!("stat: {}", e)))?;
+                let _ = crate::sys::fs::unlinkat_in_root(&self.workdir, rel_str, false);
+                crate::sys::fs::mknod_in_root(&self.workdir, rel_str, mode, 0)
+                    .map_err(|e| BranchError::Operation(format!("mknod: {}", e)))?;
+                let _ = crate::sys::fs::chmod_in_root(&self.workdir, rel_str, mode & 0o7777);
                 self.drop_merged_entry(entry.path());
                 synced_dirs.insert(dest.parent().unwrap().to_path_buf());
             } else {
@@ -4948,6 +4965,31 @@ mod tests {
             Ok(other) => panic!("expected an empty upper stub for a FIFO, got {:?}", other),
             Err(_) => panic!("copy-up of a FIFO hung"),
         }
+    }
+
+    #[test]
+    fn commit_publishes_a_fifo_the_branch_made() {
+        // The branch lets the workload mknod a FIFO, so commit must be able
+        // to publish one. Byte-copying it opens the FIFO and blocks forever;
+        // commit runs on a thread with a timeout so that shows as a failure.
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().to_path_buf();
+        let sd = storage.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut b = SeccompCowBranch::create(&wd, Some(&sd), 0).unwrap();
+            let path = format!("{}/made", b.workdir_str());
+            assert!(b.handle_mknod(&path, libc::S_IFIFO as u32 | 0o640, 0).unwrap());
+            let _ = tx.send(b.commit());
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("commit failed: {:?}", e),
+            Err(_) => panic!("commit hung publishing a FIFO"),
+        }
+        let meta = fs::symlink_metadata(workdir.path().join("made")).unwrap();
+        assert!(std::os::unix::fs::FileTypeExt::is_fifo(&meta.file_type()), "published as a FIFO");
+        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o777, 0o640);
     }
 
     #[test]
