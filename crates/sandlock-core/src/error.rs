@@ -130,6 +130,12 @@ pub enum BranchError {
     /// async `CowOpenPlan::Deleted`.
     #[error("file was deleted in this branch")]
     Deleted,
+
+    /// The lower entry is a kernel object (FIFO, socket, device node) that
+    /// merely has a name in the tree. The branch owns regular files,
+    /// directories, and symlinks; everything else stays with the kernel.
+    #[error("entry is not owned by this branch")]
+    NotOwned,
 }
 
 /// Convenience type alias.

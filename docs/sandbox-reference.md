@@ -525,7 +525,11 @@ parse_ports([80, "443", "8000-8005"])
 2. **Seccomp COW with `workdir`.** When `workdir` is set, the
    seccomp-based COW path intercepts writes under `workdir` and stages
    them in an upper layer, committed or aborted on exit per `on_exit` /
-   `on_error`.
+   `on_error`. Staging covers regular files, directories, and symlinks.
+   A FIFO, socket, or device node under `workdir` is a kernel object:
+   opening it or changing its metadata goes to the kernel under the
+   Landlock rules, renaming or hard-linking it returns `EXDEV`, and
+   nothing about it is reverted on abort.
 3. **HTTP host auto-expansion.** HTTP rules referencing concrete hosts
    auto-add corresponding TCP entries on `http_ports` (and on `443`
    when `http_ca` is set). Wildcard hosts add the equivalent any-IP

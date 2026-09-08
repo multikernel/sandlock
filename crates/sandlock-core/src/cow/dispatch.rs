@@ -489,6 +489,7 @@ fn cow_result(r: Result<bool, crate::error::BranchError>) -> NotifAction {
         // Whiteouted source: Continue would let the kernel act on the lower
         // entry, which still exists with its pre-delete content.
         Err(crate::error::BranchError::Deleted) => NotifAction::Errno(libc::ENOENT),
+        Err(crate::error::BranchError::NotOwned) => NotifAction::Continue,
         _ => NotifAction::Continue,
     }
 }
@@ -588,6 +589,16 @@ pub(crate) async fn handle_cow_write(
                 match cow.prepare_copy(rel) {
                     Ok(plan) => (Some(plan), workdir, upper, rel.clone()),
                     Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
+                    // A kernel object: its metadata is the kernel's to change,
+                    // but it cannot be staged under a new name.
+                    Err(crate::error::BranchError::NotOwned) => {
+                        return match op {
+                            CowWriteOp::Rename { .. } | CowWriteOp::Link { .. } => {
+                                NotifAction::Errno(libc::EXDEV)
+                            }
+                            _ => NotifAction::Continue,
+                        }
+                    }
                     Err(_) => return NotifAction::Continue,
                 }
             }

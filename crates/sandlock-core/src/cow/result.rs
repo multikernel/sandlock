@@ -19,6 +19,7 @@ pub(crate) fn link_result(r: Result<bool, BranchError>) -> NotifAction {
         Err(BranchError::Deleted) => NotifAction::Errno(libc::ENOENT),
         Err(BranchError::Denied) => NotifAction::Errno(libc::EPERM),
         Err(BranchError::Exists) => NotifAction::Errno(libc::EEXIST),
+        Err(BranchError::NotOwned) => NotifAction::Errno(libc::EXDEV),
         Err(_) => NotifAction::Errno(libc::EIO),
     }
 }
