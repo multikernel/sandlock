@@ -145,6 +145,23 @@ static int cmd_rmdir(int argc, char **argv) {
 }
 
 /* ── chmod ──────────────────────────────────────────────────── */
+/* chmod2 MODE PATH [nofollow]: fchmodat2(2), issued by number (452 on every
+   arch) so the test does not depend on the libc wrapper. */
+static int cmd_chmod2(int argc, char **argv) {
+    if (argc < 2) { fprintf(stderr, "chmod2: missing operand\n"); return 1; }
+    unsigned mode;
+    if (sscanf(argv[0], "%o", &mode) != 1) {
+        fprintf(stderr, "chmod2: invalid mode '%s'\n", argv[0]);
+        return 1;
+    }
+    int flags = (argc >= 3 && strcmp(argv[2], "nofollow") == 0) ? AT_SYMLINK_NOFOLLOW : 0;
+    if (syscall(452, AT_FDCWD, argv[1], mode, flags) < 0) {
+        fprintf(stderr, "chmod2: %s: %s\n", argv[1], strerror(errno));
+        return 1;
+    }
+    return 0;
+}
+
 static int cmd_chmod(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "chmod: missing operand\n"); return 1; }
     unsigned mode;
@@ -852,6 +869,7 @@ static int dispatch(const char *cmd, int argc, char **argv) {
     if (strcmp(cmd, "mkdir") == 0)          return cmd_mkdir(argc, argv);
     if (strcmp(cmd, "rmdir") == 0)          return cmd_rmdir(argc, argv);
     if (strcmp(cmd, "chmod") == 0)          return cmd_chmod(argc, argv);
+    if (strcmp(cmd, "chmod2") == 0)         return cmd_chmod2(argc, argv);
     if (strcmp(cmd, "write") == 0)          return cmd_write(argc, argv);
     if (strcmp(cmd, "rm") == 0)             return cmd_rm(argc, argv);
     if (strcmp(cmd, "mv") == 0)             return cmd_mv(argc, argv);

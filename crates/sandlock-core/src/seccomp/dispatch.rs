@@ -846,7 +846,7 @@ fn register_chroot_handlers(
     let mut write_nrs = vec![
         libc::SYS_unlinkat, libc::SYS_mkdirat, libc::SYS_renameat2,
         libc::SYS_symlinkat, libc::SYS_linkat, libc::SYS_fchmodat,
-        libc::SYS_fchownat, libc::SYS_truncate,
+        arch::SYS_FCHMODAT2, libc::SYS_fchownat, libc::SYS_truncate,
     ];
     // renameat only exists where the ABI kept it, and libc's rename() lands
     // there on the arches without a plain rename(2).
@@ -1015,7 +1015,7 @@ fn register_cow_handlers(table: &mut DispatchTable, ctx: &Arc<SupervisorCtx>) {
     let mut write_nrs = vec![
         libc::SYS_unlinkat, libc::SYS_mkdirat, libc::SYS_mknodat, libc::SYS_renameat2,
         libc::SYS_symlinkat, libc::SYS_linkat, libc::SYS_fchmodat,
-        libc::SYS_fchownat, libc::SYS_truncate,
+        arch::SYS_FCHMODAT2, libc::SYS_fchownat, libc::SYS_truncate,
     ];
     write_nrs.extend([
         arch::sys_unlink(), arch::sys_rmdir(), arch::sys_mkdir(), arch::sys_mknod(),
