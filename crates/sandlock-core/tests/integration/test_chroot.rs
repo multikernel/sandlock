@@ -2249,3 +2249,46 @@ async fn test_chroot_hardlink_to_a_file_deleted_in_the_branch_is_enoent() {
 
     cleanup_rootfs(&rootfs);
 }
+
+/// chmod is not a Landlock-gated operation, so an fchmodat2 left to the
+/// kernel resolves its absolute path against the host root: `chmod -h`
+/// inside the chroot reaches the host's file, or gets ENOENT when the host
+/// has none at that path.
+#[tokio::test]
+async fn test_chroot_fchmodat2_resolves_in_rootfs() {
+    use std::os::unix::fs::PermissionsExt;
+    let rootfs = build_test_rootfs("fchmodat2");
+    let name = format!("sandlock-fchmodat2-{}", std::process::id());
+    let inside = rootfs.join("tmp").join(&name);
+    let decoy = std::path::Path::new("/tmp").join(&name);
+    for p in [&inside, &decoy] {
+        fs::write(p, "x").unwrap();
+        fs::set_permissions(p, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write("/tmp")
+        .build()
+        .unwrap();
+
+    let virt = format!("/tmp/{name}");
+    let result = policy
+        .clone()
+        .run(&["rootfs-helper", "chmod2", "600", &virt, "nofollow"])
+        .await
+        .unwrap();
+    let mode = |p: &std::path::Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let (got_inside, got_decoy) = (mode(&inside), mode(&decoy));
+    let _ = fs::remove_file(&decoy);
+    cleanup_rootfs(&rootfs);
+
+    assert!(result.success(), "chmod2 should succeed, stderr: {}", result.stderr_str().unwrap_or(""));
+    assert_eq!(got_inside, 0o600, "the rootfs file must carry the new mode");
+    assert_eq!(got_decoy, 0o644, "the host file at the same path must be untouched");
+}

@@ -1353,12 +1353,24 @@ pub(crate) async fn handle_chroot_write(
         };
     }
 
-    if nr == libc::SYS_fchmodat {
-        let (_, host_path, vp) = match read_and_resolve(notif, notif_fd, ctx, 0, 1) {
+    if nr == libc::SYS_fchmodat || nr == crate::arch::SYS_FCHMODAT2 {
+        let nofollow = nr == crate::arch::SYS_FCHMODAT2
+            && (notif.data.args[3] & libc::AT_SYMLINK_NOFOLLOW as u64) != 0;
+        let resolved = if nofollow {
+            read_and_resolve_nofollow(notif, notif_fd, ctx, 0, 1)
+        } else {
+            read_and_resolve(notif, notif_fd, ctx, 0, 1)
+        };
+        let (_, host_path, vp) = match resolved {
             Ok(r) => r,
             Err(a) => return a,
         };
         if !ctx.can_write(&vp) { return NotifAction::Errno(libc::EACCES); }
+        // Linux has no symlink modes: the kernel's answer for
+        // AT_SYMLINK_NOFOLLOW on a symlink, given before the target is touched.
+        if nofollow && host_path.is_symlink() {
+            return NotifAction::Errno(libc::EOPNOTSUPP);
+        }
         let mode = (notif.data.args[2] & 0o7777) as u32;
 
         {

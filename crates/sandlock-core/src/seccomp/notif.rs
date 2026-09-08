@@ -1568,7 +1568,7 @@ fn syscall_category(nr: i64) -> crate::policy_fn::SyscallCategory {
         n if n == libc::SYS_openat || n == arch::SYS_OPENAT2 || n == libc::SYS_unlinkat
             || n == libc::SYS_mkdirat || n == libc::SYS_mknodat || n == libc::SYS_renameat2
             || n == libc::SYS_symlinkat || n == libc::SYS_linkat
-            || n == libc::SYS_fchmodat || n == libc::SYS_fchownat
+            || n == libc::SYS_fchmodat || n == arch::SYS_FCHMODAT2 || n == libc::SYS_fchownat
             || n == libc::SYS_truncate || n == libc::SYS_readlinkat
             || n == libc::SYS_newfstatat || n == libc::SYS_statx
             || n == libc::SYS_faccessat || n == libc::SYS_getdents64

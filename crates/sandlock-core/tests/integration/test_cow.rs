@@ -1482,3 +1482,59 @@ async fn test_seccomp_cow_hardlink_cannot_cross_the_workdir_boundary() {
     let _ = fs::remove_dir_all(&workdir);
     let _ = fs::remove_dir_all(&outside);
 }
+
+// ============================================================
+// fchmodat2
+// ============================================================
+
+/// glibc issues fchmodat2(2) whenever fchmodat is called with flags, which is
+/// what `mkfifo -m`, `chmod -h`, and python's `follow_symlinks=False` do.
+/// Left to the kernel it resolves against the real workdir: a branch-created
+/// entry got ENOENT and a lower file was changed for real.
+#[tokio::test]
+async fn test_seccomp_cow_fchmodat2_is_virtualized() {
+    use std::os::unix::fs::PermissionsExt;
+    let workdir = temp_dir("seccomp-fchmodat2");
+    let lower = workdir.join("lower.txt");
+    fs::write(&lower, "x").unwrap();
+    fs::set_permissions(&lower, fs::Permissions::from_mode(0o644)).unwrap();
+    let _ = fs::remove_file(workdir.join("link"));
+    std::os::unix::fs::symlink("lower.txt", workdir.join("link")).unwrap();
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc").fs_read("/dev")
+        .fs_write(&workdir)
+        .workdir(&workdir)
+        .cwd(&workdir)
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+
+    let script = concat!(
+        "import ctypes, os\n",
+        "libc = ctypes.CDLL(None, use_errno=True)\n",
+        "libc.syscall.restype = ctypes.c_long\n",
+        "def chmod2(path, mode, flags):\n",
+        "    r = libc.syscall(452, -100, path.encode(), mode, flags)\n",
+        "    return r if r == 0 else -ctypes.get_errno()\n",
+        "mode = lambda p: oct(os.stat(p).st_mode & 0o777)\n",
+        "os.mkfifo('made')\n",
+        "print('made', chmod2('made', 0o640, 0x100), mode('made'))\n",
+        "print('lower', chmod2('lower.txt', 0o600, 0), mode('lower.txt'))\n",
+        "print('link', chmod2('link', 0o400, 0x100), mode('lower.txt'))\n",
+    );
+    let result = policy.clone().run(&["python3", "-c", script]).await.unwrap();
+    let stdout = result.stdout_str().unwrap_or("");
+    assert!(result.success(), "exit={:?} stderr={}", result.code(), result.stderr_str().unwrap_or(""));
+    assert!(stdout.contains("made 0 0o640"), "branch-created FIFO: {stdout}");
+    assert!(stdout.contains("lower 0 0o600"), "lower file in the merged view: {stdout}");
+    // The kernel's own answer for AT_SYMLINK_NOFOLLOW on a symlink, and the
+    // target must be left alone.
+    assert!(stdout.contains("link -95 0o600"), "symlink with AT_SYMLINK_NOFOLLOW: {stdout}");
+
+    let real = fs::metadata(&lower).unwrap().permissions().mode() & 0o777;
+    assert_eq!(real, 0o644, "the abort must leave the real file untouched");
+    assert!(!workdir.join("made").exists());
+    let _ = fs::remove_dir_all(&workdir);
+}

@@ -315,7 +315,7 @@ enum CowWriteOp {
     Rename { old_path: String, new_path: String },
     Symlink { target: String, linkpath: String },
     Link { old_path: String, new_path: String },
-    Chmod { path: String, mode: u32 },
+    Chmod { path: String, mode: u32, nofollow: bool },
     Chown { path: String, uid: u32, gid: u32 },
     Truncate { path: String, length: i64 },
 }
@@ -412,9 +412,13 @@ fn parse_cow_write(
         let new_path = read_resolved(notif, 3, Some(2), notif_fd, virtual_cwd)?;
         return Some(CowWriteOp::Link { old_path, new_path });
     }
-    if nr == libc::SYS_fchmodat {
+    if nr == libc::SYS_fchmodat || nr == arch::SYS_FCHMODAT2 {
         let path = read_resolved(notif, 1, Some(0), notif_fd, virtual_cwd)?;
-        return Some(CowWriteOp::Chmod { path, mode: (notif.data.args[2] & 0o7777) as u32 });
+        // fchmodat(2) itself carries no flags; libc handles them by issuing
+        // fchmodat2 instead, which is what mkfifo -m and chmod -h reach.
+        let nofollow = nr == arch::SYS_FCHMODAT2
+            && notif.data.args[3] & libc::AT_SYMLINK_NOFOLLOW as u64 != 0;
+        return Some(CowWriteOp::Chmod { path, mode: (notif.data.args[2] & 0o7777) as u32, nofollow });
     }
     if nr == libc::SYS_fchownat {
         let path = read_resolved(notif, 1, Some(0), notif_fd, virtual_cwd)?;
@@ -464,7 +468,7 @@ fn parse_cow_write(
     }
     if Some(nr) == arch::sys_chmod() {
         let path = read_resolved(notif, 0, None, notif_fd, virtual_cwd)?;
-        return Some(CowWriteOp::Chmod { path, mode: (notif.data.args[1] & 0o7777) as u32 });
+        return Some(CowWriteOp::Chmod { path, mode: (notif.data.args[1] & 0o7777) as u32, nofollow: false });
     }
     if Some(nr) == arch::sys_chown() || Some(nr) == arch::sys_lchown() {
         let path = read_resolved(notif, 0, None, notif_fd, virtual_cwd)?;
@@ -645,8 +649,13 @@ pub(crate) async fn handle_cow_write(
             if !cow.matches(new_path) { return NotifAction::Continue; }
             link_result(cow.handle_link(old_path, new_path))
         }
-        CowWriteOp::Chmod { ref path, mode } => {
+        CowWriteOp::Chmod { ref path, mode, nofollow } => {
             if !cow.matches(path) { return NotifAction::Continue; }
+            // Linux has no symlink modes: the kernel's answer for
+            // AT_SYMLINK_NOFOLLOW on a symlink, given before the target is touched.
+            if nofollow && cow.handle_stat(path).is_some_and(|p| p.is_symlink()) {
+                return NotifAction::Errno(libc::EOPNOTSUPP);
+            }
             cow_result(cow.handle_chmod(path, mode))
         }
         CowWriteOp::Chown { ref path, uid, gid } => {
