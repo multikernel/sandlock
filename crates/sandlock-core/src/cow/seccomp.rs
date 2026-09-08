@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -36,6 +37,9 @@ fn branch_errno(e: BranchError) -> i32 {
         BranchError::Denied => libc::EPERM,
         BranchError::Deleted => libc::ENOENT,
         BranchError::Exists => libc::EEXIST,
+        // A kernel object cannot be staged in the upper; EXDEV makes mv and
+        // ln fall back to mknod plus unlink, which the branch virtualizes.
+        BranchError::NotOwned => libc::EXDEV,
         BranchError::Operation(_) | BranchError::Conflict(_) => libc::EIO,
     }
 }
@@ -741,6 +745,25 @@ impl SeccompCowBranch {
         crate::sys::fs::statat_in_root(&self.upper, rel, false).is_ok()
     }
 
+    /// The branch owns filesystem data: regular files, directories, and
+    /// symlinks. A FIFO, socket, or device is a kernel object that merely
+    /// has a name in the tree; a copy of it is meaningless (a stub cannot be
+    /// a terminal) and opening it can block the supervisor (issue #158), so
+    /// its content and metadata stay with the kernel and Landlock.
+    fn is_kernel_object_kind(kind: libc::mode_t) -> bool {
+        matches!(kind, libc::S_IFIFO | libc::S_IFSOCK | libc::S_IFCHR | libc::S_IFBLK)
+    }
+
+    /// True when the merged entry at `rel` is a lower kernel object. An
+    /// entry the branch materialized itself (a FIFO it mknod'ed) is owned.
+    fn is_kernel_object(&self, rel: &str) -> bool {
+        !self.upper_has(rel)
+            && matches!(
+                crate::sys::fs::statat_in_root(&self.workdir, rel, false),
+                Ok(st) if Self::is_kernel_object_kind(st.st_mode & libc::S_IFMT)
+            )
+    }
+
     /// Check if a relative path is hidden by a whiteout in the merged view.
     /// A whiteout covers its whole subtree; an entry re-created in the upper
     /// shadows the whiteout and is visible again.
@@ -859,31 +882,8 @@ impl SeccompCowBranch {
             return Ok(CowCopyPlan::Ready(upper_file));
         }
 
-        if kind != libc::S_IFREG {
-            // Non-regular lower (FIFO, socket, device node): its content is
-            // not filesystem data, and reading it can block forever (issue
-            // #158: a FIFO open waits for a writer). Virtualize the write
-            // like any other COW write, onto an empty regular stub in the
-            // upper, WITHOUT reading the source. Under a COW workdir a
-            // write must never need real permission on the lower entry
-            // (learn mode COWs whole trees, so `> /dev/null` lands here)
-            // and must never touch the real device.
-            self.check_quota(0)?;
-            let fd = crate::sys::fs::openat2_in_root(
-                &self.upper,
-                rel_path,
-                libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600,
-            )
-            .map_err(|e| BranchError::Operation(format!("create cow stub: {}", e)))?;
-            unsafe { libc::close(fd) };
-            // Whiteout the lower entry the stub replaces. The stub already
-            // shadows it in the merged view; the whiteout makes commit
-            // unlink it before the publish walk, which would otherwise
-            // O_WRONLY-open the surviving FIFO and block on a reader that
-            // never comes (the publish half of issue #158).
-            self.mark_deleted(rel_path);
-            return Ok(CowCopyPlan::Ready(upper_file));
+        if Self::is_kernel_object_kind(kind) {
+            return Err(BranchError::NotOwned);
         }
 
         // Regular file — defer the potentially expensive copy. Size comes from
@@ -1098,6 +1098,10 @@ impl SeccompCowBranch {
             return Err(BranchError::Deleted);
         }
 
+        if self.is_kernel_object(&rel) {
+            return Ok(None);
+        }
+
         // O_EXCL: fail if file already exists (in upper or lower)
         if flags & O_CREAT != 0 && flags & O_EXCL != 0 {
             // Confined existence check: a symlinked parent component must not
@@ -1171,6 +1175,10 @@ impl SeccompCowBranch {
             // content); report the deletion so the caller returns ENOENT,
             // matching the stat/access path.
             return Ok(CowOpenPlan::Deleted);
+        }
+
+        if self.is_kernel_object(&rel) {
+            return Ok(CowOpenPlan::Skip);
         }
 
         // O_EXCL: fail if file already exists
@@ -2121,6 +2129,22 @@ impl SeccompCowBranch {
                     &target.to_string_lossy(),
                 )
                 .map_err(|e| BranchError::Operation(format!("symlink: {}", e)))?;
+                self.drop_merged_entry(entry.path());
+                synced_dirs.insert(dest.parent().unwrap().to_path_buf());
+            } else if entry.file_type().is_fifo() || entry.file_type().is_socket() {
+                // A node the workload mknod'ed carries no bytes, and opening a
+                // FIFO to copy it would block on a peer that never comes.
+                if let Some(p) = parent_rel(rel_str) {
+                    let _ = crate::sys::fs::mkdirp_in_root(&self.workdir, p, 0o755);
+                }
+                let mode = entry
+                    .metadata()
+                    .map(|m| m.mode())
+                    .map_err(|e| BranchError::Operation(format!("stat: {}", e)))?;
+                let _ = crate::sys::fs::unlinkat_in_root(&self.workdir, rel_str, false);
+                crate::sys::fs::mknod_in_root(&self.workdir, rel_str, mode, 0)
+                    .map_err(|e| BranchError::Operation(format!("mknod: {}", e)))?;
+                let _ = crate::sys::fs::chmod_in_root(&self.workdir, rel_str, mode & 0o7777);
                 self.drop_merged_entry(entry.path());
                 synced_dirs.insert(dest.parent().unwrap().to_path_buf());
             } else {
@@ -4907,100 +4931,168 @@ mod tests {
         assert!(!branch.upper_dir().join("d").exists());
     }
 
+    fn make_fifo(path: &Path) {
+        let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+    }
+
     #[test]
-    fn copy_up_of_fifo_does_not_block() {
+    fn copy_up_of_fifo_is_refused_without_blocking() {
         // Issue #158: opening a FIFO O_RDONLY blocks until a writer appears,
-        // so the copy-up path must never stream a non-regular file. The probe
+        // so the copy-up path must never touch a non-regular file. The probe
         // runs on a thread with a timeout so a regression hangs the test, not
         // the suite.
         let (workdir, storage) = setup_workdir();
-        let fifo = workdir.path().join("pipe");
-        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
-
+        make_fifo(&workdir.path().join("pipe"));
         let wd = workdir.path().to_path_buf();
         let sd = storage.path().to_path_buf();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut b = SeccompCowBranch::create(&wd, Some(&sd), 0).unwrap();
-            let _ = tx.send(b.ensure_cow_copy("pipe").map(|p| fs::read(p).map(|b| b.len())));
+            let _ = tx.send(b.ensure_cow_copy("pipe"));
         });
         match rx.recv_timeout(std::time::Duration::from_secs(5)) {
-            // The FIFO is virtualized as an empty regular stub in the upper,
-            // created without ever opening the FIFO itself.
-            Ok(Ok(Ok(0))) => {}
-            Ok(other) => panic!("expected an empty upper stub for a FIFO, got {:?}", other),
+            Ok(Err(BranchError::NotOwned)) => {}
+            Ok(other) => panic!("expected NotOwned for a FIFO, got {:?}", other),
             Err(_) => panic!("copy-up of a FIFO hung"),
         }
     }
 
     #[test]
-    fn write_open_of_fifo_virtualizes_to_upper_stub() {
-        // A write-open of a FIFO under the COW tree keeps the virtualization
-        // contract (`> /dev/null` in a learn-mode tree must not need real
-        // write permission on /dev), and must not block the supervisor.
+    fn open_of_fifo_passes_through_to_kernel() {
+        // A FIFO is a rendezvous, not data: an upper stub would discard what
+        // the writer sends, and a supervisor-side open would block the
+        // supervisor instead of the child.
         let (workdir, storage) = setup_workdir();
-        let fifo = workdir.path().join("pipe");
-        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        make_fifo(&workdir.path().join("pipe"));
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
-        let wd = branch.workdir_str().to_string();
-        let flags = libc::O_WRONLY as u64;
-        let resolved = branch.handle_open(&format!("{}/pipe", wd), flags).unwrap();
-        assert_eq!(resolved, Some(branch.upper_dir().join("pipe")));
-        let meta = fs::metadata(branch.upper_dir().join("pipe")).unwrap();
-        assert!(meta.file_type().is_file(), "upper stub must be a regular file");
-        assert_eq!(meta.len(), 0);
+        let path = format!("{}/pipe", branch.workdir_str());
+        for flags in [libc::O_RDONLY as u64, libc::O_WRONLY as u64] {
+            assert_eq!(branch.handle_open(&path, flags).unwrap(), None);
+            assert!(matches!(branch.prepare_open(&path, flags).unwrap(), CowOpenPlan::Skip));
+        }
+        assert!(!branch.upper_dir().join("pipe").exists(), "no stub may be created");
     }
 
     #[test]
-    fn commit_replaces_lower_fifo_with_stub_bytes() {
-        // The publish half of issue #158: the stub must whiteout the lower
-        // FIFO so commit's deletion pass unlinks it. Without the whiteout
-        // the publish walk O_WRONLY-opens the surviving FIFO as its
-        // destination and blocks on a reader that never comes. Commit runs
-        // on a thread with a timeout so a regression fails the test
-        // instead of hanging the suite.
+    fn commit_leaves_lower_fifo_alone() {
+        // Commit runs on a thread with a timeout: a stub or whiteout for the
+        // FIFO would make the publish walk open it and block (issue #158).
         let (workdir, storage) = setup_workdir();
-        let fifo = workdir.path().join("pipe");
-        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
-
+        make_fifo(&workdir.path().join("pipe"));
         let wd = workdir.path().to_path_buf();
         let sd = storage.path().to_path_buf();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut b = SeccompCowBranch::create(&wd, Some(&sd), 0).unwrap();
-            let wds = b.workdir_str().to_string();
-            let resolved = b
-                .handle_open(&format!("{}/pipe", wds), libc::O_WRONLY as u64)
-                .unwrap()
-                .unwrap();
-            fs::write(&resolved, "published").unwrap();
+            let path = format!("{}/pipe", b.workdir_str());
+            assert_eq!(b.handle_open(&path, libc::O_WRONLY as u64).unwrap(), None);
             let _ = tx.send(b.commit());
         });
         match rx.recv_timeout(std::time::Duration::from_secs(10)) {
             Ok(Ok(())) => {}
             Ok(Err(e)) => panic!("commit failed: {:?}", e),
-            Err(_) => panic!("commit hung on the lower FIFO (issue #158)"),
+            Err(_) => panic!("commit hung on the lower FIFO"),
         }
-        let meta = fs::symlink_metadata(workdir.path().join("pipe")).unwrap();
-        assert!(meta.file_type().is_file(), "lower FIFO must be replaced by the stub");
-        assert_eq!(fs::read_to_string(workdir.path().join("pipe")).unwrap(), "published");
+        let ft = fs::symlink_metadata(workdir.path().join("pipe")).unwrap().file_type();
+        assert!(std::os::unix::fs::FileTypeExt::is_fifo(&ft), "lower FIFO must survive as a FIFO");
     }
 
     #[test]
-    fn chmod_of_fifo_stays_in_upper() {
+    fn chmod_of_fifo_passes_through_to_kernel() {
         let (workdir, storage) = setup_workdir();
         let fifo = workdir.path().join("pipe");
-        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        make_fifo(&fifo);
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
-        let wd = branch.workdir_str().to_string();
-        assert_eq!(branch.handle_chmod(&format!("{}/pipe", wd), 0o600).unwrap(), true);
-        // The chmod landed on the upper stub, not the real FIFO.
+        let path = format!("{}/pipe", branch.workdir_str());
+        assert!(matches!(branch.handle_chmod(&path, 0o600), Err(BranchError::NotOwned)));
+        assert!(!branch.upper_dir().join("pipe").exists(), "no stub may be created");
         let lower_mode = fs::metadata(&fifo).unwrap().permissions();
         assert_eq!(std::os::unix::fs::PermissionsExt::mode(&lower_mode) & 0o777, 0o644);
+    }
+
+    #[test]
+    fn rename_of_fifo_reports_exdev() {
+        // A kernel object cannot be staged in the upper. EXDEV is the answer
+        // mv already handles: it falls back to mknod plus unlink, both of
+        // which the branch virtualizes.
+        let (workdir, storage) = setup_workdir();
+        make_fifo(&workdir.path().join("pipe"));
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let wd = branch.workdir_str().to_string();
+        assert_eq!(
+            branch.handle_rename(&format!("{wd}/pipe"), &format!("{wd}/pipe2")),
+            Err(libc::EXDEV),
+        );
+        assert!(!branch.upper_dir().join("pipe").exists(), "no stub may be created");
+    }
+
+    #[test]
+    fn fifo_created_in_branch_stays_virtualized() {
+        // Ownership is about the lower tree: a FIFO the workload itself made
+        // lives in the upper and keeps resolving there.
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let path = format!("{}/made", branch.workdir_str());
+        assert!(branch.handle_mknod(&path, libc::S_IFIFO as u32 | 0o644, 0).unwrap());
+        assert_eq!(
+            branch.handle_open(&path, libc::O_WRONLY as u64).unwrap(),
+            Some(branch.upper_dir().join("made")),
+        );
+    }
+
+    #[test]
+    fn commit_publishes_a_fifo_the_branch_made() {
+        // The branch lets the workload mknod a FIFO, so commit must be able
+        // to publish one. Byte-copying it opens the FIFO and blocks forever;
+        // commit runs on a thread with a timeout so that shows as a failure.
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().to_path_buf();
+        let sd = storage.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut b = SeccompCowBranch::create(&wd, Some(&sd), 0).unwrap();
+            let path = format!("{}/made", b.workdir_str());
+            assert!(b.handle_mknod(&path, libc::S_IFIFO as u32 | 0o640, 0).unwrap());
+            let _ = tx.send(b.commit());
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("commit failed: {:?}", e),
+            Err(_) => panic!("commit hung publishing a FIFO"),
+        }
+        let meta = fs::symlink_metadata(workdir.path().join("made")).unwrap();
+        assert!(std::os::unix::fs::FileTypeExt::is_fifo(&meta.file_type()), "published as a FIFO");
+        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o777, 0o640);
+    }
+
+    #[test]
+    fn write_open_of_device_node_passes_through_to_kernel() {
+        // A terminal, /dev/null, or a GPU node cannot be virtualized: a stub
+        // in the upper is a regular file the program cannot ioctl, so
+        // ncurses apps lose their tty under a COW workdir of "/".
+        // Device opens go to the kernel, where Landlock decides.
+        let storage = tempfile::tempdir().unwrap();
+        let mut branch = SeccompCowBranch::create(Path::new("/"), Some(storage.path()), 0).unwrap();
+        let flags = (libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC) as u64;
+        assert_eq!(branch.handle_open("/dev/null", flags).unwrap(), None);
+        assert!(matches!(branch.prepare_open("/dev/null", flags).unwrap(), CowOpenPlan::Skip));
+        assert!(
+            !branch.upper_dir().join("dev/null").exists(),
+            "no stub may be created for a device node",
+        );
+    }
+
+    #[test]
+    fn metadata_op_on_device_does_not_bring_back_a_stub() {
+        // chmod/utimes on a device used to stage a stub that every later
+        // open then resolved to, undoing the passthrough.
+        let storage = tempfile::tempdir().unwrap();
+        let mut branch = SeccompCowBranch::create(Path::new("/"), Some(storage.path()), 0).unwrap();
+        assert!(matches!(branch.handle_chmod("/dev/null", 0o666), Err(BranchError::NotOwned)));
+        assert!(matches!(branch.handle_utimensat("/dev/null"), Err(BranchError::NotOwned)));
+        assert_eq!(branch.handle_open("/dev/null", libc::O_RDWR as u64).unwrap(), None);
+        assert!(!branch.upper_dir().join("dev/null").exists());
     }
 
     #[test]

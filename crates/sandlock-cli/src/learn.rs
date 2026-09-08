@@ -74,6 +74,7 @@ fn collapse_write_paths(writes: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
     let mut out: BTreeSet<PathBuf> = BTreeSet::new();
     for p in writes {
         if is_junk_path(p) { continue; }
+        let p = &fold_session_path(p.clone());
         if p.exists() {
             out.insert(p.clone());
             continue;
@@ -186,18 +187,18 @@ fn collapse_by_threshold(
     out.into_iter().collect()
 }
 
-/// Returns true for pid/session-specific paths that are meaningless across runs.
+/// Returns true for pid-specific paths that are meaningless across runs.
 fn is_junk_path(p: &std::path::Path) -> bool {
     let b = p.as_os_str().as_encoded_bytes();
-    // /proc/self/... and /proc/<pid>/... are pid-specific;
-    let proc_pid = b.starts_with(b"/proc/self")
-        || (b.starts_with(b"/proc/") && b.get(6).map_or(false, u8::is_ascii_digit));
-    // Only the controlling terminal is session-specific; hardware serial
-    // devices (/dev/ttyS*, /dev/ttyUSB*, ...) are stable paths a workload
-    // may legitimately need.
-    proc_pid
-        || b.starts_with(b"/dev/pts/") || b == b"/dev/pts"
-        || b == b"/dev/tty"
+    b.starts_with(b"/proc/self")
+        || (b.starts_with(b"/proc/") && b.get(6).map_or(false, u8::is_ascii_digit))
+}
+
+/// A pty's number changes between sessions; granting the directory is
+/// what lets the next run reopen whichever slave it gets. /dev/tty needs
+/// no folding: the path is stable even though the device behind it is not.
+fn fold_session_path(p: PathBuf) -> PathBuf {
+    if p.starts_with("/dev/pts") { PathBuf::from("/dev/pts") } else { p }
 }
 
 use crate::LearnArgs;
@@ -535,6 +536,9 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         .name(format!("learn-{}", std::process::id()))
         .mode("learn")
         .fs_read("/")
+        // Device opens bypass COW and land on the real node, so a terminal
+        // or `> /dev/null` needs Landlock write on /dev to keep working.
+        .fs_write("/dev")
         .workdir("/")
         // Discard all COW changes after observation; learn is read-only from
         // the real filesystem's perspective.
@@ -632,6 +636,7 @@ pub async fn run(args: LearnArgs) -> Result<()> {
 
     let reads_raw: Vec<PathBuf> = observer.reads.lock().unwrap().iter()
         .filter(|p| p.exists() && !is_junk_path(p))
+        .map(|p| fold_session_path(p.clone()))
         .filter(|p| {
             // Same guard the write side has: "/" is never a grant. A child
             // whose cwd is the workdir root lists it routinely (python's -c
@@ -645,7 +650,6 @@ pub async fn run(args: LearnArgs) -> Result<()> {
             }
             true
         })
-        .cloned()
         .collect();
     let writes_raw = observer.writes.lock().unwrap();
     let observed_all: BTreeSet<PathBuf> = reads_raw.iter()
@@ -876,5 +880,36 @@ fn max_opt(a: Option<u32>, b: Option<u32>) -> Option<u32> {
         (None, None) => None,
         (Some(v), None) | (None, Some(v)) => Some(v),
         (Some(va), Some(vb)) => Some(va.max(vb)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A slave pty path, guaranteed to exist for the duration of the test.
+    fn open_pts() -> (libc::c_int, libc::c_int, PathBuf) {
+        let (mut master, mut slave) = (-1, -1);
+        let rc = unsafe {
+            libc::openpty(&mut master, &mut slave, std::ptr::null_mut(),
+                          std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
+        let name = unsafe { std::ffi::CStr::from_ptr(libc::ttyname(slave)) };
+        (master, slave, PathBuf::from(name.to_str().unwrap()))
+    }
+
+    #[test]
+    fn controlling_terminal_is_granted_and_pts_folds_to_its_directory() {
+        // /dev/tty is a stable path (it always means "my terminal"), so a
+        // profile that omits it denies ncurses apps their screen. The pts
+        // number is what changes between sessions.
+        let (master, slave, pts) = open_pts();
+        assert!(pts.starts_with("/dev/pts/"), "unexpected pts name {}", pts.display());
+        let writes: BTreeSet<PathBuf> =
+            [PathBuf::from("/dev/tty"), pts].into_iter().collect();
+        let out = collapse_write_paths(&writes);
+        unsafe { libc::close(slave); libc::close(master); }
+        assert_eq!(out, vec![PathBuf::from("/dev/pts"), PathBuf::from("/dev/tty")]);
     }
 }

@@ -521,6 +521,29 @@ fn test_learn_captures_resource_limits() {
 
 // ── Path collapse and dedup ───────────────────────────────────────────────────
 
+/// A write-open of a device node under learn reaches the real device: a COW
+/// stub in the upper layer would leave ncurses apps without a tty.
+#[test]
+fn test_learn_device_write_open_reaches_real_device() {
+    let output = sandlock_bin()
+        .args([
+            "learn", "--", "python3", "-c",
+            "import os, stat; fd = os.open('/dev/null', os.O_RDWR); \
+             print('ISCHR', stat.S_ISCHR(os.fstat(fd).st_mode))",
+        ])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("ISCHR True"), "expected a real character device, got:\n{stdout}");
+    let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("");
+    assert!(write_line.contains("/dev/null"), "expected /dev/null in writes, got: {write_line}");
+}
+
 /// Dedup removes a path when an ancestor is already in the read set.
 #[test]
 fn test_read_dedup_removes_leaf_when_ancestor_present() {
