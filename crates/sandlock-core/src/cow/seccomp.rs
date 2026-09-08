@@ -741,6 +741,17 @@ impl SeccompCowBranch {
         crate::sys::fs::statat_in_root(&self.upper, rel, false).is_ok()
     }
 
+    /// A device node is not filesystem data: an upper stub cannot stand in
+    /// for a terminal or a GPU, so its open must reach the
+    /// kernel, where Landlock decides.
+    fn lower_is_device(&self, rel: &str) -> bool {
+        !self.upper_has(rel)
+            && matches!(
+                crate::sys::fs::statat_in_root(&self.workdir, rel, false),
+                Ok(st) if matches!(st.st_mode & libc::S_IFMT, libc::S_IFCHR | libc::S_IFBLK)
+            )
+    }
+
     /// Check if a relative path is hidden by a whiteout in the merged view.
     /// A whiteout covers its whole subtree; an entry re-created in the upper
     /// shadows the whiteout and is visible again.
@@ -860,14 +871,13 @@ impl SeccompCowBranch {
         }
 
         if kind != libc::S_IFREG {
-            // Non-regular lower (FIFO, socket, device node): its content is
+            // Non-regular lower (FIFO, socket, or a device reached through a
+            // metadata op; device opens pass through instead): its content is
             // not filesystem data, and reading it can block forever (issue
             // #158: a FIFO open waits for a writer). Virtualize the write
             // like any other COW write, onto an empty regular stub in the
-            // upper, WITHOUT reading the source. Under a COW workdir a
-            // write must never need real permission on the lower entry
-            // (learn mode COWs whole trees, so `> /dev/null` lands here)
-            // and must never touch the real device.
+            // upper, WITHOUT reading the source, so it never needs real
+            // permission on the lower entry.
             self.check_quota(0)?;
             let fd = crate::sys::fs::openat2_in_root(
                 &self.upper,
@@ -1113,6 +1123,9 @@ impl SeccompCowBranch {
         }
 
         if is_write {
+            if self.lower_is_device(&rel) {
+                return Ok(None);
+            }
             self.ensure_cow_copy(&rel).map(Some)
         } else {
             let resolved = self.resolve_read(&rel);
@@ -1187,6 +1200,9 @@ impl SeccompCowBranch {
         }
 
         if is_write {
+            if self.lower_is_device(&rel) {
+                return Ok(CowOpenPlan::Skip);
+            }
             self.prepare_cow_copy(&rel)
         } else {
             let resolved = self.resolve_read(&rel);
@@ -4935,10 +4951,27 @@ mod tests {
     }
 
     #[test]
+    fn write_open_of_device_node_passes_through_to_kernel() {
+        // A terminal, /dev/null, or a GPU node cannot be virtualized: a stub
+        // in the upper is a regular file the program cannot ioctl, so
+        // ncurses apps lose their tty under a COW workdir of "/".
+        // Device opens go to the kernel, where Landlock decides.
+        let storage = tempfile::tempdir().unwrap();
+        let mut branch = SeccompCowBranch::create(Path::new("/"), Some(storage.path()), 0).unwrap();
+        let flags = (libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC) as u64;
+        assert_eq!(branch.handle_open("/dev/null", flags).unwrap(), None);
+        assert!(matches!(branch.prepare_open("/dev/null", flags).unwrap(), CowOpenPlan::Skip));
+        assert!(
+            !branch.upper_dir().join("dev/null").exists(),
+            "no stub may be created for a device node",
+        );
+    }
+
+    #[test]
     fn write_open_of_fifo_virtualizes_to_upper_stub() {
         // A write-open of a FIFO under the COW tree keeps the virtualization
-        // contract (`> /dev/null` in a learn-mode tree must not need real
-        // write permission on /dev), and must not block the supervisor.
+        // contract (it must not need real write permission on the FIFO),
+        // and must not block the supervisor.
         let (workdir, storage) = setup_workdir();
         let fifo = workdir.path().join("pipe");
         let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();

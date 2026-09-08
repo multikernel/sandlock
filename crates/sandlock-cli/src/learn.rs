@@ -535,6 +535,9 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         .name(format!("learn-{}", std::process::id()))
         .mode("learn")
         .fs_read("/")
+        // Device opens bypass COW and land on the real node, so a terminal
+        // or `> /dev/null` needs Landlock write on /dev to keep working.
+        .fs_write("/dev")
         .workdir("/")
         // Discard all COW changes after observation; learn is read-only from
         // the real filesystem's perspective.
