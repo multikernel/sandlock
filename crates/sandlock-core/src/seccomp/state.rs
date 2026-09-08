@@ -368,6 +368,15 @@ impl ProcessIndex {
             .unwrap_or_default()
     }
 
+    /// Distinct thread groups in the index. Entries are keyed by the
+    /// notifying task's tid, so one group can appear under several keys.
+    pub fn tgids_snapshot(&self) -> HashSet<i32> {
+        self.inner
+            .read()
+            .map(|g| g.values().map(|e| e.tgid).collect())
+            .unwrap_or_default()
+    }
+
     /// Remove a process from the index. The per-process state's
     /// `Arc` reference held by the index drops here; remaining clones
     /// (e.g. a handler that's mid-execution for that pid) will drop

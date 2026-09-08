@@ -280,7 +280,7 @@ pub(crate) fn freeze_sandbox_for_execve(
 ) -> Result<SandboxFreeze, FreezeError> {
     let no_pending = |error| FreezeError { error, pending_tids: Vec::new() };
     let caller_tgid = read_tgid_of_tid(caller_tid).map_err(no_pending)?;
-    let mut tgids: HashSet<i32> = processes.pids_snapshot();
+    let mut tgids: HashSet<i32> = processes.tgids_snapshot();
     tgids.insert(caller_tgid);
 
     let mut sibling_tids: Vec<i32> = Vec::new();
@@ -511,5 +511,87 @@ mod tests {
         let _ = peer.wait();
         let _ = caller.kill();
         let _ = caller.wait();
+    }
+
+    /// Re-executed by `freeze_sandbox_tolerates_thread_tids_in_index` as a
+    /// multi-threaded peer; a no-op in a normal test run.
+    #[test]
+    fn freeze_helper_multithreaded_child() {
+        if std::env::var_os("SANDLOCK_FREEZE_HELPER").is_none() {
+            return;
+        }
+        std::thread::spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        });
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    }
+
+    /// Issue #212: the index is keyed by notifying tid, so one thread group
+    /// can appear under several entries, and re-seizing a thread the freeze
+    /// already holds fails with EPERM.
+    #[test]
+    fn freeze_sandbox_tolerates_thread_tids_in_index() {
+        use std::process::{Command, Stdio};
+
+        let mut caller = Command::new("/bin/sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn caller sleep");
+        let caller_tid = caller.id() as i32;
+
+        let mut peer = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "freeze::tests::freeze_helper_multithreaded_child",
+                "--test-threads=1",
+            ])
+            .env("SANDLOCK_FREEZE_HELPER", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn multi-threaded peer");
+        let peer_pid = peer.id() as i32;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let tids = loop {
+            let tids = list_threads_of_tgid(peer_pid).unwrap_or_default();
+            if tids.len() >= 2 {
+                break tids;
+            }
+            assert!(std::time::Instant::now() < deadline, "peer never became multi-threaded");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+
+        let processes = ProcessIndex::new();
+        for tid in &tids {
+            processes.register(*tid).expect("register peer tid");
+        }
+
+        let outcome = freeze_sandbox_for_execve(&processes, caller_tid);
+        if let Ok(freeze) = &outcome {
+            // Detach before killing: a traced thread that dies stays a
+            // zombie until its tracer reaps it, and that would wedge wait().
+            detach_peers(&freeze.peer_tids);
+        }
+        let _ = peer.kill();
+        let _ = caller.kill();
+        let _ = peer.wait();
+        let _ = caller.wait();
+
+        let outcome = outcome.expect("freeze with duplicate thread-group entries");
+        for tid in &tids {
+            assert!(
+                outcome.peer_tids.contains(tid),
+                "peer tid {} missing from {:?}",
+                tid,
+                outcome.peer_tids
+            );
+        }
     }
 }
