@@ -86,7 +86,8 @@ pub struct SyscallEvent {
     pub syscall: String,
     /// High-level category.
     pub category: SyscallCategory,
-    /// PID of the process that made the syscall.
+    /// PID of the process that made the syscall. Notifications name the
+    /// calling thread; this is its thread-group id.
     pub pid: u32,
     /// Parent PID (read from /proc/{pid}/stat).
     pub parent_pid: Option<u32>,
