@@ -1843,6 +1843,7 @@ fn decode_sendmmsg_extras(
     nr: i64,
     name: &str,
     category: crate::policy_fn::SyscallCategory,
+    event_pid: u32,
     parent_pid: Option<u32>,
     denied: bool,
     protocol: &Option<String>,
@@ -1862,7 +1863,7 @@ fn decode_sendmmsg_extras(
         extras.push(crate::policy_fn::SyscallEvent {
             syscall: name.to_string(),
             category,
-            pid: notif.pid,
+            pid: event_pid,
             parent_pid,
             host,
             port,
@@ -1900,6 +1901,8 @@ async fn emit_policy_event(
         .ok()
         .and_then(crate::seccomp::state::read_ppid)
         .and_then(|p| u32::try_from(p).ok());
+    let event_pid = crate::seccomp::state::read_tgid_of_tid(notif.pid as i32)
+        .map_or(notif.pid, |t| t as u32);
 
     // Extract metadata based on syscall type.
     //
@@ -2023,7 +2026,7 @@ async fn emit_policy_event(
     
     // Decode remaining sendmmsg entries before unblocking the child.
     let sendmmsg_extras = decode_sendmmsg_extras(
-        notif, notif_fd, nr, name, category, parent_pid, denied, &protocol,
+        notif, notif_fd, nr, name, category, event_pid, parent_pid, denied, &protocol,
     );
 
     let sock_fd = if nr == libc::SYS_connect || nr == libc::SYS_sendto
@@ -2038,7 +2041,7 @@ async fn emit_policy_event(
     let event = crate::policy_fn::SyscallEvent {
         syscall: name.to_string(),
         category,
-        pid: notif.pid,
+        pid: event_pid,
         parent_pid,
         host,
         port,

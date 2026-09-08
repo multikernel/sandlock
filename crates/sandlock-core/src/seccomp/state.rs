@@ -494,7 +494,7 @@ impl NetworkState {
         }
     }
 
-    /// Get the effective network policy for a PID and protocol.
+    /// Get the effective network policy for the task `tid` and protocol.
     ///
     /// Priority: per-PID override > live policy (from PolicyFnState) >
     /// the per-protocol allowlist for `protocol`.
@@ -503,7 +503,7 @@ impl NetworkState {
     /// protocols, since the legacy API didn't distinguish them.
     pub fn effective_network_policy(
         &self,
-        pid: u32,
+        tid: u32,
         protocol: crate::sandbox::Protocol,
         live_policy: Option<&std::sync::Arc<std::sync::RwLock<crate::policy_fn::LivePolicy>>>,
     ) -> crate::seccomp::notif::NetworkPolicy {
@@ -518,8 +518,12 @@ impl NetworkState {
             }
         };
         if let Ok(overrides) = self.pid_ip_overrides.read() {
-            if let Some(ips) = overrides.get(&pid) {
-                return ip_only_allow(ips);
+            // Overrides are keyed by process; the notification names a thread.
+            if !overrides.is_empty() {
+                let tgid = read_tgid_of_tid(tid as i32).map_or(tid, |t| t as u32);
+                if let Some(ips) = overrides.get(&tgid) {
+                    return ip_only_allow(ips);
+                }
             }
         }
         if let Some(lp) = live_policy {
@@ -932,5 +936,32 @@ mod tests {
         let key = idx.register(self_pid).unwrap();
         idx.prune_dead();
         assert_eq!(idx.key_for(self_pid), Some(key));
+    }
+
+    /// The override is set from a policy event's pid and consulted on every
+    /// thread's syscalls, so it must be keyed by process, not by task.
+    #[test]
+    fn pid_override_applies_to_every_thread_of_the_process() {
+        use crate::seccomp::notif::NetworkPolicy;
+        let ns = NetworkState::new();
+        let tgid = std::process::id();
+        let ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        ns.pid_ip_overrides
+            .write()
+            .unwrap()
+            .insert(tgid, HashSet::from([ip]));
+
+        let policy = std::thread::spawn(move || {
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
+            assert_ne!(tid, tgid);
+            ns.effective_network_policy(tid, crate::sandbox::Protocol::Tcp, None)
+        })
+        .join()
+        .unwrap();
+
+        match policy {
+            NetworkPolicy::AllowList { per_ip, .. } => assert!(per_ip.contains_key(&ip)),
+            other => panic!("override ignored for a non-leader thread: {other:?}"),
+        }
     }
 }
