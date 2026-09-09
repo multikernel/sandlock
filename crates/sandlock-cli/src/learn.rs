@@ -36,7 +36,7 @@ fn classify_path(p: &std::path::Path) -> PathTier {
     if GUARDED_PATHS.iter().any(|s| b == *s) {
         return PathTier::Guarded;
     }
-    // $HOME itself (non-root) is guarded — apps do legitimately write dotfiles there.
+    // $HOME itself (non-root) is guarded: apps do legitimately write dotfiles there.
     if let Ok(home) = std::env::var("HOME") {
         if b == home.as_bytes() && home != "/root" {
             return PathTier::Guarded;
@@ -76,12 +76,25 @@ fn collapse_write_paths(writes: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
         if is_junk_path(p) { continue; }
         let p = &fold_session_path(p.clone());
         if p.exists() {
+            if p.as_os_str().as_encoded_bytes() == b"/" {
+                eprintln!(
+                    "sandlock learn: WARNING: observed a direct write of '/', refusing to grant it"
+                );
+                continue;
+            }
+            match classify_path(p) {
+                PathTier::Protected | PathTier::Guarded => {
+                    eprintln!(
+                        "sandlock learn: NOTE: observed a direct write to '{}'",
+                        p.display()
+                    );
+                }
+                PathTier::Normal => {}
+            }
             out.insert(p.clone());
             continue;
         }
         let Some(ancestor) = p.ancestors().skip(1).find(|a| a.exists()) else { continue };
-        // "/" is always skipped: granting write access to the filesystem root
-        // is never useful and would override every other policy entry.
         if ancestor.as_os_str().as_encoded_bytes() == b"/" {
             eprintln!(
                 "sandlock learn: WARNING: write collapse for '{}' reaches filesystem root, skipping",
@@ -367,8 +380,12 @@ impl LearnObserver {
             "mkdirat" | "mknodat" => {
                 if let Some(p) = event.path {
                     let p = canonicalize_or_keep(p);
-                    if let Some(parent) = p.parent() {
-                        self.writes.lock().unwrap().insert(parent.to_path_buf());
+                    // If the target already exists the syscall will fail with
+                    // EEXIST; no MAKE_DIR right on the parent is needed.
+                    if !p.exists() {
+                        if let Some(parent) = p.parent() {
+                            self.writes.lock().unwrap().insert(parent.to_path_buf());
+                        }
                     }
                 }
             }
@@ -484,6 +501,7 @@ impl LearnObserver {
 
 /// Resolve symlinks to get the canonical path. Falls back to the original
 /// if the path doesn't exist yet (e.g. COW-intercepted creates).
+///
 fn canonicalize_or_keep(p: PathBuf) -> PathBuf {
     std::fs::canonicalize(&p).unwrap_or(p)
 }
@@ -644,7 +662,7 @@ pub async fn run(args: LearnArgs) -> Result<()> {
             // other read in the profile.
             if p.as_path() == std::path::Path::new("/") {
                 eprintln!(
-                    "sandlock learn: WARNING: observed a read of '/', refusing to grant it"
+                    "sandlock learn: WARNING: observed a direct read of '/', refusing to grant it"
                 );
                 return false;
             }

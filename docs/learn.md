@@ -53,11 +53,13 @@ optional, so omitting the ancestor would cause `sandlock run` to abort.
 
 ### Path tiers
 
-| Tier | Paths | Write (auto) | `--collapse N` | `--collapse-prefix` |
-|---|---|---|---|---|
-| **Protected** | `/`, `/root`, `~/.ssh`, `~/.aws`, `~/.kube`, `~/.gnupg` | skip + error | never (keep individual file) | refused unless `--force-sensitive-collapse` |
-| **Guarded** | `/etc`, `/proc`, `/sys`, `/dev`, `/boot`, `/run/secrets` | emit + warning + diff | never (keep individual file) | refused unless `--force-sensitive-collapse` |
-| **Normal** | everything else | collapse freely | collapse freely | collapse freely |
+| Tier | Paths | Write collapse | `--collapse` / `--collapse-prefix` |
+|---|---|---|---|
+| **Protected** | `/`, `/root`, paths ending in `/.ssh` `/.aws` `/.kube` `/.gnupg` | skip + error | never (keep individual files; override with `--force-sensitive-collapse`) |
+| **Guarded** | `$HOME`, `/etc`, `/proc`, `/sys`, `/dev`, `/boot`, `/run/secrets` | emit + warning + diff | never (keep individual files; override with `--force-sensitive-collapse`) |
+| **Normal** | everything else | collapse freely | collapse freely |
+
+The tiers apply to write collapse (when a non-existent path's nearest existing ancestor is used as the Landlock grant). Direct writes to an existing path are always recorded; a notice is printed to stderr when the path is Protected or Guarded. **The sole exception is `/`: a direct read or write of the filesystem root is always dropped with a warning, since granting `/` would subsume every other entry in the profile.**
 
 When a write collapse lands on a guarded path, a warning is printed to
 stderr along with an **observed-vs-granted diff**, the list of siblings
@@ -81,10 +83,10 @@ cargo build -p sandlock-cli
 Each test spawns a full sandlock process; running too many in
 parallel exhausts kernel limits and causes hangs, use `--test-threads=4`.
 ```bash
-# learn output tests — verify TOML profile content
+# learn output tests - verify TOML profile content
 cargo test -p sandlock-cli --test learn_test -- --test-threads=4
 
-# learn round-trip tests — learn → profile → run end-to-end
+# learn round-trip tests - learn → profile → run end-to-end
 cargo test -p sandlock-cli --test learn_integration -- --test-threads=4
 ```
 

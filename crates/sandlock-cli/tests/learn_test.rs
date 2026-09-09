@@ -704,8 +704,8 @@ fn test_write_collapse_skips_root() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("");
     assert!(!write_line.contains("\"/\""), "write list must not contain \"/\", got: {write_line}");
-    assert!(stderr.contains("filesystem root"),
-        "expected 'filesystem root' warning in stderr, got: {stderr}");
+    assert!(stderr.contains("protected path '/'"),
+        "expected protected path '/' warning in stderr, got: {stderr}");
 }
 
 /// Write collapse to a sensitive path emits a warning and observed-vs-granted diff.
@@ -745,6 +745,47 @@ fn test_write_collapse_skips_protected() {
         "write list must not contain /root (protected), got: {write_line}");
     assert!(stderr.contains("protected path"),
         "expected 'protected path' error in stderr, got: {stderr}");
+}
+
+/// mkdirat on an existing target (EEXIST) must not add the parent to the write set.
+#[test]
+fn test_mkdirat_eexist_no_write() {
+    let base = tempfile::TempDir::new_in("/var/tmp").expect("tempdir in /var/tmp");
+    let existing = base.path().join("already_there");
+    std::fs::create_dir(&existing).expect("create subdir");
+    let existing_str = existing.to_str().unwrap();
+    let base_str = base.path().to_str().unwrap();
+    // mkdirat fires pre-syscall; without the EEXIST guard the parent
+    // (base_str) would be inserted into the write set.
+    let output = sandlock_bin()
+        .args(["learn", "--", "sh", "-c", &format!("mkdir {existing_str} 2>/dev/null; true")])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(output.status.success(),
+        "sandlock learn failed: stderr={}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("write = []");
+    assert!(!write_line.contains(base_str),
+        "mkdirat on existing target must not insert parent {base_str} into writes, got: {write_line}");
+}
+
+/// Direct write to "/" must be dropped with a warning, not recorded.
+#[test]
+fn test_direct_write_root_skipped() {
+    let dir = format!("/sandlock_learn_root_mkdir_{}", std::process::id());
+    let output = sandlock_bin()
+        .args(["learn", "--", "sh", "-c", &format!("mkdir {dir} 2>/dev/null; true")])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(output.status.success(),
+        "sandlock learn failed: stderr={}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("write = []");
+    assert!(!write_line.contains("\"/\""),
+        "direct write of \"/\" must be dropped, got: {write_line}");
+    assert!(stderr.contains("direct write of '/'"),
+        "expected direct write warning in stderr, got: {stderr}");
 }
 
 // ── Merge and canonicalization ────────────────────────────────────────────────
