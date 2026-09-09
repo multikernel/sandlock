@@ -484,7 +484,8 @@ does support them, the scopes remain enforced.
 class BranchAction(Enum):
     COMMIT = "commit"   # Merge branch writes into the parent branch.
     ABORT  = "abort"    # Discard all branch writes.
-    KEEP   = "keep"     # Leave the branch as-is; caller decides.
+    KEEP   = "keep"     # Leave the branch on disk for recovery tooling.
+    DEFER  = "defer"    # Hold the branch for commit() / abort().
 ```
 
 ## Result types
@@ -496,16 +497,8 @@ class Change:
     path: str   # Path relative to workdir.
 ```
 
-```python
-@dataclass
-class DryRunResult:
-    success:   bool
-    exit_code: int
-    stdout:    bytes
-    stderr:    bytes
-    changes:   list[Change]
-    error:     str | None
-```
+Every `Result` carries `changes: list[Change]`, read from the COW branch
+before the branch action is applied. Empty without a `workdir`.
 
 ## Helpers
 

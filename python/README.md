@@ -234,8 +234,8 @@ Sandlock always applies its default syscall blocklist.
 |-----------|------|---------|-------------|
 | `fs_storage` | `str \| None` | `None` | Storage directory for the seccomp COW upper layer / deltas |
 | `max_disk` | `str \| None` | `None` | Disk quota for COW storage (e.g. `"1G"`) |
-| `on_exit` | `BranchAction` | `COMMIT` | `COMMIT`, `ABORT`, or `KEEP` |
-| `on_error` | `BranchAction` | `ABORT` | `COMMIT`, `ABORT`, or `KEEP` |
+| `on_exit` | `BranchAction` | `COMMIT` | `COMMIT`, `ABORT`, `KEEP`, or `DEFER` |
+| `on_error` | `BranchAction` | `ABORT` | `COMMIT`, `ABORT`, `KEEP`, or `DEFER` |
 
 #### Protection opt-out
 
@@ -307,16 +307,44 @@ Raises `RuntimeError` if no child has been created.
 
 Wait for the running process to finish and return its `Result`.
 
-#### `sandbox.dry_run(cmd, timeout=None) -> DryRunResult`
+#### Inspecting and deferring COW changes
 
-Run a command in a temporary COW layer, then discard all writes.
-Returns the list of filesystem changes that would have been made.
+Every `Result` from a sandbox with a `workdir` carries `changes`, the list
+of files the run added, modified, or deleted in its COW branch. A dry run
+is a run whose branch action is `ABORT`:
 
 ```python
-result = sandbox.dry_run(["sh", "-c", "echo hi > /tmp/out.txt"])
+sandbox = Sandbox(workdir=wd, on_exit=BranchAction.ABORT, ...)
+result = sandbox.run(["sh", "-c", "echo hi > out.txt"])
 for change in result.changes:
-    print(change.kind, change.path)  # "A /tmp/out.txt"
+    print(change.kind, change.path)  # "A out.txt"
 ```
+
+`BranchAction.DEFER` leaves the branch in the sandbox after the run exits so
+the caller can inspect it and decide later. While pending, `upper_dir` holds
+the new bytes of every added or modified file, laid out like `workdir`:
+
+```python
+sandbox = Sandbox(workdir=wd, on_exit=BranchAction.DEFER, ...)  # on_error stays ABORT
+result = sandbox.run(["python3", "tool.py"])
+if sandbox.pending:
+    if approve(result.changes, sandbox.upper_dir):
+        sandbox.commit()
+    else:
+        sandbox.abort()
+```
+
+- `sandbox.pending -> bool`: True between a `DEFER` run's exit and `commit()` / `abort()`.
+- `sandbox.upper_dir -> str | None`: the pending branch's upper directory.
+- `sandbox.commit()`: merge into `workdir`. Blocks up to 5s on a workdir
+  another sandbox is merging into; raises `BranchError` if the merge fails,
+  leaving the branch preserved on disk. Last-writer-wins against anything
+  that changed the workdir since the run.
+- `sandbox.abort()`: discard the branch.
+
+A pending sandbox refuses another `run()` until it is decided. Leaving a
+`with` block, or letting the sandbox go away, preserves an undecided branch
+on disk the same way `KEEP` does; nothing is ever merged without a decision.
 
 #### `sandbox.run_interactive(cmd) -> int`
 
@@ -384,16 +412,7 @@ Returned by `sandbox.run()`.
 | `stdout` | `bytes` | Captured standard output |
 | `stderr` | `bytes` | Captured standard error |
 | `error` | `str \| None` | Error message on failure |
-
-### DryRunResult
-
-Returned by `sandbox.dry_run()`.
-
-Same attributes as `Result`, plus:
-
-| Attribute | Type | Description |
-|-----------|------|-------------|
-| `changes` | `list[Change]` | Filesystem changes detected |
+| `changes` | `list[Change]` | Filesystem changes the run made to its COW branch (empty without `workdir`) |
 
 ### Change
 
@@ -653,7 +672,8 @@ from sandlock import SandlockError, SandboxError, SandboxRuntimeError
 
 - `BranchAction.COMMIT` -- merge writes on exit
 - `BranchAction.ABORT` -- discard writes
-- `BranchAction.KEEP` -- leave branch as-is
+- `BranchAction.KEEP` -- leave the branch on disk for recovery tooling
+- `BranchAction.DEFER` -- hold the branch for `commit()` / `abort()`
 
 ### MCP integration
 

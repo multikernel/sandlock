@@ -12,7 +12,7 @@ from enum import IntEnum
 from pathlib import Path
 from typing import Any, NamedTuple, Sequence
 
-from .sandbox import Sandbox as PolicyDataclass
+from .sandbox import Change, Sandbox as PolicyDataclass
 
 # ----------------------------------------------------------------
 # Load the shared library
@@ -314,6 +314,18 @@ _lib.sandlock_handle_wait_timeout.argtypes = [_c_handle_p, ctypes.c_uint64]
 _lib.sandlock_handle_free.restype = None
 _lib.sandlock_handle_free.argtypes = [_c_handle_p]
 
+_lib.sandlock_handle_pending.restype = ctypes.c_int
+_lib.sandlock_handle_pending.argtypes = [_c_handle_p]
+
+_lib.sandlock_handle_upper_dir.restype = ctypes.c_void_p
+_lib.sandlock_handle_upper_dir.argtypes = [_c_handle_p]
+
+_lib.sandlock_handle_commit.restype = ctypes.c_int
+_lib.sandlock_handle_commit.argtypes = [_c_handle_p]
+
+_lib.sandlock_handle_abort.restype = ctypes.c_int
+_lib.sandlock_handle_abort.argtypes = [_c_handle_p]
+
 _lib.sandlock_handle_port_mappings.restype = ctypes.c_char_p
 _lib.sandlock_handle_port_mappings.argtypes = [_c_handle_p]
 
@@ -355,41 +367,14 @@ _lib.sandlock_result_stderr_bytes.argtypes = [_c_result_p, ctypes.POINTER(ctypes
 _lib.sandlock_result_free.restype = None
 _lib.sandlock_result_free.argtypes = [_c_result_p]
 
-# Dry-run
-_c_dry_run_p = ctypes.c_void_p
+_lib.sandlock_result_changes_len.restype = ctypes.c_size_t
+_lib.sandlock_result_changes_len.argtypes = [_c_result_p]
 
-_lib.sandlock_dry_run.restype = _c_dry_run_p
-_lib.sandlock_dry_run.argtypes = [_c_policy_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
+_lib.sandlock_result_change_kind.restype = ctypes.c_char
+_lib.sandlock_result_change_kind.argtypes = [_c_result_p, ctypes.c_size_t]
 
-_lib.sandlock_dry_run_result_exit_code.restype = ctypes.c_int
-_lib.sandlock_dry_run_result_exit_code.argtypes = [_c_dry_run_p]
-
-_lib.sandlock_dry_run_result_reason.restype = ctypes.c_uint
-_lib.sandlock_dry_run_result_reason.argtypes = [_c_dry_run_p]
-
-_lib.sandlock_dry_run_result_signal.restype = ctypes.c_int
-_lib.sandlock_dry_run_result_signal.argtypes = [_c_dry_run_p]
-
-_lib.sandlock_dry_run_result_success.restype = ctypes.c_bool
-_lib.sandlock_dry_run_result_success.argtypes = [_c_dry_run_p]
-
-_lib.sandlock_dry_run_result_stdout_bytes.restype = ctypes.c_void_p
-_lib.sandlock_dry_run_result_stdout_bytes.argtypes = [_c_dry_run_p, ctypes.POINTER(ctypes.c_size_t)]
-
-_lib.sandlock_dry_run_result_stderr_bytes.restype = ctypes.c_void_p
-_lib.sandlock_dry_run_result_stderr_bytes.argtypes = [_c_dry_run_p, ctypes.POINTER(ctypes.c_size_t)]
-
-_lib.sandlock_dry_run_result_changes_len.restype = ctypes.c_size_t
-_lib.sandlock_dry_run_result_changes_len.argtypes = [_c_dry_run_p]
-
-_lib.sandlock_dry_run_result_change_kind.restype = ctypes.c_char
-_lib.sandlock_dry_run_result_change_kind.argtypes = [_c_dry_run_p, ctypes.c_size_t]
-
-_lib.sandlock_dry_run_result_change_path.restype = ctypes.c_void_p
-_lib.sandlock_dry_run_result_change_path.argtypes = [_c_dry_run_p, ctypes.c_size_t]
-
-_lib.sandlock_dry_run_result_free.restype = None
-_lib.sandlock_dry_run_result_free.argtypes = [_c_dry_run_p]
+_lib.sandlock_result_change_path.restype = ctypes.c_void_p
+_lib.sandlock_result_change_path.argtypes = [_c_result_p, ctypes.c_size_t]
 
 # Pipeline
 _lib.sandlock_pipeline_new.restype = _c_pipeline_p
@@ -756,6 +741,30 @@ def _read_result_bytes(result_p, fn) -> bytes:
     return ctypes.string_at(ptr, length.value)
 
 
+def _read_result_changes(result_p) -> list:
+    """Read the change list from a result pointer."""
+    changes = []
+    for i in range(_lib.sandlock_result_changes_len(result_p)):
+        kind = _lib.sandlock_result_change_kind(result_p, i).decode("ascii")
+        path_p = _lib.sandlock_result_change_path(result_p, i)
+        path = ""
+        if path_p:
+            path = ctypes.string_at(path_p).decode("utf-8", "surrogateescape")
+            _lib.sandlock_string_free(ctypes.cast(path_p, ctypes.c_char_p))
+        changes.append(Change(kind=kind, path=path))
+    return changes
+
+
+def _read_handle_string(fn, handle) -> str | None:
+    """Read and free a malloc'd C string returned for a handle."""
+    ptr = fn(handle)
+    if not ptr:
+        return None
+    value = ctypes.string_at(ptr).decode("utf-8", "surrogateescape")
+    _lib.sandlock_string_free(ctypes.cast(ptr, ctypes.c_char_p))
+    return value
+
+
 # ----------------------------------------------------------------
 # Result
 # ----------------------------------------------------------------
@@ -791,6 +800,9 @@ class Result:
     ``None`` on an error raised before a native result was produced."""
     signal: int = -1
     """Signal number for a ``SIGNALED`` result, else ``-1``."""
+    changes: list = field(default_factory=list)
+    """What the run did to its COW branch (:class:`Change` entries), read
+    before the branch action was applied. Empty without a ``workdir``."""
 
 
 # ----------------------------------------------------------------
@@ -1071,8 +1083,8 @@ class _NativePolicy:
         for vp, hp in (policy.fs_mount or {}).items():
             b = _b_fs_mount(b, _encode(str(vp)), _encode(str(hp)))
 
-        # COW branch actions (0=Commit, 1=Abort, 2=Keep)
-        _action_map = {"commit": 0, "abort": 1, "keep": 2}
+        # COW branch actions (0=Commit, 1=Abort, 2=Keep, 3=Defer)
+        _action_map = {"commit": 0, "abort": 1, "keep": 2, "defer": 3}
         on_exit_val = policy.on_exit.value if hasattr(policy.on_exit, 'value') else str(policy.on_exit)
         on_error_val = policy.on_error.value if hasattr(policy.on_error, 'value') else str(policy.on_error)
         b = _b_on_exit(b, _action_map.get(on_exit_val, 0))

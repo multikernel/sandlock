@@ -246,7 +246,7 @@ sandlock run --no-supervisor -r /proc -r /usr -r /lib -r /lib64 -r /bin -r /etc 
 ### Python API
 
 ```python
-from sandlock import Sandbox, confine
+from sandlock import Sandbox, BranchAction, confine
 
 sandbox = Sandbox(
     fs_writable=["/tmp/sandbox"],
@@ -286,10 +286,18 @@ sb = Sandbox(port_remap=True, fs_readable=["/usr", "/lib", "/etc"], name="api.lo
 confine(Sandbox(fs_readable=["/usr", "/lib"], fs_writable=["/tmp"]))
 
 # Dry-run: see what files would change, then discard
-sandbox = Sandbox(fs_writable=["."], workdir=".", fs_readable=["/usr", "/lib", "/bin", "/etc"])
-result = sandbox.dry_run(["make", "build"])
+sandbox = Sandbox(fs_writable=["."], workdir=".", fs_readable=["/usr", "/lib", "/bin", "/etc"],
+                  on_exit=BranchAction.ABORT)
+result = sandbox.run(["make", "build"])
 for c in result.changes:
     print(f"{c.kind}  {c.path}")  # A=added, M=modified, D=deleted
+
+# Defer: inspect the changes, then commit or abort
+sandbox = Sandbox(fs_writable=["."], workdir=".", fs_readable=["/usr", "/lib", "/bin", "/etc"],
+                  on_exit=BranchAction.DEFER)
+result = sandbox.run(["make", "build"])
+if sandbox.pending:
+    sandbox.commit() if approve(result.changes, sandbox.upper_dir) else sandbox.abort()
 ```
 
 ### Pipeline

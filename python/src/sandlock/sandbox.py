@@ -25,7 +25,6 @@ _name_counter = itertools.count(1)
 
 if TYPE_CHECKING:
     from ._notif_policy import NotifPolicy
-    from ._sdk import ExitReason  # DryRunResult.reason annotation (runtime import is circular)
 
 
 # --- Memory size parsing (from branching/process/limits.py) ---
@@ -99,7 +98,8 @@ class BranchAction(Enum):
 
     COMMIT = "commit"    # Merge writes into parent branch
     ABORT = "abort"      # Discard all writes
-    KEEP = "keep"        # Leave branch as-is (caller decides)
+    KEEP = "keep"        # Leave branch on disk for recovery tooling
+    DEFER = "defer"      # Hold the branch for commit() / abort()
 
 
 class StdioMode(IntEnum):
@@ -125,24 +125,6 @@ class Change:
 
     path: str
     """Path relative to workdir."""
-
-
-@dataclass
-class DryRunResult:
-    """Result of a dry-run execution."""
-
-    success: bool
-    exit_code: int = 0
-    stdout: bytes = field(default=b"", repr=False)
-    stderr: bytes = field(default=b"", repr=False)
-    changes: list = field(default_factory=list)
-    error: str | None = None
-    # Appended after the original fields so positional construction is unchanged.
-    reason: "ExitReason | None" = None
-    """Why the process terminated (parity with ``Result.reason``); ``None`` on an
-    error raised before a native result was produced."""
-    signal: int = -1
-    """Signal number for a ``SIGNALED`` result, else ``-1``."""
 
 
 @dataclass
@@ -447,6 +429,7 @@ class Sandbox:
         # Runtime state — not dataclass fields, not serialized
         self._native = None   # _NativePolicy created lazily on first use
         self._handle = None   # live sandbox handle during start()/run()
+        self._pending = None  # handle kept after a DEFER run until commit()/abort()
         self._process = None  # weakref to the live popen() Process; it OWNS its
                               # own handle (see `_popen_process`), this is only a
                               # non-owning busy marker
@@ -537,6 +520,8 @@ class Sandbox:
         first handle or alias a running popen() child."""
         if self._live_handle() is not None:
             raise RuntimeError("sandbox is already running")
+        if self._pending is not None:
+            raise RuntimeError("sandbox has a pending branch; call commit() or abort() first")
 
     def _reject_if_popen(self) -> None:
         """Raise if the live child is driven by a :meth:`popen` :class:`Process`.
@@ -574,6 +559,8 @@ class Sandbox:
             except Exception:
                 pass
             self._handle = None
+        # Freeing an undecided branch preserves it, same as KEEP.
+        self._release_pending()
         return False
 
     # ------------------------------------------------------------------
@@ -600,6 +587,71 @@ class Sandbox:
         a live :meth:`popen` :class:`Process`)."""
         return self._live_handle() is not None
 
+    @property
+    def pending(self) -> bool:
+        """True between a ``DEFER`` run's exit and :meth:`commit` / :meth:`abort`."""
+        return self._pending is not None
+
+    @property
+    def upper_dir(self) -> str | None:
+        """Where the pending branch keeps the new bytes of every added or
+        modified file, laid out like ``workdir``. ``None`` unless pending."""
+        if self._pending is None:
+            return None
+        from ._sdk import _lib, _read_handle_string
+        return _read_handle_string(_lib.sandlock_handle_upper_dir, self._pending)
+
+    def commit(self) -> None:
+        """Merge the pending branch into ``workdir``.
+
+        Blocks up to 5s on a workdir another sandbox is merging into. Raises
+        :class:`BranchError` if the merge fails; the branch is then preserved
+        on disk. Last-writer-wins against anything that changed the workdir
+        since the run.
+        """
+        from ._sdk import _lib
+        from .exceptions import BranchError
+
+        handle = self._require_pending()
+        try:
+            rc = _lib.sandlock_handle_commit(handle)
+        finally:
+            self._release_pending()
+        if rc != 0:
+            raise BranchError("commit failed; the change set is preserved on disk")
+
+    def abort(self) -> None:
+        """Discard the pending branch."""
+        from ._sdk import _lib
+
+        handle = self._require_pending()
+        try:
+            _lib.sandlock_handle_abort(handle)
+        finally:
+            self._release_pending()
+
+    def _require_pending(self):
+        if self._pending is None:
+            raise RuntimeError("no pending branch; only a DEFER run that has exited has one")
+        return self._pending
+
+    def _release_pending(self) -> None:
+        if self._pending is None:
+            return
+        from ._sdk import _lib
+        try:
+            _lib.sandlock_handle_free(self._pending)
+        finally:
+            self._pending = None
+
+    def _park_or_free(self, handle) -> None:
+        """After a wait: keep a handle whose branch is deferred, free any other."""
+        from ._sdk import _lib
+        if _lib.sandlock_handle_pending(handle):
+            self._pending = handle
+        else:
+            _lib.sandlock_handle_free(handle)
+
     # ------------------------------------------------------------------
     # Execution methods
     # ------------------------------------------------------------------
@@ -619,7 +671,7 @@ class Sandbox:
                 killed and a timeout result is returned if exceeded.
                 None means no timeout.
         """
-        from ._sdk import _lib, _make_argv, _read_result_bytes, Result, ExitReason
+        from ._sdk import _lib, _make_argv, _read_result_bytes, _read_result_changes, Result, ExitReason
 
         self._check_not_running()
 
@@ -641,14 +693,14 @@ class Sandbox:
             self._handle = None
             return Result(success=False, exit_code=-1, error="sandlock_start failed")
 
+        handle, self._handle = self._handle, None
         try:
             # None -> wait forever (0). A finite timeout clamps up to 1ms so
             # timeout=0 / sub-ms don't collapse to 0 (= wait forever).
             timeout_ms = max(1, int(timeout * 1000)) if timeout is not None else 0
-            result_p = _lib.sandlock_handle_wait_timeout(self._handle, timeout_ms)
+            result_p = _lib.sandlock_handle_wait_timeout(handle, timeout_ms)
         finally:
-            _lib.sandlock_handle_free(self._handle)
-            self._handle = None
+            self._park_or_free(handle)
 
         if not result_p:
             return Result(success=False, exit_code=-1, error="sandlock_handle_wait failed")
@@ -659,6 +711,7 @@ class Sandbox:
         signal = _lib.sandlock_result_signal(result_p)
         stdout = _read_result_bytes(result_p, _lib.sandlock_result_stdout_bytes)
         stderr = _read_result_bytes(result_p, _lib.sandlock_result_stderr_bytes)
+        changes = _read_result_changes(result_p)
         _lib.sandlock_result_free(result_p)
 
         return Result(
@@ -668,6 +721,7 @@ class Sandbox:
             signal=signal,
             stdout=stdout,
             stderr=stderr,
+            changes=changes,
         )
 
     def run_with_handlers(
@@ -718,6 +772,7 @@ class Sandbox:
             _lib,
             _make_argv,
             _read_result_bytes,
+            _read_result_changes,
             Result,
             ExitReason,
         )
@@ -844,6 +899,7 @@ class Sandbox:
         signal = _lib.sandlock_result_signal(result_p)
         stdout = _read_result_bytes(result_p, _lib.sandlock_result_stdout_bytes)
         stderr = _read_result_bytes(result_p, _lib.sandlock_result_stderr_bytes)
+        changes = _read_result_changes(result_p)
         _lib.sandlock_result_free(result_p)
 
         return Result(
@@ -853,6 +909,7 @@ class Sandbox:
             signal=signal,
             stdout=stdout,
             stderr=stderr,
+            changes=changes,
         )
 
     def create(self, cmd: Sequence[str]) -> None:
@@ -918,17 +975,17 @@ class Sandbox:
                 :meth:`popen` :class:`Process` (wait on that Process instead —
                 freeing its handle here would break it).
         """
-        from ._sdk import _lib, _read_result_bytes, Result, ExitReason
+        from ._sdk import _lib, _read_result_bytes, _read_result_changes, Result, ExitReason
 
         self._reject_if_popen()
         if self._handle is None:
             raise RuntimeError("sandbox is not running")
 
+        handle, self._handle = self._handle, None
         try:
-            result_p = _lib.sandlock_handle_wait_timeout(self._handle, 0)
+            result_p = _lib.sandlock_handle_wait_timeout(handle, 0)
         finally:
-            _lib.sandlock_handle_free(self._handle)
-            self._handle = None
+            self._park_or_free(handle)
 
         if not result_p:
             return Result(success=False, exit_code=-1, error="sandlock_handle_wait failed")
@@ -939,6 +996,7 @@ class Sandbox:
         signal = _lib.sandlock_result_signal(result_p)
         stdout = _read_result_bytes(result_p, _lib.sandlock_result_stdout_bytes)
         stderr = _read_result_bytes(result_p, _lib.sandlock_result_stderr_bytes)
+        changes = _read_result_changes(result_p)
         _lib.sandlock_result_free(result_p)
 
         return Result(
@@ -948,6 +1006,7 @@ class Sandbox:
             signal=signal,
             stdout=stdout,
             stderr=stderr,
+            changes=changes,
         )
 
     def popen(
@@ -1032,61 +1091,6 @@ class Sandbox:
             raise
         self._process = weakref.ref(proc)
         return proc
-
-    def dry_run(self, cmd: Sequence[str], timeout: float | None = None) -> "DryRunResult":
-        """Dry-run: run a command, collect filesystem changes, then discard.
-
-        Args:
-            cmd: Command and arguments to execute.
-            timeout: Maximum execution time in seconds. None means no timeout.
-
-        Returns:
-            DryRunResult with exit info and list of filesystem changes.
-        """
-        from ._sdk import _lib, _make_argv, _read_result_bytes, ExitReason
-
-        native = self._ensure_native()
-        argv, argc = _make_argv(list(cmd))
-        result_p = _lib.sandlock_dry_run(
-            native.ptr, _encode(self._resolve_name()), argv, argc,
-        )
-
-        if not result_p:
-            return DryRunResult(success=False, exit_code=-1, error="sandlock_dry_run failed")
-
-        try:
-            exit_code = _lib.sandlock_dry_run_result_exit_code(result_p)
-            success = _lib.sandlock_dry_run_result_success(result_p)
-            reason = ExitReason(_lib.sandlock_dry_run_result_reason(result_p))
-            signal = _lib.sandlock_dry_run_result_signal(result_p)
-            stdout = _read_result_bytes(result_p, _lib.sandlock_dry_run_result_stdout_bytes)
-            stderr = _read_result_bytes(result_p, _lib.sandlock_dry_run_result_stderr_bytes)
-
-            import ctypes
-            n = _lib.sandlock_dry_run_result_changes_len(result_p)
-            changes = []
-            for i in range(n):
-                kind_byte = _lib.sandlock_dry_run_result_change_kind(result_p, i)
-                kind = kind_byte.decode("ascii")
-                path_p = _lib.sandlock_dry_run_result_change_path(result_p, i)
-                if path_p:
-                    path = ctypes.c_char_p(path_p).value.decode("utf-8")
-                    _lib.sandlock_string_free(ctypes.cast(path_p, ctypes.c_char_p))
-                else:
-                    path = ""
-                changes.append(Change(kind=kind, path=path))
-        finally:
-            _lib.sandlock_dry_run_result_free(result_p)
-
-        return DryRunResult(
-            success=bool(success),
-            exit_code=exit_code,
-            reason=reason,
-            signal=signal,
-            stdout=stdout,
-            stderr=stderr,
-            changes=changes,
-        )
 
     def run_interactive(self, cmd: Sequence[str]) -> int:
         """Run with inherited stdio. Returns exit code."""
@@ -1575,7 +1579,7 @@ class Process:
                 ``stdout``/``stderr`` you have not drained can block the child on a
                 full pipe and hang the wait forever; pass a ``timeout`` or drain first.
         """
-        from ._sdk import _lib, Result, ExitReason
+        from ._sdk import _lib, _read_result_changes, Result, ExitReason
 
         # Reserve the handle under the lock so a concurrent kill()/pid sees a
         # consistent state, then run the blocking wait WITHOUT the lock so kill()
@@ -1607,7 +1611,7 @@ class Process:
             result_p = _lib.sandlock_handle_wait_timeout(handle, timeout_ms)
         finally:
             with self._lock:
-                _lib.sandlock_handle_free(handle)
+                self._sandbox._park_or_free(handle)
                 self._handle = None
                 self._waiting = False
             # Release the sandbox's busy marker so it can be reused. Guard that it
@@ -1627,9 +1631,11 @@ class Process:
         signal = _lib.sandlock_result_signal(result_p)
         # stdout/stderr were handed to the caller as fds, so the RunResult holds
         # none — read them off the streams, not the Result.
+        changes = _read_result_changes(result_p)
         _lib.sandlock_result_free(result_p)
         self._result = Result(
             success=bool(success), exit_code=exit_code, reason=reason, signal=signal,
+            changes=changes,
         )
         return self._result
 
