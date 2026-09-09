@@ -378,7 +378,7 @@ impl LearnObserver {
             }
             "openat" | "open" => {
                 if let Some(path) = event.path {
-                    let path = canonicalize_or_keep(path);
+                    let path = canonicalize_or_keep(path, event.pid);
                     if let Some(fl) = event.flags {
                         if is_write_open(fl) {
                             self.writes.lock().unwrap().insert(path);
@@ -392,7 +392,7 @@ impl LearnObserver {
             // rights, so the parent dir is what sandlock run needs, not the target.
             "mkdirat" | "mknodat" => {
                 if let Some(p) = event.path {
-                    let p = canonicalize_or_keep(p);
+                    let p = canonicalize_or_keep(p, event.pid);
                     // If the target already exists the syscall will fail with
                     // EEXIST; no MAKE_DIR right on the parent is needed.
                     if !p.exists() {
@@ -426,7 +426,7 @@ impl LearnObserver {
             // dst operates on the link itself, so only the parent is canonicalized.
             "linkat" => {
                 if let Some(src) = event.path {
-                    self.reads.lock().unwrap().insert(canonicalize_or_keep(src));
+                    self.reads.lock().unwrap().insert(canonicalize_or_keep(src, event.pid));
                 }
                 if let Some(dst) = event.path2 {
                     let dst = canonicalize_parent_or_keep(dst);
@@ -438,7 +438,7 @@ impl LearnObserver {
             // truncate: LANDLOCK_ACCESS_FS_TRUNCATE applies to the file itself.
             "truncate" => {
                 if let Some(p) = event.path {
-                    self.writes.lock().unwrap().insert(canonicalize_or_keep(p));
+                    self.writes.lock().unwrap().insert(canonicalize_or_keep(p, event.pid));
                 }
             }
             "bind" => {
@@ -449,7 +449,7 @@ impl LearnObserver {
                 } else if let Some(p) = event.path {
                     // AF_UNIX named bind: Landlock MAKE_SOCK is a directory right,
                     // so the parent dir is what sandlock run needs.
-                    let p = canonicalize_or_keep(p);
+                    let p = canonicalize_or_keep(p, event.pid);
                     if let Some(parent) = p.parent() {
                         self.writes.lock().unwrap().insert(parent.to_path_buf());
                     }
@@ -515,12 +515,22 @@ impl LearnObserver {
 /// Resolve symlinks to get the canonical path. Falls back to the original
 /// if the path doesn't exist yet (e.g. COW-intercepted creates).
 ///
-/// /proc/self is deliberately not resolved: canonicalize would turn
-/// /proc/self/maps into /proc/<pid>/maps, making it look like a volatile
-/// pid-specific path and causing is_junk_path to drop it.
-fn canonicalize_or_keep(p: PathBuf) -> PathBuf {
-    if p.as_os_str().as_encoded_bytes().starts_with(b"/proc/self") {
-        return p;
+/// /proc/self paths are canonicalized via the event pid so symlinks
+/// (e.g. /proc/self/exe) resolve against the workload, not the supervisor.
+/// Results still under /proc/<pid>/ are mapped back to /proc/self/.
+fn canonicalize_or_keep(p: PathBuf, pid: u32) -> PathBuf {
+    let b = p.as_os_str().as_encoded_bytes();
+    if b.starts_with(b"/proc/self") {
+        let suffix = &b[b"/proc/self".len()..];
+        let pid_path = PathBuf::from(format!("/proc/{}{}", pid, String::from_utf8_lossy(suffix)));
+        let resolved = std::fs::canonicalize(&pid_path).unwrap_or(pid_path);
+        let resolved_b = resolved.as_os_str().as_encoded_bytes();
+        let pid_prefix = format!("/proc/{}/", pid);
+        if resolved_b.starts_with(pid_prefix.as_bytes()) {
+            let rest = &resolved_b[pid_prefix.len() - 1..]; // keep leading /
+            return PathBuf::from(format!("/proc/self{}", String::from_utf8_lossy(rest)));
+        }
+        return resolved;
     }
     std::fs::canonicalize(&p).unwrap_or(p)
 }

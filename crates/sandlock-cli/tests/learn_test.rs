@@ -704,8 +704,8 @@ fn test_write_collapse_skips_root() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("");
     assert!(!write_line.contains("\"/\""), "write list must not contain \"/\", got: {write_line}");
-    assert!(stderr.contains("protected path '/'"),
-        "expected protected path '/' warning in stderr, got: {stderr}");
+    assert!(stderr.contains("filesystem root"),
+        "expected filesystem root warning in stderr, got: {stderr}");
 }
 
 /// Write collapse to a sensitive path emits a warning and observed-vs-granted diff.
@@ -786,6 +786,42 @@ fn test_direct_write_root_skipped() {
         "direct write of \"/\" must be dropped, got: {write_line}");
     assert!(stderr.contains("direct write of '/'"),
         "expected direct write warning in stderr, got: {stderr}");
+}
+
+/// /proc/self/maps must appear in the profile as /proc/self/maps
+#[test]
+fn test_proc_self_maps_preserved() {
+    let output = sandlock_bin()
+        .args(["learn", "--", "python3", "-c", "open('/proc/self/maps').read()"])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(output.status.success(),
+        "sandlock learn failed: stderr={}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let read_line = stdout.lines().find(|l| l.starts_with("read = [")).unwrap_or("");
+    assert!(read_line.contains("\"/proc/self/maps\""),
+        "/proc/self/maps must be recorded as-is, got: {read_line}");
+    let has_numeric_pid = read_line.split("\"/proc/").skip(1).any(|s| {
+        s.chars().next().map_or(false, |c| c.is_ascii_digit())
+    });
+    assert!(!has_numeric_pid,
+        "must not contain a numeric-pid /proc/<pid>/... entry, got: {read_line}");
+}
+
+/// /proc/self/exe is a symlink to the real binary; it must be resolved to the
+/// binary path, not recorded as /proc/self/exe.
+#[test]
+fn test_proc_self_exe_resolves_to_binary() {
+    let output = sandlock_bin()
+        .args(["learn", "--", "python3", "-c", "import os; os.open('/proc/self/exe', os.O_RDONLY)"])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(output.status.success(),
+        "sandlock learn failed: stderr={}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let read_line = stdout.lines().find(|l| l.starts_with("read = [")).unwrap_or("");
+    assert!(!read_line.contains("\"/proc/self/exe\""),
+        "/proc/self/exe must be resolved to the binary path, not recorded as-is: {read_line}");
 }
 
 // ── Merge and canonicalization ────────────────────────────────────────────────
