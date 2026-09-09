@@ -718,35 +718,15 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         policy
     };
 
-    let result = if args.dry_run {
+    if args.dry_run {
         if policy.workdir.is_none() {
             return Err(anyhow!("--dry-run requires --workdir"));
         }
-        let dr = if let Some(secs) = args.timeout {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(secs),
-                policy.dry_run_interactive(&cmd_strs),
-            ).await {
-                Ok(r) => r?,
-                Err(_) => {
-                    eprintln!("sandlock: timeout after {}s", secs);
-                    return Ok(124);
-                }
-            }
-        } else {
-            policy.dry_run_interactive(&cmd_strs).await?
-        };
+        policy.on_exit = BranchAction::Abort;
+        policy.on_error = BranchAction::Abort;
+    }
 
-        if dr.changes.is_empty() {
-            eprintln!("sandlock: dry-run: no filesystem changes");
-        } else {
-            eprintln!("sandlock: dry-run: filesystem changes:");
-            for change in &dr.changes {
-                eprintln!("{}", change);
-            }
-        }
-        dr.run_result
-    } else if let Some(secs) = args.timeout {
+    let result = if let Some(secs) = args.timeout {
         match tokio::time::timeout(
             std::time::Duration::from_secs(secs),
             policy.run_interactive(&cmd_strs),
@@ -760,6 +740,17 @@ async fn run_command(args: RunArgs) -> Result<i32> {
     } else {
         policy.run_interactive(&cmd_strs).await?
     };
+
+    if args.dry_run {
+        if result.changes.is_empty() {
+            eprintln!("sandlock: dry-run: no filesystem changes");
+        } else {
+            eprintln!("sandlock: dry-run: filesystem changes:");
+            for change in &result.changes {
+                eprintln!("{change}");
+            }
+        }
+    }
 
     if let Some(fd) = args.status_fd {
         use std::io::Write as _;

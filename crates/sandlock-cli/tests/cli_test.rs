@@ -684,3 +684,28 @@ fn test_help_shows_ps_and_inspect() {
         "--help should NOT show 'list' command (renamed to 'ps')"
     );
 }
+
+/// `--dry-run` is a run with both branch actions forced to `abort`: the
+/// change list is reported on stderr and nothing lands in the workdir.
+#[test]
+fn test_dry_run_reports_changes_and_writes_nothing() {
+    let workdir = tempfile::tempdir().expect("tempdir");
+    let sentinel = workdir.path().join("planned.txt");
+
+    let cmd = format!("echo planned > {}", sentinel.display());
+    let output = sandlock_bin()
+        .args(args_for_host(&[
+            "run", "--dry-run",
+            "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "-r", "/etc",
+            "-w", workdir.path().to_str().unwrap(),
+            "--workdir", workdir.path().to_str().unwrap(),
+            "--", "sh", "-c", &cmd,
+        ]))
+        .output()
+        .expect("failed to run sandlock");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "sandlock exit={:?}, stderr: {stderr}", output.status.code());
+
+    assert!(!sentinel.exists(), "a dry run must not write the workdir");
+    assert!(stderr.contains("A  planned.txt"), "change list missing from stderr: {stderr}");
+}
