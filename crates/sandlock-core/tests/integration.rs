@@ -52,8 +52,8 @@ mod test_user_mapping;
 #[path = "integration/test_chroot.rs"]
 mod test_chroot;
 
-#[path = "integration/test_dry_run.rs"]
-mod test_dry_run;
+#[path = "integration/test_branch_action.rs"]
+mod test_branch_action;
 
 #[path = "integration/test_http_acl.rs"]
 mod test_http_acl;

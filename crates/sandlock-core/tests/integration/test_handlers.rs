@@ -67,7 +67,7 @@ fn base_policy() -> sandlock_core::SandboxBuilder {
     // refuse to add the rule and the child exits before completing
     // confinement, surfacing as `pipe closed before 4 bytes read`
     // in the parent.  Mirrors the convention used in upstream
-    // `test_dry_run`, `test_fork`, `test_netlink_virt`, `test_landlock`.
+    // `test_branch_action`, `test_fork`, `test_netlink_virt`, `test_landlock`.
     Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")

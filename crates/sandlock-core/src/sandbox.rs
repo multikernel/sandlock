@@ -200,13 +200,17 @@ impl TryFrom<&Sandbox> for Confinement {
     }
 }
 
-/// Action to take on branch exit.
+/// What happens to the run's COW branch once the child has exited.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum BranchAction {
     #[default]
     Commit,
     Abort,
+    /// Leave the branch on disk for recovery tooling.
     Keep,
+    /// Leave the branch in the sandbox for [`Sandbox::commit`] /
+    /// [`Sandbox::abort`]. Dropped undecided, it is preserved like `Keep`.
+    Defer,
 }
 
 // ============================================================
@@ -858,8 +862,9 @@ impl Sandbox {
             _ => None,
         };
         if let Some(exit_status) = stopped {
+            let changes = self.settle_branch().await;
             let (stdout, stderr) = self.collect_pipe_drains().await;
-            return Ok(RunResult { exit_status, stdout, stderr });
+            return Ok(RunResult { exit_status, stdout, stderr, changes });
         }
 
         // Deliver EOF to a piped stdin the caller never took: otherwise a child
@@ -927,20 +932,88 @@ impl Sandbox {
             let _ = h.await;
         }
 
+        let changes = self.settle_branch().await;
+        let (stdout, stderr) = self.collect_pipe_drains().await;
+
+        Ok(RunResult { exit_status, stdout, stderr, changes })
+    }
+
+    /// Take the finished run's branch from the supervisor, read its change
+    /// set, and apply the exit action. `Defer` leaves the branch in place for
+    /// [`Self::commit`] / [`Self::abort`], so a repeat call finds it again and
+    /// only re-reads the changes.
+    async fn settle_branch(&mut self) -> Vec<crate::result::Change> {
         // A transactional-pipeline stage leaves the branch in the shared COW
-        // state for the next stage / the coordinator's single commit — don't
-        // take it out (that would strip the upper from later stages) and don't
-        // let Drop commit/abort it (`seccomp_cow` stays None).
-        if self.rt().shared_cow.is_none() {
-            if let Some(ref cow_state) = self.rt().supervisor_cow.clone() {
+        // state for the next stage / the coordinator's single commit: taking it
+        // would strip the upper from later stages.
+        if self.rt().shared_cow.is_some() {
+            return Vec::new();
+        }
+        if self.rt().seccomp_cow.is_none() {
+            if let Some(cow_state) = self.rt().supervisor_cow.clone() {
                 let mut cow = cow_state.lock().await;
                 self.rt_mut().seccomp_cow = cow.branch.take();
             }
         }
+        let Some(mut branch) = self.rt_mut().seccomp_cow.take() else {
+            return Vec::new();
+        };
+        let changes = branch.changes().unwrap_or_default();
+        match self.branch_action() {
+            BranchAction::Defer => self.rt_mut().seccomp_cow = Some(branch),
+            BranchAction::Keep => branch.keep(),
+            BranchAction::Abort => { let _ = branch.abort(); }
+            // commit() blocks up to DROP_COMMIT_LOCK_WAIT on a contended
+            // workdir, which must not stall the async worker.
+            BranchAction::Commit => {
+                let _ = tokio::task::spawn_blocking(move || branch.commit()).await;
+            }
+        }
+        changes
+    }
 
-        let (stdout, stderr) = self.collect_pipe_drains().await;
+    /// The action the exit status selects; `on_exit` until the child has
+    /// exited non-zero.
+    fn branch_action(&self) -> BranchAction {
+        let failed = self.runtime.as_ref().is_some_and(|rt| {
+            matches!(rt.state, RuntimeState::Stopped(ref s) if !matches!(s, crate::result::ExitStatus::Code(0)))
+        });
+        if failed { self.on_error.clone() } else { self.on_exit.clone() }
+    }
 
-        Ok(RunResult { exit_status, stdout, stderr })
+    /// Whether a [`BranchAction::Defer`] run has exited and is waiting for
+    /// [`Self::commit`] or [`Self::abort`].
+    pub fn pending(&self) -> bool {
+        self.runtime.as_ref().is_some_and(|rt| {
+            rt.seccomp_cow.is_some() && matches!(rt.state, RuntimeState::Stopped(_))
+        })
+    }
+
+    /// The pending branch's upper directory, laid out like the workdir and
+    /// holding the new bytes of every added or modified file.
+    pub fn upper_dir(&self) -> Option<&std::path::Path> {
+        if !self.pending() { return None; }
+        self.rt().seccomp_cow.as_ref().map(|b| b.upper_dir())
+    }
+
+    /// Merge the pending branch into the workdir. Blocks up to 5s on a
+    /// contended workdir; on timeout the branch is preserved and the error
+    /// names it. Last-writer-wins against anything that changed the workdir
+    /// since the run.
+    pub fn commit(&mut self) -> Result<(), crate::error::BranchError> {
+        self.take_pending()?.commit()
+    }
+
+    /// Discard the pending branch.
+    pub fn abort(&mut self) -> Result<(), crate::error::BranchError> {
+        self.take_pending()?.abort()
+    }
+
+    fn take_pending(&mut self) -> Result<crate::cow::seccomp::SeccompCowBranch, crate::error::BranchError> {
+        if !self.pending() {
+            return Err(crate::error::BranchError::Operation("no deferred branch to dispose".into()));
+        }
+        Ok(self.rt_mut().seccomp_cow.take().expect("pending() checked seccomp_cow"))
     }
 
     /// Join the capture-pipe drains, if this runtime still holds them.
@@ -1346,42 +1419,6 @@ impl Sandbox {
         self.wait().await
     }
 
-    /// Dry-run: create, start, wait, collect filesystem changes, then abort.
-    ///
-    /// The branch action is forced to `Abort`, not `Keep`: a dry run must never
-    /// merge, and must not leave its upper on disk either — the changes are read
-    /// out of the branch here and returned, so nothing needs preserving. `Keep`
-    /// would additionally ask the branch to survive an abandoned run (`?` on
-    /// create/wait below), which for a dry run is a pure leak.
-    pub async fn dry_run(
-        &mut self,
-        cmd: &[&str],
-    ) -> Result<crate::dry_run::DryRunResult, crate::error::SandlockError> {
-        self.on_exit = BranchAction::Abort;
-        self.on_error = BranchAction::Abort;
-        self.do_create(cmd, true).await?;
-        self.do_start()?;
-        let run_result = self.wait().await?;
-        let changes = self.collect_changes().await;
-        self.do_abort().await;
-        Ok(crate::dry_run::DryRunResult { run_result, changes })
-    }
-
-    /// Dry-run with inherited stdio. Same branch handling as [`Self::dry_run`].
-    pub async fn dry_run_interactive(
-        &mut self,
-        cmd: &[&str],
-    ) -> Result<crate::dry_run::DryRunResult, crate::error::SandlockError> {
-        self.on_exit = BranchAction::Abort;
-        self.on_error = BranchAction::Abort;
-        self.do_create(cmd, false).await?;
-        self.do_start()?;
-        let run_result = self.wait().await?;
-        let changes = self.collect_changes().await;
-        self.do_abort().await;
-        Ok(crate::dry_run::DryRunResult { run_result, changes })
-    }
-
     /// Create N COW clones of this sandbox.
     ///
     /// `fork()` requires `init_fn` and `work_fn` to be set on the sandbox (via
@@ -1642,23 +1679,6 @@ impl Sandbox {
     // ================================================================
     // Internal: collect_changes / do_abort
     // ================================================================
-
-    async fn collect_changes(&self) -> Vec<crate::dry_run::Change> {
-        if let Some(ref rt) = self.runtime {
-            if let Some(ref cow) = rt.seccomp_cow {
-                return cow.changes().unwrap_or_default();
-            }
-        }
-        Vec::new()
-    }
-
-    async fn do_abort(&mut self) {
-        if let Some(ref mut rt) = self.runtime {
-            if let Some(ref mut cow) = rt.seccomp_cow {
-                let _ = cow.abort();
-            }
-        }
-    }
 
     // ================================================================
     // Internal: do_create (fork + policy install; child parks at the
@@ -2436,25 +2456,23 @@ impl Drop for Sandbox {
                 if let Some(ParkedDrain::Running(h)) = slot { h.abort(); }
             }
 
-            let is_error = matches!(
-                rt.state,
-                RuntimeState::Stopped(ref s) if !matches!(s, crate::result::ExitStatus::Code(0))
-            );
-            let action = if is_error { &self.on_error } else { &self.on_exit };
-            let action = action.clone();
+        }
 
-            if let Some(ref mut cow) = rt.seccomp_cow {
-                match action {
-                    // NOTE: commit() is synchronous and blocks up to
-                    // DROP_COMMIT_LOCK_WAIT (5s) on a contended workdir before
-                    // deferring (bounded, no CPU spin). Do not drop a committing
-                    // Sandbox on an async runtime worker.
-                    BranchAction::Commit => { let _ = cow.commit(); }
-                    BranchAction::Abort => { let _ = cow.abort(); }
-                    // Mark kept so the branch's Drop backstop preserves the upper
-                    // instead of cleaning it as an undisposed leak.
-                    BranchAction::Keep => cow.keep(),
-                }
+        // wait() settles the branch, so this only sees one it left behind: a
+        // deferred branch nobody decided on, or one a cancelled wait() never
+        // reached.
+        let action = self.branch_action();
+        if let Some(cow) = self.runtime.as_mut().and_then(|rt| rt.seccomp_cow.as_mut()) {
+            match action {
+                // NOTE: commit() is synchronous and blocks up to
+                // DROP_COMMIT_LOCK_WAIT (5s) on a contended workdir before
+                // deferring (bounded, no CPU spin). Do not drop a committing
+                // Sandbox on an async runtime worker.
+                BranchAction::Commit => { let _ = cow.commit(); }
+                BranchAction::Abort => { let _ = cow.abort(); }
+                // The caller asked for the branch and never decided: preserve
+                // it so nothing is published and nothing is lost.
+                BranchAction::Keep | BranchAction::Defer => cow.keep(),
             }
         }
     }

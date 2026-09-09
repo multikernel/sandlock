@@ -58,6 +58,7 @@ impl Stage {
                     exit_status: ExitStatus::Timeout,
                     stdout: None,
                     stderr: None,
+                    changes: Vec::new(),
                 }),
             }
         } else {
@@ -135,6 +136,7 @@ impl Pipeline {
                     exit_status: ExitStatus::Timeout,
                     stdout: None,
                     stderr: None,
+                    changes: Vec::new(),
                 }),
             }
         } else {
@@ -231,6 +233,7 @@ async fn run_pipeline(stages: Vec<Stage>) -> Result<RunResult, SandlockError> {
         exit_status: ExitStatus::Killed,
         stdout: None,
         stderr: None,
+        changes: Vec::new(),
     };
 
     for (i, mut sb) in sandboxes.into_iter().enumerate() {
@@ -327,6 +330,7 @@ impl Gather {
                     exit_status: ExitStatus::Timeout,
                     stdout: None,
                     stderr: None,
+                    changes: Vec::new(),
                 }),
             }
         } else {
@@ -427,6 +431,7 @@ async fn run_gather(
         exit_status: ExitStatus::Killed,
         stdout: None,
         stderr: None,
+        changes: Vec::new(),
     };
     for (i, mut sb) in sandboxes.into_iter().enumerate() {
         let result = sb.wait().await?;

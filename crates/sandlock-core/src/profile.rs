@@ -107,10 +107,10 @@ pub struct FilesystemSection {
     /// Each entry has the form `"VIRTUAL:HOST"`, matching `--fs-mount` syntax.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub mount: Vec<String>,
-    /// One of `"commit"`, `"abort"`, `"keep"`. Maps to `Sandbox::on_exit`.
+    /// One of `"commit"`, `"abort"`, `"keep"`, `"defer"`. Maps to `Sandbox::on_exit`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub on_exit: Option<String>,
-    /// One of `"commit"`, `"abort"`, `"keep"`. Maps to `Sandbox::on_error`.
+    /// One of `"commit"`, `"abort"`, `"keep"`, `"defer"`. Maps to `Sandbox::on_error`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub on_error: Option<String>,
 }
@@ -361,8 +361,9 @@ fn parse_branch_action(s: &str) -> Result<crate::sandbox::BranchAction, Sandlock
         "commit" => BranchAction::Commit,
         "abort"  => BranchAction::Abort,
         "keep"   => BranchAction::Keep,
+        "defer"  => BranchAction::Defer,
         other    => return Err(SandlockError::Sandbox(SandboxError::Invalid(
-            format!("invalid branch action {other:?}; expected \"commit\" | \"abort\" | \"keep\""),
+            format!("invalid branch action {other:?}; expected \"commit\" | \"abort\" | \"keep\" | \"defer\""),
         ))),
     })
 }
@@ -406,13 +407,14 @@ fn parse_time_start(s: &str) -> Result<SystemTime, SandlockError> {
 // Reverse serialization: Sandbox -> ProfileInput (and JSON/TOML)
 // ============================================================
 
-/// Render a `BranchAction` as the profile string form (`"commit"`/`"abort"`/`"keep"`).
+/// Render a `BranchAction` as the profile string form.
 fn branch_action_str(a: &crate::sandbox::BranchAction) -> &'static str {
     use crate::sandbox::BranchAction;
     match a {
         BranchAction::Commit => "commit",
         BranchAction::Abort => "abort",
         BranchAction::Keep => "keep",
+        BranchAction::Defer => "defer",
     }
 }
 

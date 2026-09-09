@@ -1591,8 +1591,8 @@ impl SeccompCowBranch {
     }
 
     /// List all filesystem changes in the COW layer.
-    pub fn changes(&self) -> Result<Vec<crate::dry_run::Change>, BranchError> {
-        use crate::dry_run::{Change, ChangeKind};
+    pub fn changes(&self) -> Result<Vec<crate::result::Change>, BranchError> {
+        use crate::result::{Change, ChangeKind};
 
         let mut result = Vec::new();
 
@@ -3117,7 +3117,7 @@ mod tests {
             "the deletion was applied before the failure",
         );
 
-        let mut outstanding: Vec<(crate::dry_run::ChangeKind, String)> = branch
+        let mut outstanding: Vec<(crate::result::ChangeKind, String)> = branch
             .changes()
             .unwrap()
             .into_iter()
@@ -3129,8 +3129,8 @@ mod tests {
             vec![
                 // b.txt is "modified" because the obstructing symlink is still
                 // there in the workdir; c.txt was never reached.
-                (crate::dry_run::ChangeKind::Modified, "b.txt".to_string()),
-                (crate::dry_run::ChangeKind::Added, "c.txt".to_string()),
+                (crate::result::ChangeKind::Modified, "b.txt".to_string()),
+                (crate::result::ChangeKind::Added, "c.txt".to_string()),
             ],
             "changes() after a partial merge must report the remainder only",
         );
@@ -3672,7 +3672,7 @@ mod tests {
         fs::write(&upper, "new content").unwrap();
         let changes = branch.changes().unwrap();
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].kind, crate::dry_run::ChangeKind::Added);
+        assert_eq!(changes[0].kind, crate::result::ChangeKind::Added);
         assert_eq!(changes[0].path, std::path::PathBuf::from("brand_new.txt"));
     }
 
@@ -3684,7 +3684,7 @@ mod tests {
         fs::write(&upper, "modified content").unwrap();
         let changes = branch.changes().unwrap();
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].kind, crate::dry_run::ChangeKind::Modified);
+        assert_eq!(changes[0].kind, crate::result::ChangeKind::Modified);
         assert_eq!(changes[0].path, std::path::PathBuf::from("existing.txt"));
     }
 
@@ -3695,7 +3695,7 @@ mod tests {
         branch.mark_deleted("existing.txt");
         let changes = branch.changes().unwrap();
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].kind, crate::dry_run::ChangeKind::Deleted);
+        assert_eq!(changes[0].kind, crate::result::ChangeKind::Deleted);
         assert_eq!(changes[0].path, std::path::PathBuf::from("existing.txt"));
     }
 
@@ -3720,11 +3720,11 @@ mod tests {
         let mut changes = branch.changes().unwrap();
         changes.sort_by(|a, b| a.path.cmp(&b.path));
         assert_eq!(changes.len(), 3);
-        assert_eq!(changes[0].kind, crate::dry_run::ChangeKind::Modified);
+        assert_eq!(changes[0].kind, crate::result::ChangeKind::Modified);
         assert_eq!(changes[0].path, std::path::PathBuf::from("existing.txt"));
-        assert_eq!(changes[1].kind, crate::dry_run::ChangeKind::Added);
+        assert_eq!(changes[1].kind, crate::result::ChangeKind::Added);
         assert_eq!(changes[1].path, std::path::PathBuf::from("new.txt"));
-        assert_eq!(changes[2].kind, crate::dry_run::ChangeKind::Deleted);
+        assert_eq!(changes[2].kind, crate::result::ChangeKind::Deleted);
         assert_eq!(changes[2].path, std::path::PathBuf::from("subdir/nested.txt"));
     }
 
@@ -4529,7 +4529,7 @@ mod tests {
             .filter(|c| c.path == std::path::Path::new("existing.txt"))
             .collect();
         assert_eq!(for_path.len(), 1);
-        assert_eq!(for_path[0].kind, crate::dry_run::ChangeKind::Added);
+        assert_eq!(for_path[0].kind, crate::result::ChangeKind::Added);
     }
 
     #[test]
@@ -5429,7 +5429,7 @@ mod tests {
                 .changes()
                 .unwrap()
                 .iter()
-                .all(|c| c.kind != crate::dry_run::ChangeKind::Deleted),
+                .all(|c| c.kind != crate::result::ChangeKind::Deleted),
             "a whiteout the upper re-created must not be reported as a deletion",
         );
 
@@ -5549,7 +5549,7 @@ mod tests {
                 .changes()
                 .unwrap()
                 .into_iter()
-                .filter(|c| c.kind == crate::dry_run::ChangeKind::Deleted)
+                .filter(|c| c.kind == crate::result::ChangeKind::Deleted)
                 .map(|c| c.path)
                 .collect::<Vec<_>>(),
             vec![PathBuf::from("link/x.txt")],
@@ -5668,7 +5668,7 @@ mod tests {
                 .into_iter()
                 .map(|c| (c.kind, c.path))
                 .collect::<Vec<_>>(),
-            vec![(crate::dry_run::ChangeKind::Modified, PathBuf::from("f.txt"))],
+            vec![(crate::result::ChangeKind::Modified, PathBuf::from("f.txt"))],
             "precondition: the run reports the chmod as a recorded change",
         );
 
@@ -5831,7 +5831,7 @@ mod tests {
     /// reading a dry run or a recovery report is actually being told.
     #[test]
     fn changes_labels_an_entry_against_the_workdir_as_it_stands_now() {
-        use crate::dry_run::ChangeKind;
+        use crate::result::ChangeKind;
         let workdir = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
 
@@ -6242,7 +6242,7 @@ mod tests {
     /// run do" with half the truth.
     #[test]
     fn changes_on_a_kept_branch_still_reports_the_whole_change_set() {
-        use crate::dry_run::ChangeKind;
+        use crate::result::ChangeKind;
         let workdir = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         fs::write(workdir.path().join("gone.txt"), "still here").unwrap();
