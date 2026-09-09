@@ -49,8 +49,11 @@ const (
 	BranchActionCommit
 	// BranchActionAbort discards all of the branch's writes on exit.
 	BranchActionAbort
-	// BranchActionKeep leaves the branch in place for the caller to handle.
+	// BranchActionKeep leaves the branch on disk for recovery tooling.
 	BranchActionKeep
+	// BranchActionDefer holds the branch on the Process for Commit or Abort.
+	// Only Spawn and Popen can honor it; Run rejects it.
+	BranchActionDefer
 )
 
 // SyscallCategory is the high-level category of an intercepted syscall event.
@@ -170,8 +173,8 @@ const (
 // is optional; an unset field means "no restriction" unless documented
 // otherwise. sandlock's default syscall blocklist is always applied.
 //
-// A Sandbox value carries no runtime state: Run, RunInteractive, and DryRun
-// build a fresh native policy on each call, so a single Sandbox may be reused
+// A Sandbox value carries no runtime state: Run and RunInteractive build a
+// fresh native policy on each call, so a single Sandbox may be reused
 // and shared across goroutines. Use Spawn for explicit process lifecycle
 // control, which returns an independent *Process handle.
 type Sandbox struct {
@@ -304,6 +307,7 @@ type Result struct {
 	Success  bool       // true when the process exited 0
 	Stdout   []byte     // captured standard output
 	Stderr   []byte     // captured standard error
+	Changes  []Change   // what the run did to its COW branch; empty without Workdir
 }
 
 // StdioMode selects how one of a Popen'd process's standard streams is wired.
@@ -329,7 +333,7 @@ type Stdio struct {
 	Stderr StdioMode
 }
 
-// ChangeKind classifies a filesystem change observed during a dry run.
+// ChangeKind classifies a filesystem change a run made to its COW branch.
 type ChangeKind byte
 
 const (
@@ -338,15 +342,10 @@ const (
 	ChangeDeleted  ChangeKind = 'D'
 )
 
-// Change is a single filesystem change detected by DryRun.
+// Change is one filesystem change a run made to its COW branch. Modified
+// means the file was opened for writing and exists in the workdir; the bytes
+// are not compared.
 type Change struct {
 	Kind ChangeKind // 'A' added, 'M' modified, 'D' deleted
 	Path string     // path relative to the working directory
-}
-
-// DryRunResult is the outcome of a dry run: a normal Result plus the list of
-// filesystem changes the command would have made, all of which are discarded.
-type DryRunResult struct {
-	Result
-	Changes []Change
 }
