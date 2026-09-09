@@ -59,7 +59,7 @@ optional, so omitting the ancestor would cause `sandlock run` to abort.
 | **Guarded** | `$HOME`, `/etc`, `/proc`, `/sys`, `/dev`, `/boot`, `/run/secrets` | emit + warning + diff | never (keep individual files; override with `--force-sensitive-collapse`) |
 | **Normal** | everything else | collapse freely | collapse freely |
 
-The tiers apply to write collapse (when a non-existent path's nearest existing ancestor is used as the Landlock grant). Direct writes to an existing path are always recorded; a notice is printed to stderr when the path is Protected or Guarded. **The sole exception is `/`: a direct read or write of the filesystem root is always dropped with a warning, since granting `/` would subsume every other entry in the profile.**
+The tiers apply to write collapse only. **The only path dropped from direct writes/reads is `/`**: granting it would subsume every other entry in the profile. Also, warning is printed to stderr when the direct write path is Protected or Guarded. 
 
 When a write collapse lands on a guarded path, a warning is printed to
 stderr along with an **observed-vs-granted diff**, the list of siblings
