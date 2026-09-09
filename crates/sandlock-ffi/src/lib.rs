@@ -278,7 +278,7 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_fs_mount_ro(
 }
 
 /// Set the COW branch action on successful exit.
-/// `action`: 0 = Commit, 1 = Abort, 2 = Keep.
+/// `action`: 0 = Commit, 1 = Abort, 2 = Keep, 3 = Defer.
 ///
 /// # Safety
 /// `b` must be a valid builder pointer.
@@ -291,16 +291,12 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_on_exit(
         return b;
     }
     let builder = *Box::from_raw(b);
-    let action = match action {
-        1 => BranchAction::Abort,
-        2 => BranchAction::Keep,
-        _ => BranchAction::Commit,
-    };
+    let action = branch_action(action);
     Box::into_raw(Box::new(builder.on_exit(action)))
 }
 
 /// Set the COW branch action on error exit.
-/// `action`: 0 = Commit, 1 = Abort, 2 = Keep.
+/// `action`: 0 = Commit, 1 = Abort, 2 = Keep, 3 = Defer.
 ///
 /// # Safety
 /// `b` must be a valid builder pointer.
@@ -313,12 +309,17 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_on_error(
         return b;
     }
     let builder = *Box::from_raw(b);
-    let action = match action {
+    let action = branch_action(action);
+    Box::into_raw(Box::new(builder.on_error(action)))
+}
+
+fn branch_action(discriminant: u8) -> BranchAction {
+    match discriminant {
         1 => BranchAction::Abort,
         2 => BranchAction::Keep,
+        3 => BranchAction::Defer,
         _ => BranchAction::Commit,
-    };
-    Box::into_raw(Box::new(builder.on_error(action)))
+    }
 }
 
 // ----------------------------------------------------------------
@@ -1465,6 +1466,67 @@ pub unsafe extern "C" fn sandlock_handle_free(h: *mut sandlock_handle_t) {
     }
 }
 
+/// Whether a `Defer` run has exited and is waiting for `sandlock_handle_commit`
+/// or `sandlock_handle_abort`. Freeing a pending handle preserves the branch.
+///
+/// # Safety
+/// `h` must be a valid handle pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_handle_pending(h: *const sandlock_handle_t) -> c_int {
+    if h.is_null() {
+        return 0;
+    }
+    (*h).sandbox.pending() as c_int
+}
+
+/// The pending branch's upper directory, laid out like the workdir. Caller
+/// must free with `sandlock_string_free`; NULL when nothing is pending.
+///
+/// # Safety
+/// `h` must be a valid handle pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_handle_upper_dir(h: *const sandlock_handle_t) -> *mut c_char {
+    if h.is_null() {
+        return ptr::null_mut();
+    }
+    match (*h).sandbox.upper_dir() {
+        Some(p) => CString::new(p.to_string_lossy().as_bytes()).map(|s| s.into_raw()).unwrap_or(ptr::null_mut()),
+        None => ptr::null_mut(),
+    }
+}
+
+/// Merge the pending branch into the workdir. Blocks up to 5s on a contended
+/// workdir. Returns 0 on success, -1 when nothing is pending or the merge
+/// failed (a failed merge preserves the branch on disk).
+///
+/// # Safety
+/// `h` must be a valid handle pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_handle_commit(h: *mut sandlock_handle_t) -> c_int {
+    if h.is_null() {
+        return -1;
+    }
+    match (*h).sandbox.commit() {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// Discard the pending branch. Returns 0 on success, -1 when nothing is pending.
+///
+/// # Safety
+/// `h` must be a valid handle pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_handle_abort(h: *mut sandlock_handle_t) -> c_int {
+    if h.is_null() {
+        return -1;
+    }
+    match (*h).sandbox.abort() {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
 /// Run a command with inherited stdio (interactive). Returns exit code.
 ///
 /// # Safety
@@ -1681,6 +1743,53 @@ pub unsafe extern "C" fn sandlock_result_stderr_bytes(
     }
 }
 
+/// Number of filesystem changes the run made to its COW branch.
+///
+/// # Safety
+/// `r` must be a valid result pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_result_changes_len(r: *const sandlock_result_t) -> usize {
+    if r.is_null() {
+        return 0;
+    }
+    (*r)._private.changes.len()
+}
+
+/// Kind of the i-th change: 'A' (added), 'M' (modified), 'D' (deleted); 0 out of range.
+///
+/// # Safety
+/// `r` must be a valid result pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_result_change_kind(r: *const sandlock_result_t, i: usize) -> c_char {
+    if r.is_null() {
+        return 0;
+    }
+    let changes = &(*r)._private.changes;
+    match changes.get(i).map(|c| &c.kind) {
+        Some(sandlock_core::ChangeKind::Added) => b'A' as c_char,
+        Some(sandlock_core::ChangeKind::Modified) => b'M' as c_char,
+        Some(sandlock_core::ChangeKind::Deleted) => b'D' as c_char,
+        None => 0,
+    }
+}
+
+/// Workdir-relative path of the i-th change. Caller must free with
+/// `sandlock_string_free`; NULL out of range.
+///
+/// # Safety
+/// `r` must be a valid result pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_result_change_path(r: *const sandlock_result_t, i: usize) -> *mut c_char {
+    if r.is_null() {
+        return ptr::null_mut();
+    }
+    let changes = &(*r)._private.changes;
+    match changes.get(i) {
+        Some(c) => CString::new(c.path.to_string_lossy().as_bytes()).map(|s| s.into_raw()).unwrap_or(ptr::null_mut()),
+        None => ptr::null_mut(),
+    }
+}
+
 /// # Safety
 /// `r` must be null or a valid pointer from `sandlock_run`.
 #[no_mangle]
@@ -1698,234 +1807,6 @@ pub unsafe extern "C" fn sandlock_result_free(r: *mut sandlock_result_t) {
 pub unsafe extern "C" fn sandlock_string_free(s: *mut c_char) {
     if !s.is_null() {
         drop(CString::from_raw(s));
-    }
-}
-
-// ----------------------------------------------------------------
-// Dry-run
-// ----------------------------------------------------------------
-
-/// Opaque dry-run result.
-#[allow(non_camel_case_types)]
-pub struct sandlock_dry_run_result_t {
-    _private: sandlock_core::DryRunResult,
-}
-
-/// Run a command in dry-run mode with captured stdout/stderr.
-///
-/// # Safety
-/// `policy` must be a valid policy pointer. `name` may be NULL to
-/// auto-generate a sandbox name, or a valid NUL-terminated string.
-/// `argv` must point to `argc` C strings.
-#[no_mangle]
-pub unsafe extern "C" fn sandlock_dry_run(
-    policy: *const sandlock_sandbox_t,
-    name: *const c_char,
-    argv: *const *const c_char,
-    argc: c_uint,
-) -> *mut sandlock_dry_run_result_t {
-    if policy.is_null() || argv.is_null() {
-        return ptr::null_mut();
-    }
-    let policy = &(*policy)._private;
-    let name = match optional_name(name) {
-        Ok(name) => name,
-        Err(_) => return ptr::null_mut(),
-    };
-    let args = read_argv(argv, argc);
-    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-
-    let mut sb = match name {
-        Some(ref n) => policy.clone().with_name(n.clone()),
-        None => policy.clone(),
-    };
-    match with_runtime(|rt| rt.block_on(sb.dry_run(&arg_refs))) {
-        Some(Ok(result)) => Box::into_raw(Box::new(sandlock_dry_run_result_t { _private: result })),
-        _ => ptr::null_mut(),
-    }
-}
-
-/// Get the exit code from a dry-run result.
-///
-/// # Safety
-/// `r` must be a valid dry-run result pointer.
-#[no_mangle]
-pub unsafe extern "C" fn sandlock_dry_run_result_exit_code(
-    r: *const sandlock_dry_run_result_t,
-) -> c_int {
-    if r.is_null() {
-        return -1;
-    }
-    (*r)._private.run_result.code().unwrap_or(-1) as c_int
-}
-
-/// Terminating reason of a dry-run result (parity with
-/// `sandlock_result_reason`). Returns `KILLED` for a null result.
-///
-/// # Safety
-/// `r` must be null or a valid dry-run result pointer.
-#[no_mangle]
-pub unsafe extern "C" fn sandlock_dry_run_result_reason(
-    r: *const sandlock_dry_run_result_t,
-) -> sandlock_exit_reason_t {
-    if r.is_null() {
-        return sandlock_exit_reason_t::Killed;
-    }
-    exit_reason(&(*r)._private.run_result.exit_status)
-}
-
-/// Signal number for a `SIGNALED` dry-run result, or `-1` otherwise (parity
-/// with `sandlock_result_signal`).
-///
-/// # Safety
-/// `r` must be null or a valid dry-run result pointer.
-#[no_mangle]
-pub unsafe extern "C" fn sandlock_dry_run_result_signal(
-    r: *const sandlock_dry_run_result_t,
-) -> c_int {
-    if r.is_null() {
-        return -1;
-    }
-    exit_signal(&(*r)._private.run_result.exit_status)
-}
-
-/// Check if the dry-run result indicates success.
-///
-/// # Safety
-/// `r` must be a valid dry-run result pointer.
-#[no_mangle]
-pub unsafe extern "C" fn sandlock_dry_run_result_success(
-    r: *const sandlock_dry_run_result_t,
-) -> bool {
-    if r.is_null() {
-        return false;
-    }
-    (*r)._private.run_result.success()
-}
-
-/// Get captured stdout bytes from a dry-run result.
-///
-/// # Safety
-/// `r` must be a valid dry-run result pointer. `len` must be a valid pointer.
-#[no_mangle]
-pub unsafe extern "C" fn sandlock_dry_run_result_stdout_bytes(
-    r: *const sandlock_dry_run_result_t,
-    len: *mut usize,
-) -> *const u8 {
-    if r.is_null() {
-        if !len.is_null() {
-            *len = 0;
-        }
-        return ptr::null();
-    }
-    match &(*r)._private.run_result.stdout {
-        Some(v) => {
-            *len = v.len();
-            v.as_ptr()
-        }
-        None => {
-            *len = 0;
-            ptr::null()
-        }
-    }
-}
-
-/// Get captured stderr bytes from a dry-run result.
-///
-/// # Safety
-/// `r` must be a valid dry-run result pointer. `len` must be a valid pointer.
-#[no_mangle]
-pub unsafe extern "C" fn sandlock_dry_run_result_stderr_bytes(
-    r: *const sandlock_dry_run_result_t,
-    len: *mut usize,
-) -> *const u8 {
-    if r.is_null() {
-        if !len.is_null() {
-            *len = 0;
-        }
-        return ptr::null();
-    }
-    match &(*r)._private.run_result.stderr {
-        Some(v) => {
-            *len = v.len();
-            v.as_ptr()
-        }
-        None => {
-            *len = 0;
-            ptr::null()
-        }
-    }
-}
-
-/// Get the number of filesystem changes in a dry-run result.
-///
-/// # Safety
-/// `r` must be a valid dry-run result pointer.
-#[no_mangle]
-pub unsafe extern "C" fn sandlock_dry_run_result_changes_len(
-    r: *const sandlock_dry_run_result_t,
-) -> usize {
-    if r.is_null() {
-        return 0;
-    }
-    (*r)._private.changes.len()
-}
-
-/// Get the kind of the i-th change: 'A' (added), 'M' (modified), 'D' (deleted).
-///
-/// # Safety
-/// `r` must be a valid dry-run result pointer. `i` must be < changes_len.
-#[no_mangle]
-pub unsafe extern "C" fn sandlock_dry_run_result_change_kind(
-    r: *const sandlock_dry_run_result_t,
-    i: usize,
-) -> c_char {
-    if r.is_null() {
-        return 0;
-    }
-    let changes = &(*r)._private.changes;
-    if i >= changes.len() {
-        return 0;
-    }
-    use sandlock_core::ChangeKind;
-    match changes[i].kind {
-        ChangeKind::Added => b'A' as c_char,
-        ChangeKind::Modified => b'M' as c_char,
-        ChangeKind::Deleted => b'D' as c_char,
-    }
-}
-
-/// Get the path of the i-th change as a C string. Caller must free with `sandlock_string_free`.
-///
-/// # Safety
-/// `r` must be a valid dry-run result pointer. `i` must be < changes_len.
-#[no_mangle]
-pub unsafe extern "C" fn sandlock_dry_run_result_change_path(
-    r: *const sandlock_dry_run_result_t,
-    i: usize,
-) -> *mut c_char {
-    if r.is_null() {
-        return ptr::null_mut();
-    }
-    let changes = &(*r)._private.changes;
-    if i >= changes.len() {
-        return ptr::null_mut();
-    }
-    let path = changes[i].path.to_string_lossy();
-    match CString::new(path.as_bytes()) {
-        Ok(cs) => cs.into_raw(),
-        Err(_) => ptr::null_mut(),
-    }
-}
-
-/// Free a dry-run result.
-///
-/// # Safety
-/// `r` must be null or a valid dry-run result pointer.
-#[no_mangle]
-pub unsafe extern "C" fn sandlock_dry_run_result_free(r: *mut sandlock_dry_run_result_t) {
-    if !r.is_null() {
-        drop(Box::from_raw(r));
     }
 }
 
@@ -2914,8 +2795,8 @@ mod tests {
     use sandlock_core::policy_fn::Verdict;
 
     use super::{
-        exit_reason, exit_signal, sandlock_dry_run_result_reason, sandlock_dry_run_result_signal,
-        sandlock_exit_reason_t, sandlock_result_reason, sandlock_result_signal,
+        exit_reason, exit_signal, sandlock_exit_reason_t, sandlock_result_reason,
+        sandlock_result_signal,
     };
     use sandlock_core::ExitStatus;
 
@@ -2941,11 +2822,6 @@ mod tests {
                 sandlock_exit_reason_t::Killed
             ));
             assert_eq!(sandlock_result_signal(std::ptr::null()), -1);
-            assert!(matches!(
-                sandlock_dry_run_result_reason(std::ptr::null()),
-                sandlock_exit_reason_t::Killed
-            ));
-            assert_eq!(sandlock_dry_run_result_signal(std::ptr::null()), -1);
         }
     }
 
