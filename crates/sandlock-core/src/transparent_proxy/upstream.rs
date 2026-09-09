@@ -25,7 +25,7 @@ impl Forwarder {
         // with_native_roots validates upstream against the host's system trust
         // store (default feature native-tokio). Returns io::Result.
         let connector = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_native_roots()?
+            .with_provider_and_native_roots(rustls::crypto::ring::default_provider())?
             .https_or_http()
             .enable_http1()
             .build();

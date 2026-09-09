@@ -54,7 +54,6 @@ pub(crate) async fn spawn_transparent_proxy(
     ca_key_pem: Option<&str>,
     log_fn: Option<Arc<dyn Fn(&str, &str, &str) + Send + Sync>>,
 ) -> std::io::Result<HttpAclProxyHandle> {
-    // rustls 0.22 builder() uses the ring provider directly; no provider install needed.
     let orig_dest: OrigDestMap =
         Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
     let forwarder = Forwarder::new()?;
@@ -191,7 +190,10 @@ mod tests {
         // rustls client that trusts only the generated CA.
         let mut roots = rustls::RootCertStore::empty();
         roots.add(first_cert_der(&ca.cert_pem)).expect("add CA root");
-        let client_cfg = rustls::ClientConfig::builder()
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let client_cfg = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("ring supports default protocol versions")
             .with_root_certificates(roots)
             .with_no_client_auth();
         let connector = TlsConnector::from(Arc::new(client_cfg));

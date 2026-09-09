@@ -58,7 +58,12 @@ impl CertSigner {
         // rcgen serialize_der() returns PKCS#8 DER.
         let key_der = PrivateKeyDer::Pkcs8(leaf_key.serialize_der().into());
 
-        let mut cfg = ServerConfig::builder()
+        // Explicit provider: the process-wide default is ambiguous whenever a
+        // downstream crate compiles in a second rustls backend.
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut cfg = ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("server cfg: {e}")))?
             .with_no_client_auth()
             .with_single_cert(chain, key_der)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("server cfg: {e}")))?;
@@ -74,8 +79,6 @@ mod tests {
     use super::*;
 
     fn test_ca() -> (String, String) {
-        // rustls 0.22 ServerConfig::builder() uses crypto::ring::default_provider()
-        // directly (no process-wide install needed, unlike rustls 0.23).
         let m = crate::transparent_proxy::resolve_ca(None, None, true).unwrap().unwrap();
         (m.cert_pem, m.key_pem)
     }
