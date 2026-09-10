@@ -32,7 +32,7 @@ async fn abort_reports_added_file_without_creating_it() {
     drop(sb);
 
     assert!(!workdir.join("new.txt").exists(), "aborted run must not write the workdir");
-    assert!(result.changes.iter().any(|c| c.kind == ChangeKind::Added && c.path == Path::new("new.txt")));
+    assert!(result.changes.iter().any(|c| c.kind() == ChangeKind::Added && c.path == Path::new("new.txt")));
     let _ = fs::remove_dir_all(&workdir);
     let _ = fs::remove_dir_all(&storage);
 }
@@ -49,7 +49,7 @@ async fn abort_reports_modified_file_without_changing_it() {
     drop(sb);
 
     assert_eq!(fs::read_to_string(workdir.join("data.txt")).unwrap(), "original");
-    assert!(result.changes.iter().any(|c| c.kind == ChangeKind::Modified && c.path == Path::new("data.txt")));
+    assert!(result.changes.iter().any(|c| c.kind() == ChangeKind::Modified && c.path == Path::new("data.txt")));
     let _ = fs::remove_dir_all(&workdir);
     let _ = fs::remove_dir_all(&storage);
 }
@@ -66,7 +66,7 @@ async fn abort_reports_deleted_file_without_removing_it() {
     drop(sb);
 
     assert!(workdir.join("victim.txt").exists());
-    assert!(result.changes.iter().any(|c| c.kind == ChangeKind::Deleted && c.path == Path::new("victim.txt")));
+    assert!(result.changes.iter().any(|c| c.kind() == ChangeKind::Deleted && c.path == Path::new("victim.txt")));
     let _ = fs::remove_dir_all(&workdir);
     let _ = fs::remove_dir_all(&storage);
 }
@@ -82,7 +82,7 @@ async fn commit_reports_the_changes_it_merged() {
     drop(sb);
 
     assert_eq!(fs::read_to_string(workdir.join("out.txt")).unwrap(), "hi\n");
-    assert!(result.changes.iter().any(|c| c.kind == ChangeKind::Added && c.path == Path::new("out.txt")));
+    assert!(result.changes.iter().any(|c| c.kind() == ChangeKind::Added && c.path == Path::new("out.txt")));
     let _ = fs::remove_dir_all(&workdir);
     let _ = fs::remove_dir_all(&storage);
 }

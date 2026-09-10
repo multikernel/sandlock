@@ -1765,7 +1765,7 @@ pub unsafe extern "C" fn sandlock_result_change_kind(r: *const sandlock_result_t
         return 0;
     }
     let changes = &(*r)._private.changes;
-    match changes.get(i).map(|c| &c.kind) {
+    match changes.get(i).map(|c| c.kind()) {
         Some(sandlock_core::ChangeKind::Added) => b'A' as c_char,
         Some(sandlock_core::ChangeKind::Modified) => b'M' as c_char,
         Some(sandlock_core::ChangeKind::Deleted) => b'D' as c_char,

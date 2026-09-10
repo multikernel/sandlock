@@ -42,7 +42,7 @@ pub use protection::{Protection, ProtectionState, ProtectionPolicy, ProtectionSt
 pub use sandbox::{
     BindPorts, Confinement, ConfinementBuilder, Process, Sandbox, SandboxBuilder, StdioMode,
 };
-pub use result::{Change, ChangeKind, ExitStatus, RunResult};
+pub use result::{renames, Change, ChangeKind, Entry, EntryKind, ExitStatus, RunResult};
 pub use pipeline::{Stage, Pipeline, Gather};
 pub use transaction::{AbortReason, Transaction, TxnDisposition, TxnError, TxnOutcome};
 // Recovery of COW branch storage that was preserved rather than reclaimed. The

@@ -9,6 +9,7 @@ use std::fs;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::io::FromRawFd;
+use crate::result::{Entry, EntryKind};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -631,6 +632,34 @@ pub struct SeccompCowBranch {
     keep_if_abandoned: bool,
     max_disk_bytes: u64,
     disk_used: u64,
+}
+
+/// The entry at `path` without following symlinks; `None` when absent.
+pub(crate) fn lstat_entry(path: &Path) -> Option<Entry> {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    let meta = fs::symlink_metadata(path).ok()?;
+    let ft = meta.file_type();
+    let kind = if ft.is_dir() {
+        EntryKind::Dir
+    } else if ft.is_symlink() {
+        EntryKind::Symlink
+    } else if ft.is_file() {
+        EntryKind::File
+    } else if ft.is_fifo() || ft.is_socket() {
+        EntryKind::Other
+    } else {
+        return None;
+    };
+    let target = (kind == EntryKind::Symlink)
+        .then(|| fs::read_link(path).ok().map(|t| t.to_string_lossy().into_owned()))
+        .flatten();
+    Some(Entry {
+        kind,
+        mode: meta.permissions().mode() & 0o7777,
+        size: if kind == EntryKind::File { meta.len() } else { 0 },
+        digest: None,
+        target,
+    })
 }
 
 impl SeccompCowBranch {
@@ -1592,24 +1621,21 @@ impl SeccompCowBranch {
 
     /// List all filesystem changes in the COW layer.
     pub fn changes(&self) -> Result<Vec<crate::result::Change>, BranchError> {
-        use crate::result::{Change, ChangeKind};
+        use crate::result::Change;
 
         let mut result = Vec::new();
 
-        // The kind compares the two trees as they stand, not the branch's
-        // history: a whiteouted-then-recreated path still has its old bytes
-        // in the workdir, and that is what a caller diffing the sides needs.
         for entry in walkdir::WalkDir::new(&self.upper).min_depth(1) {
             let entry = entry.map_err(|e| BranchError::Operation(format!("walk: {}", e)))?;
             let rel = entry.path().strip_prefix(&self.upper).unwrap();
-            let lower = self.workdir.join(rel).symlink_metadata().ok();
+            let before = lstat_entry(&self.workdir.join(rel));
+            let after = lstat_entry(entry.path());
             // Copy-up recreates a modified file's parents in the upper; a
             // directory the workdir already has is scaffolding, not a change.
-            if entry.file_type().is_dir() && lower.as_ref().is_some_and(|m| m.is_dir()) {
+            if entry.file_type().is_dir() && before.as_ref().is_some_and(|b| b.kind == EntryKind::Dir) {
                 continue;
             }
-            let kind = if lower.is_some() { ChangeKind::Modified } else { ChangeKind::Added };
-            result.push(Change { kind, path: rel.to_path_buf() });
+            result.push(Change { path: rel.to_path_buf(), before, after });
         }
 
         // Deletions from the whiteout set; an entry re-created in the upper
@@ -1623,10 +1649,8 @@ impl SeccompCowBranch {
             if self.upper_has(rel_path) {
                 continue;
             }
-            result.push(Change {
-                kind: ChangeKind::Deleted,
-                path: std::path::PathBuf::from(rel_path),
-            });
+            let Some(before) = lstat_entry(&self.workdir.join(rel_path)) else { continue };
+            result.push(Change { path: std::path::PathBuf::from(rel_path), before: Some(before), after: None });
         }
 
         Ok(result)
@@ -3117,7 +3141,7 @@ mod tests {
             .changes()
             .unwrap()
             .into_iter()
-            .map(|c| (c.kind, c.path.display().to_string()))
+            .map(|c| (c.kind(), c.path.display().to_string()))
             .collect();
         outstanding.sort_by(|a, b| a.1.cmp(&b.1));
         assert_eq!(
@@ -3668,7 +3692,7 @@ mod tests {
         fs::write(&upper, "new content").unwrap();
         let changes = branch.changes().unwrap();
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].kind, crate::result::ChangeKind::Added);
+        assert_eq!(changes[0].kind(), crate::result::ChangeKind::Added);
         assert_eq!(changes[0].path, std::path::PathBuf::from("brand_new.txt"));
     }
 
@@ -3680,7 +3704,7 @@ mod tests {
         fs::write(&upper, "modified content").unwrap();
         let changes = branch.changes().unwrap();
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].kind, crate::result::ChangeKind::Modified);
+        assert_eq!(changes[0].kind(), crate::result::ChangeKind::Modified);
         assert_eq!(changes[0].path, std::path::PathBuf::from("existing.txt"));
     }
 
@@ -3691,7 +3715,7 @@ mod tests {
         branch.mark_deleted("existing.txt");
         let changes = branch.changes().unwrap();
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].kind, crate::result::ChangeKind::Deleted);
+        assert_eq!(changes[0].kind(), crate::result::ChangeKind::Deleted);
         assert_eq!(changes[0].path, std::path::PathBuf::from("existing.txt"));
     }
 
@@ -3716,11 +3740,11 @@ mod tests {
         let mut changes = branch.changes().unwrap();
         changes.sort_by(|a, b| a.path.cmp(&b.path));
         assert_eq!(changes.len(), 3);
-        assert_eq!(changes[0].kind, crate::result::ChangeKind::Modified);
+        assert_eq!(changes[0].kind(), crate::result::ChangeKind::Modified);
         assert_eq!(changes[0].path, std::path::PathBuf::from("existing.txt"));
-        assert_eq!(changes[1].kind, crate::result::ChangeKind::Added);
+        assert_eq!(changes[1].kind(), crate::result::ChangeKind::Added);
         assert_eq!(changes[1].path, std::path::PathBuf::from("new.txt"));
-        assert_eq!(changes[2].kind, crate::result::ChangeKind::Deleted);
+        assert_eq!(changes[2].kind(), crate::result::ChangeKind::Deleted);
         assert_eq!(changes[2].path, std::path::PathBuf::from("subdir/nested.txt"));
     }
 
@@ -4525,7 +4549,7 @@ mod tests {
             .filter(|c| c.path == std::path::Path::new("existing.txt"))
             .collect();
         assert_eq!(for_path.len(), 1);
-        assert_eq!(for_path[0].kind, crate::result::ChangeKind::Modified);
+        assert_eq!(for_path[0].kind(), crate::result::ChangeKind::Modified);
     }
 
     #[test]
@@ -5425,7 +5449,7 @@ mod tests {
                 .changes()
                 .unwrap()
                 .iter()
-                .all(|c| c.kind != crate::result::ChangeKind::Deleted),
+                .all(|c| c.kind() != crate::result::ChangeKind::Deleted),
             "a whiteout the upper re-created must not be reported as a deletion",
         );
 
@@ -5545,7 +5569,7 @@ mod tests {
                 .changes()
                 .unwrap()
                 .into_iter()
-                .filter(|c| c.kind == crate::result::ChangeKind::Deleted)
+                .filter(|c| c.kind() == crate::result::ChangeKind::Deleted)
                 .map(|c| c.path)
                 .collect::<Vec<_>>(),
             vec![PathBuf::from("link/x.txt")],
@@ -5662,7 +5686,7 @@ mod tests {
                 .changes()
                 .unwrap()
                 .into_iter()
-                .map(|c| (c.kind, c.path))
+                .map(|c| (c.kind(), c.path))
                 .collect::<Vec<_>>(),
             vec![(crate::result::ChangeKind::Modified, PathBuf::from("f.txt"))],
             "precondition: the run reports the chmod as a recorded change",
@@ -5834,14 +5858,14 @@ mod tests {
         let branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         fs::write(branch.upper.join("f.txt"), "from the run").unwrap();
         assert_eq!(
-            branch.changes().unwrap()[0].kind,
+            branch.changes().unwrap()[0].kind(),
             ChangeKind::Added,
             "nothing in the workdir yet, so the entry is an addition",
         );
 
         fs::write(workdir.path().join("f.txt"), "appeared underneath").unwrap();
         assert_eq!(
-            branch.changes().unwrap()[0].kind,
+            branch.changes().unwrap()[0].kind(),
             ChangeKind::Modified,
             "the label follows the live workdir: the commit will now overwrite a file",
         );
@@ -5866,7 +5890,7 @@ mod tests {
             .changes()
             .unwrap()
             .into_iter()
-            .map(|c| (c.kind, c.path.display().to_string()))
+            .map(|c| (c.kind(), c.path.display().to_string()))
             .collect();
         assert_eq!(changes, vec![(ChangeKind::Modified, "f.txt".to_string())]);
     }
@@ -5886,7 +5910,7 @@ mod tests {
             .changes()
             .unwrap()
             .into_iter()
-            .map(|c| (c.kind, c.path.display().to_string()))
+            .map(|c| (c.kind(), c.path.display().to_string()))
             .collect();
         assert_eq!(changes, vec![(ChangeKind::Added, "newdir".to_string())]);
     }
@@ -5908,7 +5932,7 @@ mod tests {
             .changes()
             .unwrap()
             .into_iter()
-            .map(|c| (c.kind, c.path.display().to_string()))
+            .map(|c| (c.kind(), c.path.display().to_string()))
             .collect();
         assert_eq!(changes, vec![(ChangeKind::Added, "sub/a.txt".to_string())]);
     }
@@ -6315,7 +6339,7 @@ mod tests {
         branch.keep();
 
         let mut reported: Vec<(ChangeKind, PathBuf)> =
-            branch.changes().unwrap().into_iter().map(|c| (c.kind, c.path)).collect();
+            branch.changes().unwrap().into_iter().map(|c| (c.kind(), c.path)).collect();
         reported.sort_by(|a, b| a.1.cmp(&b.1));
         assert_eq!(
             reported,
