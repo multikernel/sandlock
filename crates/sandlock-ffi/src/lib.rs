@@ -1790,6 +1790,87 @@ pub unsafe extern "C" fn sandlock_result_change_path(r: *const sandlock_result_t
     }
 }
 
+/// One side of a change, as plain data so every binding can hold it on
+/// the stack. `kind`: 0 file, 1 dir, 2 symlink, 3 other. `digest` is
+/// SHA-256 and only meaningful when `has_digest` is 1 (files).
+#[repr(C)]
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy)]
+pub struct sandlock_entry_t {
+    pub kind: u8,
+    pub mode: u32,
+    pub size: u64,
+    pub has_digest: u8,
+    pub digest: [u8; 32],
+}
+
+unsafe fn change_side<'a>(r: *const sandlock_result_t, i: usize, side: c_int) -> Option<&'a Option<sandlock_core::Entry>> {
+    if r.is_null() {
+        return None;
+    }
+    let changes = &(*r)._private.changes;
+    let change = changes.get(i)?;
+    match side {
+        0 => Some(&change.before),
+        1 => Some(&change.after),
+        _ => None,
+    }
+}
+
+/// Fill `out` with one side of the i-th change: `side` 0 is before the run
+/// touched the path, 1 is after. Returns 0 when filled, 1 when that side is
+/// absent (`out` untouched), -1 when `i` or `side` is out of range.
+///
+/// # Safety
+/// `r` must be a valid result pointer and `out` a valid, writable pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_result_change_entry(
+    r: *const sandlock_result_t,
+    i: usize,
+    side: c_int,
+    out: *mut sandlock_entry_t,
+) -> c_int {
+    use sandlock_core::EntryKind;
+    let Some(entry) = change_side(r, i, side) else { return -1 };
+    let Some(e) = entry else { return 1 };
+    if out.is_null() {
+        return -1;
+    }
+    *out = sandlock_entry_t {
+        kind: match e.kind {
+            EntryKind::File => 0,
+            EntryKind::Dir => 1,
+            EntryKind::Symlink => 2,
+            EntryKind::Other => 3,
+        },
+        mode: e.mode,
+        size: e.size,
+        has_digest: e.digest.is_some() as u8,
+        digest: e.digest.unwrap_or([0; 32]),
+    };
+    0
+}
+
+/// Symlink target of one side of the i-th change; NULL when that side is
+/// absent or not a symlink. Caller must free with `sandlock_string_free`.
+///
+/// # Safety
+/// `r` must be a valid result pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_result_change_target(
+    r: *const sandlock_result_t,
+    i: usize,
+    side: c_int,
+) -> *mut c_char {
+    let target = change_side(r, i, side)
+        .and_then(|e| e.as_ref())
+        .and_then(|e| e.target.as_deref());
+    match target {
+        Some(t) => CString::new(t).map(|s| s.into_raw()).unwrap_or(ptr::null_mut()),
+        None => ptr::null_mut(),
+    }
+}
+
 /// # Safety
 /// `r` must be null or a valid pointer from `sandlock_run`.
 #[no_mangle]

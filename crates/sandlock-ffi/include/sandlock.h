@@ -164,6 +164,19 @@ typedef struct sandlock_handle_t sandlock_handle_t;
 typedef struct sandlock_pipeline_t sandlock_pipeline_t;
 
 /**
+ * One side of a change, as plain data so every binding can hold it on
+ * the stack. `kind`: 0 file, 1 dir, 2 symlink, 3 other. `digest` is
+ * SHA-256 and only meaningful when `has_digest` is 1 (files).
+ */
+typedef struct {
+  uint8_t kind;
+  uint32_t mode;
+  uint64_t size;
+  uint8_t has_digest;
+  uint8_t digest[32];
+} sandlock_entry_t;
+
+/**
  * C-compatible syscall event passed to the policy callback.
  *
  * Path strings are intentionally absent (issue #27); use static Landlock
@@ -994,6 +1007,28 @@ char sandlock_result_change_kind(const sandlock_result_t *r, uintptr_t i);
  * `r` must be a valid result pointer.
  */
 char *sandlock_result_change_path(const sandlock_result_t *r, uintptr_t i);
+
+/**
+ * Fill `out` with one side of the i-th change: `side` 0 is before the run
+ * touched the path, 1 is after. Returns 0 when filled, 1 when that side is
+ * absent (`out` untouched), -1 when `i` or `side` is out of range.
+ *
+ * # Safety
+ * `r` must be a valid result pointer and `out` a valid, writable pointer.
+ */
+int sandlock_result_change_entry(const sandlock_result_t *r,
+                                 uintptr_t i,
+                                 int side,
+                                 sandlock_entry_t *out);
+
+/**
+ * Symlink target of one side of the i-th change; NULL when that side is
+ * absent or not a symlink. Caller must free with `sandlock_string_free`.
+ *
+ * # Safety
+ * `r` must be a valid result pointer.
+ */
+char *sandlock_result_change_target(const sandlock_result_t *r, uintptr_t i, int side);
 
 /**
  * # Safety
