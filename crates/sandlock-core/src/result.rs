@@ -104,13 +104,14 @@ impl Entry {
     }
 }
 
-/// One filesystem change a run made to its COW branch. At least one side
-/// is always present.
+/// One filesystem change a run made to its COW branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Change {
     /// Relative to the workdir.
     pub path: PathBuf,
-    /// The workdir entry when the run first touched the path.
+    /// The workdir entry when the run first touched the path. `None` for a
+    /// path that did not exist, or for a deletion of one the run could not
+    /// inspect.
     pub before: Option<Entry>,
     /// The branch entry when the change set was read.
     pub after: Option<Entry>,
@@ -119,8 +120,8 @@ pub struct Change {
 impl Change {
     pub fn kind(&self) -> ChangeKind {
         match (&self.before, &self.after) {
-            (None, _) => ChangeKind::Added,
-            (Some(_), None) => ChangeKind::Deleted,
+            (_, None) => ChangeKind::Deleted,
+            (None, Some(_)) => ChangeKind::Added,
             (Some(_), Some(_)) => ChangeKind::Modified,
         }
     }
@@ -194,6 +195,7 @@ mod change_tests {
         assert_eq!(change("a", None, Some(file(0o644, 1, 1))).kind(), ChangeKind::Added);
         assert_eq!(change("m", Some(file(0o644, 1, 1)), Some(file(0o644, 2, 2))).kind(), ChangeKind::Modified);
         assert_eq!(change("d", Some(file(0o644, 1, 1)), None).kind(), ChangeKind::Deleted);
+        assert_eq!(change("unseen", None, None).kind(), ChangeKind::Deleted);
     }
 
     #[test]

@@ -624,6 +624,8 @@ pub struct SeccompCowBranch {
     /// created after the branch's own deletion landed. Callers that need the
     /// workdir quiescent across retries have to hold it quiescent themselves.
     applied_deletions: HashSet<String>,
+    /// What the workdir held at each path when the run first touched it.
+    origins: crate::cow::origins::Origins,
     has_changes: bool,
     state: BranchState,
     /// What `Drop` does with a branch that was never disposed of: reclaim it
@@ -634,32 +636,82 @@ pub struct SeccompCowBranch {
     disk_used: u64,
 }
 
-/// The entry at `path` without following symlinks; `None` when absent.
-pub(crate) fn lstat_entry(path: &Path) -> Option<Entry> {
-    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-    let meta = fs::symlink_metadata(path).ok()?;
-    let ft = meta.file_type();
-    let kind = if ft.is_dir() {
-        EntryKind::Dir
-    } else if ft.is_symlink() {
-        EntryKind::Symlink
-    } else if ft.is_file() {
-        EntryKind::File
-    } else if ft.is_fifo() || ft.is_socket() {
-        EntryKind::Other
-    } else {
-        return None;
+/// The entry at `rel` under `root`, confined and without following
+/// symlinks: `Ok(None)` when absent, `Err` when it cannot be inspected.
+/// Digests are filled by the caller.
+pub(crate) fn lstat_entry_in_root(root: &Path, rel: &str) -> Result<Option<Entry>, i32> {
+    let st = match crate::sys::fs::statat_in_root(root, rel, false) {
+        Ok(st) => st,
+        Err(libc::ENOENT) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let kind = match st.st_mode & libc::S_IFMT {
+        libc::S_IFREG => EntryKind::File,
+        libc::S_IFDIR => EntryKind::Dir,
+        libc::S_IFLNK => EntryKind::Symlink,
+        libc::S_IFIFO | libc::S_IFSOCK => EntryKind::Other,
+        _ => return Ok(None),
     };
     let target = (kind == EntryKind::Symlink)
-        .then(|| fs::read_link(path).ok().map(|t| t.to_string_lossy().into_owned()))
-        .flatten();
-    Some(Entry {
+        .then(|| crate::sys::fs::readlink_in_root(root, rel).ok())
+        .flatten()
+        .map(|t| String::from_utf8_lossy(&t).into_owned());
+    Ok(Some(Entry {
         kind,
-        mode: meta.permissions().mode() & 0o7777,
-        size: if kind == EntryKind::File { meta.len() } else { 0 },
+        mode: st.st_mode & 0o7777,
+        size: if kind == EntryKind::File { st.st_size as u64 } else { 0 },
         digest: None,
         target,
-    })
+    }))
+}
+
+/// SHA-256 of the regular file at `rel` under `root`, read confined;
+/// `None` when it cannot be read or is not a regular file.
+pub(crate) fn sha256_in_root(root: &Path, rel: &str) -> Option<[u8; 32]> {
+    let fd = crate::sys::fs::openat2_in_root(
+        root,
+        rel,
+        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    )
+    .ok()?;
+    let mut f = unsafe { fs::File::from_raw_fd(fd) };
+    if !f.metadata().ok()?.file_type().is_file() {
+        return None;
+    }
+    let mut hasher = Sha256Writer::new(std::io::sink());
+    std::io::copy(&mut f, &mut hasher).ok()?;
+    Some(hasher.finish())
+}
+
+/// Hashes what passes through on the way to `inner`.
+struct Sha256Writer<W> {
+    inner: W,
+    ctx: ring::digest::Context,
+}
+
+impl<W: std::io::Write> Sha256Writer<W> {
+    fn new(inner: W) -> Self {
+        Self { inner, ctx: ring::digest::Context::new(&ring::digest::SHA256) }
+    }
+
+    fn finish(self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out.copy_from_slice(self.ctx.finish().as_ref());
+        out
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for Sha256Writer<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.ctx.update(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 impl SeccompCowBranch {
@@ -713,6 +765,7 @@ impl SeccompCowBranch {
             storage_dir: branch_dir,
             deleted,
             applied_deletions: HashSet::new(),
+            origins: Default::default(),
             has_changes: false,
             state: BranchState::Open,
             keep_if_abandoned: false,
@@ -800,12 +853,42 @@ impl SeccompCowBranch {
         self.deleted.covers(rel_path) && !self.upper_has(rel_path)
     }
 
+    /// Remember what the workdir holds at `rel` the first time the run
+    /// touches it. Cheap: an lstat, no bytes read. File digests arrive from
+    /// the copy stream or at capture.
+    fn touch(&mut self, rel: &str) {
+        if self.origins.get(rel).is_some() {
+            return;
+        }
+        // Unreadable is not absent: leave it unrecorded so a later deletion
+        // reports an unknown origin rather than a creation.
+        if let Ok(before) = lstat_entry_in_root(&self.workdir, rel) {
+            self.origins.record(rel, before);
+        }
+    }
+
+    /// Record every ancestor of `rel`, so the directories a copy-up recreates
+    /// in the upper are known to be the workdir's own and not reported.
+    fn touch_parents(&mut self, rel: &str) {
+        let mut end = rel.len();
+        while let Some(i) = rel[..end].rfind('/') {
+            self.touch(&rel[..i]);
+            end = i;
+        }
+    }
+
+    /// The digest of a file the copy stream just read out of the workdir.
+    pub(crate) fn record_digest(&mut self, rel: &str, digest: [u8; 32]) {
+        self.origins.set_digest(rel, digest);
+    }
+
     /// Mark a relative path as deleted (whiteout over it and its subtree).
     ///
     /// Deliberately does not touch `applied_deletions`: re-marking a path this
     /// branch already removed from the workdir leaves it non-outstanding, which
     /// is correct — the workdir entry is already gone.
     pub fn mark_deleted(&mut self, rel_path: &str) {
+        self.touch(rel_path);
         self.deleted.insert(rel_path);
         self.has_changes = true;
     }
@@ -847,6 +930,8 @@ impl SeccompCowBranch {
     /// `ensure_cow_copy` (synchronous) and the async two-phase dispatch.
     pub fn prepare_copy(&mut self, rel_path: &str) -> Result<CowCopyPlan, BranchError> {
         self.has_changes = true;
+        self.touch_parents(rel_path);
+        self.touch(rel_path);
 
         let upper_file = self.upper.join(rel_path);
         let lower_file = self.workdir.join(rel_path);
@@ -934,7 +1019,7 @@ impl SeccompCowBranch {
         workdir_root: &Path,
         upper_root: &Path,
         rel: &str,
-    ) -> Result<(), std::io::Error> {
+    ) -> Result<Option<[u8; 32]>, std::io::Error> {
         let create_dest = || -> Result<fs::File, std::io::Error> {
             let fd = crate::sys::fs::openat2_in_root(
                 upper_root,
@@ -960,7 +1045,7 @@ impl SeccompCowBranch {
             // escape target.
             Err(libc::EACCES) | Err(libc::ENOENT) => {
                 create_dest()?;
-                return Ok(());
+                return Ok(None);
             }
             // On a kernel without openat2 (ENOSYS) the copy fails and the caller
             // rolls back / returns Continue; the child then hits Landlock, which
@@ -976,14 +1061,14 @@ impl SeccompCowBranch {
         // of waiting for a writer; on a regular file it is a no-op for reads.
         if !src.metadata()?.file_type().is_file() {
             create_dest()?;
-            return Ok(());
+            return Ok(None);
         }
-        let mut dst = create_dest()?;
+        let mut dst = Sha256Writer::new(create_dest()?);
         std::io::copy(&mut src, &mut dst)?;
         if let Ok(meta) = src.metadata() {
-            let _ = dst.set_permissions(meta.permissions());
+            let _ = dst.inner.set_permissions(meta.permissions());
         }
-        Ok(())
+        Ok(Some(dst.finish()))
     }
 
     /// Ensure a COW copy exists in upper (synchronous). Returns the upper path.
@@ -993,7 +1078,12 @@ impl SeccompCowBranch {
             CowCopyPlan::Ready(upper) => Ok(upper),
             CowCopyPlan::NeedsCopy { upper, lower: _lower, file_size } => {
                 match Self::execute_copy(&self.workdir, &self.upper, rel_path) {
-                    Ok(()) => Ok(upper),
+                    Ok(digest) => {
+                        if let Some(d) = digest {
+                            self.record_digest(rel_path, d);
+                        }
+                        Ok(upper)
+                    }
                     Err(e) => {
                         self.rollback_copy(file_size);
                         Err(BranchError::Operation(format!("copy: {}", e)))
@@ -1339,6 +1429,8 @@ impl SeccompCowBranch {
             Some(r) => r,
             None => return Ok(false),
         };
+        self.touch_parents(&rel);
+        self.touch(&rel);
         self.check_quota(4096)?; // directory metadata
         self.has_changes = true;
         let ok = crate::sys::fs::mkdirp_in_root(&self.upper, &rel, 0o755).is_ok();
@@ -1368,6 +1460,8 @@ impl SeccompCowBranch {
             Some(r) => r,
             None => return Ok(false),
         };
+        self.touch_parents(&rel);
+        self.touch(&rel);
         self.check_quota(256)?;
         self.has_changes = true;
         // Ensure the parent directory exists in the upper layer before creating
@@ -1415,6 +1509,8 @@ impl SeccompCowBranch {
             Some(r) => r,
             None => return Ok(false),
         };
+        self.touch_parents(&new_rel);
+        self.touch(&new_rel);
         let src_is_dir = match self.merged_entry_is_dir(&old_rel) {
             Some(d) => d,
             None => return Err(libc::ENOENT),
@@ -1476,6 +1572,8 @@ impl SeccompCowBranch {
             Some(r) => r,
             None => return Ok(false),
         };
+        self.touch_parents(&rel);
+        self.touch(&rel);
         if std::path::Path::new(target).is_absolute() || target.split('/').any(|c| c == "..") {
             return Ok(false);
         }
@@ -1503,6 +1601,8 @@ impl SeccompCowBranch {
             Some(r) => r,
             None => return Ok(false),
         };
+        self.touch_parents(&new_rel);
+        self.touch(&new_rel);
         if self.is_deleted(&old_rel) {
             return Err(BranchError::Deleted);
         }
@@ -1619,22 +1719,32 @@ impl SeccompCowBranch {
         None
     }
 
-    /// List all filesystem changes in the COW layer.
+    /// List all filesystem changes in the COW layer: the upper against what
+    /// the run first saw at each path.
     pub fn changes(&self) -> Result<Vec<crate::result::Change>, BranchError> {
         use crate::result::Change;
 
         let mut result = Vec::new();
+        let mut reported: HashSet<String> = HashSet::new();
 
         for entry in walkdir::WalkDir::new(&self.upper).min_depth(1) {
             let entry = entry.map_err(|e| BranchError::Operation(format!("walk: {}", e)))?;
             let rel = entry.path().strip_prefix(&self.upper).unwrap();
-            let before = lstat_entry(&self.workdir.join(rel));
-            let after = lstat_entry(entry.path());
-            // Copy-up recreates a modified file's parents in the upper; a
-            // directory the workdir already has is scaffolding, not a change.
-            if entry.file_type().is_dir() && before.as_ref().is_some_and(|b| b.kind == EntryKind::Dir) {
-                continue;
+            let rel_str = rel.to_string_lossy().into_owned();
+            let mut after = lstat_entry_in_root(&self.upper, &rel_str).ok().flatten();
+            if let Some(a) = after.as_mut().filter(|a| a.kind == EntryKind::File) {
+                a.digest = sha256_in_root(&self.upper, &rel_str);
             }
+            let before = self.origins.get(&rel_str).cloned().flatten();
+            // Copy-up recreates a modified file's parents in the upper. The
+            // commit only mkdirs, so a directory the workdir already had is
+            // scaffolding whatever mode the upper copy carries.
+            if let (Some(b), Some(a)) = (&before, &after) {
+                if a.kind == EntryKind::Dir && b.kind == EntryKind::Dir {
+                    continue;
+                }
+            }
+            reported.insert(rel_str);
             result.push(Change { path: rel.to_path_buf(), before, after });
         }
 
@@ -1645,15 +1755,52 @@ impl SeccompCowBranch {
             if self.applied_deletions.contains(rel_path) {
                 continue;
             }
-            // Re-created in the upper: the upper walk reports it instead.
-            if self.upper_has(rel_path) {
+            if self.upper_has(rel_path) || reported.contains(rel_path) {
                 continue;
             }
-            let Some(before) = lstat_entry(&self.workdir.join(rel_path)) else { continue };
-            result.push(Change { path: std::path::PathBuf::from(rel_path), before: Some(before), after: None });
+            // A whiteout is only written over a lower entry, so an origin of
+            // absent here means the confined lstat could not reach what an
+            // unconfined one saw (a symlinked parent): report it with an
+            // unknown before side rather than drop an outstanding deletion.
+            let before = self.deleted_origin(rel_path);
+            let is_dir = before.as_ref().is_some_and(|b| b.kind == EntryKind::Dir);
+            reported.insert(rel_path.to_string());
+            result.push(Change { path: PathBuf::from(rel_path), before, after: None });
+            if !is_dir {
+                continue;
+            }
+            // A whiteout hides the whole subtree; report what the run had
+            // seen beneath it so a moved tree pairs up entry by entry.
+            let children: Vec<String> = self
+                .origins
+                .under(rel_path)
+                .filter(|(child, b)| b.is_some() && !self.upper_has(child) && !reported.contains(*child))
+                .map(|(child, _)| child.to_string())
+                .collect();
+            for child in children {
+                let Some(before) = self.deleted_origin(&child) else { continue };
+                reported.insert(child.clone());
+                result.push(Change { path: PathBuf::from(child), before: Some(before), after: None });
+            }
         }
 
         Ok(result)
+    }
+
+    /// The recorded origin of a deleted path. A file unlinked without a
+    /// copy-up was never streamed, so its digest is read now from the
+    /// workdir, which the commit has not touched yet; a size mismatch means
+    /// someone else rewrote it and the digest stays unknown.
+    fn deleted_origin(&self, rel: &str) -> Option<Entry> {
+        let mut before = self.origins.get(rel).cloned().flatten()?;
+        if before.kind == EntryKind::File && before.digest.is_none() {
+            let unchanged = crate::sys::fs::statat_in_root(&self.workdir, rel, false)
+                .is_ok_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFREG && st.st_size as u64 == before.size);
+            if unchanged {
+                before.digest = sha256_in_root(&self.workdir, rel);
+            }
+        }
+        Some(before)
     }
 
     /// List merged directory entries (upper + lower - deleted).
@@ -3147,9 +3294,9 @@ mod tests {
         assert_eq!(
             outstanding,
             vec![
-                // b.txt is "modified" because the obstructing symlink is still
-                // there in the workdir; c.txt was never reached.
-                (crate::result::ChangeKind::Modified, "b.txt".to_string()),
+                // Both were written straight into the upper, so neither has
+                // an origin; b.txt is the obstructed one, c.txt was never reached.
+                (crate::result::ChangeKind::Added, "b.txt".to_string()),
                 (crate::result::ChangeKind::Added, "c.txt".to_string()),
             ],
             "changes() after a partial merge must report the remainder only",
@@ -5843,31 +5990,26 @@ mod tests {
         );
     }
 
-    /// `changes()` labels an entry Added or Modified by looking at the LIVE
-    /// workdir, not at a snapshot taken when the branch was created.
-    ///
-    /// The same branch reports the same upper entry differently depending on
-    /// what the workdir holds at the moment of the call, which is what a caller
-    /// reading a dry run or a recovery report is actually being told.
+    /// `changes()` labels an entry against what the run saw when it first
+    /// touched the path, not against the live workdir at the time of the
+    /// call: a file that appears underneath afterwards does not turn the
+    /// run's creation into an overwrite.
     #[test]
-    fn changes_labels_an_entry_against_the_workdir_as_it_stands_now() {
+    fn changes_labels_an_entry_against_what_the_run_first_saw() {
         use crate::result::ChangeKind;
         let workdir = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
 
-        let branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
-        fs::write(branch.upper.join("f.txt"), "from the run").unwrap();
-        assert_eq!(
-            branch.changes().unwrap()[0].kind(),
-            ChangeKind::Added,
-            "nothing in the workdir yet, so the entry is an addition",
-        );
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let upper = branch.handle_open(&format!("{}/f.txt", branch.workdir_str()), CREATE_WRITE).unwrap().unwrap();
+        fs::write(&upper, "from the run").unwrap();
+        assert_eq!(branch.changes().unwrap()[0].kind(), ChangeKind::Added);
 
         fs::write(workdir.path().join("f.txt"), "appeared underneath").unwrap();
         assert_eq!(
             branch.changes().unwrap()[0].kind(),
-            ChangeKind::Modified,
-            "the label follows the live workdir: the commit will now overwrite a file",
+            ChangeKind::Added,
+            "the label follows the run's first touch, not the workdir as it stands now",
         );
     }
 
@@ -5924,9 +6066,9 @@ mod tests {
         let storage = tempfile::tempdir().unwrap();
         fs::create_dir(workdir.path().join("sub")).unwrap();
 
-        let branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
-        fs::create_dir(branch.upper.join("sub")).unwrap();
-        fs::write(branch.upper.join("sub/a.txt"), "new").unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let upper = branch.handle_open(&format!("{}/sub/a.txt", branch.workdir_str()), CREATE_WRITE).unwrap().unwrap();
+        fs::write(&upper, "new").unwrap();
 
         let changes: Vec<_> = branch
             .changes()
@@ -5935,6 +6077,139 @@ mod tests {
             .map(|c| (c.kind(), c.path.display().to_string()))
             .collect();
         assert_eq!(changes, vec![(ChangeKind::Added, "sub/a.txt".to_string())]);
+    }
+
+    const CREATE_WRITE: u64 = (libc::O_CREAT | libc::O_WRONLY) as u64;
+    const SHA256_ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    fn hex(d: &[u8; 32]) -> String {
+        d.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn by_path(branch: &SeccompCowBranch) -> std::collections::BTreeMap<String, crate::result::Change> {
+        branch
+            .changes()
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.path.display().to_string(), c))
+            .collect()
+    }
+
+    /// The before side is the workdir entry at first touch, digest included,
+    /// and the after side is the upper entry at capture.
+    #[test]
+    fn a_copied_up_file_reports_both_digests() {
+        use crate::result::EntryKind;
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        fs::write(workdir.path().join("f.txt"), "abc").unwrap();
+
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let upper = branch.handle_open(&format!("{}/f.txt", branch.workdir_str()), CREATE_WRITE).unwrap().unwrap();
+        fs::write(&upper, "xyz").unwrap();
+
+        let c = &by_path(&branch)["f.txt"];
+        let before = c.before.as_ref().unwrap();
+        let after = c.after.as_ref().unwrap();
+        assert_eq!(before.kind, EntryKind::File);
+        assert_eq!(before.size, 3);
+        assert_eq!(hex(&before.digest.unwrap()), SHA256_ABC);
+        assert_ne!(after.digest, before.digest);
+        assert!(!c.content_unchanged());
+    }
+
+    #[test]
+    fn a_deleted_file_reports_the_digest_it_had() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        fs::write(workdir.path().join("g.txt"), "abc").unwrap();
+
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        assert!(branch.handle_unlink(&format!("{}/g.txt", branch.workdir_str()), false).unwrap());
+
+        let c = &by_path(&branch)["g.txt"];
+        assert!(c.after.is_none());
+        assert_eq!(hex(&c.before.as_ref().unwrap().digest.unwrap()), SHA256_ABC);
+    }
+
+    /// A moved directory reports every entry on both sides, so a digest join
+    /// recovers the rename.
+    #[test]
+    fn a_renamed_directory_expands_to_per_entry_changes_that_pair_up() {
+        use crate::result::{renames, ChangeKind, EntryKind};
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        fs::create_dir(workdir.path().join("d")).unwrap();
+        fs::write(workdir.path().join("d/x"), "abc").unwrap();
+
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let wd = branch.workdir_str().to_string();
+        assert!(branch.handle_rename(&format!("{wd}/d"), &format!("{wd}/e")).unwrap());
+
+        let all = by_path(&branch);
+        assert_eq!(all["d"].kind(), ChangeKind::Deleted);
+        assert_eq!(all["d"].before.as_ref().unwrap().kind, EntryKind::Dir);
+        assert_eq!(all["d/x"].kind(), ChangeKind::Deleted);
+        assert_eq!(all["e"].kind(), ChangeKind::Added);
+        assert_eq!(all["e/x"].kind(), ChangeKind::Added);
+        let changes: Vec<_> = all.into_values().collect();
+        assert_eq!(renames(&changes), vec![(Path::new("d/x"), Path::new("e/x"))]);
+    }
+
+    #[test]
+    fn mkdir_reports_an_added_directory_with_no_before_side() {
+        use crate::result::EntryKind;
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        assert!(branch.handle_mkdir(&format!("{}/newdir", branch.workdir_str())).unwrap());
+
+        let c = &by_path(&branch)["newdir"];
+        assert!(c.before.is_none());
+        assert_eq!(c.after.as_ref().unwrap().kind, EntryKind::Dir);
+    }
+
+    #[test]
+    fn chmod_alone_is_modified_with_content_unchanged() {
+        use crate::result::ChangeKind;
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        fs::write(workdir.path().join("f.txt"), "abc").unwrap();
+
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        assert!(branch.handle_chmod(&format!("{}/f.txt", branch.workdir_str()), 0o755).unwrap());
+
+        let c = &by_path(&branch)["f.txt"];
+        assert_eq!(c.kind(), ChangeKind::Modified);
+        assert!(c.content_unchanged());
+        assert_ne!(c.before.as_ref().unwrap().mode, c.after.as_ref().unwrap().mode);
+    }
+
+    #[test]
+    fn retargeting_a_symlink_changes_content_and_keeps_the_kind() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("a", workdir.path().join("link")).unwrap();
+
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let wd = branch.workdir_str().to_string();
+        assert!(branch.handle_unlink(&format!("{wd}/link"), false).unwrap());
+        assert!(branch.handle_symlink("b", &format!("{wd}/link")).unwrap());
+
+        let c = &by_path(&branch)["link"];
+        assert_eq!(c.before.as_ref().unwrap().target.as_deref(), Some("a"));
+        assert_eq!(c.after.as_ref().unwrap().target.as_deref(), Some("b"));
+        assert!(!c.content_unchanged());
+        assert!(!c.type_changed());
+    }
+
+    #[test]
+    fn execute_copy_returns_the_digest_of_what_it_streamed() {
+        let workdir = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        fs::write(workdir.path().join("f"), "abc").unwrap();
+        let digest = SeccompCowBranch::execute_copy(workdir.path(), upper.path(), "f").unwrap().unwrap();
+        assert_eq!(hex(&digest), SHA256_ABC);
     }
 
     // ---- Names, symlinks and the confined path helpers ----

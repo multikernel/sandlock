@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::result::Entry;
+use crate::result::{Entry, EntryKind};
 
 #[derive(Debug, Default)]
 pub(crate) struct Origins {
@@ -23,6 +23,15 @@ impl Origins {
         }
         self.entries.insert(rel.to_string(), before);
         true
+    }
+
+    /// Fill in the digest of a recorded file whose bytes were streamed later.
+    pub fn set_digest(&mut self, rel: &str, digest: [u8; 32]) {
+        if let Some(Some(e)) = self.entries.get_mut(rel) {
+            if e.kind == EntryKind::File && e.digest.is_none() {
+                e.digest = Some(digest);
+            }
+        }
     }
 
     pub fn get(&self, rel: &str) -> Option<&Option<Entry>> {
@@ -64,6 +73,22 @@ mod tests {
         assert!(o.record("new", None));
         assert!(!o.record("new", Some(file(1))));
         assert_eq!(o.get("new"), Some(&None));
+    }
+
+    #[test]
+    fn set_digest_only_fills_an_empty_file_digest() {
+        let mut o = Origins::default();
+        let mut undigested = file(0);
+        undigested.digest = None;
+        o.record("f", Some(undigested));
+        o.record("keep", Some(file(1)));
+        o.record("gone", None);
+        o.set_digest("f", [9; 32]);
+        o.set_digest("keep", [9; 32]);
+        o.set_digest("gone", [9; 32]);
+        assert_eq!(o.get("f").unwrap().as_ref().unwrap().digest, Some([9; 32]));
+        assert_eq!(o.get("keep").unwrap().as_ref().unwrap().digest, Some([1; 32]));
+        assert_eq!(o.get("gone"), Some(&None));
     }
 
     #[test]
