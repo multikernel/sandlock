@@ -16,7 +16,7 @@ import pytest
 
 from pathlib import Path
 
-from sandlock import Sandbox, BranchAction, Change
+from sandlock import Sandbox, BranchAction, Change, Entry, renames
 
 
 _PYTHON_READABLE = list(dict.fromkeys([
@@ -770,6 +770,53 @@ class TestBranchAction:
         assert result.success, result
         assert [(c.kind, c.path) for c in result.changes] == [("A", "newdir")]
         assert not (workdir / "newdir").exists()
+
+    SHA256_ABC = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+
+    def test_a_modified_file_carries_both_entries(self, tmp_path):
+        workdir = tmp_path / "both-sides"
+        workdir.mkdir()
+        (workdir / "data.txt").write_text("abc")
+        p = _policy(fs_writable=[str(workdir)], workdir=str(workdir), on_exit=BranchAction.ABORT)
+        result = p.run(["sh", "-c", f"echo xyz > {workdir}/data.txt"])
+        assert result.success, result
+        [c] = result.changes
+        assert c.kind == "M" and c.path == "data.txt"
+        assert isinstance(c.before, Entry) and isinstance(c.after, Entry)
+        assert c.before.kind == "file" and c.before.size == 3
+        assert c.before.digest.hex() == self.SHA256_ABC
+        assert c.after.size == 4 and c.after.digest != c.before.digest
+        assert not c.content_unchanged and not c.type_changed
+
+    def test_touch_alone_is_modified_with_content_unchanged(self, tmp_path):
+        workdir = tmp_path / "touch"
+        workdir.mkdir()
+        (workdir / "data.txt").write_text("abc")
+        p = _policy(fs_writable=[str(workdir)], workdir=str(workdir), on_exit=BranchAction.ABORT)
+        result = p.run(["touch", str(workdir / "data.txt")])
+        assert result.success, result
+        [c] = result.changes
+        assert c.kind == "M" and c.content_unchanged
+
+    def test_a_deleted_symlink_reports_its_target(self, tmp_path):
+        workdir = tmp_path / "symlink"
+        workdir.mkdir()
+        (workdir / "link").symlink_to("a")
+        p = _policy(fs_writable=[str(workdir)], workdir=str(workdir), on_exit=BranchAction.ABORT)
+        result = p.run(["rm", str(workdir / "link")])
+        assert result.success, result
+        [c] = result.changes
+        assert c.kind == "D" and c.after is None
+        assert c.before.kind == "symlink" and c.before.target == "a" and c.before.digest is None
+
+    def test_renames_pairs_moved_files_by_digest(self, tmp_path):
+        workdir = tmp_path / "renames"
+        workdir.mkdir()
+        (workdir / "old.txt").write_text("abc")
+        p = _policy(fs_writable=[str(workdir)], workdir=str(workdir), on_exit=BranchAction.ABORT)
+        result = p.run(["mv", str(workdir / "old.txt"), str(workdir / "new.txt")])
+        assert result.success, result
+        assert renames(result.changes) == [("old.txt", "new.txt")]
 
     def test_commit_reports_the_changes_it_merged(self, tmp_path):
         workdir = tmp_path / "commit"
