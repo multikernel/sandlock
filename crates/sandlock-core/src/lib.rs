@@ -32,7 +32,6 @@ pub mod image;
 pub mod fork;
 pub(crate) mod ca_inject;
 pub(crate) mod chroot;
-pub mod dry_run;
 pub mod control;
 mod transparent_proxy;
 
@@ -43,14 +42,13 @@ pub use protection::{Protection, ProtectionState, ProtectionPolicy, ProtectionSt
 pub use sandbox::{
     BindPorts, Confinement, ConfinementBuilder, Process, Sandbox, SandboxBuilder, StdioMode,
 };
-pub use result::{RunResult, ExitStatus};
+pub use result::{Change, ChangeKind, ExitStatus, RunResult};
 pub use pipeline::{Stage, Pipeline, Gather};
 pub use transaction::{AbortReason, Transaction, TxnDisposition, TxnError, TxnOutcome};
 // Recovery of COW branch storage that was preserved rather than reclaimed. The
 // rest of `cow` is internal; the `recovery` module is the backend-neutral path
 // these belong to, and the flat aliases here are kept for convenience.
 pub use recovery::{list_preserved, read_preserved, PreserveReason, PreservedBranch};
-pub use dry_run::{Change, ChangeKind, DryRunResult};
 // Sectioned-profile parsing types: ProfileInput is the top-level deserialization
 // target; ProgramSpec carries [program].exec/args (not a Sandbox field).
 // format_net_rule renders a NetRule back into the --net-allow/--net-deny

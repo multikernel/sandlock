@@ -143,11 +143,6 @@ typedef struct sandlock_checkpoint_t sandlock_checkpoint_t;
 typedef struct sandlock_ctx_t sandlock_ctx_t;
 
 /**
- * Opaque dry-run result.
- */
-typedef struct sandlock_dry_run_result_t sandlock_dry_run_result_t;
-
-/**
  * Opaque handle for fork result (holds clone handles with pipes).
  */
 typedef struct sandlock_fork_result_t sandlock_fork_result_t;
@@ -404,7 +399,7 @@ sandlock_builder_t *sandlock_sandbox_builder_fs_mount_ro(sandlock_builder_t *b,
 
 /**
  * Set the COW branch action on successful exit.
- * `action`: 0 = Commit, 1 = Abort, 2 = Keep.
+ * `action`: 0 = Commit, 1 = Abort, 2 = Keep, 3 = Defer.
  *
  * # Safety
  * `b` must be a valid builder pointer.
@@ -413,7 +408,7 @@ sandlock_builder_t *sandlock_sandbox_builder_on_exit(sandlock_builder_t *b, uint
 
 /**
  * Set the COW branch action on error exit.
- * `action`: 0 = Commit, 1 = Abort, 2 = Keep.
+ * `action`: 0 = Commit, 1 = Abort, 2 = Keep, 3 = Defer.
  *
  * # Safety
  * `b` must be a valid builder pointer.
@@ -862,6 +857,42 @@ char *sandlock_handle_port_mappings(const sandlock_handle_t *h);
 void sandlock_handle_free(sandlock_handle_t *h);
 
 /**
+ * Whether a `Defer` run has exited and is waiting for `sandlock_handle_commit`
+ * or `sandlock_handle_abort`. Freeing a pending handle preserves the branch.
+ *
+ * # Safety
+ * `h` must be a valid handle pointer.
+ */
+int sandlock_handle_pending(const sandlock_handle_t *h);
+
+/**
+ * The pending branch's upper directory, laid out like the workdir. Caller
+ * must free with `sandlock_string_free`; NULL when nothing is pending.
+ *
+ * # Safety
+ * `h` must be a valid handle pointer.
+ */
+char *sandlock_handle_upper_dir(const sandlock_handle_t *h);
+
+/**
+ * Merge the pending branch into the workdir. Blocks up to 5s on a contended
+ * workdir. Returns 0 on success, -1 when nothing is pending or the merge
+ * failed (a failed merge preserves the branch on disk).
+ *
+ * # Safety
+ * `h` must be a valid handle pointer.
+ */
+int sandlock_handle_commit(sandlock_handle_t *h);
+
+/**
+ * Discard the pending branch. Returns 0 on success, -1 when nothing is pending.
+ *
+ * # Safety
+ * `h` must be a valid handle pointer.
+ */
+int sandlock_handle_abort(sandlock_handle_t *h);
+
+/**
  * Run a command with inherited stdio (interactive). Returns exit code.
  *
  * # Safety
@@ -940,6 +971,31 @@ const uint8_t *sandlock_result_stdout_bytes(const sandlock_result_t *r, uintptr_
 const uint8_t *sandlock_result_stderr_bytes(const sandlock_result_t *r, uintptr_t *len);
 
 /**
+ * Number of filesystem changes the run made to its COW branch.
+ *
+ * # Safety
+ * `r` must be a valid result pointer.
+ */
+uintptr_t sandlock_result_changes_len(const sandlock_result_t *r);
+
+/**
+ * Kind of the i-th change: 'A' (added), 'M' (modified), 'D' (deleted); 0 out of range.
+ *
+ * # Safety
+ * `r` must be a valid result pointer.
+ */
+char sandlock_result_change_kind(const sandlock_result_t *r, uintptr_t i);
+
+/**
+ * Workdir-relative path of the i-th change. Caller must free with
+ * `sandlock_string_free`; NULL out of range.
+ *
+ * # Safety
+ * `r` must be a valid result pointer.
+ */
+char *sandlock_result_change_path(const sandlock_result_t *r, uintptr_t i);
+
+/**
  * # Safety
  * `r` must be null or a valid pointer from `sandlock_run`.
  */
@@ -952,103 +1008,6 @@ void sandlock_result_free(sandlock_result_t *r);
  * `s` must be null or a pointer from a `sandlock_result_std*` function.
  */
 void sandlock_string_free(char *s);
-
-/**
- * Run a command in dry-run mode with captured stdout/stderr.
- *
- * # Safety
- * `policy` must be a valid policy pointer. `name` may be NULL to
- * auto-generate a sandbox name, or a valid NUL-terminated string.
- * `argv` must point to `argc` C strings.
- */
-sandlock_dry_run_result_t *sandlock_dry_run(const sandlock_sandbox_t *policy,
-                                            const char *name,
-                                            const char *const *argv,
-                                            unsigned int argc);
-
-/**
- * Get the exit code from a dry-run result.
- *
- * # Safety
- * `r` must be a valid dry-run result pointer.
- */
-int sandlock_dry_run_result_exit_code(const sandlock_dry_run_result_t *r);
-
-/**
- * Terminating reason of a dry-run result (parity with
- * `sandlock_result_reason`). Returns `KILLED` for a null result.
- *
- * # Safety
- * `r` must be null or a valid dry-run result pointer.
- */
-sandlock_exit_reason sandlock_dry_run_result_reason(const sandlock_dry_run_result_t *r);
-
-/**
- * Signal number for a `SIGNALED` dry-run result, or `-1` otherwise (parity
- * with `sandlock_result_signal`).
- *
- * # Safety
- * `r` must be null or a valid dry-run result pointer.
- */
-int sandlock_dry_run_result_signal(const sandlock_dry_run_result_t *r);
-
-/**
- * Check if the dry-run result indicates success.
- *
- * # Safety
- * `r` must be a valid dry-run result pointer.
- */
-bool sandlock_dry_run_result_success(const sandlock_dry_run_result_t *r);
-
-/**
- * Get captured stdout bytes from a dry-run result.
- *
- * # Safety
- * `r` must be a valid dry-run result pointer. `len` must be a valid pointer.
- */
-const uint8_t *sandlock_dry_run_result_stdout_bytes(const sandlock_dry_run_result_t *r,
-                                                    uintptr_t *len);
-
-/**
- * Get captured stderr bytes from a dry-run result.
- *
- * # Safety
- * `r` must be a valid dry-run result pointer. `len` must be a valid pointer.
- */
-const uint8_t *sandlock_dry_run_result_stderr_bytes(const sandlock_dry_run_result_t *r,
-                                                    uintptr_t *len);
-
-/**
- * Get the number of filesystem changes in a dry-run result.
- *
- * # Safety
- * `r` must be a valid dry-run result pointer.
- */
-uintptr_t sandlock_dry_run_result_changes_len(const sandlock_dry_run_result_t *r);
-
-/**
- * Get the kind of the i-th change: 'A' (added), 'M' (modified), 'D' (deleted).
- *
- * # Safety
- * `r` must be a valid dry-run result pointer. `i` must be < changes_len.
- */
-char sandlock_dry_run_result_change_kind(const sandlock_dry_run_result_t *r, uintptr_t i);
-
-/**
- * Get the path of the i-th change as a C string. Caller must free with `sandlock_string_free`.
- *
- * # Safety
- * `r` must be a valid dry-run result pointer. `i` must be < changes_len.
- */
-char *sandlock_dry_run_result_change_path(const sandlock_dry_run_result_t *r, uintptr_t i);
-
-/**
- * Free a dry-run result.
- *
- * # Safety
- * `r` must be null or a valid dry-run result pointer.
- */
-void sandlock_dry_run_result_free(sandlock_dry_run_result_t *r);
 
 /**
  * Create a new empty pipeline.

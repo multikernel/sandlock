@@ -1036,10 +1036,9 @@ fn cow_sandbox(workdir: &std::path::Path, on_exit: BranchAction) -> SandboxBuild
 
 /// A merge that STARTS and then fails leaves the change set on disk under a
 /// `MergeInterrupted` marker — the record that the workdir may have been touched
-/// and must be reconciled, not merely re-committed. On the plain-`Sandbox` path
-/// this is the only trace: the disposition runs in `Drop` and discards the
-/// `commit()` error, so the caller — already holding its `RunResult` and
-/// reporting a successful run — is never told.
+/// and must be reconciled, not merely re-committed. `Defer` is what lets the
+/// obstruction be planted between the run and its commit, and it is also the
+/// one path where the caller is told: `Sandbox::commit` returns the error.
 ///
 /// The failure is planted so it lands INSIDE the merge, not at the lock: the
 /// workdir stays intact (so the commit flock opens) but a symlink sits where the
@@ -1056,7 +1055,7 @@ async fn test_failed_merge_on_the_drop_path_leaves_the_upper_recoverable() {
     }
 
     {
-        let mut sb = cow_sandbox(&workdir, BranchAction::Commit)
+        let mut sb = cow_sandbox(&workdir, BranchAction::Defer)
             .fs_storage(&storage)
             .build()
             .unwrap();
@@ -1072,7 +1071,8 @@ async fn test_failed_merge_on_the_drop_path_leaves_the_upper_recoverable() {
         // by then. The child wrote `added.txt` into the upper (COW), so the base
         // path is free to plant here without the child having followed it.
         std::os::unix::fs::symlink("/dev/null", workdir.join("added.txt")).unwrap();
-        // Dropped here: `Drop` commits, the merge fails, and the error is lost.
+        assert!(sb.commit().is_err(), "the obstructed merge must report its failure");
+        assert!(!sb.pending(), "a failed commit disposes the branch by preserving it");
     }
 
     let preserved = sandlock_core::list_preserved(&storage);

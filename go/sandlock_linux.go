@@ -585,6 +585,16 @@ func readResult(r *C.sandlock_result_t) *Result {
 	}
 	res.Stdout = readBytes(r, true)
 	res.Stderr = readBytes(r, false)
+	count := int(C.sandlock_result_changes_len(r))
+	for i := 0; i < count; i++ {
+		kind := byte(C.sandlock_result_change_kind(r, C.uintptr_t(i)))
+		var path string
+		if pc := C.sandlock_result_change_path(r, C.uintptr_t(i)); pc != nil {
+			path = C.GoString(pc)
+			C.sandlock_string_free(pc)
+		}
+		res.Changes = append(res.Changes, Change{Kind: ChangeKind(kind), Path: path})
+	}
 	return res
 }
 
@@ -612,6 +622,9 @@ func (s *Sandbox) Run(ctx context.Context, cmd ...string) (*Result, error) {
 	}
 	if len(cmd) == 0 {
 		return nil, fmt.Errorf("sandlock: empty command")
+	}
+	if s.OnExit == BranchActionDefer || s.OnError == BranchActionDefer {
+		return nil, fmt.Errorf("sandlock: BranchActionDefer needs a Process to decide on; use Spawn or Popen")
 	}
 	policyPtr, err := s.buildPolicy()
 	if err != nil {
@@ -676,63 +689,6 @@ func (s *Sandbox) RunInteractive(ctx context.Context, cmd ...string) (int, error
 	return code, nil
 }
 
-// DryRun executes cmd against a temporary copy-on-write layer, collects the
-// filesystem changes it would have made, then discards them. It requires
-// Workdir to be set.
-func (s *Sandbox) DryRun(ctx context.Context, cmd ...string) (*DryRunResult, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if len(cmd) == 0 {
-		return nil, fmt.Errorf("sandlock: empty command")
-	}
-	policyPtr, err := s.buildPolicy()
-	if err != nil {
-		return nil, err
-	}
-	defer C.sandlock_sandbox_free(policyPtr)
-
-	argv, err := cArgv(cmd)
-	if err != nil {
-		return nil, err
-	}
-	defer freeArgv(argv)
-	ap, ac := argvPtr(argv)
-	name := s.cName()
-	defer freeName(name)
-
-	r := C.sandlock_dry_run(policyPtr, name, ap, ac)
-	if r == nil {
-		return nil, fmt.Errorf("sandlock: dry run failed (Workdir is required; check that readable paths exist)")
-	}
-	defer C.sandlock_dry_run_result_free(r)
-
-	out := &DryRunResult{Result: Result{
-		ExitCode: int(C.sandlock_dry_run_result_exit_code(r)),
-		Reason:   ExitReason(C.sandlock_dry_run_result_reason(r)),
-		Signal:   int(C.sandlock_dry_run_result_signal(r)),
-		Success:  bool(C.sandlock_dry_run_result_success(r)),
-	}}
-	var n C.uintptr_t
-	if p := C.sandlock_dry_run_result_stdout_bytes(r, &n); p != nil && n > 0 {
-		out.Stdout = C.GoBytes(unsafe.Pointer(p), C.int(n))
-	}
-	if p := C.sandlock_dry_run_result_stderr_bytes(r, &n); p != nil && n > 0 {
-		out.Stderr = C.GoBytes(unsafe.Pointer(p), C.int(n))
-	}
-	count := int(C.sandlock_dry_run_result_changes_len(r))
-	for i := 0; i < count; i++ {
-		kind := byte(C.sandlock_dry_run_result_change_kind(r, C.uintptr_t(i)))
-		var path string
-		if pc := C.sandlock_dry_run_result_change_path(r, C.uintptr_t(i)); pc != nil {
-			path = C.GoString(pc)
-			C.sandlock_string_free(pc)
-		}
-		out.Changes = append(out.Changes, Change{Kind: ChangeKind(kind), Path: path})
-	}
-	return out, nil
-}
-
 // Confine applies the Sandbox's Landlock filesystem rules to the current
 // process, in place and irreversibly. Only filesystem fields are honored;
 // configuration that requires a supervisor or a fresh child (seccomp,
@@ -794,6 +750,7 @@ type Process struct {
 	h       *C.sandlock_handle_t
 	pid     int
 	waiting bool // a Wait owns the handle; other handle ops must defer to it
+	pending bool // the run exited under BranchActionDefer; Commit/Abort own the handle now
 
 	// Caller-owned stdio for a process started by Popen. Each is non-nil only
 	// for a stream wired StdioPiped; it owns the pipe fd (closing the file
@@ -970,9 +927,15 @@ func (p *Process) Wait() (*Result, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.waiting = false
-	C.sandlock_handle_free(h)
-	p.h = nil
-	runtime.SetFinalizer(p, nil)
+	// A deferred branch keeps the handle alive until Commit/Abort/Close; the
+	// finalizer stays armed so a leaked Process still preserves it.
+	if C.sandlock_handle_pending(h) != 0 {
+		p.pending = true
+	} else {
+		C.sandlock_handle_free(h)
+		p.h = nil
+		runtime.SetFinalizer(p, nil)
+	}
 	if r == nil {
 		return nil, fmt.Errorf("sandlock: wait failed")
 	}
@@ -981,10 +944,65 @@ func (p *Process) Wait() (*Result, error) {
 	return res, nil
 }
 
+// Pending reports whether the process exited under BranchActionDefer and its
+// change set is waiting for Commit or Abort. Close on a pending Process
+// preserves the branch on disk, the same as BranchActionKeep.
+func (p *Process) Pending() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.pending
+}
+
+// UpperDir is the pending branch's upper directory, laid out like Workdir and
+// holding the new bytes of every added or modified file. Empty unless Pending.
+func (p *Process) UpperDir() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.pending {
+		return ""
+	}
+	c := C.sandlock_handle_upper_dir(p.h)
+	if c == nil {
+		return ""
+	}
+	defer C.sandlock_string_free(c)
+	return C.GoString(c)
+}
+
+// Commit merges the pending branch into Workdir and releases the handle. It
+// blocks up to 5s on a workdir another sandbox is merging into; a failed merge
+// leaves the branch preserved on disk. Last-writer-wins against anything that
+// changed the workdir since the run.
+func (p *Process) Commit() error {
+	return p.dispose(func(h *C.sandlock_handle_t) C.int { return C.sandlock_handle_commit(h) }, "commit")
+}
+
+// Abort discards the pending branch and releases the handle.
+func (p *Process) Abort() error {
+	return p.dispose(func(h *C.sandlock_handle_t) C.int { return C.sandlock_handle_abort(h) }, "abort")
+}
+
+func (p *Process) dispose(op func(*C.sandlock_handle_t) C.int, name string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.pending {
+		return fmt.Errorf("sandlock: no pending branch to %s", name)
+	}
+	rc := op(p.h)
+	p.pending = false
+	C.sandlock_handle_free(p.h)
+	p.h = nil
+	runtime.SetFinalizer(p, nil)
+	if rc != 0 {
+		return fmt.Errorf("sandlock: %s failed; the change set is preserved on disk", name)
+	}
+	return nil
+}
+
 func (p *Process) signal(sig syscall.Signal) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.h == nil || p.pid <= 0 {
+	if p.h == nil || p.pid <= 0 || p.pending {
 		return ErrNotRunning
 	}
 	// The sandbox child leads its own process group; signal the whole group.
@@ -1081,6 +1099,7 @@ func (p *Process) Close() error {
 	}
 	C.sandlock_handle_free(p.h)
 	p.h = nil
+	p.pending = false
 	runtime.SetFinalizer(p, nil)
 	return nil
 }

@@ -143,7 +143,7 @@ impl Transaction {
     ///
     /// The stages really execute — this predicts the filesystem effect on the
     /// workdir, not the effect of running the commands. Same contract as
-    /// [`Sandbox::dry_run`](crate::sandbox::Sandbox::dry_run) for one sandbox.
+    /// a `Sandbox` run with both branch actions set to `Abort`.
     /// The outcome's [`disposition`](TxnOutcome::disposition) is
     /// [`TxnDisposition::DryRun`] unless a stage failed or the transaction timed
     /// out first.
@@ -392,7 +392,7 @@ pub struct TxnOutcome {
     /// The filesystem changes the shared upper held at the end of the run, i.e.
     /// what the commit merged (or, when not committed, what was discarded).
     /// Captured from the branch before it is disposed of.
-    pub changes: Vec<crate::dry_run::Change>,
+    pub changes: Vec<crate::result::Change>,
 }
 
 impl TxnOutcome {
@@ -613,7 +613,7 @@ async fn run_txn(
 /// What the commit phase did with the shared upper.
 struct Finished {
     /// The change set the upper held, read before it was disposed of.
-    changes: Vec<crate::dry_run::Change>,
+    changes: Vec<crate::result::Change>,
     /// `None` when the upper was discarded rather than merged (a dry run, or an
     /// aborted run); otherwise the result of the locked commit.
     commit: Option<Result<(), CommitError>>,
@@ -908,7 +908,7 @@ mod tests {
     #[test]
     fn per_stage_branch_actions_are_rejected_unless_both_are_the_default() {
         let wd = tempfile::tempdir().unwrap();
-        let actions = [BranchAction::Commit, BranchAction::Abort, BranchAction::Keep];
+        let actions = [BranchAction::Commit, BranchAction::Abort, BranchAction::Keep, BranchAction::Defer];
 
         for on_exit in &actions {
             for on_error in &actions {
@@ -2069,7 +2069,7 @@ mod tests {
             .collect();
         assert_eq!(
             paths,
-            vec![(crate::dry_run::ChangeKind::Added, std::path::PathBuf::from("a.txt"))],
+            vec![(crate::result::ChangeKind::Added, std::path::PathBuf::from("a.txt"))],
             "the discarded change set must still be reported"
         );
         assert!(

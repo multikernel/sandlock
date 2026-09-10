@@ -228,26 +228,116 @@ func TestPolicyFnReceivesExecveArgv(t *testing.T) {
 	}
 }
 
-func TestDryRun(t *testing.T) {
+func TestAbortReportsChangesAndWritesNothing(t *testing.T) {
 	requireLandlock(t)
 	dir := t.TempDir()
 	sb := &sandlock.Sandbox{
 		FSReadable: rootfs,
 		FSWritable: []string{dir},
 		Workdir:    dir,
+		OnExit:     sandlock.BranchActionAbort,
 	}
-	res, err := sb.DryRun(context.Background(), "sh", "-c", "echo hi > "+dir+"/out.txt")
+	res, err := sb.Run(context.Background(), "sh", "-c", "echo hi > "+dir+"/out.txt")
 	if err != nil {
-		t.Fatalf("DryRun: %v", err)
+		t.Fatalf("Run: %v", err)
 	}
 	if !res.Success {
-		t.Fatalf("dry run failed: exit=%d stderr=%q", res.ExitCode, res.Stderr)
+		t.Fatalf("run failed: exit=%d stderr=%q", res.ExitCode, res.Stderr)
 	}
-	// The write is discarded; the file must not exist on the host afterward.
 	if _, statErr := os.Stat(dir + "/out.txt"); statErr == nil {
-		t.Fatalf("dry run leaked a write to the host")
+		t.Fatalf("an aborting run leaked a write to the host")
 	}
-	t.Logf("changes: %+v", res.Changes)
+	want := sandlock.Change{Kind: sandlock.ChangeAdded, Path: "out.txt"}
+	if len(res.Changes) != 1 || res.Changes[0] != want {
+		t.Fatalf("changes = %+v, want [%+v]", res.Changes, want)
+	}
+}
+
+func TestRunRejectsDefer(t *testing.T) {
+	requireLandlock(t)
+	dir := t.TempDir()
+	sb := &sandlock.Sandbox{
+		FSReadable: rootfs,
+		FSWritable: []string{dir},
+		Workdir:    dir,
+		OnExit:     sandlock.BranchActionDefer,
+	}
+	if _, err := sb.Run(context.Background(), "true"); err == nil {
+		t.Fatal("Run must refuse a Defer policy: it has no Process to decide on")
+	}
+}
+
+func TestDeferHoldsTheBranchForTheProcess(t *testing.T) {
+	requireLandlock(t)
+	dir := t.TempDir()
+	sb := &sandlock.Sandbox{
+		FSReadable: rootfs,
+		FSWritable: []string{dir},
+		Workdir:    dir,
+		OnExit:     sandlock.BranchActionDefer,
+	}
+	p, err := sb.Spawn("sh", "-c", "echo hi > "+dir+"/out.txt")
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer p.Close()
+	res, err := p.Wait()
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if !res.Success || len(res.Changes) != 1 {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	if !p.Pending() {
+		t.Fatal("a Defer run must be pending after Wait")
+	}
+	if _, statErr := os.Stat(dir + "/out.txt"); statErr == nil {
+		t.Fatal("nothing may land before Commit")
+	}
+	upper := p.UpperDir()
+	if body, readErr := os.ReadFile(upper + "/out.txt"); readErr != nil || string(body) != "hi\n" {
+		t.Fatalf("upper %q does not hold the write: %q, %v", upper, body, readErr)
+	}
+	if err := p.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if p.Pending() {
+		t.Fatal("Commit must clear pending")
+	}
+	if body, readErr := os.ReadFile(dir + "/out.txt"); readErr != nil || string(body) != "hi\n" {
+		t.Fatalf("workdir does not hold the committed write: %q, %v", body, readErr)
+	}
+	if err := p.Commit(); err == nil {
+		t.Fatal("a second Commit has nothing to merge and must fail")
+	}
+}
+
+func TestDeferAbortDiscards(t *testing.T) {
+	requireLandlock(t)
+	dir := t.TempDir()
+	sb := &sandlock.Sandbox{
+		FSReadable: rootfs,
+		FSWritable: []string{dir},
+		Workdir:    dir,
+		OnExit:     sandlock.BranchActionDefer,
+	}
+	p, err := sb.Spawn("sh", "-c", "echo hi > "+dir+"/out.txt")
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer p.Close()
+	if _, err := p.Wait(); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if err := p.Abort(); err != nil {
+		t.Fatalf("Abort: %v", err)
+	}
+	if p.Pending() {
+		t.Fatal("Abort must clear pending")
+	}
+	if _, statErr := os.Stat(dir + "/out.txt"); statErr == nil {
+		t.Fatal("an aborted branch must not land")
+	}
 }
 
 func TestProcessKillInterruptsWait(t *testing.T) {

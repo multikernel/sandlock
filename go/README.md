@@ -85,8 +85,8 @@ func main() {
 `Sandbox` is a plain configuration struct; every field is optional and an unset
 field means "no restriction" unless noted. sandlock's default syscall blocklist
 is always applied. A `Sandbox` carries no runtime state, so it is safe to reuse
-and share across goroutines — `Run`, `RunInteractive`, and `DryRun` build a
-fresh native policy on each call.
+and share across goroutines: `Run` and `RunInteractive` build a fresh native
+policy on each call.
 
 | Group | Fields |
 |---|---|
@@ -117,7 +117,6 @@ with `NetAllowBind`).
 ```go
 func (s *Sandbox) Run(ctx context.Context, cmd ...string) (*Result, error)
 func (s *Sandbox) RunInteractive(ctx context.Context, cmd ...string) (int, error)
-func (s *Sandbox) DryRun(ctx context.Context, cmd ...string) (*DryRunResult, error)
 func (s *Sandbox) Spawn(cmd ...string) (*Process, error)
 func (s *Sandbox) Popen(stdio Stdio, cmd ...string) (*Process, error)
 ```
@@ -126,9 +125,9 @@ func (s *Sandbox) Popen(stdio Stdio, cmd ...string) (*Process, error)
   and returns a result with `ExitCode == -1`. `ctx` cancellation without a
   deadline does not preempt a running child.
 - **RunInteractive** inherits the caller's stdio and returns the exit code.
-- **DryRun** runs against a temporary copy-on-write layer, reports the
-  filesystem `Changes` it would have made, and discards them. Requires
-  `Workdir`.
+- Every `Result` from a sandbox with `Workdir` carries `Changes`, the files and
+  directories the run added, modified, or deleted in its COW branch. A dry run is a run
+  with `OnExit: BranchActionAbort`.
 - **Spawn** starts a process without waiting, returning a `*Process`.
 - **Popen** is the streaming counterpart of Spawn: each stream set to
   `StdioPiped` is handed back on the `*Process` as an `*os.File`
@@ -198,6 +197,12 @@ func (p *Process) Resume() error          // SIGCONT
 func (p *Process) Kill() error            // SIGKILL
 func (p *Process) Ports() (map[int]int, error) // virtual→real, with PortRemap
 func (p *Process) Close() error           // release the handle (kills if running), close piped streams
+
+// BranchActionDefer only: after Wait, the change set stays on the Process.
+func (p *Process) Pending() bool          // exited under Defer and undecided
+func (p *Process) UpperDir() string       // new bytes of added/modified files, laid out like Workdir
+func (p *Process) Commit() error          // merge into Workdir (blocks up to 5s on a contended workdir)
+func (p *Process) Abort() error           // discard
 
 // Popen only: caller-owned pipe ends, non-nil per stream wired StdioPiped.
 p.Stdin  // *os.File

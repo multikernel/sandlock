@@ -14,7 +14,9 @@ import time
 
 import pytest
 
-from sandlock import Sandbox, Change, DryRunResult
+from pathlib import Path
+
+from sandlock import Sandbox, BranchAction, Change
 
 
 _PYTHON_READABLE = list(dict.fromkeys([
@@ -719,75 +721,155 @@ class TestPauseResume:
             sb.resume()
 
 
-class TestDryRun:
-    """Tests for Sandbox.dry_run()."""
+class TestBranchAction:
+    """Every run reports its changes; DEFER hands the disposition to the caller."""
 
-    def test_dry_run_reports_added_file(self, tmp_path):
+    def test_abort_reports_added_file_without_creating_it(self, tmp_path):
         workdir = tmp_path / "add"
         workdir.mkdir()
-        (workdir / "existing.txt").write_text("hello")
-
-        p = _policy(fs_writable=[str(workdir)], workdir=str(workdir))
-        result = p.dry_run(
-            ["sh", "-c", f"touch {workdir}/new.txt"]
-        )
+        p = _policy(fs_writable=[str(workdir)], workdir=str(workdir), on_exit=BranchAction.ABORT)
+        result = p.run(["sh", "-c", f"touch {workdir}/new.txt"])
         assert result.success
-        assert not (workdir / "new.txt").exists(), "new.txt should not exist after dry-run"
-        kinds = [c.kind for c in result.changes]
-        assert "A" in kinds
+        assert not (workdir / "new.txt").exists()
+        assert ("A", "new.txt") in [(c.kind, c.path) for c in result.changes]
 
-    def test_dry_run_reports_modified_file(self, tmp_path):
+    def test_abort_reports_modified_file_without_changing_it(self, tmp_path):
         workdir = tmp_path / "mod"
         workdir.mkdir()
         (workdir / "data.txt").write_text("original")
-
-        p = _policy(fs_writable=[str(workdir)], workdir=str(workdir))
-        result = p.dry_run(
-            ["sh", "-c", f"echo changed > {workdir}/data.txt"]
-        )
+        p = _policy(fs_writable=[str(workdir)], workdir=str(workdir), on_exit=BranchAction.ABORT)
+        result = p.run(["sh", "-c", f"echo changed > {workdir}/data.txt"])
         assert result.success
         assert (workdir / "data.txt").read_text() == "original"
-        kinds = [c.kind for c in result.changes]
-        assert "M" in kinds
+        assert ("M", "data.txt") in [(c.kind, c.path) for c in result.changes]
 
-    def test_dry_run_reports_deleted_file(self, tmp_path):
+    def test_abort_reports_deleted_file_without_removing_it(self, tmp_path):
         workdir = tmp_path / "del"
         workdir.mkdir()
         (workdir / "victim.txt").write_text("delete me")
-
-        p = _policy(fs_writable=[str(workdir)], workdir=str(workdir))
-        result = p.dry_run(
-            ["sh", "-c", f"rm {workdir}/victim.txt"]
-        )
+        p = _policy(fs_writable=[str(workdir)], workdir=str(workdir), on_exit=BranchAction.ABORT)
+        result = p.run(["sh", "-c", f"rm {workdir}/victim.txt"])
         assert result.success
-        assert (workdir / "victim.txt").exists(), "file should still exist after dry-run"
-        kinds = [c.kind for c in result.changes]
-        assert "D" in kinds
+        assert (workdir / "victim.txt").exists()
+        assert ("D", "victim.txt") in [(c.kind, c.path) for c in result.changes]
 
-    def test_dry_run_no_changes(self, tmp_path):
+    def test_rename_over_an_existing_file_reports_modified(self, tmp_path):
+        workdir = tmp_path / "rename-over"
+        workdir.mkdir()
+        (workdir / "data.txt").write_text("original")
+        p = _policy(fs_writable=[str(workdir)], workdir=str(workdir), on_exit=BranchAction.ABORT)
+        result = p.run(["sh", "-c", f"cd {workdir} && echo changed > tmp && mv tmp data.txt"])
+        assert result.success, result
+        assert [(c.kind, c.path) for c in result.changes] == [("M", "data.txt")]
+
+    def test_added_empty_directory_is_reported(self, tmp_path):
+        workdir = tmp_path / "empty-dir"
+        workdir.mkdir()
+        p = _policy(fs_writable=[str(workdir)], workdir=str(workdir), on_exit=BranchAction.ABORT)
+        result = p.run(["mkdir", str(workdir / "newdir")])
+        assert result.success, result
+        assert [(c.kind, c.path) for c in result.changes] == [("A", "newdir")]
+        assert not (workdir / "newdir").exists()
+
+    def test_commit_reports_the_changes_it_merged(self, tmp_path):
+        workdir = tmp_path / "commit"
+        workdir.mkdir()
+        p = _policy(fs_writable=[str(workdir)], workdir=str(workdir))
+        result = p.run(["sh", "-c", f"echo hi > {workdir}/out.txt"])
+        assert result.success
+        assert (workdir / "out.txt").read_text() == "hi\n"
+        assert [c for c in result.changes if isinstance(c, Change)] == result.changes
+        assert ("A", "out.txt") in [(c.kind, c.path) for c in result.changes]
+        assert not p.pending
+
+    def test_run_without_changes_reports_none(self, tmp_path):
         workdir = tmp_path / "noop"
         workdir.mkdir()
-
         p = _policy(fs_writable=[str(workdir)], workdir=str(workdir))
-        result = p.dry_run(["echo", "hello"])
+        result = p.run(["echo", "hello"])
         assert result.success
         assert result.changes == []
 
-    def test_dry_run_returns_structured_result(self, tmp_path):
-        workdir = tmp_path / "struct"
+    def test_defer_holds_the_branch_until_commit(self, tmp_path):
+        workdir = tmp_path / "defer-commit"
         workdir.mkdir()
-        (workdir / "f.txt").write_text("x")
+        p = _policy(fs_writable=[str(workdir)], workdir=str(workdir), on_exit=BranchAction.DEFER)
+        result = p.run(["sh", "-c", f"echo hi > {workdir}/out.txt"])
+        assert result.success
+        assert p.pending
+        assert not (workdir / "out.txt").exists()
+        assert (Path(p.upper_dir) / "out.txt").read_text() == "hi\n"
 
-        p = _policy(fs_writable=[str(workdir)], workdir=str(workdir))
-        result = p.dry_run(
-            ["sh", "-c", f"echo y > {workdir}/f.txt; touch {workdir}/new.txt"]
+        p.commit()
+        assert not p.pending
+        assert p.upper_dir is None
+        assert (workdir / "out.txt").read_text() == "hi\n"
+
+    def test_defer_then_abort_discards(self, tmp_path):
+        workdir = tmp_path / "defer-abort"
+        workdir.mkdir()
+        p = _policy(fs_writable=[str(workdir)], workdir=str(workdir), on_exit=BranchAction.DEFER)
+        p.run(["sh", "-c", f"echo hi > {workdir}/out.txt"])
+        assert p.pending
+        p.abort()
+        assert not p.pending
+        assert not (workdir / "out.txt").exists()
+
+    def test_defer_on_exit_still_aborts_a_failed_run(self, tmp_path):
+        workdir = tmp_path / "defer-fail"
+        workdir.mkdir()
+        p = _policy(
+            fs_writable=[str(workdir)], workdir=str(workdir),
+            on_exit=BranchAction.DEFER, on_error=BranchAction.ABORT,
         )
-        assert isinstance(result, DryRunResult)
-        assert isinstance(result.changes, list)
-        for c in result.changes:
-            assert isinstance(c, Change)
-            assert c.kind in ("A", "M", "D")
-            assert isinstance(c.path, str)
+        result = p.run(["sh", "-c", f"echo hi > {workdir}/out.txt; exit 3"])
+        assert result.exit_code == 3
+        assert ("A", "out.txt") in [(c.kind, c.path) for c in result.changes]
+        assert not p.pending
+        assert not (workdir / "out.txt").exists()
+
+    def test_commit_and_abort_need_a_pending_branch(self, tmp_path):
+        workdir = tmp_path / "not-pending"
+        workdir.mkdir()
+        p = _policy(fs_writable=[str(workdir)], workdir=str(workdir))
+        with pytest.raises(RuntimeError):
+            p.commit()
+        with pytest.raises(RuntimeError):
+            p.abort()
+        p.run(["true"])
+        with pytest.raises(RuntimeError):
+            p.commit()
+
+    def test_a_pending_sandbox_refuses_another_run(self, tmp_path):
+        workdir = tmp_path / "busy"
+        workdir.mkdir()
+        p = _policy(fs_writable=[str(workdir)], workdir=str(workdir), on_exit=BranchAction.DEFER)
+        p.run(["sh", "-c", f"echo hi > {workdir}/out.txt"])
+        assert p.pending
+        with pytest.raises(RuntimeError):
+            p.run(["true"])
+        p.abort()
+        assert p.run(["true"]).success
+
+    def test_leaving_the_context_releases_a_pending_branch(self, tmp_path):
+        workdir = tmp_path / "ctx"
+        workdir.mkdir()
+        with _policy(fs_writable=[str(workdir)], workdir=str(workdir), on_exit=BranchAction.DEFER) as p:
+            p.run(["sh", "-c", f"echo hi > {workdir}/out.txt"])
+            assert p.pending
+        assert not p.pending
+        assert not (workdir / "out.txt").exists(), "an undecided branch is never published"
+
+    def test_spawn_wait_defers_too(self, tmp_path):
+        workdir = tmp_path / "spawn"
+        workdir.mkdir()
+        p = _policy(fs_writable=[str(workdir)], workdir=str(workdir), on_exit=BranchAction.DEFER)
+        p.spawn(["sh", "-c", f"echo hi > {workdir}/out.txt"])
+        result = p.wait()
+        assert result.success
+        assert p.pending
+        p.commit()
+        assert (workdir / "out.txt").read_text() == "hi\n"
 
 
 class TestNewPolicyFields:
@@ -990,8 +1072,8 @@ class TestDiskQuota:
         )
         assert result.success
 
-    def test_quota_dry_run_enforced(self, tmp_path):
-        """Quota applies during dry_run (COW is always active)."""
+    def test_quota_enforced_on_an_aborting_run(self, tmp_path):
+        """Quota applies whatever the branch action (COW is always active)."""
         workdir = tmp_path / "dryquota"
         workdir.mkdir()
         (workdir / "big.bin").write_bytes(b"\x00" * 8192)
@@ -999,8 +1081,9 @@ class TestDiskQuota:
             fs_writable=[str(workdir)],
             workdir=str(workdir),
             max_disk="1K",
+            on_exit=BranchAction.ABORT,
         )
-        result = p.dry_run(
+        result = p.run(
             ["sh", "-c", f"echo x >> {workdir}/big.bin"]
         )
         assert not result.success

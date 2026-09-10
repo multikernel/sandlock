@@ -1422,6 +1422,7 @@ dependencies = [
  "libc",
  "sandlock-core",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
