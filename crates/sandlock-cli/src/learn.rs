@@ -36,7 +36,7 @@ fn classify_path(p: &std::path::Path) -> PathTier {
     if GUARDED_PATHS.iter().any(|s| b == *s) {
         return PathTier::Guarded;
     }
-    // $HOME itself (non-root) is guarded — apps do legitimately write dotfiles there.
+    // $HOME itself (non-root) is guarded: apps do legitimately write dotfiles there.
     if let Ok(home) = std::env::var("HOME") {
         if b == home.as_bytes() && home != "/root" {
             return PathTier::Guarded;
@@ -76,12 +76,25 @@ fn collapse_write_paths(writes: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
         if is_junk_path(p) { continue; }
         let p = &fold_session_path(p.clone());
         if p.exists() {
+            if p.as_os_str().as_encoded_bytes() == b"/" {
+                eprintln!(
+                    "sandlock learn: WARNING: observed a direct write of '/', refusing to grant it"
+                );
+                continue;
+            }
+            match classify_path(p) {
+                PathTier::Protected | PathTier::Guarded => {
+                    eprintln!(
+                        "sandlock learn: NOTE: observed a direct write to '{}'",
+                        p.display()
+                    );
+                }
+                PathTier::Normal => {}
+            }
             out.insert(p.clone());
             continue;
         }
         let Some(ancestor) = p.ancestors().skip(1).find(|a| a.exists()) else { continue };
-        // "/" is always skipped: granting write access to the filesystem root
-        // is never useful and would override every other policy entry.
         if ancestor.as_os_str().as_encoded_bytes() == b"/" {
             eprintln!(
                 "sandlock learn: WARNING: write collapse for '{}' reaches filesystem root, skipping",
@@ -190,8 +203,21 @@ fn collapse_by_threshold(
 /// Returns true for pid-specific paths that are meaningless across runs.
 fn is_junk_path(p: &std::path::Path) -> bool {
     let b = p.as_os_str().as_encoded_bytes();
-    b.starts_with(b"/proc/self")
-        || (b.starts_with(b"/proc/") && b.get(6).map_or(false, u8::is_ascii_digit))
+    // /proc/<pid>/... are pid-specific across runs.
+    let proc_numeric_pid = b.starts_with(b"/proc/")
+        && b.get(6).map_or(false, u8::is_ascii_digit);
+    // Under /proc/self, only sub-trees with volatile numeric components are
+    // junk. Stable entries like /proc/self/maps are legitimately needed
+    // across runs (e.g. V8 reads maps on every startup).
+    let proc_self_volatile = b.starts_with(b"/proc/self/fd/")
+        || b.starts_with(b"/proc/self/fdinfo/")
+        || b.starts_with(b"/proc/self/task/")
+        || b.starts_with(b"/proc/self/map_files/")
+        || b == b"/proc/self/fd"
+        || b == b"/proc/self/fdinfo"
+        || b == b"/proc/self/task"
+        || b == b"/proc/self/map_files";
+    proc_numeric_pid || proc_self_volatile
 }
 
 /// A pty's number changes between sessions; granting the directory is
@@ -352,7 +378,7 @@ impl LearnObserver {
             }
             "openat" | "open" => {
                 if let Some(path) = event.path {
-                    let path = canonicalize_or_keep(path);
+                    let path = canonicalize_or_keep(path, event.pid);
                     if let Some(fl) = event.flags {
                         if is_write_open(fl) {
                             self.writes.lock().unwrap().insert(path);
@@ -366,9 +392,13 @@ impl LearnObserver {
             // rights, so the parent dir is what sandlock run needs, not the target.
             "mkdirat" | "mknodat" => {
                 if let Some(p) = event.path {
-                    let p = canonicalize_or_keep(p);
-                    if let Some(parent) = p.parent() {
-                        self.writes.lock().unwrap().insert(parent.to_path_buf());
+                    let p = canonicalize_or_keep(p, event.pid);
+                    // If the target already exists the syscall will fail with
+                    // EEXIST; no MAKE_DIR right on the parent is needed.
+                    if !p.exists() {
+                        if let Some(parent) = p.parent() {
+                            self.writes.lock().unwrap().insert(parent.to_path_buf());
+                        }
                     }
                 }
             }
@@ -396,7 +426,7 @@ impl LearnObserver {
             // dst operates on the link itself, so only the parent is canonicalized.
             "linkat" => {
                 if let Some(src) = event.path {
-                    self.reads.lock().unwrap().insert(canonicalize_or_keep(src));
+                    self.reads.lock().unwrap().insert(canonicalize_or_keep(src, event.pid));
                 }
                 if let Some(dst) = event.path2 {
                     let dst = canonicalize_parent_or_keep(dst);
@@ -408,7 +438,7 @@ impl LearnObserver {
             // truncate: LANDLOCK_ACCESS_FS_TRUNCATE applies to the file itself.
             "truncate" => {
                 if let Some(p) = event.path {
-                    self.writes.lock().unwrap().insert(canonicalize_or_keep(p));
+                    self.writes.lock().unwrap().insert(canonicalize_or_keep(p, event.pid));
                 }
             }
             "bind" => {
@@ -419,7 +449,7 @@ impl LearnObserver {
                 } else if let Some(p) = event.path {
                     // AF_UNIX named bind: Landlock MAKE_SOCK is a directory right,
                     // so the parent dir is what sandlock run needs.
-                    let p = canonicalize_or_keep(p);
+                    let p = canonicalize_or_keep(p, event.pid);
                     if let Some(parent) = p.parent() {
                         self.writes.lock().unwrap().insert(parent.to_path_buf());
                     }
@@ -484,7 +514,24 @@ impl LearnObserver {
 
 /// Resolve symlinks to get the canonical path. Falls back to the original
 /// if the path doesn't exist yet (e.g. COW-intercepted creates).
-fn canonicalize_or_keep(p: PathBuf) -> PathBuf {
+///
+/// /proc/self paths are canonicalized via the event pid so symlinks
+/// (e.g. /proc/self/exe) resolve against the workload, not the supervisor.
+/// Results still under /proc/<pid>/ are mapped back to /proc/self/.
+fn canonicalize_or_keep(p: PathBuf, pid: u32) -> PathBuf {
+    let b = p.as_os_str().as_encoded_bytes();
+    if b.starts_with(b"/proc/self") {
+        let suffix = &b[b"/proc/self".len()..];
+        let pid_path = PathBuf::from(format!("/proc/{}{}", pid, String::from_utf8_lossy(suffix)));
+        let resolved = std::fs::canonicalize(&pid_path).unwrap_or(pid_path);
+        let resolved_b = resolved.as_os_str().as_encoded_bytes();
+        let pid_prefix = format!("/proc/{}/", pid);
+        if resolved_b.starts_with(pid_prefix.as_bytes()) {
+            let rest = &resolved_b[pid_prefix.len() - 1..]; // keep leading /
+            return PathBuf::from(format!("/proc/self{}", String::from_utf8_lossy(rest)));
+        }
+        return resolved;
+    }
     std::fs::canonicalize(&p).unwrap_or(p)
 }
 
@@ -644,7 +691,7 @@ pub async fn run(args: LearnArgs) -> Result<()> {
             // other read in the profile.
             if p.as_path() == std::path::Path::new("/") {
                 eprintln!(
-                    "sandlock learn: WARNING: observed a read of '/', refusing to grant it"
+                    "sandlock learn: WARNING: observed a direct read of '/', refusing to grant it"
                 );
                 return false;
             }
