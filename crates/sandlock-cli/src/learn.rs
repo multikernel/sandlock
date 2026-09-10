@@ -76,7 +76,7 @@ fn collapse_write_paths(writes: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
         if is_junk_path(p) { continue; }
         let p = &fold_session_path(p.clone());
         if p.exists() {
-            if p.as_os_str().as_encoded_bytes() == b"/" {
+            if is_fs_root(p) {
                 eprintln!(
                     "sandlock learn: WARNING: observed a direct write of '/', refusing to grant it"
                 );
@@ -95,7 +95,7 @@ fn collapse_write_paths(writes: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
             continue;
         }
         let Some(ancestor) = p.ancestors().skip(1).find(|a| a.exists()) else { continue };
-        if ancestor.as_os_str().as_encoded_bytes() == b"/" {
+        if is_fs_root(&ancestor) {
             eprintln!(
                 "sandlock learn: WARNING: write collapse for '{}' reaches filesystem root, skipping",
                 p.display()
@@ -198,6 +198,10 @@ fn collapse_by_threshold(
         }
     }
     out.into_iter().collect()
+}
+
+fn is_fs_root(p: &Path) -> bool {
+    p == Path::new("/")
 }
 
 /// Returns true for pid-specific paths that are meaningless across runs.
@@ -691,7 +695,7 @@ pub async fn run(args: LearnArgs) -> Result<()> {
             // whose cwd is the workdir root lists it routinely (python's -c
             // puts the cwd on sys.path), and granting it would subsume every
             // other read in the profile.
-            if p.as_path() == std::path::Path::new("/") {
+            if is_fs_root(p) {
                 eprintln!(
                     "sandlock learn: WARNING: observed a direct read of '/', refusing to grant it"
                 );
