@@ -33,6 +33,8 @@
 package sandlock
 
 import (
+	"os"
+	"sort"
 	"strings"
 	"unsafe"
 )
@@ -342,10 +344,94 @@ const (
 	ChangeDeleted  ChangeKind = 'D'
 )
 
-// Change is one filesystem change a run made to its COW branch. Modified
-// means the path exists on both sides; the bytes are not compared, so a
-// rename over an existing file counts.
+// EntryKind classifies one side of a Change.
+type EntryKind uint8
+
+const (
+	EntryFile EntryKind = iota
+	EntryDir
+	EntrySymlink
+	EntryOther // fifo or socket: no bytes, only a mode
+)
+
+// Entry is one side of a Change.
+type Entry struct {
+	Kind   EntryKind
+	Mode   os.FileMode // permission bits
+	Size   int64       // byte length for a file; 0 otherwise
+	Digest *[32]byte   // SHA-256 of the bytes; files only
+	Target string      // link target, verbatim; symlinks only
+}
+
+func (e *Entry) sameContent(o *Entry) bool {
+	if e.Kind != o.Kind || e.Target != o.Target || (e.Digest == nil) != (o.Digest == nil) {
+		return false
+	}
+	return e.Digest == nil || *e.Digest == *o.Digest
+}
+
+// Change is one filesystem change a run made to its COW branch.
 type Change struct {
-	Kind ChangeKind // 'A' added, 'M' modified, 'D' deleted
-	Path string     // path relative to the working directory
+	Path   string // path relative to the working directory
+	Before *Entry // the workdir entry when the run first touched the path; nil if absent
+	After  *Entry // the branch entry when the change set was read; nil if removed
+}
+
+// Kind is derived from which sides are present.
+func (c Change) Kind() ChangeKind {
+	switch {
+	case c.After == nil:
+		return ChangeDeleted
+	case c.Before == nil:
+		return ChangeAdded
+	default:
+		return ChangeModified
+	}
+}
+
+// ContentUnchanged reports both sides present with the same kind and bytes
+// or target: a touch, a mode change, or a rewrite with identical contents.
+func (c Change) ContentUnchanged() bool {
+	return c.Before != nil && c.After != nil && c.Before.sameContent(c.After)
+}
+
+// TypeChanged reports both sides present with different kinds.
+func (c Change) TypeChanged() bool {
+	return c.Before != nil && c.After != nil && c.Before.Kind != c.After.Kind
+}
+
+func (c Change) String() string {
+	return string(c.Kind()) + "  " + c.Path
+}
+
+// Renames pairs each deleted file with the added file carrying the same
+// digest, as {old, new}. A digest seen more than once on either side is
+// ambiguous and left unpaired.
+func Renames(changes []Change) [][2]string {
+	unique := func(pick func(Change) (*Entry, *Entry)) map[[32]byte]*string {
+		out := map[[32]byte]*string{}
+		for _, c := range changes {
+			entry, other := pick(c)
+			if entry == nil || other != nil || entry.Digest == nil {
+				continue
+			}
+			if _, dup := out[*entry.Digest]; dup {
+				out[*entry.Digest] = nil
+			} else {
+				path := c.Path
+				out[*entry.Digest] = &path
+			}
+		}
+		return out
+	}
+	deleted := unique(func(c Change) (*Entry, *Entry) { return c.Before, c.After })
+	added := unique(func(c Change) (*Entry, *Entry) { return c.After, c.Before })
+	var pairs [][2]string
+	for d, old := range deleted {
+		if new, ok := added[d]; ok && old != nil && new != nil {
+			pairs = append(pairs, [2]string{*old, *new})
+		}
+	}
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i][0] < pairs[j][0] })
+	return pairs
 }

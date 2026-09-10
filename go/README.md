@@ -126,8 +126,11 @@ func (s *Sandbox) Popen(stdio Stdio, cmd ...string) (*Process, error)
   deadline does not preempt a running child.
 - **RunInteractive** inherits the caller's stdio and returns the exit code.
 - Every `Result` from a sandbox with `Workdir` carries `Changes`, the files and
-  directories the run added, modified, or deleted in its COW branch. A dry run is a run
-  with `OnExit: BranchActionAbort`.
+  directories the run added, modified, or deleted in its COW branch. Each
+  `Change` holds the `Before` and `After` entries (kind, mode, size, digest,
+  link target); `Kind()` derives A, M, or D from which sides exist, and
+  `Renames` pairs moved files by digest. A dry run is a run with
+  `OnExit: BranchActionAbort`.
 - **Spawn** starts a process without waiting, returning a `*Process`.
 - **Popen** is the streaming counterpart of Spawn: each stream set to
   `StdioPiped` is handed back on the `*Process` as an `*os.File`
