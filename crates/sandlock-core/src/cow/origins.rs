@@ -34,6 +34,10 @@ impl Origins {
         }
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Option<Entry>)> {
+        self.entries.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
     pub fn get(&self, rel: &str) -> Option<&Option<Entry>> {
         self.entries.get(rel)
     }

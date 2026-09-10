@@ -222,6 +222,9 @@ pub struct PreservedBranch {
     pub deleted: Vec<PathBuf>,
     /// Why it was preserved, which says what state the workdir is in.
     pub reason: PreserveReason,
+    /// What the run first saw at each path it touched, as far as the marker
+    /// recorded it. Feeds [`changes`](Self::changes).
+    pub origins: Vec<(PathBuf, Option<Entry>)>,
     /// The process that preserved it.
     ///
     /// Load-bearing for one thing: a `MergeInterrupted` marker is written
@@ -296,6 +299,7 @@ pub fn read_preserved(branch_dir: &Path) -> Option<PreservedBranch> {
     let mut upper = None;
     let mut pid = None;
     let mut deleted = Vec::new();
+    let mut origins = Vec::new();
     for line in body.split(|&b| b == b'\n') {
         let sep = match line.iter().position(|&b| b == b'=') {
             Some(i) => i,
@@ -309,6 +313,7 @@ pub fn read_preserved(branch_dir: &Path) -> Option<PreservedBranch> {
             b"upper" => upper = Some(path()),
             // Repeated, one per deleted path — the only multi-valued key.
             b"deleted" => deleted.push(path()),
+            b"before" => origins.extend(parse_origin_line(value)),
             b"pid" => pid = std::str::from_utf8(value).ok().and_then(|s| s.parse().ok()),
             _ => {}
         }
@@ -318,9 +323,91 @@ pub fn read_preserved(branch_dir: &Path) -> Option<PreservedBranch> {
         upper: upper?,
         workdir: workdir?,
         deleted,
+        origins,
         reason: reason?,
         pid: pid?,
     })
+}
+
+impl PreservedBranch {
+    /// The change set the branch still holds, in the same shape a live run
+    /// reports: the preserved upper against what the run first saw.
+    pub fn changes(&self) -> Result<Vec<crate::result::Change>, BranchError> {
+        let mut origins = crate::cow::origins::Origins::default();
+        for (path, before) in &self.origins {
+            origins.record(&path.to_string_lossy(), before.clone());
+        }
+        let deleted: Vec<String> = self.deleted.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        compute_changes(&self.upper, &self.workdir, &origins, deleted.iter().map(String::as_str))
+    }
+}
+
+/// One marker line for an origin record: kind, mode, size, a hex column
+/// holding the digest or the link target, and the path last because it is
+/// the field that may contain a tab.
+fn origin_line(rel: &str, before: &Option<Entry>) -> Vec<u8> {
+    let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let line = match before {
+        None => format!("-\t0\t0\t-\t{rel}"),
+        Some(e) => {
+            let kind = match e.kind {
+                EntryKind::File => 'f',
+                EntryKind::Dir => 'd',
+                EntryKind::Symlink => 'l',
+                EntryKind::Other => 'o',
+            };
+            let column = match (&e.digest, &e.target) {
+                (Some(d), _) => hex(d),
+                (None, Some(t)) => hex(t.as_bytes()),
+                (None, None) => "-".to_string(),
+            };
+            format!("{kind}\t{:o}\t{}\t{column}\t{rel}", e.mode, e.size)
+        }
+    };
+    marker_escape(line.as_bytes())
+}
+
+fn parse_origin_line(value: &[u8]) -> Option<(PathBuf, Option<Entry>)> {
+    use std::os::unix::ffi::OsStringExt;
+    let raw = marker_unescape(value);
+    let mut fields = raw.splitn(5, |&b| b == b'\t');
+    let kind = fields.next()?;
+    let mode = std::str::from_utf8(fields.next()?).ok()?;
+    let size = std::str::from_utf8(fields.next()?).ok()?;
+    let column = fields.next()?;
+    let path = PathBuf::from(std::ffi::OsString::from_vec(fields.next()?.to_vec()));
+    let unhex = |h: &[u8]| -> Option<Vec<u8>> {
+        if h.len() % 2 != 0 {
+            return None;
+        }
+        h.chunks(2)
+            .map(|c| u8::from_str_radix(std::str::from_utf8(c).ok()?, 16).ok())
+            .collect()
+    };
+    let kind = match kind {
+        b"-" => return Some((path, None)),
+        b"f" => EntryKind::File,
+        b"d" => EntryKind::Dir,
+        b"l" => EntryKind::Symlink,
+        b"o" => EntryKind::Other,
+        _ => return None,
+    };
+    let mut entry = Entry {
+        kind,
+        mode: u32::from_str_radix(mode, 8).ok()?,
+        size: size.parse().ok()?,
+        digest: None,
+        target: None,
+    };
+    if column != b"-" {
+        let bytes = unhex(column)?;
+        match kind {
+            EntryKind::File => entry.digest = Some(bytes.try_into().ok()?),
+            EntryKind::Symlink => entry.target = Some(String::from_utf8_lossy(&bytes).into_owned()),
+            _ => {}
+        }
+    }
+    Some((path, Some(entry)))
 }
 
 /// Enumerate every preserved branch directly under `storage_base` — the sweep
@@ -712,6 +799,91 @@ impl<W: std::io::Write> std::io::Write for Sha256Writer<W> {
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
     }
+}
+
+/// The change set of `upper` against `origins`, plus the outstanding
+/// `deleted` whiteouts. Shared by a live branch and a preserved one.
+fn compute_changes<'a>(
+    upper: &Path,
+    workdir: &Path,
+    origins: &crate::cow::origins::Origins,
+    deleted: impl Iterator<Item = &'a str>,
+) -> Result<Vec<crate::result::Change>, BranchError> {
+    use crate::result::Change;
+
+    let upper_has = |rel: &str| crate::sys::fs::statat_in_root(upper, rel, false).is_ok();
+    let mut result = Vec::new();
+    let mut reported: HashSet<String> = HashSet::new();
+
+    for entry in walkdir::WalkDir::new(upper).min_depth(1) {
+        let entry = entry.map_err(|e| BranchError::Operation(format!("walk: {}", e)))?;
+        let rel = entry.path().strip_prefix(upper).unwrap();
+        let rel_str = rel.to_string_lossy().into_owned();
+        let mut after = lstat_entry_in_root(upper, &rel_str).ok().flatten();
+        if let Some(a) = after.as_mut().filter(|a| a.kind == EntryKind::File) {
+            a.digest = sha256_in_root(upper, &rel_str);
+        }
+        let before = origins.get(&rel_str).cloned().flatten();
+        // Copy-up recreates a modified file's parents in the upper. The
+        // commit only mkdirs, so a directory the workdir already had is
+        // scaffolding whatever mode the upper copy carries.
+        if let (Some(b), Some(a)) = (&before, &after) {
+            if a.kind == EntryKind::Dir && b.kind == EntryKind::Dir {
+                continue;
+            }
+        }
+        reported.insert(rel_str);
+        result.push(Change { path: rel.to_path_buf(), before, after });
+    }
+
+    // Deletions from the whiteout set; an entry re-created in the upper
+    // is reported by the upper walk instead.
+    for rel_path in deleted {
+        if upper_has(rel_path) || reported.contains(rel_path) {
+            continue;
+        }
+        // A whiteout is only written over a lower entry, so an origin of
+        // absent here means the confined lstat could not reach what an
+        // unconfined one saw (a symlinked parent): report it with an
+        // unknown before side rather than drop an outstanding deletion.
+        let before = deleted_origin(workdir, origins, rel_path);
+        let is_dir = before.as_ref().is_some_and(|b| b.kind == EntryKind::Dir);
+        reported.insert(rel_path.to_string());
+        result.push(Change { path: PathBuf::from(rel_path), before, after: None });
+        if !is_dir {
+            continue;
+        }
+        // A whiteout hides the whole subtree; report what the run had
+        // seen beneath it so a moved tree pairs up entry by entry.
+        let children: Vec<String> = origins
+            .under(rel_path)
+            .filter(|(child, b)| b.is_some() && !upper_has(child) && !reported.contains(*child))
+            .map(|(child, _)| child.to_string())
+            .collect();
+        for child in children {
+            let Some(before) = deleted_origin(workdir, origins, &child) else { continue };
+            reported.insert(child.clone());
+            result.push(Change { path: PathBuf::from(child), before: Some(before), after: None });
+        }
+    }
+
+    Ok(result)
+}
+
+/// The recorded origin of a deleted path. A file unlinked without a
+/// copy-up was never streamed, so its digest is read now from the
+/// workdir, which the commit has not touched yet; a size mismatch means
+/// someone else rewrote it and the digest stays unknown.
+fn deleted_origin(workdir: &Path, origins: &crate::cow::origins::Origins, rel: &str) -> Option<Entry> {
+    let mut before = origins.get(rel).cloned().flatten()?;
+    if before.kind == EntryKind::File && before.digest.is_none() {
+        let unchanged = crate::sys::fs::statat_in_root(workdir, rel, false)
+            .is_ok_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFREG && st.st_size as u64 == before.size);
+        if unchanged {
+            before.digest = sha256_in_root(workdir, rel);
+        }
+    }
+    Some(before)
 }
 
 impl SeccompCowBranch {
@@ -1722,85 +1894,7 @@ impl SeccompCowBranch {
     /// List all filesystem changes in the COW layer: the upper against what
     /// the run first saw at each path.
     pub fn changes(&self) -> Result<Vec<crate::result::Change>, BranchError> {
-        use crate::result::Change;
-
-        let mut result = Vec::new();
-        let mut reported: HashSet<String> = HashSet::new();
-
-        for entry in walkdir::WalkDir::new(&self.upper).min_depth(1) {
-            let entry = entry.map_err(|e| BranchError::Operation(format!("walk: {}", e)))?;
-            let rel = entry.path().strip_prefix(&self.upper).unwrap();
-            let rel_str = rel.to_string_lossy().into_owned();
-            let mut after = lstat_entry_in_root(&self.upper, &rel_str).ok().flatten();
-            if let Some(a) = after.as_mut().filter(|a| a.kind == EntryKind::File) {
-                a.digest = sha256_in_root(&self.upper, &rel_str);
-            }
-            let before = self.origins.get(&rel_str).cloned().flatten();
-            // Copy-up recreates a modified file's parents in the upper. The
-            // commit only mkdirs, so a directory the workdir already had is
-            // scaffolding whatever mode the upper copy carries.
-            if let (Some(b), Some(a)) = (&before, &after) {
-                if a.kind == EntryKind::Dir && b.kind == EntryKind::Dir {
-                    continue;
-                }
-            }
-            reported.insert(rel_str);
-            result.push(Change { path: rel.to_path_buf(), before, after });
-        }
-
-        // Deletions from the whiteout set; an entry re-created in the upper
-        // is reported by the upper walk instead.
-        for rel_path in self.deleted.iter() {
-            // Already landed this run: not something the next commit will do.
-            if self.applied_deletions.contains(rel_path) {
-                continue;
-            }
-            if self.upper_has(rel_path) || reported.contains(rel_path) {
-                continue;
-            }
-            // A whiteout is only written over a lower entry, so an origin of
-            // absent here means the confined lstat could not reach what an
-            // unconfined one saw (a symlinked parent): report it with an
-            // unknown before side rather than drop an outstanding deletion.
-            let before = self.deleted_origin(rel_path);
-            let is_dir = before.as_ref().is_some_and(|b| b.kind == EntryKind::Dir);
-            reported.insert(rel_path.to_string());
-            result.push(Change { path: PathBuf::from(rel_path), before, after: None });
-            if !is_dir {
-                continue;
-            }
-            // A whiteout hides the whole subtree; report what the run had
-            // seen beneath it so a moved tree pairs up entry by entry.
-            let children: Vec<String> = self
-                .origins
-                .under(rel_path)
-                .filter(|(child, b)| b.is_some() && !self.upper_has(child) && !reported.contains(*child))
-                .map(|(child, _)| child.to_string())
-                .collect();
-            for child in children {
-                let Some(before) = self.deleted_origin(&child) else { continue };
-                reported.insert(child.clone());
-                result.push(Change { path: PathBuf::from(child), before: Some(before), after: None });
-            }
-        }
-
-        Ok(result)
-    }
-
-    /// The recorded origin of a deleted path. A file unlinked without a
-    /// copy-up was never streamed, so its digest is read now from the
-    /// workdir, which the commit has not touched yet; a size mismatch means
-    /// someone else rewrote it and the digest stays unknown.
-    fn deleted_origin(&self, rel: &str) -> Option<Entry> {
-        let mut before = self.origins.get(rel).cloned().flatten()?;
-        if before.kind == EntryKind::File && before.digest.is_none() {
-            let unchanged = crate::sys::fs::statat_in_root(&self.workdir, rel, false)
-                .is_ok_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFREG && st.st_size as u64 == before.size);
-            if unchanged {
-                before.digest = sha256_in_root(&self.workdir, rel);
-            }
-        }
-        Some(before)
+        compute_changes(&self.upper, &self.workdir, &self.origins, self.outstanding_deletions())
     }
 
     /// List merged directory entries (upper + lower - deleted).
@@ -2529,6 +2623,10 @@ impl SeccompCowBranch {
         for rel in self.outstanding_deletions() {
             body.extend_from_slice(b"\ndeleted=");
             body.extend_from_slice(&marker_escape(rel.as_bytes()));
+        }
+        for (rel, before) in self.origins.iter() {
+            body.extend_from_slice(b"\nbefore=");
+            body.extend_from_slice(&origin_line(rel, before));
         }
         body.extend_from_slice(format!("\npid={}\n", std::process::id()).as_bytes());
 
@@ -6210,6 +6308,87 @@ mod tests {
         fs::write(workdir.path().join("f"), "abc").unwrap();
         let digest = SeccompCowBranch::execute_copy(workdir.path(), upper.path(), "f").unwrap().unwrap();
         assert_eq!(hex(&digest), SHA256_ABC);
+    }
+
+    fn sorted_changes(changes: Vec<crate::result::Change>) -> Vec<crate::result::Change> {
+        let mut v = changes;
+        v.sort_by(|a, b| a.path.cmp(&b.path));
+        v
+    }
+
+    /// The marker carries what the run first saw, so recovery tooling reads
+    /// the same change set the live branch reported, digests included.
+    #[test]
+    fn a_preserved_branch_reports_the_same_changes_as_the_live_one() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        fs::write(workdir.path().join("mod.txt"), "abc").unwrap();
+        fs::write(workdir.path().join("gone.txt"), "abc").unwrap();
+
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let wd = branch.workdir_str().to_string();
+        let upper = branch.handle_open(&format!("{wd}/mod.txt"), CREATE_WRITE).unwrap().unwrap();
+        fs::write(&upper, "xyz").unwrap();
+        assert!(branch.handle_unlink(&format!("{wd}/gone.txt"), false).unwrap());
+        assert!(branch.handle_mkdir(&format!("{wd}/newdir")).unwrap());
+        let live = sorted_changes(branch.changes().unwrap());
+        assert_eq!(live.len(), 3);
+        assert!(live.iter().all(|c| c.before.as_ref().is_none_or(|b| b.kind != EntryKind::File || b.digest.is_some())));
+
+        branch.preserve(PreserveReason::Kept);
+        let preserved = read_preserved(&branch.storage_dir).expect("a kept branch has a marker");
+        assert_eq!(sorted_changes(preserved.changes().unwrap()), live);
+    }
+
+    #[test]
+    fn the_marker_round_trips_a_symlink_target_with_a_tab_and_a_newline() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("we\tird\nname", workdir.path().join("link")).unwrap();
+
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let wd = branch.workdir_str().to_string();
+        assert!(branch.handle_unlink(&format!("{wd}/link"), false).unwrap());
+        branch.preserve(PreserveReason::Kept);
+
+        let preserved = read_preserved(&branch.storage_dir).unwrap();
+        let changes = preserved.changes().unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].before.as_ref().unwrap().target.as_deref(), Some("we\tird\nname"));
+    }
+
+    /// A marker from before origins existed, or one whose origin lines were
+    /// lost, still yields a change set: additions and deletions with no
+    /// before side.
+    #[test]
+    fn a_marker_without_origin_lines_reports_unknown_origins() {
+        use crate::result::ChangeKind;
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        fs::write(workdir.path().join("gone.txt"), "abc").unwrap();
+        let branch_dir = storage.path().join("old");
+        fs::create_dir_all(branch_dir.join("upper")).unwrap();
+        fs::write(branch_dir.join("upper/added.txt"), "payload").unwrap();
+        fs::write(
+            branch_dir.join(PRESERVED_MARKER),
+            format!(
+                "reason=kept\nworkdir={}\nupper={}\ndeleted=gone.txt\npid=1\n",
+                workdir.path().display(),
+                branch_dir.join("upper").display(),
+            ),
+        )
+        .unwrap();
+
+        let preserved = read_preserved(&branch_dir).unwrap();
+        let changes = sorted_changes(preserved.changes().unwrap());
+        let summary: Vec<_> = changes.iter().map(|c| (c.kind(), c.path.display().to_string(), c.before.is_some())).collect();
+        assert_eq!(
+            summary,
+            vec![
+                (ChangeKind::Added, "added.txt".to_string(), false),
+                (ChangeKind::Deleted, "gone.txt".to_string(), false),
+            ],
+        );
     }
 
     // ---- Names, symlinks and the confined path helpers ----
