@@ -59,8 +59,10 @@ pub enum ExitStatus {
 pub enum ChangeKind {
     /// Exists in the branch but not in the workdir.
     Added,
-    /// Opened for writing and exists in the workdir; the bytes are not compared.
+    /// Exists on both sides; the bytes are not compared, so a rewrite with
+    /// identical contents, a mode change, or a rename over the path all count.
     Modified,
+    /// Exists in the workdir but not in the branch.
     Deleted,
 }
 

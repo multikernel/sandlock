@@ -753,6 +753,24 @@ class TestBranchAction:
         assert (workdir / "victim.txt").exists()
         assert ("D", "victim.txt") in [(c.kind, c.path) for c in result.changes]
 
+    def test_rename_over_an_existing_file_reports_modified(self, tmp_path):
+        workdir = tmp_path / "rename-over"
+        workdir.mkdir()
+        (workdir / "data.txt").write_text("original")
+        p = _policy(fs_writable=[str(workdir)], workdir=str(workdir), on_exit=BranchAction.ABORT)
+        result = p.run(["sh", "-c", f"cd {workdir} && echo changed > tmp && mv tmp data.txt"])
+        assert result.success, result
+        assert [(c.kind, c.path) for c in result.changes] == [("M", "data.txt")]
+
+    def test_added_empty_directory_is_reported(self, tmp_path):
+        workdir = tmp_path / "empty-dir"
+        workdir.mkdir()
+        p = _policy(fs_writable=[str(workdir)], workdir=str(workdir), on_exit=BranchAction.ABORT)
+        result = p.run(["mkdir", str(workdir / "newdir")])
+        assert result.success, result
+        assert [(c.kind, c.path) for c in result.changes] == [("A", "newdir")]
+        assert not (workdir / "newdir").exists()
+
     def test_commit_reports_the_changes_it_merged(self, tmp_path):
         workdir = tmp_path / "commit"
         workdir.mkdir()

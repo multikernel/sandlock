@@ -125,8 +125,8 @@ func (s *Sandbox) Popen(stdio Stdio, cmd ...string) (*Process, error)
   and returns a result with `ExitCode == -1`. `ctx` cancellation without a
   deadline does not preempt a running child.
 - **RunInteractive** inherits the caller's stdio and returns the exit code.
-- Every `Result` from a sandbox with `Workdir` carries `Changes`, the files
-  the run added, modified, or deleted in its COW branch. A dry run is a run
+- Every `Result` from a sandbox with `Workdir` carries `Changes`, the files and
+  directories the run added, modified, or deleted in its COW branch. A dry run is a run
   with `OnExit: BranchActionAbort`.
 - **Spawn** starts a process without waiting, returning a `*Process`.
 - **Popen** is the streaming counterpart of Spawn: each stream set to

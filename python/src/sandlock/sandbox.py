@@ -118,10 +118,10 @@ class StdioMode(IntEnum):
 
 @dataclass(frozen=True)
 class Change:
-    """A single filesystem change detected by dry-run."""
+    """A single filesystem change a run made to its COW branch."""
 
     kind: str
-    """Change kind: A=added, M=modified, D=deleted."""
+    """A=added, M=modified (exists on both sides, bytes not compared), D=deleted."""
 
     path: str
     """Path relative to workdir."""

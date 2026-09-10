@@ -343,8 +343,8 @@ const (
 )
 
 // Change is one filesystem change a run made to its COW branch. Modified
-// means the file was opened for writing and exists in the workdir; the bytes
-// are not compared.
+// means the path exists on both sides; the bytes are not compared, so a
+// rename over an existing file counts.
 type Change struct {
 	Kind ChangeKind // 'A' added, 'M' modified, 'D' deleted
 	Path string     // path relative to the working directory

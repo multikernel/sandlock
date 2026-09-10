@@ -1596,23 +1596,19 @@ impl SeccompCowBranch {
 
         let mut result = Vec::new();
 
-        // Walk upper directory for added/modified files
+        // The kind compares the two trees as they stand, not the branch's
+        // history: a whiteouted-then-recreated path still has its old bytes
+        // in the workdir, and that is what a caller diffing the sides needs.
         for entry in walkdir::WalkDir::new(&self.upper).min_depth(1) {
             let entry = entry.map_err(|e| BranchError::Operation(format!("walk: {}", e)))?;
-            if entry.file_type().is_dir() {
+            let rel = entry.path().strip_prefix(&self.upper).unwrap();
+            let lower = self.workdir.join(rel).symlink_metadata().ok();
+            // Copy-up recreates a modified file's parents in the upper; a
+            // directory the workdir already has is scaffolding, not a change.
+            if entry.file_type().is_dir() && lower.as_ref().is_some_and(|m| m.is_dir()) {
                 continue;
             }
-            let rel = entry.path().strip_prefix(&self.upper).unwrap();
-            let lower = self.workdir.join(rel);
-            // A covered path's lower entry is logically gone, so a re-created
-            // upper entry is an addition even though lower bytes still exist.
-            let kind = if self.deleted.covers(&rel.to_string_lossy()) {
-                ChangeKind::Added
-            } else if lower.exists() {
-                ChangeKind::Modified
-            } else {
-                ChangeKind::Added
-            };
+            let kind = if lower.is_some() { ChangeKind::Modified } else { ChangeKind::Added };
             result.push(Change { kind, path: rel.to_path_buf() });
         }
 
@@ -4523,13 +4519,13 @@ mod tests {
         let upper = branch.ensure_cow_copy("existing.txt").unwrap();
         fs::write(&upper, "recreated").unwrap();
         let changes = branch.changes().unwrap();
-        // The recreated file is a single Added entry, not Deleted + Modified.
+        // The recreated file is a single Modified entry, not Deleted + Modified.
         let for_path: Vec<_> = changes
             .iter()
             .filter(|c| c.path == std::path::Path::new("existing.txt"))
             .collect();
         assert_eq!(for_path.len(), 1);
-        assert_eq!(for_path[0].kind, crate::result::ChangeKind::Added);
+        assert_eq!(for_path[0].kind, crate::result::ChangeKind::Modified);
     }
 
     #[test]
@@ -5849,6 +5845,72 @@ mod tests {
             ChangeKind::Modified,
             "the label follows the live workdir: the commit will now overwrite a file",
         );
+    }
+
+    /// A path that exists on both sides is Modified even when a whiteout
+    /// covers it: `sed -i`, `mv over` and `rm; recreate` all unlink first,
+    /// and a caller diffing the two trees needs the old bytes it can still
+    /// read in the workdir, not a claim that the file is new.
+    #[test]
+    fn changes_labels_a_recreated_entry_modified_while_the_workdir_still_has_it() {
+        use crate::result::ChangeKind;
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        fs::write(workdir.path().join("f.txt"), "before").unwrap();
+
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        branch.mark_deleted("f.txt");
+        fs::write(branch.upper.join("f.txt"), "after").unwrap();
+
+        let changes: Vec<_> = branch
+            .changes()
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.kind, c.path.display().to_string()))
+            .collect();
+        assert_eq!(changes, vec![(ChangeKind::Modified, "f.txt".to_string())]);
+    }
+
+    /// The commit creates every directory the upper holds, so an empty one the
+    /// run made is a change and must be reported like any other addition.
+    #[test]
+    fn changes_reports_an_added_empty_directory() {
+        use crate::result::ChangeKind;
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+
+        let branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        fs::create_dir(branch.upper.join("newdir")).unwrap();
+
+        let changes: Vec<_> = branch
+            .changes()
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.kind, c.path.display().to_string()))
+            .collect();
+        assert_eq!(changes, vec![(ChangeKind::Added, "newdir".to_string())]);
+    }
+
+    /// Copy-up recreates the parents of a modified file in the upper; those
+    /// mirror directories the workdir already has and are not changes.
+    #[test]
+    fn changes_skips_upper_directories_the_workdir_already_has() {
+        use crate::result::ChangeKind;
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        fs::create_dir(workdir.path().join("sub")).unwrap();
+
+        let branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        fs::create_dir(branch.upper.join("sub")).unwrap();
+        fs::write(branch.upper.join("sub/a.txt"), "new").unwrap();
+
+        let changes: Vec<_> = branch
+            .changes()
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.kind, c.path.display().to_string()))
+            .collect();
+        assert_eq!(changes, vec![(ChangeKind::Added, "sub/a.txt".to_string())]);
     }
 
     // ---- Names, symlinks and the confined path helpers ----

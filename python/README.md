@@ -310,7 +310,7 @@ Wait for the running process to finish and return its `Result`.
 #### Inspecting and deferring COW changes
 
 Every `Result` from a sandbox with a `workdir` carries `changes`, the list
-of files the run added, modified, or deleted in its COW branch. A dry run
+of files and directories the run added, modified, or deleted in its COW branch. A dry run
 is a run whose branch action is `ABORT`:
 
 ```python
