@@ -822,6 +822,31 @@ fn test_proc_self_exe_resolves_to_binary() {
     let read_line = stdout.lines().find(|l| l.starts_with("read = [")).unwrap_or("");
     assert!(!read_line.contains("\"/proc/self/exe\""),
         "/proc/self/exe must be resolved to the binary path, not recorded as-is: {read_line}");
+    let interp = std::process::Command::new("python3")
+        .args(["-c", "import sys; print(sys.executable)"])
+        .output()
+        .expect("run python3");
+    let interp = String::from_utf8_lossy(&interp.stdout).trim().to_string();
+    let interp = std::fs::canonicalize(&interp).expect("canonicalize python3");
+    let expected = format!("\"{}\"", interp.display());
+    assert!(read_line.contains(&expected),
+        "expected resolved interpreter {expected} in reads, got: {read_line}");
+}
+
+/// Opening /proc/self itself (no sub-entry) must be recorded as /proc/self,
+/// not resolved to /proc/<pid> and then dropped as junk.
+#[test]
+fn test_proc_self_bare_preserved() {
+    let output = sandlock_bin()
+        .args(["learn", "--", "python3", "-c", "import os; os.listdir('/proc/self')"])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(output.status.success(),
+        "sandlock learn failed: stderr={}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let read_line = stdout.lines().find(|l| l.starts_with("read = [")).unwrap_or("");
+    assert!(read_line.contains("\"/proc/self\""),
+        "/proc/self must be recorded as-is, got: {read_line}");
 }
 
 // ── Merge and canonicalization ────────────────────────────────────────────────

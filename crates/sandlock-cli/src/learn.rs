@@ -4,7 +4,7 @@
 //! usable by `sandlock run -p`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
@@ -406,7 +406,7 @@ impl LearnObserver {
             // only the parent is canonicalized to avoid following the symlink.
             "unlinkat" | "symlinkat" => {
                 if let Some(p) = event.path {
-                    let p = canonicalize_parent_or_keep(p);
+                    let p = canonicalize_parent_or_keep(p, event.pid);
                     if let Some(parent) = p.parent() {
                         self.writes.lock().unwrap().insert(parent.to_path_buf());
                     }
@@ -416,7 +416,7 @@ impl LearnObserver {
             // Both operate on the link itself, not its target.
             "renameat2" => {
                 for p in [event.path, event.path2].into_iter().flatten() {
-                    let p = canonicalize_parent_or_keep(p);
+                    let p = canonicalize_parent_or_keep(p, event.pid);
                     if let Some(parent) = p.parent() {
                         self.writes.lock().unwrap().insert(parent.to_path_buf());
                     }
@@ -429,7 +429,7 @@ impl LearnObserver {
                     self.reads.lock().unwrap().insert(canonicalize_or_keep(src, event.pid));
                 }
                 if let Some(dst) = event.path2 {
-                    let dst = canonicalize_parent_or_keep(dst);
+                    let dst = canonicalize_parent_or_keep(dst, event.pid);
                     if let Some(parent) = dst.parent() {
                         self.writes.lock().unwrap().insert(parent.to_path_buf());
                     }
@@ -517,27 +517,30 @@ impl LearnObserver {
 ///
 /// /proc/self paths are canonicalized via the event pid so symlinks
 /// (e.g. /proc/self/exe) resolve against the workload, not the supervisor.
-/// Results still under /proc/<pid>/ are mapped back to /proc/self/.
+/// Results still under /proc/<pid> are mapped back to /proc/self.
 fn canonicalize_or_keep(p: PathBuf, pid: u32) -> PathBuf {
-    let b = p.as_os_str().as_encoded_bytes();
-    if b.starts_with(b"/proc/self") {
-        let suffix = &b[b"/proc/self".len()..];
-        let pid_path = PathBuf::from(format!("/proc/{}{}", pid, String::from_utf8_lossy(suffix)));
-        let resolved = std::fs::canonicalize(&pid_path).unwrap_or(pid_path);
-        let resolved_b = resolved.as_os_str().as_encoded_bytes();
-        let pid_prefix = format!("/proc/{}/", pid);
-        if resolved_b.starts_with(pid_prefix.as_bytes()) {
-            let rest = &resolved_b[pid_prefix.len() - 1..]; // keep leading /
-            return PathBuf::from(format!("/proc/self{}", String::from_utf8_lossy(rest)));
-        }
-        return resolved;
+    let proc_self = Path::new("/proc/self");
+    let Ok(rest) = p.strip_prefix(proc_self) else {
+        return std::fs::canonicalize(&p).unwrap_or(p);
+    };
+    let proc_pid = Path::new("/proc").join(pid.to_string());
+    let pid_path = join_rest(&proc_pid, rest);
+    let resolved = std::fs::canonicalize(&pid_path).unwrap_or(pid_path);
+    match resolved.strip_prefix(&proc_pid) {
+        Ok(rest) => join_rest(proc_self, rest),
+        Err(_) => resolved,
     }
-    std::fs::canonicalize(&p).unwrap_or(p)
+}
+
+/// PathBuf::join appends a separator even for an empty component, which
+/// would turn the bare directory into "dir/".
+fn join_rest(base: &Path, rest: &Path) -> PathBuf {
+    if rest.as_os_str().is_empty() { base.to_path_buf() } else { base.join(rest) }
 }
 
 /// Canonicalize only the parent directory and rejoin the final component.
 /// Used for syscalls that operate on the link itself (unlink, rename, symlink).
-fn canonicalize_parent_or_keep(p: PathBuf) -> PathBuf {
+fn canonicalize_parent_or_keep(p: PathBuf, pid: u32) -> PathBuf {
     let file_name = match p.file_name() {
         Some(n) => n.to_owned(),
         None => return p,
@@ -546,8 +549,7 @@ fn canonicalize_parent_or_keep(p: PathBuf) -> PathBuf {
         Some(par) => par,
         None => return p,
     };
-    let canonical_parent = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
-    canonical_parent.join(file_name)
+    canonicalize_or_keep(parent.to_path_buf(), pid).join(file_name)
 }
 
 pub async fn run(args: LearnArgs) -> Result<()> {
