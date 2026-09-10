@@ -492,13 +492,32 @@ class BranchAction(Enum):
 
 ```python
 @dataclass(frozen=True)
+class Entry:
+    kind: str            # "file", "dir", "symlink", or "other" (fifo, socket).
+    mode: int            # Permission bits.
+    size: int            # Byte length for a file; 0 otherwise.
+    digest: bytes | None # SHA-256 of the bytes; files only.
+    target: str | None   # Link target; symlinks only.
+
+@dataclass(frozen=True)
 class Change:
-    kind: str   # "A" = added, "M" = modified, "D" = deleted.
-    path: str   # Path relative to workdir.
+    path: str            # Path relative to workdir.
+    before: Entry | None # The workdir entry when the run first touched the path.
+    after: Entry | None  # The branch entry when the change set was read.
+
+    kind: str            # Derived: "A" (no before), "M" (both sides), "D" (no after).
+    content_unchanged: bool  # Both sides present with the same kind and digest or target.
+    type_changed: bool       # Both sides present with different kinds.
+
+def renames(changes: list[Change]) -> list[tuple[str, str]]: ...
 ```
 
 Every `Result` carries `changes: list[Change]`, read from the COW branch
-before the branch action is applied. Empty without a `workdir`.
+before the branch action is applied. Empty without a `workdir`. `before` is
+recorded when the run first touches a path, so a file that appears in the
+workdir afterwards does not turn an addition into an overwrite. A `before`
+of `None` on a deletion means the run removed an entry it could not inspect.
+`renames` pairs each deleted file with the added file of equal digest.
 
 ## Helpers
 
