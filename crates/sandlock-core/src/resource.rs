@@ -27,7 +27,7 @@ use crate::sys::structs::{
 /// CLONE_THREAD flag — threads don't count toward process limit.
 const CLONE_THREAD: u64 = 0x0001_0000;
 
-/// MAP_ANONYMOUS flag — only anonymous mappings count toward memory limit.
+/// MAP_ANONYMOUS flag: anonymous and writable private file mappings count.
 const MAP_ANONYMOUS: u64 = 0x20;
 
 /// Effective clone flags for a fork-like notification.
@@ -742,11 +742,18 @@ pub(crate) async fn handle_memory(
     if nr == libc::SYS_mmap {
         // args[1] = len, args[2] = prot, args[3] = flags. A PROT_NONE
         // reservation backs nothing until it is remapped writable (a later
-        // mmap this handler charges) or mprotect'd (caught by the floor).
+        // mmap this handler charges) or mprotect'd (judged above). A
+        // writable private file mapping is anonymous memory in waiting:
+        // /dev/zero mapped that way is a plain anonymous mapping by another
+        // name, and the kernel's own data_vm counts its full length.
         let len = args[1];
         let prot = args[2];
         let flags = args[3];
-        if (flags & MAP_ANONYMOUS) != 0 && prot != libc::PROT_NONE as u64 {
+        let anon = (flags & MAP_ANONYMOUS) != 0 && prot != libc::PROT_NONE as u64;
+        let private_writable = (flags & MAP_ANONYMOUS) == 0
+            && (flags & libc::MAP_PRIVATE as u64) != 0
+            && (prot & libc::PROT_WRITE as u64) != 0;
+        if anon || private_writable {
             if would_exceed(&st, len) {
                 return kill;
             }
@@ -1031,10 +1038,40 @@ mod tests {
     }
 
     fn mmap_notif(len: u64, prot: u64) -> SeccompNotif {
-        let mut n = fake_notif(libc::SYS_mmap, 0);
         let flags = (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as u64;
-        n.data.args = [0, len, prot, flags, u64::MAX, 0];
+        file_mmap_notif(len, prot, flags)
+    }
+
+    fn file_mmap_notif(len: u64, prot: u64, flags: u64) -> SeccompNotif {
+        let mut n = fake_notif(libc::SYS_mmap, 0);
+        n.data.args = [0, len, prot, flags, 3, 0];
         n
+    }
+
+    /// A writable private file mapping is anonymous memory in waiting:
+    /// every written page is copied, and `/dev/zero` mapped this way is
+    /// indistinguishable from an anonymous mapping. Shared and read-only
+    /// file mappings never create private pages and stay free.
+    #[tokio::test]
+    async fn writable_private_file_mapping_is_charged() {
+        let ctx = fake_supervisor_ctx(false);
+        let mut policy = fake_policy(false);
+        policy.max_memory_bytes = 1 << 20;
+        policy.has_memory_limit = true;
+        let rw = (libc::PROT_READ | libc::PROT_WRITE) as u64;
+
+        let shared = file_mmap_notif(1 << 30, rw, libc::MAP_SHARED as u64);
+        assert!(matches!(handle_memory(&shared, &ctx, &policy).await, NotifAction::Continue));
+        let readonly = file_mmap_notif(1 << 30, libc::PROT_READ as u64, libc::MAP_PRIVATE as u64);
+        assert!(matches!(handle_memory(&readonly, &ctx, &policy).await, NotifAction::Continue));
+        assert_eq!(ctx.resource.lock().await.mem_used, 0);
+
+        let small = file_mmap_notif(1 << 19, rw, libc::MAP_PRIVATE as u64);
+        assert!(matches!(handle_memory(&small, &ctx, &policy).await, NotifAction::Continue));
+        assert_eq!(ctx.resource.lock().await.mem_used, 1 << 19);
+
+        let big = file_mmap_notif(1 << 30, rw, libc::MAP_PRIVATE as u64);
+        assert!(matches!(handle_memory(&big, &ctx, &policy).await, NotifAction::KillTask { .. }));
     }
 
     /// A PROT_NONE reservation backs nothing, so it must not count: the

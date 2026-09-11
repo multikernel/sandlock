@@ -298,6 +298,38 @@ class TestMaxMemoryMprotectCommit:
         )
 
 
+class TestMaxMemoryPrivateFileMapping:
+    def test_writable_private_file_mapping_is_charged(self):
+        """A writable MAP_PRIVATE file mapping must count like anonymous memory.
+
+        Only MAP_ANONYMOUS was charged, so mapping /dev/zero private and
+        writable gave a workload arbitrary anonymous memory the ledger
+        never saw. A modest mapping under the limit must still work.
+        """
+        prog = (
+            "import mmap\n"
+            "f = open('/dev/zero', 'rb')\n"
+            "rw = mmap.PROT_READ | mmap.PROT_WRITE\n"
+            "m = mmap.mmap(f.fileno(), 8 << 20, flags=mmap.MAP_PRIVATE, prot=rw)\n"
+            "m[::4096] = b'\\x01' * (len(m) // 4096)\n"
+            "print('SMALL-OK', flush=True)\n"
+            "big = mmap.mmap(f.fileno(), 400 << 20, flags=mmap.MAP_PRIVATE, prot=rw)\n"
+            "big[::4096] = b'\\x01' * (len(big) // 4096)\n"
+            "print('COMMITTED', flush=True)\n"
+        )
+        result = _policy(fs_writable=["/tmp"], max_memory="128M").run(
+            [sys.executable, "-c", prog], timeout=60
+        )
+
+        assert b"SMALL-OK" in result.stdout, (
+            f"small mapping was refused: reason={result.reason} "
+            f"signal={result.signal} stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+        assert b"COMMITTED" not in result.stdout, (
+            "wrote 400 MiB of private /dev/zero pages under a 128 MiB limit"
+        )
+
+
 class TestNetAllowDenyAll:
     """An empty `net_allow` denies all outbound — including when fs grants are
     present, which turn on the named-`AF_UNIX` connect gate (`has_unix_fs_gate`)
