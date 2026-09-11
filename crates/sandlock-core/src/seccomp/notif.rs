@@ -1540,6 +1540,8 @@ fn syscall_name(nr: i64) -> &'static str {
         n if n == libc::SYS_mmap => "mmap",
         n if n == libc::SYS_munmap => "munmap",
         n if n == libc::SYS_brk => "brk",
+        n if n == libc::SYS_mremap => "mremap",
+        n if n == libc::SYS_mprotect => "mprotect",
         n if n == libc::SYS_getrandom => "getrandom",
         n if n == libc::SYS_unlinkat => "unlinkat",
         n if n == libc::SYS_mkdirat => "mkdirat",
@@ -1588,6 +1590,7 @@ fn syscall_category(nr: i64) -> crate::policy_fn::SyscallCategory {
             || n == libc::SYS_execve || n == libc::SYS_execveat => SyscallCategory::Process,
         n if n == libc::SYS_mmap || n == libc::SYS_munmap
             || n == libc::SYS_brk || n == libc::SYS_mremap
+            || n == libc::SYS_mprotect
             => SyscallCategory::Memory,
         _ => SyscallCategory::File, // default
     }

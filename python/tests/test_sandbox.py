@@ -226,6 +226,110 @@ class TestMaxMemoryKillsTheViolator:
         )
 
 
+class TestMaxMemoryIgnoresReservations:
+    def test_prot_none_reservation_survives_a_small_limit(self):
+        """Reserving address space must not spend the memory budget.
+
+        Anonymous mmaps were charged by length regardless of protection,
+        so a PROT_NONE reservation counted as if it were committed. The
+        Go runtime reserves over a gigabyte that way at startup, which
+        made every practical limit kill a Go program before main ran.
+        Committed memory must still be judged: the writable allocation
+        that follows is over the limit and must die.
+        """
+        prog = (
+            "import mmap\n"
+            "r = mmap.mmap(-1, 1 << 30, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS, prot=0)\n"
+            "print('RESERVED', flush=True)\n"
+            "b = bytearray(400 * 1024 * 1024)\n"
+            "b[::4096] = b'\\x01' * (len(b) // 4096)\n"
+            "print('COMMITTED', flush=True)\n"
+        )
+        result = _policy(fs_writable=["/tmp"], max_memory="128M").run(
+            [sys.executable, "-c", prog], timeout=60
+        )
+
+        assert b"RESERVED" in result.stdout, (
+            f"reservation was charged: reason={result.reason} "
+            f"signal={result.signal} stdout={result.stdout!r}"
+        )
+        assert b"COMMITTED" not in result.stdout, (
+            "a writable allocation over the limit was not stopped"
+        )
+
+
+class TestMaxMemoryMprotectCommit:
+    def test_mprotect_of_a_reservation_is_judged(self):
+        """Committing a reservation with mprotect must not escape the limit.
+
+        Reservations are free, so a workload could reserve PROT_NONE,
+        mprotect it writable, and touch it all without ever making the
+        memory syscall that would have corrected the ledger. A small
+        commit under the limit must still go through.
+        """
+        prog = (
+            "import ctypes\n"
+            "libc = ctypes.CDLL(None, use_errno=True)\n"
+            "libc.mmap.restype = ctypes.c_void_p\n"
+            "libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,"
+            " ctypes.c_int, ctypes.c_int, ctypes.c_long]\n"
+            "libc.mprotect.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]\n"
+            "n = 512 << 20\n"
+            "p = libc.mmap(None, n, 0, 0x22, -1, 0)\n"
+            "print('RESERVED', flush=True)\n"
+            "small = 16 << 20\n"
+            "assert libc.mprotect(p, small, 3) == 0\n"
+            "ctypes.memset(p, 1, small)\n"
+            "print('SMALL-OK', flush=True)\n"
+            "assert libc.mprotect(p + small, n - small, 3) == 0\n"
+            "ctypes.memset(p + small, 1, n - small)\n"
+            "print('COMMITTED', flush=True)\n"
+        )
+        result = _policy(fs_writable=["/tmp"], max_memory="128M").run(
+            [sys.executable, "-c", prog], timeout=60
+        )
+
+        assert b"SMALL-OK" in result.stdout, (
+            f"small commit was refused: reason={result.reason} "
+            f"signal={result.signal} stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+        assert b"COMMITTED" not in result.stdout, (
+            "mprotect committed 496 MiB under a 128 MiB limit"
+        )
+
+
+class TestMaxMemoryPrivateFileMapping:
+    def test_writable_private_file_mapping_is_charged(self):
+        """A writable MAP_PRIVATE file mapping must count like anonymous memory.
+
+        Only MAP_ANONYMOUS was charged, so mapping /dev/zero private and
+        writable gave a workload arbitrary anonymous memory the ledger
+        never saw. A modest mapping under the limit must still work.
+        """
+        prog = (
+            "import mmap\n"
+            "f = open('/dev/zero', 'rb')\n"
+            "rw = mmap.PROT_READ | mmap.PROT_WRITE\n"
+            "m = mmap.mmap(f.fileno(), 8 << 20, flags=mmap.MAP_PRIVATE, prot=rw)\n"
+            "m[::4096] = b'\\x01' * (len(m) // 4096)\n"
+            "print('SMALL-OK', flush=True)\n"
+            "big = mmap.mmap(f.fileno(), 400 << 20, flags=mmap.MAP_PRIVATE, prot=rw)\n"
+            "big[::4096] = b'\\x01' * (len(big) // 4096)\n"
+            "print('COMMITTED', flush=True)\n"
+        )
+        result = _policy(fs_writable=["/tmp"], max_memory="128M").run(
+            [sys.executable, "-c", prog], timeout=60
+        )
+
+        assert b"SMALL-OK" in result.stdout, (
+            f"small mapping was refused: reason={result.reason} "
+            f"signal={result.signal} stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+        assert b"COMMITTED" not in result.stdout, (
+            "wrote 400 MiB of private /dev/zero pages under a 128 MiB limit"
+        )
+
+
 class TestNetAllowDenyAll:
     """An empty `net_allow` denies all outbound — including when fs grants are
     present, which turn on the named-`AF_UNIX` connect gate (`has_unix_fs_gate`)

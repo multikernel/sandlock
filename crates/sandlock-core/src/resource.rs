@@ -27,7 +27,7 @@ use crate::sys::structs::{
 /// CLONE_THREAD flag — threads don't count toward process limit.
 const CLONE_THREAD: u64 = 0x0001_0000;
 
-/// MAP_ANONYMOUS flag — only anonymous mappings count toward memory limit.
+/// MAP_ANONYMOUS flag: anonymous and writable private file mappings count.
 const MAP_ANONYMOUS: u64 = 0x20;
 
 /// Effective clone flags for a fork-like notification.
@@ -642,13 +642,39 @@ fn read_private_anon_bytes(pid: i32) -> Option<u64> {
     Some(pages.saturating_mul(page_size as u64))
 }
 
+/// Bytes of `[addr, addr + len)` that an mprotect granting write would
+/// newly commit: the overlap with private mappings that are not yet
+/// writable. Shared mappings are skipped; writing to one never creates
+/// anonymous memory.
+fn newly_writable_bytes(pid: i32, addr: u64, len: u64) -> Option<u64> {
+    let maps = std::fs::read_to_string(format!("/proc/{}/maps", pid)).ok()?;
+    let end = addr.checked_add(len)?;
+    let mut total = 0u64;
+    for line in maps.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(range), Some(perms)) = (fields.next(), fields.next()) else { continue };
+        let Some((lo, hi)) = range.split_once('-') else { continue };
+        let (Ok(lo), Ok(hi)) = (u64::from_str_radix(lo, 16), u64::from_str_radix(hi, 16)) else {
+            continue;
+        };
+        if perms.as_bytes().get(1) == Some(&b'w') || perms.as_bytes().get(3) != Some(&b'p') {
+            continue;
+        }
+        let (lo, hi) = (lo.max(addr), hi.min(end));
+        if lo < hi {
+            total += hi - lo;
+        }
+    }
+    Some(total)
+}
+
 /// Raise a laundered ledger back to the measured footprint: only
 /// anonymous mappings are charged but every unmap is credited, so
 /// mapping and unmapping a file refunds memory that was never charged.
 ///
-/// A floor, not an assignment: `mmap` charges `PROT_NONE` reservations
-/// that `data_vm` excludes until an `mprotect` this handler never sees
-/// makes them writable, so the ledger must be allowed to sit higher.
+/// A floor, not an assignment: shared anonymous mappings and shmget
+/// segments are charged but `data_vm` excludes them, so the ledger must
+/// be allowed to sit higher.
 fn reconcile_floor(st: &mut ResourceState, per: Option<&mut PerProcessState>, pid: i32) {
     let Some(per) = per else { return };
     let Some(measured) = read_private_anon_bytes(pid) else { return };
@@ -660,7 +686,7 @@ fn reconcile_floor(st: &mut ResourceState, per: Option<&mut PerProcessState>, pi
     }
 }
 
-/// Handle memory-related notifications (mmap, munmap, brk, mremap, shmget).
+/// Handle memory-related notifications (mmap, munmap, brk, mremap, mprotect, shmget).
 ///
 /// Tracks anonymous memory usage and enforces the configured memory limit.
 pub(crate) async fn handle_memory(
@@ -714,10 +740,20 @@ pub(crate) async fn handle_memory(
     }
 
     if nr == libc::SYS_mmap {
-        // args[1] = len, args[3] = flags
+        // args[1] = len, args[2] = prot, args[3] = flags. A PROT_NONE
+        // reservation backs nothing until it is remapped writable (a later
+        // mmap this handler charges) or mprotect'd (judged above). A
+        // writable private file mapping is anonymous memory in waiting:
+        // /dev/zero mapped that way is a plain anonymous mapping by another
+        // name, and the kernel's own data_vm counts its full length.
         let len = args[1];
+        let prot = args[2];
         let flags = args[3];
-        if (flags & MAP_ANONYMOUS) != 0 {
+        let anon = (flags & MAP_ANONYMOUS) != 0 && prot != libc::PROT_NONE as u64;
+        let private_writable = (flags & MAP_ANONYMOUS) == 0
+            && (flags & libc::MAP_PRIVATE as u64) != 0
+            && (prot & libc::PROT_WRITE as u64) != 0;
+        if anon || private_writable {
             if would_exceed(&st, len) {
                 return kill;
             }
@@ -763,6 +799,21 @@ pub(crate) async fn handle_memory(
             charge(&mut st, per.as_deref_mut(), growth);
         } else if new_len < old_len {
             credit(&mut st, per.as_deref_mut(), old_len - new_len);
+        }
+    } else if nr == libc::SYS_mprotect {
+        // args[0] = addr, args[1] = len. Only calls granting PROT_WRITE
+        // arrive (BPF filter). Judged but never charged: the floor measures
+        // the result exactly at the next event, whereas charging the length
+        // would count already-writable pages twice with no way back down.
+        // The maps read that tells the two apart is deferred until the
+        // whole length would exceed the limit, so it costs nothing on the
+        // hot path.
+        let (addr, len) = (args[0], args[1]);
+        if would_exceed(&st, len) {
+            let newly = newly_writable_bytes(notif.pid as i32, addr, len).unwrap_or(len);
+            if would_exceed(&st, newly) {
+                return kill;
+            }
         }
     } else if nr == libc::SYS_shmget {
         // shmget(key, size, shmflg) — args[1] = size
@@ -879,8 +930,7 @@ mod memory_range_tests {
         assert_eq!(per.mem_charged, measured);
         assert_eq!(st.mem_used, per.mem_charged);
 
-        // A ledger above the measure is left alone: mmap charges PROT_NONE
-        // reservations that the kernel's measure excludes.
+        // A ledger above the measure is left alone.
         let inflated = per.mem_charged + (1 << 30);
         per.mem_charged = inflated;
         st.mem_used = inflated;
@@ -985,6 +1035,122 @@ mod tests {
             child_pidfd: None,
             notif_fd: -1,
         })
+    }
+
+    fn mmap_notif(len: u64, prot: u64) -> SeccompNotif {
+        let flags = (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as u64;
+        file_mmap_notif(len, prot, flags)
+    }
+
+    fn file_mmap_notif(len: u64, prot: u64, flags: u64) -> SeccompNotif {
+        let mut n = fake_notif(libc::SYS_mmap, 0);
+        n.data.args = [0, len, prot, flags, 3, 0];
+        n
+    }
+
+    /// A writable private file mapping is anonymous memory in waiting:
+    /// every written page is copied, and `/dev/zero` mapped this way is
+    /// indistinguishable from an anonymous mapping. Shared and read-only
+    /// file mappings never create private pages and stay free.
+    #[tokio::test]
+    async fn writable_private_file_mapping_is_charged() {
+        let ctx = fake_supervisor_ctx(false);
+        let mut policy = fake_policy(false);
+        policy.max_memory_bytes = 1 << 20;
+        policy.has_memory_limit = true;
+        let rw = (libc::PROT_READ | libc::PROT_WRITE) as u64;
+
+        let shared = file_mmap_notif(1 << 30, rw, libc::MAP_SHARED as u64);
+        assert!(matches!(handle_memory(&shared, &ctx, &policy).await, NotifAction::Continue));
+        let readonly = file_mmap_notif(1 << 30, libc::PROT_READ as u64, libc::MAP_PRIVATE as u64);
+        assert!(matches!(handle_memory(&readonly, &ctx, &policy).await, NotifAction::Continue));
+        assert_eq!(ctx.resource.lock().await.mem_used, 0);
+
+        let small = file_mmap_notif(1 << 19, rw, libc::MAP_PRIVATE as u64);
+        assert!(matches!(handle_memory(&small, &ctx, &policy).await, NotifAction::Continue));
+        assert_eq!(ctx.resource.lock().await.mem_used, 1 << 19);
+
+        let big = file_mmap_notif(1 << 30, rw, libc::MAP_PRIVATE as u64);
+        assert!(matches!(handle_memory(&big, &ctx, &policy).await, NotifAction::KillTask { .. }));
+    }
+
+    /// A PROT_NONE reservation backs nothing, so it must not count: the
+    /// Go runtime reserves over a gigabyte of address space at startup and
+    /// used to be killed by any limit smaller than that before main ran.
+    #[tokio::test]
+    async fn prot_none_reservation_is_not_charged() {
+        let ctx = fake_supervisor_ctx(false);
+        let mut policy = fake_policy(false);
+        policy.max_memory_bytes = 1 << 20;
+        policy.has_memory_limit = true;
+
+        let reserve = mmap_notif(1 << 30, libc::PROT_NONE as u64);
+        let action = handle_memory(&reserve, &ctx, &policy).await;
+        assert!(matches!(action, NotifAction::Continue), "reservation killed");
+        assert_eq!(ctx.resource.lock().await.mem_used, 0);
+
+        let commit = mmap_notif(1 << 30, (libc::PROT_READ | libc::PROT_WRITE) as u64);
+        let action = handle_memory(&commit, &ctx, &policy).await;
+        assert!(matches!(action, NotifAction::KillTask { .. }), "commit not judged");
+    }
+
+    fn mprotect_notif(addr: u64, len: u64) -> SeccompNotif {
+        let mut n = fake_notif(libc::SYS_mprotect, 0);
+        n.pid = std::process::id();
+        n.data.args = [addr, len, (libc::PROT_READ | libc::PROT_WRITE) as u64, 0, 0, 0];
+        n
+    }
+
+    fn map_anon(len: usize, prot: i32) -> u64 {
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                prot,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(p, libc::MAP_FAILED, "mmap failed");
+        p as u64
+    }
+
+    /// Making a reservation writable is the moment it becomes real memory,
+    /// so it is judged against the limit; but it is never charged, since
+    /// the floor will measure it exactly at the next event.
+    #[tokio::test]
+    async fn mprotect_of_a_reservation_is_judged_but_not_charged() {
+        let ctx = fake_supervisor_ctx(false);
+        let mut policy = fake_policy(false);
+        policy.max_memory_bytes = 1 << 20;
+        policy.has_memory_limit = true;
+        let reserved = map_anon(1 << 30, libc::PROT_NONE);
+
+        let over = handle_memory(&mprotect_notif(reserved, 1 << 30), &ctx, &policy).await;
+        assert!(matches!(over, NotifAction::KillTask { .. }), "1 GiB commit under 1 MiB");
+
+        let under = handle_memory(&mprotect_notif(reserved, 1 << 19), &ctx, &policy).await;
+        assert!(matches!(under, NotifAction::Continue), "512 KiB commit under 1 MiB");
+        assert_eq!(ctx.resource.lock().await.mem_used, 0, "mprotect must not charge");
+        unsafe { libc::munmap(reserved as *mut _, 1 << 30) };
+    }
+
+    /// Re-granting write on memory that is already writable adds nothing,
+    /// so a JIT flipping a large code cache back to RW near the limit must
+    /// not be killed for it.
+    #[tokio::test]
+    async fn mprotect_of_writable_memory_adds_nothing() {
+        let ctx = fake_supervisor_ctx(false);
+        let mut policy = fake_policy(false);
+        policy.max_memory_bytes = 64 << 20;
+        policy.has_memory_limit = true;
+        ctx.resource.lock().await.mem_used = 60 << 20;
+        let writable = map_anon(16 << 20, libc::PROT_READ | libc::PROT_WRITE);
+
+        let action = handle_memory(&mprotect_notif(writable, 16 << 20), &ctx, &policy).await;
+        assert!(matches!(action, NotifAction::Continue), "already-writable range killed");
+        unsafe { libc::munmap(writable as *mut _, 16 << 20) };
     }
 
     #[test]

@@ -308,7 +308,7 @@ pub(crate) fn build_dispatch_table(
     if policy.has_memory_limit {
         for &nr in &[
             libc::SYS_mmap, libc::SYS_munmap, libc::SYS_brk,
-            libc::SYS_mremap, libc::SYS_shmget,
+            libc::SYS_mremap, libc::SYS_mprotect, libc::SYS_shmget,
         ] {
             let policy_for_mem = Arc::clone(policy);
             let __sup = Arc::clone(ctx);

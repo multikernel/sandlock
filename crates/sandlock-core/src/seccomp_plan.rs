@@ -70,6 +70,8 @@ const MEMORY_NOTIF_SYSCALLS: &[i64] = &[
     libc::SYS_munmap,
     libc::SYS_brk,
     libc::SYS_mremap,
+    // Only calls granting PROT_WRITE reach the supervisor; see arg_filters.
+    libc::SYS_mprotect,
     // exec destroys the address space and the kernel picks a fresh
     // randomized brk base, so brk accounting must observe it to drop the
     // old image's base; otherwise the new image's first brk is charged the
@@ -657,6 +659,20 @@ pub(crate) fn arg_filters_resolved(resolved: &ResolvedSandbox) -> Vec<SockFilter
         insns.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr_waitid, 0, 3));
         insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARGS3_LO));
         insns.push(jump(BPF_JMP | BPF_JSET | BPF_K, wnohang_or_wnowait, 0, 1));
+        insns.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+    }
+
+    // --- mprotect: notify only when PROT_WRITE is being granted ---
+    // A reservation becomes real memory when it turns writable, which is
+    // the only mprotect the accounting cares about. JITs flip code pages
+    // RW <-> RX constantly; the RX half must not pay a supervisor trip.
+    // mprotect(addr, len, prot): prot is arg2
+    if features.memory_limit {
+        let nr_mprotect = libc::SYS_mprotect as u32;
+        insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR));
+        insns.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr_mprotect, 0, 3));
+        insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARGS2_LO));
+        insns.push(jump(BPF_JMP | BPF_JSET | BPF_K, libc::PROT_WRITE as u32, 1, 0));
         insns.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
     }
 
