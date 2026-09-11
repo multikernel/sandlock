@@ -594,8 +594,8 @@ func readResult(r *C.sandlock_result_t) *Result {
 		}
 		res.Changes = append(res.Changes, Change{
 			Path:   path,
-			Before: readChangeSide(r, i, 0),
-			After:  readChangeSide(r, i, 1),
+			Before: readChangeSide(r, i, C.SANDLOCK_CHANGE_BEFORE),
+			After:  readChangeSide(r, i, C.SANDLOCK_CHANGE_AFTER),
 		})
 	}
 	return res

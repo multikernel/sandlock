@@ -1790,14 +1790,32 @@ pub unsafe extern "C" fn sandlock_result_change_path(r: *const sandlock_result_t
     }
 }
 
+/// What one side of a change is (`sandlock_entry_t.kind`).
+#[allow(non_camel_case_types)]
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum sandlock_entry_kind_t {
+    File = 0,
+    Dir = 1,
+    Symlink = 2,
+    /// A fifo, socket, or device node: no bytes, only a mode.
+    Other = 3,
+}
+
+/// `side` of `sandlock_result_change_entry` and `sandlock_result_change_target`:
+/// the workdir entry when the run first touched the path.
+pub const SANDLOCK_CHANGE_BEFORE: c_int = 0;
+/// The branch entry when the change set was read.
+pub const SANDLOCK_CHANGE_AFTER: c_int = 1;
+
 /// One side of a change, as plain data so every binding can hold it on
-/// the stack. `kind`: 0 file, 1 dir, 2 symlink, 3 other. `digest` is
-/// SHA-256 and only meaningful when `has_digest` is 1 (files).
+/// the stack. `digest` is SHA-256 and only meaningful when `has_digest`
+/// is 1 (files).
 #[repr(C)]
 #[allow(non_camel_case_types)]
 #[derive(Clone, Copy)]
 pub struct sandlock_entry_t {
-    pub kind: u8,
+    pub kind: sandlock_entry_kind_t,
     pub mode: u32,
     pub size: u64,
     pub has_digest: u8,
@@ -1811,14 +1829,14 @@ unsafe fn change_side<'a>(r: *const sandlock_result_t, i: usize, side: c_int) ->
     let changes = &(*r)._private.changes;
     let change = changes.get(i)?;
     match side {
-        0 => Some(&change.before),
-        1 => Some(&change.after),
+        SANDLOCK_CHANGE_BEFORE => Some(&change.before),
+        SANDLOCK_CHANGE_AFTER => Some(&change.after),
         _ => None,
     }
 }
 
-/// Fill `out` with one side of the i-th change: `side` 0 is before the run
-/// touched the path, 1 is after. Returns 0 when filled, 1 when that side is
+/// Fill `out` with one side of the i-th change, `SANDLOCK_CHANGE_BEFORE` or
+/// `SANDLOCK_CHANGE_AFTER`. Returns 0 when filled, 1 when that side is
 /// absent (`out` untouched), -1 when `i` or `side` is out of range.
 ///
 /// # Safety
@@ -1838,10 +1856,10 @@ pub unsafe extern "C" fn sandlock_result_change_entry(
     }
     *out = sandlock_entry_t {
         kind: match e.kind {
-            EntryKind::File => 0,
-            EntryKind::Dir => 1,
-            EntryKind::Symlink => 2,
-            EntryKind::Other => 3,
+            EntryKind::File => sandlock_entry_kind_t::File,
+            EntryKind::Dir => sandlock_entry_kind_t::Dir,
+            EntryKind::Symlink => sandlock_entry_kind_t::Symlink,
+            EntryKind::Other => sandlock_entry_kind_t::Other,
         },
         mode: e.mode,
         size: e.size,

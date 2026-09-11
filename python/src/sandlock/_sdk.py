@@ -379,7 +379,7 @@ _lib.sandlock_result_change_path.argtypes = [_c_result_p, ctypes.c_size_t]
 
 class _CEntry(ctypes.Structure):
     _fields_ = [
-        ("kind", ctypes.c_uint8),
+        ("kind", ctypes.c_uint32),
         ("mode", ctypes.c_uint32),
         ("size", ctypes.c_uint64),
         ("has_digest", ctypes.c_uint8),
@@ -758,7 +758,8 @@ def _read_result_bytes(result_p, fn) -> bytes:
     return ctypes.string_at(ptr, length.value)
 
 
-_ENTRY_KINDS = ("file", "dir", "symlink", "other")
+_ENTRY_KINDS = ("file", "dir", "symlink", "other")  # sandlock_entry_kind order
+_CHANGE_BEFORE, _CHANGE_AFTER = 0, 1
 
 
 def _take_string(p) -> str | None:
@@ -789,8 +790,8 @@ def _read_result_changes(result_p) -> list:
         path = _take_string(_lib.sandlock_result_change_path(result_p, i)) or ""
         changes.append(Change(
             path=path,
-            before=_read_change_side(result_p, i, 0),
-            after=_read_change_side(result_p, i, 1),
+            before=_read_change_side(result_p, i, _CHANGE_BEFORE),
+            after=_read_change_side(result_p, i, _CHANGE_AFTER),
         ))
     return changes
 

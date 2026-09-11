@@ -7,21 +7,21 @@ use std::path::Path;
 use std::ptr;
 
 use sandlock_ffi::{
-    sandlock_create_for_run, sandlock_entry_t, sandlock_handle_free, sandlock_handle_wait,
+    sandlock_create_for_run, sandlock_entry_kind_t, sandlock_entry_t, sandlock_handle_free,
+    sandlock_handle_wait,
     sandlock_result_change_entry, sandlock_result_change_kind, sandlock_result_change_path,
     sandlock_result_change_target, sandlock_result_changes_len, sandlock_result_free,
     sandlock_result_success, sandlock_sandbox_build, sandlock_sandbox_builder_cwd,
     sandlock_sandbox_builder_fs_read, sandlock_sandbox_builder_fs_storage,
     sandlock_sandbox_builder_fs_write, sandlock_sandbox_builder_new,
     sandlock_sandbox_builder_on_exit, sandlock_sandbox_builder_workdir, sandlock_sandbox_free,
-    sandlock_sandbox_t, sandlock_start, sandlock_string_free,
+    sandlock_sandbox_t, sandlock_start, sandlock_string_free, SANDLOCK_CHANGE_AFTER,
+    SANDLOCK_CHANGE_BEFORE,
 };
 
 const ABORT: u8 = 1;
-const BEFORE: c_int = 0;
-const AFTER: c_int = 1;
-const ENTRY_FILE: u8 = 0;
-const ENTRY_SYMLINK: u8 = 2;
+const BEFORE: c_int = SANDLOCK_CHANGE_BEFORE;
+const AFTER: c_int = SANDLOCK_CHANGE_AFTER;
 const SHA256_ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
 fn build_policy(workdir: &Path, storage: &Path) -> *mut sandlock_sandbox_t {
@@ -57,7 +57,7 @@ fn hex(d: &[u8; 32]) -> String {
 }
 
 fn entry(r: *const sandlock_ffi::sandlock_result_t, i: usize, side: c_int) -> Option<sandlock_entry_t> {
-    let mut out = sandlock_entry_t { kind: 0, mode: 0, size: 0, has_digest: 0, digest: [0; 32] };
+    let mut out = sandlock_entry_t { kind: sandlock_entry_kind_t::File, mode: 0, size: 0, has_digest: 0, digest: [0; 32] };
     match unsafe { sandlock_result_change_entry(r, i, side, &mut out) } {
         0 => Some(out),
         1 => None,
@@ -108,7 +108,7 @@ fn both_sides_of_every_change_are_readable() {
     assert_eq!(unsafe { sandlock_result_change_kind(r, i) } as u8, b'M');
     let before = entry(r, i, BEFORE).unwrap();
     let after = entry(r, i, AFTER).unwrap();
-    assert_eq!(before.kind, ENTRY_FILE);
+    assert_eq!(before.kind, sandlock_entry_kind_t::File);
     assert_eq!(before.size, 3);
     assert_eq!(before.has_digest, 1);
     assert_eq!(hex(&before.digest), SHA256_ABC);
@@ -124,12 +124,12 @@ fn both_sides_of_every_change_are_readable() {
     assert!(entry(r, i, AFTER).is_none());
 
     let i = by_path["link"];
-    assert_eq!(entry(r, i, BEFORE).unwrap().kind, ENTRY_SYMLINK);
+    assert_eq!(entry(r, i, BEFORE).unwrap().kind, sandlock_entry_kind_t::Symlink);
     assert_eq!(target(r, i, BEFORE).as_deref(), Some("a"));
     assert_eq!(target(r, i, AFTER).as_deref(), Some("b"));
     assert!(target(r, by_path["mod.txt"], AFTER).is_none());
 
-    let mut out = sandlock_entry_t { kind: 0, mode: 0, size: 0, has_digest: 0, digest: [0; 32] };
+    let mut out = sandlock_entry_t { kind: sandlock_entry_kind_t::File, mode: 0, size: 0, has_digest: 0, digest: [0; 32] };
     assert_eq!(unsafe { sandlock_result_change_entry(r, n, BEFORE, &mut out) }, -1);
     assert_eq!(unsafe { sandlock_result_change_entry(r, 0, 2, &mut out) }, -1);
 

@@ -344,8 +344,8 @@ const (
 	ChangeDeleted  ChangeKind = 'D'
 )
 
-// EntryKind classifies one side of a Change.
-type EntryKind uint8
+// EntryKind classifies one side of a Change; values mirror sandlock_entry_kind.
+type EntryKind uint32
 
 const (
 	EntryFile EntryKind = iota

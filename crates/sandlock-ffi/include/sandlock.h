@@ -23,6 +23,17 @@ typedef struct sandlock_handler_t sandlock_handler_t;
 
 
 /**
+ * `side` of `sandlock_result_change_entry` and `sandlock_result_change_target`:
+ * the workdir entry when the run first touched the path.
+ */
+#define SANDLOCK_CHANGE_BEFORE 0
+
+/**
+ * The branch entry when the change set was read.
+ */
+#define SANDLOCK_CHANGE_AFTER 1
+
+/**
  * `flags` bit for [`sandlock_action_set_inject_bytes`]: leave the injected
  * memfd writable (do not seal). Default (bit clear) seals it read-only.
  */
@@ -65,6 +76,26 @@ enum sandlock_exit_reason
 };
 #ifndef __cplusplus
 typedef uint32_t sandlock_exit_reason;
+#endif // __cplusplus
+
+/**
+ * What one side of a change is (`sandlock_entry_t.kind`).
+ */
+enum sandlock_entry_kind
+#ifdef __cplusplus
+  : uint32_t
+#endif // __cplusplus
+ {
+  SANDLOCK_ENTRY_KIND_FILE = 0,
+  SANDLOCK_ENTRY_KIND_DIR = 1,
+  SANDLOCK_ENTRY_KIND_SYMLINK = 2,
+  /**
+   * A fifo, socket, or device node: no bytes, only a mode.
+   */
+  SANDLOCK_ENTRY_KIND_OTHER = 3,
+};
+#ifndef __cplusplus
+typedef uint32_t sandlock_entry_kind;
 #endif // __cplusplus
 
 /**
@@ -165,11 +196,11 @@ typedef struct sandlock_pipeline_t sandlock_pipeline_t;
 
 /**
  * One side of a change, as plain data so every binding can hold it on
- * the stack. `kind`: 0 file, 1 dir, 2 symlink, 3 other. `digest` is
- * SHA-256 and only meaningful when `has_digest` is 1 (files).
+ * the stack. `digest` is SHA-256 and only meaningful when `has_digest`
+ * is 1 (files).
  */
 typedef struct {
-  uint8_t kind;
+  sandlock_entry_kind kind;
   uint32_t mode;
   uint64_t size;
   uint8_t has_digest;
@@ -1009,8 +1040,8 @@ char sandlock_result_change_kind(const sandlock_result_t *r, uintptr_t i);
 char *sandlock_result_change_path(const sandlock_result_t *r, uintptr_t i);
 
 /**
- * Fill `out` with one side of the i-th change: `side` 0 is before the run
- * touched the path, 1 is after. Returns 0 when filled, 1 when that side is
+ * Fill `out` with one side of the i-th change, `SANDLOCK_CHANGE_BEFORE` or
+ * `SANDLOCK_CHANGE_AFTER`. Returns 0 when filled, 1 when that side is
  * absent (`out` untouched), -1 when `i` or `side` is out of range.
  *
  * # Safety
