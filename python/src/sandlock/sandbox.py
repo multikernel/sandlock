@@ -121,7 +121,7 @@ class Entry:
     """One side of a :class:`Change`."""
 
     kind: str
-    """``"file"``, ``"dir"``, ``"symlink"``, or ``"other"`` (fifo, socket)."""
+    """``"file"``, ``"dir"``, ``"symlink"``, or ``"other"`` (fifo, socket, device node)."""
 
     mode: int
     """Permission bits."""

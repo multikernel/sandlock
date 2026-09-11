@@ -736,7 +736,7 @@ pub(crate) fn lstat_entry_in_root(root: &Path, rel: &str) -> Result<Option<Entry
         libc::S_IFREG => EntryKind::File,
         libc::S_IFDIR => EntryKind::Dir,
         libc::S_IFLNK => EntryKind::Symlink,
-        libc::S_IFIFO | libc::S_IFSOCK => EntryKind::Other,
+        libc::S_IFIFO | libc::S_IFSOCK | libc::S_IFCHR | libc::S_IFBLK => EntryKind::Other,
         _ => return Ok(None),
     };
     let target = (kind == EntryKind::Symlink)
@@ -6214,6 +6214,17 @@ mod tests {
         assert_eq!(hex(&before.digest.unwrap()), SHA256_ABC);
         assert_ne!(after.digest, before.digest);
         assert!(!c.content_unchanged());
+    }
+
+    /// A device node is an entry like any other; mapping it to "absent"
+    /// would report it as deleted while it still exists.
+    #[test]
+    fn a_device_node_is_an_entry_of_kind_other() {
+        use crate::result::EntryKind;
+        let e = lstat_entry_in_root(Path::new("/dev"), "null").unwrap().unwrap();
+        assert_eq!(e.kind, EntryKind::Other);
+        assert_eq!(e.size, 0);
+        assert!(e.digest.is_none());
     }
 
     #[test]

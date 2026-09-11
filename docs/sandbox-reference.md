@@ -493,7 +493,7 @@ class BranchAction(Enum):
 ```python
 @dataclass(frozen=True)
 class Entry:
-    kind: str            # "file", "dir", "symlink", or "other" (fifo, socket).
+    kind: str            # "file", "dir", "symlink", or "other" (fifo, socket, device node).
     mode: int            # Permission bits.
     size: int            # Byte length for a file; 0 otherwise.
     digest: bytes | None # SHA-256 of the bytes; files only.

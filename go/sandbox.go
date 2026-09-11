@@ -351,7 +351,7 @@ const (
 	EntryFile EntryKind = iota
 	EntryDir
 	EntrySymlink
-	EntryOther // fifo or socket: no bytes, only a mode
+	EntryOther // fifo, socket, or device node: no bytes, only a mode
 )
 
 // Entry is one side of a Change.

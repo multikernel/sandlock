@@ -80,7 +80,7 @@ pub enum EntryKind {
     File,
     Dir,
     Symlink,
-    /// A fifo or socket: no bytes, only a mode.
+    /// A fifo, socket, or device node: no bytes, only a mode.
     Other,
 }
 
