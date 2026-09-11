@@ -266,6 +266,12 @@ func TestChangesCarryBothSides(t *testing.T) {
 	if err := os.Symlink("a", dir+"/link"); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(dir+"/suid.txt", []byte("suid"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir+"/suid.txt", os.ModeSetuid|0o755); err != nil {
+		t.Fatal(err)
+	}
 	sb := &sandlock.Sandbox{
 		FSReadable: rootfs,
 		FSWritable: []string{dir},
@@ -273,7 +279,7 @@ func TestChangesCarryBothSides(t *testing.T) {
 		OnExit:     sandlock.BranchActionAbort,
 	}
 	res, err := sb.Run(context.Background(), "sh", "-c",
-		"cd "+dir+" && echo xyz > mod.txt && mv old.txt new.txt && rm link && ln -s b link")
+		"cd "+dir+" && echo xyz > mod.txt && mv old.txt new.txt && rm link && ln -s b link && rm suid.txt")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -305,6 +311,10 @@ func TestChangesCarryBothSides(t *testing.T) {
 	}
 	if link.TypeChanged() || link.ContentUnchanged() {
 		t.Fatalf("a retargeted link keeps its kind and changes content: %+v", link)
+	}
+
+	if suid := byPath["suid.txt"]; suid.Before == nil || suid.Before.Mode != os.ModeSetuid|0o755 {
+		t.Fatalf("suid.txt before = %+v", suid.Before)
 	}
 
 	if got := sandlock.Renames(res.Changes); len(got) != 1 || got[0] != [2]string{"old.txt", "new.txt"} {

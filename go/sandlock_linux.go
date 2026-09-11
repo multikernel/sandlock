@@ -608,7 +608,7 @@ func readChangeSide(r *C.sandlock_result_t, i int, side int) *Entry {
 	}
 	e := &Entry{
 		Kind: EntryKind(raw.kind),
-		Mode: os.FileMode(raw.mode),
+		Mode: fileMode(uint32(raw.mode)),
 		Size: int64(raw.size),
 	}
 	if raw.has_digest != 0 {
@@ -623,6 +623,22 @@ func readChangeSide(r *C.sandlock_result_t, i int, side int) *Entry {
 		C.sandlock_string_free(pc)
 	}
 	return e
+}
+
+// os.FileMode keeps setuid, setgid, and sticky in its own high bits, so a
+// raw st_mode cast would drop them into bits FileMode never reads.
+func fileMode(raw uint32) os.FileMode {
+	m := os.FileMode(raw & 0o777)
+	if raw&syscall.S_ISUID != 0 {
+		m |= os.ModeSetuid
+	}
+	if raw&syscall.S_ISGID != 0 {
+		m |= os.ModeSetgid
+	}
+	if raw&syscall.S_ISVTX != 0 {
+		m |= os.ModeSticky
+	}
+	return m
 }
 
 func readBytes(r *C.sandlock_result_t, stdout bool) []byte {
