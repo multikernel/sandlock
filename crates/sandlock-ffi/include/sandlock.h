@@ -1023,14 +1023,6 @@ const uint8_t *sandlock_result_stderr_bytes(const sandlock_result_t *r, uintptr_
 uintptr_t sandlock_result_changes_len(const sandlock_result_t *r);
 
 /**
- * Kind of the i-th change: 'A' (added), 'M' (modified), 'D' (deleted); 0 out of range.
- *
- * # Safety
- * `r` must be a valid result pointer.
- */
-char sandlock_result_change_kind(const sandlock_result_t *r, uintptr_t i);
-
-/**
  * Workdir-relative path of the i-th change. Caller must free with
  * `sandlock_string_free`; NULL out of range.
  *

@@ -1755,24 +1755,6 @@ pub unsafe extern "C" fn sandlock_result_changes_len(r: *const sandlock_result_t
     (*r)._private.changes.len()
 }
 
-/// Kind of the i-th change: 'A' (added), 'M' (modified), 'D' (deleted); 0 out of range.
-///
-/// # Safety
-/// `r` must be a valid result pointer.
-#[no_mangle]
-pub unsafe extern "C" fn sandlock_result_change_kind(r: *const sandlock_result_t, i: usize) -> c_char {
-    if r.is_null() {
-        return 0;
-    }
-    let changes = &(*r)._private.changes;
-    match changes.get(i).map(|c| c.kind()) {
-        Some(sandlock_core::ChangeKind::Added) => b'A' as c_char,
-        Some(sandlock_core::ChangeKind::Modified) => b'M' as c_char,
-        Some(sandlock_core::ChangeKind::Deleted) => b'D' as c_char,
-        None => 0,
-    }
-}
-
 /// Workdir-relative path of the i-th change. Caller must free with
 /// `sandlock_string_free`; NULL out of range.
 ///

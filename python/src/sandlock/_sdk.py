@@ -370,9 +370,6 @@ _lib.sandlock_result_free.argtypes = [_c_result_p]
 _lib.sandlock_result_changes_len.restype = ctypes.c_size_t
 _lib.sandlock_result_changes_len.argtypes = [_c_result_p]
 
-_lib.sandlock_result_change_kind.restype = ctypes.c_char
-_lib.sandlock_result_change_kind.argtypes = [_c_result_p, ctypes.c_size_t]
-
 _lib.sandlock_result_change_path.restype = ctypes.c_void_p
 _lib.sandlock_result_change_path.argtypes = [_c_result_p, ctypes.c_size_t]
 

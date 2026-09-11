@@ -9,7 +9,7 @@ use std::ptr;
 use sandlock_ffi::{
     sandlock_create_for_run, sandlock_handle_abort, sandlock_handle_commit, sandlock_handle_free,
     sandlock_handle_pending, sandlock_handle_upper_dir, sandlock_handle_wait,
-    sandlock_result_change_kind, sandlock_result_change_path, sandlock_result_changes_len,
+    sandlock_result_change_entry, sandlock_result_change_path, sandlock_result_changes_len,
     sandlock_result_free, sandlock_result_success, sandlock_sandbox_build,
     sandlock_sandbox_builder_cwd, sandlock_sandbox_builder_fs_read,
     sandlock_sandbox_builder_fs_storage, sandlock_sandbox_builder_fs_write,
@@ -60,7 +60,11 @@ fn run_deferred(workdir: &Path, storage: &Path) -> *mut sandlock_ffi::sandlock_h
     assert!(unsafe { sandlock_result_success(r) });
 
     assert_eq!(unsafe { sandlock_result_changes_len(r) }, 1);
-    assert_eq!(unsafe { sandlock_result_change_kind(r, 0) } as u8, b'A');
+    let mut out = sandlock_ffi::sandlock_entry_t {
+        kind: sandlock_ffi::sandlock_entry_kind_t::File, mode: 0, size: 0, has_digest: 0, digest: [0; 32],
+    };
+    assert_eq!(unsafe { sandlock_result_change_entry(r, 0, sandlock_ffi::SANDLOCK_CHANGE_BEFORE, &mut out) }, 1);
+    assert_eq!(unsafe { sandlock_result_change_entry(r, 0, sandlock_ffi::SANDLOCK_CHANGE_AFTER, &mut out) }, 0);
     let p = unsafe { sandlock_result_change_path(r, 0) };
     assert_eq!(unsafe { CStr::from_ptr(p) }.to_str().unwrap(), "out.txt");
     unsafe { sandlock_string_free(p) };

@@ -9,7 +9,7 @@ use std::ptr;
 use sandlock_ffi::{
     sandlock_create_for_run, sandlock_entry_kind_t, sandlock_entry_t, sandlock_handle_free,
     sandlock_handle_wait,
-    sandlock_result_change_entry, sandlock_result_change_kind, sandlock_result_change_path,
+    sandlock_result_change_entry, sandlock_result_change_path,
     sandlock_result_change_target, sandlock_result_changes_len, sandlock_result_free,
     sandlock_result_success, sandlock_sandbox_build, sandlock_sandbox_builder_cwd,
     sandlock_sandbox_builder_fs_read, sandlock_sandbox_builder_fs_storage,
@@ -105,7 +105,6 @@ fn both_sides_of_every_change_are_readable() {
     assert_eq!(by_path.keys().collect::<Vec<_>>(), vec!["added.txt", "gone.txt", "link", "mod.txt"]);
 
     let i = by_path["mod.txt"];
-    assert_eq!(unsafe { sandlock_result_change_kind(r, i) } as u8, b'M');
     let before = entry(r, i, BEFORE).unwrap();
     let after = entry(r, i, AFTER).unwrap();
     assert_eq!(before.kind, sandlock_entry_kind_t::File);
