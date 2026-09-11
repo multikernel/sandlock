@@ -646,9 +646,9 @@ fn read_private_anon_bytes(pid: i32) -> Option<u64> {
 /// anonymous mappings are charged but every unmap is credited, so
 /// mapping and unmapping a file refunds memory that was never charged.
 ///
-/// A floor, not an assignment: `mmap` charges `PROT_NONE` reservations
-/// that `data_vm` excludes until an `mprotect` this handler never sees
-/// makes them writable, so the ledger must be allowed to sit higher.
+/// A floor, not an assignment: shared anonymous mappings and shmget
+/// segments are charged but `data_vm` excludes them, so the ledger must
+/// be allowed to sit higher.
 fn reconcile_floor(st: &mut ResourceState, per: Option<&mut PerProcessState>, pid: i32) {
     let Some(per) = per else { return };
     let Some(measured) = read_private_anon_bytes(pid) else { return };
@@ -714,10 +714,13 @@ pub(crate) async fn handle_memory(
     }
 
     if nr == libc::SYS_mmap {
-        // args[1] = len, args[3] = flags
+        // args[1] = len, args[2] = prot, args[3] = flags. A PROT_NONE
+        // reservation backs nothing until it is remapped writable (a later
+        // mmap this handler charges) or mprotect'd (caught by the floor).
         let len = args[1];
+        let prot = args[2];
         let flags = args[3];
-        if (flags & MAP_ANONYMOUS) != 0 {
+        if (flags & MAP_ANONYMOUS) != 0 && prot != libc::PROT_NONE as u64 {
             if would_exceed(&st, len) {
                 return kill;
             }
@@ -879,8 +882,7 @@ mod memory_range_tests {
         assert_eq!(per.mem_charged, measured);
         assert_eq!(st.mem_used, per.mem_charged);
 
-        // A ledger above the measure is left alone: mmap charges PROT_NONE
-        // reservations that the kernel's measure excludes.
+        // A ledger above the measure is left alone.
         let inflated = per.mem_charged + (1 << 30);
         per.mem_charged = inflated;
         st.mem_used = inflated;
@@ -985,6 +987,33 @@ mod tests {
             child_pidfd: None,
             notif_fd: -1,
         })
+    }
+
+    fn mmap_notif(len: u64, prot: u64) -> SeccompNotif {
+        let mut n = fake_notif(libc::SYS_mmap, 0);
+        let flags = (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as u64;
+        n.data.args = [0, len, prot, flags, u64::MAX, 0];
+        n
+    }
+
+    /// A PROT_NONE reservation backs nothing, so it must not count: the
+    /// Go runtime reserves over a gigabyte of address space at startup and
+    /// used to be killed by any limit smaller than that before main ran.
+    #[tokio::test]
+    async fn prot_none_reservation_is_not_charged() {
+        let ctx = fake_supervisor_ctx(false);
+        let mut policy = fake_policy(false);
+        policy.max_memory_bytes = 1 << 20;
+        policy.has_memory_limit = true;
+
+        let reserve = mmap_notif(1 << 30, libc::PROT_NONE as u64);
+        let action = handle_memory(&reserve, &ctx, &policy).await;
+        assert!(matches!(action, NotifAction::Continue), "reservation killed");
+        assert_eq!(ctx.resource.lock().await.mem_used, 0);
+
+        let commit = mmap_notif(1 << 30, (libc::PROT_READ | libc::PROT_WRITE) as u64);
+        let action = handle_memory(&commit, &ctx, &policy).await;
+        assert!(matches!(action, NotifAction::KillTask { .. }), "commit not judged");
     }
 
     #[test]

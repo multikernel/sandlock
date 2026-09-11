@@ -226,6 +226,38 @@ class TestMaxMemoryKillsTheViolator:
         )
 
 
+class TestMaxMemoryIgnoresReservations:
+    def test_prot_none_reservation_survives_a_small_limit(self):
+        """Reserving address space must not spend the memory budget.
+
+        Anonymous mmaps were charged by length regardless of protection,
+        so a PROT_NONE reservation counted as if it were committed. The
+        Go runtime reserves over a gigabyte that way at startup, which
+        made every practical limit kill a Go program before main ran.
+        Committed memory must still be judged: the writable allocation
+        that follows is over the limit and must die.
+        """
+        prog = (
+            "import mmap\n"
+            "r = mmap.mmap(-1, 1 << 30, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS, prot=0)\n"
+            "print('RESERVED', flush=True)\n"
+            "b = bytearray(400 * 1024 * 1024)\n"
+            "b[::4096] = b'\\x01' * (len(b) // 4096)\n"
+            "print('COMMITTED', flush=True)\n"
+        )
+        result = _policy(fs_writable=["/tmp"], max_memory="128M").run(
+            [sys.executable, "-c", prog], timeout=60
+        )
+
+        assert b"RESERVED" in result.stdout, (
+            f"reservation was charged: reason={result.reason} "
+            f"signal={result.signal} stdout={result.stdout!r}"
+        )
+        assert b"COMMITTED" not in result.stdout, (
+            "a writable allocation over the limit was not stopped"
+        )
+
+
 class TestNetAllowDenyAll:
     """An empty `net_allow` denies all outbound — including when fs grants are
     present, which turn on the named-`AF_UNIX` connect gate (`has_unix_fs_gate`)
