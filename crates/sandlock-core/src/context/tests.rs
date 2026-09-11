@@ -311,6 +311,32 @@ fn test_arg_filters_has_clone_ioctl_prctl_socket() {
 }
 
 #[test]
+fn test_arg_filters_mprotect_traps_only_with_memory_limit() {
+    use crate::sys::structs::{
+        BPF_ABS, BPF_JEQ, BPF_JSET, BPF_JMP, BPF_K, BPF_LD, BPF_W, OFFSET_ARGS2_LO,
+    };
+    // SYS_mprotect collides with AF_INET6 on x86_64, so the test looks for
+    // the nr check followed by the prot load rather than the bare constant.
+    let has_mprotect = |filters: &[crate::sys::structs::SockFilter]| {
+        filters.windows(2).any(|w| w[0].code == (BPF_JMP | BPF_JEQ | BPF_K)
+            && w[0].k == libc::SYS_mprotect as u32
+            && w[1].code == (BPF_LD | BPF_W | BPF_ABS)
+            && w[1].k == OFFSET_ARGS2_LO)
+    };
+    let unlimited = Sandbox::builder().build().unwrap();
+    assert!(!has_mprotect(&arg_filters(&unlimited)));
+
+    let limited = Sandbox::builder()
+        .max_memory(crate::sandbox::ByteSize::mib(256))
+        .build()
+        .unwrap();
+    let filters = arg_filters(&limited);
+    assert!(has_mprotect(&filters));
+    assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JSET | BPF_K)
+        && f.k == libc::PROT_WRITE as u32));
+}
+
+#[test]
 fn test_arg_filters_raw_sockets() {
     use crate::sys::structs::{BPF_ALU, BPF_AND, BPF_JEQ, BPF_JMP, BPF_K};
     // Raw sockets are blocked by default: no `icmp-raw://*` rule.

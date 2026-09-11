@@ -258,6 +258,46 @@ class TestMaxMemoryIgnoresReservations:
         )
 
 
+class TestMaxMemoryMprotectCommit:
+    def test_mprotect_of_a_reservation_is_judged(self):
+        """Committing a reservation with mprotect must not escape the limit.
+
+        Reservations are free, so a workload could reserve PROT_NONE,
+        mprotect it writable, and touch it all without ever making the
+        memory syscall that would have corrected the ledger. A small
+        commit under the limit must still go through.
+        """
+        prog = (
+            "import ctypes\n"
+            "libc = ctypes.CDLL(None, use_errno=True)\n"
+            "libc.mmap.restype = ctypes.c_void_p\n"
+            "libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,"
+            " ctypes.c_int, ctypes.c_int, ctypes.c_long]\n"
+            "libc.mprotect.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]\n"
+            "n = 512 << 20\n"
+            "p = libc.mmap(None, n, 0, 0x22, -1, 0)\n"
+            "print('RESERVED', flush=True)\n"
+            "small = 16 << 20\n"
+            "assert libc.mprotect(p, small, 3) == 0\n"
+            "ctypes.memset(p, 1, small)\n"
+            "print('SMALL-OK', flush=True)\n"
+            "assert libc.mprotect(p + small, n - small, 3) == 0\n"
+            "ctypes.memset(p + small, 1, n - small)\n"
+            "print('COMMITTED', flush=True)\n"
+        )
+        result = _policy(fs_writable=["/tmp"], max_memory="128M").run(
+            [sys.executable, "-c", prog], timeout=60
+        )
+
+        assert b"SMALL-OK" in result.stdout, (
+            f"small commit was refused: reason={result.reason} "
+            f"signal={result.signal} stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+        assert b"COMMITTED" not in result.stdout, (
+            "mprotect committed 496 MiB under a 128 MiB limit"
+        )
+
+
 class TestNetAllowDenyAll:
     """An empty `net_allow` denies all outbound — including when fs grants are
     present, which turn on the named-`AF_UNIX` connect gate (`has_unix_fs_gate`)
