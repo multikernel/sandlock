@@ -418,8 +418,25 @@ Returned by `sandbox.run()`.
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
-| `kind` | `str` | `"A"` (added), `"M"` (modified), or `"D"` (deleted) |
 | `path` | `str` | Path relative to workdir |
+| `before` | `Entry \| None` | The workdir entry when the run first touched the path; `None` if absent |
+| `after` | `Entry \| None` | The branch entry when the change set was read; `None` if removed |
+| `kind` | `str` | Derived: `"A"` (no `before`), `"M"` (both sides), `"D"` (no `after`) |
+| `content_unchanged` | `bool` | Both sides present with the same kind and digest or target |
+| `type_changed` | `bool` | Both sides present with different kinds |
+
+`renames(changes)` pairs each deleted file with the added file carrying
+the same digest, as `(old_path, new_path)` tuples.
+
+### Entry
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `kind` | `str` | `"file"`, `"dir"`, `"symlink"`, or `"other"` |
+| `mode` | `int` | Permission bits |
+| `size` | `int` | Byte length for a file; 0 otherwise |
+| `digest` | `bytes \| None` | SHA-256 of the bytes; files only |
+| `target` | `str \| None` | Link target; symlinks only |
 
 ### Stage and Pipeline
 

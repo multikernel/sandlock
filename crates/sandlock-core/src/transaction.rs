@@ -2065,7 +2065,7 @@ mod tests {
         let paths: Vec<_> = finished
             .changes
             .iter()
-            .map(|c| (c.kind.clone(), c.path.clone()))
+            .map(|c| (c.kind(), c.path.clone()))
             .collect();
         assert_eq!(
             paths,

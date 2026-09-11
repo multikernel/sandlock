@@ -74,6 +74,7 @@ exclude = [
 "sandlock_exception_policy_t" = "sandlock_exception"
 "sandlock_action_kind_t" = "sandlock_action"
 "sandlock_exit_reason_t" = "sandlock_exit_reason"
+"sandlock_entry_kind_t" = "sandlock_entry_kind"
 
 [enum]
 rename_variants = "ScreamingSnakeCase"

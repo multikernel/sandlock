@@ -15,7 +15,7 @@ from ._sdk import (
 from .inputs import inputs
 from .handler import Handler, NotifAction, HandlerCtx, ExceptionPolicy
 from .sandbox import (
-    Sandbox, BranchAction, parse_ports, Change, StdioMode, Process,
+    Sandbox, BranchAction, parse_ports, Change, Entry, renames, StdioMode, Process,
 )
 from ._profile import load_profile, list_profiles
 from .exceptions import (
@@ -52,6 +52,8 @@ __all__ = [
     "BranchAction",
     "parse_ports",
     "Change",
+    "Entry",
+    "renames",
     "StdioMode",
     "Process",
     "Protection",

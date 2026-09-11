@@ -12,7 +12,7 @@ from enum import IntEnum
 from pathlib import Path
 from typing import Any, NamedTuple, Sequence
 
-from .sandbox import Change, Sandbox as PolicyDataclass
+from .sandbox import Change, Entry, Sandbox as PolicyDataclass
 
 # ----------------------------------------------------------------
 # Load the shared library
@@ -370,11 +370,25 @@ _lib.sandlock_result_free.argtypes = [_c_result_p]
 _lib.sandlock_result_changes_len.restype = ctypes.c_size_t
 _lib.sandlock_result_changes_len.argtypes = [_c_result_p]
 
-_lib.sandlock_result_change_kind.restype = ctypes.c_char
-_lib.sandlock_result_change_kind.argtypes = [_c_result_p, ctypes.c_size_t]
-
 _lib.sandlock_result_change_path.restype = ctypes.c_void_p
 _lib.sandlock_result_change_path.argtypes = [_c_result_p, ctypes.c_size_t]
+
+
+class _CEntry(ctypes.Structure):
+    _fields_ = [
+        ("kind", ctypes.c_uint32),
+        ("mode", ctypes.c_uint32),
+        ("size", ctypes.c_uint64),
+        ("has_digest", ctypes.c_uint8),
+        ("digest", ctypes.c_uint8 * 32),
+    ]
+
+
+_lib.sandlock_result_change_entry.restype = ctypes.c_int
+_lib.sandlock_result_change_entry.argtypes = [_c_result_p, ctypes.c_size_t, ctypes.c_int, ctypes.POINTER(_CEntry)]
+
+_lib.sandlock_result_change_target.restype = ctypes.c_void_p
+_lib.sandlock_result_change_target.argtypes = [_c_result_p, ctypes.c_size_t, ctypes.c_int]
 
 # Pipeline
 _lib.sandlock_pipeline_new.restype = _c_pipeline_p
@@ -741,17 +755,41 @@ def _read_result_bytes(result_p, fn) -> bytes:
     return ctypes.string_at(ptr, length.value)
 
 
+_ENTRY_KINDS = ("file", "dir", "symlink", "other")  # sandlock_entry_kind order
+_CHANGE_BEFORE, _CHANGE_AFTER = 0, 1
+
+
+def _take_string(p) -> str | None:
+    if not p:
+        return None
+    s = ctypes.string_at(p).decode("utf-8", "surrogateescape")
+    _lib.sandlock_string_free(ctypes.cast(p, ctypes.c_char_p))
+    return s
+
+
+def _read_change_side(result_p, i: int, side: int) -> Entry | None:
+    raw = _CEntry()
+    if _lib.sandlock_result_change_entry(result_p, i, side, ctypes.byref(raw)) != 0:
+        return None
+    return Entry(
+        kind=_ENTRY_KINDS[raw.kind],
+        mode=raw.mode,
+        size=raw.size,
+        digest=bytes(raw.digest) if raw.has_digest else None,
+        target=_take_string(_lib.sandlock_result_change_target(result_p, i, side)),
+    )
+
+
 def _read_result_changes(result_p) -> list:
     """Read the change list from a result pointer."""
     changes = []
     for i in range(_lib.sandlock_result_changes_len(result_p)):
-        kind = _lib.sandlock_result_change_kind(result_p, i).decode("ascii")
-        path_p = _lib.sandlock_result_change_path(result_p, i)
-        path = ""
-        if path_p:
-            path = ctypes.string_at(path_p).decode("utf-8", "surrogateescape")
-            _lib.sandlock_string_free(ctypes.cast(path_p, ctypes.c_char_p))
-        changes.append(Change(kind=kind, path=path))
+        path = _take_string(_lib.sandlock_result_change_path(result_p, i)) or ""
+        changes.append(Change(
+            path=path,
+            before=_read_change_side(result_p, i, _CHANGE_BEFORE),
+            after=_read_change_side(result_p, i, _CHANGE_AFTER),
+        ))
     return changes
 
 

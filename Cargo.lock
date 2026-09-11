@@ -1400,6 +1400,7 @@ dependencies = [
  "rand",
  "rand_chacha",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-pemfile",
  "serde",

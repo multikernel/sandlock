@@ -1755,24 +1755,6 @@ pub unsafe extern "C" fn sandlock_result_changes_len(r: *const sandlock_result_t
     (*r)._private.changes.len()
 }
 
-/// Kind of the i-th change: 'A' (added), 'M' (modified), 'D' (deleted); 0 out of range.
-///
-/// # Safety
-/// `r` must be a valid result pointer.
-#[no_mangle]
-pub unsafe extern "C" fn sandlock_result_change_kind(r: *const sandlock_result_t, i: usize) -> c_char {
-    if r.is_null() {
-        return 0;
-    }
-    let changes = &(*r)._private.changes;
-    match changes.get(i).map(|c| &c.kind) {
-        Some(sandlock_core::ChangeKind::Added) => b'A' as c_char,
-        Some(sandlock_core::ChangeKind::Modified) => b'M' as c_char,
-        Some(sandlock_core::ChangeKind::Deleted) => b'D' as c_char,
-        None => 0,
-    }
-}
-
 /// Workdir-relative path of the i-th change. Caller must free with
 /// `sandlock_string_free`; NULL out of range.
 ///
@@ -1786,6 +1768,105 @@ pub unsafe extern "C" fn sandlock_result_change_path(r: *const sandlock_result_t
     let changes = &(*r)._private.changes;
     match changes.get(i) {
         Some(c) => CString::new(c.path.to_string_lossy().as_bytes()).map(|s| s.into_raw()).unwrap_or(ptr::null_mut()),
+        None => ptr::null_mut(),
+    }
+}
+
+/// What one side of a change is (`sandlock_entry_t.kind`).
+#[allow(non_camel_case_types)]
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum sandlock_entry_kind_t {
+    File = 0,
+    Dir = 1,
+    Symlink = 2,
+    /// A fifo, socket, or device node: no bytes, only a mode.
+    Other = 3,
+}
+
+/// `side` of `sandlock_result_change_entry` and `sandlock_result_change_target`:
+/// the workdir entry when the run first touched the path.
+pub const SANDLOCK_CHANGE_BEFORE: c_int = 0;
+/// The branch entry when the change set was read.
+pub const SANDLOCK_CHANGE_AFTER: c_int = 1;
+
+/// One side of a change, as plain data so every binding can hold it on
+/// the stack. `digest` is SHA-256 and only meaningful when `has_digest`
+/// is 1 (files).
+#[repr(C)]
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy)]
+pub struct sandlock_entry_t {
+    pub kind: sandlock_entry_kind_t,
+    pub mode: u32,
+    pub size: u64,
+    pub has_digest: u8,
+    pub digest: [u8; 32],
+}
+
+unsafe fn change_side<'a>(r: *const sandlock_result_t, i: usize, side: c_int) -> Option<&'a Option<sandlock_core::Entry>> {
+    if r.is_null() {
+        return None;
+    }
+    let changes = &(*r)._private.changes;
+    let change = changes.get(i)?;
+    match side {
+        SANDLOCK_CHANGE_BEFORE => Some(&change.before),
+        SANDLOCK_CHANGE_AFTER => Some(&change.after),
+        _ => None,
+    }
+}
+
+/// Fill `out` with one side of the i-th change, `SANDLOCK_CHANGE_BEFORE` or
+/// `SANDLOCK_CHANGE_AFTER`. Returns 0 when filled, 1 when that side is
+/// absent (`out` untouched), -1 when `i` or `side` is out of range.
+///
+/// # Safety
+/// `r` must be a valid result pointer and `out` a valid, writable pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_result_change_entry(
+    r: *const sandlock_result_t,
+    i: usize,
+    side: c_int,
+    out: *mut sandlock_entry_t,
+) -> c_int {
+    use sandlock_core::EntryKind;
+    let Some(entry) = change_side(r, i, side) else { return -1 };
+    let Some(e) = entry else { return 1 };
+    if out.is_null() {
+        return -1;
+    }
+    *out = sandlock_entry_t {
+        kind: match e.kind {
+            EntryKind::File => sandlock_entry_kind_t::File,
+            EntryKind::Dir => sandlock_entry_kind_t::Dir,
+            EntryKind::Symlink => sandlock_entry_kind_t::Symlink,
+            EntryKind::Other => sandlock_entry_kind_t::Other,
+        },
+        mode: e.mode,
+        size: e.size,
+        has_digest: e.digest.is_some() as u8,
+        digest: e.digest.unwrap_or([0; 32]),
+    };
+    0
+}
+
+/// Symlink target of one side of the i-th change; NULL when that side is
+/// absent or not a symlink. Caller must free with `sandlock_string_free`.
+///
+/// # Safety
+/// `r` must be a valid result pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_result_change_target(
+    r: *const sandlock_result_t,
+    i: usize,
+    side: c_int,
+) -> *mut c_char {
+    let target = change_side(r, i, side)
+        .and_then(|e| e.as_ref())
+        .and_then(|e| e.target.as_deref());
+    match target {
+        Some(t) => CString::new(t).map(|s| s.into_raw()).unwrap_or(ptr::null_mut()),
         None => ptr::null_mut(),
     }
 }

@@ -587,15 +587,58 @@ func readResult(r *C.sandlock_result_t) *Result {
 	res.Stderr = readBytes(r, false)
 	count := int(C.sandlock_result_changes_len(r))
 	for i := 0; i < count; i++ {
-		kind := byte(C.sandlock_result_change_kind(r, C.uintptr_t(i)))
 		var path string
 		if pc := C.sandlock_result_change_path(r, C.uintptr_t(i)); pc != nil {
 			path = C.GoString(pc)
 			C.sandlock_string_free(pc)
 		}
-		res.Changes = append(res.Changes, Change{Kind: ChangeKind(kind), Path: path})
+		res.Changes = append(res.Changes, Change{
+			Path:   path,
+			Before: readChangeSide(r, i, C.SANDLOCK_CHANGE_BEFORE),
+			After:  readChangeSide(r, i, C.SANDLOCK_CHANGE_AFTER),
+		})
 	}
 	return res
+}
+
+func readChangeSide(r *C.sandlock_result_t, i int, side int) *Entry {
+	var raw C.sandlock_entry_t
+	if C.sandlock_result_change_entry(r, C.uintptr_t(i), C.int(side), &raw) != 0 {
+		return nil
+	}
+	e := &Entry{
+		Kind: EntryKind(raw.kind),
+		Mode: fileMode(uint32(raw.mode)),
+		Size: int64(raw.size),
+	}
+	if raw.has_digest != 0 {
+		var d [32]byte
+		for j := range d {
+			d[j] = byte(raw.digest[j])
+		}
+		e.Digest = &d
+	}
+	if pc := C.sandlock_result_change_target(r, C.uintptr_t(i), C.int(side)); pc != nil {
+		e.Target = C.GoString(pc)
+		C.sandlock_string_free(pc)
+	}
+	return e
+}
+
+// os.FileMode keeps setuid, setgid, and sticky in its own high bits, so a
+// raw st_mode cast would drop them into bits FileMode never reads.
+func fileMode(raw uint32) os.FileMode {
+	m := os.FileMode(raw & 0o777)
+	if raw&syscall.S_ISUID != 0 {
+		m |= os.ModeSetuid
+	}
+	if raw&syscall.S_ISGID != 0 {
+		m |= os.ModeSetgid
+	}
+	if raw&syscall.S_ISVTX != 0 {
+		m |= os.ModeSticky
+	}
+	return m
 }
 
 func readBytes(r *C.sandlock_result_t, stdout bool) []byte {

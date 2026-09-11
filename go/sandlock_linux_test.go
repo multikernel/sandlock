@@ -247,9 +247,78 @@ func TestAbortReportsChangesAndWritesNothing(t *testing.T) {
 	if _, statErr := os.Stat(dir + "/out.txt"); statErr == nil {
 		t.Fatalf("an aborting run leaked a write to the host")
 	}
-	want := sandlock.Change{Kind: sandlock.ChangeAdded, Path: "out.txt"}
-	if len(res.Changes) != 1 || res.Changes[0] != want {
-		t.Fatalf("changes = %+v, want [%+v]", res.Changes, want)
+	if len(res.Changes) != 1 || res.Changes[0].Kind() != sandlock.ChangeAdded || res.Changes[0].Path != "out.txt" {
+		t.Fatalf("changes = %+v, want [A out.txt]", res.Changes)
+	}
+}
+
+const sha256ABC = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+
+func TestChangesCarryBothSides(t *testing.T) {
+	requireLandlock(t)
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/mod.txt", []byte("abc"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/old.txt", []byte("abc"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("a", dir+"/link"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/suid.txt", []byte("suid"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir+"/suid.txt", os.ModeSetuid|0o755); err != nil {
+		t.Fatal(err)
+	}
+	sb := &sandlock.Sandbox{
+		FSReadable: rootfs,
+		FSWritable: []string{dir},
+		Workdir:    dir,
+		OnExit:     sandlock.BranchActionAbort,
+	}
+	res, err := sb.Run(context.Background(), "sh", "-c",
+		"cd "+dir+" && echo xyz > mod.txt && mv old.txt new.txt && rm link && ln -s b link && rm suid.txt")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !res.Success {
+		t.Fatalf("run failed: exit=%d stderr=%q", res.ExitCode, res.Stderr)
+	}
+	byPath := map[string]sandlock.Change{}
+	for _, c := range res.Changes {
+		byPath[c.Path] = c
+	}
+
+	mod := byPath["mod.txt"]
+	if mod.Kind() != sandlock.ChangeModified || mod.Before == nil || mod.After == nil {
+		t.Fatalf("mod.txt = %+v", mod)
+	}
+	if mod.Before.Kind != sandlock.EntryFile || mod.Before.Size != 3 || mod.Before.Digest == nil {
+		t.Fatalf("mod.txt before = %+v", mod.Before)
+	}
+	if got := fmt.Sprintf("%x", *mod.Before.Digest); got != sha256ABC {
+		t.Fatalf("mod.txt before digest = %s", got)
+	}
+	if mod.After.Size != 4 || *mod.After.Digest == *mod.Before.Digest || mod.ContentUnchanged() {
+		t.Fatalf("mod.txt after = %+v", mod.After)
+	}
+
+	link := byPath["link"]
+	if link.Before == nil || link.Before.Kind != sandlock.EntrySymlink || link.Before.Target != "a" || link.After.Target != "b" {
+		t.Fatalf("link = %+v", link)
+	}
+	if link.TypeChanged() || link.ContentUnchanged() {
+		t.Fatalf("a retargeted link keeps its kind and changes content: %+v", link)
+	}
+
+	if suid := byPath["suid.txt"]; suid.Before == nil || suid.Before.Mode != os.ModeSetuid|0o755 {
+		t.Fatalf("suid.txt before = %+v", suid.Before)
+	}
+
+	if got := sandlock.Renames(res.Changes); len(got) != 1 || got[0] != [2]string{"old.txt", "new.txt"} {
+		t.Fatalf("renames = %v", got)
 	}
 }
 

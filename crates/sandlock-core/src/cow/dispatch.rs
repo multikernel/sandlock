@@ -266,7 +266,15 @@ pub(crate) async fn handle_cow_open(
             }).await;
 
             match copy_result {
-                Ok(Ok(())) => upper,
+                Ok(Ok(digest)) => {
+                    if let Some(d) = digest {
+                        let mut st = cow_state.lock().await;
+                        if let Some(cow) = st.branch.as_mut() {
+                            cow.record_digest(&rel_path, d);
+                        }
+                    }
+                    upper
+                }
                 Ok(Err(_)) | Err(_) => {
                     // Copy failed — roll back quota and let kernel handle it
                     let mut st = cow_state.lock().await;
@@ -541,11 +549,20 @@ async fn execute_deferred_copy(
     upper: std::path::PathBuf,
     file_size: u64,
 ) -> Option<std::path::PathBuf> {
+    let rel_path = rel.clone();
     let copy_result = tokio::task::spawn_blocking(move || {
         crate::cow::seccomp::SeccompCowBranch::execute_copy(&workdir_root, &upper_root, &rel)
     }).await;
     match copy_result {
-        Ok(Ok(())) => Some(upper),
+        Ok(Ok(digest)) => {
+            if let Some(d) = digest {
+                let mut st = cow_state.lock().await;
+                if let Some(cow) = st.branch.as_mut() {
+                    cow.record_digest(&rel_path, d);
+                }
+            }
+            Some(upper)
+        }
         _ => {
             let mut st = cow_state.lock().await;
             if let Some(cow) = st.branch.as_mut() {

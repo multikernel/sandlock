@@ -117,14 +117,82 @@ class StdioMode(IntEnum):
 
 
 @dataclass(frozen=True)
+class Entry:
+    """One side of a :class:`Change`."""
+
+    kind: str
+    """``"file"``, ``"dir"``, ``"symlink"``, or ``"other"`` (fifo, socket, device node)."""
+
+    mode: int
+    """Permission bits."""
+
+    size: int
+    """Byte length for a file; 0 otherwise."""
+
+    digest: bytes | None
+    """SHA-256 of the bytes. Files only."""
+
+    target: str | None
+    """Link target, verbatim. Symlinks only."""
+
+    def _same_content(self, other: "Entry") -> bool:
+        return self.kind == other.kind and self.digest == other.digest and self.target == other.target
+
+
+@dataclass(frozen=True)
 class Change:
     """A single filesystem change a run made to its COW branch."""
 
-    kind: str
-    """A=added, M=modified (exists on both sides, bytes not compared), D=deleted."""
-
     path: str
     """Path relative to workdir."""
+
+    before: Entry | None
+    """The workdir entry when the run first touched the path. ``None`` for a
+    path that did not exist, or for a deletion of one the run could not inspect."""
+
+    after: Entry | None
+    """The branch entry when the change set was read. ``None`` when removed."""
+
+    @property
+    def kind(self) -> str:
+        """``"A"`` added, ``"M"`` modified (both sides present), ``"D"`` deleted."""
+        if self.after is None:
+            return "D"
+        return "A" if self.before is None else "M"
+
+    @property
+    def content_unchanged(self) -> bool:
+        """Both sides present with the same kind and bytes or target: a touch,
+        a mode change, or a rewrite with identical contents."""
+        return self.before is not None and self.after is not None and self.before._same_content(self.after)
+
+    @property
+    def type_changed(self) -> bool:
+        return self.before is not None and self.after is not None and self.before.kind != self.after.kind
+
+    def __str__(self) -> str:
+        return f"{self.kind}  {self.path}"
+
+
+def renames(changes: Sequence[Change]) -> list[tuple[str, str]]:
+    """Pair each deleted file with the added file carrying the same digest.
+    A digest seen more than once on either side is ambiguous and left unpaired."""
+    def unique(side: str) -> dict[bytes, str | None]:
+        by_digest: dict[bytes, str | None] = {}
+        for c in changes:
+            entry = c.before if side == "before" else c.after
+            other = c.after if side == "before" else c.before
+            if entry is None or other is not None or entry.digest is None:
+                continue
+            by_digest[entry.digest] = None if entry.digest in by_digest else c.path
+        return by_digest
+
+    deleted, added = unique("before"), unique("after")
+    return sorted(
+        (old, added[d])
+        for d, old in deleted.items()
+        if old is not None and added.get(d) is not None
+    )
 
 
 @dataclass

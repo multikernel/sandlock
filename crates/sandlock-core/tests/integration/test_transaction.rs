@@ -615,7 +615,7 @@ async fn test_txn_reports_changes_on_commit_and_abort() {
     let mut got: Vec<(ChangeKind, String)> = committed
         .changes
         .iter()
-        .map(|c| (c.kind.clone(), c.path.display().to_string()))
+        .map(|c| (c.kind(), c.path.display().to_string()))
         .collect();
     got.sort_by(|a, b| a.1.cmp(&b.1));
     assert_eq!(
@@ -927,7 +927,7 @@ async fn test_txn_deletion_commit_applies_abort_preserves() {
     assert!(committed.committed(), "commit expected; disposition: {:?}", committed.disposition);
     assert!(!wd_c.join("keep.txt").exists(), "committed deletion must remove keep.txt from the workdir");
     assert_eq!(
-        committed.changes.iter().map(|c| (c.kind.clone(), c.path.display().to_string())).collect::<Vec<_>>(),
+        committed.changes.iter().map(|c| (c.kind(), c.path.display().to_string())).collect::<Vec<_>>(),
         vec![(ChangeKind::Deleted, "keep.txt".to_string())],
         "a deletion must be reported as a change",
     );
