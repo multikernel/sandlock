@@ -692,6 +692,8 @@ mod tests {
 
     #[test]
     fn statx_confines_symlinked_parent() {
+        // The libc crate only exposes this constant for glibc targets.
+        const STATX_BASIC_STATS: u32 = 0x7ff;
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         std::fs::write(root.join("f"), "data").unwrap();
@@ -699,9 +701,9 @@ mod tests {
         let mut buf = vec![0u8; 256];
 
         // In-tree file resolves; escaping parent does not.
-        skip_if_nosys!(statx_in_root(root, "f", 0, libc::STATX_BASIC_STATS, &mut buf)).unwrap();
+        skip_if_nosys!(statx_in_root(root, "f", 0, STATX_BASIC_STATS, &mut buf)).unwrap();
         assert_eq!(
-            statx_in_root(root, "dirlink/group", 0, libc::STATX_BASIC_STATS, &mut buf),
+            statx_in_root(root, "dirlink/group", 0, STATX_BASIC_STATS, &mut buf),
             Err(libc::ENOENT)
         );
     }

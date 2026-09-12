@@ -1095,7 +1095,7 @@ pub(crate) async fn handle_cow_exec(
     let child_fd = unsafe {
         libc::ioctl(
             notif_fd,
-            crate::sys::structs::SECCOMP_IOCTL_NOTIF_ADDFD as libc::c_ulong,
+            crate::sys::structs::SECCOMP_IOCTL_NOTIF_ADDFD as libc::Ioctl,
             &addfd as *const _,
         )
     };
@@ -1380,7 +1380,7 @@ pub(crate) async fn handle_cow_chdir(
     let child_fd = unsafe {
         libc::ioctl(
             notif_fd,
-            crate::sys::structs::SECCOMP_IOCTL_NOTIF_ADDFD as libc::c_ulong,
+            crate::sys::structs::SECCOMP_IOCTL_NOTIF_ADDFD as libc::Ioctl,
             &addfd as *const _,
         )
     };
