@@ -22,6 +22,7 @@ pub(crate) mod cow;
 pub mod recovery;
 pub(crate) mod checkpoint;
 pub(crate) mod freeze;
+pub(crate) mod exec_relay;
 pub mod netlink;
 pub(crate) mod procfs;
 pub(crate) mod port_remap;
