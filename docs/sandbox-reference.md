@@ -551,5 +551,5 @@ parse_ports([80, "443", "8000-8005"])
    user-memory pointers after `Continue`. Path-based control belongs
    in static Landlock rules (`fs_readable`, `fs_writable`,
    `fs_denied`) or in `ctx.deny_path()` for runtime additions.
-   `event.argv` is exposed and TOCTOU-safe; the supervisor freezes
-   peer tasks before exposing it.
+   `event.argv` is exposed and TOCTOU-safe: an allowed `execve` runs
+   through a relay that execs the target with the argv the policy saw.

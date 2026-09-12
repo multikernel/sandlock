@@ -385,15 +385,13 @@ positive int = deny with errno, `"audit"`/`-2` = allow + flag.
 >   belongs in static Landlock rules (`fs_readable` / `fs_writable` /
 >   `fs_denied`) — kernel-enforced and TOCTOU-immune. Use
 >   `ctx.deny_path()` for runtime additions.
-> - **`event.argv` is exposed and TOCTOU-safe.** Before exposing
->   `argv` to `policy_fn` or returning `Continue` for an
->   `execve`, the supervisor freezes every task in `ProcessIndex`,
->   including peer processes that may alias argv through shared memory.
->   With `policy_fn` active, fork-like syscalls are traced for one
->   ptrace creation event, so children are registered in `ProcessIndex`
->   before they can run user code. If the freeze or creation tracking
->   cannot be established (e.g., YAMA blocks ptrace), the syscall is
->   denied with `EPERM`; the safety invariant is never silently relaxed.
+> - **`event.argv` is exposed and TOCTOU-safe.** The supervisor reads
+>   `argv` once and, on `Continue`, redirects the `execve` to a small
+>   static relay program delivered in a sealed memfd at an fd number the
+>   sandbox cannot repopulate. The relay execs the target with exactly the
+>   argv the policy saw, so a sibling thread or `CLONE_VM` peer rewriting
+>   the original memory changes nothing. No task is stopped and no ptrace
+>   is involved; the one visible cost is an extra `execve` per spawn.
 
 **Context methods:**
 - `ctx.restrict_network(ips)` / `ctx.grant_network(ips)` — network control

@@ -512,10 +512,11 @@ Contract:
 - **Terminal decision.** `Defer` is non-`Continue`, so it short-circuits the handler chain exactly
   like `Errno`/`ReturnValue`: later handlers on the same syscall do not run. A deferring handler
   decides the outcome.
-- **No deferral on freeze/fork syscalls.** Deferral is refused (with `EPERM`) on
-  `execve`/`execveat` and fork-creating syscalls, because moving the response off-loop would skip
-  the argv-safety freeze (see [issue #27][i27]) and process creation-tracking that those paths
-  require before `Continue`.
+- **No deferral on policy-checked execs.** Deferral is refused (with `EPERM`) on
+  `execve`/`execveat` while a `policy_fn` or an exec-bound handler is active, because the
+  exec relay that keeps `argv` TOCTOU-safe (see [issue #27][i27]) must rewrite the exec on the
+  supervisor loop before `Continue`. Such handlers also see the relay's own re-exec of an
+  approved program, flagged by `HandlerCtx::relay_exec`.
 - **Bounded fan-out.** At most `DEFER_MAX_INFLIGHT` deferred futures run concurrently; beyond that,
   further deferrals fail fast with `EAGAIN` rather than queuing. The cap also bounds the resources
   workers hold (memfds, sockets).
