@@ -213,3 +213,76 @@ async fn clone_files_without_thread_is_rejected() {
     let r = policy.clone().run(&["python3", "-c", script]).await.unwrap();
     assert_eq!(stdout_of(&r), "EINVAL", "stderr: {}", stderr_of(&r));
 }
+
+/// Under chroot the relay hands the child's virtual path to the chroot exec
+/// handler, which resolves it against the now single-threaded relay.
+#[tokio::test]
+async fn chroot_exec_reports_argv_and_runs() {
+    let helper = helper_binary();
+    let rootfs = scratch_dir("rootfs");
+    for dir in ["usr/bin", "etc", "proc", "dev", "tmp"] {
+        std::fs::create_dir_all(rootfs.join(dir)).unwrap();
+    }
+    let dest = rootfs.join("usr/bin/rootfs-helper");
+    std::fs::copy(&helper, &dest).unwrap();
+    std::fs::set_permissions(&dest, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink("usr/bin", rootfs.join("bin")).unwrap();
+
+    let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_cb = seen.clone();
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .policy_fn(move |event, _ctx| {
+            if event.syscall == "execve" {
+                if let Some(argv) = &event.argv {
+                    seen_cb.lock().unwrap().push(argv.clone());
+                }
+            }
+            Verdict::Allow
+        })
+        .build()
+        .unwrap();
+    let r = policy.clone().run(&["/bin/rootfs-helper", "echo", "chroot-relay-ok"]).await.unwrap();
+    assert!(r.success(), "stderr: {}", stderr_of(&r));
+    assert_eq!(stdout_of(&r), "chroot-relay-ok");
+    let seen = seen.lock().unwrap();
+    assert!(seen.iter().any(|a| a.iter().any(|s| s == "chroot-relay-ok")), "argv seen: {seen:?}");
+    let _ = std::fs::remove_dir_all(&rootfs);
+}
+
+/// A script the sandbox itself wrote lives only in the COW branch; the COW
+/// exec handler serves it to the relay's exec.
+#[tokio::test]
+async fn cow_exec_of_a_file_written_in_the_sandbox() {
+    let workdir = scratch_dir("cow");
+    let script = workdir.join("made-inside.sh");
+    let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_cb = seen.clone();
+    let policy = base_policy()
+        .fs_write(&workdir)
+        .workdir(&workdir)
+        .policy_fn(move |event, _ctx| {
+            if event.syscall == "execve" {
+                if let Some(argv) = &event.argv {
+                    seen_cb.lock().unwrap().push(argv.clone());
+                }
+            }
+            Verdict::Allow
+        })
+        .build()
+        .unwrap();
+    let cmd = format!(
+        "printf '#!/bin/sh\\necho cow-relay-ok $1\\n' > {s} && chmod +x {s} && {s} from-cow",
+        s = script.display()
+    );
+    let r = policy.clone().run(&["sh", "-c", &cmd]).await.unwrap();
+    assert!(r.success(), "stderr: {}", stderr_of(&r));
+    assert_eq!(stdout_of(&r), "cow-relay-ok from-cow");
+    let seen = seen.lock().unwrap();
+    assert!(seen.iter().any(|a| a.iter().any(|s| s == "from-cow")), "argv seen: {seen:?}");
+    let _ = std::fs::remove_dir_all(&workdir);
+}
