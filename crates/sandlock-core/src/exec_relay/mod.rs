@@ -186,6 +186,23 @@ pub struct RelayState {
     holds: Mutex<HashMap<i32, Hold>>,
 }
 
+impl RelayState {
+    /// Whether `pid` is a running relay: a hold exists for its process and its
+    /// exe is the memfd. Syscalls the relay makes between its two execs are
+    /// mechanism, not application behaviour, and must not reach policy_fn.
+    pub(crate) fn is_relay_task(&self, pid: i32) -> bool {
+        let holds = self.holds.lock().unwrap();
+        if holds.is_empty() {
+            return false;
+        }
+        let tgid = read_tgid_of_tid(pid).unwrap_or(pid);
+        match holds.get(&tgid) {
+            Some(hold) => ident_of(Path::new(&format!("/proc/{pid}/exe"))) == Some(hold.memfd_ident),
+            None => false,
+        }
+    }
+}
+
 pub(crate) enum Prepared {
     /// The relay's own execve: already judged, let the exec handlers run it.
     SecondExec,

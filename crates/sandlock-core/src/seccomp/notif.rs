@@ -2248,8 +2248,16 @@ async fn handle_notification(
     let fork_counted = matches!(action, NotifAction::Continue)
         && crate::resource::fork_counted_on_continue(&notif, fd);
 
-    // Emit event to policy_fn callback if active.
-    if let Some(verdict) = emit_policy_event(&notif, &action, &ctx.policy_fn, fd, None).await {
+    // Emit event to policy_fn callback if active. A running exec relay's own
+    // syscalls are hidden: observers would otherwise record the memfd as
+    // the program that ran.
+    let relay_internal = policy.argv_safety_required && ctx.exec_relay.is_relay_task(notif.pid as i32);
+    let verdict = if relay_internal {
+        None
+    } else {
+        emit_policy_event(&notif, &action, &ctx.policy_fn, fd, None).await
+    };
+    if let Some(verdict) = verdict {
         use crate::policy_fn::Verdict;
         match verdict {
             Verdict::Deny => { action = NotifAction::Errno(libc::EPERM); }
