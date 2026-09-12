@@ -26,6 +26,7 @@ use crate::sys::structs::{
 
 /// CLONE_THREAD flag — threads don't count toward process limit.
 const CLONE_THREAD: u64 = 0x0001_0000;
+const CLONE_FILES: u64 = 0x0000_0400;
 
 /// MAP_ANONYMOUS flag — only anonymous mappings count toward memory limit.
 const MAP_ANONYMOUS: u64 = 0x20;
@@ -86,10 +87,20 @@ pub(crate) async fn handle_fork(
     notif: &SeccompNotif,
     notif_fd: RawFd,
     ctx: &Arc<SupervisorCtx>,
-    _policy: &NotifPolicy,
+    policy: &NotifPolicy,
 ) -> NotifAction {
     let nr = notif.data.nr as i64;
     let args = &notif.data.args;
+
+    // The exec relay pins its fd through the caller's RLIMIT_NOFILE, which a
+    // process sharing the fd table without sharing the limit could defeat.
+    if policy.argv_safety_required {
+        if let Some(flags) = clone_flags(notif, notif_fd) {
+            if flags & CLONE_FILES != 0 && flags & CLONE_THREAD == 0 {
+                return NotifAction::Errno(libc::EINVAL);
+            }
+        }
+    }
 
     // Namespace flags are denied for clone (clone3's are caught by the
     // BPF arg filter; vfork takes no flags).
@@ -981,6 +992,7 @@ mod tests {
             chroot: Arc::new(Mutex::new(ChrootState::new())),
             netlink: Arc::new(NetlinkState::new()),
             processes: Arc::new(ProcessIndex::new()),
+            exec_relay: Default::default(),
             policy: Arc::new(fake_policy(argv_safety_required)),
             child_pidfd: None,
             notif_fd: -1,

@@ -76,6 +76,9 @@ pub trait Handler: Send + Sync + 'static {
 pub struct HandlerCtx {
     pub notif: SeccompNotif,
     pub notif_fd: RawFd,
+    /// The exec relay re-executing a program the policy already approved;
+    /// handlers observing application execs should ignore it.
+    pub relay_exec: bool,
 }
 
 // Blanket impl: any Fn(&HandlerCtx) -> Future is a Handler.
@@ -236,10 +239,11 @@ impl DispatchTable {
         &self,
         notif: SeccompNotif,
         notif_fd: RawFd,
+        relay_exec: bool,
     ) -> NotifAction {
         let nr = notif.data.nr as i64;
         if let Some(chain) = self.chains.get(&nr) {
-            let handler_ctx = HandlerCtx { notif, notif_fd };
+            let handler_ctx = HandlerCtx { notif, notif_fd, relay_exec };
             for handler in &chain.handlers {
                 let action = handler.handle(&handler_ctx).await;
                 if !matches!(action, NotifAction::Continue) {
@@ -836,10 +840,16 @@ fn register_chroot_handlers(
             crate::chroot::dispatch::handle_chroot_legacy_open));
     }
 
-    // execve, execveat — unconditional return
+    // execve, execveat — unconditional return. Under argv safety the exec
+    // relay owns the application's exec; this handler runs on the relay's.
     for &nr in &[libc::SYS_execve, libc::SYS_execveat] {
-        table.register(nr, chroot_handler!(policy,
-            crate::chroot::dispatch::handle_chroot_exec));
+        let inner = chroot_handler!(policy, crate::chroot::dispatch::handle_chroot_exec);
+        let relayed = policy.argv_safety_required;
+        table.register(nr, move |cx: &HandlerCtx| {
+            let skip = relayed && !cx.relay_exec;
+            let fut = inner(cx);
+            async move { if skip { NotifAction::Continue } else { fut.await } }
+        });
     }
 
     // Modern write syscalls
@@ -1061,8 +1071,16 @@ fn register_cow_handlers(table: &mut DispatchTable, ctx: &Arc<SupervisorCtx>) {
     table.register(libc::SYS_chdir, cow_call!(crate::cow::dispatch::handle_cow_chdir));
     table.register(libc::SYS_getcwd, cow_call!(crate::cow::dispatch::handle_cow_getcwd));
 
+    // Under argv safety the exec relay owns the application's exec; the COW
+    // handler runs on the relay's.
     for &nr in &[libc::SYS_execve, libc::SYS_execveat] {
-        table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_exec));
+        let inner = cow_call!(crate::cow::dispatch::handle_cow_exec);
+        let relayed = ctx.policy.argv_safety_required;
+        table.register(nr, move |cx: &HandlerCtx| {
+            let skip = relayed && !cx.relay_exec;
+            let fut = inner(cx);
+            async move { if skip { NotifAction::Continue } else { fut.await } }
+        });
     }
 }
 
@@ -1124,6 +1142,7 @@ mod handler_tests {
             chroot: Arc::new(Mutex::new(ChrootState::new())),
             netlink: Arc::new(NetlinkState::new()),
             processes: Arc::new(ProcessIndex::new()),
+            exec_relay: Default::default(),
             policy: Arc::new(NotifPolicy {
                 max_memory_bytes: 0,
                 max_processes: 0,
@@ -1230,7 +1249,7 @@ mod handler_tests {
 
         let _ctx = fake_supervisor_ctx();
         let action = table
-            .dispatch(fake_notif(libc::SYS_openat as i32), -1)
+            .dispatch(fake_notif(libc::SYS_openat as i32), -1, false)
             .await;
 
         assert!(matches!(action, NotifAction::Continue));
@@ -1283,7 +1302,7 @@ mod handler_tests {
 
         let _ctx = fake_supervisor_ctx();
         let action = table
-            .dispatch(fake_notif(libc::SYS_openat as i32), -1)
+            .dispatch(fake_notif(libc::SYS_openat as i32), -1, false)
             .await;
 
         assert!(matches!(action, NotifAction::Continue));
@@ -1334,7 +1353,7 @@ mod handler_tests {
 
         let _ctx = fake_supervisor_ctx();
         let action = table
-            .dispatch(fake_notif(libc::SYS_openat as i32), -1)
+            .dispatch(fake_notif(libc::SYS_openat as i32), -1, false)
             .await;
 
         match action {
@@ -1375,7 +1394,7 @@ mod handler_tests {
 
         let _ctx = fake_supervisor_ctx();
         let action = table
-            .dispatch(fake_notif(libc::SYS_openat as i32), -1)
+            .dispatch(fake_notif(libc::SYS_openat as i32), -1, false)
             .await;
 
         assert!(
@@ -1439,7 +1458,7 @@ mod handler_tests {
 
         let _sup = fake_supervisor_ctx();
         let notif = fake_notif(libc::SYS_openat as i32);
-        let cx = HandlerCtx { notif, notif_fd: -1 };
+        let cx = HandlerCtx { notif, notif_fd: -1, relay_exec: false };
 
         let action = h.handle(&cx).await;
         assert!(matches!(action, NotifAction::Continue));
@@ -1487,7 +1506,7 @@ mod handler_tests {
         // Walker MUST hit the struct's handle() each time, accumulating
         // state on &self.calls.
         for _ in 0..3 {
-            let action = table.dispatch(notif, -1).await;
+            let action = table.dispatch(notif, -1, false).await;
             assert!(matches!(action, NotifAction::Continue));
         }
 

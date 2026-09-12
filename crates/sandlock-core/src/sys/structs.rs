@@ -154,6 +154,8 @@ pub const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
 pub const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
 pub const SECCOMP_USER_NOTIF_FLAG_CONTINUE: u32 = 1;
 pub const SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP: u32 = 1;
+/// Install the fd at `newfd`, replacing whatever is there (Linux 5.9+).
+pub const SECCOMP_ADDFD_FLAG_SETFD: u32 = 1 << 0;
 /// Atomically install the fd and respond to the syscall (Linux 5.14+).
 pub const SECCOMP_ADDFD_FLAG_SEND: u32 = 1 << 1;
 

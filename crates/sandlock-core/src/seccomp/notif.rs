@@ -1224,7 +1224,7 @@ struct ExecRewritePlan {
 /// Read a NULL-terminated pointer array (argv or envp) from child memory.
 /// Chunked at page boundaries because a single straddling read fails whole
 /// if any page is unmapped, and mappings are page-granular.
-fn read_exec_ptr_array(
+pub(crate) fn read_exec_ptr_array(
     read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>, NotifError>,
     base: u64,
 ) -> Result<Vec<u64>, NotifError> {
@@ -1274,7 +1274,7 @@ fn read_exec_range(
 
 /// Read a NUL-terminated string (NUL excluded) of at most
 /// `EXEC_MAX_ARG_STRLEN` bytes, chunked at page boundaries.
-fn read_exec_cstr(
+pub(crate) fn read_exec_cstr(
     read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>, NotifError>,
     addr: u64,
 ) -> Result<Vec<u8>, NotifError> {
@@ -1435,8 +1435,22 @@ pub(crate) fn rewrite_exec_path_to_fd(
     child_fd: i32,
 ) -> Result<(), NotifError> {
     let fd_path = format!("/proc/self/fd/{}\0", child_fd);
+    rewrite_exec_path(notif_fd, id, pid, path_ptr, argv_ptr, envp_ptr, fd_path.as_bytes())
+}
+
+/// Rewrite the child's exec path to `new_path` (NUL included), relocating
+/// any argv/envp string the new bytes would overwrite.
+pub(crate) fn rewrite_exec_path(
+    notif_fd: RawFd,
+    id: u64,
+    pid: u32,
+    path_ptr: u64,
+    argv_ptr: u64,
+    envp_ptr: u64,
+    new_path: &[u8],
+) -> Result<(), NotifError> {
     let mut read = |addr: u64, len: usize| read_child_mem(notif_fd, id, pid, addr, len);
-    let plan = plan_exec_rewrite(&mut read, path_ptr, fd_path.as_bytes(), argv_ptr, envp_ptr)?;
+    let plan = plan_exec_rewrite(&mut read, path_ptr, new_path, argv_ptr, envp_ptr)?;
     write_child_mem_force(notif_fd, id, pid, path_ptr, &plan.buf)?;
     for (slot, new_ptr) in plan.patches {
         write_child_mem_force(notif_fd, id, pid, slot, &new_ptr.to_ne_bytes())?;
@@ -1885,6 +1899,7 @@ async fn emit_policy_event(
     action: &NotifAction,
     policy_fn_state: &Arc<tokio::sync::Mutex<super::state::PolicyFnState>>,
     notif_fd: RawFd,
+    exec: Option<&crate::exec_relay::ExecRequest>,
 ) -> Option<crate::policy_fn::Verdict> {
     let pfs = policy_fn_state.lock().await;
     let tx = match pfs.event_tx.as_ref() {
@@ -1928,7 +1943,10 @@ async fn emit_policy_event(
     let mut path2 = None;
     let mut flags = None;
 
-    if !denied && (nr == libc::SYS_execve || nr == libc::SYS_execveat) {
+    if let Some(req) = exec {
+        argv = Some(req.argv_strings());
+        path = Some(req.resolved.clone());
+    } else if !denied && (nr == libc::SYS_execve || nr == libc::SYS_execveat) {
         // execve(pathname, argv, envp):       args[1] = argv ptr
         // execveat(dirfd, pathname, argv, ..): args[2] = argv ptr
         let argv_ptr = if nr == libc::SYS_execveat {
@@ -2173,6 +2191,16 @@ async fn handle_notification(
         maybe_patch_vdso(notif.pid as i32, &mut pfs, policy);
     }
 
+    // Policy-checked execs take their own path: the relay carries the argv
+    // the policy judged, so nothing below applies to them.
+    {
+        let nr = notif.data.nr as i64;
+        if policy.argv_safety_required && (nr == libc::SYS_execve || nr == libc::SYS_execveat) {
+            handle_relay_exec(notif, ctx, dispatch_table, fd).await;
+            return;
+        }
+    }
+
     // Check dynamic path denials before dispatch. The gated syscall set is
     // shared with the BPF notif list so enforcement scope cannot drift from
     // interception scope; see `fs_denied_path_syscalls` for what is gated
@@ -2190,7 +2218,7 @@ async fn handle_notification(
                 drop(pfs);
                 // Let normal dispatch run first so /proc virtualization and
                 // other handlers still win for their paths.
-                let action = dispatch_table.dispatch(notif, fd).await;
+                let action = dispatch_table.dispatch(notif, fd, false).await;
                 // A bare `Continue` for openat/open is the racy window: the
                 // supervisor's resolution said "not denied", but the kernel
                 // re-resolves after Continue and a racing thread can swap a
@@ -2210,7 +2238,7 @@ async fn handle_notification(
                 }
             }
         } else {
-            dispatch_table.dispatch(notif, fd).await
+            dispatch_table.dispatch(notif, fd, false).await
         }
     };
 
@@ -2265,7 +2293,7 @@ async fn handle_notification(
     // Emit event to policy_fn callback if active. For execve, argv is
     // only populated after `exec_freeze` has stopped every possible
     // writer, and those tasks stay stopped until after NOTIF_SEND.
-    if let Some(verdict) = emit_policy_event(&notif, &action, &ctx.policy_fn, fd).await {
+    if let Some(verdict) = emit_policy_event(&notif, &action, &ctx.policy_fn, fd, None).await {
         use crate::policy_fn::Verdict;
         match verdict {
             Verdict::Deny => { action = NotifAction::Errno(libc::EPERM); }
@@ -2369,6 +2397,52 @@ async fn handle_notification(
         // reap the queued interrupts and detach.
         crate::freeze::reap_pending(&freeze.pending_tids);
     }
+}
+
+/// An execve under argv safety. The request is read once; that copy is what
+/// the policy sees and what the relay runs. The relay's own execve comes
+/// back through here already judged and only needs the exec handlers.
+async fn handle_relay_exec(
+    notif: SeccompNotif,
+    ctx: &Arc<super::ctx::SupervisorCtx>,
+    dispatch_table: &super::dispatch::DispatchTable,
+    fd: RawFd,
+) {
+    use crate::exec_relay::{self, Prepared};
+    let pending = match exec_relay::prepare(&notif, fd, ctx).await {
+        Err(errno) => {
+            let _ = send_response(fd, notif.id, NotifAction::Errno(errno));
+            return;
+        }
+        Ok(Prepared::SecondExec) => {
+            let mut action = dispatch_table.dispatch(notif, fd, true).await;
+            if matches!(action, NotifAction::Defer(_)) {
+                action = NotifAction::Errno(libc::EPERM);
+            }
+            let _ = send_response(fd, notif.id, action);
+            return;
+        }
+        Ok(Prepared::First(pending)) => pending,
+    };
+
+    let mut action = dispatch_table.dispatch(notif, fd, false).await;
+    if matches!(action, NotifAction::Defer(_)) {
+        action = NotifAction::Errno(libc::EPERM);
+    }
+    if let Some(verdict) = emit_policy_event(&notif, &action, &ctx.policy_fn, fd, Some(&pending.request)).await {
+        use crate::policy_fn::Verdict;
+        match verdict {
+            Verdict::Deny => action = NotifAction::Errno(libc::EPERM),
+            Verdict::DenyWith(errno) => action = NotifAction::Errno(errno),
+            Verdict::Audit | Verdict::Allow => {}
+        }
+    }
+    if matches!(action, NotifAction::Continue) {
+        if let Err(errno) = exec_relay::commit(pending, &notif, fd, ctx) {
+            action = NotifAction::Errno(errno);
+        }
+    }
+    let _ = send_response(fd, notif.id, action);
 }
 
 // ============================================================

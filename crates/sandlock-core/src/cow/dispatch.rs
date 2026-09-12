@@ -139,7 +139,7 @@ fn resolve_at_path_with_virtual(
     }
 }
 
-fn map_cow_upper_path(cow: &SeccompCowBranch, path: &str) -> String {
+pub(crate) fn map_cow_upper_path(cow: &SeccompCowBranch, path: &str) -> String {
     let path = PathBuf::from(path);
     if let Ok(rel) = path.strip_prefix(cow.upper_dir()) {
         return normalize_path(cow.workdir().join(rel)).to_string_lossy().into_owned();
