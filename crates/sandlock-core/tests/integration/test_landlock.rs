@@ -9,6 +9,57 @@ fn temp_file(name: &str) -> PathBuf {
     ))
 }
 
+/// Sibling dirs under the system temp dir for the named-socket tests. `out`
+/// holds what the sandbox writes and is the only write grant, so `sock` stays
+/// outside every write grant (Landlock grants are additive). The base is kept
+/// short because an AF_UNIX address caps at 108 bytes.
+struct SocketDirs {
+    base: PathBuf,
+    out: PathBuf,
+    sock: PathBuf,
+}
+
+fn socket_dirs(tag: &str) -> SocketDirs {
+    let base = std::env::temp_dir().join(format!("sl-{}-{}", std::process::id(), tag));
+    let _ = std::fs::remove_dir_all(&base);
+    let out = base.join("out");
+    let sock = base.join("sock");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::create_dir_all(&sock).unwrap();
+    let longest = sock.join("svc.dgram");
+    assert!(
+        longest.as_os_str().len() < 108,
+        "socket path {} exceeds the 108-byte AF_UNIX limit",
+        longest.display()
+    );
+    SocketDirs { base, out, sock }
+}
+
+fn spawn_listener(script: &str) -> std::process::Child {
+    std::process::Command::new("python3")
+        .args(["-c", script])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+fn await_listener_ready(listener: &mut std::process::Child, ready_file: &std::path::Path) {
+    for _ in 0..100 {
+        if ready_file.exists() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = listener.kill();
+    let mut stderr = String::new();
+    if let Some(mut e) = listener.stderr.take() {
+        use std::io::Read;
+        let _ = e.read_to_string(&mut stderr);
+    }
+    let _ = listener.wait();
+    panic!("listener should signal readiness; listener stderr: {stderr}");
+}
+
 #[tokio::test]
 async fn test_can_read_allowed_path() {
     let dir = temp_file("read-allowed-dir");
@@ -509,17 +560,13 @@ async fn test_named_unix_socket_connect_denied_without_fs_write() {
         return;
     }
 
-    // Socket lives under the cargo target tmpdir (a real host mount visible in
-    // the sandbox, unlike the virtualized /tmp), in a dir we grant READ only.
-    let sock_dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("named-unixsock-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&sock_dir);
+    let dirs = socket_dirs("named-unixsock");
+    let sock_dir = &dirs.sock;
     let sock_path = sock_dir.join("svc.sock");
     let _ = std::fs::remove_file(&sock_path);
 
-    // Result/ready files use the proven /tmp + fs_write("/tmp") pattern.
-    let out = temp_file("named-sock-result");
-    let ready_file = temp_file("named-sock-ready");
+    let out = dirs.out.join("result");
+    let ready_file = dirs.out.join("ready");
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&ready_file);
 
@@ -537,17 +584,8 @@ async fn test_named_unix_socket_connect_denied_without_fs_write() {
         sock = sock_path.display(),
         ready = ready_file.display(),
     );
-    let mut listener_proc = std::process::Command::new("python3")
-        .args(["-c", &listener_script])
-        .spawn()
-        .unwrap();
-    for _ in 0..100 {
-        if ready_file.exists() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    assert!(ready_file.exists(), "listener should signal readiness");
+    let mut listener_proc = spawn_listener(&listener_script);
+    await_listener_ready(&mut listener_proc, &ready_file);
 
     // Positive control: the unsandboxed test process can reach the socket, so a
     // negative result inside the sandbox is attributable to the gate, not a dead
@@ -585,7 +623,7 @@ async fn test_named_unix_socket_connect_denied_without_fs_write() {
         .fs_read("/etc")
         .fs_read("/proc")
         .fs_read("/dev")
-        .fs_write("/tmp")
+        .fs_write(dirs.out.to_str().unwrap())
         // socket dir is READable (path resolves) but NOT writable -> connect denied
         .fs_read(sock_dir.to_str().unwrap())
         .build()
@@ -612,7 +650,7 @@ async fn test_named_unix_socket_connect_denied_without_fs_write() {
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&ready_file);
     let _ = std::fs::remove_file(&sock_path);
-    let _ = std::fs::remove_dir_all(&sock_dir);
+    let _ = std::fs::remove_dir_all(&dirs.base);
 }
 
 // Selectivity guard for the gate above: the same connect that is denied under
@@ -626,14 +664,13 @@ async fn test_named_unix_socket_connect_allowed_with_fs_write() {
         return;
     }
 
-    let sock_dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("named-unixsock-rw-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&sock_dir);
+    let dirs = socket_dirs("named-unixsock-rw");
+    let sock_dir = &dirs.sock;
     let sock_path = sock_dir.join("svc.sock");
     let _ = std::fs::remove_file(&sock_path);
 
-    let out = temp_file("named-sock-rw-result");
-    let ready_file = temp_file("named-sock-rw-ready");
+    let out = dirs.out.join("result");
+    let ready_file = dirs.out.join("ready");
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&ready_file);
 
@@ -650,17 +687,8 @@ async fn test_named_unix_socket_connect_allowed_with_fs_write() {
         sock = sock_path.display(),
         ready = ready_file.display(),
     );
-    let mut listener_proc = std::process::Command::new("python3")
-        .args(["-c", &listener_script])
-        .spawn()
-        .unwrap();
-    for _ in 0..100 {
-        if ready_file.exists() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    assert!(ready_file.exists(), "listener should signal readiness");
+    let mut listener_proc = spawn_listener(&listener_script);
+    await_listener_ready(&mut listener_proc, &ready_file);
 
     let child_script = format!(
         concat!(
@@ -687,7 +715,7 @@ async fn test_named_unix_socket_connect_allowed_with_fs_write() {
         .fs_read("/etc")
         .fs_read("/proc")
         .fs_read("/dev")
-        .fs_write("/tmp")
+        .fs_write(dirs.out.to_str().unwrap())
         // socket dir is WRITE granted -> connect permitted
         .fs_write(sock_dir.to_str().unwrap())
         .build()
@@ -711,7 +739,7 @@ async fn test_named_unix_socket_connect_allowed_with_fs_write() {
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&ready_file);
     let _ = std::fs::remove_file(&sock_path);
-    let _ = std::fs::remove_dir_all(&sock_dir);
+    let _ = std::fs::remove_dir_all(&dirs.base);
 }
 
 // Allow-path hardening (stage 2): a symlink inside a WRITE-granted directory
@@ -726,20 +754,18 @@ async fn test_named_unix_socket_symlink_escape_denied() {
         return;
     }
 
-    let base = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("named-unixsock-symlink-{}", std::process::id()));
-    let granted = base.join("granted"); // fs_write granted
-    let outside = base.join("outside"); // NOT granted: the escape target
-    let _ = std::fs::create_dir_all(&granted);
-    let _ = std::fs::create_dir_all(&outside);
+    let dirs = socket_dirs("named-unixsock-symlink");
+    let granted = &dirs.sock; // fs_write granted
+    let outside = dirs.base.join("outside"); // NOT granted: the escape target
+    std::fs::create_dir_all(&outside).unwrap();
     let real_sock = outside.join("real.sock");
     let link_sock = granted.join("link.sock");
     let _ = std::fs::remove_file(&real_sock);
     let _ = std::fs::remove_file(&link_sock);
     std::os::unix::fs::symlink(&real_sock, &link_sock).unwrap();
 
-    let out = temp_file("named-sock-symlink-result");
-    let ready_file = temp_file("named-sock-symlink-ready");
+    let out = dirs.out.join("result");
+    let ready_file = dirs.out.join("ready");
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&ready_file);
 
@@ -757,17 +783,8 @@ async fn test_named_unix_socket_symlink_escape_denied() {
         sock = real_sock.display(),
         ready = ready_file.display(),
     );
-    let mut listener_proc = std::process::Command::new("python3")
-        .args(["-c", &listener_script])
-        .spawn()
-        .unwrap();
-    for _ in 0..100 {
-        if ready_file.exists() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    assert!(ready_file.exists(), "listener should signal readiness");
+    let mut listener_proc = spawn_listener(&listener_script);
+    await_listener_ready(&mut listener_proc, &ready_file);
 
     // Positive control: the symlink really does resolve and connect from outside
     // the sandbox, so the escape path is live and the sandbox must refuse it.
@@ -805,7 +822,7 @@ async fn test_named_unix_socket_symlink_escape_denied() {
         .fs_read("/etc")
         .fs_read("/proc")
         .fs_read("/dev")
-        .fs_write("/tmp")
+        .fs_write(dirs.out.to_str().unwrap())
         // the symlink's directory is writable; the real target's dir is NOT granted
         .fs_write(granted.to_str().unwrap())
         .build()
@@ -830,7 +847,7 @@ async fn test_named_unix_socket_symlink_escape_denied() {
     let _ = std::fs::remove_file(&ready_file);
     let _ = std::fs::remove_file(&real_sock);
     let _ = std::fs::remove_file(&link_sock);
-    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&dirs.base);
 }
 
 // Datagram vector: a unix SOCK_DGRAM `sendto()` to a named socket reaches it
@@ -844,14 +861,13 @@ async fn test_named_unix_dgram_sendto_denied_without_fs_write() {
         return;
     }
 
-    let sock_dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("named-unixdgram-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&sock_dir);
+    let dirs = socket_dirs("named-unixdgram");
+    let sock_dir = &dirs.sock;
     let sock_path = sock_dir.join("svc.dgram");
     let _ = std::fs::remove_file(&sock_path);
 
-    let out = temp_file("named-dgram-result");
-    let ready_file = temp_file("named-dgram-ready");
+    let out = dirs.out.join("result");
+    let ready_file = dirs.out.join("ready");
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&ready_file);
 
@@ -868,17 +884,8 @@ async fn test_named_unix_dgram_sendto_denied_without_fs_write() {
         sock = sock_path.display(),
         ready = ready_file.display(),
     );
-    let mut listener_proc = std::process::Command::new("python3")
-        .args(["-c", &listener_script])
-        .spawn()
-        .unwrap();
-    for _ in 0..100 {
-        if ready_file.exists() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    assert!(ready_file.exists(), "listener should signal readiness");
+    let mut listener_proc = spawn_listener(&listener_script);
+    await_listener_ready(&mut listener_proc, &ready_file);
 
     let child_script = format!(
         concat!(
@@ -905,7 +912,7 @@ async fn test_named_unix_dgram_sendto_denied_without_fs_write() {
         .fs_read("/etc")
         .fs_read("/proc")
         .fs_read("/dev")
-        .fs_write("/tmp")
+        .fs_write(dirs.out.to_str().unwrap())
         // socket dir is READable but NOT writable -> sendto denied
         .fs_read(sock_dir.to_str().unwrap())
         .build()
@@ -929,7 +936,7 @@ async fn test_named_unix_dgram_sendto_denied_without_fs_write() {
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&ready_file);
     let _ = std::fs::remove_file(&sock_path);
-    let _ = std::fs::remove_dir_all(&sock_dir);
+    let _ = std::fs::remove_dir_all(&dirs.base);
 }
 
 // sendmsg() is an equivalent datagram path to sendto() (the address sits in
@@ -942,14 +949,13 @@ async fn test_named_unix_dgram_sendmsg_denied_without_fs_write() {
         return;
     }
 
-    let sock_dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("named-unixmsg-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&sock_dir);
+    let dirs = socket_dirs("named-unixmsg");
+    let sock_dir = &dirs.sock;
     let sock_path = sock_dir.join("svc.dgram");
     let _ = std::fs::remove_file(&sock_path);
 
-    let out = temp_file("named-msg-result");
-    let ready_file = temp_file("named-msg-ready");
+    let out = dirs.out.join("result");
+    let ready_file = dirs.out.join("ready");
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&ready_file);
 
@@ -965,17 +971,8 @@ async fn test_named_unix_dgram_sendmsg_denied_without_fs_write() {
         sock = sock_path.display(),
         ready = ready_file.display(),
     );
-    let mut listener_proc = std::process::Command::new("python3")
-        .args(["-c", &listener_script])
-        .spawn()
-        .unwrap();
-    for _ in 0..100 {
-        if ready_file.exists() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    assert!(ready_file.exists(), "listener should signal readiness");
+    let mut listener_proc = spawn_listener(&listener_script);
+    await_listener_ready(&mut listener_proc, &ready_file);
 
     // sendmsg with msg_name set to the named socket address.
     let child_script = format!(
@@ -1003,7 +1000,7 @@ async fn test_named_unix_dgram_sendmsg_denied_without_fs_write() {
         .fs_read("/etc")
         .fs_read("/proc")
         .fs_read("/dev")
-        .fs_write("/tmp")
+        .fs_write(dirs.out.to_str().unwrap())
         .fs_read(sock_dir.to_str().unwrap())
         .build()
         .unwrap();
@@ -1026,7 +1023,7 @@ async fn test_named_unix_dgram_sendmsg_denied_without_fs_write() {
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&ready_file);
     let _ = std::fs::remove_file(&sock_path);
-    let _ = std::fs::remove_dir_all(&sock_dir);
+    let _ = std::fs::remove_dir_all(&dirs.base);
 }
 
 // Allow+delivery guard for the datagram on-behalf send paths: a sendto/sendmsg
@@ -1042,15 +1039,14 @@ async fn dgram_allow_delivers(which: &str, tag: &str, net_allow: Option<&str>) {
         return;
     }
 
-    let sock_dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("named-dgram-allow-{}-{}", tag, std::process::id()));
-    let _ = std::fs::create_dir_all(&sock_dir);
+    let dirs = socket_dirs(&format!("named-dgram-allow-{tag}"));
+    let sock_dir = &dirs.sock;
     let sock_path = sock_dir.join("svc.dgram");
     let _ = std::fs::remove_file(&sock_path);
 
-    let out = temp_file(&format!("dgram-allow-{tag}-result"));
-    let ready_file = temp_file(&format!("dgram-allow-{tag}-ready"));
-    let recv_file = temp_file(&format!("dgram-allow-{tag}-recv"));
+    let out = dirs.out.join("result");
+    let ready_file = dirs.out.join("ready");
+    let recv_file = dirs.out.join("recv");
     for f in [&out, &ready_file, &recv_file] {
         let _ = std::fs::remove_file(f);
     }
@@ -1074,17 +1070,8 @@ async fn dgram_allow_delivers(which: &str, tag: &str, net_allow: Option<&str>) {
         ready = ready_file.display(),
         recv = recv_file.display(),
     );
-    let mut listener_proc = std::process::Command::new("python3")
-        .args(["-c", &listener_script])
-        .spawn()
-        .unwrap();
-    for _ in 0..100 {
-        if ready_file.exists() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    assert!(ready_file.exists(), "listener should signal readiness");
+    let mut listener_proc = spawn_listener(&listener_script);
+    await_listener_ready(&mut listener_proc, &ready_file);
 
     let send_call = if which == "sendmsg" {
         format!("s.sendmsg([b'payload-42'], [], 0, '{}')", sock_path.display())
@@ -1116,7 +1103,7 @@ async fn dgram_allow_delivers(which: &str, tag: &str, net_allow: Option<&str>) {
         .fs_read("/etc")
         .fs_read("/proc")
         .fs_read("/dev")
-        .fs_write("/tmp")
+        .fs_write(dirs.out.to_str().unwrap())
         // socket dir is WRITE granted -> send permitted, on-behalf
         .fs_write(sock_dir.to_str().unwrap());
     // A non-empty net_allow turns on the destination policy, which is what makes
@@ -1160,7 +1147,7 @@ async fn dgram_allow_delivers(which: &str, tag: &str, net_allow: Option<&str>) {
     for f in [&out, &ready_file, &recv_file, &sock_path] {
         let _ = std::fs::remove_file(f);
     }
-    let _ = std::fs::remove_dir_all(&sock_dir);
+    let _ = std::fs::remove_dir_all(&dirs.base);
 }
 
 #[tokio::test]
@@ -1211,14 +1198,13 @@ async fn test_named_unix_dgram_sendmmsg_denied_without_fs_write() {
         return;
     }
 
-    let sock_dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("named-unixmmsg-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&sock_dir);
+    let dirs = socket_dirs("named-unixmmsg");
+    let sock_dir = &dirs.sock;
     let sock_path = sock_dir.join("svc.dgram");
     let _ = std::fs::remove_file(&sock_path);
 
-    let out = temp_file("named-mmsg-result");
-    let ready_file = temp_file("named-mmsg-ready");
+    let out = dirs.out.join("result");
+    let ready_file = dirs.out.join("ready");
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&ready_file);
 
@@ -1234,17 +1220,8 @@ async fn test_named_unix_dgram_sendmmsg_denied_without_fs_write() {
         sock = sock_path.display(),
         ready = ready_file.display(),
     );
-    let mut listener_proc = std::process::Command::new("python3")
-        .args(["-c", &listener_script])
-        .spawn()
-        .unwrap();
-    for _ in 0..100 {
-        if ready_file.exists() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    assert!(ready_file.exists(), "listener should signal readiness");
+    let mut listener_proc = spawn_listener(&listener_script);
+    await_listener_ready(&mut listener_proc, &ready_file);
 
     let child_script = format!("{}{}", sendmmsg_ctypes_preamble(), format!(
         concat!(
@@ -1263,7 +1240,7 @@ async fn test_named_unix_dgram_sendmmsg_denied_without_fs_write() {
         .fs_read("/etc")
         .fs_read("/proc")
         .fs_read("/dev")
-        .fs_write("/tmp")
+        .fs_write(dirs.out.to_str().unwrap())
         .fs_read(sock_dir.to_str().unwrap())
         .build()
         .unwrap();
@@ -1286,7 +1263,7 @@ async fn test_named_unix_dgram_sendmmsg_denied_without_fs_write() {
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&ready_file);
     let _ = std::fs::remove_file(&sock_path);
-    let _ = std::fs::remove_dir_all(&sock_dir);
+    let _ = std::fs::remove_dir_all(&dirs.base);
 }
 
 // Python ctypes preamble defining `send_one(path, data)` which issues a
@@ -1333,15 +1310,14 @@ async fn test_named_unix_dgram_sendmmsg_allowed_delivers() {
         return;
     }
 
-    let sock_dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("named-unixmmsg-rw-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&sock_dir);
+    let dirs = socket_dirs("named-unixmmsg-rw");
+    let sock_dir = &dirs.sock;
     let sock_path = sock_dir.join("svc.dgram");
     let _ = std::fs::remove_file(&sock_path);
 
-    let out = temp_file("named-mmsg-rw-result");
-    let ready_file = temp_file("named-mmsg-rw-ready");
-    let recv_file = temp_file("named-mmsg-rw-recv");
+    let out = dirs.out.join("result");
+    let ready_file = dirs.out.join("ready");
+    let recv_file = dirs.out.join("recv");
     for f in [&out, &ready_file, &recv_file] {
         let _ = std::fs::remove_file(f);
     }
@@ -1364,17 +1340,8 @@ async fn test_named_unix_dgram_sendmmsg_allowed_delivers() {
         ready = ready_file.display(),
         recv = recv_file.display(),
     );
-    let mut listener_proc = std::process::Command::new("python3")
-        .args(["-c", &listener_script])
-        .spawn()
-        .unwrap();
-    for _ in 0..100 {
-        if ready_file.exists() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    assert!(ready_file.exists(), "listener should signal readiness");
+    let mut listener_proc = spawn_listener(&listener_script);
+    await_listener_ready(&mut listener_proc, &ready_file);
 
     let child_script = format!("{}{}", sendmmsg_ctypes_preamble(), format!(
         concat!(
@@ -1393,7 +1360,7 @@ async fn test_named_unix_dgram_sendmmsg_allowed_delivers() {
         .fs_read("/etc")
         .fs_read("/proc")
         .fs_read("/dev")
-        .fs_write("/tmp")
+        .fs_write(dirs.out.to_str().unwrap())
         .fs_write(sock_dir.to_str().unwrap())
         .build()
         .unwrap();
@@ -1427,7 +1394,7 @@ async fn test_named_unix_dgram_sendmmsg_allowed_delivers() {
     for f in [&out, &ready_file, &recv_file, &sock_path] {
         let _ = std::fs::remove_file(f);
     }
-    let _ = std::fs::remove_dir_all(&sock_dir);
+    let _ = std::fs::remove_dir_all(&dirs.base);
 }
 
 #[tokio::test]

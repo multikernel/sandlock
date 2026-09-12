@@ -25,6 +25,43 @@ const STUB_BASE: u64 = 0x30_0000_0000;
 const STUB_BASE: u64 = 0;
 const STUB_SPAN: u64 = 0x40_0000;
 
+/// Points this process's stdout and stderr at `path` for the guard's lifetime.
+/// The checkpointed child inherits them and the restore stub reopens whatever
+/// they name, so the test must pick a path inside its own grants rather than
+/// inherit the test runner's stdout, which may be a file the policy denies.
+struct StdioRedirect {
+    saved: [libc::c_int; 2],
+}
+
+impl StdioRedirect {
+    fn to_file(path: &std::path::Path) -> Self {
+        use std::os::unix::io::AsRawFd;
+        let file = std::fs::File::create(path).unwrap();
+        let saved = unsafe {
+            [
+                libc::fcntl(1, libc::F_DUPFD_CLOEXEC, 3),
+                libc::fcntl(2, libc::F_DUPFD_CLOEXEC, 3),
+            ]
+        };
+        assert!(saved[0] >= 0 && saved[1] >= 0, "saving stdio fds");
+        let fd = file.as_raw_fd();
+        let redirected = unsafe { libc::dup2(fd, 1) == 1 && libc::dup2(fd, 2) == 2 };
+        assert!(redirected, "redirecting stdio");
+        Self { saved }
+    }
+}
+
+impl Drop for StdioRedirect {
+    fn drop(&mut self) {
+        unsafe {
+            libc::dup2(self.saved[0], 1);
+            libc::dup2(self.saved[1], 2);
+            libc::close(self.saved[0]);
+            libc::close(self.saved[1]);
+        }
+    }
+}
+
 /// Parse `/proc/<pid>/maps` into `(start, end, path)` triples.
 fn read_maps(pid: i32) -> Vec<(u64, u64, String)> {
     std::fs::read_to_string(format!("/proc/{pid}/maps"))
@@ -83,8 +120,11 @@ async fn test_restore_glibc_vdso_program_resumes() {
 
     let helper_s = helper.to_str().unwrap().to_string();
     let mut sb = policy.clone().with_name("vdso-src");
-    sb.spawn_interactive(&[helper_s.as_str(), "clock-loop", counter_s.as_str()])
-        .await.unwrap();
+    {
+        let _stdio = StdioRedirect::to_file(&tmp.join("helper.log"));
+        sb.spawn_interactive(&[helper_s.as_str(), "clock-loop", counter_s.as_str()])
+            .await.unwrap();
+    }
 
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
