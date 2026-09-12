@@ -1256,20 +1256,24 @@ pub(crate) fn read_exec_ptr_array(
     }
 }
 
-/// Read exactly `len` bytes starting at `addr`, chunked at page boundaries.
-fn read_exec_range(
+/// Whether the `len` bytes at `addr` hold no NUL. Checked one page at a time
+/// so the scan stops at a string's terminator before touching a later page,
+/// which may be unmapped: musl's allocator leaves gaps between chunks.
+fn nul_free_run(
     read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>, NotifError>,
     addr: u64,
     len: usize,
-) -> Result<Vec<u8>, NotifError> {
-    let mut out = Vec::with_capacity(len);
+) -> Result<bool, NotifError> {
+    let end = addr + len as u64;
     let mut cur = addr;
-    while out.len() < len {
-        let chunk = ((4096 - cur % 4096) as usize).min(len - out.len());
-        out.extend_from_slice(&read(cur, chunk)?);
+    while cur < end {
+        let chunk = ((4096 - cur % 4096) as usize).min((end - cur) as usize);
+        if read(cur, chunk)?.contains(&0) {
+            return Ok(false);
+        }
         cur += chunk as u64;
     }
-    Ok(out)
+    Ok(true)
 }
 
 /// Read a NUL-terminated string (NUL excluded) of at most
@@ -1358,8 +1362,7 @@ fn plan_exec_rewrite(
     below.dedup();
     let mut nul_free_from = path_ptr;
     for &p in below.iter().rev() {
-        let seg = read_exec_range(read, p, (nul_free_from - p) as usize)?;
-        if seg.contains(&0) {
+        if !nul_free_run(read, p, (nul_free_from - p) as usize)? {
             break;
         }
         relocate(&mut buf, &mut relocated, read, p)?;
