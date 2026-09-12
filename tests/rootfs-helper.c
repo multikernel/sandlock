@@ -12,6 +12,7 @@
  */
 #define _GNU_SOURCE
 #include <dirent.h>
+#include <sched.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -851,10 +852,45 @@ static int cmd_write_fd_link(int argc, char **argv) {
     return 0;
 }
 
+/* ── argv-race (argv policy TOCTOU probe) ─────────────────────────────────── */
+/* A sibling thread keeps swapping the word argv[1] points at between
+ * "allowed" and "blocked" while the main thread execs /bin/echo with it.
+ * Both words are eight bytes including the NUL, stored as one aligned
+ * 64-bit write, so the kernel never sees a torn value. */
+static union { char s[16]; unsigned long long w[2]; } race_buf __attribute__((aligned(8)));
+
+static int race_flipper(void *arg) {
+    unsigned long long allowed, blocked;
+    (void)arg;
+    memcpy(&allowed, "allowed", 8);
+    memcpy(&blocked, "blocked", 8);
+    for (;;) {
+        *(volatile unsigned long long *)&race_buf.w[0] = blocked;
+        *(volatile unsigned long long *)&race_buf.w[0] = allowed;
+    }
+    return 0;
+}
+
+static int cmd_argv_race(int argc, char **argv) {
+    (void)argc; (void)argv;
+    size_t sz = 64 * 1024;
+    char *stack = malloc(sz);
+    if (!stack) { perror("argv-race: malloc"); return 3; }
+    memcpy(race_buf.s, "allowed", 8);
+    int flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM;
+    if (clone(race_flipper, stack + sz, flags, NULL) < 0) { perror("argv-race: clone"); return 3; }
+    usleep(200);
+    char *args[] = { "echo", race_buf.s, NULL };
+    execv("/bin/echo", args);
+    fprintf(stderr, "EXEC_FAILED %d\n", errno);
+    return 3;
+}
+
 /* ── dispatch ───────────────────────────────────────────────── */
 
 static int dispatch(const char *cmd, int argc, char **argv) {
     if (strcmp(cmd, "chdir") == 0)          return cmd_chdir(argc, argv);
+    if (strcmp(cmd, "argv-race") == 0)      return cmd_argv_race(argc, argv);
     if (strcmp(cmd, "fchdir") == 0)         return cmd_fchdir(argc, argv);
     if (strcmp(cmd, "openat2") == 0)        return cmd_openat2(argc, argv);
     if (strcmp(cmd, "chdir-self") == 0)     return cmd_chdir_self(argc, argv);

@@ -1224,7 +1224,7 @@ struct ExecRewritePlan {
 /// Read a NULL-terminated pointer array (argv or envp) from child memory.
 /// Chunked at page boundaries because a single straddling read fails whole
 /// if any page is unmapped, and mappings are page-granular.
-fn read_exec_ptr_array(
+pub(crate) fn read_exec_ptr_array(
     read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>, NotifError>,
     base: u64,
 ) -> Result<Vec<u64>, NotifError> {
@@ -1256,25 +1256,29 @@ fn read_exec_ptr_array(
     }
 }
 
-/// Read exactly `len` bytes starting at `addr`, chunked at page boundaries.
-fn read_exec_range(
+/// Whether the `len` bytes at `addr` hold no NUL. Checked one page at a time
+/// so the scan stops at a string's terminator before touching a later page,
+/// which may be unmapped: musl's allocator leaves gaps between chunks.
+fn nul_free_run(
     read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>, NotifError>,
     addr: u64,
     len: usize,
-) -> Result<Vec<u8>, NotifError> {
-    let mut out = Vec::with_capacity(len);
+) -> Result<bool, NotifError> {
+    let end = addr + len as u64;
     let mut cur = addr;
-    while out.len() < len {
-        let chunk = ((4096 - cur % 4096) as usize).min(len - out.len());
-        out.extend_from_slice(&read(cur, chunk)?);
+    while cur < end {
+        let chunk = ((4096 - cur % 4096) as usize).min((end - cur) as usize);
+        if read(cur, chunk)?.contains(&0) {
+            return Ok(false);
+        }
         cur += chunk as u64;
     }
-    Ok(out)
+    Ok(true)
 }
 
 /// Read a NUL-terminated string (NUL excluded) of at most
 /// `EXEC_MAX_ARG_STRLEN` bytes, chunked at page boundaries.
-fn read_exec_cstr(
+pub(crate) fn read_exec_cstr(
     read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>, NotifError>,
     addr: u64,
 ) -> Result<Vec<u8>, NotifError> {
@@ -1358,8 +1362,7 @@ fn plan_exec_rewrite(
     below.dedup();
     let mut nul_free_from = path_ptr;
     for &p in below.iter().rev() {
-        let seg = read_exec_range(read, p, (nul_free_from - p) as usize)?;
-        if seg.contains(&0) {
+        if !nul_free_run(read, p, (nul_free_from - p) as usize)? {
             break;
         }
         relocate(&mut buf, &mut relocated, read, p)?;
@@ -1435,8 +1438,22 @@ pub(crate) fn rewrite_exec_path_to_fd(
     child_fd: i32,
 ) -> Result<(), NotifError> {
     let fd_path = format!("/proc/self/fd/{}\0", child_fd);
+    rewrite_exec_path(notif_fd, id, pid, path_ptr, argv_ptr, envp_ptr, fd_path.as_bytes())
+}
+
+/// Rewrite the child's exec path to `new_path` (NUL included), relocating
+/// any argv/envp string the new bytes would overwrite.
+pub(crate) fn rewrite_exec_path(
+    notif_fd: RawFd,
+    id: u64,
+    pid: u32,
+    path_ptr: u64,
+    argv_ptr: u64,
+    envp_ptr: u64,
+    new_path: &[u8],
+) -> Result<(), NotifError> {
     let mut read = |addr: u64, len: usize| read_child_mem(notif_fd, id, pid, addr, len);
-    let plan = plan_exec_rewrite(&mut read, path_ptr, fd_path.as_bytes(), argv_ptr, envp_ptr)?;
+    let plan = plan_exec_rewrite(&mut read, path_ptr, new_path, argv_ptr, envp_ptr)?;
     write_child_mem_force(notif_fd, id, pid, path_ptr, &plan.buf)?;
     for (slot, new_ptr) in plan.patches {
         write_child_mem_force(notif_fd, id, pid, slot, &new_ptr.to_ne_bytes())?;
@@ -1885,6 +1902,7 @@ async fn emit_policy_event(
     action: &NotifAction,
     policy_fn_state: &Arc<tokio::sync::Mutex<super::state::PolicyFnState>>,
     notif_fd: RawFd,
+    exec: Option<&crate::exec_relay::ExecRequest>,
 ) -> Option<crate::policy_fn::Verdict> {
     let pfs = policy_fn_state.lock().await;
     let tx = match pfs.event_tx.as_ref() {
@@ -1928,7 +1946,10 @@ async fn emit_policy_event(
     let mut path2 = None;
     let mut flags = None;
 
-    if !denied && (nr == libc::SYS_execve || nr == libc::SYS_execveat) {
+    if let Some(req) = exec {
+        argv = Some(req.argv_strings());
+        path = Some(req.resolved.clone());
+    } else if !denied && (nr == libc::SYS_execve || nr == libc::SYS_execveat) {
         // execve(pathname, argv, envp):       args[1] = argv ptr
         // execveat(dirfd, pathname, argv, ..): args[2] = argv ptr
         let argv_ptr = if nr == libc::SYS_execveat {
@@ -2173,6 +2194,16 @@ async fn handle_notification(
         maybe_patch_vdso(notif.pid as i32, &mut pfs, policy);
     }
 
+    // Policy-checked execs take their own path: the relay carries the argv
+    // the policy judged, so nothing below applies to them.
+    {
+        let nr = notif.data.nr as i64;
+        if policy.argv_safety_required && (nr == libc::SYS_execve || nr == libc::SYS_execveat) {
+            handle_relay_exec(notif, ctx, dispatch_table, fd).await;
+            return;
+        }
+    }
+
     // Check dynamic path denials before dispatch. The gated syscall set is
     // shared with the BPF notif list so enforcement scope cannot drift from
     // interception scope; see `fs_denied_path_syscalls` for what is gated
@@ -2190,7 +2221,7 @@ async fn handle_notification(
                 drop(pfs);
                 // Let normal dispatch run first so /proc virtualization and
                 // other handlers still win for their paths.
-                let action = dispatch_table.dispatch(notif, fd).await;
+                let action = dispatch_table.dispatch(notif, fd, false).await;
                 // A bare `Continue` for openat/open is the racy window: the
                 // supervisor's resolution said "not denied", but the kernel
                 // re-resolves after Continue and a racing thread can swap a
@@ -2210,62 +2241,23 @@ async fn handle_notification(
                 }
             }
         } else {
-            dispatch_table.dispatch(notif, fd).await
+            dispatch_table.dispatch(notif, fd, false).await
         }
     };
 
-    let nr = notif.data.nr as i64;
     let fork_counted = matches!(action, NotifAction::Continue)
         && crate::resource::fork_counted_on_continue(&notif, fd);
 
-    // TOCTOU-close for execve (issue #27): freeze every sandbox task
-    // that could mutate argv before policy_fn reads argv and before the
-    // kernel re-reads it after Continue. This covers two writer classes:
-    //   1. Sibling threads of the calling tid (same TGID, share mm).
-    //   2. Peer processes in other TGIDs that alias argv pages via
-    //      MAP_SHARED mappings or share mm via clone(CLONE_VM).
-    //
-    // The freeze enumerates ProcessIndex. With policy_fn active, that
-    // index is complete: fork-like syscalls are traced at creation time
-    // below, before new children can run user code.
-    //
-    // Strict on failure: if we cannot establish the freeze, we cannot
-    // safely expose argv or allow execve, so we deny with EPERM.
-    let mut exec_freeze = None;
-    if matches!(action, NotifAction::Continue)
-        && policy.argv_safety_required
-        && crate::freeze::requires_freeze_on_continue(nr)
-    {
-        match crate::freeze::freeze_sandbox_for_execve(
-            &ctx.processes,
-            notif.pid as i32,
-        ) {
-            Ok(outcome) => {
-                exec_freeze = Some(outcome);
-            }
-            Err(e) => {
-                eprintln!(
-                    "sandlock: argv-safety freeze failed for pid {}: {} \
-                     — denying execve to preserve TOCTOU invariant",
-                    notif.pid, e
-                );
-                action = NotifAction::Errno(libc::EPERM);
-                // Rollback could not release tasks that had not entered
-                // ptrace-stop yet; carry them to the post-send reap.
-                if !e.pending_tids.is_empty() {
-                    exec_freeze = Some(crate::freeze::SandboxFreeze {
-                        pending_tids: e.pending_tids,
-                        ..Default::default()
-                    });
-                }
-            }
-        }
-    }
-
-    // Emit event to policy_fn callback if active. For execve, argv is
-    // only populated after `exec_freeze` has stopped every possible
-    // writer, and those tasks stay stopped until after NOTIF_SEND.
-    if let Some(verdict) = emit_policy_event(&notif, &action, &ctx.policy_fn, fd).await {
+    // Emit event to policy_fn callback if active. A running exec relay's own
+    // syscalls are hidden: observers would otherwise record the memfd as
+    // the program that ran.
+    let relay_internal = policy.argv_safety_required && ctx.exec_relay.is_relay_task(notif.pid as i32);
+    let verdict = if relay_internal {
+        None
+    } else {
+        emit_policy_event(&notif, &action, &ctx.policy_fn, fd, None).await
+    };
+    if let Some(verdict) = verdict {
         use crate::policy_fn::Verdict;
         match verdict {
             Verdict::Deny => { action = NotifAction::Errno(libc::EPERM); }
@@ -2279,49 +2271,11 @@ async fn handle_notification(
         crate::resource::rollback_fork_count(&ctx.resource).await;
     }
 
-    // With policy_fn active, fork-like syscalls are traced for exactly
-    // one ptrace event so ProcessIndex becomes complete before the new
-    // child can run user code. That closes the race where a peer
-    // process could exist without ever having produced a notification.
-    let mut creation_trace = None;
-    if matches!(action, NotifAction::Continue)
-        && crate::resource::requires_process_creation_tracking(&notif, fd, policy)
-    {
-        match crate::resource::prepare_process_creation_tracking(ctx, notif.pid as i32).await {
-            Ok(trace) => {
-                creation_trace = Some(trace);
-            }
-            Err(e) => {
-                eprintln!(
-                    "sandlock: process-creation tracking failed for pid {}: {} \
-                     — denying fork-like syscall to preserve argv TOCTOU invariant",
-                    notif.pid, e
-                );
-                if fork_counted {
-                    crate::resource::rollback_fork_count(&ctx.resource).await;
-                }
-                action = NotifAction::Errno(libc::EPERM);
-            }
-        }
-    }
-
     // Deferred response: run the handler's future on a worker task so the
     // single supervisor loop is not blocked waiting for slow work (a network
     // round-trip, a blocking syscall). The trapped child stays parked in the
     // syscall; the worker sends the real response later, keyed by notif.id.
-    //
-    // Deferral is refused on syscalls whose Continue path requires the
-    // execve argv-safety freeze or fork creation-tracking: sending the
-    // response off-loop would skip that TOCTOU-closing work. (When `action`
-    // is Defer it is not Continue, so `exec_freeze`/`creation_trace` above
-    // are already None — there is nothing to unwind here.)
     if let NotifAction::Defer(deferred) = action {
-        if crate::freeze::requires_freeze_on_continue(nr)
-            || crate::resource::requires_process_creation_tracking(&notif, fd, policy)
-        {
-            let _ = send_response(fd, notif.id, NotifAction::Errno(libc::EPERM));
-            return;
-        }
         match Arc::clone(defer_sem).try_acquire_owned() {
             Ok(permit) => spawn_deferred(fd, notif.id, deferred, permit),
             // Too many deferrals in flight: fail fast with EAGAIN rather than
@@ -2333,42 +2287,54 @@ async fn handle_notification(
         return;
     }
 
-    // Ignore error — child may have exited between recv and response.
-    let exec_continued = exec_freeze.is_some() && matches!(action, NotifAction::Continue);
-    let send_result = send_response(fd, notif.id, action);
+    // Ignore error: the child may have exited between recv and response.
+    let _ = send_response(fd, notif.id, action);
+}
 
-    if let Some(trace) = creation_trace {
-        if send_result.is_ok() {
-            match crate::resource::finish_process_creation_tracking(trace).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    crate::resource::rollback_fork_count(&ctx.resource).await;
-                }
-                Err(e) => {
-                    crate::resource::rollback_fork_count(&ctx.resource).await;
-                    eprintln!(
-                        "sandlock: process-creation tracking completion failed for pid {}: {}",
-                        notif.pid, e
-                    );
-                }
+/// An execve under argv safety. The request is read once; that copy is what
+/// the policy sees and what the relay runs. The relay's own execve comes
+/// back through here already judged and only needs the exec handlers.
+async fn handle_relay_exec(
+    notif: SeccompNotif,
+    ctx: &Arc<super::ctx::SupervisorCtx>,
+    dispatch_table: &super::dispatch::DispatchTable,
+    fd: RawFd,
+) {
+    use crate::exec_relay::{self, Prepared};
+    let pending = match exec_relay::prepare(&notif, fd, ctx).await {
+        Err(errno) => {
+            let _ = send_response(fd, notif.id, NotifAction::Errno(errno));
+            return;
+        }
+        Ok(Prepared::SecondExec) => {
+            let mut action = dispatch_table.dispatch(notif, fd, true).await;
+            if matches!(action, NotifAction::Defer(_)) {
+                action = NotifAction::Errno(libc::EPERM);
             }
-        } else {
-            crate::resource::rollback_fork_count(&ctx.resource).await;
-            crate::resource::abort_process_creation_tracking(trace).await;
+            let _ = send_response(fd, notif.id, action);
+            return;
         }
-    }
+        Ok(Prepared::First(pending)) => pending,
+    };
 
-    if let Some(freeze) = exec_freeze {
-        if exec_continued && send_result.is_ok() {
-            crate::freeze::detach_peers(&freeze.peer_tids);
-        } else {
-            crate::freeze::detach_all(&freeze);
-        }
-        // Now that the response is out, the kernel wait holding any pending
-        // task (the vfork parent waiting on this very execve) can clear;
-        // reap the queued interrupts and detach.
-        crate::freeze::reap_pending(&freeze.pending_tids);
+    let mut action = dispatch_table.dispatch(notif, fd, false).await;
+    if matches!(action, NotifAction::Defer(_)) {
+        action = NotifAction::Errno(libc::EPERM);
     }
+    if let Some(verdict) = emit_policy_event(&notif, &action, &ctx.policy_fn, fd, Some(&pending.request)).await {
+        use crate::policy_fn::Verdict;
+        match verdict {
+            Verdict::Deny => action = NotifAction::Errno(libc::EPERM),
+            Verdict::DenyWith(errno) => action = NotifAction::Errno(errno),
+            Verdict::Audit | Verdict::Allow => {}
+        }
+    }
+    if matches!(action, NotifAction::Continue) {
+        if let Err(errno) = exec_relay::commit(pending, &notif, fd, ctx) {
+            action = NotifAction::Errno(errno);
+        }
+    }
+    let _ = send_response(fd, notif.id, action);
 }
 
 // ============================================================

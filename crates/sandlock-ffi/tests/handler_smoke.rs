@@ -291,9 +291,10 @@ fn fake_ctx() -> HandlerCtx {
                 arch: 0xC000003E,
                 instruction_pointer: 0,
                 args: [0; 6],
-            },
+    },
         },
         notif_fd: -1,
+        relay_exec: false,
     }
 }
 
@@ -356,9 +357,10 @@ fn fake_ctx_with_isolated_child() -> (HandlerCtx, std::process::Child) {
                 arch: 0xC000003E,
                 instruction_pointer: 0,
                 args: [0; 6],
-            },
+    },
         },
         notif_fd: -1,
+        relay_exec: false,
     };
     (ctx, child)
 }
@@ -835,9 +837,10 @@ async fn ffi_handler_translates_kill_zero_pgid_substitutes_child_pgid() {
                 arch: 0xC000_003E,
                 instruction_pointer: 0,
                 args: [0; 6],
-            },
+    },
         },
         notif_fd: -1,
+        relay_exec: false,
     };
     let action = h.handle(&cx).await;
 
@@ -872,9 +875,10 @@ fn fake_ctx_with_pid(pid: u32) -> HandlerCtx {
                 arch: 0xC000_003E,
                 instruction_pointer: 0,
                 args: [0; 6],
-            },
+    },
         },
         notif_fd: -1,
+        relay_exec: false,
     }
 }
 

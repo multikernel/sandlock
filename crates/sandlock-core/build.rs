@@ -102,6 +102,38 @@ fn main() {
     // Emit the path every run (rustc-env is not cached across build-script runs),
     // whether or not the binary was just (re)built.
     println!("cargo:rustc-env=RESTORE_STUB_PATH={}", stub_bin.display());
+
+    // exec-relay: the supervisor execs it in place of every policy-checked
+    // execve, so unlike the restore stub it is embedded into the crate and
+    // must build for every target; a missing compiler is a hard error.
+    let relay_src = manifest_dir.join("src/exec_relay/relay.c");
+    let relay_bin = out_dir.join("exec-relay");
+    let relay_ccs: &[&str] = if is_riscv64 && !host.starts_with("riscv64") {
+        &["riscv64-linux-gnu-gcc", "riscv64-unknown-linux-gnu-gcc"]
+    } else if target.starts_with("aarch64") && !host.starts_with("aarch64") {
+        &["aarch64-linux-gnu-gcc"]
+    } else {
+        &["cc"]
+    };
+    if !build_static(
+        &relay_src,
+        &relay_bin,
+        relay_ccs,
+        &[
+            "-static",
+            "-nostdlib",
+            "-no-pie",
+            "-fPIE",
+            "-O2",
+            "-ffreestanding",
+            "-fno-builtin",
+            "-fno-tree-loop-distribute-patterns",
+            "-fno-stack-protector",
+        ],
+    ) {
+        panic!("failed to compile exec-relay for {target}: no working C compiler");
+    }
+    println!("cargo:rustc-env=EXEC_RELAY_PATH={}", relay_bin.display());
 }
 
 /// Compile `src` to `bin` with the first working compiler in `ccs`, skipping the

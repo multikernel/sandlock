@@ -194,7 +194,7 @@ async fn test_policy_fn_passthrough() {
     assert!(count > 0, "callback should have been called at least once, got {}", count);
 }
 
-/// Test execve events include argv (TOCTOU-safe via sibling freeze).
+/// Test execve events include argv (what the relay then runs).
 #[tokio::test]
 async fn test_policy_fn_execve_argv() {
     let argvs: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -222,9 +222,8 @@ async fn test_policy_fn_execve_argv() {
     assert!(has_python, "argv should contain python3, got: {:?}", *captured);
 }
 
-/// Test argv_contains-based denial. The supervisor freezes sibling
-/// threads of the calling tid before Continue, so the policy_fn's
-/// argv inspection binds to what the kernel will run.
+/// Test argv_contains-based denial. The exec relay runs exactly the argv
+/// the policy inspected, so the verdict binds to what will run.
 #[tokio::test]
 async fn test_policy_fn_deny_by_argv() {
     let policy = base_policy()
@@ -552,9 +551,8 @@ async fn test_policy_fn_restrict_max_processes_enforced() {
 }
 
 /// Regression: a workload that forks under an active policy_fn must not
-/// deadlock the supervisor's fork-event ptrace tracking. Fork many times in one
-/// run and require it to complete (bounded so a regression fails instead of
-/// hanging the suite forever).
+/// deadlock the supervisor. Fork many times in one run and require it to
+/// complete (bounded so a regression fails instead of hanging the suite).
 #[tokio::test]
 async fn test_policy_fn_fork_does_not_deadlock() {
     let many_forks = concat!(

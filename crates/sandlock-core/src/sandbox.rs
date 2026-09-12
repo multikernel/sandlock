@@ -2227,6 +2227,7 @@ impl Sandbox {
                 chroot: Arc::clone(&chroot_state),
                 netlink: Arc::new(crate::netlink::NetlinkState::new()),
                 processes: Arc::clone(&processes),
+                exec_relay: Default::default(),
                 policy: Arc::new(notif_policy),
                 child_pidfd: child_pidfd_raw,
                 notif_fd: notif_raw_fd,
@@ -2987,7 +2988,7 @@ fn parse_bind_ports(specs: &[String], label: &str) -> Result<Vec<u16>, SandboxEr
 /// existence can be checked before spawn. Honors `--fs-mount` (virtual:host)
 /// mappings (which take precedence) and chroot. Used to validate
 /// `--http-inject-ca` targets.
-fn resolve_sandbox_path_to_host(
+pub(crate) fn resolve_sandbox_path_to_host(
     child_path: &std::path::Path,
     chroot_root: Option<&std::path::Path>,
     mounts: &[(std::path::PathBuf, std::path::PathBuf)],

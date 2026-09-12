@@ -33,6 +33,8 @@ pub struct SupervisorCtx {
     /// an internal RwLock, so handlers can query it synchronously
     /// without `.await`.
     pub processes: Arc<ProcessIndex>,
+    /// Relay execs in flight, keyed by tgid.
+    pub exec_relay: Arc<crate::exec_relay::RelayState>,
     /// Immutable policy — no lock needed.
     pub policy: Arc<NotifPolicy>,
     /// pidfd for the child process (immutable after spawn).
