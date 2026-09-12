@@ -58,15 +58,18 @@ fn test_notif_syscalls_always_has_clone() {
     }
 }
 
+/// Bare fork(2) stays out of the filter even under policy_fn: the exec
+/// relay needs no fork-time child registration, so hot fork loops keep
+/// bypassing the supervisor.
 #[test]
-fn test_notif_syscalls_fork_gated_on_policy_fn() {
+fn test_notif_syscalls_fork_not_intercepted_under_policy_fn() {
     let Some(fork) = arch::sys_fork() else { return };
     let policy = Sandbox::builder()
         .policy_fn(|_event, _ctx| crate::policy_fn::Verdict::Allow)
         .build()
         .unwrap();
     let nrs = notif_syscalls(&policy, None);
-    assert!(nrs.contains(&(fork as u32)));
+    assert!(!nrs.contains(&(fork as u32)));
 }
 
 #[test]

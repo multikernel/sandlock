@@ -2245,57 +2245,10 @@ async fn handle_notification(
         }
     };
 
-    let nr = notif.data.nr as i64;
     let fork_counted = matches!(action, NotifAction::Continue)
         && crate::resource::fork_counted_on_continue(&notif, fd);
 
-    // TOCTOU-close for execve (issue #27): freeze every sandbox task
-    // that could mutate argv before policy_fn reads argv and before the
-    // kernel re-reads it after Continue. This covers two writer classes:
-    //   1. Sibling threads of the calling tid (same TGID, share mm).
-    //   2. Peer processes in other TGIDs that alias argv pages via
-    //      MAP_SHARED mappings or share mm via clone(CLONE_VM).
-    //
-    // The freeze enumerates ProcessIndex. With policy_fn active, that
-    // index is complete: fork-like syscalls are traced at creation time
-    // below, before new children can run user code.
-    //
-    // Strict on failure: if we cannot establish the freeze, we cannot
-    // safely expose argv or allow execve, so we deny with EPERM.
-    let mut exec_freeze = None;
-    if matches!(action, NotifAction::Continue)
-        && policy.argv_safety_required
-        && crate::freeze::requires_freeze_on_continue(nr)
-    {
-        match crate::freeze::freeze_sandbox_for_execve(
-            &ctx.processes,
-            notif.pid as i32,
-        ) {
-            Ok(outcome) => {
-                exec_freeze = Some(outcome);
-            }
-            Err(e) => {
-                eprintln!(
-                    "sandlock: argv-safety freeze failed for pid {}: {} \
-                     — denying execve to preserve TOCTOU invariant",
-                    notif.pid, e
-                );
-                action = NotifAction::Errno(libc::EPERM);
-                // Rollback could not release tasks that had not entered
-                // ptrace-stop yet; carry them to the post-send reap.
-                if !e.pending_tids.is_empty() {
-                    exec_freeze = Some(crate::freeze::SandboxFreeze {
-                        pending_tids: e.pending_tids,
-                        ..Default::default()
-                    });
-                }
-            }
-        }
-    }
-
-    // Emit event to policy_fn callback if active. For execve, argv is
-    // only populated after `exec_freeze` has stopped every possible
-    // writer, and those tasks stay stopped until after NOTIF_SEND.
+    // Emit event to policy_fn callback if active.
     if let Some(verdict) = emit_policy_event(&notif, &action, &ctx.policy_fn, fd, None).await {
         use crate::policy_fn::Verdict;
         match verdict {
@@ -2310,49 +2263,11 @@ async fn handle_notification(
         crate::resource::rollback_fork_count(&ctx.resource).await;
     }
 
-    // With policy_fn active, fork-like syscalls are traced for exactly
-    // one ptrace event so ProcessIndex becomes complete before the new
-    // child can run user code. That closes the race where a peer
-    // process could exist without ever having produced a notification.
-    let mut creation_trace = None;
-    if matches!(action, NotifAction::Continue)
-        && crate::resource::requires_process_creation_tracking(&notif, fd, policy)
-    {
-        match crate::resource::prepare_process_creation_tracking(ctx, notif.pid as i32).await {
-            Ok(trace) => {
-                creation_trace = Some(trace);
-            }
-            Err(e) => {
-                eprintln!(
-                    "sandlock: process-creation tracking failed for pid {}: {} \
-                     — denying fork-like syscall to preserve argv TOCTOU invariant",
-                    notif.pid, e
-                );
-                if fork_counted {
-                    crate::resource::rollback_fork_count(&ctx.resource).await;
-                }
-                action = NotifAction::Errno(libc::EPERM);
-            }
-        }
-    }
-
     // Deferred response: run the handler's future on a worker task so the
     // single supervisor loop is not blocked waiting for slow work (a network
     // round-trip, a blocking syscall). The trapped child stays parked in the
     // syscall; the worker sends the real response later, keyed by notif.id.
-    //
-    // Deferral is refused on syscalls whose Continue path requires the
-    // execve argv-safety freeze or fork creation-tracking: sending the
-    // response off-loop would skip that TOCTOU-closing work. (When `action`
-    // is Defer it is not Continue, so `exec_freeze`/`creation_trace` above
-    // are already None — there is nothing to unwind here.)
     if let NotifAction::Defer(deferred) = action {
-        if crate::freeze::requires_freeze_on_continue(nr)
-            || crate::resource::requires_process_creation_tracking(&notif, fd, policy)
-        {
-            let _ = send_response(fd, notif.id, NotifAction::Errno(libc::EPERM));
-            return;
-        }
         match Arc::clone(defer_sem).try_acquire_owned() {
             Ok(permit) => spawn_deferred(fd, notif.id, deferred, permit),
             // Too many deferrals in flight: fail fast with EAGAIN rather than
@@ -2364,42 +2279,8 @@ async fn handle_notification(
         return;
     }
 
-    // Ignore error — child may have exited between recv and response.
-    let exec_continued = exec_freeze.is_some() && matches!(action, NotifAction::Continue);
-    let send_result = send_response(fd, notif.id, action);
-
-    if let Some(trace) = creation_trace {
-        if send_result.is_ok() {
-            match crate::resource::finish_process_creation_tracking(trace).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    crate::resource::rollback_fork_count(&ctx.resource).await;
-                }
-                Err(e) => {
-                    crate::resource::rollback_fork_count(&ctx.resource).await;
-                    eprintln!(
-                        "sandlock: process-creation tracking completion failed for pid {}: {}",
-                        notif.pid, e
-                    );
-                }
-            }
-        } else {
-            crate::resource::rollback_fork_count(&ctx.resource).await;
-            crate::resource::abort_process_creation_tracking(trace).await;
-        }
-    }
-
-    if let Some(freeze) = exec_freeze {
-        if exec_continued && send_result.is_ok() {
-            crate::freeze::detach_peers(&freeze.peer_tids);
-        } else {
-            crate::freeze::detach_all(&freeze);
-        }
-        // Now that the response is out, the kernel wait holding any pending
-        // task (the vfork parent waiting on this very execve) can clear;
-        // reap the queued interrupts and detach.
-        crate::freeze::reap_pending(&freeze.pending_tids);
-    }
+    // Ignore error: the child may have exited between recv and response.
+    let _ = send_response(fd, notif.id, action);
 }
 
 /// An execve under argv safety. The request is read once; that copy is what

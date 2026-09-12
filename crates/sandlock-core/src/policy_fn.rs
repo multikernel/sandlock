@@ -63,19 +63,11 @@ pub enum SyscallCategory {
 /// (`fs_read` / `fs_write` / `fs_deny`); see issue #27.
 ///
 /// `argv` *is* exposed for `execve`/`execveat` and is TOCTOU-safe by
-/// construction: with `policy_fn` active, fork-like syscalls are traced
-/// for one ptrace creation event, so children are registered in
-/// `ProcessIndex` before they can run user code. Before the supervisor
-/// exposes `argv` to `policy_fn` or returns `Continue` for an execve, it
-/// then `PTRACE_SEIZE`+`PTRACE_INTERRUPT`s every task that could write
-/// the memory — both sibling threads of the calling tid (same TGID, share
-/// `mm_struct`) and peer threads in other TGIDs that may alias argv
-/// pages via `MAP_SHARED` mappings or share `mm_struct` via
-/// `clone(CLONE_VM)`. The kernel's post-Continue re-read therefore
-/// sees the same memory the supervisor inspected. Siblings are killed
-/// by the kernel during execve's `de_thread` step; peer threads are
-/// detached after `NOTIF_SEND` and resume normally. See
-/// `crate::freeze`.
+/// construction: the supervisor reads it once, and an allowed execve is
+/// redirected to the exec relay, a static program that execs the target
+/// with exactly that copy. Whatever a sibling thread or CLONE_VM peer
+/// writes to the original memory afterwards changes nothing. See
+/// `crate::exec_relay`.
 ///
 /// Network fields (`host`, `port`) are TOCTOU-safe because the
 /// supervisor performs `connect`/`sendto`/`bind` on-behalf via
