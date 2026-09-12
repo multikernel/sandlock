@@ -9,14 +9,14 @@ use crate::error::{SandlockError, SandboxRuntimeError};
 
 pub(crate) fn ptrace_seize(pid: i32) -> io::Result<()> {
     let ret = unsafe {
-        libc::ptrace(libc::PTRACE_SEIZE as libc::c_uint, pid, 0, 0)
+        libc::ptrace(libc::PTRACE_SEIZE, pid, 0, 0)
     };
     if ret < 0 {
         return Err(io::Error::last_os_error());
     }
     // PTRACE_INTERRUPT stops the tracee without SIGSTOP side effects
     let ret = unsafe {
-        libc::ptrace(libc::PTRACE_INTERRUPT as libc::c_uint, pid, 0, 0)
+        libc::ptrace(libc::PTRACE_INTERRUPT, pid, 0, 0)
     };
     if ret < 0 {
         return Err(io::Error::last_os_error());

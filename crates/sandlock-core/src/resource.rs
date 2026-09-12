@@ -315,7 +315,7 @@ fn process_creation_worker(
         | libc::PTRACE_O_TRACEVFORK
         | libc::PTRACE_O_TRACECLONE
         | libc::PTRACE_O_TRACESYSGOOD) as libc::c_ulong;
-    let ret = unsafe { libc::ptrace(libc::PTRACE_SEIZE as libc::c_uint, caller_tid, 0, opts) };
+    let ret = unsafe { libc::ptrace(libc::PTRACE_SEIZE, caller_tid, 0, opts) };
     if ret < 0 {
         let errno = io::Error::last_os_error().raw_os_error().unwrap_or(libc::EPERM);
         let _ = attached_tx.send(Err(errno));
@@ -441,13 +441,13 @@ fn run_creation_event_loop(caller_tid: i32, ctx: &Arc<SupervisorCtx>) -> io::Res
         // Some other signal-delivery-stop in the window: forward the pending
         // signal and keep waiting for the fork event.
         let inject = if stopsig == libc::SIGTRAP { 0 } else { stopsig as libc::c_ulong };
-        ptrace_resume(caller_tid, libc::PTRACE_CONT, inject)?;
+        ptrace_cont(caller_tid, inject)?;
     }
 }
 
-/// `ptrace(request, tid, 0, data)` returning an error on failure.
-fn ptrace_resume(tid: i32, request: libc::c_uint, data: libc::c_ulong) -> io::Result<()> {
-    let ret = unsafe { libc::ptrace(request, tid, 0, data) };
+/// Resume `tid` with `sig` injected (0 for none), failing on error.
+fn ptrace_cont(tid: i32, sig: libc::c_ulong) -> io::Result<()> {
+    let ret = unsafe { libc::ptrace(libc::PTRACE_CONT, tid, 0, sig) };
     if ret < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -461,7 +461,7 @@ fn handle_fork_event(caller_tid: i32, ctx: &Arc<SupervisorCtx>) -> io::Result<bo
     let mut child_pid: libc::c_ulong = 0;
     let ret = unsafe {
         libc::ptrace(
-            libc::PTRACE_GETEVENTMSG as libc::c_uint,
+            libc::PTRACE_GETEVENTMSG,
             caller_tid,
             0,
             &mut child_pid,

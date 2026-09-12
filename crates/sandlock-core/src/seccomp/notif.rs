@@ -832,7 +832,7 @@ impl NotifPolicy {
 fn recv_notif(fd: RawFd) -> io::Result<SeccompNotif> {
     let mut notif: SeccompNotif = unsafe { std::mem::zeroed() };
     let ret = unsafe {
-        libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_RECV as libc::c_ulong, &mut notif as *mut _)
+        libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_RECV as libc::Ioctl, &mut notif as *mut _)
     };
     if ret < 0 {
         Err(io::Error::last_os_error())
@@ -945,7 +945,7 @@ fn inject_fd_and_send(fd: RawFd, id: u64, srcfd: RawFd, newfd_flags: u32) -> io:
         newfd_flags,
     };
     let ret = unsafe {
-        libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_ADDFD as libc::c_ulong, &addfd as *const _)
+        libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_ADDFD as libc::Ioctl, &addfd as *const _)
     };
     if ret < 0 {
         Err(io::Error::last_os_error())
@@ -965,7 +965,7 @@ fn inject_fd(fd: RawFd, id: u64, srcfd: RawFd, targetfd: i32) -> io::Result<()> 
         newfd_flags: 0,
     };
     let ret = unsafe {
-        libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_ADDFD as libc::c_ulong, &addfd as *const _)
+        libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_ADDFD as libc::Ioctl, &addfd as *const _)
     };
     if ret < 0 {
         Err(io::Error::last_os_error())
@@ -977,7 +977,7 @@ fn inject_fd(fd: RawFd, id: u64, srcfd: RawFd, targetfd: i32) -> io::Result<()> 
 /// Raw ioctl to send a notification response.
 fn send_resp_raw(fd: RawFd, resp: &SeccompNotifResp) -> io::Result<()> {
     let ret = unsafe {
-        libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_SEND as libc::c_ulong, resp as *const _)
+        libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_SEND as libc::Ioctl, resp as *const _)
     };
     if ret < 0 {
         Err(io::Error::last_os_error())
@@ -990,7 +990,7 @@ fn send_resp_raw(fd: RawFd, resp: &SeccompNotifResp) -> io::Result<()> {
 /// ioctl(fd, SECCOMP_IOCTL_NOTIF_ID_VALID, &id)
 pub(crate) fn id_valid(fd: RawFd, id: u64) -> io::Result<()> {
     let ret = unsafe {
-        libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_ID_VALID as libc::c_ulong, &id as *const _)
+        libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_ID_VALID as libc::Ioctl, &id as *const _)
     };
     if ret < 0 {
         Err(io::Error::last_os_error())
@@ -1003,7 +1003,7 @@ pub(crate) fn id_valid(fd: RawFd, id: u64) -> io::Result<()> {
 fn try_set_sync_wakeup(fd: RawFd) {
     let flags: u64 = SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP as u64;
     unsafe {
-        libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_SET_FLAGS as libc::c_ulong, &flags as *const _);
+        libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_SET_FLAGS as libc::Ioctl, &flags as *const _);
     }
 }
 
@@ -1256,20 +1256,24 @@ fn read_exec_ptr_array(
     }
 }
 
-/// Read exactly `len` bytes starting at `addr`, chunked at page boundaries.
-fn read_exec_range(
+/// Whether the `len` bytes at `addr` hold no NUL. Checked one page at a time
+/// so the scan stops at a string's terminator before touching a later page,
+/// which may be unmapped: musl's allocator leaves gaps between chunks.
+fn nul_free_run(
     read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>, NotifError>,
     addr: u64,
     len: usize,
-) -> Result<Vec<u8>, NotifError> {
-    let mut out = Vec::with_capacity(len);
+) -> Result<bool, NotifError> {
+    let end = addr + len as u64;
     let mut cur = addr;
-    while out.len() < len {
-        let chunk = ((4096 - cur % 4096) as usize).min(len - out.len());
-        out.extend_from_slice(&read(cur, chunk)?);
+    while cur < end {
+        let chunk = ((4096 - cur % 4096) as usize).min((end - cur) as usize);
+        if read(cur, chunk)?.contains(&0) {
+            return Ok(false);
+        }
         cur += chunk as u64;
     }
-    Ok(out)
+    Ok(true)
 }
 
 /// Read a NUL-terminated string (NUL excluded) of at most
@@ -1358,8 +1362,7 @@ fn plan_exec_rewrite(
     below.dedup();
     let mut nul_free_from = path_ptr;
     for &p in below.iter().rev() {
-        let seg = read_exec_range(read, p, (nul_free_from - p) as usize)?;
-        if seg.contains(&0) {
+        if !nul_free_run(read, p, (nul_free_from - p) as usize)? {
             break;
         }
         relocate(&mut buf, &mut relocated, read, p)?;

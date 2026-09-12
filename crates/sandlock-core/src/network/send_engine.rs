@@ -42,7 +42,7 @@ fn send_materialized_at(fd: RawFd, m: &MaterializedMsg, offset: usize, flags: i3
         }
         if let Some(ref c) = m.control {
             msg.msg_control = c.as_ptr() as *mut libc::c_void;
-            msg.msg_controllen = c.len();
+            msg.msg_controllen = c.len() as _;
         }
     }
     msg.msg_iov = &iov as *const libc::iovec as *mut libc::iovec;

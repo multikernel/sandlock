@@ -150,19 +150,21 @@ pub fn abi_version() -> Result<u32, ConfinementError> {
 
 /// Open `path` and add a Landlock path-beneath rule to `ruleset_fd`.
 fn add_path_rule(ruleset_fd: &OwnedFd, path: &Path, access: u64) -> Result<(), ConfinementError> {
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::fd::FromRawFd;
     // Reference the path with O_PATH rather than opening it for I/O: O_PATH does
     // not block on FIFOs and needs no read permission on the target, so a rule
     // on a FIFO or a write-only/no-read path neither hangs nor fails here. An
     // O_PATH fd still supports fstat (the file-type check below) and serves as a
-    // valid parent_fd for landlock_add_rule.
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
-        .open(path)
-        .map_err(|e| {
-            ConfinementError::Landlock(format!("open path {:?} failed: {}", path, e))
-        })?;
+    // valid parent_fd for landlock_add_rule. Call open(2) directly: musl folds
+    // O_PATH into O_ACCMODE, which OpenOptions::custom_flags masks out.
+    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|e| ConfinementError::Landlock(format!("open path {:?} failed: {}", path, e)))?;
+    let raw = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    if raw < 0 {
+        let e = std::io::Error::last_os_error();
+        return Err(ConfinementError::Landlock(format!("open path {:?} failed: {}", path, e)));
+    }
+    let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(raw) });
 
     // Directory-only access rights (READ_DIR, MAKE_*, REMOVE_*, REFER) make
     // landlock_add_rule fail with EINVAL on a non-directory path. Mask the
