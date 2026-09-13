@@ -581,7 +581,7 @@ class TestPortRemap:
             "print(s.getsockname()[1]); "
             "s.close()"
         )
-        policy = _policy(port_remap=True)
+        policy = _policy(port_remap=True, net_allow_bind=[8080])
 
         r1 = policy.run(["python3", "-c", code])
         r2 = policy.run(["python3", "-c", code])
@@ -601,7 +601,7 @@ class TestPortRemap:
             "print(name[0], name[1]); "
             "s.close()"
         )
-        policy = _policy(port_remap=True)
+        policy = _policy(port_remap=True, net_allow_bind=[4000])
         result = policy.run(["python3", "-c", code])
 
         assert result.success
@@ -618,7 +618,7 @@ class TestPortRemap:
             "print(s.getsockname()[1]); "
             "s.close()"
         )
-        policy = _policy(port_remap=True)
+        policy = _policy(port_remap=True, net_allow_bind=["*"])
         result = policy.run(["python3", "-c", code])
 
         assert result.success
@@ -633,7 +633,7 @@ class TestPortRemap:
             "print(s.getsockname()[1]); "
             "s.close()"
         )
-        policy = _policy(port_remap=True)
+        policy = _policy(port_remap=True, net_allow_bind=[5000])
         result = policy.run(["python3", "-c", code])
 
         assert result.success

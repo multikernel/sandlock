@@ -757,7 +757,9 @@ comma-separated list of single ports or inclusive `lo-hi` ranges (e.g.
 allows binding any port, including an ephemeral `bind(0)`; it cannot be
 mixed with port lists (repeating the bare wildcard is fine). Landlock enforces the
 allowlist (TCP only; the wildcard simply leaves Landlock's `BIND_TCP` hook
-unhandled); `--port-remap` adds on-behalf virtualization for binding.
+unhandled). When network supervision is active (`--net-allow`, `--net-deny`,
+`--http-allow`, `--port-remap`, a policy function) `bind()` runs on the
+supervisor's on-behalf path, which enforces the same allowlist.
 `--net-deny-bind <ports>` is the inverse: default-allow binding, deny the
 listed TCP ports (same port syntax, mutually exclusive with
 `--net-allow-bind`). Because Landlock is allowlist-only, a deny-bind relaxes

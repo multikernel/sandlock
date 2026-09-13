@@ -600,6 +600,9 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         // A scheme-less "*" covers TCP and UDP; ICMP always needs its own rule.
         .net_allow("*")
         .net_allow("icmp://*")
+        // Observation must see every bind the program attempts, so nothing
+        // may refuse one before it is recorded.
+        .net_allow_bind("*")
         .max_memory(sandlock_core::sandbox::ByteSize(1 << 43)) // 8 TiB
         .policy_fn(move |event, _ctx| observer_cb.on_event(event));
 

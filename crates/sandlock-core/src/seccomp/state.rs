@@ -468,6 +468,12 @@ pub struct NetworkState {
     /// denylist). The on-behalf `bind()` handler rejects a TCP bind to any
     /// port in this set with `EACCES`; empty = no bind denylist.
     pub bind_deny_ports: HashSet<u16>,
+    /// `--net-allow-bind`: TCP ports the sandbox may bind. The on-behalf
+    /// `bind()` runs in the supervisor, outside the child's Landlock domain,
+    /// so the kernel rules never see it and this set is the only enforcer
+    /// there. `None` = unrestricted (`'*'` or NetTcp inactive); `Some(empty)`
+    /// = the default deny-all.
+    pub bind_allow_ports: Option<HashSet<u16>>,
     /// Per-PID network overrides from policy_fn (IP-only via the legacy
     /// `restrict_network(ips)` API; any port is permitted to listed IPs).
     pub pid_ip_overrides: std::sync::Arc<std::sync::RwLock<HashMap<u32, HashSet<std::net::IpAddr>>>>,
@@ -487,6 +493,7 @@ impl NetworkState {
             icmp_policy: crate::seccomp::notif::NetworkPolicy::Unrestricted,
             port_map: crate::port_remap::PortMap::new(),
             bind_deny_ports: HashSet::new(),
+            bind_allow_ports: None,
             pid_ip_overrides: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
             http_acl_addr: None,
             http_acl_ports: HashSet::new(),

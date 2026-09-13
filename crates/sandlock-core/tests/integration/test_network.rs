@@ -1276,3 +1276,88 @@ async fn test_sendmmsg_blocking_entry_defers_and_delivers_under_net_policy() {
     );
     assert_eq!(got, N, "peer must receive all {N} bytes of the deferred batch entry");
 }
+
+/// Any network supervision (`--net-allow`, `--port-remap`, ...) moves
+/// `bind()` onto the on-behalf path, where the supervisor binds outside the
+/// child's Landlock domain. The bind allowlist must still hold there:
+/// listed ports bind, unlisted ports and ephemeral `bind(0)` fail with
+/// EACCES, and UDP is untouched.
+#[tokio::test]
+async fn test_net_allow_bind_enforced_on_behalf() {
+    fn free_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+    let allowed = free_port();
+    let mut other = free_port();
+    while other == allowed {
+        other = free_port();
+    }
+
+    let script = format!(concat!(
+        "import socket, json\n",
+        "res = {{}}\n",
+        "def tcp(key, port):\n",
+        "  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+        "  s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
+        "  try:\n",
+        "    s.bind(('127.0.0.1', port)); res[key] = 'ok'\n",
+        "  except PermissionError:\n",
+        "    res[key] = 'eacces'\n",
+        "  except OSError as e:\n",
+        "    res[key] = 'err:%d' % e.errno\n",
+        "  s.close()\n",
+        "tcp('allowed', {allowed})\n",
+        "tcp('other', {other})\n",
+        "tcp('ephemeral', 0)\n",
+        "u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
+        "try:\n",
+        "  u.bind(('127.0.0.1', {other})); res['udp'] = 'ok'\n",
+        "except OSError as e:\n",
+        "  res['udp'] = 'err:%d' % e.errno\n",
+        "open('{out}', 'w').write(json.dumps(res))\n",
+    ), allowed = allowed, other = other, out = "{out}");
+
+    let supervised = [
+        ("net_allow", base_policy().net_allow("udp://*").net_allow("127.0.0.1:1")),
+        ("net_deny", base_policy().net_deny("10.0.0.0/8")),
+        ("port_remap", base_policy().net_allow("udp://*").port_remap(true)),
+    ];
+    for (label, builder) in supervised {
+        let out = temp_file(&format!("allowbind_{label}"));
+        let policy = builder.net_allow_bind_port(allowed).build().unwrap();
+        let script = script.replace("{out}", &out.display().to_string());
+        let result = policy.clone()
+            .run_interactive(&["python3", "-c", &script]).await.unwrap();
+        assert!(result.success(), "{label}: exit={:?}", result.code());
+        let content = std::fs::read_to_string(&out).unwrap_or_default();
+        let _ = std::fs::remove_file(&out);
+        assert!(content.contains("\"allowed\": \"ok\""), "{label}: listed port must bind; got: {content}");
+        assert!(content.contains("\"other\": \"eacces\""), "{label}: unlisted port must fail with EACCES; got: {content}");
+        assert!(content.contains("\"ephemeral\": \"eacces\""), "{label}: bind(0) must fail with EACCES; got: {content}");
+        assert!(content.contains("\"udp\": \"ok\""), "{label}: UDP bind must be unaffected; got: {content}");
+    }
+}
+
+/// With no allowlist at all, the default is deny-every-TCP-bind. That must
+/// hold on the on-behalf path too, not only under Landlock.
+#[tokio::test]
+async fn test_default_bind_deny_enforced_on_behalf() {
+    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let out = temp_file("defaultbind");
+    let policy = base_policy().port_remap(true).build().unwrap();
+    let script = format!(concat!(
+        "import socket\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+        "try:\n",
+        "  s.bind(('127.0.0.1', {port})); r = 'ok'\n",
+        "except PermissionError:\n",
+        "  r = 'eacces'\n",
+        "open('{out}', 'w').write(r)\n",
+    ), port = port, out = out.display());
+    let result = policy.clone()
+        .run_interactive(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(content, "eacces", "TCP bind with no allowlist must fail under port_remap");
+}

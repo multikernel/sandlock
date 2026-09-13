@@ -169,20 +169,21 @@ pub(crate) async fn handle_bind(
         return NotifAction::Errno(libc::EACCES);
     }
 
-    // Non-IP family or ephemeral (port == 0): bind verbatim — nothing to
-    // track or remap. extract_port returns None for non-IP families and
-    // for truncated buffers; in both cases the kernel will validate.
-    let virtual_port = match extract_port(&bytes) {
-        Some(p) if p != 0 => p,
-        _ => return bind_verbatim(&dup_fd, &bytes, addr_len),
-    };
+    // Non-IP family or truncated buffer: extract_port returns None and the
+    // kernel validates the bind.
+    let ip_port = extract_port(&bytes);
 
-    // --net-deny-bind: reject binding a denied TCP port. Only TCP is gated
-    // (mirroring --net-allow-bind); UDP/other binds are unaffected. The
-    // SO_PROTOCOL probe is skipped entirely when the denylist is empty.
-    let denied = {
-        let ns = network.lock().await;
-        !ns.bind_deny_ports.is_empty() && ns.bind_deny_ports.contains(&virtual_port)
+    // TCP bind allowlist / denylist. Only TCP is gated (Landlock's BIND_TCP
+    // is TCP-only); UDP/other binds are unaffected. A port-0 bind is refused
+    // under an allowlist because Landlock refuses it too: only `'*'` can
+    // express "any ephemeral port".
+    let denied = match ip_port {
+        Some(port) => {
+            let ns = network.lock().await;
+            ns.bind_allow_ports.as_ref().is_some_and(|allow| !allow.contains(&port))
+                || ns.bind_deny_ports.contains(&port)
+        }
+        None => false,
     };
     if denied
         && crate::network::query_socket_protocol(dup_fd.as_raw_fd())
@@ -190,6 +191,12 @@ pub(crate) async fn handle_bind(
     {
         return NotifAction::Errno(libc::EACCES);
     }
+
+    // Ephemeral (port == 0): bind verbatim, nothing to track or remap.
+    let virtual_port = match ip_port {
+        Some(p) if p != 0 => p,
+        _ => return bind_verbatim(&dup_fd, &bytes, addr_len),
+    };
 
     // Pick a first-attempt port: cached real port if known, else the
     // virtual port itself. The cached real port keeps repeat binds of

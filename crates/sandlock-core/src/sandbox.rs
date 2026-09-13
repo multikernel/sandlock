@@ -422,9 +422,10 @@ pub struct Sandbox {
     /// Mutually exclusive with `net_allow`.
     pub net_deny: Vec<NetDeny>,
     /// `--net-allow-bind`: TCP ports the sandbox may bind (default-deny
-    /// allowlist, Landlock-enforced; `All` leaves Landlock's `BIND_TCP`
-    /// hook unhandled so any port may be bound). Mutually exclusive with
-    /// `net_deny_bind`.
+    /// allowlist, enforced by Landlock on the direct path and by the
+    /// on-behalf `bind()` handler under network supervision; `All` leaves
+    /// Landlock's `BIND_TCP` hook unhandled so any port may be bound).
+    /// Mutually exclusive with `net_deny_bind`.
     pub net_allow_bind: BindPorts,
     /// `--net-deny-bind`: TCP ports the sandbox may NOT bind (default-allow
     /// denylist, enforced on the on-behalf `bind()` path). Mutually
@@ -2135,6 +2136,15 @@ impl Sandbox {
             net_state.http_acl_ports = self.http_ports.iter().copied().collect();
             net_state.http_acl_orig_dest = self.rt().http_acl_handle.as_ref().map(|h| h.orig_dest.clone());
             net_state.bind_deny_ports = self.net_deny_bind.iter().copied().collect();
+            let net_tcp_active = self.active_protections()?
+                .into_iter()
+                .any(|(p, s)| p == Protection::NetTcp && s == ProtectionStatus::Active);
+            net_state.bind_allow_ports = match &self.net_allow_bind {
+                BindPorts::Ports(ports) if net_tcp_active && self.net_deny_bind.is_empty() => {
+                    Some(ports.iter().copied().collect())
+                }
+                _ => None,
+            };
             if let Some(cb) = self.rt_mut().on_bind.take() {
                 net_state.port_map.on_bind = Some(cb);
             }
