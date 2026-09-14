@@ -1276,3 +1276,348 @@ async fn test_sendmmsg_blocking_entry_defers_and_delivers_under_net_policy() {
     );
     assert_eq!(got, N, "peer must receive all {N} bytes of the deferred batch entry");
 }
+
+// ============================================================
+// Issue #135: combined allow + deny outbound policy
+// ============================================================
+
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+fn connect_script(port: u16, host: &str, out: &std::path::Path) -> String {
+    format!(concat!(
+        "import socket\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+        "s.settimeout(3)\n",
+        "try:\n",
+        "  s.connect(('{host}', {port}))\n",
+        "  open('{out}', 'w').write('CONNECTED')\n",
+        "except OSError as e:\n",
+        "  open('{out}', 'w').write('ERR:%d' % e.errno)\n",
+        "s.close()\n",
+    ), host = host, port = port, out = out.display())
+}
+
+/// Finite combined allow + deny where the denied overlap loses: the allowlist
+/// covers the live listener, but the deny CIDR covers it too, so the connect
+/// must be refused even though a listener is accepting.
+#[tokio::test]
+async fn test_combined_finite_overlap_denied() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let out = temp_file("combined-overlap");
+
+    let policy = base_policy()
+        .net_allow(format!("127.0.0.1:{port}"))
+        .net_deny("127.0.0.0/8")
+        .build()
+        .unwrap();
+
+    let result = policy.clone()
+        .run_interactive(&["python3", "-c", &connect_script(port, "127.0.0.1", &out)])
+        .await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+    let got = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    drop(listener);
+    assert_eq!(got, "ERR:111", "denied overlap must be refused (ECONNREFUSED); got {got:?}");
+}
+
+/// Finite combined allow + deny where the endpoint is outside the denylist:
+/// the live listener must actually accept the connect.
+#[tokio::test]
+async fn test_combined_finite_non_overlap_connects() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let out = temp_file("combined-non-overlap");
+
+    let policy = base_policy()
+        .net_allow(format!("127.0.0.1:{port}"))
+        .net_deny("10.0.0.0/8")
+        .build()
+        .unwrap();
+
+    let result = policy.clone()
+        .run_interactive(&["python3", "-c", &connect_script(port, "127.0.0.1", &out)])
+        .await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+    let got = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    drop(listener);
+    assert_eq!(got, "CONNECTED", "non-overlapping allow must connect; got {got:?}");
+}
+
+/// Wildcard allow with a deny carve-out: `:port` form allows any IP on the
+/// listed ports, and the denylist removes one loopback host. Two live
+/// listeners prove both directions.
+#[tokio::test]
+async fn test_combined_wildcard_allow_with_deny_carve_out() {
+    let l1 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let p1 = l1.local_addr().unwrap().port();
+    let l2 = TcpListener::bind("127.0.0.2:0").unwrap();
+    let p2 = l2.local_addr().unwrap().port();
+    let out = temp_file("combined-wildcard");
+
+    let policy = base_policy()
+        .net_allow(format!(":{p1}"))
+        .net_allow(format!(":{p2}"))
+        .net_deny("127.0.0.2")
+        .build()
+        .unwrap();
+
+    let script = format!(concat!(
+        "import socket\n",
+        "def probe(host, port):\n",
+        "  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(3)\n",
+        "  try:\n",
+        "    s.connect((host, port)); return 'OK'\n",
+        "  except OSError as e: return 'ERR%d' % e.errno\n",
+        "  finally: s.close()\n",
+        "open('{out}', 'w').write('a=' + probe('127.0.0.1', {p1}) + ' b=' + probe('127.0.0.2', {p2}))\n",
+    ), out = out.display(), p1 = p1, p2 = p2);
+
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+    let got = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    drop(l1);
+    drop(l2);
+    assert!(got.contains("a=OK"), "wildcard allow must connect outside the carve-out; got {got:?}");
+    assert!(got.contains("b=ERR111"), "deny carve-out must refuse; got {got:?}");
+}
+
+/// An allowed hostname that resolves into a denied CIDR is refused. Uses
+/// `localhost` (loopback-local resolution, no external network) against a
+/// live 127.0.0.1 listener: success would prove the allow won, refusal proves
+/// the deny won after resolution.
+#[tokio::test]
+async fn test_combined_hostname_resolving_into_denied_cidr_refused() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let out = temp_file("combined-hostname-deny");
+
+    let policy = base_policy()
+        .net_allow(format!("localhost:{port}"))
+        .net_deny("127.0.0.0/8")
+        .build()
+        .unwrap();
+
+    let result = policy.clone()
+        .run_interactive(&["python3", "-c", &connect_script(port, "127.0.0.1", &out)])
+        .await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+    let got = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    drop(listener);
+    assert_eq!(got, "ERR:111", "hostname allow resolving into a denied CIDR must be refused; got {got:?}");
+}
+
+/// Deny-only plus HTTP-generated allow rules must retain deny-only network
+/// semantics: the generated `net_allow` reachability entries must not promote
+/// the policy to combined. A live listener on an address outside both the
+/// HTTP allow host and the denylist must still connect.
+#[tokio::test]
+async fn test_deny_only_with_http_allow_stays_deny_only() {
+    let listener = TcpListener::bind("127.0.0.2:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let out = temp_file("deny-only-http");
+
+    let policy = base_policy()
+        .net_deny("10.0.0.0/8")
+        .http_allow("GET 127.0.0.1/*")
+        .build()
+        .unwrap();
+    assert!(!policy.net_allow_is_active(), "HTTP-generated rules must not activate the allow layer");
+
+    let result = policy.clone()
+        .run_interactive(&["python3", "-c", &connect_script(port, "127.0.0.2", &out)])
+        .await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+    let got = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    drop(listener);
+    assert_eq!(got, "CONNECTED", "deny-only + HTTP must still allow non-denied egress; got {got:?}");
+}
+
+fn bind_probe_script(out: &std::path::Path, ports: &[u16]) -> String {
+    let cases: Vec<String> = ports.iter().map(|p| format!(
+        "try:\n  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n  s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n  s.bind(('127.0.0.1', {p}))\n  res[{p}] = 'ok'\n  s.close()\nexcept OSError as e:\n  res[{p}] = 'err:%d' % e.errno\n",
+        p = p,
+    )).collect();
+    format!(concat!(
+        "import socket, json\n",
+        "res = {{}}\n",
+        "{cases}",
+        "open('{out}', 'w').write(json.dumps(res))\n",
+    ), cases = cases.join(""), out = out.display())
+}
+
+/// Finite allow-bind + deny-bind: the denied port loses while a merely
+/// allowed port binds.
+#[tokio::test]
+async fn test_combined_bind_deny_wins() {
+    let p_allowed = free_port();
+    let mut p_denied = free_port();
+    while p_denied == p_allowed {
+        p_denied = free_port();
+    }
+    let out = temp_file("combined-bind");
+
+    let policy = base_policy()
+        .net_allow_bind(format!("{p_allowed},{p_denied}"))
+        .net_deny_bind(format!("{p_denied}"))
+        .build()
+        .unwrap();
+
+    let result = policy.clone()
+        .run_interactive(&["python3", "-c", &bind_probe_script(&out, &[p_allowed, p_denied])])
+        .await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+    let got = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert!(got.contains(&format!("\"{p_allowed}\": \"ok\"")), "allowed bind must succeed; got {got:?}");
+    assert!(got.contains(&format!("\"{p_denied}\": \"err:13\"")), "denied bind must fail with EACCES; got {got:?}");
+}
+
+/// `allow_bind("*")` with a deny carve-out: an unlisted fixed port binds
+/// while the denied one is refused with EACCES.
+#[tokio::test]
+async fn test_bind_wildcard_with_deny_carve_out() {
+    let p_denied = free_port();
+    let p_other = free_port();
+    let out = temp_file("bind-wildcard-carve");
+
+    let policy = base_policy()
+        .net_allow_bind("*")
+        .net_deny_bind(format!("{p_denied}"))
+        .build()
+        .unwrap();
+
+    let script = format!(concat!(
+        "import socket, json\n",
+        "res = {{}}\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+        "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
+        "try:\n",
+        "  s.bind(('127.0.0.1', {denied}))\n",
+        "  res['denied'] = 'bound'\n",
+        "except PermissionError:\n",
+        "  res['denied'] = 'eacces'\n",
+        "s.close()\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+        "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
+        "try:\n",
+        "  s.bind(('127.0.0.1', {other}))\n",
+        "  res['other'] = 'ok'\n",
+        "except OSError as e:\n",
+        "  res['other'] = 'err:%d' % e.errno\n",
+        "s.close()\n",
+        "open('{out}', 'w').write(json.dumps(res))\n",
+    ), denied = p_denied, other = p_other, out = out.display());
+
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+    let got = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert!(got.contains("\"denied\": \"eacces\""), "denied carve-out must fail with EACCES; got {got:?}");
+    assert!(got.contains("\"other\": \"ok\""), "non-denied bind under wildcard must succeed; got {got:?}");
+}
+
+/// Standalone `allow_bind(0)`: an ephemeral `bind(0)` succeeds while an
+/// explicit nonzero bind is denied. Landlock enforces both legs directly.
+#[tokio::test]
+async fn test_allow_bind_zero_ephemeral_only() {
+    let p_fixed = free_port();
+    let out = temp_file("bind-zero");
+
+    let policy = base_policy().net_allow_bind_port(0).build().unwrap();
+
+    let script = format!(concat!(
+        "import socket, json\n",
+        "res = {{}}\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+        "try:\n",
+        "  s.bind(('127.0.0.1', 0))\n",
+        "  res['ephemeral'] = 'ok'\n",
+        "except OSError as e:\n",
+        "  res['ephemeral'] = 'err:%d' % e.errno\n",
+        "s.close()\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+        "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
+        "try:\n",
+        "  s.bind(('127.0.0.1', {fixed}))\n",
+        "  res['fixed'] = 'bound'\n",
+        "except OSError as e:\n",
+        "  res['fixed'] = 'err:%d' % e.errno\n",
+        "s.close()\n",
+        "open('{out}', 'w').write(json.dumps(res))\n",
+    ), fixed = p_fixed, out = out.display());
+
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+    let got = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert!(got.contains("\"ephemeral\": \"ok\""), "bind(0) must succeed; got {got:?}");
+    assert!(got.contains(&format!("\"fixed\": \"err:13\"")), "explicit nonzero bind must be denied (EACCES); got {got:?}");
+}
+
+/// Combined `allow_bind(0)` + deny-bind: ephemeral binds succeed, the denied
+/// explicit port loses, and an unlisted explicit port stays denied.
+#[tokio::test]
+async fn test_combined_bind_zero_with_deny() {
+    let p_allowed = free_port();
+    let mut p_denied = free_port();
+    while p_denied == p_allowed {
+        p_denied = free_port();
+    }
+    let mut p_other = free_port();
+    while p_other == p_allowed || p_other == p_denied {
+        p_other = free_port();
+    }
+    let out = temp_file("combined-bind-zero");
+
+    let policy = base_policy()
+        .net_allow_bind_port(0)
+        .net_allow_bind_port(p_allowed)
+        .net_deny_bind(format!("{p_denied}"))
+        .build()
+        .unwrap();
+
+    let script = format!(concat!(
+        "import socket, json\n",
+        "res = {{}}\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+        "try:\n",
+        "  s.bind(('127.0.0.1', 0))\n",
+        "  res['ephemeral'] = 'ok'\n",
+        "except OSError as e:\n",
+        "  res['ephemeral'] = 'err:%d' % e.errno\n",
+        "s.close()\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+        "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
+        "try:\n",
+        "  s.bind(('127.0.0.1', {denied}))\n",
+        "  res['denied'] = 'bound'\n",
+        "except OSError as e:\n",
+        "  res['denied'] = 'err:%d' % e.errno\n",
+        "s.close()\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+        "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
+        "try:\n",
+        "  s.bind(('127.0.0.1', {other}))\n",
+        "  res['other'] = 'bound'\n",
+        "except OSError as e:\n",
+        "  res['other'] = 'err:%d' % e.errno\n",
+        "s.close()\n",
+        "open('{out}', 'w').write(json.dumps(res))\n",
+    ), denied = p_denied, other = p_other, out = out.display());
+
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+    let got = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert!(got.contains("\"ephemeral\": \"ok\""), "bind(0) must succeed; got {got:?}");
+    assert!(got.contains("\"denied\": \"err:13\""), "denied explicit bind must fail with EACCES; got {got:?}");
+    assert!(got.contains("\"other\": \"err:13\""), "unlisted explicit bind must stay denied; got {got:?}");
+}

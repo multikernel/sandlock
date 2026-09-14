@@ -38,10 +38,12 @@ pub(crate) fn destination_verdict(
     }
 }
 
-/// Apply the static deny layer before the resolved allow layer. Allow already
-/// carries legacy dynamic resolution (per-PID > live > static); checking
-/// deny first preserves arbitrary allowlist/denylist intersections and makes
-/// it impossible for a dynamic override to erase a static deny.
+/// Resolve order: effective allow first, then the immutable static deny.
+/// Allow already carries legacy dynamic resolution (per-PID override > live
+/// policy > static per-protocol allowlist). Deny is always the static
+/// per-protocol denylist and wins second, including when the effective allow
+/// is `Unrestricted` or comes from a `policy_fn`/per-PID override. No
+/// dynamic/static allow intersection is performed.
 pub(crate) fn layered_destination_verdict(
     effective: &NetworkPolicyLayers,
     ip: IpAddr,
@@ -50,10 +52,11 @@ pub(crate) fn layered_destination_verdict(
     let Some(port) = port else {
         return Err(ECONNREFUSED);
     };
+    destination_verdict(&effective.allow, ip, Some(port))?;
     if !effective.deny.allows(ip, port) {
         return Err(ECONNREFUSED);
     }
-    destination_verdict(&effective.allow, ip, Some(port))
+    Ok(())
 }
 
 /// Resolve the effective per-protocol allow/deny layers for `pid` and apply
@@ -250,7 +253,7 @@ mod tests {
     }
 
     #[test]
-    fn layered_verdict_checks_static_deny_before_resolved_allow() {
+    fn layered_verdict_checks_static_deny_after_resolved_allow() {
         // Allow here stands in for an already-resolved legacy dynamic
         // override (IP-only, any port); deny must still win.
         use crate::seccomp::notif::NetworkPolicy as NP;

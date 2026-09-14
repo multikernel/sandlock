@@ -330,7 +330,7 @@ pub fn compute_net_mask(
     if ProtectionStatus::resolve(Protection::NetTcp, abi, pol) != ProtectionStatus::Active {
         return (0, false);
     }
-    use crate::sandbox::{BindPorts, Protocol};
+    use crate::sandbox::Protocol;
     let allow_all_ports = sandbox
         .net_allow
         .iter()
@@ -346,13 +346,13 @@ pub fn compute_net_mask(
     // on-behalf seccomp handler (the bind denylist enforcer), so Landlock
     // must not gate BIND_TCP. Drop it from the handled set; the on-behalf
     // path becomes the sole bind enforcer. When an allowlist is also present,
-    // the same supervisor path applies both layers. `--net-allow-bind '*'`
-    // likewise leaves BIND_TCP unhandled: every port is allowed and nothing
-    // enforces on the on-behalf path. A listed port `0` cannot be expressed
-    // to Landlock (a `0` rule would wildcard every port), so it also routes
-    // binds through the supervisor for exact-match enforcement.
-    let allow_has_zero = matches!(&sandbox.net_allow_bind, BindPorts::Ports(p) if p.contains(&0));
-    if !sandbox.net_deny_bind.is_empty() || sandbox.net_allow_bind.is_all() || allow_has_zero {
+    // the same supervisor path applies both layers with exact-match
+    // semantics. `--net-allow-bind '*'` likewise leaves BIND_TCP unhandled:
+    // every port is allowed and nothing enforces on the on-behalf path.
+    // A listed port `0` needs no special case: a Landlock `BIND_TCP` rule
+    // with port 0 permits only a `bind(0)` request (the kernel then chooses
+    // an ephemeral port) and does not permit explicit `bind(nonzero)`.
+    if !sandbox.net_deny_bind.is_empty() || sandbox.net_allow_bind.is_all() {
         mask &= !LANDLOCK_ACCESS_NET_BIND_TCP;
     }
     (mask, net_wildcard)
@@ -551,15 +551,15 @@ fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError
     let net_tcp_active =
         ProtectionStatus::resolve(Protection::NetTcp, abi, pol) == ProtectionStatus::Active;
     // `BindPorts::All` installs no rules: BIND_TCP was dropped from the
-    // handled set, so every bind is already allowed. Port `0` is skipped:
-    // a Landlock `0` rule would wildcard every port, while the policy means
-    // only an ephemeral `bind(0)` request.
+    // handled set, so every bind is already allowed. A listed port `0` is
+    // installed verbatim: Landlock permits only a `bind(0)` request with it
+    // (the kernel then chooses an ephemeral port), not explicit nonzero binds.
     if handle_net
         && net_tcp_active
         && handled_access_net & LANDLOCK_ACCESS_NET_BIND_TCP != 0
     {
         if let crate::sandbox::BindPorts::Ports(ports) = &policy.net_allow_bind {
-            for &port in ports.iter().filter(|p| **p != 0) {
+            for &port in ports {
                 add_net_rule(&ruleset_fd, port, LANDLOCK_ACCESS_NET_BIND_TCP).map_err(|e| {
                     SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
                 })?;
@@ -874,19 +874,20 @@ mod mask_contract_tests {
     }
 
     #[test]
-    fn net_mask_allow_bind_zero_routes_binds_to_supervisor() {
-        // A listed port 0 authorizes only bind(0); Landlock cannot express
-        // that without wildcarding every port, so BIND_TCP must be dropped.
+    fn net_mask_allow_bind_zero_keeps_landlock_bind_gate() {
+        // A listed port 0 is installed verbatim: Landlock permits only a
+        // `bind(0)` request with it, not explicit nonzero binds, so the
+        // BIND_TCP gate stays handled.
         let pol = ProtectionPolicy::strict_all();
         let sb = Sandbox::builder()
             .net_allow_bind("0")
             .build()
             .expect("bind-zero sandbox builds");
         let (mask, _) = compute_net_mask(6, &pol, &sb, true);
-        assert_eq!(
+        assert_ne!(
             mask & LANDLOCK_ACCESS_NET_BIND_TCP,
             0,
-            "bind port 0 must route binds to the supervisor for exact-match checks",
+            "bind port 0 must keep the Landlock BIND_TCP gate",
         );
         assert_ne!(
             mask & LANDLOCK_ACCESS_NET_CONNECT_TCP,
