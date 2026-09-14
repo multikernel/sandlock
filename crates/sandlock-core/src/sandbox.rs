@@ -341,8 +341,10 @@ enum RuntimeState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BindPorts {
     /// Allow binding only the listed ports. Empty means no bind is
-    /// permitted while the NetTcp protection is active (the default). The
-    /// numeric port `0` is Landlock's any-port wildcard.
+    /// permitted while the NetTcp protection is active (the default).
+    /// Port `0` is the ephemeral-bind request: listing `0` authorizes only
+    /// `bind(0)`, not explicit nonzero ports. Only `All` (`'*'`) is the
+    /// any-port form.
     Ports(Vec<u16>),
     /// `--net-allow-bind '*'`: any TCP port may be bound.
     All,
@@ -365,13 +367,12 @@ impl BindPorts {
         matches!(self, BindPorts::All)
     }
 
-    /// True when `port` is covered by this allowlist.
+    /// True when `port` is covered by this allowlist. Exact match only:
+    /// a listed `0` authorizes an ephemeral `bind(0)` request, never an
+    /// explicit nonzero port.
     pub(crate) fn allows_port(&self, port: u16) -> bool {
         match self {
-            // Landlock uses bind port 0 as its wildcard for every TCP port.
-            // Preserve that meaning when the supervisor evaluates a combined
-            // allow/deny policy instead of the kernel rule.
-            BindPorts::Ports(ports) => ports.contains(&port) || ports.contains(&0),
+            BindPorts::Ports(ports) => ports.contains(&port),
             BindPorts::All => true,
         }
     }
@@ -438,9 +439,9 @@ pub struct Sandbox {
     pub net_deny: Vec<NetDeny>,
     /// `--net-allow-bind`: TCP ports the sandbox may bind (default-deny
     /// allowlist, Landlock-enforced when used alone; `All` leaves Landlock's
-    /// `BIND_TCP` hook unhandled so any port may be bound). Numeric port `0`
-    /// has the same any-port meaning. When combined with `net_deny_bind`, the
-    /// supervisor enforces both layers.
+    /// `BIND_TCP` hook unhandled so any port may be bound). Listing port `0`
+    /// authorizes only an ephemeral `bind(0)` request. When combined with
+    /// `net_deny_bind`, the supervisor enforces both layers.
     pub net_allow_bind: BindPorts,
     /// `--net-deny-bind`: TCP ports the sandbox may NOT bind (default-allow
     /// denylist, enforced on the on-behalf `bind()` path). When combined with
@@ -583,10 +584,42 @@ pub struct Sandbox {
     restore_skipped: Vec<crate::checkpoint::SkippedFd>,
 
     /// Whether the user supplied an outbound `net_allow` rule before HTTP ACL
-    /// reachability rules were appended. It is stored in checkpoint metadata,
-    /// not in `policy.dat`, so the existing bincode layout remains compatible.
-    #[serde(skip)]
+    /// reachability rules were appended. Serialized as the trailing bincode
+    /// field so direct `Sandbox` round trips preserve deny-only vs combined
+    /// mode; legacy blobs without the trailing byte deserialize to `None`
+    /// and are inferred as deny-only whenever `net_deny` is present. The same
+    /// value is also mirrored in checkpoint `meta.json` for older images.
+    #[serde(default, deserialize_with = "deserialize_trailing_net_allow_explicit")]
     pub(crate) net_allow_explicit: Option<bool>,
+}
+
+/// Deserialize the trailing `net_allow_explicit` flag, tolerating legacy
+/// `policy.dat` blobs that end before it. Bincode serializes structs as a
+/// tuple in field order, so a blob written before the flag existed simply
+/// hits EOF here; map-based formats (JSON) use `#[serde(default)]`.
+fn deserialize_trailing_net_allow_explicit<'de, D>(d: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    match Option::<bool>::deserialize(d) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            // Legacy `policy.dat` blobs end before this trailing flag. Only
+            // an end-of-input failure falls back to `None` (legacy inference);
+            // any other decoding error still fails closed.
+            let msg = e.to_string().to_lowercase();
+            if msg.contains("eof")
+                || msg.contains("unexpected end")
+                || msg.contains("failed to fill")
+                || msg.contains("not enough data")
+            {
+                Ok(None)
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for Sandbox {
@@ -2235,7 +2268,6 @@ impl Sandbox {
                 let live = std::sync::Arc::new(std::sync::RwLock::new(live));
                 let denied = policy_fn_state.denied.clone();
                 let pid_overrides = net_state.pid_ip_overrides.clone();
-                let network_policy_active = net_state.network_policy_active.clone();
                 policy_fn_state.live_policy = Some(live.clone());
                 let worker = crate::policy_fn::spawn_policy_fn(
                     callback.clone(),
@@ -2243,7 +2275,6 @@ impl Sandbox {
                     ceiling,
                     pid_overrides,
                     denied,
-                    network_policy_active,
                 );
                 policy_fn_state.event_tx = Some(worker.sender());
                 self.rt_mut().policy_fn_worker = Some(worker);

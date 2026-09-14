@@ -2185,42 +2185,7 @@ async fn handle_notification(
     // interception scope; see `fs_denied_path_syscalls` for what is gated
     // and why symlink/mkdir are not.
     let nr = notif.data.nr as i64;
-    let is_network_syscall = nr == libc::SYS_connect
-        || nr == libc::SYS_bind
-        || nr == libc::SYS_sendto
-        || nr == libc::SYS_sendmsg
-        || nr == libc::SYS_sendmmsg;
-    let network_policy_callback_active = if is_network_syscall {
-        let pfs = ctx.policy_fn.lock().await;
-        pfs.event_tx.is_some()
-    } else {
-        false
-    };
-    let mut policy_event_handled = false;
-    let mut action = if network_policy_callback_active {
-        // Network handlers execute connect/send/bind on behalf of the child,
-        // so the callback must decide before dispatch can cause a side effect.
-        // `Continue` is only a placeholder here; the event is metadata-only.
-        let pre_verdict = emit_policy_event(
-            &notif,
-            &NotifAction::Continue,
-            &ctx.policy_fn,
-            fd,
-        )
-        .await;
-        match pre_verdict {
-            Some(verdict) => {
-                policy_event_handled = true;
-                use crate::policy_fn::Verdict;
-                match verdict {
-                    Verdict::Deny => NotifAction::Errno(libc::EPERM),
-                    Verdict::DenyWith(errno) => NotifAction::Errno(errno),
-                    Verdict::Audit | Verdict::Allow => dispatch_table.dispatch(notif, fd).await,
-                }
-            }
-            None => dispatch_table.dispatch(notif, fd).await,
-        }
-    } else {
+    let mut action = {
         let should_precheck_denied = policy.chroot_root.is_none()
             && crate::seccomp_plan::fs_denied_path_syscalls().contains(&nr);
         if should_precheck_denied {
@@ -2306,15 +2271,13 @@ async fn handle_notification(
     // Emit event to policy_fn callback if active. For execve, argv is
     // only populated after `exec_freeze` has stopped every possible
     // writer, and those tasks stay stopped until after NOTIF_SEND.
-    if !policy_event_handled {
-        if let Some(verdict) = emit_policy_event(&notif, &action, &ctx.policy_fn, fd).await {
-            use crate::policy_fn::Verdict;
-            match verdict {
-                Verdict::Deny => { action = NotifAction::Errno(libc::EPERM); }
-                Verdict::DenyWith(errno) => { action = NotifAction::Errno(errno); }
-                Verdict::Audit => { /* allow, but could log here */ }
-                Verdict::Allow => {}
-            }
+    if let Some(verdict) = emit_policy_event(&notif, &action, &ctx.policy_fn, fd).await {
+        use crate::policy_fn::Verdict;
+        match verdict {
+            Verdict::Deny => { action = NotifAction::Errno(libc::EPERM); }
+            Verdict::DenyWith(errno) => { action = NotifAction::Errno(errno); }
+            Verdict::Audit => { /* allow, but could log here */ }
+            Verdict::Allow => {}
         }
     }
 

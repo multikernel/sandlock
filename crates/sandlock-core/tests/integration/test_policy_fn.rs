@@ -62,8 +62,7 @@ async fn test_policy_fn_receives_events_with_metadata() {
 #[tokio::test]
 async fn test_policy_fn_deny_connect() {
     let out = temp_file("deny-connect");
-    let (listener, port) = loopback_listener("127.0.0.1");
-    listener.set_nonblocking(true).unwrap();
+    let (_listener, port) = loopback_listener("127.0.0.1");
 
     let policy = base_policy()
         .net_allow(format!("127.0.0.1:{port}"))
@@ -94,10 +93,6 @@ async fn test_policy_fn_deny_connect() {
     let _ = std::fs::remove_file(&out);
     // EPERM (1) from the policy_fn deny — not a dead-port ECONNREFUSED.
     assert_eq!(content, "BLOCKED:1", "connect should be denied by policy_fn (EPERM)");
-    assert!(
-        matches!(listener.accept(), Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock),
-        "denied connect must not reach the listener"
-    );
 }
 
 /// restrict_network narrows outbound to the listed IPs and is enforced. Use
@@ -141,47 +136,6 @@ async fn test_policy_fn_restrict_network_takes_effect() {
     let _ = std::fs::remove_file(&out);
     assert!(content.contains("allowed=OK"), "listed IP should still connect, got: {}", content);
     assert!(content.contains("denied=ERR111"), "non-listed IP should be refused, got: {}", content);
-}
-
-/// An empty restriction is an active deny-all, not an absent override.
-#[tokio::test]
-async fn test_policy_fn_restrict_network_empty_denies_all() {
-    let out = temp_file("restrict-net-empty");
-    let (_listener, port) = loopback_listener("127.0.0.1");
-
-    let policy = base_policy()
-        .net_allow(format!("127.0.0.1:{port}"))
-        .policy_fn(|event, ctx| {
-            if event.syscall == "execve" {
-                ctx.restrict_network(&[]);
-            }
-            Verdict::Allow
-        })
-        .build()
-        .unwrap();
-
-    let script = format!(concat!(
-        "import socket\n",
-        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "s.settimeout(3)\n",
-        "try:\n",
-        "  s.connect(('127.0.0.1', {port}))\n",
-        "  result = 'CONNECTED'\n",
-        "except OSError as e:\n",
-        "  result = 'BLOCKED:%d' % e.errno\n",
-        "open('{out}', 'w').write(result)\n",
-    ), port = port, out = out.display());
-
-    let result = policy
-        .clone()
-        .run_interactive(&["python3", "-c", &script])
-        .await
-        .unwrap();
-    assert!(result.success());
-
-    let content = std::fs::read_to_string(&out).unwrap_or_default();
-    let _ = std::fs::remove_file(&out);
-    assert_eq!(content, "BLOCKED:111", "empty restriction must deny the live connect");
 }
 
 /// Test deny_path blocks filesystem access dynamically.

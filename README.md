@@ -405,9 +405,9 @@ positive int = deny with errno, `"audit"`/`-2` = allow + flag.
 - `ctx.deny_path(path)` / `ctx.allow_path(path)` — dynamic filesystem restriction
 - `ctx.restrict_pid_network(pid, ips)` — per-PID network override
 
-Dynamic network restrictions are IP-only and are intersected with the static
-`net_allow`/`net_deny` layers; they cannot add a port, protocol, or destination
-outside the static policy.
+Dynamic network restrictions are IP-only and resolve with legacy priority
+(per-PID override > live policy > static allowlist); the static `net_deny`
+layer is always checked first, so a dynamic override can never erase it.
 
 **Held syscalls** (child blocked until callback returns): `execve`,
 `connect`, `sendto`, `bind`, `openat`.
@@ -763,10 +763,10 @@ with no content inspection.
 **Bind.** `--net-allow-bind <ports>` is independent from `--net-allow` and
 governs server-side `bind()` as a default-deny allowlist. Each value is a
 comma-separated list of single ports or inclusive `lo-hi` ranges (e.g.
-`--net-allow-bind 8080,9000-9005`), and the flag repeats. The `'*'` wildcard
-allows binding any port, including an ephemeral `bind(0)`; numeric port `0`
-has the same any-port meaning. It cannot be mixed with port lists (repeating
-the bare wildcard is fine). Landlock enforces the
+`--net-allow-bind 8080,9000-9005`), and the flag repeats. Only the `'*'`
+wildcard allows binding any port, including an ephemeral `bind(0)`; a listed
+port `0` authorizes only a `bind(0)` request. The wildcard cannot be mixed
+with port lists (repeating the bare wildcard is fine). Landlock enforces the
 allowlist (TCP only; the wildcard simply leaves Landlock's `BIND_TCP` hook
 unhandled); `--port-remap` adds on-behalf virtualization for binding.
 `--net-deny-bind <ports>` is the inverse: default-allow binding, deny the

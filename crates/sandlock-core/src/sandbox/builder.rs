@@ -458,9 +458,9 @@ impl SandboxBuilder {
         self
     }
 
-    /// Allow binding a single TCP port. Port `0` means any TCP port, matching
-    /// Landlock's bind rule semantics. For comma-separated lists or `lo-hi`
-    /// ranges, use [`net_allow_bind`](Self::net_allow_bind).
+    /// Allow binding a single TCP port. Port `0` authorizes only an ephemeral
+    /// `bind(0)` request, not explicit nonzero ports. For comma-separated
+    /// lists or `lo-hi` ranges, use [`net_allow_bind`](Self::net_allow_bind).
     pub fn net_allow_bind_port(mut self, port: u16) -> Self {
         self.net_allow_bind.push(port.to_string());
         self
@@ -468,9 +468,10 @@ impl SandboxBuilder {
 
     /// Allow binding TCP ports from a spec: a comma-separated list of single
     /// ports or inclusive `lo-hi` ranges (e.g. `"8080,9000-9005"`), or the
-    /// `"*"` wildcard to allow binding any port. Numeric port `0` also means
-    /// any port. Mixing the wildcard with port lists fails at build time;
-    /// repeating the bare wildcard is idempotent.
+    /// `"*"` wildcard to allow binding any port. Only `"*"` is the any-port
+    /// form; a listed port `0` authorizes only `bind(0)`. Mixing the wildcard
+    /// with port lists fails at build time; repeating the bare wildcard is
+    /// idempotent.
     pub fn net_allow_bind(mut self, spec: impl Into<String>) -> Self {
         self.net_allow_bind.push(spec.into());
         self

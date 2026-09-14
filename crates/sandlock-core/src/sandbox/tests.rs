@@ -322,16 +322,35 @@ fn builder_keeps_http_generated_allow_rules_out_of_deny_only_mode() {
 }
 
 #[test]
-fn outbound_mode_marker_does_not_change_policy_bincode_layout() {
-    let mut policy = Sandbox::builder()
+fn outbound_mode_marker_survives_policy_bincode_round_trip() {
+    let policy = Sandbox::builder()
         .net_allow("127.0.0.1:443")
         .net_deny("10.0.0.0/8")
         .build()
         .unwrap();
-    let with_marker = bincode::serialize(&policy).unwrap();
-    policy.net_allow_explicit = None;
-    let without_marker = bincode::serialize(&policy).unwrap();
-    assert_eq!(with_marker, without_marker);
+    assert!(policy.net_allow_is_active());
+    let bytes = bincode::serialize(&policy).unwrap();
+    let restored: Sandbox = bincode::deserialize(&bytes).unwrap();
+    assert_eq!(restored.net_allow_explicit, Some(true));
+    assert!(restored.net_allow_is_active());
+}
+
+#[test]
+fn outbound_mode_marker_legacy_blob_infers_deny_only() {
+    // Simulate a `policy.dat` written before the trailing flag existed by
+    // truncating it. Deserialization must succeed and infer deny-only.
+    let policy = Sandbox::builder()
+        .net_allow("127.0.0.1:443")
+        .net_deny("10.0.0.0/8")
+        .build()
+        .unwrap();
+    let mut bytes = bincode::serialize(&policy).unwrap();
+    // Trailing flag is `Some(true)` = tag 1 + value 1; drop those bytes.
+    assert!(bytes.len() >= 2);
+    bytes.truncate(bytes.len() - 2);
+    let restored: Sandbox = bincode::deserialize(&bytes).unwrap();
+    assert_eq!(restored.net_allow_explicit, None);
+    assert!(!restored.net_allow_is_active());
 }
 
 #[test]
@@ -358,10 +377,14 @@ fn builder_combines_allow_bind_and_deny_bind() {
 }
 
 #[test]
-fn bind_allow_port_zero_is_a_wildcard() {
+fn bind_allow_port_zero_is_ephemeral_only() {
     let policy = Sandbox::builder().net_allow_bind_port(0).build().unwrap();
+    assert!(policy.net_allow_bind.allows_port(0));
+    assert!(!policy.net_allow_bind.allows_port(80));
+    assert!(!policy.net_allow_bind.allows_port(49152));
+    // Only `*` is the any-port form.
+    let policy = Sandbox::builder().net_allow_bind("*").build().unwrap();
     assert!(policy.net_allow_bind.allows_port(80));
-    assert!(policy.net_allow_bind.allows_port(49152));
 }
 
 #[test]

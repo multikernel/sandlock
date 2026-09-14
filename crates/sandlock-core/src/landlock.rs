@@ -302,10 +302,12 @@ pub fn compute_fs_mask(abi: u32, pol: &ProtectionPolicy) -> u64 {
 /// covers every port we drop `CONNECT_TCP` from the handled set (the
 /// on-behalf path is then the sole enforcer).
 ///
-/// `--net-deny` is default-allow: every TCP connect must reach the
-/// on-behalf seccomp path (the DenyList enforcer), so Landlock must not
-/// gate `CONNECT_TCP` at all. A non-empty `net_deny` therefore forces the
-/// wildcard treatment, exactly like an all-ports `--net-allow` rule.
+/// Outbound modes: deny-only (`net_deny` present, no explicit `net_allow`)
+/// forces the wildcard treatment because every TCP connect must reach the
+/// on-behalf DenyList enforcer. A combined policy with a finite allowlist
+/// keeps `CONNECT_TCP` handled so Landlock still gates ports; a combined
+/// policy whose allowlist covers every TCP port drops it like an
+/// allow-only wildcard.
 ///
 /// Returns `(0, false)` when `Protection::NetTcp` is not `Active`
 /// (either disabled by policy or degraded on a kernel that does not
@@ -328,12 +330,13 @@ pub fn compute_net_mask(
     if ProtectionStatus::resolve(Protection::NetTcp, abi, pol) != ProtectionStatus::Active {
         return (0, false);
     }
-    use crate::sandbox::Protocol;
-    let net_wildcard = !sandbox.net_deny.is_empty()
-        || sandbox
-            .net_allow
-            .iter()
-            .any(|r| r.protocol == Protocol::Tcp && r.all_ports);
+    use crate::sandbox::{BindPorts, Protocol};
+    let allow_all_ports = sandbox
+        .net_allow
+        .iter()
+        .any(|r| r.protocol == Protocol::Tcp && r.all_ports);
+    let deny_only = !sandbox.net_deny.is_empty() && !sandbox.net_allow_is_active();
+    let net_wildcard = deny_only || allow_all_ports;
     let mut mask = if net_wildcard {
         LANDLOCK_ACCESS_NET_BIND_TCP
     } else {
@@ -345,8 +348,11 @@ pub fn compute_net_mask(
     // path becomes the sole bind enforcer. When an allowlist is also present,
     // the same supervisor path applies both layers. `--net-allow-bind '*'`
     // likewise leaves BIND_TCP unhandled: every port is allowed and nothing
-    // enforces on the on-behalf path.
-    if !sandbox.net_deny_bind.is_empty() || sandbox.net_allow_bind.is_all() {
+    // enforces on the on-behalf path. A listed port `0` cannot be expressed
+    // to Landlock (a `0` rule would wildcard every port), so it also routes
+    // binds through the supervisor for exact-match enforcement.
+    let allow_has_zero = matches!(&sandbox.net_allow_bind, BindPorts::Ports(p) if p.contains(&0));
+    if !sandbox.net_deny_bind.is_empty() || sandbox.net_allow_bind.is_all() || allow_has_zero {
         mask &= !LANDLOCK_ACCESS_NET_BIND_TCP;
     }
     (mask, net_wildcard)
@@ -545,13 +551,15 @@ fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError
     let net_tcp_active =
         ProtectionStatus::resolve(Protection::NetTcp, abi, pol) == ProtectionStatus::Active;
     // `BindPorts::All` installs no rules: BIND_TCP was dropped from the
-    // handled set, so every bind is already allowed.
+    // handled set, so every bind is already allowed. Port `0` is skipped:
+    // a Landlock `0` rule would wildcard every port, while the policy means
+    // only an ephemeral `bind(0)` request.
     if handle_net
         && net_tcp_active
         && handled_access_net & LANDLOCK_ACCESS_NET_BIND_TCP != 0
     {
         if let crate::sandbox::BindPorts::Ports(ports) = &policy.net_allow_bind {
-            for &port in ports {
+            for &port in ports.iter().filter(|p| **p != 0) {
                 add_net_rule(&ruleset_fd, port, LANDLOCK_ACCESS_NET_BIND_TCP).map_err(|e| {
                     SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
                 })?;
@@ -809,23 +817,82 @@ mod mask_contract_tests {
 
     #[test]
     fn net_mask_net_deny_forces_wildcard_dropping_connect_tcp() {
-        // `--net-deny` is default-allow and enforced on the on-behalf
-        // seccomp path, so Landlock must not gate CONNECT_TCP: a non-empty
-        // net_deny forces the wildcard treatment (BIND_TCP only), exactly
-        // like an all-ports --net-allow rule. This pins the reconciliation
-        // of the net-deny runtime relaxation with compute_net_mask.
+        // Deny-only (`--net-deny` without explicit `--net-allow`) is
+        // default-allow and enforced on the on-behalf seccomp path, so
+        // Landlock must not gate CONNECT_TCP.
         let pol = ProtectionPolicy::strict_all();
         let sb = Sandbox::builder()
             .net_deny("10.0.0.0/8")
             .build()
             .expect("net_deny sandbox builds");
+        assert!(!sb.net_allow_is_active());
         let (mask, wildcard) = compute_net_mask(6, &pol, &sb, true);
         assert_eq!(
             mask,
             LANDLOCK_ACCESS_NET_BIND_TCP,
-            "net_deny must drop CONNECT_TCP so all TCP connects reach the on-behalf path",
+            "deny-only must drop CONNECT_TCP so all TCP connects reach the on-behalf path",
         );
-        assert!(wildcard, "net_deny must set the wildcard flag");
+        assert!(wildcard, "deny-only must set the wildcard flag");
+    }
+
+    #[test]
+    fn net_mask_combined_finite_keeps_connect_tcp() {
+        // Combined finite allow + deny keeps Landlock port gating; the
+        // supervisor applies allow then deny on the on-behalf path.
+        let pol = ProtectionPolicy::strict_all();
+        let sb = Sandbox::builder()
+            .net_allow("127.0.0.1:443")
+            .net_deny("10.0.0.0/8")
+            .build()
+            .expect("combined sandbox builds");
+        assert!(sb.net_allow_is_active());
+        let (mask, wildcard) = compute_net_mask(6, &pol, &sb, true);
+        assert!(!wildcard, "combined finite must not force the connect wildcard");
+        assert_eq!(
+            mask,
+            LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP,
+            "combined finite keeps both TCP hooks",
+        );
+    }
+
+    #[test]
+    fn net_mask_combined_wildcard_drops_connect_tcp() {
+        let pol = ProtectionPolicy::strict_all();
+        let sb = Sandbox::builder()
+            .net_allow("tcp://*:443")
+            .net_allow("tcp://127.0.0.1:*")
+            .net_deny("10.0.0.0/8")
+            .build()
+            .expect("combined wildcard sandbox builds");
+        let (mask, wildcard) = compute_net_mask(6, &pol, &sb, true);
+        assert!(wildcard, "combined wildcard must set the wildcard flag");
+        assert_eq!(
+            mask & LANDLOCK_ACCESS_NET_CONNECT_TCP,
+            0,
+            "combined wildcard must drop CONNECT_TCP",
+        );
+    }
+
+    #[test]
+    fn net_mask_allow_bind_zero_routes_binds_to_supervisor() {
+        // A listed port 0 authorizes only bind(0); Landlock cannot express
+        // that without wildcarding every port, so BIND_TCP must be dropped.
+        let pol = ProtectionPolicy::strict_all();
+        let sb = Sandbox::builder()
+            .net_allow_bind("0")
+            .build()
+            .expect("bind-zero sandbox builds");
+        let (mask, _) = compute_net_mask(6, &pol, &sb, true);
+        assert_eq!(
+            mask & LANDLOCK_ACCESS_NET_BIND_TCP,
+            0,
+            "bind port 0 must route binds to the supervisor for exact-match checks",
+        );
+        assert_ne!(
+            mask & LANDLOCK_ACCESS_NET_CONNECT_TCP,
+            0,
+            "bind-zero must not affect CONNECT_TCP handling",
+        );
     }
 
     #[test]

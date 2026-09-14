@@ -215,9 +215,11 @@ impl Checkpoint {
         let policy_bytes = std::fs::read(dir.join("policy.dat"))
             .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
         let mut policy: Sandbox = bincode::deserialize(&policy_bytes).map_err(io_err)?;
-        // Keep this mode bit outside policy.dat: adding a trailing field to the
-        // bincode struct would make older policy.dat files unreadable.
-        policy.net_allow_explicit = meta.net_allow_explicit;
+        // The mode flag is now the trailing `policy.dat` field; `meta.json`
+        // only backfills legacy images whose blob predates it.
+        if policy.net_allow_explicit.is_none() {
+            policy.net_allow_explicit = meta.net_allow_explicit;
+        }
 
         // app_state.bin
         let app_state_path = dir.join("app_state.bin");
@@ -342,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn image_stores_outbound_mode_in_metadata_not_policy_bincode() {
+    fn image_stores_outbound_mode_in_policy_bincode_and_metadata() {
         let dir = std::env::temp_dir().join(format!("sandlock-mode-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let policy = Sandbox::builder()
@@ -363,7 +365,7 @@ mod tests {
         checkpoint.save(&dir).unwrap();
         let policy_bytes = std::fs::read(dir.join("policy.dat")).unwrap();
         let policy_from_bincode: Sandbox = bincode::deserialize(&policy_bytes).unwrap();
-        assert!(policy_from_bincode.net_allow_explicit.is_none());
+        assert_eq!(policy_from_bincode.net_allow_explicit, Some(true));
         assert!(
             std::fs::read_to_string(dir.join("meta.json"))
                 .unwrap()

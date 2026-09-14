@@ -38,9 +38,10 @@ pub(crate) fn destination_verdict(
     }
 }
 
-/// Apply the static deny layer before the allow layer. Keeping the two checks
-/// separate preserves arbitrary allowlist/denylist intersections and makes it
-/// impossible for a dynamic allow override to erase a static deny.
+/// Apply the static deny layer before the resolved allow layer. Allow already
+/// carries legacy dynamic resolution (per-PID > live > static); checking
+/// deny first preserves arbitrary allowlist/denylist intersections and makes
+/// it impossible for a dynamic override to erase a static deny.
 pub(crate) fn layered_destination_verdict(
     effective: &NetworkPolicyLayers,
     ip: IpAddr,
@@ -51,11 +52,6 @@ pub(crate) fn layered_destination_verdict(
     };
     if !effective.deny.allows(ip, port) {
         return Err(ECONNREFUSED);
-    }
-    if let Some(dynamic_ips) = &effective.dynamic_ips {
-        if !dynamic_ips.contains(&ip.to_canonical()) {
-            return Err(ECONNREFUSED);
-        }
     }
     destination_verdict(&effective.allow, ip, Some(port))
 }
@@ -241,11 +237,7 @@ mod tests {
             any_ip_ports: HashSet::new(),
             deny_all: false,
         };
-        let layers = NetworkPolicyLayers {
-            allow,
-            deny,
-            dynamic_ips: None,
-        };
+        let layers = NetworkPolicyLayers { allow, deny };
 
         assert_eq!(
             layered_destination_verdict(&layers, "10.1.2.3".parse().unwrap(), Some(443)),
@@ -258,38 +250,29 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_ip_layer_cannot_widen_static_port_policy() {
-        let ip: IpAddr = "127.0.0.1".parse().unwrap();
-        let allow = allowlist_for("127.0.0.1", 443);
-        let layers = NetworkPolicyLayers {
-            allow,
-            deny: NetworkPolicy::Unrestricted,
-            dynamic_ips: Some(HashSet::from([ip])),
+    fn layered_verdict_checks_static_deny_before_resolved_allow() {
+        // Allow here stands in for an already-resolved legacy dynamic
+        // override (IP-only, any port); deny must still win.
+        use crate::seccomp::notif::NetworkPolicy as NP;
+        let allow = NP::AllowList {
+            per_ip: HashMap::from([(
+                "10.1.2.3".parse::<IpAddr>().unwrap(),
+                PortAllow::Any,
+            )]),
+            cidrs: Vec::new(),
+            any_ip_ports: HashSet::new(),
         };
-
-        assert_eq!(layered_destination_verdict(&layers, ip, Some(443)), Ok(()));
-        assert_eq!(
-            layered_destination_verdict(&layers, ip, Some(80)),
-            Err(ECONNREFUSED)
-        );
-    }
-
-    #[test]
-    fn dynamic_ip_layer_cannot_bypass_static_allowlist() {
-        let static_ip: IpAddr = "127.0.0.1".parse().unwrap();
-        let foreign_ip: IpAddr = "8.8.8.8".parse().unwrap();
-        let layers = NetworkPolicyLayers {
-            allow: allowlist_for("127.0.0.1", 443),
-            deny: NetworkPolicy::Unrestricted,
-            dynamic_ips: Some(HashSet::from([foreign_ip])),
+        let deny = NP::DenyList {
+            cidrs: vec![(
+                crate::network::IpCidr::parse("10.0.0.0/8").unwrap(),
+                PortAllow::Any,
+            )],
+            any_ip_ports: HashSet::new(),
+            deny_all: false,
         };
-
+        let layers = NetworkPolicyLayers { allow, deny };
         assert_eq!(
-            layered_destination_verdict(&layers, foreign_ip, Some(443)),
-            Err(ECONNREFUSED)
-        );
-        assert_eq!(
-            layered_destination_verdict(&layers, static_ip, Some(443)),
+            layered_destination_verdict(&layers, "10.1.2.3".parse().unwrap(), Some(443)),
             Err(ECONNREFUSED)
         );
     }

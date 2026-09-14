@@ -275,10 +275,11 @@ class Sandbox:
     net_allow_bind: Sequence[int | str] = field(default_factory=list)
     """TCP ports the sandbox may bind (default-deny allowlist). Empty = deny
     all. Each entry is a port number or a ``"lo-hi"`` range string (or a
-    comma-separated list); ``["*"]`` or port ``0`` allows binding any port and
-    cannot be mixed with port entries. Landlock's port hooks are TCP-only — UDP
-    bind is not separately gated. When combined with :attr:`net_deny_bind`,
-    denied ports win."""
+    comma-separated list); only ``["*"]`` allows binding any port and it
+    cannot be mixed with port entries (a listed ``0`` authorizes only
+    ``bind(0)``). Landlock's port hooks are TCP-only — UDP bind is not
+    separately gated. When combined with :attr:`net_deny_bind`, denied ports
+    win."""
 
     net_deny_bind: Sequence[int | str] = field(default_factory=list)
     """TCP ports the sandbox may NOT bind (default-allow denylist; the
