@@ -66,7 +66,7 @@ const MAX_SOCKADDR_LEN: usize = std::mem::size_of::<libc::sockaddr_storage>();
 /// allocation. A length larger than a `sockaddr_storage` cannot address a valid
 /// sockaddr, so it fails closed with `EINVAL` (matching what the kernel would
 /// return) rather than being silently truncated; a read fault maps to `EIO`.
-pub(super) fn read_sockaddr(
+pub(crate) fn read_sockaddr(
     notif_fd: RawFd,
     id: u64,
     pid: u32,
@@ -86,7 +86,7 @@ pub(super) fn read_sockaddr(
 /// Query `SO_PROTOCOL` on a dup'd socket fd to learn whether to route
 /// the on-behalf check through the TCP, UDP, or ICMP policy.
 ///
-/// Returns `None` for protocols sandlock does not gate via `net_allow`
+/// Returns `None` for protocols sandlock does not gate via network rules
 /// (raw, SCTP, etc.) — the handler treats those as "no rule applies"
 /// which collapses to the default-deny path.
 pub(crate) fn query_socket_protocol(fd: RawFd) -> Option<Protocol> {
@@ -148,7 +148,7 @@ fn socket_is_unix(fd: RawFd) -> bool {
 /// Continue safety (issue #27): the on-behalf paths don't return Continue
 /// at all (they return ReturnValue/Errno after performing the syscall in
 /// the supervisor). The Continue cases in this module are:
-///   1. Non-IP families (AF_UNIX etc.) — the IP allowlist doesn't apply;
+///   1. Non-IP families (AF_UNIX etc.) — the IP policy doesn't apply;
 ///      Landlock IPC scoping is the enforcement boundary. One sub-case is
 ///      narrower: `sendto`'s non-IP fall-through does NOT Continue once a
 ///      destination policy is active. That fall-through has no chroot check —

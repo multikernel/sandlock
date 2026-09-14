@@ -481,7 +481,12 @@ mod tests {
         let ceiling = test_live();
         let pid_overrides = Arc::new(RwLock::new(HashMap::new()));
         let denied = Arc::new(crate::seccomp::state::DeniedSet::default());
-        let mut ctx = PolicyContext::new(live.clone(), ceiling, pid_overrides, denied);
+        let mut ctx = PolicyContext::new(
+            live.clone(),
+            ceiling,
+            pid_overrides,
+            denied,
+        );
 
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
         ctx.grant_network(&[ip]).unwrap();
@@ -498,7 +503,12 @@ mod tests {
         let ceiling = test_live();
         let pid_overrides = Arc::new(RwLock::new(HashMap::new()));
         let denied = Arc::new(crate::seccomp::state::DeniedSet::default());
-        let mut ctx = PolicyContext::new(live.clone(), ceiling, pid_overrides, denied);
+        let mut ctx = PolicyContext::new(
+            live.clone(),
+            ceiling,
+            pid_overrides,
+            denied,
+        );
 
         // Try to grant an IP not in ceiling — should be silently ignored
         let foreign: IpAddr = "8.8.8.8".parse().unwrap();
@@ -512,7 +522,12 @@ mod tests {
         let ceiling = test_live();
         let pid_overrides = Arc::new(RwLock::new(HashMap::new()));
         let denied = Arc::new(crate::seccomp::state::DeniedSet::default());
-        let mut ctx = PolicyContext::new(live, ceiling, pid_overrides, denied);
+        let mut ctx = PolicyContext::new(
+            live,
+            ceiling,
+            pid_overrides,
+            denied,
+        );
 
         ctx.restrict_network(&[]);
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
@@ -525,7 +540,12 @@ mod tests {
         let ceiling = test_live();
         let pid_overrides = Arc::new(RwLock::new(HashMap::new()));
         let denied = Arc::new(crate::seccomp::state::DeniedSet::default());
-        let mut ctx = PolicyContext::new(live.clone(), ceiling, pid_overrides, denied);
+        let mut ctx = PolicyContext::new(
+            live.clone(),
+            ceiling,
+            pid_overrides,
+            denied,
+        );
 
         ctx.restrict_max_memory(256 * 1024 * 1024);
         assert_eq!(live.read().unwrap().max_memory_bytes, 256 * 1024 * 1024);
@@ -537,7 +557,12 @@ mod tests {
         let ceiling = test_live();
         let pid_overrides = Arc::new(RwLock::new(HashMap::new()));
         let denied = Arc::new(crate::seccomp::state::DeniedSet::default());
-        let ctx = PolicyContext::new(live, ceiling, pid_overrides.clone(), denied);
+        let ctx = PolicyContext::new(
+            live,
+            ceiling,
+            pid_overrides.clone(),
+            denied,
+        );
 
         let localhost: IpAddr = "127.0.0.1".parse().unwrap();
         ctx.restrict_pid_network(1234, &[localhost]);
@@ -554,7 +579,12 @@ mod tests {
         let ceiling = test_live();
         let pid_overrides = Arc::new(RwLock::new(HashMap::new()));
         let denied = Arc::new(crate::seccomp::state::DeniedSet::default());
-        let ctx = PolicyContext::new(live, ceiling, pid_overrides.clone(), denied);
+        let ctx = PolicyContext::new(
+            live,
+            ceiling,
+            pid_overrides.clone(),
+            denied,
+        );
 
         let localhost: IpAddr = "127.0.0.1".parse().unwrap();
         ctx.restrict_pid_network(1234, &[localhost]);

@@ -111,7 +111,9 @@ with Sandbox(fs_readable=["/usr", "/lib"]) as sb:
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `net_allow` | `list[str]` | `[]` | Outbound endpoint rules. Bare `host:port` is TCP; protocol prefixes opt others in: `tcp://host:port`, `udp://host:port` (or `udp://*:*` for any UDP), `icmp://host` (or `icmp://*` for any ICMP echo via the kernel ping socket — gated by `net.ipv4.ping_group_range` on the host). Empty = deny all. Raw ICMP is not exposed. |
-| `net_allow_bind` | `list[int \| str]` | `[]` | TCP ports the sandbox may bind (empty = deny all; `["*"]` = allow any port) |
+| `net_deny` | `list[str]` | `[]` | Default-allow outbound denylist for literal IP/CIDR targets. When combined with `net_allow`, denied destinations win. |
+| `net_allow_bind` | `list[int \| str]` | `[]` | TCP ports the sandbox may bind (empty = deny all; `["*"]` = allow any port; a listed `0` authorizes only `bind(0)`) |
+| `net_deny_bind` | `list[int \| str]` | `[]` | Default-allow TCP bind denylist. When combined with `net_allow_bind`, denied ports win. |
 | `port_remap` | `bool` | `False` | Transparent TCP port virtualization |
 
 #### HTTP ACL
@@ -576,12 +578,16 @@ Methods available inside `policy_fn`:
 | Method | Description |
 |--------|-------------|
 | `ctx.restrict_network(ips)` | Restrict to given IP addresses |
-| `ctx.grant_network(ips)` | Allow additional IP addresses |
+| `ctx.grant_network(ips)` | Allow additional IP addresses up to the static network ceiling |
 | `ctx.restrict_max_memory(bytes)` | Lower memory limit |
 | `ctx.restrict_max_processes(n)` | Lower process limit |
 | `ctx.restrict_pid_network(pid, ips)` | Per-PID network restriction |
 | `ctx.deny_path(path)` | Deny access to a path |
 | `ctx.allow_path(path)` | Remove a previously denied path |
+
+Dynamic IP restrictions resolve with legacy priority (per-PID override > live
+policy > static allowlist); the static `net_deny` layer is always checked
+first, so a dynamic override can never erase it.
 
 Callback return values:
 

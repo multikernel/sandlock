@@ -38,7 +38,7 @@ pub struct SandboxBuilder {
     /// Accepts `<ip>`, `<cidr>`, `<cidr>:<port[,port]>`, `:<port>`, `*`, and
     /// `[<ipv6>]:<port>`. The port is optional (no `:port` means all ports).
     /// Hostnames are rejected; use `--http-deny` for domains. Repeat the flag
-    /// for multiple rules. Mutually exclusive with `--net-allow`.
+    /// for multiple rules. When combined with `--net-allow`, deny rules win.
     #[cfg_attr(feature = "cli", arg(long = "net-deny", value_name = "SPEC"))]
     pub net_deny: Vec<String>,
 
@@ -51,8 +51,8 @@ pub struct SandboxBuilder {
 
     /// `--net-deny-bind`: TCP ports the sandbox may NOT bind/listen on
     /// (default-allow denylist; the inverse of `--net-allow-bind`). Same
-    /// port syntax (comma-separated ports / `lo-hi` ranges). Repeatable.
-    /// Mutually exclusive with `--net-allow-bind`.
+    /// port syntax (comma-separated ports / `lo-hi` ranges). Repeatable. When
+    /// combined with `--net-allow-bind`, denied ports win.
     #[cfg_attr(feature = "cli", arg(long = "net-deny-bind", value_name = "PORTS"))]
     pub net_deny_bind: Vec<String>,
 
@@ -458,8 +458,9 @@ impl SandboxBuilder {
         self
     }
 
-    /// Allow binding a single TCP port. For comma-separated lists or
-    /// `lo-hi` ranges, use [`net_allow_bind`](Self::net_allow_bind).
+    /// Allow binding a single TCP port. Port `0` authorizes only an ephemeral
+    /// `bind(0)` request, not explicit nonzero ports. For comma-separated
+    /// lists or `lo-hi` ranges, use [`net_allow_bind`](Self::net_allow_bind).
     pub fn net_allow_bind_port(mut self, port: u16) -> Self {
         self.net_allow_bind.push(port.to_string());
         self
@@ -467,8 +468,9 @@ impl SandboxBuilder {
 
     /// Allow binding TCP ports from a spec: a comma-separated list of single
     /// ports or inclusive `lo-hi` ranges (e.g. `"8080,9000-9005"`), or the
-    /// `"*"` wildcard to allow binding any port. Mixing the wildcard with
-    /// port lists fails at build time; repeating the bare wildcard is
+    /// `"*"` wildcard to allow binding any port. Only `"*"` is the any-port
+    /// form; a listed port `0` authorizes only `bind(0)`. Mixing the wildcard
+    /// with port lists fails at build time; repeating the bare wildcard is
     /// idempotent.
     pub fn net_allow_bind(mut self, spec: impl Into<String>) -> Self {
         self.net_allow_bind.push(spec.into());
@@ -964,24 +966,16 @@ impl SandboxBuilder {
             net_deny.extend(NetRule::parse_deny(&s)?);
         }
 
-        // --net-allow and --net-deny are mutually exclusive. Check the
-        // user-supplied allow count (the original specs), not the post-HTTP
-        // extension, so a coexisting --http-deny does not false-trigger.
-        if !net_allow.is_empty() && !net_deny.is_empty() {
-            return Err(SandboxError::Invalid(
-                "--net-allow and --net-deny are mutually exclusive".into(),
-            ));
-        }
+        // Keep the origin of net_allow separate from the parsed rules. HTTP
+        // ACL setup appends reachability rules below, but those generated
+        // rules must not turn an explicit deny-only policy into a combined
+        // allow/deny policy.
+        let net_allow_explicit = Some(!net_allow.is_empty());
 
-        // Expand bind port specs. --net-allow-bind (default-deny allowlist)
-        // and --net-deny-bind (default-allow denylist) are contradictory.
+        // Expand bind port specs. Both sides are retained; the supervisor
+        // applies the denylist after the allowlist when both are present.
         let net_allow_bind = parse_allow_bind_ports(&self.net_allow_bind, "--net-allow-bind")?;
         let net_deny_bind = parse_bind_ports(&self.net_deny_bind, "--net-deny-bind")?;
-        if !net_allow_bind.is_default() && !net_deny_bind.is_empty() {
-            return Err(SandboxError::Invalid(
-                "--net-allow-bind and --net-deny-bind are mutually exclusive".into(),
-            ));
-        }
 
         crate::http::extend_net_allow_for_http(
             &mut net_allow,
@@ -1047,6 +1041,7 @@ impl SandboxBuilder {
             work_fn: self.work_fn,
             runtime: None,
             restore_skipped: Vec::new(),
+            net_allow_explicit,
         })
     }
 

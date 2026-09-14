@@ -95,10 +95,8 @@ async fn test_policy_fn_deny_connect() {
     assert_eq!(content, "BLOCKED:1", "connect should be denied by policy_fn (EPERM)");
 }
 
-/// restrict_network narrows outbound to the listed IPs and is enforced. The
-/// previous version called `restrict_network(&[])` — an empty list is a no-op —
-/// and connected to a dead port, so it verified nothing. Use two live loopback
-/// listeners (127.0.0.1 and 127.0.0.2), both allowlisted up front so either
+/// restrict_network narrows outbound to the listed IPs and is enforced. Use
+/// two live loopback listeners (127.0.0.1 and 127.0.0.2), both allowlisted up front so either
 /// would connect; restricting to ["127.0.0.1"] must then permit the first and
 /// refuse the second (ECONNREFUSED, errno 111).
 #[tokio::test]

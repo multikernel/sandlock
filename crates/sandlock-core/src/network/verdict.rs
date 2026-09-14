@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use crate::seccomp::ctx::SupervisorCtx;
 use crate::seccomp::notif::NetworkPolicy;
+use crate::seccomp::state::NetworkPolicyLayers;
 use crate::sys::structs::ECONNREFUSED;
 
 use super::Protocol;
@@ -37,10 +38,31 @@ pub(crate) fn destination_verdict(
     }
 }
 
-/// Resolve the effective per-protocol policy for `pid` and apply
-/// [`destination_verdict`]. Shared by the sendto and sendmsg handlers;
+/// Resolve order: effective allow first, then the immutable static deny.
+/// Allow already carries legacy dynamic resolution (per-PID override > live
+/// policy > static per-protocol allowlist). Deny is always the static
+/// per-protocol denylist and wins second, including when the effective allow
+/// is `Unrestricted` or comes from a `policy_fn`/per-PID override. No
+/// dynamic/static allow intersection is performed.
+pub(crate) fn layered_destination_verdict(
+    effective: &NetworkPolicyLayers,
+    ip: IpAddr,
+    port: Option<u16>,
+) -> Result<(), i32> {
+    let Some(port) = port else {
+        return Err(ECONNREFUSED);
+    };
+    destination_verdict(&effective.allow, ip, Some(port))?;
+    if !effective.deny.allows(ip, port) {
+        return Err(ECONNREFUSED);
+    }
+    Ok(())
+}
+
+/// Resolve the effective per-protocol allow/deny layers for `pid` and apply
+/// [`layered_destination_verdict`]. Shared by the sendto and sendmsg handlers;
 /// connect keeps its own `ns` borrow alive for HTTP-ACL and port-remap
-/// reads, so it calls [`destination_verdict`] directly.
+/// reads, so it calls [`layered_destination_verdict`] directly.
 pub(crate) async fn check_ip_destination(
     ctx: &Arc<SupervisorCtx>,
     pid: u32,
@@ -55,7 +77,7 @@ pub(crate) async fn check_ip_destination(
     };
     let effective = ns.effective_network_policy(pid, protocol, live_policy.as_ref());
     drop(ns);
-    destination_verdict(&effective, ip, port)
+    layered_destination_verdict(&effective, ip, port)
 }
 
 /// True if `real` (an already-canonical path) is at or under any of `prefixes`,
@@ -201,6 +223,61 @@ mod tests {
             cidrs: Vec::new(),
             any_ip_ports: HashSet::new(),
         }
+    }
+
+    #[test]
+    fn layered_verdict_deny_wins_over_allow() {
+        let allow = NetworkPolicy::AllowList {
+            per_ip: HashMap::new(),
+            cidrs: Vec::new(),
+            any_ip_ports: HashSet::from([443]),
+        };
+        let deny = NetworkPolicy::DenyList {
+            cidrs: vec![(
+                crate::network::IpCidr::parse("10.0.0.0/8").unwrap(),
+                PortAllow::Any,
+            )],
+            any_ip_ports: HashSet::new(),
+            deny_all: false,
+        };
+        let layers = NetworkPolicyLayers { allow, deny };
+
+        assert_eq!(
+            layered_destination_verdict(&layers, "10.1.2.3".parse().unwrap(), Some(443)),
+            Err(ECONNREFUSED)
+        );
+        assert_eq!(
+            layered_destination_verdict(&layers, "8.8.8.8".parse().unwrap(), Some(443)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn layered_verdict_checks_static_deny_after_resolved_allow() {
+        // Allow here stands in for an already-resolved legacy dynamic
+        // override (IP-only, any port); deny must still win.
+        use crate::seccomp::notif::NetworkPolicy as NP;
+        let allow = NP::AllowList {
+            per_ip: HashMap::from([(
+                "10.1.2.3".parse::<IpAddr>().unwrap(),
+                PortAllow::Any,
+            )]),
+            cidrs: Vec::new(),
+            any_ip_ports: HashSet::new(),
+        };
+        let deny = NP::DenyList {
+            cidrs: vec![(
+                crate::network::IpCidr::parse("10.0.0.0/8").unwrap(),
+                PortAllow::Any,
+            )],
+            any_ip_ports: HashSet::new(),
+            deny_all: false,
+        };
+        let layers = NetworkPolicyLayers { allow, deny };
+        assert_eq!(
+            layered_destination_verdict(&layers, "10.1.2.3".parse().unwrap(), Some(443)),
+            Err(ECONNREFUSED)
+        );
     }
 
     #[test]

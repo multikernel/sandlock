@@ -491,8 +491,13 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         for p in &base.fs_readable { b = b.fs_read(p); }
         for p in &base.fs_writable { b = b.fs_write(p); }
         for p in &base.fs_denied { b = b.fs_deny(p); }
-        for rule in &base.net_allow {
-            b = b.net_allow(sandlock_core::format_net_rule(rule));
+        // `Sandbox.net_allow` includes internal HTTP reachability rules. Do
+        // not feed those back as explicit allow rules for a deny-only profile;
+        // the HTTP fields below regenerate them without changing the mode.
+        if base.net_allow_is_active() {
+            for rule in &base.net_allow {
+                b = b.net_allow(sandlock_core::format_net_rule(rule));
+            }
         }
         for rule in &base.net_deny {
             b = b.net_deny(sandlock_core::format_net_rule(rule));

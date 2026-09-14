@@ -275,15 +275,16 @@ pub enum NetworkPolicy {
 }
 
 impl NetworkPolicy {
-    /// True iff no destination can ever match: the allowlist for a protocol
-    /// nothing was granted to. Distinguishes "deny all" from `Unrestricted`
-    /// and from a `DenyList` (both default-allow).
+    /// True iff no destination can ever match. For an allowlist this means
+    /// nothing was granted; for a denylist it means the explicit deny-all
+    /// wildcard was used.
     pub fn denies_everything(&self) -> bool {
         match self {
             NetworkPolicy::AllowList { per_ip, cidrs, any_ip_ports } => {
                 per_ip.is_empty() && cidrs.is_empty() && any_ip_ports.is_empty()
             }
-            _ => false,
+            NetworkPolicy::DenyList { deny_all, .. } => *deny_all,
+            NetworkPolicy::Unrestricted => false,
         }
     }
 
@@ -2183,8 +2184,8 @@ async fn handle_notification(
     // shared with the BPF notif list so enforcement scope cannot drift from
     // interception scope; see `fs_denied_path_syscalls` for what is gated
     // and why symlink/mkdir are not.
+    let nr = notif.data.nr as i64;
     let mut action = {
-        let nr = notif.data.nr as i64;
         let should_precheck_denied = policy.chroot_root.is_none()
             && crate::seccomp_plan::fs_denied_path_syscalls().contains(&nr);
         if should_precheck_denied {
@@ -2220,7 +2221,6 @@ async fn handle_notification(
         }
     };
 
-    let nr = notif.data.nr as i64;
     let fork_counted = matches!(action, NotifAction::Continue)
         && crate::resource::fork_counted_on_continue(&notif, fd);
 

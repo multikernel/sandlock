@@ -449,21 +449,52 @@ impl CowState {
 // NetworkState — network policy and port remapping state
 // ============================================================
 
-/// Network policy and port-remapping state. Holds one
-/// `NetworkPolicy` per L4 protocol — the on-behalf handler picks the
-/// matching one based on the dup'd fd's `SO_PROTOCOL`.
+/// The resolved allow and static deny layers applied to one destination.
+/// Allow is resolved with legacy `policy_fn` priority (per-PID override >
+/// live policy > static per-protocol allowlist); deny is always the static
+/// per-protocol denylist and is checked first, so a dynamic override can
+/// never erase it.
+#[derive(Debug, Clone)]
+pub(crate) struct NetworkPolicyLayers {
+    /// Effective allow policy after legacy dynamic resolution.
+    pub allow: crate::seccomp::notif::NetworkPolicy,
+    /// Static default-allow deny layer, or unrestricted when no denylist is
+    /// active for this protocol.
+    pub deny: crate::seccomp::notif::NetworkPolicy,
+}
+
+impl NetworkPolicyLayers {
+    /// True when no destination can pass either layer.
+    pub(crate) fn denies_everything(&self) -> bool {
+        self.allow.denies_everything() || self.deny.denies_everything()
+    }
+}
+
+
+/// Network policy and port-remapping state. Holds separate allow and deny
+/// `NetworkPolicy` layers per L4 protocol — the on-behalf handler picks the
+/// matching pair based on the dup'd fd's `SO_PROTOCOL`.
 pub struct NetworkState {
-    /// Allowlist for TCP destinations (`tcp://...` and bare-form rules;
+    /// Allow layer for TCP destinations (`tcp://...` and bare-form rules;
     /// bare specs expand to a TCP + UDP pair at parse time).
     pub tcp_policy: crate::seccomp::notif::NetworkPolicy,
-    /// Allowlist for UDP destinations (`udp://...` and bare-form rules).
+    /// Static deny layer for TCP destinations.
+    pub tcp_deny_policy: crate::seccomp::notif::NetworkPolicy,
+    /// Allow layer for UDP destinations (`udp://...` and bare-form rules).
     pub udp_policy: crate::seccomp::notif::NetworkPolicy,
-    /// Allowlist for ICMP destinations (`icmp://...` rules). ICMP rules
+    /// Static deny layer for UDP destinations.
+    pub udp_deny_policy: crate::seccomp::notif::NetworkPolicy,
+    /// Allow layer for ICMP destinations (`icmp://...` rules). ICMP rules
     /// carry no ports, so every entry uses `PortAllow::Any` and the
     /// effective check is IP-only.
     pub icmp_policy: crate::seccomp::notif::NetworkPolicy,
+    /// Static deny layer for ICMP destinations.
+    pub icmp_deny_policy: crate::seccomp::notif::NetworkPolicy,
     /// Port binding and remapping tracker.
     pub port_map: crate::port_remap::PortMap,
+    /// Bind allow layer. `None` means bind is in deny-only mode; `Some` may
+    /// contain an empty `Ports` list for the default-deny allow-only mode.
+    pub bind_allow_ports: Option<crate::sandbox::BindPorts>,
     /// `--net-deny-bind`: TCP ports the sandbox may NOT bind (default-allow
     /// denylist). The on-behalf `bind()` handler rejects a TCP bind to any
     /// port in this set with `EACCES`; empty = no bind denylist.
@@ -483,9 +514,13 @@ impl NetworkState {
     pub fn new() -> Self {
         Self {
             tcp_policy: crate::seccomp::notif::NetworkPolicy::Unrestricted,
+            tcp_deny_policy: crate::seccomp::notif::NetworkPolicy::Unrestricted,
             udp_policy: crate::seccomp::notif::NetworkPolicy::Unrestricted,
+            udp_deny_policy: crate::seccomp::notif::NetworkPolicy::Unrestricted,
             icmp_policy: crate::seccomp::notif::NetworkPolicy::Unrestricted,
+            icmp_deny_policy: crate::seccomp::notif::NetworkPolicy::Unrestricted,
             port_map: crate::port_remap::PortMap::new(),
+            bind_allow_ports: Some(crate::sandbox::BindPorts::default()),
             bind_deny_ports: HashSet::new(),
             pid_ip_overrides: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
             http_acl_addr: None,
@@ -494,23 +529,33 @@ impl NetworkState {
         }
     }
 
-    /// Get the effective network policy for the task `tid` and protocol.
+    /// Get the effective allow and deny policy layers for the task `tid` and
+    /// protocol.
     ///
-    /// Priority: per-PID override > live policy (from PolicyFnState) >
-    /// the per-protocol allowlist for `protocol`.
-    /// PID/live overrides are IP-only — any port is permitted to listed
-    /// IPs (legacy `policy_fn` semantics) — and they apply across all
-    /// protocols, since the legacy API didn't distinguish them.
-    pub fn effective_network_policy(
+    /// Allow resolution keeps the legacy `policy_fn` priority: per-PID
+    /// override > live policy (when non-empty) > static per-protocol
+    /// allowlist. PID/live overrides are IP-only — any port is permitted to
+    /// listed IPs — and apply across all protocols. Deny is always the
+    /// static per-protocol denylist and is checked first by the verdict, so
+    /// a dynamic override can never erase it.
+    pub(crate) fn effective_network_policy(
         &self,
         tid: u32,
         protocol: crate::sandbox::Protocol,
         live_policy: Option<&std::sync::Arc<std::sync::RwLock<crate::policy_fn::LivePolicy>>>,
-    ) -> crate::seccomp::notif::NetworkPolicy {
+    ) -> NetworkPolicyLayers {
         use crate::sandbox::Protocol;
         use crate::seccomp::notif::{NetworkPolicy, PortAllow};
+        let deny = match protocol {
+            Protocol::Tcp => self.tcp_deny_policy.clone(),
+            Protocol::Udp => self.udp_deny_policy.clone(),
+            Protocol::Icmp => self.icmp_deny_policy.clone(),
+        };
         let ip_only_allow = |ips: &HashSet<std::net::IpAddr>| {
-            let per_ip = ips.iter().map(|&ip| (ip, PortAllow::Any)).collect();
+            let per_ip = ips
+                .iter()
+                .map(|ip| (ip.to_canonical(), PortAllow::Any))
+                .collect();
             NetworkPolicy::AllowList {
                 per_ip,
                 cidrs: Vec::new(),
@@ -522,22 +567,29 @@ impl NetworkState {
             if !overrides.is_empty() {
                 let tgid = read_tgid_of_tid(tid as i32).map_or(tid, |t| t as u32);
                 if let Some(ips) = overrides.get(&tgid) {
-                    return ip_only_allow(ips);
+                    return NetworkPolicyLayers {
+                        allow: ip_only_allow(ips),
+                        deny,
+                    };
                 }
             }
         }
         if let Some(lp) = live_policy {
             if let Ok(live) = lp.read() {
                 if !live.allowed_ips.is_empty() {
-                    return ip_only_allow(&live.allowed_ips);
+                    return NetworkPolicyLayers {
+                        allow: ip_only_allow(&live.allowed_ips),
+                        deny,
+                    };
                 }
             }
         }
-        match protocol {
+        let allow = match protocol {
             Protocol::Tcp => self.tcp_policy.clone(),
             Protocol::Udp => self.udp_policy.clone(),
             Protocol::Icmp => self.icmp_policy.clone(),
-        }
+        };
+        NetworkPolicyLayers { allow, deny }
     }
 }
 
@@ -951,7 +1003,7 @@ mod tests {
             .unwrap()
             .insert(tgid, HashSet::from([ip]));
 
-        let policy = std::thread::spawn(move || {
+        let layers = std::thread::spawn(move || {
             let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
             assert_ne!(tid, tgid);
             ns.effective_network_policy(tid, crate::sandbox::Protocol::Tcp, None)
@@ -959,9 +1011,104 @@ mod tests {
         .join()
         .unwrap();
 
-        match policy {
+        match layers.allow {
             NetworkPolicy::AllowList { per_ip, .. } => assert!(per_ip.contains_key(&ip)),
             other => panic!("override ignored for a non-leader thread: {other:?}"),
         }
+        assert!(matches!(layers.deny, NetworkPolicy::Unrestricted));
+    }
+
+    #[test]
+    fn pid_override_cannot_erase_static_network_deny() {
+        use crate::network::IpCidr;
+        use crate::seccomp::notif::{NetworkPolicy, PortAllow};
+
+        let mut ns = NetworkState::new();
+        ns.tcp_deny_policy = NetworkPolicy::DenyList {
+            cidrs: vec![(IpCidr::parse("10.0.0.0/8").unwrap(), PortAllow::Any)],
+            any_ip_ports: HashSet::new(),
+            deny_all: false,
+        };
+        let allowed_by_override: std::net::IpAddr = "10.1.2.3".parse().unwrap();
+        ns.pid_ip_overrides
+            .write()
+            .unwrap()
+            .insert(std::process::id(), HashSet::from([allowed_by_override]));
+
+        let layers =
+            ns.effective_network_policy(std::process::id(), crate::sandbox::Protocol::Tcp, None);
+        // Dynamic override replaces the allow layer (legacy semantics), but
+        // the static deny layer is preserved alongside it for the verdict.
+        assert!(layers.allow.allows(allowed_by_override, 443));
+        assert!(!layers.deny.allows(allowed_by_override, 443));
+    }
+
+    #[test]
+    fn empty_live_policy_falls_back_to_static_allow() {
+        use crate::seccomp::notif::{NetworkPolicy, PortAllow};
+
+        let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let mut ns = NetworkState::new();
+        ns.tcp_policy = NetworkPolicy::AllowList {
+            per_ip: HashMap::from([(ip, PortAllow::Specific(HashSet::from([443])))]),
+            cidrs: Vec::new(),
+            any_ip_ports: HashSet::new(),
+        };
+        let live = Arc::new(std::sync::RwLock::new(crate::policy_fn::LivePolicy {
+            allowed_ips: HashSet::new(),
+            max_memory_bytes: 0,
+            max_processes: 0,
+        }));
+
+        let layers = ns.effective_network_policy(
+            std::process::id(),
+            crate::sandbox::Protocol::Tcp,
+            Some(&live),
+        );
+        assert!(layers.allow.allows(ip, 443));
+        assert!(!layers.allow.allows(ip, 80));
+    }
+
+    #[test]
+    fn live_policy_replaces_static_allow_with_ip_only_grant() {
+        use crate::seccomp::notif::{NetworkPolicy, PortAllow};
+
+        let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let mut ns = NetworkState::new();
+        ns.tcp_policy = NetworkPolicy::AllowList {
+            per_ip: HashMap::from([(ip, PortAllow::Specific(HashSet::from([443])))]),
+            cidrs: Vec::new(),
+            any_ip_ports: HashSet::new(),
+        };
+        let live = Arc::new(std::sync::RwLock::new(crate::policy_fn::LivePolicy {
+            allowed_ips: HashSet::from([ip]),
+            max_memory_bytes: 0,
+            max_processes: 0,
+        }));
+
+        let layers = ns.effective_network_policy(
+            std::process::id(),
+            crate::sandbox::Protocol::Tcp,
+            Some(&live),
+        );
+        // Legacy semantics: a non-empty live set replaces the static allow
+        // with an IP-only grant (any port to the listed IP).
+        assert!(layers.allow.allows(ip, 443));
+        assert!(layers.allow.allows(ip, 80));
+    }
+
+    #[test]
+    fn deny_all_denylist_denies_everything() {
+        use crate::seccomp::notif::NetworkPolicy;
+
+        let mut ns = NetworkState::new();
+        ns.tcp_deny_policy = NetworkPolicy::DenyList {
+            cidrs: Vec::new(),
+            any_ip_ports: HashSet::new(),
+            deny_all: true,
+        };
+        let layers =
+            ns.effective_network_policy(std::process::id(), crate::sandbox::Protocol::Tcp, None);
+        assert!(layers.denies_everything());
     }
 }

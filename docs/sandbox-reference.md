@@ -327,9 +327,10 @@ Landlock rules are kernel-evaluated and TOCTOU-immune.
 
 ## `[network]`
 
-Outbound allowlist, bind allowlist, and port virtualization. Each
+Outbound allowlist, denylist, bind policy, and port virtualization. Each
 entry of `net_allow` is a single rule of the form **protocol, host,
-port**. Rules are OR'd. An empty `net_allow` denies all outbound
+port**. Allow rules are OR'd; when both allow and deny rules are present, a
+destination must match an allow rule and must not match a deny rule. An empty `net_allow` denies all outbound
 traffic. Protocol gating falls out of rule presence: without a UDP
 rule, UDP socket creation is denied at the seccomp layer; without an
 ICMP rule, kernel ping socket creation is denied. A scheme-less rule
@@ -348,8 +349,9 @@ Rule shapes:
 | Python       | TOML         | Type                    | Default | Description                                                                                                                                          |
 | ------------ | ------------ | ----------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `net_allow`  | `allow`      | `Sequence[str]`         | `()`    | Outbound endpoint allowlist. Empty list denies all outbound.                                                                                         |
-| `net_allow_bind`   | `allow_bind` | `Sequence[int \| str]`  | `()`    | TCP ports the sandbox may bind/listen on (default-deny allowlist). Each entry is a port or a `"lo-hi"` range; `"*"` allows binding any port and cannot be mixed with port entries. Landlock ABI v4+ (TCP only; UDP `bind()` is not separately gated). Mutually exclusive with `net_deny_bind`.        |
-| `net_deny_bind`    | `deny_bind`  | `Sequence[int \| str]`  | `()`    | TCP ports the sandbox may NOT bind (default-allow denylist; inverse of `net_allow_bind`). Same port syntax. Enforced on the on-behalf `bind()` path (Landlock `BIND_TCP` is relaxed). Mutually exclusive with `net_allow_bind`.        |
+| `net_deny`  | `deny`      | `Sequence[str]`         | `()`    | Outbound endpoint denylist. Targets are literal IP/CIDR values; when combined with `net_allow`, denied destinations win. |
+| `net_allow_bind`   | `allow_bind` | `Sequence[int \| str]`  | `()`    | TCP ports the sandbox may bind/listen on (default-deny allowlist). Each entry is a port or a `"lo-hi"` range; only `"*"` allows binding any port and it cannot be mixed with port entries (a listed `0` authorizes only `bind(0)`). Landlock ABI v4+ (TCP only; UDP `bind()` is not separately gated). When combined with `net_deny_bind`, denied ports win.        |
+| `net_deny_bind`    | `deny_bind`  | `Sequence[int \| str]`  | `()`    | TCP ports the sandbox may NOT bind (default-allow denylist; inverse of `net_allow_bind`). Same port syntax. Enforced on the on-behalf `bind()` path (Landlock `BIND_TCP` is relaxed); when combined with `net_allow_bind`, denied ports win.        |
 | `port_remap` | `port_remap` | `bool`                  | `False` | Enable transparent TCP port virtualization. Each sandbox receives an independent virtual port space; conflicting binds are remapped to unique real ports via `pidfd_getfd`. |
 
 Hostnames are resolved once at sandbox creation and pinned via a
@@ -534,7 +536,14 @@ parse_ports([80, "443", "8000-8005"])
    outbound traffic. Protocol gating is a function of rule presence:
    the seccomp layer denies UDP and ICMP socket creation when no rule
    of that protocol is configured.
-2. **Seccomp COW with `workdir`.** When `workdir` is set, the
+2. **Allow/deny precedence.** `net_allow` and `net_deny` may be used
+   together; a destination must match the allowlist and must not match the
+   denylist. The same precedence applies to `net_allow_bind` and
+   `net_deny_bind` for TCP ports. `policy_fn` IP restrictions resolve with
+   legacy priority (per-PID override > live policy > static allowlist) and
+   the static denylist is always checked first, so a dynamic override can
+   never erase it.
+3. **Seccomp COW with `workdir`.** When `workdir` is set, the
    seccomp-based COW path intercepts writes under `workdir` and stages
    them in an upper layer, committed or aborted on exit per `on_exit` /
    `on_error`. Staging covers regular files, directories, and symlinks.

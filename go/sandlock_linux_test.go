@@ -894,4 +894,20 @@ print(json.dumps(res))
 	if !strings.Contains(out, `"ephemeral": "ok"`) {
 		t.Fatalf("wildcard must allow an ephemeral port-0 bind; got stdout=%q", out)
 	}
+
+	// Both allow and deny layers may be configured together through the Go API.
+	combined := &sandlock.Sandbox{
+		FSReadable:   rootfs,
+		NetAllow:     []string{"127.0.0.1:443"},
+		NetDeny:      []string{"10.0.0.0/8"},
+		NetAllowBind: []string{"*"},
+		NetDenyBind:  []string{"22"},
+	}
+	res, err = combined.Run(context.Background(), "echo", "combined")
+	if err != nil {
+		t.Fatalf("combined policy Run: %v", err)
+	}
+	if !res.Success || strings.TrimSpace(string(res.Stdout)) != "combined" {
+		t.Fatalf("combined policy failed: exit=%d stdout=%q stderr=%q", res.ExitCode, res.Stdout, res.Stderr)
+	}
 }
