@@ -104,7 +104,9 @@ pub struct SyscallEvent {
     /// children before they can run user code while `policy_fn` is
     /// active.
     pub argv: Option<Vec<String>>,
-    /// Whether the supervisor denied this syscall.
+    /// Whether an earlier supervisor check denied this syscall. Network events
+    /// are delivered before on-behalf execution so a callback denial cannot
+    /// occur after a network side effect.
     pub denied: bool,
     /// Resolved absolute path for file syscalls (openat, execve/execveat,
     /// mkdirat, unlinkat, symlinkat, truncate, renameat2 src, linkat src).
@@ -168,6 +170,7 @@ pub struct PolicyContext {
     restricted: HashSet<&'static str>,
     pid_overrides: Arc<RwLock<HashMap<u32, HashSet<IpAddr>>>>,
     denied: Arc<crate::seccomp::state::DeniedSet>,
+    network_policy_active: Arc<RwLock<bool>>,
 }
 
 impl PolicyContext {
@@ -176,6 +179,7 @@ impl PolicyContext {
         ceiling: LivePolicy,
         pid_overrides: Arc<RwLock<HashMap<u32, HashSet<IpAddr>>>>,
         denied: Arc<crate::seccomp::state::DeniedSet>,
+        network_policy_active: Arc<RwLock<bool>>,
     ) -> Self {
         Self {
             live,
@@ -183,6 +187,7 @@ impl PolicyContext {
             restricted: HashSet::new(),
             pid_overrides,
             denied,
+            network_policy_active,
         }
     }
 
@@ -201,11 +206,19 @@ impl PolicyContext {
     /// Expand allowed IPs. Cannot exceed ceiling. Fails if restricted.
     pub fn grant_network(&mut self, ips: &[IpAddr]) -> Result<(), PolicyFnError> {
         self.check_not_restricted("allowed_ips")?;
+        // Keep the activation flag and live policy under one lock order. The
+        // supervisor takes this flag before the live-policy lock when it
+        // snapshots a network decision.
+        let mut network_policy_active = self.network_policy_active.write().unwrap();
         let mut live = self.live.write().unwrap();
+        let before = live.allowed_ips.len();
         for ip in ips {
             if self.ceiling.allowed_ips.contains(ip) {
                 live.allowed_ips.insert(*ip);
             }
+        }
+        if live.allowed_ips.len() != before {
+            *network_policy_active = true;
         }
         Ok(())
     }
@@ -228,11 +241,14 @@ impl PolicyContext {
 
     // ---- Restrict (permanent shrink) ----
 
-    /// Permanently restrict allowed IPs. Cannot be granted back.
+    /// Permanently restrict allowed IPs. Cannot be granted back and cannot
+    /// widen the sandbox's static network allow layer.
     pub fn restrict_network(&mut self, ips: &[IpAddr]) {
         self.restricted.insert("allowed_ips");
+        let mut network_policy_active = self.network_policy_active.write().unwrap();
         let mut live = self.live.write().unwrap();
         live.allowed_ips = ips.iter().copied().collect();
+        *network_policy_active = true;
     }
 
     /// Permanently restrict max memory. Cannot be granted back.
@@ -251,7 +267,8 @@ impl PolicyContext {
 
     // ---- Per-PID overrides ----
 
-    /// Restrict network for a specific PID (tighter than global policy).
+    /// Restrict network for a specific PID (tighter than global and static
+    /// policy layers).
     pub fn restrict_pid_network(&self, pid: u32, ips: &[IpAddr]) {
         let mut overrides = self.pid_overrides.write().unwrap();
         overrides.insert(pid, ips.iter().copied().collect());
@@ -389,13 +406,21 @@ pub(crate) fn spawn_policy_fn(
     ceiling: LivePolicy,
     pid_overrides: Arc<RwLock<HashMap<u32, HashSet<IpAddr>>>>,
     denied: Arc<crate::seccomp::state::DeniedSet>,
+    network_policy_active: Arc<RwLock<bool>>,
 ) -> PolicyFnWorker {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PolicyMsg>();
 
     let thread = std::thread::Builder::new()
         .name("sandlock-policy-fn".to_string())
         .spawn(move || {
-            let mut ctx = PolicyContext::new(live, ceiling, pid_overrides, denied);
+            let mut ctx =
+                PolicyContext::new(
+                    live,
+                    ceiling,
+                    pid_overrides,
+                    denied,
+                    network_policy_active,
+                );
 
             while let Some(PolicyMsg::Event(pe)) = rx.blocking_recv() {
                 let verdict = callback(pe.event, &mut ctx);
@@ -437,6 +462,7 @@ mod tests {
             test_live(),
             Arc::new(RwLock::new(HashMap::new())),
             Arc::new(crate::seccomp::state::DeniedSet::default()),
+            Arc::new(RwLock::new(false)),
         );
         let tx = worker.sender();
         let event = SyscallEvent {
@@ -481,7 +507,13 @@ mod tests {
         let ceiling = test_live();
         let pid_overrides = Arc::new(RwLock::new(HashMap::new()));
         let denied = Arc::new(crate::seccomp::state::DeniedSet::default());
-        let mut ctx = PolicyContext::new(live.clone(), ceiling, pid_overrides, denied);
+        let mut ctx = PolicyContext::new(
+            live.clone(),
+            ceiling,
+            pid_overrides,
+            denied,
+            Arc::new(RwLock::new(false)),
+        );
 
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
         ctx.grant_network(&[ip]).unwrap();
@@ -498,7 +530,13 @@ mod tests {
         let ceiling = test_live();
         let pid_overrides = Arc::new(RwLock::new(HashMap::new()));
         let denied = Arc::new(crate::seccomp::state::DeniedSet::default());
-        let mut ctx = PolicyContext::new(live.clone(), ceiling, pid_overrides, denied);
+        let mut ctx = PolicyContext::new(
+            live.clone(),
+            ceiling,
+            pid_overrides,
+            denied,
+            Arc::new(RwLock::new(false)),
+        );
 
         // Try to grant an IP not in ceiling — should be silently ignored
         let foreign: IpAddr = "8.8.8.8".parse().unwrap();
@@ -512,7 +550,13 @@ mod tests {
         let ceiling = test_live();
         let pid_overrides = Arc::new(RwLock::new(HashMap::new()));
         let denied = Arc::new(crate::seccomp::state::DeniedSet::default());
-        let mut ctx = PolicyContext::new(live, ceiling, pid_overrides, denied);
+        let mut ctx = PolicyContext::new(
+            live,
+            ceiling,
+            pid_overrides,
+            denied,
+            Arc::new(RwLock::new(false)),
+        );
 
         ctx.restrict_network(&[]);
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
@@ -525,7 +569,13 @@ mod tests {
         let ceiling = test_live();
         let pid_overrides = Arc::new(RwLock::new(HashMap::new()));
         let denied = Arc::new(crate::seccomp::state::DeniedSet::default());
-        let mut ctx = PolicyContext::new(live.clone(), ceiling, pid_overrides, denied);
+        let mut ctx = PolicyContext::new(
+            live.clone(),
+            ceiling,
+            pid_overrides,
+            denied,
+            Arc::new(RwLock::new(false)),
+        );
 
         ctx.restrict_max_memory(256 * 1024 * 1024);
         assert_eq!(live.read().unwrap().max_memory_bytes, 256 * 1024 * 1024);
@@ -537,7 +587,13 @@ mod tests {
         let ceiling = test_live();
         let pid_overrides = Arc::new(RwLock::new(HashMap::new()));
         let denied = Arc::new(crate::seccomp::state::DeniedSet::default());
-        let ctx = PolicyContext::new(live, ceiling, pid_overrides.clone(), denied);
+        let ctx = PolicyContext::new(
+            live,
+            ceiling,
+            pid_overrides.clone(),
+            denied,
+            Arc::new(RwLock::new(false)),
+        );
 
         let localhost: IpAddr = "127.0.0.1".parse().unwrap();
         ctx.restrict_pid_network(1234, &[localhost]);
@@ -554,7 +610,13 @@ mod tests {
         let ceiling = test_live();
         let pid_overrides = Arc::new(RwLock::new(HashMap::new()));
         let denied = Arc::new(crate::seccomp::state::DeniedSet::default());
-        let ctx = PolicyContext::new(live, ceiling, pid_overrides.clone(), denied);
+        let ctx = PolicyContext::new(
+            live,
+            ceiling,
+            pid_overrides.clone(),
+            denied,
+            Arc::new(RwLock::new(false)),
+        );
 
         let localhost: IpAddr = "127.0.0.1".parse().unwrap();
         ctx.restrict_pid_network(1234, &[localhost]);

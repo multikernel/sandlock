@@ -52,6 +52,9 @@ struct MetaJson {
     cow_snapshot: Option<String>,
     #[serde(default)]
     version: u32,
+    /// Optional because older checkpoint images did not record policy mode.
+    #[serde(default)]
+    net_allow_explicit: Option<bool>,
 }
 
 /// JSON schema for process/info.json.
@@ -117,6 +120,7 @@ impl Checkpoint {
             name: self.name.clone(),
             cow_snapshot: self.cow_snapshot.as_ref().map(|p| p.display().to_string()),
             version: IMAGE_VERSION,
+            net_allow_explicit: self.policy.net_allow_explicit,
         })?;
 
         // policy.dat (bincode -- complex struct, not human-readable anyway)
@@ -210,7 +214,10 @@ impl Checkpoint {
         // policy.dat
         let policy_bytes = std::fs::read(dir.join("policy.dat"))
             .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
-        let policy: Sandbox = bincode::deserialize(&policy_bytes).map_err(io_err)?;
+        let mut policy: Sandbox = bincode::deserialize(&policy_bytes).map_err(io_err)?;
+        // Keep this mode bit outside policy.dat: adding a trailing field to the
+        // bincode struct would make older policy.dat files unreadable.
+        policy.net_allow_explicit = meta.net_allow_explicit;
 
         // app_state.bin
         let app_state_path = dir.join("app_state.bin");
@@ -296,6 +303,29 @@ impl Checkpoint {
 #[cfg(test)]
 mod tests {
     use super::Checkpoint;
+    use crate::checkpoint::{MemoryMap, MemorySegment, ProcessState};
+    use crate::sandbox::Sandbox;
+
+    fn empty_process_state() -> ProcessState {
+        ProcessState {
+            pid: 0,
+            cwd: "/".into(),
+            exe: "/bin/true".into(),
+            regs: Vec::new(),
+            fpregs: Vec::new(),
+            memory_maps: vec![MemoryMap {
+                start: 0,
+                end: 0,
+                perms: String::new(),
+                offset: 0,
+                path: None,
+            }],
+            memory_data: vec![MemorySegment {
+                start: 0,
+                data: Vec::new(),
+            }],
+        }
+    }
 
     #[test]
     fn image_rejects_wrong_version() {
@@ -309,5 +339,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let msg = res.unwrap_err().to_string();
         assert!(msg.contains("version"), "error should mention version, got: {msg}");
+    }
+
+    #[test]
+    fn image_stores_outbound_mode_in_metadata_not_policy_bincode() {
+        let dir = std::env::temp_dir().join(format!("sandlock-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let policy = Sandbox::builder()
+            .net_allow("127.0.0.1:443")
+            .net_deny("10.0.0.0/8")
+            .build()
+            .unwrap();
+        assert!(policy.net_allow_is_active());
+        let checkpoint = Checkpoint {
+            name: "mode-test".into(),
+            policy,
+            process_state: empty_process_state(),
+            fd_table: Vec::new(),
+            cow_snapshot: None,
+            app_state: None,
+        };
+
+        checkpoint.save(&dir).unwrap();
+        let policy_bytes = std::fs::read(dir.join("policy.dat")).unwrap();
+        let policy_from_bincode: Sandbox = bincode::deserialize(&policy_bytes).unwrap();
+        assert!(policy_from_bincode.net_allow_explicit.is_none());
+        assert!(
+            std::fs::read_to_string(dir.join("meta.json"))
+                .unwrap()
+                .contains("\"net_allow_explicit\": true")
+        );
+
+        let loaded = Checkpoint::load(&dir).unwrap();
+        assert!(loaded.policy.net_allow_is_active());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

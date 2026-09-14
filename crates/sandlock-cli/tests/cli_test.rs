@@ -195,16 +195,24 @@ fn test_no_supervisor_rejects_net_deny() {
 }
 
 #[test]
-fn test_net_allow_and_net_deny_are_mutually_exclusive() {
-    // Also guards the CLI wiring: --net-deny must reach build(), otherwise
-    // the exclusivity check never fires and the flag is silently dropped.
+fn test_net_allow_and_net_deny_combine() {
+    // Also guards the CLI wiring: both flags must reach build() and the
+    // resulting policy must be accepted.
     let output = sandlock_bin()
-        .args(["run", "--net-allow", "github.com:443", "--net-deny", "10.0.0.0/8", "--", "/bin/true"])
+        .args(args_for_host(&[
+            "run", "--net-allow", "127.0.0.1:443", "--net-deny", "10.0.0.0/8",
+            "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin", "-r", "/etc",
+            "--", "/bin/true",
+        ]))
         .output()
         .expect("failed to run");
-    assert!(!output.status.success());
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("mutually exclusive"), "stderr: {}", stderr);
+    assert!(!stderr.contains("mutually exclusive"), "stderr: {}", stderr);
 }
 
 #[test]

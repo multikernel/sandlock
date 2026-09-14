@@ -698,6 +698,12 @@ mod tests {
         assert_eq!(policy.net_allow_bind, vec!["8080,9000-9005"]);
         assert_eq!(policy.net_deny_bind, vec!["22"]);
         assert!(policy.port_remap);
+
+        let sandbox = policy.to_sandbox().unwrap();
+        assert!(!sandbox.net_allow.is_empty());
+        assert!(!sandbox.net_deny.is_empty());
+        assert!(!sandbox.net_allow_bind.is_default());
+        assert_eq!(sandbox.net_deny_bind, vec![22]);
     }
 
     #[test]

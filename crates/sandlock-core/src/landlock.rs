@@ -342,10 +342,10 @@ pub fn compute_net_mask(
     // `--net-deny-bind` is default-allow: every TCP bind must reach the
     // on-behalf seccomp handler (the bind denylist enforcer), so Landlock
     // must not gate BIND_TCP. Drop it from the handled set; the on-behalf
-    // path becomes the sole bind enforcer. (Mutually exclusive with
-    // `--net-allow-bind`, so no kernel bind rules are installed either.)
-    // `--net-allow-bind '*'` likewise leaves BIND_TCP unhandled: every
-    // port is allowed and nothing enforces on the on-behalf path.
+    // path becomes the sole bind enforcer. When an allowlist is also present,
+    // the same supervisor path applies both layers. `--net-allow-bind '*'`
+    // likewise leaves BIND_TCP unhandled: every port is allowed and nothing
+    // enforces on the on-behalf path.
     if !sandbox.net_deny_bind.is_empty() || sandbox.net_allow_bind.is_all() {
         mask &= !LANDLOCK_ACCESS_NET_BIND_TCP;
     }
@@ -546,7 +546,10 @@ fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError
         ProtectionStatus::resolve(Protection::NetTcp, abi, pol) == ProtectionStatus::Active;
     // `BindPorts::All` installs no rules: BIND_TCP was dropped from the
     // handled set, so every bind is already allowed.
-    if handle_net && net_tcp_active {
+    if handle_net
+        && net_tcp_active
+        && handled_access_net & LANDLOCK_ACCESS_NET_BIND_TCP != 0
+    {
         if let crate::sandbox::BindPorts::Ports(ports) = &policy.net_allow_bind {
             for &port in ports {
                 add_net_rule(&ruleset_fd, port, LANDLOCK_ACCESS_NET_BIND_TCP).map_err(|e| {
@@ -846,6 +849,27 @@ mod mask_contract_tests {
             mask & LANDLOCK_ACCESS_NET_CONNECT_TCP,
             0,
             "net_deny_bind must not affect CONNECT_TCP handling",
+        );
+    }
+
+    #[test]
+    fn net_mask_combined_bind_policy_drops_bind_tcp_for_supervisor_check() {
+        let pol = ProtectionPolicy::strict_all();
+        let sb = Sandbox::builder()
+            .net_allow_bind("8080")
+            .net_deny_bind("8080")
+            .build()
+            .expect("combined bind policy builds");
+        let (mask, _wildcard) = compute_net_mask(6, &pol, &sb, true);
+        assert_eq!(
+            mask & LANDLOCK_ACCESS_NET_BIND_TCP,
+            0,
+            "combined bind policy must let the supervisor apply deny precedence",
+        );
+        assert_ne!(
+            mask & LANDLOCK_ACCESS_NET_CONNECT_TCP,
+            0,
+            "bind policy must not alter CONNECT_TCP handling",
         );
     }
 

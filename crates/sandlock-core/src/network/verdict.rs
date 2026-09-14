@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use crate::seccomp::ctx::SupervisorCtx;
 use crate::seccomp::notif::NetworkPolicy;
+use crate::seccomp::state::NetworkPolicyLayers;
 use crate::sys::structs::ECONNREFUSED;
 
 use super::Protocol;
@@ -37,10 +38,32 @@ pub(crate) fn destination_verdict(
     }
 }
 
-/// Resolve the effective per-protocol policy for `pid` and apply
-/// [`destination_verdict`]. Shared by the sendto and sendmsg handlers;
+/// Apply the static deny layer before the allow layer. Keeping the two checks
+/// separate preserves arbitrary allowlist/denylist intersections and makes it
+/// impossible for a dynamic allow override to erase a static deny.
+pub(crate) fn layered_destination_verdict(
+    effective: &NetworkPolicyLayers,
+    ip: IpAddr,
+    port: Option<u16>,
+) -> Result<(), i32> {
+    let Some(port) = port else {
+        return Err(ECONNREFUSED);
+    };
+    if !effective.deny.allows(ip, port) {
+        return Err(ECONNREFUSED);
+    }
+    if let Some(dynamic_ips) = &effective.dynamic_ips {
+        if !dynamic_ips.contains(&ip.to_canonical()) {
+            return Err(ECONNREFUSED);
+        }
+    }
+    destination_verdict(&effective.allow, ip, Some(port))
+}
+
+/// Resolve the effective per-protocol allow/deny layers for `pid` and apply
+/// [`layered_destination_verdict`]. Shared by the sendto and sendmsg handlers;
 /// connect keeps its own `ns` borrow alive for HTTP-ACL and port-remap
-/// reads, so it calls [`destination_verdict`] directly.
+/// reads, so it calls [`layered_destination_verdict`] directly.
 pub(crate) async fn check_ip_destination(
     ctx: &Arc<SupervisorCtx>,
     pid: u32,
@@ -55,7 +78,7 @@ pub(crate) async fn check_ip_destination(
     };
     let effective = ns.effective_network_policy(pid, protocol, live_policy.as_ref());
     drop(ns);
-    destination_verdict(&effective, ip, port)
+    layered_destination_verdict(&effective, ip, port)
 }
 
 /// True if `real` (an already-canonical path) is at or under any of `prefixes`,
@@ -201,6 +224,74 @@ mod tests {
             cidrs: Vec::new(),
             any_ip_ports: HashSet::new(),
         }
+    }
+
+    #[test]
+    fn layered_verdict_deny_wins_over_allow() {
+        let allow = NetworkPolicy::AllowList {
+            per_ip: HashMap::new(),
+            cidrs: Vec::new(),
+            any_ip_ports: HashSet::from([443]),
+        };
+        let deny = NetworkPolicy::DenyList {
+            cidrs: vec![(
+                crate::network::IpCidr::parse("10.0.0.0/8").unwrap(),
+                PortAllow::Any,
+            )],
+            any_ip_ports: HashSet::new(),
+            deny_all: false,
+        };
+        let layers = NetworkPolicyLayers {
+            allow,
+            deny,
+            dynamic_ips: None,
+        };
+
+        assert_eq!(
+            layered_destination_verdict(&layers, "10.1.2.3".parse().unwrap(), Some(443)),
+            Err(ECONNREFUSED)
+        );
+        assert_eq!(
+            layered_destination_verdict(&layers, "8.8.8.8".parse().unwrap(), Some(443)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn dynamic_ip_layer_cannot_widen_static_port_policy() {
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let allow = allowlist_for("127.0.0.1", 443);
+        let layers = NetworkPolicyLayers {
+            allow,
+            deny: NetworkPolicy::Unrestricted,
+            dynamic_ips: Some(HashSet::from([ip])),
+        };
+
+        assert_eq!(layered_destination_verdict(&layers, ip, Some(443)), Ok(()));
+        assert_eq!(
+            layered_destination_verdict(&layers, ip, Some(80)),
+            Err(ECONNREFUSED)
+        );
+    }
+
+    #[test]
+    fn dynamic_ip_layer_cannot_bypass_static_allowlist() {
+        let static_ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let foreign_ip: IpAddr = "8.8.8.8".parse().unwrap();
+        let layers = NetworkPolicyLayers {
+            allow: allowlist_for("127.0.0.1", 443),
+            deny: NetworkPolicy::Unrestricted,
+            dynamic_ips: Some(HashSet::from([foreign_ip])),
+        };
+
+        assert_eq!(
+            layered_destination_verdict(&layers, foreign_ip, Some(443)),
+            Err(ECONNREFUSED)
+        );
+        assert_eq!(
+            layered_destination_verdict(&layers, static_ip, Some(443)),
+            Err(ECONNREFUSED)
+        );
     }
 
     #[test]

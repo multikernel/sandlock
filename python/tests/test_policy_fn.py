@@ -153,10 +153,6 @@ class TestPolicyFnRestrict:
     def test_restrict_network_on_execve(self):
         """restrict_network narrows outbound to the listed IPs after execve.
 
-        The old version called ``restrict_network([])`` — an empty list is a
-        no-op (the override is skipped when it lists no IPs) — and asserted only
-        that the program printed, so it verified nothing about the restriction.
-
         Use two live loopback listeners on 127.0.0.1 and 127.0.0.2, both
         allowlisted up front so either would connect. Restricting to
         ``["127.0.0.1"]`` must then permit the first and deny the second

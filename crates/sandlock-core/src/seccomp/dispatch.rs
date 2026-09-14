@@ -729,12 +729,12 @@ pub(crate) fn build_dispatch_table(
         let __sup = Arc::clone(ctx);
         table.register(libc::SYS_bind, move |cx: &HandlerCtx| {
             let notif = cx.notif;
-            let sup = Arc::clone(&__sup);
-            let notif_fd = cx.notif_fd;
-            async move {
-                crate::port_remap::handle_bind(&notif, &sup.network, notif_fd).await
-            }
-        });
+                let sup = Arc::clone(&__sup);
+                let notif_fd = cx.notif_fd;
+                async move {
+                    crate::port_remap::handle_bind(&notif, &sup, notif_fd).await
+                }
+            });
     }
 
     // ------------------------------------------------------------------

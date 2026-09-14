@@ -287,21 +287,51 @@ fn builder_net_deny_bind_rejects_wildcard() {
 }
 
 #[test]
-fn builder_net_allow_bind_wildcard_exclusive_with_deny_bind() {
-    assert!(Sandbox::builder()
+fn builder_net_allow_bind_wildcard_combines_with_deny_bind() {
+    let policy = Sandbox::builder()
         .net_allow_bind("*")
         .net_deny_bind_port(22)
         .build()
-        .is_err());
+        .unwrap();
+    assert_eq!(policy.net_allow_bind, BindPorts::All);
+    assert_eq!(policy.net_deny_bind, vec![22]);
 }
 
 #[test]
-fn builder_rejects_net_allow_and_net_deny_together() {
-    let err = Sandbox::builder()
+fn builder_combines_net_allow_and_net_deny() {
+    let policy = Sandbox::builder()
         .net_allow("github.com:443")
         .net_deny("10.0.0.0/8")
         .build();
-    assert!(err.is_err());
+    let policy = policy.unwrap();
+    assert_eq!(policy.net_allow.len(), 2);
+    assert_eq!(policy.net_deny.len(), 2);
+    assert_eq!(policy.net_allow_explicit, Some(true));
+}
+
+#[test]
+fn builder_keeps_http_generated_allow_rules_out_of_deny_only_mode() {
+    let policy = Sandbox::builder()
+        .net_deny("10.0.0.0/8")
+        .http_allow("GET api.example.com/v1/*")
+        .build()
+        .unwrap();
+    assert!(!policy.net_allow.is_empty());
+    assert_eq!(policy.net_allow_explicit, Some(false));
+    assert!(!policy.net_allow_is_active());
+}
+
+#[test]
+fn outbound_mode_marker_does_not_change_policy_bincode_layout() {
+    let mut policy = Sandbox::builder()
+        .net_allow("127.0.0.1:443")
+        .net_deny("10.0.0.0/8")
+        .build()
+        .unwrap();
+    let with_marker = bincode::serialize(&policy).unwrap();
+    policy.net_allow_explicit = None;
+    let without_marker = bincode::serialize(&policy).unwrap();
+    assert_eq!(with_marker, without_marker);
 }
 
 #[test]
@@ -317,13 +347,21 @@ fn builder_net_deny_bind_comma_and_ranges() {
 }
 
 #[test]
-fn builder_rejects_allow_bind_and_deny_bind_together() {
-    let err = Sandbox::builder()
+fn builder_combines_allow_bind_and_deny_bind() {
+    let policy = Sandbox::builder()
         .net_allow_bind("8080")
         .net_deny_bind("9090")
-        .build();
-    assert!(err.is_err());
-    assert!(format!("{}", err.unwrap_err()).contains("mutually exclusive"));
+        .build()
+        .unwrap();
+    assert_eq!(policy.net_allow_bind, BindPorts::Ports(vec![8080]));
+    assert_eq!(policy.net_deny_bind, vec![9090]);
+}
+
+#[test]
+fn bind_allow_port_zero_is_a_wildcard() {
+    let policy = Sandbox::builder().net_allow_bind_port(0).build().unwrap();
+    assert!(policy.net_allow_bind.allows_port(80));
+    assert!(policy.net_allow_bind.allows_port(49152));
 }
 
 #[test]
