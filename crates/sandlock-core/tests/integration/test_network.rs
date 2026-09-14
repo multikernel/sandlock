@@ -1387,12 +1387,61 @@ async fn test_combined_wildcard_allow_with_deny_carve_out() {
     assert!(got.contains("b=ERR111"), "deny carve-out must refuse; got {got:?}");
 }
 
+/// Unrestricted allow (`net_allow("*")` resolves per-protocol to
+/// `NetworkPolicy::Unrestricted`) with a static deny carve-out. Two live
+/// loopback listeners prove both directions: the non-denied destination
+/// connects while the denied one returns the policy denial.
+#[tokio::test]
+async fn test_combined_unrestricted_allow_with_deny_carve_out() {
+    let l1 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let p1 = l1.local_addr().unwrap().port();
+    let l2 = TcpListener::bind("127.0.0.2:0").unwrap();
+    let p2 = l2.local_addr().unwrap().port();
+    let out = temp_file("combined-unrestricted");
+
+    let policy = base_policy()
+        .net_allow("*")
+        .net_deny("127.0.0.2")
+        .build()
+        .unwrap();
+
+    let script = format!(concat!(
+        "import socket\n",
+        "def probe(host, port):\n",
+        "  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(3)\n",
+        "  try:\n",
+        "    s.connect((host, port)); return 'OK'\n",
+        "  except OSError as e: return 'ERR%d' % e.errno\n",
+        "  finally: s.close()\n",
+        "open('{out}', 'w').write('a=' + probe('127.0.0.1', {p1}) + ' b=' + probe('127.0.0.2', {p2}))\n",
+    ), out = out.display(), p1 = p1, p2 = p2);
+
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+    let got = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    drop(l1);
+    drop(l2);
+    assert!(got.contains("a=OK"), "unrestricted allow must connect outside the carve-out; got {got:?}");
+    assert!(got.contains("b=ERR111"), "deny carve-out must refuse even under unrestricted allow; got {got:?}");
+}
+
 /// An allowed hostname that resolves into a denied CIDR is refused. Uses
 /// `localhost` (loopback-local resolution, no external network) against a
 /// live 127.0.0.1 listener: success would prove the allow won, refusal proves
 /// the deny won after resolution.
 #[tokio::test]
 async fn test_combined_hostname_resolving_into_denied_cidr_refused() {
+    // Guard against a host where `localhost` does not resolve to 127.0.0.1:
+    // without that resolution the test would pass vacuously.
+    let resolved: Vec<std::net::IpAddr> =
+        std::net::ToSocketAddrs::to_socket_addrs("localhost:0")
+            .map(|it| it.map(|sa| sa.ip()).collect())
+            .unwrap_or_default();
+    if !resolved.contains(&"127.0.0.1".parse().unwrap()) {
+        eprintln!("SKIP test_combined_hostname_resolving_into_denied_cidr_refused: localhost does not resolve to 127.0.0.1 (got {resolved:?})");
+        return;
+    }
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let out = temp_file("combined-hostname-deny");
