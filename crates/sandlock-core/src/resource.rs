@@ -19,7 +19,7 @@ use tokio::sync::Mutex;
 
 use crate::seccomp::ctx::SupervisorCtx;
 use crate::seccomp::notif::{read_child_mem, spawn_pid_watcher, NotifAction, NotifPolicy};
-use crate::seccomp::state::{read_tgid_of_tid, PerProcessState, ResourceState};
+use crate::seccomp::state::{read_tgid_of_tid, PerProcessState, PidKey, ResourceState};
 use crate::sys::structs::{
     SeccompNotif, CLONE_NS_FLAGS, EAGAIN, EPERM,
 };
@@ -124,6 +124,10 @@ pub(crate) async fn handle_fork(
     // Enforce concurrent process limit.
     let limit = live_max.unwrap_or(rs.max_processes);
     if rs.proc_count >= limit {
+        let exited = ctx.processes.release_exited_slots();
+        rs.proc_count = rs.proc_count.saturating_sub(exited);
+    }
+    if rs.proc_count >= limit {
         return NotifAction::Errno(EAGAIN);
     }
 
@@ -156,20 +160,23 @@ pub(crate) fn register_pid_if_new(ctx: &Arc<SupervisorCtx>, pid: i32) -> bool {
         return true;
     }
 
-    let pidfd = match crate::sys::syscall::pidfd_open(pid as u32, 0) {
-        Ok(fd) => fd,
+    // Without PIDFD_THREAD only a thread-group leader opens, and its pidfd
+    // stays unreadable until the whole group is gone: that is the lifetime
+    // of a process slot.
+    let (pidfd, holds_slot) = match crate::sys::syscall::pidfd_open(pid as u32, 0) {
+        Ok(fd) => (fd, true),
         Err(_) => {
+            // The slot belongs to the leader, which may never notify itself.
+            let leader_tracked = matches!(
+                read_tgid_of_tid(pid),
+                Some(tgid) if tgid != pid && register_pid_if_new(ctx, tgid)
+            );
             // clone3 can create CLONE_THREAD tasks. Linux 6.9 added
             // PIDFD_THREAD so pidfd_open works for non-leader TIDs too.
             const PIDFD_THREAD: u32 = libc::O_EXCL as u32;
             match crate::sys::syscall::pidfd_open(pid as u32, PIDFD_THREAD) {
-                Ok(fd) => fd,
-                Err(_) => {
-                    if matches!(read_tgid_of_tid(pid), Some(tgid) if ctx.processes.contains(tgid)) {
-                        return true;
-                    }
-                    return false; // old kernel or process gone
-                }
+                Ok(fd) => (fd, false),
+                Err(_) => return leader_tracked, // old kernel or process gone
             }
         }
     };
@@ -179,7 +186,10 @@ pub(crate) fn register_pid_if_new(ctx: &Arc<SupervisorCtx>, pid: i32) -> bool {
         None => return false, // process exited between pidfd_open and stat read
     };
 
-    // Hand the pidfd to the watcher; it owns the fd's lifetime now.
+    let pidfd = Arc::new(pidfd);
+    if holds_slot {
+        ctx.processes.hold_slot(key, Arc::clone(&pidfd));
+    }
     spawn_pid_watcher(Arc::clone(ctx), key, pidfd);
     true
 }
@@ -539,18 +549,14 @@ pub(crate) async fn abort_process_creation_tracking(mut trace: ProcessCreationTr
     }
 }
 
-/// Handle wait4/waitid notifications — decrement the concurrent process count.
-///
-/// Only blocking waits reach the supervisor (WNOHANG/WNOWAIT calls are
-/// filtered out by BPF and allowed without notification).  A blocking wait
-/// will definitely reap a child, so we decrement before the kernel executes it.
-pub(crate) async fn handle_wait(
-    _notif: &SeccompNotif,
-    resource: &Arc<Mutex<ResourceState>>,
-) -> NotifAction {
-    let mut rs = resource.lock().await;
-    rs.proc_count = rs.proc_count.saturating_sub(1);
-    NotifAction::Continue
+/// Release the process slot of `key` once it has exited.
+pub(crate) async fn release_process_slot(ctx: &SupervisorCtx, key: PidKey) {
+    // Taken before the slot so `handle_fork` never sees one already given
+    // up but not yet uncounted.
+    let mut rs = ctx.resource.lock().await;
+    if ctx.processes.release_slot(key) {
+        rs.proc_count = rs.proc_count.saturating_sub(1);
+    }
 }
 
 /// Undo the optimistic process-count increment if a fork-like syscall

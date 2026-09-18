@@ -2499,15 +2499,15 @@ async fn process_index_gc(processes: Arc<super::state::ProcessIndex>) {
 /// (process exit) and then runs unified cleanup across every
 /// per-process supervisor map.
 ///
-/// The watcher *owns* the pidfd via `AsyncFd<OwnedFd>` — the kernel
+/// The watcher holds the pidfd via `AsyncFd<Arc<OwnedFd>>` — the kernel
 /// fd stays alive for as long as tokio's IO driver has it registered,
-/// and is closed exactly once when the watcher task ends. This avoids
-/// a TOCTOU where dropping the fd from a separate map could let a
-/// recycled fd be deregistered from epoll.
+/// whoever else shares the `Arc`. This avoids a TOCTOU where dropping
+/// the fd from a separate map could let a recycled fd be deregistered
+/// from epoll.
 pub(crate) fn spawn_pid_watcher(
     ctx: Arc<super::ctx::SupervisorCtx>,
     key: super::state::PidKey,
-    pidfd: std::os::unix::io::OwnedFd,
+    pidfd: Arc<std::os::unix::io::OwnedFd>,
 ) {
     tokio::spawn(async move {
         let async_fd = match tokio::io::unix::AsyncFd::with_interest(
@@ -2518,9 +2518,8 @@ pub(crate) fn spawn_pid_watcher(
             Err(_) => {
                 // AsyncFd registration failed (extremely unusual);
                 // fall back to immediate cleanup so we don't leak the
-                // index entry. The OwnedFd we passed in is consumed
-                // by `with_interest`'s Err return and will close on
-                // drop here.
+                // index entry. The process is still alive, so its slot
+                // stays held until `release_exited_slots` sees it die.
                 cleanup_pid(&ctx, key).await;
                 return;
             }
@@ -2528,8 +2527,8 @@ pub(crate) fn spawn_pid_watcher(
         // pidfd becomes readable when the process exits; we don't
         // read any data, so `readable()` is just an await point.
         let _ = async_fd.readable().await;
+        crate::resource::release_process_slot(&ctx, key).await;
         cleanup_pid(&ctx, key).await;
-        // async_fd drops here, closing the pidfd.
     });
 }
 
