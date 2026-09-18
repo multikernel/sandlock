@@ -207,6 +207,45 @@ async fn test_process_limit_allows_sequential_reuse() {
     let _ = std::fs::remove_file(&out);
 }
 
+/// Run `script` under `max_processes` and return what it wrote to `{out}`.
+async fn run_under_process_limit(name: &str, max_processes: u32, script: &str) -> String {
+    let out = temp_path(name);
+    let script = script.replace("{out}", &out.display().to_string());
+    let policy = base_policy().max_processes(max_processes).build().unwrap();
+    policy.clone().run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    let content = std::fs::read_to_string(&out).expect("temp file should exist");
+    let _ = std::fs::remove_file(&out);
+    content
+}
+
+#[cfg(target_arch = "x86_64")]
+#[tokio::test]
+async fn test_process_limit_counts_bare_fork() {
+    // glibc's fork() is clone(2) underneath, so only a raw fork(2) exercises
+    // the legacy syscall number.
+    let script = concat!(
+        "import ctypes, os, time\n",
+        "libc = ctypes.CDLL(None, use_errno=True)\n",
+        "count = 0\n",
+        "for i in range(10):\n",
+        "  pid = libc.syscall(57)\n",
+        "  if pid == 0:\n",
+        "    time.sleep(60)\n",
+        "    os._exit(0)\n",
+        "  if pid < 0:\n",
+        "    break\n",
+        "  count += 1\n",
+        "open('{out}', 'w').write(str(count))\n",
+    );
+    let count: u32 = run_under_process_limit("bare-fork", 3, script)
+        .await
+        .parse()
+        .unwrap();
+    assert_eq!(count, 2, "limit 3 leaves room for 2 children, got {}", count);
+}
+
 #[tokio::test]
 async fn test_threads_do_not_count_toward_process_limit_clone3() {
     // Regression: handle_fork only checked CLONE_THREAD on SYS_clone, not

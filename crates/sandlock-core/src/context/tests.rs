@@ -49,24 +49,9 @@ fn test_notif_syscalls_always_has_clone() {
     if let Some(vfork) = arch::sys_vfork() {
         assert!(nrs.contains(&(vfork as u32)));
     }
-    // Bare fork(2) is intercepted only when policy_fn is active:
-    // see notif_syscalls. The default policy has no policy_fn, so
-    // fork stays out of the BPF filter and hot fork-loops keep
-    // bypassing the supervisor.
     if let Some(fork) = arch::sys_fork() {
-        assert!(!nrs.contains(&(fork as u32)));
+        assert!(nrs.contains(&(fork as u32)));
     }
-}
-
-#[test]
-fn test_notif_syscalls_fork_gated_on_policy_fn() {
-    let Some(fork) = arch::sys_fork() else { return };
-    let policy = Sandbox::builder()
-        .policy_fn(|_event, _ctx| crate::policy_fn::Verdict::Allow)
-        .build()
-        .unwrap();
-    let nrs = notif_syscalls(&policy, None);
-    assert!(nrs.contains(&(fork as u32)));
 }
 
 #[test]

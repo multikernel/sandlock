@@ -361,15 +361,9 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
     let mut nrs = SyscallList::with(BASE_NOTIF_SYSCALLS);
     nrs.push_optional(arch::sys_vfork());
 
-    // Bare fork(2) carries none of the namespace/process-limit risk of
-    // clone/clone3 and was historically left out of the BPF filter so
-    // hot fork-loops (COW map-reduce) bypass the supervisor entirely.
-    // It only needs interception when argv safety is required, so the
-    // supervisor can register the new child via ptrace fork events before
-    // user code can mutate argv observed by policy_fn or exec handlers.
-    if features.argv_safety_required {
-        nrs.push_optional(arch::sys_fork());
-    }
+    // Bare fork(2) creates a process like any clone: left out of the
+    // filter it would never be counted against the process limit.
+    nrs.push_optional(arch::sys_fork());
 
     if features.memory_limit {
         nrs.extend(MEMORY_NOTIF_SYSCALLS);
