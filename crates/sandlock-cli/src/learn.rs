@@ -15,13 +15,13 @@ use sandlock_core::Sandbox;
 
 
 /// Protected: no legitimate sandboxed workload needs a recursive grant here.
-/// Write collapse to these is skipped + error. Read collapse never fires here.
-const PROTECTED_PATHS: &[&[u8]] = &[b"/", b"/root"];
+/// Write grants on these are skipped + error. Read collapse never fires here.
+const PROTECTED_PATHS: &[&[u8]] = &[b"/"];
 const PROTECTED_CRED_SUFFIXES: &[&[u8]] = &[b"/.ssh", b"/.aws", b"/.kube", b"/.gnupg"];
 
 /// Guarded: write grants are sometimes necessary but warrant operator awareness.
-/// Write collapse emits + warning + diff. Read collapse never fires here.
-const GUARDED_PATHS: &[&[u8]] = &[b"/etc", b"/proc", b"/sys", b"/dev", b"/boot", b"/run/secrets"];
+/// Write grants emit + warning + diff. Read collapse never fires here.
+const GUARDED_PATHS: &[&[u8]] = &[b"/etc", b"/proc", b"/sys", b"/dev", b"/boot", b"/run/secrets", b"/root"];
 
 #[derive(PartialEq)]
 enum PathTier { Protected, Guarded, Normal }
@@ -36,9 +36,9 @@ fn classify_path(p: &std::path::Path) -> PathTier {
     if GUARDED_PATHS.iter().any(|s| b == *s) {
         return PathTier::Guarded;
     }
-    // $HOME itself (non-root) is guarded: apps do legitimately write dotfiles there.
+    // $HOME itself is guarded: apps do legitimately write dotfiles there.
     if let Ok(home) = std::env::var("HOME") {
-        if b == home.as_bytes() && home != "/root" {
+        if b == home.as_bytes() {
             return PathTier::Guarded;
         }
     }
@@ -63,63 +63,42 @@ fn print_observed_vs_granted_diff(dir: &std::path::Path, observed: &BTreeSet<Pat
     );
 }
 
-/// Collapse write paths for the profile, with safety guards.
+/// Turn observed write paths into Landlock grants, with safety guards.
 ///
-/// For paths that exist on the real FS: record as-is.
-/// For paths that don't exist (COW-created): walk up to the nearest existing
-/// ancestor, which is required for Landlock. Guards:
-/// - "/" → skip entirely and print an error
-/// - sensitive dirs → emit but print a warning + observed-vs-granted diff
+/// Landlock needs an existing path, so a COW-created path is granted through
+/// its nearest existing ancestor. The grant is recursive either way, so the
+/// tier check applies to the granted path, not to how the workload named it.
 fn collapse_write_paths(writes: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
     let mut out: BTreeSet<PathBuf> = BTreeSet::new();
     for p in writes {
         if is_junk_path(p) { continue; }
         let p = &fold_session_path(p.clone());
-        if p.exists() {
-            if is_fs_root(p) {
-                eprintln!(
-                    "sandlock learn: WARNING: observed a direct write of '/', refusing to grant it"
-                );
-                continue;
-            }
-            match classify_path(p) {
-                PathTier::Protected | PathTier::Guarded => {
-                    eprintln!(
-                        "sandlock learn: NOTE: observed a direct write to '{}'",
-                        p.display()
-                    );
-                }
-                PathTier::Normal => {}
-            }
-            out.insert(p.clone());
-            continue;
-        }
-        let Some(ancestor) = p.ancestors().skip(1).find(|a| a.exists()) else { continue };
-        if is_fs_root(&ancestor) {
+        let Some(grant) = p.ancestors().find(|a| a.exists()) else { continue };
+        if is_fs_root(grant) {
             eprintln!(
-                "sandlock learn: WARNING: write collapse for '{}' reaches filesystem root, skipping",
+                "sandlock learn: WARNING: write to '{}' needs a grant on the filesystem root, skipping",
                 p.display()
             );
             continue;
         }
-        match classify_path(&ancestor) {
+        match classify_path(grant) {
             PathTier::Protected => {
                 eprintln!(
-                    "sandlock learn: WARNING: write collapse for '{}' reaches protected path '{}', skipping",
-                    p.display(), ancestor.display()
+                    "sandlock learn: WARNING: write to '{}' needs a grant on protected path '{}', skipping",
+                    p.display(), grant.display()
                 );
                 continue;
             }
             PathTier::Guarded => {
                 eprintln!(
-                    "sandlock learn: WARNING: write collapse '{}' to '{}' (guarded directory)",
-                    p.display(), ancestor.display()
+                    "sandlock learn: WARNING: write to '{}' grants '{}' (guarded directory)",
+                    p.display(), grant.display()
                 );
-                print_observed_vs_granted_diff(&ancestor, writes);
+                print_observed_vs_granted_diff(grant, writes);
             }
             PathTier::Normal => {}
         }
-        out.insert(ancestor.to_path_buf());
+        out.insert(grant.to_path_buf());
     }
     out.into_iter().collect()
 }
