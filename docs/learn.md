@@ -53,15 +53,21 @@ optional, so omitting the ancestor would cause `sandlock run` to abort.
 
 ### Path tiers
 
-| Tier | Paths | Write collapse | `--collapse` / `--collapse-prefix` |
+| Tier | Paths | Write grant | `--collapse` / `--collapse-prefix` |
 |---|---|---|---|
-| **Protected** | `/`, `/root`, paths ending in `/.ssh` `/.aws` `/.kube` `/.gnupg` | skip + error | never (keep individual files; override with `--force-sensitive-collapse`) |
-| **Guarded** | `$HOME`, `/etc`, `/proc`, `/sys`, `/dev`, `/boot`, `/run/secrets` | emit + warning + diff | never (keep individual files; override with `--force-sensitive-collapse`) |
-| **Normal** | everything else | collapse freely | collapse freely |
+| **Protected** | `/`, paths ending in `/.ssh` `/.aws` `/.kube` `/.gnupg` | skip + error | never (keep individual files; override with `--force-sensitive-collapse`) |
+| **Guarded** | `$HOME`, `/root`, `/etc`, `/proc`, `/sys`, `/dev`, `/boot`, `/run/secrets` | emit + warning + diff | never (keep individual files; override with `--force-sensitive-collapse`) |
+| **Normal** | everything else | grant freely | collapse freely |
 
-The tiers apply to write collapse only. **The only path dropped from direct writes and reads is `/`**: granting it would subsume every other entry in the profile. A direct write to a Protected or Guarded path is still recorded, with a NOTE printed to stderr.
+The write tier is decided by the path that ends up granted, not by how the
+workload reached it. A Landlock grant on a directory is recursive, so
+`mkdir ~/.ssh/x` (which needs a right on `~/.ssh` itself) and creating
+`~/.ssh/x/y` (which collapses to `~/.ssh`) are treated the same. Existing
+files inside a Protected or Guarded directory are Normal and granted
+individually. **The only path dropped from reads is `/`**: granting it would
+subsume every other entry in the profile.
 
-When a write collapse lands on a guarded path, a warning is printed to
+When a write grant lands on a guarded path, a warning is printed to
 stderr along with an **observed-vs-granted diff**, the list of siblings
 in that directory the workload never touched but will now have write access
 to. The operator can use this to decide whether the grant is acceptable.

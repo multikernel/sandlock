@@ -730,21 +730,52 @@ fn test_write_collapse_warns_sensitive() {
         "expected observed-vs-granted diff in stderr, got: {stderr}");
 }
 
-/// Write collapse to a protected path is skipped entirely.
-#[test]
-fn test_write_collapse_skips_protected() {
+/// Runs `sandlock learn -- sh -c <cmd>` with $HOME pointed at `home`.
+fn learn_sh_with_home(cmd: &str, home: &std::path::Path) -> (String, String) {
     let output = sandlock_bin()
-        .args(["learn", "--", "sh", "-c", "echo x > /root/sandlock_learn_protected_test_$$"])
+        .env("HOME", home)
+        .args(["learn", "--", "sh", "-c", cmd])
         .output()
         .expect("failed to run sandlock learn");
     assert!(output.status.success(), "stderr={}", String::from_utf8_lossy(&output.stderr));
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("");
-    assert!(!write_line.contains("/root\"") && !write_line.contains("/root,"),
-        "write list must not contain /root (protected), got: {write_line}");
-    assert!(stderr.contains("protected path"),
-        "expected 'protected path' error in stderr, got: {stderr}");
+    let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("write = []");
+    (write_line.to_owned(), String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+/// A protected directory is never granted, whether the workload creates a
+/// file under it (ancestor walk) or a directory in it (parent recorded directly).
+#[test]
+fn test_write_grant_skips_protected() {
+    let base = tempfile::TempDir::new_in("/var/tmp").expect("tempdir in /var/tmp");
+    let ssh = base.path().join(".ssh");
+    std::fs::create_dir(&ssh).expect("create .ssh");
+    let ssh_str = ssh.to_str().unwrap();
+    for cmd in [format!("echo x > {ssh_str}/new_key"), format!("mkdir {ssh_str}/sub")] {
+        let (write_line, stderr) = learn_sh_with_home(&cmd, base.path());
+        assert!(!write_line.contains(ssh_str),
+            "`{cmd}`: write list must not contain {ssh_str} (protected), got: {write_line}");
+        assert!(stderr.contains("protected path"),
+            "`{cmd}`: expected 'protected path' warning in stderr, got: {stderr}");
+    }
+}
+
+/// $HOME is guarded, /root included: the grant is emitted with the same warning
+/// and diff for both ways of reaching it.
+#[test]
+fn test_write_grant_warns_guarded_home() {
+    let home = tempfile::TempDir::new_in("/var/tmp").expect("tempdir in /var/tmp");
+    std::fs::write(home.path().join("untouched"), b"x").expect("seed sibling");
+    let home_str = home.path().to_str().unwrap();
+    for cmd in [format!("echo x > {home_str}/new_dotfile"), format!("mkdir {home_str}/sub")] {
+        let (write_line, stderr) = learn_sh_with_home(&cmd, home.path());
+        assert!(write_line.contains(&format!("\"{home_str}\"")),
+            "`{cmd}`: expected {home_str} in write list, got: {write_line}");
+        assert!(stderr.contains("guarded directory"),
+            "`{cmd}`: expected 'guarded directory' warning in stderr, got: {stderr}");
+        assert!(stderr.contains("unobserved siblings now writable under"),
+            "`{cmd}`: expected observed-vs-granted diff in stderr, got: {stderr}");
+    }
 }
 
 /// mkdirat on an existing target (EEXIST) must not add the parent to the write set.
@@ -784,8 +815,8 @@ fn test_direct_write_root_skipped() {
     let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("write = []");
     assert!(!write_line.contains("\"/\""),
         "direct write of \"/\" must be dropped, got: {write_line}");
-    assert!(stderr.contains("direct write of '/'"),
-        "expected direct write warning in stderr, got: {stderr}");
+    assert!(stderr.contains("filesystem root"),
+        "expected filesystem root warning in stderr, got: {stderr}");
 }
 
 /// /proc/self/maps must appear in the profile as /proc/self/maps
