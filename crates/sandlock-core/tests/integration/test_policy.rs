@@ -3,7 +3,7 @@ use sandlock_core::sandbox::{ByteSize, BranchAction, Sandbox};
 #[test]
 fn test_default_policy() {
     let policy = Sandbox::builder().build().unwrap();
-    assert_eq!(policy.max_processes, 64);
+    assert_eq!(policy.max_processes, None);
     assert!(policy.extra_deny_syscalls.is_empty());
     // UDP, ICMP, and raw ICMP are denied by default — there are no rules
     // for those protocols in `net_allow`, which is what the BPF filter
@@ -70,7 +70,7 @@ fn test_builder_resource_limits() {
         .build()
         .unwrap();
     assert_eq!(policy.max_memory.unwrap().0, 512 * 1024 * 1024);
-    assert_eq!(policy.max_processes, 20);
+    assert_eq!(policy.max_processes, Some(20));
     assert_eq!(policy.max_cpu.unwrap(), 50);
 }
 

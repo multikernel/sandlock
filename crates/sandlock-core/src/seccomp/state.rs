@@ -4,17 +4,19 @@
 // `ProcessIndex`; cleanup on exit is just dropping the entry's `Arc`.
 
 use std::collections::{HashMap, HashSet};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 
 /// Resource-limit runtime state shared across notification handlers.
 pub struct ResourceState {
-    /// Live concurrent process count — incremented on fork, decremented on wait.
+    /// Process slots in use: reserved when a fork is allowed, released
+    /// when the process it created exits.
     pub proc_count: u32,
     /// Peak concurrent process count observed since sandbox start.
     pub peak_proc_count: u32,
-    /// Maximum allowed concurrent processes.
+    /// Maximum allowed concurrent processes (`u32::MAX` = unlimited).
     pub max_processes: u32,
     /// Estimated anonymous memory usage (bytes).
     pub mem_used: u64,
@@ -184,6 +186,10 @@ pub struct PerProcessState {
 /// deregister a recycled fd from epoll.
 pub struct ProcessIndex {
     inner: std::sync::RwLock<HashMap<i32, ProcessEntry>>,
+    /// Pidfds of the registered processes that hold a process-limit slot.
+    /// Kept apart from `ProcessEntry`, which can be dropped while the
+    /// process is still alive.
+    slots: std::sync::Mutex<HashMap<PidKey, Arc<OwnedFd>>>,
 }
 
 /// A task's current directory as the sandbox believes it to be: the
@@ -213,7 +219,55 @@ impl ProcessIndex {
     pub fn new() -> Self {
         Self {
             inner: std::sync::RwLock::new(HashMap::new()),
+            slots: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Record that `key` holds a process-limit slot until `pidfd` reports
+    /// its exit.
+    pub fn hold_slot(&self, key: PidKey, pidfd: Arc<OwnedFd>) {
+        if let Ok(mut slots) = self.slots.lock() {
+            slots.insert(key, pidfd);
+        }
+    }
+
+    /// Give up the slot held by `key`. True only for the first caller, so
+    /// the exit watcher and `release_exited_slots` cannot both count it.
+    pub fn release_slot(&self, key: PidKey) -> bool {
+        self.slots
+            .lock()
+            .map(|mut slots| slots.remove(&key).is_some())
+            .unwrap_or(false)
+    }
+
+    /// Give up the slots of processes that have already exited, returning
+    /// how many. The exit watchers run asynchronously, so a parent that
+    /// reaps a child and forks again at once would otherwise beat them to
+    /// `handle_fork` and be refused a slot the kernel already shows free.
+    pub fn release_exited_slots(&self) -> u32 {
+        let Ok(mut slots) = self.slots.lock() else {
+            return 0;
+        };
+        let keys: Vec<PidKey> = slots.keys().copied().collect();
+        let mut fds: Vec<libc::pollfd> = keys
+            .iter()
+            .map(|key| libc::pollfd {
+                fd: slots[key].as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 0) };
+        if ready <= 0 {
+            return 0;
+        }
+        let mut released = 0;
+        for (key, fd) in keys.iter().zip(&fds) {
+            if fd.revents != 0 && slots.remove(key).is_some() {
+                released += 1;
+            }
+        }
+        released
     }
 
     /// Register a process by reading its start_time once and

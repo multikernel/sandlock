@@ -173,8 +173,8 @@ async fn test_process_limit_allows_sequential_reuse() {
     let out = temp_path("proc-reuse");
 
     // Fork+wait sequentially: each child exits before the next fork, so peak
-    // concurrent processes never exceeds 2 (parent + 1 child).  With
-    // max_processes=3 this should succeed for all iterations.
+    // concurrent processes never exceeds 2 (parent + 1 child), which is
+    // exactly what max_processes=2 allows.
     let script = format!(concat!(
         "import os\n",
         "count = 0\n",
@@ -191,7 +191,7 @@ async fn test_process_limit_allows_sequential_reuse() {
         "open('{out}', 'w').write(str(count))\n",
     ), out = out.display());
 
-    let policy = base_policy().max_processes(3).build().unwrap();
+    let policy = base_policy().max_processes(2).build().unwrap();
     policy.clone().run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
@@ -205,6 +205,208 @@ async fn test_process_limit_allows_sequential_reuse() {
     );
 
     let _ = std::fs::remove_file(&out);
+}
+
+#[tokio::test]
+async fn test_process_limit_unset_is_unlimited() {
+    // 100 live children is past the 64 that used to be the default.
+    let out = temp_path("no-process-limit");
+    let script = format!(concat!(
+        "import os, signal\n",
+        "pids = []\n",
+        "try:\n",
+        "  for i in range(100):\n",
+        "    pid = os.fork()\n",
+        "    if pid == 0:\n",
+        "      signal.pause()\n",
+        "      os._exit(0)\n",
+        "    pids.append(pid)\n",
+        "except OSError:\n",
+        "  pass\n",
+        "open('{}', 'w').write(str(len(pids)))\n",
+        "for pid in pids:\n",
+        "  os.kill(pid, signal.SIGKILL)\n",
+        "  os.waitpid(pid, 0)\n",
+    ), out.display());
+    let policy = base_policy().build().unwrap();
+    policy.clone().run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    let count: u32 = std::fs::read_to_string(&out)
+        .expect("temp file should exist")
+        .parse()
+        .unwrap();
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(count, 100, "no limit set, all 100 forks should succeed, got {}", count);
+}
+
+/// Run `script` under `max_processes` and return what it wrote to `{out}`.
+async fn run_under_process_limit(name: &str, max_processes: u32, script: &str) -> String {
+    let out = temp_path(name);
+    let script = script.replace("{out}", &out.display().to_string());
+    let policy = base_policy().max_processes(max_processes).build().unwrap();
+    policy.clone().run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    let content = std::fs::read_to_string(&out).expect("temp file should exist");
+    let _ = std::fs::remove_file(&out);
+    content
+}
+
+#[cfg(target_arch = "x86_64")]
+#[tokio::test]
+async fn test_process_limit_counts_bare_fork() {
+    // glibc's fork() is clone(2) underneath, so only a raw fork(2) exercises
+    // the legacy syscall number.
+    let script = concat!(
+        "import ctypes, os, time\n",
+        "libc = ctypes.CDLL(None, use_errno=True)\n",
+        "count = 0\n",
+        "for i in range(10):\n",
+        "  pid = libc.syscall(57)\n",
+        "  if pid == 0:\n",
+        "    time.sleep(60)\n",
+        "    os._exit(0)\n",
+        "  if pid < 0:\n",
+        "    break\n",
+        "  count += 1\n",
+        "open('{out}', 'w').write(str(count))\n",
+    );
+    let count: u32 = run_under_process_limit("bare-fork", 3, script)
+        .await
+        .parse()
+        .unwrap();
+    assert_eq!(count, 2, "limit 3 leaves room for 2 children, got {}", count);
+}
+
+// A slot belongs to a process until it dies, however it is reaped. Each test
+// below forks more children in sequence than the limit allows at once, under
+// a limit with no headroom beyond the children alive at that moment.
+
+#[tokio::test]
+async fn test_process_limit_releases_slot_on_wnohang_reap() {
+    let script = concat!(
+        "import os, time\n",
+        "count = 0\n",
+        "try:\n",
+        "  for i in range(20):\n",
+        "    pid = os.fork()\n",
+        "    if pid == 0:\n",
+        "      os._exit(0)\n",
+        "    while os.waitpid(pid, os.WNOHANG)[0] == 0:\n",
+        "      time.sleep(0.001)\n",
+        "    count += 1\n",
+        "except OSError:\n",
+        "  pass\n",
+        "open('{out}', 'w').write(str(count))\n",
+    );
+    let count = run_under_process_limit("wnohang-reap", 2, script).await;
+    assert_eq!(count, "20", "every WNOHANG-reaped child should free its slot");
+}
+
+#[tokio::test]
+async fn test_process_limit_releases_slot_on_auto_reap() {
+    // SIGCHLD ignored: the kernel reaps the child, no wait call ever happens.
+    let script = concat!(
+        "import os, signal, time\n",
+        "signal.signal(signal.SIGCHLD, signal.SIG_IGN)\n",
+        "count = 0\n",
+        "try:\n",
+        "  for i in range(20):\n",
+        "    pid = os.fork()\n",
+        "    if pid == 0:\n",
+        "      os._exit(0)\n",
+        "    try:\n",
+        "      while True:\n",
+        "        os.kill(pid, 0)\n",
+        "        time.sleep(0.001)\n",
+        "    except ProcessLookupError:\n",
+        "      pass\n",
+        "    count += 1\n",
+        "except OSError:\n",
+        "  pass\n",
+        "open('{out}', 'w').write(str(count))\n",
+    );
+    let count = run_under_process_limit("auto-reap", 2, script).await;
+    assert_eq!(count, "20", "every auto-reaped child should free its slot");
+}
+
+#[tokio::test]
+async fn test_process_limit_releases_slot_of_orphan() {
+    // Double fork: the grandchild is reaped by init, never by a sandbox wait.
+    // Its death is not observable from here, so a refused fork is retried
+    // until the grandchild of the previous round is gone.
+    let script = concat!(
+        "import os, time\n",
+        "def fork_retrying():\n",
+        "  for attempt in range(2000):\n",
+        "    try:\n",
+        "      return os.fork()\n",
+        "    except OSError:\n",
+        "      time.sleep(0.001)\n",
+        "  raise SystemExit(1)\n",
+        "count = 0\n",
+        "for i in range(20):\n",
+        "  pid = fork_retrying()\n",
+        "  if pid == 0:\n",
+        "    if fork_retrying() == 0:\n",
+        "      os._exit(0)\n",
+        "    os._exit(0)\n",
+        "  os.waitpid(pid, 0)\n",
+        "  count += 1\n",
+        "  open('{out}', 'w').write(str(count))\n",
+    );
+    let count = run_under_process_limit("orphan", 3, script).await;
+    assert_eq!(count, "20", "every orphaned grandchild should free its slot");
+}
+
+#[tokio::test]
+async fn test_process_limit_not_lowered_by_failed_wait() {
+    // A blocking wait that reaps nothing (ECHILD) must not free a slot.
+    let script = concat!(
+        "import os, time\n",
+        "count = 0\n",
+        "for i in range(10):\n",
+        "  try:\n",
+        "    os.waitpid(1, 0)\n",
+        "  except ChildProcessError:\n",
+        "    pass\n",
+        "  try:\n",
+        "    pid = os.fork()\n",
+        "  except OSError:\n",
+        "    break\n",
+        "  if pid == 0:\n",
+        "    time.sleep(60)\n",
+        "    os._exit(0)\n",
+        "  count += 1\n",
+        "open('{out}', 'w').write(str(count))\n",
+    );
+    let count = run_under_process_limit("failed-wait", 3, script).await;
+    assert_eq!(count, "2", "limit 3 leaves room for exactly 2 live children");
+}
+
+#[tokio::test]
+async fn test_process_limit_releases_slots_of_concurrent_children() {
+    let script = concat!(
+        "import os\n",
+        "count = 0\n",
+        "try:\n",
+        "  for round in range(10):\n",
+        "    pids = []\n",
+        "    for i in range(4):\n",
+        "      pid = os.fork()\n",
+        "      if pid == 0:\n",
+        "        os._exit(0)\n",
+        "      pids.append(pid)\n",
+        "    for pid in pids:\n",
+        "      os.waitpid(pid, 0)\n",
+        "    count += 1\n",
+        "except OSError:\n",
+        "  pass\n",
+        "open('{out}', 'w').write(str(count))\n",
+    );
+    let count = run_under_process_limit("concurrent", 5, script).await;
+    assert_eq!(count, "10", "each round of 4 children should free all 4 slots");
 }
 
 #[tokio::test]

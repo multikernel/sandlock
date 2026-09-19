@@ -149,7 +149,7 @@ pub struct LivePolicy {
     pub allowed_ips: HashSet<IpAddr>,
     /// Maximum memory in bytes (0 = unlimited).
     pub max_memory_bytes: u64,
-    /// Maximum number of forks.
+    /// Maximum concurrent processes (`u32::MAX` = unlimited).
     pub max_processes: u32,
 }
 

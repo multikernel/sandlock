@@ -13,7 +13,7 @@ use crate::seccomp::bpf::{jump, stmt};
 use crate::sys::structs::{
     AF_INET, AF_INET6, BPF_ABS, BPF_ALU, BPF_AND, BPF_JEQ, BPF_JMP, BPF_JSET, BPF_K,
     BPF_LD, BPF_RET, BPF_W, CLONE_NS_FLAGS, DEFAULT_BLOCKLIST_SYSCALLS, EPERM,
-    OFFSET_ARGS0_LO, OFFSET_ARGS1_LO, OFFSET_ARGS2_LO, OFFSET_ARGS3_LO, OFFSET_NR,
+    OFFSET_ARGS0_LO, OFFSET_ARGS1_LO, OFFSET_ARGS2_LO, OFFSET_NR,
     PR_SET_DUMPABLE, PR_SET_PTRACER, PR_SET_SECUREBITS, SECCOMP_RET_ALLOW,
     SECCOMP_RET_ERRNO, SIOCETHTOOL, SIOCGIFADDR, SIOCGIFBRDADDR, SIOCGIFCONF,
     SIOCGIFDSTADDR, SIOCGIFFLAGS, SIOCGIFHWADDR, SIOCGIFINDEX, SIOCGIFNAME,
@@ -61,8 +61,10 @@ impl SyscallList {
 const BASE_NOTIF_SYSCALLS: &[i64] = &[
     libc::SYS_clone,
     libc::SYS_clone3,
-    libc::SYS_wait4,
-    libc::SYS_waitid,
+    // A process that never makes another notified syscall still registers
+    // on its way out, so its exit can release its process slot.
+    libc::SYS_exit,
+    libc::SYS_exit_group,
 ];
 
 const MEMORY_NOTIF_SYSCALLS: &[i64] = &[
@@ -361,15 +363,9 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
     let mut nrs = SyscallList::with(BASE_NOTIF_SYSCALLS);
     nrs.push_optional(arch::sys_vfork());
 
-    // Bare fork(2) carries none of the namespace/process-limit risk of
-    // clone/clone3 and was historically left out of the BPF filter so
-    // hot fork-loops (COW map-reduce) bypass the supervisor entirely.
-    // It only needs interception when argv safety is required, so the
-    // supervisor can register the new child via ptrace fork events before
-    // user code can mutate argv observed by policy_fn or exec handlers.
-    if features.argv_safety_required {
-        nrs.push_optional(arch::sys_fork());
-    }
+    // Bare fork(2) creates a process like any clone: left out of the
+    // filter it would never be counted against the process limit.
+    nrs.push_optional(arch::sys_fork());
 
     if features.memory_limit {
         nrs.extend(MEMORY_NOTIF_SYSCALLS);
@@ -631,36 +627,6 @@ pub(crate) fn arg_filters_resolved(resolved: &ResolvedSandbox) -> Vec<SockFilter
     // by the blocked_types block above. Sandlock does not expose raw
     // sockets; ping uses the SOCK_DGRAM kernel ping socket via an
     // `icmp://...` rule, gated by host `ping_group_range`.)
-
-    // --- wait4: skip notification for WNOHANG/WNOWAIT (non-blocking) ---
-    // wait4(pid, status, options, rusage): options is arg2
-    // 5 instructions:
-    //   LD NR
-    //   JEQ wait4 -> +0, skip 3
-    //   LD arg2
-    //   JSET (WNOHANG|WNOWAIT) -> +0, skip 1
-    //   RET ALLOW
-    {
-        let nr_wait4 = libc::SYS_wait4 as u32;
-        let wnohang_or_wnowait = (libc::WNOHANG | 0x0100_0000/* WNOWAIT */) as u32;
-        insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR));
-        insns.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr_wait4, 0, 3));
-        insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARGS2_LO));
-        insns.push(jump(BPF_JMP | BPF_JSET | BPF_K, wnohang_or_wnowait, 0, 1));
-        insns.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
-    }
-
-    // --- waitid: skip notification for WNOHANG/WNOWAIT (non-blocking) ---
-    // waitid(idtype, id, infop, options, rusage): options is arg3
-    {
-        let nr_waitid = libc::SYS_waitid as u32;
-        let wnohang_or_wnowait = (libc::WNOHANG | 0x0100_0000/* WNOWAIT */) as u32;
-        insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR));
-        insns.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr_waitid, 0, 3));
-        insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARGS3_LO));
-        insns.push(jump(BPF_JMP | BPF_JSET | BPF_K, wnohang_or_wnowait, 0, 1));
-        insns.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
-    }
 
     // --- mprotect: notify only when PROT_WRITE is being granted ---
     // A reservation becomes real memory when it turns writable, which is

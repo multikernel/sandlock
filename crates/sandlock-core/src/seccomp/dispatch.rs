@@ -289,20 +289,6 @@ pub(crate) fn build_dispatch_table(
     }
 
     // ------------------------------------------------------------------
-    // Wait family (always on)
-    // ------------------------------------------------------------------
-    for &nr in &[libc::SYS_wait4, libc::SYS_waitid] {
-        let resource_for_wait = Arc::clone(resource);
-        table.register(nr, move |cx: &HandlerCtx| {
-            let notif = cx.notif;
-            let resource = Arc::clone(&resource_for_wait);
-            async move {
-                crate::resource::handle_wait(&notif, &resource).await
-            }
-        });
-    }
-
-    // ------------------------------------------------------------------
     // Memory management (conditional on has_memory_limit)
     // ------------------------------------------------------------------
     if policy.has_memory_limit {
