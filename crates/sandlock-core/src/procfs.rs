@@ -63,6 +63,34 @@ pub(crate) fn extract_proc_pid(path: &str) -> Option<i32> {
     component.parse::<i32>().ok()
 }
 
+/// Spell a per-task view of the network namespace as `/proc/net`.
+///
+/// `/proc/net` is a link to `self/net` and every task directory carries the
+/// same tree, so those spellings must reach the `/proc/net` virtualization
+/// instead of the host's tables.
+pub(crate) fn canon_proc_net(path: &str) -> std::borrow::Cow<'_, str> {
+    let tail = (|| {
+        let (task, rest) = path.strip_prefix("/proc/")?.split_once('/')?;
+        if task != "self" && task != "thread-self" && task.parse::<i32>().is_err() {
+            return None;
+        }
+        let rest = match rest.strip_prefix("task/") {
+            Some(thread) => {
+                let (tid, rest) = thread.split_once('/')?;
+                tid.parse::<i32>().ok()?;
+                rest
+            }
+            None => rest,
+        };
+        let tail = rest.strip_prefix("net")?;
+        (tail.is_empty() || tail.starts_with('/')).then_some(tail)
+    })();
+    match tail {
+        Some(tail) => format!("/proc/net{}", tail).into(),
+        None => path.into(),
+    }
+}
+
 // ============================================================
 // /proc/cpuinfo generator
 // ============================================================
@@ -441,6 +469,9 @@ pub(crate) async fn handle_proc_open(
             return NotifAction::Errno(EACCES);
         }
     }
+
+    let path = canon_proc_net(path);
+    let path = path.as_ref();
 
     // Virtualize /proc/cpuinfo.
     if path == "/proc/cpuinfo" {
@@ -1071,6 +1102,18 @@ mod tests {
         assert_eq!(extract_proc_pid("/proc/net/tcp"), None);
         assert_eq!(extract_proc_pid("/etc/group"), None);
         assert_eq!(extract_proc_pid("/proc/"), None);
+    }
+
+    #[test]
+    fn test_canon_proc_net() {
+        assert_eq!(canon_proc_net("/proc/self/net/dev"), "/proc/net/dev");
+        assert_eq!(canon_proc_net("/proc/thread-self/net/tcp6"), "/proc/net/tcp6");
+        assert_eq!(canon_proc_net("/proc/42/net"), "/proc/net");
+        assert_eq!(canon_proc_net("/proc/42/task/43/net/dev"), "/proc/net/dev");
+        assert_eq!(canon_proc_net("/proc/net/dev"), "/proc/net/dev");
+        assert_eq!(canon_proc_net("/proc/self/network"), "/proc/self/network");
+        assert_eq!(canon_proc_net("/proc/self/task/net/dev"), "/proc/self/task/net/dev");
+        assert_eq!(canon_proc_net("/proc/sys/net/core"), "/proc/sys/net/core");
     }
 
     #[test]
