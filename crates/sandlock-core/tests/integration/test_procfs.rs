@@ -351,3 +351,28 @@ async fn test_proc_net_tcp_hides_host_ports() {
 
     let _ = std::fs::remove_file(&out);
 }
+
+/// /proc/net is a link to self/net, and every task directory has the same
+/// tree: none of those spellings may show the host's interfaces.
+#[tokio::test]
+async fn test_proc_net_virt_covers_per_task_spellings() {
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .build()
+        .unwrap();
+
+    let script = concat!(
+        "for p in /proc/net/dev /proc/self/net/dev /proc/thread-self/net/dev ",
+        "/proc/$$/net/dev /proc/$$/task/$$/net/dev; do ",
+        "grep -c : $p; done",
+    );
+    let result = policy.clone().run(&["sh", "-c", script]).await.unwrap();
+    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
+    let counts: Vec<&str> = stdout.lines().collect();
+    assert_eq!(counts, ["1"; 5], "only loopback should be listed under every spelling");
+}
