@@ -207,6 +207,39 @@ async fn test_process_limit_allows_sequential_reuse() {
     let _ = std::fs::remove_file(&out);
 }
 
+#[tokio::test]
+async fn test_process_limit_unset_is_unlimited() {
+    // 100 live children is past the 64 that used to be the default.
+    let out = temp_path("no-process-limit");
+    let script = format!(concat!(
+        "import os, signal\n",
+        "pids = []\n",
+        "try:\n",
+        "  for i in range(100):\n",
+        "    pid = os.fork()\n",
+        "    if pid == 0:\n",
+        "      signal.pause()\n",
+        "      os._exit(0)\n",
+        "    pids.append(pid)\n",
+        "except OSError:\n",
+        "  pass\n",
+        "open('{}', 'w').write(str(len(pids)))\n",
+        "for pid in pids:\n",
+        "  os.kill(pid, signal.SIGKILL)\n",
+        "  os.waitpid(pid, 0)\n",
+    ), out.display());
+    let policy = base_policy().build().unwrap();
+    policy.clone().run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    let count: u32 = std::fs::read_to_string(&out)
+        .expect("temp file should exist")
+        .parse()
+        .unwrap();
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(count, 100, "no limit set, all 100 forks should succeed, got {}", count);
+}
+
 /// Run `script` under `max_processes` and return what it wrote to `{out}`.
 async fn run_under_process_limit(name: &str, max_processes: u32, script: &str) -> String {
     let out = temp_path(name);

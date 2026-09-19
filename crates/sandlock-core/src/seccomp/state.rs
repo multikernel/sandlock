@@ -16,7 +16,7 @@ pub struct ResourceState {
     pub proc_count: u32,
     /// Peak concurrent process count observed since sandbox start.
     pub peak_proc_count: u32,
-    /// Maximum allowed concurrent processes.
+    /// Maximum allowed concurrent processes (`u32::MAX` = unlimited).
     pub max_processes: u32,
     /// Estimated anonymous memory usage (bytes).
     pub mem_used: u64,

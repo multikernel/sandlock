@@ -1142,7 +1142,7 @@ class _NativePolicy:
                 disk_bytes = int(policy.max_disk)
             b = _b_max_disk(b, disk_bytes)
 
-        if policy.max_processes != 64:
+        if policy.max_processes is not None:
             b = _b_max_processes(b, policy.max_processes)
         if policy.max_cpu is not None:
             b = _b_max_cpu(b, policy.max_cpu)

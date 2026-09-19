@@ -79,7 +79,7 @@ class TestPolicy:
         assert p.net_allow_bind == []
         assert p.net_allow == []
         assert p.max_memory is None
-        assert p.max_processes == 64
+        assert p.max_processes is None
         assert p.max_cpu is None
 
     def test_mutable_config(self):

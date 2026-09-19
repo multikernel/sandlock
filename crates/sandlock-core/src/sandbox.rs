@@ -163,7 +163,7 @@ impl TryFrom<&Sandbox> for Confinement {
         if !sandbox.http_inject_ca.is_empty() { unsupported.push("http_inject_ca"); }
         if sandbox.http_ca_out.is_some() { unsupported.push("http_ca_out"); }
         if sandbox.max_memory.is_some() { unsupported.push("max_memory"); }
-        if sandbox.max_processes != 64 { unsupported.push("max_processes"); }
+        if sandbox.max_processes.is_some() { unsupported.push("max_processes"); }
         if sandbox.max_open_files.is_some() { unsupported.push("max_open_files"); }
         if sandbox.max_cpu.is_some() { unsupported.push("max_cpu"); }
         if sandbox.random_seed.is_some() { unsupported.push("random_seed"); }
@@ -464,7 +464,7 @@ pub struct Sandbox {
 
     // Resource limits
     pub max_memory: Option<ByteSize>,
-    pub max_processes: u32,
+    pub max_processes: Option<u32>,
     pub max_open_files: Option<u32>,
     pub max_cpu: Option<u8>,
 
@@ -2062,7 +2062,7 @@ impl Sandbox {
             let rt_name = self.rt().name.clone();
             let notif_policy = NotifPolicy {
                 max_memory_bytes: self.max_memory.map(|m| m.0).unwrap_or(0),
-                max_processes: self.max_processes,
+                max_processes: self.max_processes.unwrap_or(u32::MAX),
                 has_memory_limit: resolved.features.memory_limit,
                 has_net_destination_policy: resolved.features.network_destination_policy,
                 has_bind_denylist: resolved.features.bind_denylist,

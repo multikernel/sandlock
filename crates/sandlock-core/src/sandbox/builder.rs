@@ -111,7 +111,7 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", clap(skip))]
     pub max_memory: Option<ByteSize>,
 
-    /// Peak concurrent process limit; threads do not count [default: 64]
+    /// Peak concurrent process limit; threads do not count [default: unlimited]
     #[cfg_attr(feature = "cli", arg(short = 'P', long = "max-processes"))]
     pub max_processes: Option<u32>,
 
@@ -1012,7 +1012,7 @@ impl SandboxBuilder {
             http_ca_out: self.http_ca_out,
             http_log_fn: self.http_log_fn,
             max_memory: self.max_memory,
-            max_processes: self.max_processes.unwrap_or(64),
+            max_processes: self.max_processes,
             max_open_files: self.max_open_files,
             max_cpu: self.max_cpu,
             random_seed: self.random_seed,

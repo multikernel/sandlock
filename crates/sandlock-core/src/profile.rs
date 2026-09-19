@@ -591,10 +591,7 @@ pub fn sandbox_to_profile(s: &Sandbox, extra_denied: &[String]) -> ProfileInput 
         },
         limits: LimitsSection {
             memory: s.max_memory.map(byte_size_str),
-            // max_processes defaults to 64 when unset; emit it only when the
-            // user explicitly set a non-default value so the serialized profile
-            // stays minimal. The default round-trips either way.
-            processes: if s.max_processes == 64 { None } else { Some(s.max_processes) },
+            processes: s.max_processes,
             open_files: s.max_open_files,
             cpu: s.max_cpu,
             disk: s.max_disk.map(byte_size_str),

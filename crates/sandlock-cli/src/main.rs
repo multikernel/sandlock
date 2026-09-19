@@ -516,7 +516,7 @@ async fn run_command(args: RunArgs) -> Result<i32> {
             b = b.http_port(*port);
         }
         if let Some(mem) = base.max_memory { b = b.max_memory(mem); }
-        b = b.max_processes(base.max_processes);
+        if let Some(n) = base.max_processes { b = b.max_processes(n); }
         if let Some(cpu) = base.max_cpu { b = b.max_cpu(cpu); }
         if let Some(seed) = base.random_seed { b = b.random_seed(seed); }
         if let Some(n) = base.num_cpus { b = b.num_cpus(n); }
@@ -869,7 +869,7 @@ fn validate_no_supervisor_profile(profile: &Sandbox, source: &str) -> Result<()>
     if profile.http_ca.is_some() { bad.push("[config].http_ca"); }
     if profile.http_key.is_some() { bad.push("[config].http_key"); }
     if profile.max_memory.is_some() { bad.push("[limits].memory"); }
-    if profile.max_processes != 64 { bad.push("[limits].processes"); }
+    if profile.max_processes.is_some() { bad.push("[limits].processes"); }
     if profile.max_open_files.is_some() { bad.push("[limits].open_files"); }
     if profile.max_cpu.is_some() { bad.push("[limits].cpu"); }
     if profile.max_disk.is_some() { bad.push("[limits].disk"); }

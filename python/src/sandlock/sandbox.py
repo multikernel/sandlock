@@ -317,10 +317,10 @@ class Sandbox:
     max_memory: str | int | None = None
     """Memory limit. String like '512M' or int bytes."""
 
-    max_processes: int = 64
-    """Maximum total forks allowed in the sandbox (lifetime count,
-    not concurrent).  Enforced by the seccomp notif supervisor.
-    Also enables fork interception needed for checkpoint freeze."""
+    max_processes: int | None = None
+    """Maximum concurrent processes in the sandbox (threads do not
+    count).  None means unlimited.  Enforced by the seccomp notif
+    supervisor."""
 
     max_open_files: int | None = None
     """Maximum number of open file descriptors.  Enforced via
