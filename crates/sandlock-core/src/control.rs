@@ -47,7 +47,8 @@ use std::os::linux::net::SocketAddrExt;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::cell::{Cell, RefCell};
+use std::sync::{Arc, Mutex, MutexGuard, Once, PoisonError};
 use std::task::{Context, Poll};
 
 use tokio::io::unix::AsyncFd;
@@ -83,13 +84,72 @@ fn pgrp_socket_addr(name: &str) -> std::io::Result<SocketAddr> {
 // Live control fds
 // ============================================================
 
-/// Every control fd this process holds, so a forked child can close them
+/// Every control fd this process holds, so a forked child can drop them
 /// without reading /proc. Bind, close, and fork() all take the lock, so a
 /// child never sees an fd that is half registered.
 static LIVE: Mutex<Vec<RawFd>> = Mutex::new(Vec::new());
 
-fn live() -> std::sync::MutexGuard<'static, Vec<RawFd>> {
+fn live() -> MutexGuard<'static, Vec<RawFd>> {
     LIVE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+// An abstract name stays bound while any fd refers to it, and the host can
+// fork at any time: os.fork() in Python, a worker pool, anything. Such a
+// child may never exec, so SOCK_CLOEXEC does not help; it has to let go of
+// the names at the fork itself.
+
+/// What one fork on this thread holds from just before it until both sides
+/// are past it: the live list, locked, and an unnamed socket to put on each
+/// control fd's number in the child. Closing the numbers instead would let
+/// them be reused, and the child's copy of a `ControlFd` still closes its
+/// number on drop.
+struct ForkInProgress {
+    live: MutexGuard<'static, Vec<RawFd>>,
+    placeholder: RawFd,
+}
+
+impl Drop for ForkInProgress {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.placeholder) };
+    }
+}
+
+thread_local! {
+    static FORK_IN_PROGRESS: RefCell<Option<ForkInProgress>> = const { RefCell::new(None) };
+    /// The one control fd the child being forked keeps: its own pgrp socket.
+    static FORK_KEEP: Cell<Option<RawFd>> = const { Cell::new(None) };
+}
+
+extern "C" fn before_fork() {
+    let live = live();
+    let placeholder = match live.is_empty() {
+        true => -1,
+        false => unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) },
+    };
+    let _ = FORK_IN_PROGRESS.try_with(|f| *f.borrow_mut() = Some(ForkInProgress { live, placeholder }));
+}
+
+extern "C" fn after_fork_in_parent() {
+    let _ = FORK_IN_PROGRESS.try_with(|f| f.borrow_mut().take());
+}
+
+extern "C" fn after_fork_in_child() {
+    let keep = FORK_KEEP.try_with(Cell::get).ok().flatten();
+    let _ = FORK_IN_PROGRESS.try_with(|f| {
+        let Some(fork) = f.borrow_mut().take() else { return };
+        for &fd in fork.live.iter() {
+            if Some(fd) != keep && unsafe { libc::dup3(fork.placeholder, fd, libc::O_CLOEXEC) } < 0 {
+                unsafe { libc::close(fd) };
+            }
+        }
+    });
+}
+
+fn unname_control_fds_in_forked_children() {
+    static INSTALLED: Once = Once::new();
+    INSTALLED.call_once(|| unsafe {
+        libc::pthread_atfork(Some(before_fork), Some(after_fork_in_parent), Some(after_fork_in_child));
+    });
 }
 
 /// A socket fd that stays on the live list until it closes.
@@ -98,6 +158,7 @@ pub(crate) struct ControlFd(RawFd);
 
 impl ControlFd {
     fn register(fd: OwnedFd) -> Self {
+        unname_control_fds_in_forked_children();
         let fd = fd.into_raw_fd();
         live().push(fd);
         ControlFd(fd)
@@ -157,19 +218,12 @@ impl Drop for ControlFd {
     }
 }
 
-/// fork() with the live list locked. The child closes every control fd but
-/// `keep` before anything else runs, so the sandbox never holds one; `keep`
-/// is the child's own pgrp socket, which it still has to listen on.
+/// fork() a sandbox child. Like any forked child it loses every control
+/// fd, except `keep`: its own pgrp socket, which it still has to listen on.
 pub(crate) fn fork_without_control_fds(keep: Option<RawFd>) -> libc::pid_t {
-    let live = live();
+    FORK_KEEP.set(keep);
     let pid = unsafe { libc::fork() };
-    if pid == 0 {
-        for &fd in live.iter() {
-            if Some(fd) != keep {
-                unsafe { libc::close(fd) };
-            }
-        }
-    }
+    FORK_KEEP.set(None);
     pid
 }
 
@@ -805,26 +859,52 @@ mod tests {
         assert!(!live().contains(&control) && !live().contains(&pgrp));
     }
 
-    /// A forked child keeps only the pgrp socket it was told to, with no
-    /// help from /proc.
-    #[test]
-    fn forked_child_keeps_only_its_pgrp_socket() {
-        let pid = std::process::id();
-        let mine = bind_control_sockets(&format!("test-ctrl-fork-mine-{pid}")).unwrap();
-        let sibling = bind_control_sockets(&format!("test-ctrl-fork-sibling-{pid}")).unwrap();
-        let keep = mine.pgrp.as_raw_fd();
-        let closed = [mine.control.as_raw_fd(), sibling.control.as_raw_fd(), sibling.pgrp.as_raw_fd()];
+    /// True while `fd` is a socket bound to a name. Only makes a syscall,
+    /// so a forked child can use it.
+    fn is_named(fd: RawFd) -> bool {
+        let mut sun: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        let rc = unsafe { libc::getsockname(fd, &mut sun as *mut _ as *mut libc::sockaddr, &mut len) };
+        rc == 0 && len as usize > std::mem::size_of::<libc::sa_family_t>()
+    }
 
-        let child = fork_without_control_fds(Some(keep));
+    fn child_exits_zero_if(child: libc::pid_t, check: impl FnOnce() -> bool) {
         assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
         if child == 0 {
-            let is_open = |fd: RawFd| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0;
-            let ok = is_open(keep) && closed.iter().all(|&fd| !is_open(fd));
-            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+            unsafe { libc::_exit(if check() { 0 } else { 1 }) };
         }
         let mut status = 0;
         assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
         assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "child status {status:#x}");
+    }
+
+    /// A sandbox child keeps the name of the pgrp socket it was told to
+    /// and no other, with no help from /proc.
+    #[test]
+    fn sandbox_child_keeps_only_its_pgrp_name() {
+        let pid = std::process::id();
+        let mine = bind_control_sockets(&format!("test-ctrl-fork-mine-{pid}")).unwrap();
+        let sibling = bind_control_sockets(&format!("test-ctrl-fork-sibling-{pid}")).unwrap();
+        let keep = mine.pgrp.as_raw_fd();
+        let unnamed = [mine.control.as_raw_fd(), sibling.control.as_raw_fd(), sibling.pgrp.as_raw_fd()];
+
+        let child = fork_without_control_fds(Some(keep));
+        child_exits_zero_if(child, || is_named(keep) && unnamed.iter().all(|&fd| !is_named(fd)));
+    }
+
+    /// The host can fork on its own, and such a child may never exec. It
+    /// must not hold any sandbox's name, and the numbers stay occupied so
+    /// that nothing the child opens can be closed by a stale `ControlFd`.
+    #[test]
+    fn a_fork_made_by_the_host_holds_no_name() {
+        let sockets = bind_control_sockets(&format!("test-ctrl-fork-host-{}", std::process::id())).unwrap();
+        let fds = [sockets.control.as_raw_fd(), sockets.pgrp.as_raw_fd()];
+
+        let child = unsafe { libc::fork() };
+        child_exits_zero_if(child, || {
+            fds.iter().all(|&fd| !is_named(fd) && unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0)
+        });
+        assert!(fds.iter().all(|&fd| is_named(fd)), "the parent keeps its names");
     }
 
     /// The pids come from the kernel's record of who called listen(), not
