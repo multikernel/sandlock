@@ -457,3 +457,22 @@ async fn if_nameindex_works_under_destination_policy() {
     );
     assert!(result.success());
 }
+
+/// iproute2 and libnl refuse a reply whose sender address is not a
+/// `sockaddr_nl` (`Sender address length == 0`), and glibc wants `nl_pid == 0`.
+#[tokio::test]
+async fn reply_sender_address_looks_like_the_kernel() {
+    // Python decodes the address by the family the kernel wrote (AF_UNIX), so
+    // it hands back the 10 bytes after sa_family, or None when there are none.
+    let script = concat!(
+        "import socket, struct\n",
+        "s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE)\n",
+        "s.send(struct.pack('IHHII', 16, 999, 1, 1, 0))\n",
+        "data, addr = s.recvfrom(4096)\n",
+        "print(None if addr is None else (2 + len(addr), addr[2:6] == bytes(4)))\n",
+    );
+    let policy = base_policy().build().unwrap();
+    let result = policy.clone().run(&["python3", "-c", script]).await.unwrap();
+    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
+    assert_eq!(stdout.trim(), "(12, True)", "expected sizeof(sockaddr_nl) and nl_pid == 0");
+}
