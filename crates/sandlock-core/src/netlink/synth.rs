@@ -30,7 +30,7 @@ pub fn synthesize_reply(req: &ParsedRequest, reply_pid: u32) -> Vec<Vec<u8>> {
             build_link_dump(req.nlmsg_seq, reply_pid),
         RTM_GETADDR if req.nlmsg_flags & NLM_F_DUMP != 0 =>
             build_addr_dump(req.nlmsg_seq, reply_pid),
-        _ => vec![build_error(req, -libc::EOPNOTSUPP)],
+        _ => vec![build_error(req, reply_pid, -libc::EOPNOTSUPP)],
     }
 }
 
@@ -107,8 +107,11 @@ fn build_addr_dump(seq: u32, pid: u32) -> Vec<Vec<u8>> {
     vec![v4, v6, done_datagram(seq, pid)]
 }
 
-fn build_error(req: &ParsedRequest, err: i32) -> Vec<u8> {
-    encode_one(NLMSG_ERROR, 0, req.nlmsg_seq, req.nlmsg_pid, |w| {
+fn build_error(req: &ParsedRequest, reply_pid: u32, err: i32) -> Vec<u8> {
+    // Addressed to the receiving socket like a kernel reply: iproute2's dump
+    // loop skips any other pid and then waits forever. Only the echoed
+    // request header keeps the pid the sender wrote.
+    encode_one(NLMSG_ERROR, 0, req.nlmsg_seq, reply_pid, |w| {
         w.write_aligned(&err.to_ne_bytes());
         let orig = NlMsgHdr {
             nlmsg_len: NLMSG_HDRLEN as u32,
@@ -170,5 +173,18 @@ mod tests {
         assert_eq!(t, NLMSG_ERROR);
         let err = i32::from_ne_bytes(reply[0][16..20].try_into().unwrap());
         assert_eq!(err, -libc::EOPNOTSUPP);
+    }
+
+    #[test]
+    fn error_reply_is_addressed_to_the_receiving_socket() {
+        let req = ParsedRequest {
+            nlmsg_type: 999, nlmsg_flags: NLM_F_REQUEST,
+            nlmsg_seq: 7, nlmsg_pid: 0,
+        };
+        let reply = synthesize_reply(&req, 1234);
+        let outer_pid = u32::from_ne_bytes(reply[0][12..16].try_into().unwrap());
+        assert_eq!(outer_pid, 1234);
+        let echoed_pid = u32::from_ne_bytes(reply[0][32..36].try_into().unwrap());
+        assert_eq!(echoed_pid, 0, "the echoed request header keeps the sender's pid");
     }
 }
