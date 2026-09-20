@@ -18,7 +18,6 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::seccomp::ctx::SupervisorCtx;
 use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction};
 use crate::seccomp::state::NetworkState;
 use crate::sys::structs::{SeccompNotif, AF_INET, AF_INET6};
@@ -130,10 +129,9 @@ fn set_port_in_sockaddr(bytes: &mut [u8], port: u16) {
 /// bind(sockfd, addr, addrlen): args[0]=fd, args[1]=addr_ptr, args[2]=addrlen
 pub(crate) async fn handle_bind(
     notif: &SeccompNotif,
-    ctx: &Arc<SupervisorCtx>,
+    network: &Arc<Mutex<NetworkState>>,
     notif_fd: RawFd,
 ) -> NotifAction {
-    let network = &ctx.network;
     let sockfd = notif.data.args[0] as i32;
     let addr_ptr = notif.data.args[1];
     let addr_len = notif.data.args[2] as usize;

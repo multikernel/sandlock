@@ -718,7 +718,7 @@ pub(crate) fn build_dispatch_table(
             let sup = Arc::clone(&__sup);
             let notif_fd = cx.notif_fd;
             async move {
-                crate::port_remap::handle_bind(&notif, &sup, notif_fd).await
+                crate::port_remap::handle_bind(&notif, &sup.network, notif_fd).await
             }
         });
     }
