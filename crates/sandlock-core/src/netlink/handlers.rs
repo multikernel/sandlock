@@ -71,6 +71,37 @@ fn read_struct<T: Copy>(
     Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const T) })
 }
 
+/// Give the responder's end an address the child will read as the kernel's.
+///
+/// A socketpair has no peer address, so recvmsg reports `msg_namelen == 0`,
+/// which iproute2 and libnl reject outright. An abstract name of 10 bytes
+/// makes the address exactly a `sockaddr_nl`, zero where `nl_pid` lies.
+fn bind_kernel_like_address(fd: RawFd) -> std::io::Result<()> {
+    const NL_GROUPS: std::ops::Range<usize> = 6..10;
+    const SOCKADDR_NL_LEN: libc::socklen_t = 12;
+
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    loop {
+        // Abstract names are host-wide, so the bytes no reader checks carry
+        // the uniqueness.
+        let unique = rand::random::<u32>().to_ne_bytes();
+        for (dst, src) in addr.sun_path[NL_GROUPS].iter_mut().zip(unique) {
+            *dst = src as libc::c_char;
+        }
+        let rc = unsafe {
+            libc::bind(fd, &addr as *const _ as *const libc::sockaddr, SOCKADDR_NL_LEN)
+        };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EADDRINUSE) {
+            return Err(err);
+        }
+    }
+}
+
 /// Intercept `socket(AF_NETLINK, *, NETLINK_ROUTE)` and substitute one end
 /// of a `socketpair(AF_UNIX, SOCK_SEQPACKET)`. A tokio task takes the
 /// supervisor-side end and speaks synthesized NETLINK_ROUTE replies.
@@ -114,6 +145,7 @@ pub async fn handle_socket(
     let flags = unsafe { libc::fcntl(fds[0], libc::F_GETFL) };
     if flags < 0
         || unsafe { libc::fcntl(fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+        || bind_kernel_like_address(fds[0]).is_err()
     {
         unsafe {
             libc::close(fds[0]);
