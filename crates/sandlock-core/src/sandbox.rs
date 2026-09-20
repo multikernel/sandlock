@@ -277,7 +277,7 @@ struct Runtime {
     policy_fn_worker: Option<crate::policy_fn::PolicyFnWorker>,
     throttle_handle: Option<JoinHandle<()>>,
     loadavg_handle: Option<JoinHandle<()>>,
-    control_handle: Option<JoinHandle<()>>,
+    control_handle: Option<crate::control::ControlHandle>,
     _stdout_read: Option<std::os::fd::OwnedFd>,
     _stderr_read: Option<std::os::fd::OwnedFd>,
     // Drains of the capture pipes above, each holding either the task still
@@ -1003,11 +1003,9 @@ impl Sandbox {
         rt.policy_fn_worker = None;
         if let Some(h) = rt.throttle_handle.take() { h.abort(); }
         if let Some(h) = rt.loadavg_handle.take() { h.abort(); }
-        // Awaiting the aborted task drops its listener, so the name is free
-        // for reuse the moment wait() returns.
+        // The name is free for reuse the moment wait() returns.
         if let Some(h) = rt.control_handle.take() {
-            h.abort();
-            let _ = h.await;
+            h.release().await;
         }
 
         let changes = self.settle_branch().await;
@@ -2527,8 +2525,7 @@ impl Drop for Sandbox {
             rt.policy_fn_worker = None;
             if let Some(h) = rt.throttle_handle.take() { h.abort(); }
             if let Some(h) = rt.loadavg_handle.take() { h.abort(); }
-            // Drop cannot await; the name is released when the runtime drops
-            // the aborted task. wait() is the synchronous path.
+            // wait() is the path that returns with the name free.
             if let Some(h) = rt.control_handle.take() { h.abort(); }
 
             // Nobody is left to collect these; aborting closes the read ends.

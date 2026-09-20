@@ -232,14 +232,14 @@ pub(crate) fn fork_without_control_fds(keep: Option<RawFd>) -> libc::pid_t {
 /// listen() on it after setpgid(), so its peer pid is the group leader.
 #[derive(Debug)]
 pub(crate) struct ControlSockets {
-    pub control: ControlFd,
-    pub pgrp: ControlFd,
+    pub control: Arc<ControlFd>,
+    pub pgrp: Arc<ControlFd>,
 }
 
 /// `AddrInUse` means a live sandbox of this uid already owns the name.
 pub(crate) fn bind_control_sockets(name: &str) -> std::io::Result<ControlSockets> {
-    let control = ControlFd::register(UnixListener::bind_addr(&socket_addr(name)?)?.into());
-    let pgrp = ControlFd::register(bind_only(&pgrp_socket_addr(name)?)?);
+    let control = Arc::new(ControlFd::register(UnixListener::bind_addr(&socket_addr(name)?)?.into()));
+    let pgrp = Arc::new(ControlFd::register(bind_only(&pgrp_socket_addr(name)?)?));
     Ok(ControlSockets { control, pgrp })
 }
 
@@ -293,14 +293,64 @@ pub(crate) fn spawn_control_loop(
     ctx: Option<Arc<SupervisorCtx>>,
     sandbox: Sandbox,
     info: SandboxInfo,
-) -> tokio::task::JoinHandle<()> {
+) -> ControlHandle {
     // Mutex only to satisfy Sync: Sandbox carries a Box<dyn FnOnce> slot
     // even though this clone's is None.
     let sandbox = Arc::new(tokio::sync::Mutex::new(sandbox));
-    tokio::spawn(async move {
-        let ControlSockets { control, pgrp } = sockets;
+    let (control, pgrp) = (Arc::clone(&sockets.control), Arc::clone(&sockets.pgrp));
+    let task = tokio::spawn(async move {
         control_loop(control, Some(pgrp), ctx, sandbox, info, unsafe { libc::getuid() }).await;
-    })
+    });
+    ControlHandle { task, sockets }
+}
+
+/// A running control loop. The sockets are held here as well, so that
+/// `release` still has them once the loop is gone.
+pub(crate) struct ControlHandle {
+    task: tokio::task::JoinHandle<()>,
+    sockets: ControlSockets,
+}
+
+impl ControlHandle {
+    /// Stop serving and return once the names are free. Closing our fds is
+    /// not enough for that: a child the host spawned copied them at its
+    /// fork and holds them until it execs.
+    pub(crate) async fn release(self) {
+        self.task.abort();
+        let _ = self.task.await;
+        let ControlSockets { control, pgrp } = self.sockets;
+        let tombstones = [tombstone(&control), tombstone(&pgrp)];
+        drop((control, pgrp));
+        for tombstone in tombstones.iter().flatten() {
+            let _ = tombstone.readable().await;
+        }
+    }
+
+    /// For Drop, which cannot wait: the names are free soon, not now.
+    pub(crate) fn abort(self) {
+        self.task.abort();
+    }
+}
+
+/// A connection left in `listener`'s backlog. Nobody accepts it any more,
+/// so it hangs up when the kernel releases the listener, which takes the
+/// last fd that refers to it, in any process. `None` for a socket that
+/// never listened, which has no backlog.
+fn tombstone(listener: &ControlFd) -> Option<AsyncFd<OwnedFd>> {
+    let mut sun: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+    let addr = &mut sun as *mut _ as *mut libc::sockaddr;
+    unsafe {
+        if libc::getsockname(listener.as_raw_fd(), addr, &mut len) != 0 {
+            return None;
+        }
+        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0);
+        if fd < 0 {
+            return None;
+        }
+        let fd = OwnedFd::from_raw_fd(fd);
+        (libc::connect(fd.as_raw_fd(), addr, len) == 0).then(|| AsyncFd::new(fd).ok()).flatten()
+    }
 }
 
 fn peer_cred(fd: RawFd) -> Option<libc::ucred> {
@@ -318,12 +368,12 @@ fn peer_cred(fd: RawFd) -> Option<libc::ucred> {
     (rc == 0).then_some(cred)
 }
 
-fn into_async(fd: ControlFd) -> Option<AsyncFd<ControlFd>> {
+fn into_async(fd: Arc<ControlFd>) -> Option<AsyncFd<Arc<ControlFd>>> {
     fd.set_nonblocking().ok()?;
     AsyncFd::new(fd).ok()
 }
 
-async fn accept(listener: &AsyncFd<ControlFd>) -> std::io::Result<ControlFd> {
+async fn accept(listener: &AsyncFd<Arc<ControlFd>>) -> std::io::Result<ControlFd> {
     loop {
         let mut guard = listener.readable().await?;
         match guard.try_io(|inner| inner.get_ref().accept()) {
@@ -386,8 +436,8 @@ impl tokio::io::AsyncWrite for ControlStream {
 /// dropped to keep its backlog empty; a child that never called listen()
 /// makes accept() fail with EINVAL, after which the socket is left alone.
 async fn control_loop(
-    listener: ControlFd,
-    pgrp: Option<ControlFd>,
+    listener: Arc<ControlFd>,
+    pgrp: Option<Arc<ControlFd>>,
     ctx: Option<Arc<SupervisorCtx>>,
     sandbox: Arc<tokio::sync::Mutex<Sandbox>>,
     info: SandboxInfo,

@@ -702,6 +702,41 @@ async fn test_control_parked_child_does_not_pin_other_names() {
     assert!(again.is_ok(), "a parked sibling must not pin the name: {:?}", again.err());
 }
 
+/// A child the host spawns copies every control fd at its fork and holds
+/// them until it execs, and libc's fork handlers never run for one made by
+/// vfork or a raw clone, as Command and Go's os/exec make them. wait() must
+/// outlast such a copy instead of returning with the name still taken.
+#[tokio::test]
+async fn test_control_wait_outlasts_a_spawning_child() {
+    let policy = sandlock_core::Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/proc")
+        .build()
+        .unwrap();
+    let name = format!("test-ctrl-spawning-{}", std::process::id());
+    let mut first = policy.clone().with_name(&name);
+    first.create(&["true"]).await.unwrap();
+
+    // Stands in for the fork-to-exec window, stretched to 300 ms.
+    let spawning = unsafe { libc::syscall(libc::SYS_clone, libc::SIGCHLD, 0, 0, 0, 0) } as libc::pid_t;
+    assert!(spawning >= 0, "clone: {}", std::io::Error::last_os_error());
+    if spawning == 0 {
+        unsafe {
+            libc::usleep(300_000);
+            libc::_exit(0);
+        }
+    }
+
+    first.start().unwrap();
+    first.wait().await.unwrap();
+    let again = policy.with_name(&name).run(&["true"]).await;
+    unsafe { libc::waitpid(spawning, std::ptr::null_mut(), 0) };
+    assert!(again.is_ok(), "the name must be free once wait() returns: {:?}", again.err());
+}
+
 // ============================================================
 // pgrp socket vs extra fd targets
 // ============================================================
