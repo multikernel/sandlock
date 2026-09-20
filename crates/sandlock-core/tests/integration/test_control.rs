@@ -668,10 +668,10 @@ async fn test_control_name_is_free_when_wait_returns() {
     }
 }
 
-/// A child forked while another sandbox's listener exists inherits that fd,
-/// and an abstract name stays bound while any fd refers to it. The child
-/// must drop those copies before it parks, or a created-but-not-started
-/// sandbox pins every other name in the process.
+/// An abstract name stays bound while any fd refers to it, and a child
+/// forked while another sandbox exists copies the whole fd table. A
+/// created-but-not-started sandbox must not pin the other names in the
+/// process that way.
 #[tokio::test]
 async fn test_control_parked_child_does_not_pin_other_names() {
     let policy = sandlock_core::Sandbox::builder()
@@ -703,128 +703,88 @@ async fn test_control_parked_child_does_not_pin_other_names() {
 }
 
 // ============================================================
-// pgrp socket vs extra fd targets
+// Forks the host makes on its own
 // ============================================================
 
-fn open_devnull() -> std::os::fd::OwnedFd {
-    use std::os::fd::FromRawFd;
-    let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-    assert!(fd >= 0, "open /dev/null: {}", std::io::Error::last_os_error());
-    unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
-}
-
-/// Fill every hole in the fd table so later allocations are consecutive
-/// from the returned number. `keep` holds the fillers open.
-fn make_fd_table_contiguous(keep: &mut Vec<std::os::fd::OwnedFd>) -> i32 {
-    use std::os::fd::AsRawFd;
-    let top = (0..4096).rev().find(|&fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0).unwrap();
-    loop {
-        let filler = open_devnull();
-        let fd = filler.as_raw_fd();
-        keep.push(filler);
-        if fd > top {
-            return fd + 1;
-        }
-    }
-}
-
-/// The fd number in this process bound to `name`'s pgrp socket.
-fn pgrp_fd_of(name: &str) -> Option<i32> {
-    let want = format!("\0sandlock/{}/{}/pgrp", unsafe { libc::getuid() }, name);
-    (0..4096).find(|&fd| {
-        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-        let mut len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
-        let rc = unsafe { libc::getsockname(fd, &mut addr as *mut _ as *mut libc::sockaddr, &mut len) };
-        if rc != 0 {
-            return false;
-        }
-        let path_len = (len as usize).saturating_sub(std::mem::offset_of!(libc::sockaddr_un, sun_path));
-        let path: Vec<u8> = addr.sun_path[..path_len].iter().map(|&c| c as u8).collect();
-        path == want.as_bytes()
-    })
-}
-
-const FD_LAYOUT_ENV: &str = "SANDLOCK_TEST_FD_LAYOUT_CHILD";
-const FD_LAYOUT_TEST: &str = "test_control::test_control_pgrp_published_before_extra_fd_dup2";
-
-/// The child dup2s extra fds onto fixed low targets, and the pgrp socket
-/// takes the lowest free fd in the supervisor, so a target can be the pgrp
-/// socket's own number. Publishing after the dup2 would listen on the
-/// caller's fd and then close it.
-#[test]
-fn test_control_pgrp_published_before_extra_fd_dup2() {
-    // Fd numbers are only predictable while no other thread allocates,
-    // so the body runs alone in a fresh process.
-    if std::env::var_os(FD_LAYOUT_ENV).is_none() {
-        let status = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", FD_LAYOUT_TEST, "--test-threads=1"])
-            .env(FD_LAYOUT_ENV, "1")
-            .status()
-            .unwrap();
-        assert!(status.success(), "fd layout body failed in the child process");
-        return;
-    }
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(pgrp_published_before_extra_fd_dup2());
-}
-
-async fn pgrp_published_before_extra_fd_dup2() {
-    use std::io::{Read, Write};
-    use std::os::fd::AsRawFd;
-
-    let policy = sandlock_core::Sandbox::builder()
+fn name_reuse_policy() -> sandlock_core::Sandbox {
+    sandlock_core::Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/bin")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
         .fs_read("/proc")
         .build()
-        .unwrap();
-    let pid = std::process::id();
-    let mut fillers = Vec::new();
+        .unwrap()
+}
 
-    // Learn how many fds create() allocates before the pgrp socket.
-    let probe_name = format!("test-ctrl-pgrp-probe-{pid}");
-    let (probe_out_r, probe_out_w) = std::io::pipe().unwrap();
-    let base = make_fd_table_contiguous(&mut fillers);
-    let mut probe = policy.clone().with_name(&probe_name);
-    probe
-        .create_with_gather_io(&["true"], None, Some(probe_out_w.as_raw_fd()), None, Vec::new())
-        .await
-        .unwrap();
-    let offset = pgrp_fd_of(&probe_name).expect("probe pgrp socket") - base;
-    probe.start().unwrap();
-    probe.wait().await.unwrap();
-    drop(probe);
-    drop((probe_out_r, probe_out_w));
-    for _ in 0..16 {
-        tokio::task::yield_now().await;
+/// A child of this process that no libc hook sees, as vfork, posix_spawn
+/// and a raw clone make them. It copies every fd and holds the copies for
+/// `hold_ms`, without ever calling exec.
+fn lingering_child(hold_ms: u32) -> libc::pid_t {
+    let child = unsafe { libc::syscall(libc::SYS_clone, libc::SIGCHLD, 0, 0, 0, 0) } as libc::pid_t;
+    assert!(child >= 0, "clone: {}", std::io::Error::last_os_error());
+    if child == 0 {
+        unsafe {
+            libc::usleep(hold_ms * 1000);
+            libc::_exit(0);
+        }
     }
+    child
+}
 
-    // Now aim an extra fd at exactly that number.
-    let name = format!("test-ctrl-pgrp-dup2-{pid}");
+/// The host spawned a child while the sandbox was live, and that child is
+/// still around, not exec'd, when the name is reused. wait() must neither
+/// leave the name taken nor wait for that child.
+#[tokio::test]
+async fn test_control_name_survives_a_lingering_host_child() {
+    let policy = name_reuse_policy();
+    let name = format!("test-ctrl-lingering-{}", std::process::id());
+    let mut first = policy.clone().with_name(&name);
+    first.create(&["true"]).await.unwrap();
+
+    let lingering = lingering_child(2000);
+    let started = std::time::Instant::now();
+    first.start().unwrap();
+    first.wait().await.unwrap();
+    let again = policy.with_name(&name).run(&["true"]).await;
+    let took = started.elapsed();
+
+    unsafe {
+        libc::kill(lingering, libc::SIGKILL);
+        libc::waitpid(lingering, std::ptr::null_mut(), 0);
+    }
+    assert!(again.is_ok(), "the name must be free once wait() returns: {:?}", again.err());
+    assert!(took < Duration::from_millis(1500), "must not wait for the host's child, took {took:?}");
+}
+
+/// `sandlock kill` has to work on a sandbox that was created but not
+/// started, so the child publishes its name before it parks, and an extra
+/// fd still reaches the command afterwards.
+#[tokio::test]
+async fn test_control_created_sandbox_publishes_its_pids() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+
+    let name = format!("test-ctrl-created-{}", std::process::id());
     let (data_r, mut data_w) = std::io::pipe().unwrap();
     data_w.write_all(b"ping\n").unwrap();
     drop(data_w);
     let (mut out_r, out_w) = std::io::pipe().unwrap();
-    let target = make_fd_table_contiguous(&mut fillers) + offset;
-    let mut sb = policy.with_name(&name);
+
+    let mut sb = name_reuse_policy().with_name(&name);
     sb.create_with_gather_io(
-        &["cat", &format!("/proc/self/fd/{target}")],
+        &["cat", "/proc/self/fd/100"],
         None,
         Some(out_w.as_raw_fd()),
         None,
-        vec![(target, data_r.as_raw_fd())],
+        vec![(100, data_r.as_raw_fd())],
     )
     .await
     .unwrap();
-    assert_eq!(pgrp_fd_of(&name), Some(target), "fd layout assumption broke");
 
-    let pids = sandlock_core::control::sandbox_pids(&name).expect("pgrp socket listens before start");
+    let pids = sandlock_core::control::sandbox_pids(&name).expect("the name is published before start");
     assert_eq!(Some(pids.child), sb.pid());
+    assert_eq!(pids.supervisor, std::process::id() as i32);
 
     sb.start().unwrap();
     let result = sb.wait().await.unwrap();

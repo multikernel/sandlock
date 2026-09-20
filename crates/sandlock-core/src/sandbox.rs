@@ -278,6 +278,7 @@ struct Runtime {
     throttle_handle: Option<JoinHandle<()>>,
     loadavg_handle: Option<JoinHandle<()>>,
     control_handle: Option<JoinHandle<()>>,
+    name_vault: Option<crate::control::NameVault>,
     _stdout_read: Option<std::os::fd::OwnedFd>,
     _stderr_read: Option<std::os::fd::OwnedFd>,
     // Drains of the capture pipes above, each holding either the task still
@@ -1003,12 +1004,12 @@ impl Sandbox {
         rt.policy_fn_worker = None;
         if let Some(h) = rt.throttle_handle.take() { h.abort(); }
         if let Some(h) = rt.loadavg_handle.take() { h.abort(); }
-        // Awaiting the aborted task drops its listener, so the name is free
-        // for reuse the moment wait() returns.
         if let Some(h) = rt.control_handle.take() {
             h.abort();
             let _ = h.await;
         }
+        // The name is free for reuse the moment wait() returns.
+        rt.name_vault = None;
 
         let changes = self.settle_branch().await;
         let (stdout, stderr) = self.collect_pipe_drains().await;
@@ -1537,7 +1538,7 @@ impl Sandbox {
             }
         }
 
-        let pid = crate::control::fork_without_control_fds(None);
+        let pid = unsafe { libc::fork() };
         if pid < 0 {
             unsafe { libc::close(ctrl_child_fd) };
             return Err(SandboxRuntimeError::Fork(std::io::Error::last_os_error()).into());
@@ -1640,6 +1641,7 @@ impl Sandbox {
                 shared_cow: None,
                 tty_foreground_taken: false,
                 control_handle: None,
+                name_vault: None,
             }));
             clones.push(clone_sb);
         }
@@ -1721,6 +1723,7 @@ impl Sandbox {
             throttle_handle: None,
             loadavg_handle: None,
             control_handle: None,
+            name_vault: None,
             _stdout_read: None,
             _stderr_read: None,
             stdout_drain: None,
@@ -1967,18 +1970,9 @@ impl Sandbox {
         let foreground = stdio.all_inherit();
         let tty_foreground_taken = foreground && unsafe { libc::isatty(0) } == 1;
 
-        // Bound before the fork so a name collision fails with no child to
-        // reap. The child sheds its copies as it forks.
         let sandbox_name = self.rt().name.clone();
-        let mut control_sockets = match crate::control::bind_control_sockets(&sandbox_name) {
-            Ok(s) => Some(s),
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                return Err(SandboxRuntimeError::Child(format!(
-                    "sandbox '{}' is already running",
-                    sandbox_name
-                ))
-                .into());
-            }
+        let mut name_vault = match crate::control::NameVault::new(&sandbox_name) {
+            Ok(vault) => Some(vault),
             Err(e) => {
                 // A nested sandlock whose outer policy denies AF_UNIX lands
                 // here; the sandbox still runs, it is just not introspectable.
@@ -1990,26 +1984,24 @@ impl Sandbox {
                 None
             }
         };
-        let pgrp_socket = control_sockets.as_ref().map(|s| s.pgrp.as_raw_fd());
+        let name_publisher = name_vault.as_ref().and_then(|v| v.publisher());
 
-        let pid = crate::control::fork_without_control_fds(pgrp_socket);
+        let pid = unsafe { libc::fork() };
         if pid < 0 {
             return Err(SandboxRuntimeError::Fork(std::io::Error::last_os_error()).into());
         }
 
         if pid == 0 {
             // ===== CHILD PROCESS =====
-            // killpg() needs the group to exist before anyone can connect,
-            // and the dup2 loops below have fixed targets that can be this
-            // socket's own fd number, so both come first.
+            // killpg() needs the group to exist before anyone can connect.
             if unsafe { libc::setpgid(0, 0) } != 0 {
                 use std::io::Write;
                 let err = std::io::Error::last_os_error();
                 let _ = writeln!(std::io::stderr(), "sandlock child: setpgid: {err}");
                 unsafe { libc::_exit(127) };
             }
-            if let Some(fd) = pgrp_socket {
-                crate::control::publish_pgrp(fd);
+            if let Some(publisher) = name_publisher {
+                publisher.publish();
             }
             let io_overrides = self.rt().io_overrides;
             if let Some((stdin_fd, stdout_fd, stderr_fd)) = io_overrides {
@@ -2102,6 +2094,30 @@ impl Sandbox {
             Ok(fd) => Some(fd),
             Err(_) => None,
         };
+
+        // The child binds the name, so a collision shows up only now; drop
+        // kills and reaps the child.
+        let mut request_socket = None;
+        if let Some(mut vault) = name_vault.take() {
+            match vault.published(pidfd.as_ref().map(|fd| fd.as_raw_fd())) {
+                Ok(()) => {
+                    request_socket = crate::control::bind_request_socket(&sandbox_name, pid).ok();
+                    self.rt_mut().name_vault = Some(vault);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    return Err(SandboxRuntimeError::Child(format!(
+                        "sandbox '{}' is already running",
+                        sandbox_name
+                    ))
+                    .into());
+                }
+                Err(e) => eprintln!(
+                    "sandlock: control socket setup failed for '{}': {} \
+                     (introspection unavailable for this sandbox)",
+                    sandbox_name, e
+                ),
+            }
+        }
 
         let notif_fd_num = read_u32_fd(pipes.notif_r.as_raw_fd())
             .map_err(|e| SandboxRuntimeError::Child(format!("read notif fd from child: {}", e)))?;
@@ -2345,9 +2361,9 @@ impl Sandbox {
 
             // Independent of the seccomp-notify loop so accept() never adds
             // latency to syscall notification processing.
-            if let Some(sockets) = control_sockets.take() {
+            if let Some(listener) = request_socket.take() {
                 self.rt_mut().control_handle = Some(crate::control::spawn_control_loop(
-                    sockets,
+                    listener,
                     Some(control_ctx),
                     sandbox_snapshot,
                     control_info.clone(),
@@ -2369,9 +2385,9 @@ impl Sandbox {
 
         // No notify supervisor (--no-supervisor or nested): still answer ps,
         // inspect, and kill, with the static policy and no ports.
-        if let Some(sockets) = control_sockets.take() {
+        if let Some(listener) = request_socket.take() {
             self.rt_mut().control_handle = Some(crate::control::spawn_control_loop(
-                sockets,
+                listener,
                 None,
                 self.clone(),
                 control_info,
@@ -2527,9 +2543,8 @@ impl Drop for Sandbox {
             rt.policy_fn_worker = None;
             if let Some(h) = rt.throttle_handle.take() { h.abort(); }
             if let Some(h) = rt.loadavg_handle.take() { h.abort(); }
-            // Drop cannot await; the name is released when the runtime drops
-            // the aborted task. wait() is the synchronous path.
             if let Some(h) = rt.control_handle.take() { h.abort(); }
+            rt.name_vault = None;
 
             // Nobody is left to collect these; aborting closes the read ends.
             // A drain that already finished holds only bytes, dropped with the

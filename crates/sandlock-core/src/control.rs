@@ -1,10 +1,11 @@
 //! Per-sandbox control sockets for introspection and kill.
 //!
-//! Every sandbox (CLI, Python SDK, embedded) binds two abstract Unix
-//! stream sockets before it forks. `\0sandlock/<uid>/<name>` is the
-//! control endpoint; the supervisor calls listen() on it. The child
-//! inherits `\0sandlock/<uid>/<name>/pgrp` and calls listen() on that one
-//! right after setpgid(), then closes it; the supervisor keeps the fd.
+//! Every sandbox (CLI, Python SDK, embedded) owns two abstract Unix
+//! stream sockets. `\0sandlock/<uid>/<name>` is the name: the child binds
+//! it and calls listen() on it right after setpgid(), and nobody ever
+//! accepts on it. `\0sandlock/<uid>/<name>/<child pid>` takes the requests;
+//! the supervisor binds it and calls listen() on it once the fork has
+//! given the child a pid.
 //! Abstract names live in the kernel, not the filesystem: bind on a taken
 //! name fails, so the first name is the UID-wide sandbox mutex; both names
 //! vanish with the supervisor, so nothing is ever stale; `/proc/net/unix`
@@ -12,12 +13,21 @@
 //! sandlock needs no writable directory from the outer policy, only
 //! permission to create a socket.
 //!
+//! A name stays bound while any fd refers to its socket, and a fork copies
+//! every fd. The name socket is therefore held with no fd at all (see
+//! [`NameVault`]), so that no fork of the host, not even a child that never
+//! execs, can keep a finished sandbox's name taken. The request socket
+//! does sit in the fd table, since it has to be accepted on, but its name
+//! is never asked for twice.
+//!
 //! listen() stamps the caller's pid into the socket and SO_PEERCRED hands
-//! that stamp to whoever connects, so a client learns the supervisor's pid
-//! from the first socket and the child's, which is its process group, from
-//! the second, without the supervisor answering anything. That is what
-//! `sandlock kill` uses, so it works on a supervisor that is stopped or
-//! wedged. Abstract names carry no permission bits, so both sides check
+//! that stamp to whoever connects, so a client learns the child's pid,
+//! which is its process group, from the name socket, and the supervisor's
+//! from the request socket, which the child's pid leads it to, without the
+//! supervisor answering anything. That is what `sandlock kill` uses, so it
+//! works on a supervisor that is stopped or wedged. Nobody accepts on the
+//! name socket, so each lookup stays in its backlog for the life of the
+//! sandbox. Abstract names carry no permission bits, so both sides check
 //! the SO_PEERCRED uid: the server closes any connection from another uid
 //! and the client refuses a listener owned by one.
 //!
@@ -44,10 +54,10 @@
 //! `ProfileInput`), `ports` (virtual to real port map).
 
 use std::os::linux::net::SocketAddrExt;
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use tokio::io::unix::AsyncFd;
@@ -65,8 +75,8 @@ pub(crate) fn socket_name(uid: u32, name: &str) -> Vec<u8> {
 }
 
 /// Sandbox names reject `/`, so the suffix cannot collide with a name.
-fn pgrp_socket_name(uid: u32, name: &str) -> Vec<u8> {
-    format!("sandlock/{uid}/{name}/pgrp").into_bytes()
+fn request_socket_name(uid: u32, name: &str, child: i32) -> Vec<u8> {
+    format!("sandlock/{uid}/{name}/{child}").into_bytes()
 }
 
 fn socket_addr(name: &str) -> std::io::Result<SocketAddr> {
@@ -74,38 +84,174 @@ fn socket_addr(name: &str) -> std::io::Result<SocketAddr> {
     SocketAddr::from_abstract_name(socket_name(uid, name))
 }
 
-fn pgrp_socket_addr(name: &str) -> std::io::Result<SocketAddr> {
+fn request_socket_addr(name: &str, child: i32) -> std::io::Result<SocketAddr> {
     let uid = unsafe { libc::getuid() };
-    SocketAddr::from_abstract_name(pgrp_socket_name(uid, name))
+    SocketAddr::from_abstract_name(request_socket_name(uid, name, child))
 }
 
 // ============================================================
-// Live control fds
+// The name, parked in flight
 // ============================================================
 
-/// Every control fd this process holds, so a forked child can close them
-/// without reading /proc. Bind, close, and fork() all take the lock, so a
-/// child never sees an fd that is half registered.
-static LIVE: Mutex<Vec<RawFd>> = Mutex::new(Vec::new());
+/// A sockaddr the forked child can use: it must not allocate.
+type RawAddr = (libc::sockaddr_un, libc::socklen_t);
 
-fn live() -> std::sync::MutexGuard<'static, Vec<RawFd>> {
-    LIVE.lock().unwrap_or_else(PoisonError::into_inner)
+fn raw_addr(name: &[u8]) -> RawAddr {
+    let mut sun: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    sun.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (dst, &src) in sun.sun_path[1..].iter_mut().zip(name) {
+        *dst = src as libc::c_char;
+    }
+    let len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + 1 + name.len();
+    (sun, len as libc::socklen_t)
 }
 
-/// A socket fd that stays on the live list until it closes.
-#[derive(Debug)]
-pub(crate) struct ControlFd(RawFd);
+/// Holds a sandbox's name socket without holding an fd to it.
+///
+/// An abstract name stays bound while any fd refers to its socket, and
+/// every fork of this process copies every fd, including forks the host
+/// makes on its own and children that never exec. So the name socket never
+/// enters this process's fd table. The child creates it and sends it here
+/// with SCM_RIGHTS, and the message is left unreceived: a file in flight is
+/// one reference, which fork does not multiply. Receiving the message with
+/// no room for the fd makes the kernel drop that reference, which frees the
+/// name at once, whoever holds a copy of this socketpair.
+pub(crate) struct NameVault {
+    vault: OwnedFd,
+    child_end: Option<OwnedFd>,
+    addr: RawAddr,
+}
 
-impl ControlFd {
-    fn register(fd: OwnedFd) -> Self {
-        let fd = fd.into_raw_fd();
-        live().push(fd);
-        ControlFd(fd)
+/// What the child needs to publish the name. Plain data, built before the
+/// fork.
+#[derive(Clone, Copy)]
+pub(crate) struct NamePublisher {
+    to_vault: RawFd,
+    vault: RawFd,
+    addr: RawAddr,
+}
+
+impl NameVault {
+    pub(crate) fn new(name: &str) -> std::io::Result<Self> {
+        let mut pair = [0 as RawFd; 2];
+        let kind = libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC;
+        if unsafe { libc::socketpair(libc::AF_UNIX, kind, 0, pair.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let (vault, child_end) = unsafe { (OwnedFd::from_raw_fd(pair[0]), OwnedFd::from_raw_fd(pair[1])) };
+        let addr = raw_addr(&socket_name(unsafe { libc::getuid() }, name));
+        Ok(NameVault { vault, child_end: Some(child_end), addr })
     }
 
+    pub(crate) fn publisher(&self) -> Option<NamePublisher> {
+        let to_vault = self.child_end.as_ref()?.as_raw_fd();
+        Some(NamePublisher { to_vault, vault: self.vault.as_raw_fd(), addr: self.addr })
+    }
+
+    /// In the parent, after the fork: wait for the child's verdict without
+    /// taking the socket out of flight. `AddrInUse` means a live sandbox of
+    /// this uid already owns the name. `child` is the child's pidfd, so a
+    /// child that died before publishing cannot hang this.
+    pub(crate) fn published(&mut self, child: Option<RawFd>) -> std::io::Result<()> {
+        self.child_end = None;
+        let mut fds = [
+            libc::pollfd { fd: self.vault.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: child.unwrap_or(-1), events: libc::POLLIN, revents: 0 },
+        ];
+        loop {
+            let rc = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+            if rc < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if rc < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            break;
+        }
+        if fds[0].revents & libc::POLLIN == 0 {
+            return Err(std::io::Error::other("child exited before publishing its name"));
+        }
+        // No control buffer: a peek must not install the fd here either.
+        let mut status = [0u8; 4];
+        match recv_without_fd(self.vault.as_raw_fd(), &mut status, libc::MSG_PEEK) {
+            Ok(4) if status == [0; 4] => Ok(()),
+            Ok(4) => Err(std::io::Error::from_raw_os_error(i32::from_ne_bytes(status))),
+            Ok(_) => Err(std::io::Error::other("child exited before publishing its name")),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+impl Drop for NameVault {
+    fn drop(&mut self) {
+        let mut status = [0u8; 4];
+        while matches!(recv_without_fd(self.vault.as_raw_fd(), &mut status, libc::MSG_DONTWAIT), Ok(n) if n > 0) {}
+    }
+}
+
+/// Receive data only. The kernel closes any fd the message carries.
+fn recv_without_fd(sock: RawFd, buf: &mut [u8], flags: libc::c_int) -> std::io::Result<usize> {
+    let mut iov = libc::iovec { iov_base: buf.as_mut_ptr() as *mut libc::c_void, iov_len: buf.len() };
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    match unsafe { libc::recvmsg(sock, &mut msg, flags) } {
+        n if n < 0 => Err(std::io::Error::last_os_error()),
+        n => Ok(n as usize),
+    }
+}
+
+impl NamePublisher {
+    /// In the child, after setpgid(). listen() records this pid, which is
+    /// also its process group, as the socket's peer credential. The status
+    /// goes to the parent either way; the socket goes with it on success.
+    pub(crate) fn publish(&self) {
+        unsafe {
+            let sock = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+            let addr = &self.addr.0 as *const _ as *const libc::sockaddr;
+            let ok = sock >= 0
+                && libc::bind(sock, addr, self.addr.1) == 0
+                && libc::listen(sock, libc::SOMAXCONN) == 0;
+            let status: i32 = if ok { 0 } else { *libc::__errno_location() };
+
+            let mut data = status.to_ne_bytes();
+            let mut iov = libc::iovec { iov_base: data.as_mut_ptr() as *mut libc::c_void, iov_len: data.len() };
+            let mut cmsg = [0u64; 4];
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            if ok {
+                msg.msg_control = cmsg.as_mut_ptr() as *mut libc::c_void;
+                msg.msg_controllen = libc::CMSG_SPACE(4) as _;
+                let hdr = libc::CMSG_FIRSTHDR(&msg);
+                (*hdr).cmsg_level = libc::SOL_SOCKET;
+                (*hdr).cmsg_type = libc::SCM_RIGHTS;
+                (*hdr).cmsg_len = libc::CMSG_LEN(4) as _;
+                std::ptr::write_unaligned(libc::CMSG_DATA(hdr) as *mut RawFd, sock);
+            }
+            libc::sendmsg(self.to_vault, &msg, libc::MSG_NOSIGNAL);
+            libc::close(sock);
+            libc::close(self.to_vault);
+            libc::close(self.vault);
+        }
+    }
+}
+
+// ============================================================
+// The request socket
+// ============================================================
+
+/// A socket fd that refuses connections from the moment we let go of it.
+/// Its name is never reused, so a copy in some forked child does no harm
+/// by lingering, but it must not look alive.
+#[derive(Debug)]
+pub(crate) struct ControlFd(OwnedFd);
+
+impl ControlFd {
     fn set_nonblocking(&self) -> std::io::Result<()> {
-        let flags = unsafe { libc::fcntl(self.0, libc::F_GETFL) };
-        if flags < 0 || unsafe { libc::fcntl(self.0, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        let fd = self.0.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
             return Err(std::io::Error::last_os_error());
         }
         Ok(())
@@ -114,7 +260,7 @@ impl ControlFd {
     fn accept(&self) -> std::io::Result<ControlFd> {
         let fd = unsafe {
             libc::accept4(
-                self.0,
+                self.0.as_raw_fd(),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
@@ -123,11 +269,11 @@ impl ControlFd {
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(ControlFd::register(unsafe { OwnedFd::from_raw_fd(fd) }))
+        Ok(ControlFd(unsafe { OwnedFd::from_raw_fd(fd) }))
     }
 
     fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = unsafe { libc::read(self.0, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        let n = unsafe { libc::read(self.0.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         if n < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -135,7 +281,7 @@ impl ControlFd {
     }
 
     fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = unsafe { libc::write(self.0, buf.as_ptr() as *const libc::c_void, buf.len()) };
+        let n = unsafe { libc::write(self.0.as_raw_fd(), buf.as_ptr() as *const libc::c_void, buf.len()) };
         if n < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -145,80 +291,21 @@ impl ControlFd {
 
 impl AsRawFd for ControlFd {
     fn as_raw_fd(&self) -> RawFd {
-        self.0
+        self.0.as_raw_fd()
     }
 }
 
 impl Drop for ControlFd {
     fn drop(&mut self) {
-        let mut live = live();
-        live.retain(|&fd| fd != self.0);
-        unsafe { libc::close(self.0) };
+        unsafe { libc::shutdown(self.0.as_raw_fd(), libc::SHUT_RDWR) };
     }
 }
 
-/// fork() with the live list locked. The child closes every control fd but
-/// `keep` before anything else runs, so the sandbox never holds one; `keep`
-/// is the child's own pgrp socket, which it still has to listen on.
-pub(crate) fn fork_without_control_fds(keep: Option<RawFd>) -> libc::pid_t {
-    let live = live();
-    let pid = unsafe { libc::fork() };
-    if pid == 0 {
-        for &fd in live.iter() {
-            if Some(fd) != keep {
-                unsafe { libc::close(fd) };
-            }
-        }
-    }
-    pid
-}
-
-/// Both sockets of one sandbox, bound before it forks. `control` already
-/// listens, from the supervisor. `pgrp` is bound only: the child calls
-/// listen() on it after setpgid(), so its peer pid is the group leader.
-#[derive(Debug)]
-pub(crate) struct ControlSockets {
-    pub control: ControlFd,
-    pub pgrp: ControlFd,
-}
-
-/// `AddrInUse` means a live sandbox of this uid already owns the name.
-pub(crate) fn bind_control_sockets(name: &str) -> std::io::Result<ControlSockets> {
-    let control = ControlFd::register(UnixListener::bind_addr(&socket_addr(name)?)?.into());
-    let pgrp = ControlFd::register(bind_only(&pgrp_socket_addr(name)?)?);
-    Ok(ControlSockets { control, pgrp })
-}
-
-/// std has no bind-without-listen, and listen() must be the child's call.
-fn bind_only(addr: &SocketAddr) -> std::io::Result<OwnedFd> {
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    let name = addr.as_abstract_name().expect("abstract address");
-    let mut sun: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    sun.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    for (dst, &src) in sun.sun_path[1..].iter_mut().zip(name) {
-        *dst = src as libc::c_char;
-    }
-    let len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + 1 + name.len();
-    let rc = unsafe {
-        libc::bind(fd.as_raw_fd(), &sun as *const _ as *const libc::sockaddr, len as libc::socklen_t)
-    };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(fd)
-}
-
-/// In the child, after setpgid(). listen() records this pid as the
-/// socket's peer credential; the supervisor keeps the socket alive.
-pub(crate) fn publish_pgrp(fd: RawFd) {
-    unsafe {
-        libc::listen(fd, libc::SOMAXCONN);
-        libc::close(fd);
-    }
+/// Bind and listen on this instance's request socket. The child's pid is
+/// part of the name: clients learn it from the name socket, and it keeps
+/// the name from ever being asked for twice.
+pub(crate) fn bind_request_socket(name: &str, child: i32) -> std::io::Result<ControlFd> {
+    Ok(ControlFd(UnixListener::bind_addr(&request_socket_addr(name, child)?)?.into()))
 }
 
 // ============================================================
@@ -235,7 +322,7 @@ pub struct SandboxInfo {
 /// seccomp-notify supervisor (`--no-supervisor`, nested); those still
 /// answer `info` and the static `config`, and report no ports.
 pub(crate) fn spawn_control_loop(
-    sockets: ControlSockets,
+    listener: ControlFd,
     ctx: Option<Arc<SupervisorCtx>>,
     sandbox: Sandbox,
     info: SandboxInfo,
@@ -243,10 +330,7 @@ pub(crate) fn spawn_control_loop(
     // Mutex only to satisfy Sync: Sandbox carries a Box<dyn FnOnce> slot
     // even though this clone's is None.
     let sandbox = Arc::new(tokio::sync::Mutex::new(sandbox));
-    tokio::spawn(async move {
-        let ControlSockets { control, pgrp } = sockets;
-        control_loop(control, Some(pgrp), ctx, sandbox, info, unsafe { libc::getuid() }).await;
-    })
+    tokio::spawn(control_loop(listener, ctx, sandbox, info, unsafe { libc::getuid() }))
 }
 
 fn peer_cred(fd: RawFd) -> Option<libc::ucred> {
@@ -279,8 +363,7 @@ async fn accept(listener: &AsyncFd<ControlFd>) -> std::io::Result<ControlFd> {
     }
 }
 
-/// One accepted connection, driven through the reactor while its fd stays
-/// on the live list.
+/// One accepted connection, driven through the reactor.
 struct ControlStream(AsyncFd<ControlFd>);
 
 impl tokio::io::AsyncRead for ControlStream {
@@ -327,40 +410,18 @@ impl tokio::io::AsyncWrite for ControlStream {
 /// Accept one connection at a time and serve one request per connection.
 /// `my_uid` is a parameter so a test can prove the refusal path without a
 /// second uid. The timeout keeps one stalled client from wedging
-/// introspection. Clients only connect to the pgrp socket for its peer
-/// credential and never speak, so those connections are accepted and
-/// dropped to keep its backlog empty; a child that never called listen()
-/// makes accept() fail with EINVAL, after which the socket is left alone.
+/// introspection.
 async fn control_loop(
     listener: ControlFd,
-    pgrp: Option<ControlFd>,
     ctx: Option<Arc<SupervisorCtx>>,
     sandbox: Arc<tokio::sync::Mutex<Sandbox>>,
     info: SandboxInfo,
     my_uid: u32,
 ) {
     let Some(listener) = into_async(listener) else { return };
-    let mut pgrp = pgrp.and_then(into_async);
 
     loop {
-        let drain = async {
-            match &pgrp {
-                Some(l) => accept(l).await,
-                None => std::future::pending().await,
-            }
-        };
-        let stream = tokio::select! {
-            accepted = accept(&listener) => match accepted {
-                Ok(stream) => stream,
-                Err(_) => return,
-            },
-            drained = drain => {
-                if drained.is_err() {
-                    pgrp = None;
-                }
-                continue;
-            }
-        };
+        let Ok(stream) = accept(&listener).await else { return };
         // Abstract names have no permission bits, so this is the only gate.
         if peer_cred(stream.as_raw_fd()).map(|c| c.uid) != Some(my_uid) {
             continue;
@@ -679,18 +740,26 @@ pub fn sandbox_pids(name: &str) -> Result<SandboxPids, String> {
 }
 
 fn sandbox_pids_as(name: &str, my_uid: u32) -> Result<SandboxPids, String> {
-    let (_, supervisor) = connect_control(name, my_uid)?;
-    let addr = pgrp_socket_addr(name).map_err(|e| format!("socket address for '{}': {}", name, e))?;
-    // The name exists, so the supervisor is up; the child has not reached
-    // listen() yet if this is refused.
-    let (_, child) = connect_as(&addr, my_uid).map_err(|e| match e.kind() {
+    let (stream, pids) = connect_request(name, my_uid)?;
+    drop(stream);
+    Ok(pids)
+}
+
+/// Connect to a sandbox's request socket, by way of its name socket.
+fn connect_request(name: &str, my_uid: u32) -> Result<(UnixStream, SandboxPids), String> {
+    let (_, child) = connect_control(name, my_uid)?;
+    let addr = request_socket_addr(name, child.pid)
+        .map_err(|e| format!("socket address for '{}': {}", name, e))?;
+    // The name exists, so the child is up; the supervisor has not bound
+    // its side yet if this is refused.
+    let (stream, supervisor) = connect_as(&addr, my_uid).map_err(|e| match e.kind() {
         std::io::ErrorKind::ConnectionRefused => format!("sandbox '{}' is still starting", name),
         std::io::ErrorKind::PermissionDenied => {
             format!("socket for '{}' is owned by another user", name)
         }
         _ => format!("connect to sandbox '{}': {}", name, e),
     })?;
-    Ok(SandboxPids { child: child.pid, supervisor: supervisor.pid })
+    Ok((stream, SandboxPids { child: child.pid, supervisor: supervisor.pid }))
 }
 
 /// Send a request to a sandbox's control socket and return the response.
@@ -710,7 +779,7 @@ fn send_control_request_as(
 ) -> Result<ControlResponse, String> {
     use std::io::{Read, Write};
 
-    let (mut stream, _) = connect_control(name, my_uid)?;
+    let (mut stream, _) = connect_request(name, my_uid)?;
 
     // Set a 2-second timeout on reads so a wedged supervisor does not
     // block the CLI forever.
@@ -765,7 +834,7 @@ mod tests {
     fn longest_name_fits_sun_path() {
         let name = "x".repeat(64);
         // Leading NUL plus the name must fit the kernel's 108-byte sun_path.
-        assert!(pgrp_socket_name(u32::MAX, &name).len() < 108);
+        assert!(request_socket_name(u32::MAX, &name, i32::MAX).len() < 108);
     }
 
     #[test]
@@ -781,50 +850,64 @@ mod tests {
         assert_eq!(parse_proc_net_unix(text, 1001), vec!["other"]);
     }
 
+    /// Claim `name` the way a sandbox does: a forked child publishes it.
+    /// Returns the vault and that child's pid, which the name is stamped
+    /// with.
+    fn claim(name: &str) -> std::io::Result<(NameVault, i32)> {
+        let mut vault = NameVault::new(name)?;
+        let publisher = vault.publisher().unwrap();
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
+        if child == 0 {
+            publisher.publish();
+            unsafe { libc::_exit(0) };
+        }
+        let published = vault.published(None);
+        unsafe { libc::waitpid(child, std::ptr::null_mut(), 0) };
+        published.map(|()| (vault, child))
+    }
+
     #[test]
-    fn bind_is_the_name_mutex_and_listing_follows_the_listener() {
+    fn the_name_is_a_mutex_and_listing_follows_it() {
         // Unique name: sandbox names are uid-wide, never reuse a fixed one.
         let name = format!("test-ctrl-unit-{}", std::process::id());
-        let sockets = bind_control_sockets(&name).unwrap();
+        let (vault, _) = claim(&name).unwrap();
         assert!(list_sandboxes().unwrap().contains(&name));
-        let err = bind_control_sockets(&name).unwrap_err();
+        let err = claim(&name).err().expect("second claim must fail");
         assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
-        drop(sockets);
+        drop(vault);
         assert!(!list_sandboxes().unwrap().contains(&name));
     }
 
-    /// The live list is exactly what a forked child closes, so it has to
-    /// follow every bind and every drop.
+    /// The host can fork at any time, in ways no libc hook sees, and such a
+    /// child may never exec. It copies every fd of this process, and the
+    /// name must still be free the moment its vault is dropped.
     #[test]
-    fn live_list_follows_bind_and_drop() {
-        let name = format!("test-ctrl-live-{}", std::process::id());
-        let sockets = bind_control_sockets(&name).unwrap();
-        let (control, pgrp) = (sockets.control.as_raw_fd(), sockets.pgrp.as_raw_fd());
-        assert!(live().contains(&control) && live().contains(&pgrp));
-        drop(sockets);
-        assert!(!live().contains(&control) && !live().contains(&pgrp));
-    }
+    fn a_fork_made_by_the_host_cannot_hold_the_name() {
+        let name = format!("test-ctrl-host-fork-{}", std::process::id());
+        let (vault, _) = claim(&name).unwrap();
 
-    /// A forked child keeps only the pgrp socket it was told to, with no
-    /// help from /proc.
-    #[test]
-    fn forked_child_keeps_only_its_pgrp_socket() {
-        let pid = std::process::id();
-        let mine = bind_control_sockets(&format!("test-ctrl-fork-mine-{pid}")).unwrap();
-        let sibling = bind_control_sockets(&format!("test-ctrl-fork-sibling-{pid}")).unwrap();
-        let keep = mine.pgrp.as_raw_fd();
-        let closed = [mine.control.as_raw_fd(), sibling.control.as_raw_fd(), sibling.pgrp.as_raw_fd()];
-
-        let child = fork_without_control_fds(Some(keep));
-        assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
-        if child == 0 {
-            let is_open = |fd: RawFd| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0;
-            let ok = is_open(keep) && closed.iter().all(|&fd| !is_open(fd));
-            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+        let mut gate = [0 as RawFd; 2];
+        assert_eq!(unsafe { libc::pipe2(gate.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let lingering = unsafe { libc::syscall(libc::SYS_clone, libc::SIGCHLD, 0, 0, 0, 0) } as libc::pid_t;
+        assert!(lingering >= 0, "clone: {}", std::io::Error::last_os_error());
+        if lingering == 0 {
+            let mut byte = 0u8;
+            unsafe {
+                libc::close(gate[1]);
+                libc::read(gate[0], &mut byte as *mut u8 as *mut libc::c_void, 1);
+                libc::_exit(0);
+            }
         }
-        let mut status = 0;
-        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
-        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "child status {status:#x}");
+
+        drop(vault);
+        let again = claim(&name);
+        unsafe {
+            libc::close(gate[1]);
+            libc::close(gate[0]);
+            libc::waitpid(lingering, std::ptr::null_mut(), 0);
+        }
+        again.expect("the name must be free while the host's child lives");
     }
 
     /// The pids come from the kernel's record of who called listen(), not
@@ -832,23 +915,36 @@ mod tests {
     #[test]
     fn client_learns_both_pids_from_the_kernel() {
         let name = format!("test-ctrl-pids-{}", std::process::id());
-        let sockets = bind_control_sockets(&name).unwrap();
+        let (_vault, child) = claim(&name).unwrap();
         let me = std::process::id() as i32;
 
         let err = sandbox_pids(&name).unwrap_err();
-        assert!(err.contains("still starting"), "before listen: {err}");
+        assert!(err.contains("still starting"), "before the request socket: {err}");
 
-        assert_eq!(unsafe { libc::listen(sockets.pgrp.as_raw_fd(), 1) }, 0);
+        let _requests = bind_request_socket(&name, child).unwrap();
         let pids = sandbox_pids(&name).unwrap();
-        assert_eq!((pids.child, pids.supervisor), (me, me));
+        assert_eq!((pids.child, pids.supervisor), (child, me));
 
         let expect = unsafe { libc::getuid() }.wrapping_add(1);
         let err = sandbox_pids_as(&name, expect).unwrap_err();
         assert!(err.contains("owned by another user"), "got: {err}");
     }
 
+    /// A request socket we let go of must refuse connections at once, even
+    /// while a copy of its fd lingers in some forked child.
+    #[test]
+    fn a_released_request_socket_refuses_connections() {
+        let name = format!("test-ctrl-refuse-{}", std::process::id());
+        let (_vault, child) = claim(&name).unwrap();
+        let requests = bind_request_socket(&name, child).unwrap();
+        let copy = unsafe { libc::dup(requests.as_raw_fd()) };
+        drop(requests);
+        let err = sandbox_pids(&name).unwrap_err();
+        unsafe { libc::close(copy) };
+        assert!(err.contains("still starting"), "got: {err}");
+    }
+
     use std::io::{Read, Write};
-    use std::os::unix::net::UnixStream;
 
     fn test_sandbox() -> Sandbox {
         Sandbox::builder().fs_read("/usr").build().unwrap()
@@ -858,18 +954,19 @@ mod tests {
         SandboxInfo { mode: Some("test".into()) }
     }
 
-    /// Bind a listener for `name`, run the control loop on it with
-    /// `expected_uid`, and return the task handle.
-    fn serve(name: &str, expected_uid: u32) -> tokio::task::JoinHandle<()> {
-        let listener = bind_control_sockets(name).unwrap().control;
+    /// Claim `name` and run the control loop for it as `expected_uid`. The
+    /// name lasts as long as the returned vault.
+    fn serve(name: &str, expected_uid: u32) -> (NameVault, tokio::task::JoinHandle<()>) {
+        let (vault, child) = claim(name).unwrap();
+        let listener = bind_request_socket(name, child).unwrap();
         let sandbox = Arc::new(tokio::sync::Mutex::new(test_sandbox()));
-        tokio::spawn(control_loop(listener, None, None, sandbox, info(), expected_uid))
+        (vault, tokio::spawn(control_loop(listener, None, sandbox, info(), expected_uid)))
     }
 
     /// Connect as ourselves, send an info request, and return what the
     /// server sent back (empty on a silent close).
     fn raw_info_request(name: &str) -> Vec<u8> {
-        let mut s = UnixStream::connect_addr(&socket_addr(name).unwrap()).unwrap();
+        let (mut s, _) = connect_request(name, unsafe { libc::getuid() }).unwrap();
         let body = br#"{"v":1,"verb":"info","args":{}}"#;
         s.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
         s.write_all(body).unwrap();
@@ -882,7 +979,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn server_answers_its_own_uid() {
         let name = format!("test-ctrl-own-{}", std::process::id());
-        let task = serve(&name, unsafe { libc::getuid() });
+        let (_vault, task) = serve(&name, unsafe { libc::getuid() });
         let out = tokio::task::spawn_blocking(move || raw_info_request(&name)).await.unwrap();
         task.abort();
         assert!(out.len() > 4, "expected a response, got {} bytes", out.len());
@@ -895,7 +992,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn server_closes_on_another_uid_without_answering() {
         let name = format!("test-ctrl-foreign-{}", std::process::id());
-        let task = serve(&name, unsafe { libc::getuid() }.wrapping_add(1));
+        let (_vault, task) = serve(&name, unsafe { libc::getuid() }.wrapping_add(1));
         let out = tokio::task::spawn_blocking(move || raw_info_request(&name)).await.unwrap();
         task.abort();
         assert!(out.is_empty(), "another uid must get no bytes, got {:?}", out);
@@ -904,7 +1001,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn client_refuses_a_listener_owned_by_another_uid() {
         let name = format!("test-ctrl-squat-{}", std::process::id());
-        let task = serve(&name, unsafe { libc::getuid() });
+        let (_vault, task) = serve(&name, unsafe { libc::getuid() });
         let expect = unsafe { libc::getuid() }.wrapping_add(1);
         let n = name.clone();
         let err = tokio::task::spawn_blocking(move || {
@@ -922,7 +1019,7 @@ mod tests {
         let addr = SocketAddr::from_abstract_name(b"sandlock-probe-\xff\xfe").unwrap();
         let _foreign = UnixListener::bind_addr(&addr).unwrap();
         let name = format!("test-ctrl-utf8-{}", std::process::id());
-        let _ours = bind_control_sockets(&name).unwrap();
+        let _ours = claim(&name).unwrap();
         assert!(list_sandboxes().unwrap().contains(&name));
     }
 }
