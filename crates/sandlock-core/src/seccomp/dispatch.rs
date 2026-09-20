@@ -279,11 +279,10 @@ pub(crate) fn build_dispatch_table(
         let ctx_for_fork = Arc::clone(ctx);
         table.register(nr, move |cx: &HandlerCtx| {
             let notif = cx.notif;
-            let notif_fd = cx.notif_fd;
             let policy = Arc::clone(&policy_for_fork);
             let ctx = Arc::clone(&ctx_for_fork);
             async move {
-                crate::resource::handle_fork(&notif, notif_fd, &ctx, &policy).await
+                crate::resource::handle_fork(&notif, &ctx, &policy).await
             }
         });
     }

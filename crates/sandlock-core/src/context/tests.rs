@@ -45,7 +45,6 @@ fn test_notif_syscalls_always_has_clone() {
     let policy = Sandbox::builder().build().unwrap();
     let nrs = notif_syscalls(&policy, None);
     assert!(nrs.contains(&(libc::SYS_clone as u32)));
-    assert!(nrs.contains(&(libc::SYS_clone3 as u32)));
     if let Some(vfork) = arch::sys_vfork() {
         assert!(nrs.contains(&(vfork as u32)));
     }

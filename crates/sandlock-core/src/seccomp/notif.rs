@@ -2222,7 +2222,7 @@ async fn handle_notification(
 
     let nr = notif.data.nr as i64;
     let fork_counted = matches!(action, NotifAction::Continue)
-        && crate::resource::fork_counted_on_continue(&notif, fd);
+        && crate::resource::fork_counted_on_continue(&notif);
 
     // TOCTOU-close for execve (issue #27): freeze every sandbox task
     // that could mutate argv before policy_fn reads argv and before the
@@ -2291,7 +2291,7 @@ async fn handle_notification(
     // process could exist without ever having produced a notification.
     let mut creation_trace = None;
     if matches!(action, NotifAction::Continue)
-        && crate::resource::requires_process_creation_tracking(&notif, fd, policy)
+        && crate::resource::requires_process_creation_tracking(&notif, policy)
     {
         match crate::resource::prepare_process_creation_tracking(ctx, notif.pid as i32).await {
             Ok(trace) => {
@@ -2323,7 +2323,7 @@ async fn handle_notification(
     // are already None — there is nothing to unwind here.)
     if let NotifAction::Defer(deferred) = action {
         if crate::freeze::requires_freeze_on_continue(nr)
-            || crate::resource::requires_process_creation_tracking(&notif, fd, policy)
+            || crate::resource::requires_process_creation_tracking(&notif, policy)
         {
             let _ = send_response(fd, notif.id, NotifAction::Errno(libc::EPERM));
             return;
