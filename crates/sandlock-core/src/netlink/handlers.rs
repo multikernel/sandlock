@@ -11,7 +11,7 @@
 //! cannot change the fd number stored in another thread's syscall
 //! registers.
 
-use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 use crate::netlink::{proxy, state::NetlinkState};
@@ -139,12 +139,15 @@ pub async fn handle_socket(
     // TOCTOU gap: the entry lands in the state map *before* the child's
     // syscall unblocks, and the key is the exact fd slot the kernel
     // allocated — not derivable by racing the child.
+    let Ok(socket_cookie) = super::state::socket_cookie(child_fd.as_raw_fd()) else {
+        return NotifAction::Errno(libc::ENOMEM);
+    };
     let state = Arc::clone(state);
     NotifAction::InjectFdSendTracked {
         srcfd: child_fd,
         newfd_flags: libc::O_CLOEXEC as u32,
         on_success: OnInjectSuccess::new(move |child_fd_num| {
-            state.register(tgid, child_fd_num);
+            state.register(tgid, child_fd_num, socket_cookie);
         }),
     }
 }
@@ -209,20 +212,6 @@ pub async fn handle_bind(
     let tgid = tgid_of(notif.pid as i32);
     if state.is_cookie(tgid, fd) {
         return NotifAction::ReturnValue(0);
-    }
-    NotifAction::Continue
-}
-
-/// Remove `(tgid, fd)` from the cookie set when the child closes a
-/// tracked netlink socket.  Lets the kernel actually close the fd too.
-pub async fn handle_close(
-    notif: &SeccompNotif,
-    state: &Arc<NetlinkState>,
-) -> NotifAction {
-    let fd = notif.data.args[0] as i32;
-    let tgid = tgid_of(notif.pid as i32);
-    if state.is_cookie(tgid, fd) {
-        state.unregister(tgid, fd);
     }
     NotifAction::Continue
 }

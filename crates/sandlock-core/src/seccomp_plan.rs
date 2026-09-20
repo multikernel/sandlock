@@ -122,8 +122,9 @@ fn procfs_hosts_notif_syscalls() -> Vec<i64> {
 //   recvfrom, recvmsg         -- zero msg_name so glibc accepts the reply
 //                                (kernel only writes sun_family on unix
 //                                 recvmsg, leaving nl_pid uninitialized)
-//   close                     -- unregister (pid, fd) so reuse doesn't
-//                                collide with the cookie set
+// close is deliberately absent: a trapped close that a signal interrupts
+// never runs and is never retried, which leaks the fd (issue #235). The
+// cookie set validates each slot on lookup instead.
 // Send traffic flows through the real socketpair untouched.
 const NETLINK_NOTIF_SYSCALLS: &[i64] = &[
     libc::SYS_socket,
@@ -131,7 +132,6 @@ const NETLINK_NOTIF_SYSCALLS: &[i64] = &[
     libc::SYS_getsockname,
     libc::SYS_recvfrom,
     libc::SYS_recvmsg,
-    libc::SYS_close,
 ];
 
 fn cow_path_syscalls() -> Vec<i64> {

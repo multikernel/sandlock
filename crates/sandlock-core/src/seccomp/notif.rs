@@ -2554,6 +2554,7 @@ pub(crate) async fn cleanup_pid(ctx: &super::ctx::SupervisorCtx, key: super::sta
         }
     }
     ctx.processes.unregister(key);
+    ctx.netlink.forget_process(key.pid);
 }
 
 // ============================================================

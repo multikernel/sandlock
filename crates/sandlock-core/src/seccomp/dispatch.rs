@@ -695,17 +695,6 @@ pub(crate) fn build_dispatch_table(
                 }
             });
         }
-        // Unregister on close so the (pid, fd) slot isn't left in the
-        // cookie set once the child reuses the fd for something else.
-        let __sup = Arc::clone(ctx);
-        table.register(libc::SYS_close, move |cx: &HandlerCtx| {
-            let notif = cx.notif;
-            let sup = Arc::clone(&__sup);
-            async move {
-                let state = Arc::clone(&sup.netlink);
-                crate::netlink::handlers::handle_close(&notif, &state).await
-            }
-        });
     }
 
     // ------------------------------------------------------------------

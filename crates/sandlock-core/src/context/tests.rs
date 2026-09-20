@@ -54,6 +54,15 @@ fn test_notif_syscalls_always_has_clone() {
     }
 }
 
+/// A trapped close that a signal interrupts never runs, and callers do not
+/// retry it, so the fd leaks (issue #235). Nothing may put it on the list.
+#[test]
+fn test_notif_syscalls_never_has_close() {
+    let policy = Sandbox::builder().build().unwrap();
+    let nrs = notif_syscalls(&policy, None);
+    assert!(!nrs.contains(&(libc::SYS_close as u32)));
+}
+
 #[test]
 fn test_notif_syscalls_memory() {
     // shmget only appears in notif when SysV IPC is allowed:
