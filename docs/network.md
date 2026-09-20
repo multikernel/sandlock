@@ -11,7 +11,8 @@ defaults are in [`sandbox-reference.md`](sandbox-reference.md#network).
 
 Outbound traffic is gated by an endpoint list naming
 **protocol × destination**. `--net-allow` (allowlist) and `--net-deny`
-(denylist) share one grammar and are mutually exclusive:
+(denylist) share one grammar. When both are present, a destination must pass
+the allowlist and must not match the denylist (deny wins overlaps):
 
 ```
 <spec>     repeatable; the port is optional (a bare target = all ports)
@@ -32,9 +33,10 @@ A comma groups ports within one spec (`host:80,443`); to pass multiple
 rules, repeat the flag. IP and CIDR targets are matched by containment
 with no DNS (an IP literal is a `/32` or `/128`); only hostnames resolve.
 
-Multiple rules are OR'd. A destination is permitted iff some rule
-matches the **same protocol** as the socket plus the destination IP
-and port (port is N/A for ICMP).
+Multiple rules within each list are OR'd. With `--net-allow` alone, a
+destination is permitted iff some allow rule matches the **same protocol** as
+the socket plus the destination IP and port (port is N/A for ICMP). When
+`--net-deny` is also present, the destination must not match any deny rule.
 
 **Protocol gating** falls out of rule presence per scheme:
 
@@ -56,7 +58,8 @@ For unrestricted TCP and UDP egress, opt in explicitly with
 `--net-allow '*'`; ICMP needs its own `--net-allow 'icmp://*'`.
 
 **Denylist (`--net-deny`).** The inverse of the allowlist: networking is
-default-allow and the listed targets are blocked. It uses the same
+default-allow and the listed targets are blocked. When combined with
+`--net-allow`, denied destinations win. It uses the same
 grammar as `--net-allow` above, the only difference being that targets
 must be literal IPs/CIDRs (hostnames are rejected; use `--http-deny` for
 domains). Examples:
@@ -68,6 +71,13 @@ domains). Examples:
 --net-deny '*'                     # any IP, all ports (TCP and UDP)
 --net-deny 'udp://192.168.0.0/16'  # UDP only, to a CIDR
 --net-deny 'tcp://10.0.0.1:22'     # TCP only, one IP and port
+```
+
+When both lists are present the allowlist minus the denylist applies;
+deny always wins an overlap:
+
+```
+--net-allow ':443' --net-deny 10.0.0.0/8   # allow HTTPS generally, except the denied CIDR
 ```
 
 **Resolution.** Only hostname targets touch DNS: they are resolved once
@@ -106,15 +116,16 @@ allow-all.
     and `sendmmsg()`; the supervisor dups the child fd, queries
     `getsockopt(SOL_SOCKET, SO_PROTOCOL)` to learn whether the socket
     is TCP / UDP / ICMP, then checks the destination against that
-    protocol's resolved allowlist before performing the syscall.
+    protocol's resolved allow/deny layers before performing the syscall.
     The HTTP/HTTPS proxy redirect (when configured) happens here too.
 
 **HTTP / HTTPS interception.** `--http-allow` / `--http-deny` route
 matching ports through a transparent proxy. Each rule with a concrete
-host auto-extends `--net-allow` with `host:80` (and `host:443` when
-`--http-ca` is set) so the proxy's intercept ports are reachable;
-wildcard hosts auto-add `:80` / `:443` (any IP). All auto-added
-entries are TCP. HTTPS MITM is enabled two ways: pass `--http-ca <cert>`
+host generates a `host:80` reachability rule (and `host:443` when
+`--http-ca` is set) at resolution time so the proxy's intercept ports
+are reachable; wildcard hosts generate `:80` / `:443` (any IP). All
+generated entries are TCP and are merged only at enforcement; they are
+never stored in `--net-allow`. HTTPS MITM is enabled two ways: pass `--http-ca <cert>`
 and `--http-key <key>` to bring your own CA, or pass `--http-inject-ca
 <bundle>` to have sandlock generate an ephemeral CA (private key in
 memory only) and splice its public cert into each named trust bundle at
@@ -128,18 +139,19 @@ with no content inspection.
 **Bind.** `--net-allow-bind <ports>` is independent from `--net-allow` and
 governs server-side `bind()` as a default-deny allowlist. Each value is a
 comma-separated list of single ports or inclusive `lo-hi` ranges (e.g.
-`--net-allow-bind 8080,9000-9005`), and the flag repeats. The `'*'` wildcard
-allows binding any port, including an ephemeral `bind(0)`; it cannot be
-mixed with port lists (repeating the bare wildcard is fine). Landlock enforces the
+`--net-allow-bind 8080,9000-9005`), and the flag repeats. Only the `'*'`
+wildcard allows binding any port, including an ephemeral `bind(0)`; a listed
+port `0` authorizes only a `bind(0)` request. The wildcard cannot be mixed
+with port lists (repeating the bare wildcard is fine). Landlock enforces the
 allowlist (TCP only; the wildcard simply leaves Landlock's `BIND_TCP` hook
 unhandled). When network supervision is active (`--net-allow`, `--net-deny`,
 `--http-allow`, `--port-remap`, a policy function) `bind()` runs on the
 supervisor's on-behalf path, which enforces the same allowlist.
 `--net-deny-bind <ports>` is the inverse: default-allow binding, deny the
-listed TCP ports (same port syntax, mutually exclusive with
-`--net-allow-bind`). Because Landlock is allowlist-only, a deny-bind relaxes
-the Landlock `BIND_TCP` hook and enforces the denylist on the on-behalf
-seccomp `bind()` path instead.
+listed TCP ports (same port syntax). When both bind flags are present, a port
+must pass the allowlist and must not match the denylist. Because Landlock is
+allowlist-only, a deny-bind relaxes the Landlock `BIND_TCP` hook and enforces
+the denylist on the on-behalf seccomp `bind()` path instead.
 
 **AF_UNIX sockets** are governed by Landlock's
 `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`, independent from `--net-allow`.
@@ -148,7 +160,7 @@ seccomp `bind()` path instead.
 
 ```bash
 # HTTP-level ACL (method + host + path rules via transparent proxy)
-# HTTP rules with concrete hosts auto-extend --net-allow with host:80,443
+# HTTP rules generate host:80,443 reachability at resolution time (not stored in --net-allow)
 sandlock run \
   --http-allow "GET docs.python.org/*" \
   --http-allow "POST api.openai.com/v1/chat/completions" \

@@ -287,21 +287,103 @@ fn builder_net_deny_bind_rejects_wildcard() {
 }
 
 #[test]
-fn builder_net_allow_bind_wildcard_exclusive_with_deny_bind() {
-    assert!(Sandbox::builder()
+fn builder_net_allow_bind_wildcard_combines_with_deny_bind() {
+    let policy = Sandbox::builder()
         .net_allow_bind("*")
         .net_deny_bind_port(22)
         .build()
-        .is_err());
+        .unwrap();
+    assert_eq!(policy.net_allow_bind, BindPorts::All);
+    assert_eq!(policy.net_deny_bind, vec![22]);
 }
 
 #[test]
-fn builder_rejects_net_allow_and_net_deny_together() {
-    let err = Sandbox::builder()
+fn builder_combines_net_allow_and_net_deny() {
+    let policy = Sandbox::builder()
         .net_allow("github.com:443")
         .net_deny("10.0.0.0/8")
         .build();
-    assert!(err.is_err());
+    let policy = policy.unwrap();
+    assert_eq!(policy.net_allow.len(), 2);
+    assert_eq!(policy.net_deny.len(), 2);
+    assert!(policy.net_allow_is_active());
+}
+
+#[test]
+fn builder_keeps_http_reachability_out_of_net_allow() {
+    // `net_allow` holds only explicit rules; HTTP reachability is generated
+    // at resolution time and merged only at consumption sites.
+    let policy = Sandbox::builder()
+        .net_deny("10.0.0.0/8")
+        .http_allow("GET api.example.com/v1/*")
+        .build()
+        .unwrap();
+    assert!(policy.net_allow.is_empty());
+    assert!(!policy.net_allow_is_active());
+    assert_eq!(policy.effective_net_allow().len(), 1);
+}
+
+#[test]
+fn builder_http_only_stays_restrictive_allowlist() {
+    let policy = Sandbox::builder()
+        .http_allow("GET api.example.com/v1/*")
+        .build()
+        .unwrap();
+    assert!(policy.net_allow.is_empty());
+    assert!(policy.net_deny.is_empty());
+    assert!(policy.net_allow_is_active());
+    assert_eq!(policy.effective_net_allow().len(), 1);
+}
+
+#[test]
+fn builder_deny_only_http_stays_default_allow() {
+    let policy = Sandbox::builder()
+        .net_deny("10.0.0.0/8")
+        .http_allow("GET 127.0.0.1/*")
+        .build()
+        .unwrap();
+    assert!(policy.net_allow.is_empty());
+    assert!(!policy.net_allow_is_active());
+    // Reachability is still generated for the proxy, but the allow layer
+    // stays inactive so non-denied egress remains allowed.
+    assert_eq!(policy.effective_net_allow().len(), 1);
+}
+
+#[test]
+fn builder_combined_http_merges_at_resolution_time() {
+    let policy = Sandbox::builder()
+        .net_allow("github.com:443")
+        .net_deny("10.0.0.0/8")
+        .http_allow("GET api.example.com/v1/*")
+        .build()
+        .unwrap();
+    // 2 explicit rules (scheme-less expands to TCP+UDP); HTTP derived is separate.
+    assert_eq!(policy.net_allow.len(), 2);
+    assert!(policy.net_allow_is_active());
+    assert_eq!(policy.effective_net_allow().len(), 3);
+}
+
+#[test]
+fn outbound_mode_survives_policy_bincode_round_trip() {
+    for builder in [
+        Sandbox::builder()
+            .net_allow("127.0.0.1:443")
+            .net_deny("10.0.0.0/8"),
+        Sandbox::builder()
+            .net_deny("10.0.0.0/8")
+            .http_allow("GET api.example.com/v1/*"),
+        Sandbox::builder().http_allow("GET api.example.com/v1/*"),
+    ] {
+        let policy = builder.build().unwrap();
+        let expected_active = policy.net_allow_is_active();
+        let expected_effective = policy.effective_net_allow().len();
+        let bytes = bincode::serialize(&policy).unwrap();
+        let restored: Sandbox = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(restored.net_allow_is_active(), expected_active);
+        assert_eq!(restored.effective_net_allow().len(), expected_effective);
+        assert_eq!(restored.net_allow.len(), policy.net_allow.len());
+        assert_eq!(restored.net_deny.len(), policy.net_deny.len());
+    }
 }
 
 #[test]
@@ -317,13 +399,95 @@ fn builder_net_deny_bind_comma_and_ranges() {
 }
 
 #[test]
-fn builder_rejects_allow_bind_and_deny_bind_together() {
-    let err = Sandbox::builder()
+fn builder_combines_allow_bind_and_deny_bind() {
+    let policy = Sandbox::builder()
         .net_allow_bind("8080")
         .net_deny_bind("9090")
-        .build();
-    assert!(err.is_err());
-    assert!(format!("{}", err.unwrap_err()).contains("mutually exclusive"));
+        .build()
+        .unwrap();
+    assert_eq!(policy.net_allow_bind, BindPorts::Ports(vec![8080]));
+    assert_eq!(policy.net_deny_bind, vec![9090]);
+}
+
+#[test]
+fn bind_allow_port_zero_is_ephemeral_only() {
+    let policy = Sandbox::builder().net_allow_bind_port(0).build().unwrap();
+    assert!(policy.net_allow_bind.allows_port(0));
+    assert!(!policy.net_allow_bind.allows_port(80));
+    assert!(!policy.net_allow_bind.allows_port(49152));
+    // Only `*` is the any-port form.
+    let policy = Sandbox::builder().net_allow_bind("*").build().unwrap();
+    assert!(policy.net_allow_bind.allows_port(80));
+}
+
+#[test]
+fn bind_allow_layer_is_not_installed_without_active_net_tcp() {
+    // bind() can still reach the on-behalf handler when NetTcp is disabled
+    // or degraded (port remap, destination supervision). The allow layer
+    // must not be installed then: otherwise the default empty allowlist
+    // would deny every TCP bind even though the protection is off. This
+    // holds for default, explicit-allow, combined, and deny-only bind
+    // policies alike.
+    for builder in [
+        Sandbox::builder().port_remap(true),
+        Sandbox::builder().port_remap(true).net_allow_bind("8080"),
+        Sandbox::builder()
+            .port_remap(true)
+            .net_allow_bind("8080")
+            .net_deny_bind("9090"),
+        Sandbox::builder().port_remap(true).net_deny_bind("9090"),
+    ] {
+        let policy = builder.build().unwrap();
+        assert_eq!(policy.bind_allow_layer(false), None);
+    }
+}
+
+#[test]
+fn bind_allow_layer_combined_policy_when_net_tcp_active() {
+    // With NetTcp active the combined allow-minus-deny bind policy stays
+    // enforced on the on-behalf path; deny-only bind has no allow layer
+    // and the wildcard stays unrestricted.
+    let combined = Sandbox::builder()
+        .net_allow_bind("8080")
+        .net_deny_bind("9090")
+        .build()
+        .unwrap();
+    assert_eq!(
+        combined.bind_allow_layer(true),
+        Some(BindPorts::Ports(vec![8080]))
+    );
+
+    let default_policy = Sandbox::builder().build().unwrap();
+    assert_eq!(
+        default_policy.bind_allow_layer(true),
+        Some(BindPorts::Ports(vec![]))
+    );
+
+    let deny_only = Sandbox::builder().net_deny_bind("9090").build().unwrap();
+    assert_eq!(deny_only.bind_allow_layer(true), None);
+
+    let wildcard = Sandbox::builder().net_allow_bind("*").build().unwrap();
+    assert_eq!(wildcard.bind_allow_layer(true), Some(BindPorts::All));
+}
+
+#[test]
+fn disabled_net_tcp_reports_inactive_and_drops_bind_allow_layer() {
+    // Explicitly disabling NetTcp resolves to Disabled on any host ABI,
+    // and the resolved flag keeps the allow layer uninstalled even with
+    // an explicit allowlist and port remap active.
+    let policy = Sandbox::builder()
+        .disable(Protection::NetTcp)
+        .port_remap(true)
+        .net_allow_bind("8080")
+        .build()
+        .unwrap();
+    let net_tcp_active = policy
+        .active_protections()
+        .unwrap()
+        .into_iter()
+        .any(|(p, s)| p == Protection::NetTcp && s == ProtectionStatus::Active);
+    assert!(!net_tcp_active);
+    assert_eq!(policy.bind_allow_layer(net_tcp_active), None);
 }
 
 #[test]

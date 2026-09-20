@@ -247,7 +247,8 @@ class TestNetAllow:
 
 class TestNetDeny:
     """Endpoint denylist semantics for `net_deny` (default-allow, inverse of
-    `net_allow`, mutually exclusive with it). Targets are literal IP/CIDR."""
+    `net_allow`, with denied destinations taking precedence). Targets are
+    literal IP/CIDR."""
 
     def test_default_is_empty(self):
         assert Sandbox().net_deny == []

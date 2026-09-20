@@ -28,7 +28,12 @@ use crate::sandbox::Sandbox;
 // text) that were never captured into `memory/`. Each `memory/<start_hex>.bin`
 // is re-associated with its map entry by matching start address.
 
-const IMAGE_VERSION: u32 = 2;
+// v3: `Sandbox.net_allow` holds only explicit user rules; HTTP reachability
+// is regenerated at resolution time. v2 images may contain HTTP-derived
+// rules inside `net_allow`, which v3 would misread as explicit rules
+// (e.g. deny-only+HTTP loading as combined), so v2 is rejected outright
+// with no compatibility fallback (pre-1.0 policy).
+const IMAGE_VERSION: u32 = 3;
 
 fn io_err(e: impl std::fmt::Display) -> SandlockError {
     SandlockError::Runtime(SandboxRuntimeError::Child(e.to_string()))
@@ -296,6 +301,29 @@ impl Checkpoint {
 #[cfg(test)]
 mod tests {
     use super::Checkpoint;
+    use crate::checkpoint::{MemoryMap, MemorySegment, ProcessState};
+    use crate::sandbox::Sandbox;
+
+    fn empty_process_state() -> ProcessState {
+        ProcessState {
+            pid: 0,
+            cwd: "/".into(),
+            exe: "/bin/true".into(),
+            regs: Vec::new(),
+            fpregs: Vec::new(),
+            memory_maps: vec![MemoryMap {
+                start: 0,
+                end: 0,
+                perms: String::new(),
+                offset: 0,
+                path: None,
+            }],
+            memory_data: vec![MemorySegment {
+                start: 0,
+                data: Vec::new(),
+            }],
+        }
+    }
 
     #[test]
     fn image_rejects_wrong_version() {
@@ -309,5 +337,77 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let msg = res.unwrap_err().to_string();
         assert!(msg.contains("version"), "error should mention version, got: {msg}");
+    }
+
+    fn round_trip_policy(policy: Sandbox) -> Sandbox {
+        let dir = std::env::temp_dir().join(format!(
+            "sandlock-mode-{}-{}",
+            std::process::id(),
+            // Use nanos to avoid collisions when tests run in parallel.
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let checkpoint = Checkpoint {
+            name: "mode-test".into(),
+            policy,
+            process_state: empty_process_state(),
+            fd_table: Vec::new(),
+            cow_snapshot: None,
+            app_state: None,
+        };
+
+        checkpoint.save(&dir).unwrap();
+        let loaded = Checkpoint::load(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        loaded.policy
+    }
+
+    #[test]
+    fn image_round_trip_preserves_combined_policy_without_origin_flag() {
+        let policy = Sandbox::builder()
+            .net_allow("127.0.0.1:443")
+            .net_deny("10.0.0.0/8")
+            .build()
+            .unwrap();
+        assert_eq!(policy.net_allow.len(), 2);
+        assert!(policy.net_allow_is_active());
+        let loaded = round_trip_policy(policy);
+        assert_eq!(loaded.net_allow.len(), 2);
+        assert_eq!(loaded.net_deny.len(), 2);
+        assert!(loaded.net_allow_is_active());
+    }
+
+    #[test]
+    fn image_round_trip_preserves_deny_only_http_as_default_allow() {
+        let policy = Sandbox::builder()
+            .net_deny("10.0.0.0/8")
+            .http_allow("GET api.example.com/v1/*")
+            .build()
+            .unwrap();
+        assert!(policy.net_allow.is_empty());
+        assert!(!policy.net_allow_is_active());
+        assert_eq!(policy.http_allow.len(), 1);
+        let loaded = round_trip_policy(policy);
+        assert!(loaded.net_allow.is_empty());
+        assert!(!loaded.net_allow_is_active());
+        assert_eq!(loaded.http_allow.len(), 1);
+        assert_eq!(loaded.effective_net_allow().len(), 1);
+    }
+
+    #[test]
+    fn image_round_trip_preserves_http_only_as_restrictive_allowlist() {
+        let policy = Sandbox::builder()
+            .http_allow("GET api.example.com/v1/*")
+            .build()
+            .unwrap();
+        assert!(policy.net_allow.is_empty());
+        assert!(policy.net_allow_is_active());
+        let loaded = round_trip_policy(policy);
+        assert!(loaded.net_allow.is_empty());
+        assert!(loaded.net_allow_is_active());
+        assert!(!loaded.effective_net_allow().is_empty());
     }
 }

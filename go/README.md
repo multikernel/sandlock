@@ -106,11 +106,12 @@ policy on each call.
 host, IP, or CIDR (`"10.0.0.0/8:443"`, `"[2606:4700::/32]:443"`); scheme
 prefixes opt other protocols in (`"udp://1.1.1.1:53"`, `"udp://*"`,
 `"icmp://host"`, `"icmp://*"`). `NetDeny` is the inverse (default-allow
-denylist, IP/CIDR targets only, mutually exclusive with `NetAllow`).
+denylist, IP/CIDR targets only); when both are set, denied destinations win.
 `NetAllowBind` entries are comma-separated single ports or inclusive ranges
-(`"8080"`, `"3000-3010"`, `"8080,9000-9005"`). `NetDenyBind` is the inverse
-(default-allow bind, deny these TCP ports; same syntax, mutually exclusive
-with `NetAllowBind`).
+(`"8080"`, `"3000-3010"`, `"8080,9000-9005"`); only `"*"` means any port (a
+listed `"0"` authorizes only `bind(0)`). `NetDenyBind` is the inverse
+(default-allow bind, deny these TCP ports; same syntax); when both are set,
+denied ports win.
 
 ### Execution
 

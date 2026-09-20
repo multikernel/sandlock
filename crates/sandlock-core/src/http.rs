@@ -173,20 +173,20 @@ pub fn http_acl_check(
     false // allow rules exist but none matched
 }
 
-/// Add the network allowlist entries needed for HTTP ACL interception.
+/// Network allowlist entries needed for HTTP ACL interception.
 ///
 /// HTTP ACLs are enforced by a local proxy, but the sandbox still needs to be
 /// allowed to reach the original destination on the intercepted ports. Concrete
 /// HTTP rule hosts tighten the IP allowlist to those hosts; wildcard hosts or
 /// explicit HTTP ports with no rules allow any IP on the HTTP ports.
-pub(crate) fn extend_net_allow_for_http(
-    net_allow: &mut Vec<NetAllow>,
+pub(crate) fn http_net_allow_rules(
     http_allow: &[HttpRule],
     http_deny: &[HttpRule],
     http_ports: &[u16],
-) {
+) -> Vec<NetAllow> {
+    let mut out = Vec::new();
     if http_ports.is_empty() {
-        return;
+        return out;
     }
 
     let mut wildcard_seen = false;
@@ -203,7 +203,7 @@ pub(crate) fn extend_net_allow_for_http(
     }
 
     if wildcard_seen || (http_allow.is_empty() && http_deny.is_empty()) {
-        net_allow.push(NetAllow {
+        out.push(NetAllow {
             protocol: Protocol::Tcp,
             target: NetTarget::AnyIp,
             ports: http_ports.to_vec(),
@@ -212,13 +212,14 @@ pub(crate) fn extend_net_allow_for_http(
     }
 
     for host in concrete_hosts {
-        net_allow.push(NetAllow {
+        out.push(NetAllow {
             protocol: Protocol::Tcp,
             target: NetTarget::Host(host),
             ports: http_ports.to_vec(),
             all_ports: false,
         });
     }
+    out
 }
 
 #[cfg(test)]
@@ -462,15 +463,14 @@ mod tests {
     }
 
     #[test]
-    fn extend_net_allow_for_http_adds_concrete_hosts() {
+    fn http_net_allow_rules_adds_concrete_hosts() {
         let allow = vec![
             HttpRule::parse("GET api.example.com/v1/*").unwrap(),
             HttpRule::parse("POST API.example.com/v2/*").unwrap(),
         ];
         let deny = vec![HttpRule::parse("* admin.example.com/*").unwrap()];
-        let mut net_allow = Vec::new();
 
-        extend_net_allow_for_http(&mut net_allow, &allow, &deny, &[80, 443]);
+        let net_allow = http_net_allow_rules(&allow, &deny, &[80, 443]);
 
         assert_eq!(net_allow.len(), 2);
         assert_eq!(net_allow[0].protocol, Protocol::Tcp);
@@ -482,17 +482,15 @@ mod tests {
     }
 
     #[test]
-    fn extend_net_allow_for_http_adds_any_ip_for_wildcard_or_bare_port() {
-        let mut net_allow = Vec::new();
-        extend_net_allow_for_http(&mut net_allow, &[], &[], &[8080]);
+    fn http_net_allow_rules_adds_any_ip_for_wildcard_or_bare_port() {
+        let net_allow = http_net_allow_rules(&[], &[], &[8080]);
         assert_eq!(net_allow.len(), 1);
         assert_eq!(net_allow[0].protocol, Protocol::Tcp);
         assert_eq!(net_allow[0].target, NetTarget::AnyIp);
         assert_eq!(net_allow[0].ports, vec![8080]);
 
         let allow = vec![HttpRule::parse("* */public/*").unwrap()];
-        let mut net_allow = Vec::new();
-        extend_net_allow_for_http(&mut net_allow, &allow, &[], &[80]);
+        let net_allow = http_net_allow_rules(&allow, &[], &[80]);
         assert_eq!(net_allow.len(), 1);
         assert_eq!(net_allow[0].protocol, Protocol::Tcp);
         assert_eq!(net_allow[0].target, NetTarget::AnyIp);

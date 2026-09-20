@@ -105,3 +105,8 @@ let result = dynamic.run(&["python3", "agent.py"]).await?;
 by the kernel first and never reach the callback, so a Landlock denial
 cannot be overridden from `policy_fn`. Path-based decisions belong in
 those static rules; use `ctx.deny_path()` for runtime additions.
+
+Dynamic network restrictions are IP-only and resolve with legacy priority
+(per-PID override > live policy > static allowlist); the static `net_deny`
+layer is applied after the allow verdict and always wins, so a dynamic
+override can never erase it.

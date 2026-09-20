@@ -33,7 +33,7 @@ use super::{query_socket_protocol, socket_is_unix, Protocol};
 /// Perform sendto() on behalf of the child process (TOCTOU-safe).
 ///
 /// 1. Copy sockaddr from child memory (our copy — immune to TOCTOU)
-/// 2. Check IP against allowlist on our copy
+/// 2. Check IP against the effective allow/deny policy on our copy
 /// 3. Copy data buffer from child memory
 /// 4. Duplicate child's socket fd via pidfd_getfd
 /// 5. sendto() in supervisor with validated sockaddr + copied data
@@ -68,7 +68,7 @@ pub(super) async fn sendto_on_behalf(
             Err(e) => return NotifAction::Errno(e),
         };
 
-    // 2. Check (ip, port) against the per-protocol endpoint allowlist.
+    // 2. Check (ip, port) against the per-protocol allow/deny layers.
     // One pidfd_getfd serves both the SO_PROTOCOL probe and the
     // on-behalf sendto.
     if let Some(ip) = parse_ip_from_sockaddr(&addr_bytes) {
@@ -226,7 +226,7 @@ pub(super) async fn sendto_on_behalf(
 ///
 /// 1. Copy full msghdr from child memory
 /// 2. Copy sockaddr from msg_name (our copy — immune to TOCTOU)
-/// 3. Check IP against allowlist on our copy
+/// 3. Check IP against the effective allow/deny policy on our copy
 /// 4. Copy iovec data buffers from child memory
 /// 5. Copy control message buffer from child memory
 /// 6. Duplicate child's socket fd via pidfd_getfd

@@ -939,10 +939,11 @@ mod tests {
         assert!(policy.allows_sysv_ipc());
         assert_eq!(policy.extra_deny_syscalls.len(), 2);
         assert_eq!(policy.fs_readable.len(), 2);
-        // 1 user rule (tcp://cache.internal:6379) + at least 1 http-port-derived
-        // rule that the builder auto-merges (api.internal on http.ports). The
-        // merge is the contract being verified here.
-        assert!(policy.net_allow.len() >= 2);
+        // 1 user rule only; HTTP reachability is generated at resolution time
+        // and merged only at consumption (effective_net_allow), not stored:
+        // 1 explicit TCP rule + 1 concrete HTTP host + 1 wildcard AnyIp rule.
+        assert_eq!(policy.net_allow.len(), 1);
+        assert_eq!(policy.effective_net_allow().len(), 3);
         // allow_bind mixes a bare int port and a quoted range string.
         assert_eq!(
             policy.net_allow_bind,
@@ -1020,6 +1021,104 @@ mod tests {
         let (policy, _spec) = parse_profile(toml).unwrap();
         assert_eq!(policy.net_deny_bind, vec![8080, 9000, 9001, 9002]);
         assert!(policy.net_allow_bind.is_default());
+    }
+
+    #[test]
+    fn profile_combined_network_policy_round_trips() {
+        let toml = r#"
+            [network]
+            allow = ["tcp://127.0.0.1:443"]
+            deny = ["10.0.0.0/8"]
+            allow_bind = [8080]
+            deny_bind = [9090]
+        "#;
+        let (policy, _) = parse_profile(toml).unwrap();
+        let rendered = sandbox_to_profile(&policy, &[]);
+        assert_eq!(rendered.network.allow.len(), 1);
+        assert!(!rendered.network.deny.is_empty());
+        assert_eq!(rendered.network.allow_bind, vec![PortSpec::Port(8080)]);
+        assert_eq!(rendered.network.deny_bind, vec![PortSpec::Port(9090)]);
+
+        let (round_tripped, _) = parse_input(rendered).unwrap();
+        assert!(round_tripped.net_allow_is_active());
+        assert_eq!(round_tripped.net_allow.len(), policy.net_allow.len());
+        assert_eq!(round_tripped.net_deny.len(), policy.net_deny.len());
+        assert_eq!(round_tripped.net_allow_bind, policy.net_allow_bind);
+        assert_eq!(round_tripped.net_deny_bind, policy.net_deny_bind);
+    }
+
+    #[test]
+    fn profile_deny_only_http_policy_does_not_promote_generated_allow_rules() {
+        let toml = r#"
+            [network]
+            deny = ["10.0.0.0/8"]
+
+            [http]
+            allow = ["GET api.example.com/v1/*"]
+        "#;
+        let (policy, _) = parse_profile(toml).unwrap();
+        assert!(policy.net_allow.is_empty());
+        assert!(!policy.net_allow_is_active());
+        assert_eq!(policy.effective_net_allow().len(), 1);
+
+        let rendered = sandbox_to_profile(&policy, &[]);
+        assert!(rendered.network.allow.is_empty());
+        assert_eq!(rendered.http.allow, vec!["GET api.example.com/v1/*"]);
+
+        let (round_tripped, _) = parse_input(rendered).unwrap();
+        assert!(!round_tripped.net_allow_is_active());
+        assert!(round_tripped.net_allow.is_empty());
+        assert_eq!(round_tripped.effective_net_allow().len(), 1);
+    }
+
+    #[test]
+    fn profile_http_only_round_trips_as_restrictive_allowlist() {
+        let toml = r#"
+            [http]
+            allow = ["GET api.example.com/v1/*"]
+        "#;
+        let (policy, _) = parse_profile(toml).unwrap();
+        assert!(policy.net_allow.is_empty());
+        assert!(policy.net_allow_is_active());
+
+        let rendered = sandbox_to_profile(&policy, &[]);
+        assert!(rendered.network.allow.is_empty());
+        assert_eq!(rendered.http.allow, vec!["GET api.example.com/v1/*"]);
+
+        let (round_tripped, _) = parse_input(rendered).unwrap();
+        assert!(round_tripped.net_allow.is_empty());
+        assert!(round_tripped.net_allow_is_active());
+        assert_eq!(
+            round_tripped.effective_net_allow().len(),
+            policy.effective_net_allow().len()
+        );
+    }
+
+    #[test]
+    fn profile_combined_http_round_trips_without_duplicating_derived_rules() {
+        let toml = r#"
+            [network]
+            allow = ["tcp://127.0.0.1:443"]
+            deny = ["10.0.0.0/8"]
+
+            [http]
+            allow = ["GET api.example.com/v1/*"]
+        "#;
+        let (policy, _) = parse_profile(toml).unwrap();
+        assert_eq!(policy.net_allow.len(), 1);
+        assert!(policy.net_allow_is_active());
+
+        let rendered = sandbox_to_profile(&policy, &[]);
+        assert_eq!(rendered.network.allow.len(), 1);
+        assert_eq!(rendered.http.allow, vec!["GET api.example.com/v1/*"]);
+
+        let (round_tripped, _) = parse_input(rendered).unwrap();
+        assert_eq!(round_tripped.net_allow.len(), 1);
+        assert_eq!(
+            round_tripped.effective_net_allow().len(),
+            policy.effective_net_allow().len()
+        );
+        assert!(round_tripped.net_allow_is_active());
     }
 
     #[test]

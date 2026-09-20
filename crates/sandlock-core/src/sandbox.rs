@@ -342,6 +342,9 @@ enum RuntimeState {
 pub enum BindPorts {
     /// Allow binding only the listed ports. Empty means no bind is
     /// permitted while the NetTcp protection is active (the default).
+    /// Port `0` is the ephemeral-bind request: listing `0` authorizes only
+    /// `bind(0)`, not explicit nonzero ports. Only `All` (`'*'`) is the
+    /// any-port form.
     Ports(Vec<u16>),
     /// `--net-allow-bind '*'`: any TCP port may be bound.
     All,
@@ -362,6 +365,16 @@ impl BindPorts {
     /// True for the `'*'` wildcard (any port may be bound).
     pub fn is_all(&self) -> bool {
         matches!(self, BindPorts::All)
+    }
+
+    /// True when `port` is covered by this allowlist. Exact match only:
+    /// a listed `0` authorizes an ephemeral `bind(0)` request, never an
+    /// explicit nonzero port.
+    pub(crate) fn allows_port(&self, port: u16) -> bool {
+        match self {
+            BindPorts::Ports(ports) => ports.contains(&port),
+            BindPorts::All => true,
+        }
     }
 }
 
@@ -405,31 +418,41 @@ pub struct Sandbox {
     /// needs an explicit rule (`icmp://*` for any ICMP echo). TCP is
     /// always permitted.
     ///
+    /// Explicit outbound endpoint allowlist: only user `--net-allow` rules.
+    /// HTTP reachability is never stored here; it is generated at resolution
+    /// time from `http_allow`/`http_deny`/`http_ports` and merged only where
+    /// the rules are consumed.
+    ///
     /// Empty `net_allow` and empty `http_allow`/`http_deny` together
     /// mean "deny all outbound" (Landlock direct path denies, no
-    /// on-behalf path is enabled). Otherwise, the on-behalf path
-    /// enforces these rules: a destination is permitted iff any rule
-    /// matches the protocol, destination IP (or has `host: None` = any
-    /// IP), and destination port (N/A for ICMP).
+    /// on-behalf path is enabled). With `net_deny`, every matching
+    /// destination is denied and all other protocols/destinations remain
+    /// default-allowed; when both lists are present, a destination must pass
+    /// the allow layer and must not match the deny layer. The on-behalf path
+    /// enforces these rules using the protocol, destination IP (or
+    /// `host: None` = any IP), and destination port (N/A for ICMP).
     ///
-    /// HTTP rules with concrete hosts auto-add a matching
+    /// HTTP rules with concrete hosts generate a matching
     /// `(Tcp, host, [80])` (and `(Tcp, host, [443])` when `--http-ca`
-    /// is set) entry at build time so the proxy's intercept ports
-    /// remain reachable. HTTP rules with wildcard hosts auto-add
+    /// is set) entry at resolution time so the proxy's intercept ports
+    /// remain reachable. HTTP rules with wildcard hosts generate
     /// `(Tcp, None, [80])` instead.
     pub net_allow: Vec<NetAllow>,
     /// Parsed `--net-deny` rules (default-allow, IP/CIDR/port denylist).
-    /// Mutually exclusive with `net_allow`.
+    /// When `net_allow` is also configured, this layer is checked after the
+    /// allow layer and therefore always wins.
     pub net_deny: Vec<NetDeny>,
     /// `--net-allow-bind`: TCP ports the sandbox may bind (default-deny
     /// allowlist, enforced by Landlock on the direct path and by the
     /// on-behalf `bind()` handler under network supervision; `All` leaves
     /// Landlock's `BIND_TCP` hook unhandled so any port may be bound).
-    /// Mutually exclusive with `net_deny_bind`.
+    /// Listing port `0` authorizes only an ephemeral `bind(0)` request.
+    /// When combined with `net_deny_bind`, the supervisor enforces both
+    /// layers and denied ports win.
     pub net_allow_bind: BindPorts,
     /// `--net-deny-bind`: TCP ports the sandbox may NOT bind (default-allow
-    /// denylist, enforced on the on-behalf `bind()` path). Mutually
-    /// exclusive with `net_allow_bind`.
+    /// denylist, enforced on the on-behalf `bind()` path). When combined with
+    /// `net_allow_bind`, denied ports win.
     pub net_deny_bind: Vec<u16>,
     // HTTP ACL
     pub http_allow: Vec<HttpRule>,
@@ -670,6 +693,60 @@ impl Sandbox {
     /// Returns true iff the policy grants the `sysv_ipc` syscall group.
     pub fn allows_sysv_ipc(&self) -> bool {
         self.extra_allow_syscalls.iter().any(|s| s == "sysv_ipc")
+    }
+
+    /// HTTP-derived reachability rules from the HTTP ACL fields.
+    pub(crate) fn http_net_allow_rules(&self) -> Vec<NetAllow> {
+        crate::http::http_net_allow_rules(&self.http_allow, &self.http_deny, &self.http_ports)
+    }
+
+    /// Explicit plus HTTP-derived allow rules, in that order. Used only where
+    /// the rules are consumed (resolution, Landlock port gates, virtual hosts).
+    /// The mode itself is derived from the separated configuration via
+    /// [`Self::net_allow_is_active`].
+    pub(crate) fn effective_net_allow(&self) -> Vec<NetAllow> {
+        let mut out = self.net_allow.clone();
+        out.extend(self.http_net_allow_rules());
+        out
+    }
+
+    /// Whether the outbound allow rules are an active runtime layer.
+    ///
+    /// Derived from the separated configuration: explicit `--net-allow` rules
+    /// always activate the layer; HTTP-derived reachability activates it only
+    /// for non-deny policies (HTTP-only stays a restrictive allowlist, while
+    /// deny-only+HTTP stays default-allow with the HTTP proxy on top).
+    pub(crate) fn net_allow_is_active(&self) -> bool {
+        if !self.net_allow.is_empty() {
+            return true;
+        }
+        if !self.net_deny.is_empty() {
+            return false;
+        }
+        !self.http_net_allow_rules().is_empty()
+    }
+
+    /// Whether bind handling has a default-deny allow layer. A deny-only bind
+    /// policy has no allow layer; an empty allowlist without a denylist is the
+    /// existing default-deny policy.
+    pub(crate) fn bind_allow_is_active(&self) -> bool {
+        self.net_deny_bind.is_empty() || !self.net_allow_bind.is_default()
+    }
+
+    /// Resolve the on-behalf bind allow layer for the supervisor.
+    ///
+    /// Installed only while the NetTcp protection is active: `bind()` can
+    /// still reach the on-behalf handler when NetTcp is disabled or degraded
+    /// (port remap, destination supervision), and without this gate the
+    /// default/explicit allowlist would deny every TCP bind even though the
+    /// protection is off. The denylist is populated and enforced
+    /// independently of this layer.
+    pub(crate) fn bind_allow_layer(&self, net_tcp_active: bool) -> Option<BindPorts> {
+        if net_tcp_active && self.bind_allow_is_active() {
+            Some(self.net_allow_bind.clone())
+        } else {
+            None
+        }
     }
 
     /// Validate cross-section invariants — checks that span multiple fields.
@@ -1750,15 +1827,16 @@ impl Sandbox {
 
         let pipes = PipePair::new().map_err(SandboxRuntimeError::Io)?;
 
-        let resolved_net_allow = network::resolve_net_allow(&self.net_allow)
+        let effective_net_allow = self.effective_net_allow();
+        let resolved_net_allow = network::resolve_net_allow(&effective_net_allow)
             .await
             .map_err(SandboxRuntimeError::Io)?;
         // In chroot/image mode, seed the synthetic /etc/hosts from the
         // rootfs's own file so entries baked into the image (private
         // registries, internal hostnames, etc.) survive virtualization.
         // Without a chroot, the helper returns the fixed loopback base.
-        // Either way, concrete-host rules from `net_allow` are appended
-        // on top.
+        // Either way, concrete-host rules (explicit plus HTTP-derived) are
+        // appended on top.
         let virtual_etc_hosts = network::compose_virtual_etc_hosts(
             self.chroot.as_deref(),
             &resolved_net_allow.concrete_host_entries,
@@ -2097,15 +2175,14 @@ impl Sandbox {
             let time_random_state = TimeRandomState::new(time_offset, random_state);
 
             let mut net_state = NetworkState::new();
-            if !self.net_deny.is_empty() {
-                let resolved_deny = network::resolve_net_deny(&self.net_deny);
-                net_state.tcp_policy = resolved_deny.tcp;
-                net_state.udp_policy = resolved_deny.udp;
-                net_state.icmp_policy = resolved_deny.icmp;
-            } else {
-                let no_rules = self.net_allow.is_empty();
+            let resolved_deny = network::resolve_net_deny(&self.net_deny);
+            net_state.tcp_deny_policy = resolved_deny.tcp;
+            net_state.udp_deny_policy = resolved_deny.udp;
+            net_state.icmp_deny_policy = resolved_deny.icmp;
+
+            if self.net_allow_is_active() {
                 let policy_from = |resolved: &network::ResolvedNetAllow| {
-                    if no_rules || resolved.any_ip_all_ports {
+                    if resolved.any_ip_all_ports {
                         crate::seccomp::notif::NetworkPolicy::Unrestricted
                     } else {
                         use crate::seccomp::notif::PortAllow;
@@ -2135,16 +2212,11 @@ impl Sandbox {
             net_state.http_acl_addr = self.rt().http_acl_handle.as_ref().map(|h| h.addr);
             net_state.http_acl_ports = self.http_ports.iter().copied().collect();
             net_state.http_acl_orig_dest = self.rt().http_acl_handle.as_ref().map(|h| h.orig_dest.clone());
-            net_state.bind_deny_ports = self.net_deny_bind.iter().copied().collect();
             let net_tcp_active = self.active_protections()?
                 .into_iter()
                 .any(|(p, s)| p == Protection::NetTcp && s == ProtectionStatus::Active);
-            net_state.bind_allow_ports = match &self.net_allow_bind {
-                BindPorts::Ports(ports) if net_tcp_active && self.net_deny_bind.is_empty() => {
-                    Some(ports.iter().copied().collect())
-                }
-                _ => None,
-            };
+            net_state.bind_allow_ports = self.bind_allow_layer(net_tcp_active);
+            net_state.bind_deny_ports = self.net_deny_bind.iter().copied().collect();
             if let Some(cb) = self.rt_mut().on_bind.take() {
                 net_state.port_map.on_bind = Some(cb);
             }

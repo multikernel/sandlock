@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
+use crate::seccomp::ctx::SupervisorCtx;
 use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction};
 use crate::seccomp::state::NetworkState;
 use crate::sys::structs::{SeccompNotif, AF_INET, AF_INET6};
@@ -129,9 +130,10 @@ fn set_port_in_sockaddr(bytes: &mut [u8], port: u16) {
 /// bind(sockfd, addr, addrlen): args[0]=fd, args[1]=addr_ptr, args[2]=addrlen
 pub(crate) async fn handle_bind(
     notif: &SeccompNotif,
-    network: &Arc<Mutex<NetworkState>>,
+    ctx: &Arc<SupervisorCtx>,
     notif_fd: RawFd,
 ) -> NotifAction {
+    let network = &ctx.network;
     let sockfd = notif.data.args[0] as i32;
     let addr_ptr = notif.data.args[1];
     let addr_len = notif.data.args[2] as usize;
@@ -140,10 +142,15 @@ pub(crate) async fn handle_bind(
         return NotifAction::Continue;
     }
 
-    let read_len = addr_len.min(128);
-    let mut bytes = match read_child_mem(notif_fd, notif.id, notif.pid, addr_ptr, read_len) {
+    let mut bytes = match crate::network::read_sockaddr(
+        notif_fd,
+        notif.id,
+        notif.pid,
+        addr_ptr,
+        addr_len,
+    ) {
         Ok(b) => b,
-        Err(_) => return NotifAction::Errno(libc::EIO),
+        Err(e) => return NotifAction::Errno(e),
     };
 
     let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
@@ -151,52 +158,62 @@ pub(crate) async fn handle_bind(
         Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
     };
 
+    let protocol = crate::network::query_socket_protocol(dup_fd.as_raw_fd());
+
     // A UDP bind is an inbound grant that Landlock cannot express
     // (BIND_TCP is TCP-only). With no UDP rule the protocol is
     // send-time deny-all, and a bound socket would still be a
     // receive-only channel — so the bind is refused outright. Checked
     // before the port extraction so ephemeral (port 0) binds are
     // covered too.
-    let udp_deny_all = {
+    let (udp_deny_all, bind_allow_ports, bind_deny_ports) = {
         let ns = network.lock().await;
-        ns.effective_network_policy(notif.pid, crate::network::Protocol::Udp, None)
-            .denies_everything()
+        let udp_deny_all = protocol == Some(crate::network::Protocol::Udp)
+            && ns
+                .effective_network_policy(
+                    notif.pid,
+                    crate::network::Protocol::Udp,
+                    None,
+                )
+                .denies_everything();
+        (udp_deny_all, ns.bind_allow_ports.clone(), ns.bind_deny_ports.clone())
     };
-    if udp_deny_all
-        && crate::network::query_socket_protocol(dup_fd.as_raw_fd())
-            == Some(crate::network::Protocol::Udp)
-    {
+    if udp_deny_all {
         return NotifAction::Errno(libc::EACCES);
     }
 
-    // Non-IP family or truncated buffer: extract_port returns None and the
-    // kernel validates the bind.
-    let ip_port = extract_port(&bytes);
+    // Non-IP families: bind verbatim: there is no TCP port policy to apply.
+    // A port of zero is still a meaningful requested TCP port and must pass
+    // through both bind policy layers before the kernel selects an ephemeral
+    // real port.
+    let virtual_port = match extract_port(&bytes) {
+        Some(p) => p,
+        None => return bind_verbatim(&dup_fd, &bytes, addr_len),
+    };
 
-    // TCP bind allowlist / denylist. Only TCP is gated (Landlock's BIND_TCP
-    // is TCP-only); UDP/other binds are unaffected. A port-0 bind is refused
-    // under an allowlist because Landlock refuses it too: only `'*'` can
-    // express "any ephemeral port".
-    let denied = match ip_port {
-        Some(port) => {
-            let ns = network.lock().await;
-            ns.bind_allow_ports.as_ref().is_some_and(|allow| !allow.contains(&port))
-                || ns.bind_deny_ports.contains(&port)
+    // Bind allow/deny rules are TCP-only and are evaluated against the
+    // virtual port before any port remapping. Deny is checked first so an
+    // overlapping allow/deny pair cannot be widened by the allow layer.
+    // The on-behalf `bind()` runs in the supervisor, outside the child's
+    // Landlock domain, so these checks are the only allow enforcer here,
+    // the allowlist (including the default deny-all) must not be skipped.
+    if protocol == Some(crate::network::Protocol::Tcp) {
+        if bind_deny_ports.contains(&virtual_port) {
+            return NotifAction::Errno(libc::EACCES);
         }
-        None => false,
-    };
-    if denied
-        && crate::network::query_socket_protocol(dup_fd.as_raw_fd())
-            == Some(crate::network::Protocol::Tcp)
-    {
-        return NotifAction::Errno(libc::EACCES);
+        if bind_allow_ports
+            .as_ref()
+            .is_some_and(|allow| !allow.allows_port(virtual_port))
+        {
+            return NotifAction::Errno(libc::EACCES);
+        }
     }
 
-    // Ephemeral (port == 0): bind verbatim, nothing to track or remap.
-    let virtual_port = match ip_port {
-        Some(p) if p != 0 => p,
-        _ => return bind_verbatim(&dup_fd, &bytes, addr_len),
-    };
+    // Ephemeral binds do not create a virtual-to-real mapping, but they still
+    // pass the policy checks above.
+    if virtual_port == 0 {
+        return bind_verbatim(&dup_fd, &bytes, addr_len);
+    }
 
     // Pick a first-attempt port: cached real port if known, else the
     // virtual port itself. The cached real port keeps repeat binds of

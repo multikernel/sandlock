@@ -260,8 +260,8 @@ class Sandbox:
 
     net_deny: Sequence[str] = field(default_factory=list)
     """Outbound endpoint denylist: default-allow networking, block these
-    targets. The inverse of :attr:`net_allow` and **mutually exclusive**
-    with it. Same grammar as ``net_allow`` except targets must be a literal
+    targets. When combined with :attr:`net_allow`, denied destinations win.
+    Same grammar as ``net_allow`` except targets must be a literal
     IP/CIDR or ``"*"`` (hostnames are rejected; use :attr:`http_deny` for
     domains), e.g. ``["10.0.0.0/8", "169.254.169.254:80", "udp://*"]``.
     Empty = no denylist. See README "Network Model" for details."""
@@ -275,15 +275,17 @@ class Sandbox:
     net_allow_bind: Sequence[int | str] = field(default_factory=list)
     """TCP ports the sandbox may bind (default-deny allowlist). Empty = deny
     all. Each entry is a port number or a ``"lo-hi"`` range string (or a
-    comma-separated list); ``["*"]`` allows binding any port and cannot be
-    mixed with port entries. Landlock's port hooks are TCP-only — UDP bind is not
-    separately gated. Mutually exclusive with :attr:`net_deny_bind`."""
+    comma-separated list); only ``["*"]`` allows binding any port and it
+    cannot be mixed with port entries (a listed ``0`` authorizes only
+    ``bind(0)``). Landlock's port hooks are TCP-only, UDP bind is not
+    separately gated. When combined with :attr:`net_deny_bind`, denied ports
+    win."""
 
     net_deny_bind: Sequence[int | str] = field(default_factory=list)
     """TCP ports the sandbox may NOT bind (default-allow denylist; the
     inverse of :attr:`net_allow_bind`, enforced on the on-behalf ``bind()``
-    path). Same port syntax. Empty = no bind denylist. Mutually exclusive
-    with :attr:`net_allow_bind`."""
+    path). Same port syntax. Empty = no bind denylist. When combined with
+    :attr:`net_allow_bind`, denied ports win."""
 
     # HTTP ACL
     http_allow: Sequence[str] = field(default_factory=list)

@@ -16,7 +16,7 @@ use super::materialize::{
     set_port_in_sockaddr, sockaddr_is_ipv6,
 };
 use super::unix::connect_named_unix_on_behalf;
-use super::verdict::{destination_verdict, path_under_any};
+use super::verdict::{layered_destination_verdict, path_under_any};
 use super::query_socket_protocol;
 
 // ============================================================
@@ -26,7 +26,7 @@ use super::query_socket_protocol;
 /// Perform connect() on behalf of the child process (TOCTOU-safe).
 ///
 /// 1. Copy sockaddr from child memory (our copy — immune to TOCTOU)
-/// 2. Check IP against allowlist on our copy
+/// 2. Check IP against the effective allow/deny policy on our copy
 /// 3. Duplicate child's socket fd via pidfd_getfd
 /// 4. connect() in supervisor with our validated sockaddr
 /// 5. Return result to child
@@ -47,7 +47,7 @@ pub(super) async fn connect_on_behalf(
             Err(e) => return NotifAction::Errno(e),
         };
 
-    // 2. Check destination against the per-protocol endpoint allowlist.
+    // 2. Check destination against the per-protocol allow/deny layers.
     // The dup we'd need anyway for the on-behalf connect doubles as
     // our SO_PROTOCOL probe — one pidfd_getfd, one getsockopt. The
     // per-protocol policy is keyed on whether the socket is TCP / UDP
@@ -84,7 +84,7 @@ pub(super) async fn connect_on_behalf(
             pfs.live_policy.clone()
         };
         let effective = ns.effective_network_policy(notif.pid, protocol, live_policy.as_ref());
-        if let Err(e) = destination_verdict(&effective, ip, dest_port) {
+        if let Err(e) = layered_destination_verdict(&effective, ip, dest_port) {
             return NotifAction::Errno(e);
         }
         let proxy = ns

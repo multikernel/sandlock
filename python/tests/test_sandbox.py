@@ -367,7 +367,7 @@ class TestNetAllowDenyAll:
 
 class TestNetDeny:
     """`net_deny` wired through the FFI: default-allow networking with an
-    IP/CIDR/port denylist, mutually exclusive with `net_allow`."""
+    IP/CIDR/port denylist; denied destinations win over `net_allow`."""
 
     def test_net_deny_builds_and_runs(self):
         result = _policy(
@@ -376,16 +376,17 @@ class TestNetDeny:
         assert result.success
         assert result.stdout.strip() == b"ok"
 
-    def test_net_allow_and_net_deny_mutually_exclusive(self):
-        with pytest.raises(RuntimeError, match="mutually exclusive"):
-            _policy(
-                net_allow=["github.com:443"], net_deny=["10.0.0.0/8"]
-            ).run(["echo", "ok"])
+    def test_net_allow_and_net_deny_combine(self):
+        result = _policy(
+            net_allow=["127.0.0.1:443"], net_deny=["10.0.0.0/8"]
+        ).run(["echo", "ok"])
+        assert result.success
+        assert result.stdout.strip() == b"ok"
 
 
 class TestNetDenyBind:
     """`net_deny_bind` wired through the FFI: default-allow bind with a TCP
-    port denylist, mutually exclusive with `net_allow_bind`."""
+    port denylist; denied ports win over `net_allow_bind`."""
 
     def test_net_deny_bind_builds_and_runs(self):
         result = _policy(net_deny_bind=["8080,9000-9002", 443]).run(["echo", "ok"])
@@ -399,9 +400,10 @@ class TestNetDenyBind:
         with pytest.raises(RuntimeError, match="wildcard"):
             _policy(net_deny_bind=["*"]).run(["echo", "ok"])
 
-    def test_allow_bind_and_deny_bind_mutually_exclusive(self):
-        with pytest.raises(RuntimeError, match="mutually exclusive"):
-            _policy(net_allow_bind=[8080], net_deny_bind=[9090]).run(["echo", "ok"])
+    def test_allow_bind_and_deny_bind_combine(self):
+        result = _policy(net_allow_bind=[8080], net_deny_bind=[9090]).run(["echo", "ok"])
+        assert result.success
+        assert result.stdout.strip() == b"ok"
 
 
 class TestNetAllowBindWildcard:
@@ -444,9 +446,10 @@ class TestNetAllowBindWildcard:
         result = _policy(net_allow_bind=["*", "*"]).run(["echo", "ok"])
         assert result.success
 
-    def test_wildcard_exclusive_with_deny_bind(self):
-        with pytest.raises(RuntimeError, match="mutually exclusive"):
-            _policy(net_allow_bind=["*"], net_deny_bind=[22]).run(["echo", "ok"])
+    def test_wildcard_combines_with_deny_bind(self):
+        result = _policy(net_allow_bind=["*"], net_deny_bind=[22]).run(["echo", "ok"])
+        assert result.success
+        assert result.stdout.strip() == b"ok"
 
 
 class TestSandlockRunCAbiMultiThreaded:
