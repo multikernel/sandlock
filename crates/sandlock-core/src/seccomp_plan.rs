@@ -60,7 +60,6 @@ impl SyscallList {
 
 const BASE_NOTIF_SYSCALLS: &[i64] = &[
     libc::SYS_clone,
-    libc::SYS_clone3,
     // A process that never makes another notified syscall still registers
     // on its way out, so its exit can release its process slot.
     libc::SYS_exit,
@@ -499,6 +498,7 @@ pub(crate) fn blocklist_syscall_numbers(policy: &Sandbox) -> Vec<u32> {
 ///
 /// Returns a `Vec<SockFilter>` containing self-contained BPF blocks for:
 ///   - clone: block namespace creation flags
+///   - clone3: refuse with ENOSYS so callers fall back to clone
 ///   - ioctl: block TIOCSTI, TIOCLINUX, SIOCGIF*, SIOCETHTOOL
 ///   - prctl: block PR_SET_DUMPABLE, PR_SET_SECUREBITS, PR_SET_PTRACER
 ///   - socket: block SOCK_RAW/SOCK_DGRAM on AF_INET/AF_INET6 (with type mask)
@@ -529,6 +529,14 @@ pub(crate) fn arg_filters_resolved(resolved: &ResolvedSandbox) -> Vec<SockFilter
     insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARGS0_LO));
     insns.push(jump(BPF_JMP | BPF_JSET | BPF_K, CLONE_NS_FLAGS as u32, 0, 1));
     insns.push(stmt(BPF_RET | BPF_K, ret_errno));
+
+    // --- clone3: not available ---
+    // Its flags sit in a struct in user memory, which BPF cannot read, and a
+    // supervisor that reads them races a CLONE_VM peer rewriting the struct
+    // before the kernel does. ENOSYS sends libc to clone, checked above.
+    insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR));
+    insns.push(jump(BPF_JMP | BPF_JEQ | BPF_K, libc::SYS_clone3 as u32, 0, 1));
+    insns.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | libc::ENOSYS as u32));
 
     // --- ioctl: block dangerous commands ---
     // Block terminal injection (TIOCSTI, TIOCLINUX) and network interface

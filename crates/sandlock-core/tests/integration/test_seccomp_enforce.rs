@@ -570,3 +570,33 @@ async fn test_control_semaphore_denied_by_default() {
 async fn test_control_semaphore_denied_without_supervisor() {
     check_control_semaphore_is_inaccessible(true).await;
 }
+
+// ------------------------------------------------------------------
+// clone3 is refused outright (issue #240)
+// ------------------------------------------------------------------
+/// clone3 keeps its flags in a struct BPF cannot read, so it used to carry
+/// CLONE_NEWUSER past the ban that stops clone. ENOSYS sends libc to clone.
+#[tokio::test]
+async fn test_clone3_is_refused_so_namespace_flags_cannot_hide_in_it() {
+    let script = format!(concat!(
+        "import ctypes, errno, os, struct, subprocess\n",
+        "libc = ctypes.CDLL(None, use_errno=True)\n",
+        "CLONE_NEWUSER, SIGCHLD = 0x10000000, 17\n",
+        "def outcome(r):\n",
+        "  if r == 0: os._exit(0)\n",
+        "  return 'created' if r > 0 else errno.errorcode[ctypes.get_errno()]\n",
+        "def clone3(flags):\n",
+        "  args = ctypes.create_string_buffer(struct.pack('8Q', flags, 0, 0, 0, SIGCHLD, 0, 0, 0))\n",
+        "  return outcome(libc.syscall({clone3}, args, ctypes.c_size_t(64)))\n",
+        "print(clone3(0), clone3(CLONE_NEWUSER))\n",
+        "print(outcome(libc.syscall({clone}, ctypes.c_ulong(CLONE_NEWUSER | SIGCHLD), 0, 0, 0, 0)))\n",
+        "print(subprocess.run(['true']).returncode)\n",
+    ), clone3 = libc::SYS_clone3, clone = libc::SYS_clone);
+    let policy = base_policy().build().unwrap();
+    let result = policy.clone().run(&["python3", "-c", &script]).await.unwrap();
+    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines, ["ENOSYS ENOSYS", "EPERM", "0"],
+        "clone3 refused, clone(CLONE_NEWUSER) refused, ordinary spawning still works; stderr: {}",
+        String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default()));
+}
