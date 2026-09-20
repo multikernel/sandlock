@@ -24,10 +24,6 @@ pub struct ResourceState {
     pub peak_mem_used: u64,
     /// Maximum allowed anonymous memory (bytes).
     pub max_memory_bytes: u64,
-    /// Whether fork notifications should be held (checkpoint/freeze).
-    pub hold_forks: bool,
-    /// Notification IDs held during a checkpoint freeze.
-    pub held_notif_ids: Vec<u64>,
     /// Exponentially-weighted load average.
     pub load_avg: crate::procfs::LoadAvg,
     /// Instant when the supervisor started (for uptime reporting).
@@ -44,8 +40,6 @@ impl ResourceState {
             mem_used: 0,
             peak_mem_used: 0,
             max_memory_bytes,
-            hold_forks: false,
-            held_notif_ids: Vec::new(),
             load_avg: crate::procfs::LoadAvg::new(),
             start_instant: std::time::Instant::now(),
         }

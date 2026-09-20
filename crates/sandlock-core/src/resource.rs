@@ -96,12 +96,6 @@ pub(crate) async fn handle_fork(
 
     let mut rs = ctx.resource.lock().await;
 
-    // Checkpoint/freeze: hold the fork notification.
-    if rs.hold_forks {
-        rs.held_notif_ids.push(notif.id);
-        return NotifAction::Hold;
-    }
-
     // Enforce concurrent process limit.
     let limit = live_max.unwrap_or(rs.max_processes);
     if rs.proc_count >= limit {

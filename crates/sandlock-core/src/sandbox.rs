@@ -1298,29 +1298,24 @@ impl Sandbox {
         self.do_create(&[name], false).await
     }
 
-    /// Freeze the sandbox: hold fork notifications + SIGSTOP the process group.
-    pub(crate) async fn freeze(&self) -> Result<(), crate::error::SandlockError> {
+    /// Freeze the sandbox: SIGSTOP the process group.
+    ///
+    /// A fork in flight cannot slip through: the kernel makes a signal sent
+    /// to a group appear to happen after any fork it overlaps (copy_process
+    /// restarts with the signal pending), so the child is stopped too.
+    pub(crate) fn freeze(&self) -> Result<(), crate::error::SandlockError> {
         use crate::error::{SandboxRuntimeError, SandlockError};
         let rt = self.runtime.as_ref().ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
         let pid = rt.child_pid.ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
-        if let Some(ref resource) = rt.supervisor_resource {
-            let mut rs = resource.lock().await;
-            rs.hold_forks = true;
-        }
         unsafe { libc::killpg(pid, libc::SIGSTOP); }
         Ok(())
     }
 
-    /// Thaw the sandbox: release held fork notifications + SIGCONT.
-    pub(crate) async fn thaw(&self) -> Result<(), crate::error::SandlockError> {
+    /// Thaw the sandbox: SIGCONT the process group.
+    pub(crate) fn thaw(&self) -> Result<(), crate::error::SandlockError> {
         use crate::error::{SandboxRuntimeError, SandlockError};
         let rt = self.runtime.as_ref().ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
         let pid = rt.child_pid.ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
-        if let Some(ref resource) = rt.supervisor_resource {
-            let mut rs = resource.lock().await;
-            rs.hold_forks = false;
-            rs.held_notif_ids.clear();
-        }
         unsafe { libc::killpg(pid, libc::SIGCONT); }
         Ok(())
     }
@@ -1343,9 +1338,9 @@ impl Sandbox {
         if target_pid <= 0 {
             return Err(SandlockError::Runtime(SandboxRuntimeError::NotRunning));
         }
-        self.freeze().await?;
+        self.freeze()?;
         let cp = crate::checkpoint::capture(target_pid, self);
-        self.thaw().await?;
+        self.thaw()?;
         cp
     }
 

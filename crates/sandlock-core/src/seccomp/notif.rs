@@ -2965,8 +2965,6 @@ mod tests {
         assert_eq!(rs.mem_used, 0);
         assert_eq!(rs.max_memory_bytes, 1024 * 1024);
         assert_eq!(rs.max_processes, 10);
-        assert!(!rs.hold_forks);
-        assert!(rs.held_notif_ids.is_empty());
     }
 
     #[test]
