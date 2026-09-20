@@ -720,3 +720,42 @@ async fn inject_bytes_delivers_synthetic_content_to_guest() {
         "guest must read back exactly the injected bytes for a host-nonexistent path"
     );
 }
+
+/// With no process limit and no policy callback, fork is the kernel's alone:
+/// it completes while the supervisor is busy, because it never asks it. A
+/// fork that did would sit in the queue behind the slow handler, where a
+/// signal can fail it with an EINTR no caller expects (issue #235).
+#[tokio::test]
+async fn fork_does_not_wait_for_the_supervisor_by_default() {
+    let policy = base_policy().build().unwrap();
+    // libc's fork, not os.fork: CPython's reads /proc/self/stat on the way
+    // (its fork-with-threads warning), and that open is a trapped syscall.
+    let script = concat!(
+        "import ctypes, os, time\n",
+        "libc = ctypes.CDLL(None)\n",
+        "busy = libc.fork()\n",
+        "if busy == 0:\n",
+        "  os.getppid()\n",
+        "  os._exit(0)\n",
+        "time.sleep(0.3)\n",
+        "start = time.monotonic()\n",
+        "pid = libc.fork()\n",
+        "if pid == 0:\n",
+        "  os._exit(0)\n",
+        "os.waitpid(pid, 0)\n",
+        "print('prompt' if time.monotonic() - start < 0.5 else 'waited')\n",
+        "os.waitpid(busy, 0)\n",
+    );
+    let slow = |_cx: &HandlerCtx| async {
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        NotifAction::Continue
+    };
+    let result = policy
+        .clone()
+        .run_with_handlers(&["python3", "-c", script], [(libc::SYS_getppid, slow)])
+        .await
+        .expect("sandbox spawn failed");
+    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
+    assert_eq!(stdout.trim(), "prompt", "stderr: {}",
+        String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default()));
+}

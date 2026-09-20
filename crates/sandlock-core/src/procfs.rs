@@ -470,7 +470,7 @@ pub(crate) async fn handle_proc_open(
         let total = processes.len() as u32;
         let last_pid = processes.max_pid().unwrap_or(0);
         let rs = resource.lock().await;
-        let running = rs.proc_count;
+        let running = rs.proc_count.max(processes.process_count());
         let content = generate_loadavg(&rs.load_avg, running, total, last_pid);
         return inject_memfd(&content);
     }

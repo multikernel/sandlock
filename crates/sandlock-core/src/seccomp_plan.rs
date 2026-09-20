@@ -31,12 +31,6 @@ struct SyscallList {
 }
 
 impl SyscallList {
-    fn with(syscalls: &[i64]) -> Self {
-        let mut list = Self::default();
-        list.extend(syscalls);
-        list
-    }
-
     fn push(&mut self, nr: i64) {
         self.nrs.push(nr as u32);
     }
@@ -58,7 +52,10 @@ impl SyscallList {
     }
 }
 
-const BASE_NOTIF_SYSCALLS: &[i64] = &[
+// Only with `fork_supervision`. fork, vfork and clone never fail with
+// EINTR natively, so nothing retries them, and a trapped syscall that a
+// signal interrupts does fail that way (issue #235).
+const FORK_NOTIF_SYSCALLS: &[i64] = &[
     libc::SYS_clone,
     // A process that never makes another notified syscall still registers
     // on its way out, so its exit can release its process slot.
@@ -359,12 +356,15 @@ pub(crate) fn notif_syscalls(policy: &Sandbox, sandbox_name: Option<&str>) -> Ve
 /// internal feature view.
 pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
     let features = &resolved.features;
-    let mut nrs = SyscallList::with(BASE_NOTIF_SYSCALLS);
-    nrs.push_optional(arch::sys_vfork());
+    let mut nrs = SyscallList::default();
+    if features.fork_supervision {
+        nrs.extend(FORK_NOTIF_SYSCALLS);
+        nrs.push_optional(arch::sys_vfork());
 
-    // Bare fork(2) creates a process like any clone: left out of the
-    // filter it would never be counted against the process limit.
-    nrs.push_optional(arch::sys_fork());
+        // Bare fork(2) creates a process like any clone: left out of the
+        // filter it would never be counted against the process limit.
+        nrs.push_optional(arch::sys_fork());
+    }
 
     if features.memory_limit {
         nrs.extend(MEMORY_NOTIF_SYSCALLS);

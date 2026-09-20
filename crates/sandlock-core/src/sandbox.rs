@@ -2278,13 +2278,14 @@ impl Sandbox {
             }
 
             let la_resource = Arc::clone(&res_state);
+            let la_processes = Arc::clone(&processes);
             self.rt_mut().loadavg_handle = Some(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(5));
                 interval.tick().await;
                 loop {
                     interval.tick().await;
                     let mut rs = la_resource.lock().await;
-                    let running = rs.proc_count;
+                    let running = rs.proc_count.max(la_processes.process_count());
                     rs.load_avg.sample(running);
                 }
             }));

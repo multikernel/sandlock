@@ -59,7 +59,7 @@ The async notification supervisor (tokio) handles intercepted syscalls:
 
 | Syscall | Handler |
 |---|---|
-| `clone/fork/vfork` | Process count enforcement |
+| `clone/fork/vfork` | Process count enforcement (only with `max_processes` or `policy_fn`; otherwise left to the kernel) |
 | `mmap/munmap/brk/mremap/mprotect` | Memory limit tracking |
 | `connect/sendto/sendmsg` | IP allowlist + on-behalf execution + HTTP ACL redirect |
 | `bind` | On-behalf bind + port remapping |

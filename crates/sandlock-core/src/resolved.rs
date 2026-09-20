@@ -45,6 +45,12 @@ pub(crate) struct SandboxFeatures {
     pub(crate) port_remap: bool,
     pub(crate) http_acl: bool,
     pub(crate) argv_safety_required: bool,
+    /// Process creation and exit go through the supervisor: there is a
+    /// process limit to enforce, or children must be registered before they
+    /// run. Otherwise fork is left to the kernel, because a trapped fork
+    /// that a signal interrupts fails with an EINTR no caller expects
+    /// (issue #235).
+    pub(crate) fork_supervision: bool,
     pub(crate) sysv_ipc_allowed: bool,
     pub(crate) net_allow_present: bool,
     pub(crate) net_deny: bool,
@@ -65,6 +71,7 @@ impl SandboxFeatures {
         let exec_handler = handler_syscalls
             .iter()
             .any(|&nr| nr == libc::SYS_execve || nr == libc::SYS_execveat);
+        let argv_safety_required = sandbox.policy_fn.is_some() || exec_handler;
 
         Self {
             memory_limit: sandbox.max_memory.is_some(),
@@ -82,7 +89,8 @@ impl SandboxFeatures {
             policy_fn: sandbox.policy_fn.is_some(),
             port_remap: sandbox.port_remap,
             http_acl,
-            argv_safety_required: sandbox.policy_fn.is_some() || exec_handler,
+            argv_safety_required,
+            fork_supervision: sandbox.max_processes.is_some() || argv_safety_required,
             sysv_ipc_allowed: sandbox.allows_sysv_ipc(),
             net_allow_present: !sandbox.net_allow.is_empty(),
             net_deny: !sandbox.net_deny.is_empty(),

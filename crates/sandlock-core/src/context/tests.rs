@@ -40,16 +40,43 @@ fn test_write_read_u32_large() {
     assert_eq!(got, val);
 }
 
+fn process_lifecycle_syscalls() -> Vec<u32> {
+    [Some(libc::SYS_clone), Some(libc::SYS_exit), Some(libc::SYS_exit_group), arch::sys_vfork(), arch::sys_fork()]
+        .into_iter()
+        .flatten()
+        .map(|nr| nr as u32)
+        .collect()
+}
+
+/// fork, vfork and clone never fail with EINTR natively, so nothing retries
+/// them, and a trapped syscall that a signal interrupts does (issue #235).
+/// They stay with the kernel unless a feature needs to see them.
 #[test]
-fn test_notif_syscalls_always_has_clone() {
+fn test_notif_syscalls_leave_fork_alone_by_default() {
     let policy = Sandbox::builder().build().unwrap();
     let nrs = notif_syscalls(&policy, None);
-    assert!(nrs.contains(&(libc::SYS_clone as u32)));
-    if let Some(vfork) = arch::sys_vfork() {
-        assert!(nrs.contains(&(vfork as u32)));
+    for nr in process_lifecycle_syscalls() {
+        assert!(!nrs.contains(&nr), "syscall {nr} should not be notified");
     }
-    if let Some(fork) = arch::sys_fork() {
-        assert!(nrs.contains(&(fork as u32)));
+    assert!(!nrs.contains(&(libc::SYS_clone3 as u32)));
+}
+
+#[test]
+fn test_notif_syscalls_has_fork_for_a_process_limit() {
+    let policy = Sandbox::builder().max_processes(8).build().unwrap();
+    let nrs = notif_syscalls(&policy, None);
+    for nr in process_lifecycle_syscalls() {
+        assert!(nrs.contains(&nr), "syscall {nr} should be notified");
+    }
+}
+
+/// Children have to be registered before they run for argv decisions.
+#[test]
+fn test_notif_syscalls_has_fork_for_a_policy_fn() {
+    let policy = Sandbox::builder().policy_fn(|_event, _ctx| Default::default()).build().unwrap();
+    let nrs = notif_syscalls(&policy, None);
+    for nr in process_lifecycle_syscalls() {
+        assert!(nrs.contains(&nr), "syscall {nr} should be notified");
     }
 }
 

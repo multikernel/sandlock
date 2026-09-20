@@ -418,6 +418,13 @@ impl ProcessIndex {
 
     /// Distinct thread groups in the index. Entries are keyed by the
     /// notifying task's tid, so one group can appear under several keys.
+    /// Processes seen so far. Unlike `ResourceState::proc_count` this needs
+    /// no fork interception: every process registers on its first notified
+    /// syscall, which the dynamic loader's opens make immediate.
+    pub fn process_count(&self) -> u32 {
+        self.tgids_snapshot().len() as u32
+    }
+
     pub fn tgids_snapshot(&self) -> HashSet<i32> {
         self.inner
             .read()
