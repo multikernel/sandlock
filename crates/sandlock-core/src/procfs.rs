@@ -86,7 +86,7 @@ const PROC_THREAD_SELF: &str = "/proc/thread-self";
 const NAMESPACE_ENTRIES: &[&str] = &["net", "mounts", "mountinfo", "mountstats", "cgroup"];
 
 /// Split `/proc/<task>[/task/<tid>]/<entry><tail>` for a namespace entry.
-fn proc_namespace_entry(path: &str) -> Option<(&'static str, &str)> {
+pub(crate) fn proc_namespace_entry(path: &str) -> Option<(&'static str, &str)> {
     let (task, rest) = path.strip_prefix("/proc/")?.split_once('/')?;
     if task != "self" && task != "thread-self" && task.parse::<i32>().is_err() {
         return None;
@@ -679,6 +679,49 @@ fn own_proc_target(path: &str, tid: i32, tgid: i32) -> Option<OwnProcTarget<'_>>
     // spelling of the caller's own directory has to match too.
     let rest = strip_dir_prefix(path, PROC_SELF).or_else(|| strip_dir_prefix(path, &own))?;
     Some(OwnProcTarget { base: own, rest, self_forms: vec![format!("{}{}", PROC_SELF, rest)] })
+}
+
+/// The pid-free spellings of a path inside the caller's own /proc directory,
+/// which are the only ones a grant or a deny can name. Empty for any other path.
+pub(crate) fn own_proc_self_forms(path: &str, tid: i32, tgid: i32) -> Vec<String> {
+    own_proc_target(path, tid, tgid).map(|target| target.self_forms).unwrap_or_default()
+}
+
+/// The /dev names that are links into the caller's fd directory on this host.
+fn dev_fd_aliases() -> &'static [(&'static str, &'static str)] {
+    static ALIASES: std::sync::OnceLock<Vec<(&str, &str)>> = std::sync::OnceLock::new();
+    ALIASES.get_or_init(|| {
+        [
+            ("/dev/stdin", "/proc/self/fd/0"),
+            ("/dev/stdout", "/proc/self/fd/1"),
+            ("/dev/stderr", "/proc/self/fd/2"),
+            ("/dev/fd", "/proc/self/fd"),
+        ]
+        .into_iter()
+        .filter(|(alias, target)| {
+            std::fs::read_link(alias).is_ok_and(|link| link == std::path::Path::new(target))
+        })
+        .collect()
+    })
+}
+
+/// The caller's own fd, when `path` is a request to reopen one: /proc/self/fd/N
+/// under any spelling of the caller's directory, or /dev/stdin and its kin.
+pub(crate) fn own_fd_request(path: &str, tid: i32, tgid: i32) -> Option<i32> {
+    let aliased = dev_fd_aliases().iter().find_map(|(alias, target)| {
+        strip_dir_prefix(path, alias).map(|rest| format!("{}{}", target, rest))
+    });
+    let target = own_proc_target(aliased.as_deref().unwrap_or(path), tid, tgid)?;
+    let rest = match target.rest.strip_prefix("/task/") {
+        Some(thread) => {
+            let (thread, rest) = thread.split_once('/')?;
+            thread.parse::<i32>().ok()?;
+            rest
+        }
+        None => target.rest.strip_prefix('/')?,
+    };
+    let fd = rest.strip_prefix("fd/")?;
+    fd.bytes().all(|b| b.is_ascii_digit()).then(|| fd.parse().ok()).flatten()
 }
 
 /// Serve a read-only open inside the caller's own /proc directory, when the
@@ -1337,6 +1380,34 @@ mod tests {
         assert!(maps.is_under_any(&[PathBuf::from("/usr"), PathBuf::from("/proc/self/maps")]));
         assert!(!maps.is_under_any(&[PathBuf::from("/proc/self/map")]));
         assert!(!maps.is_under_any(&[]));
+    }
+
+    #[test]
+    fn test_own_fd_request() {
+        assert_eq!(own_fd_request("/proc/self/fd/0", 12, 10), Some(0));
+        assert_eq!(own_fd_request("/proc/thread-self/fd/7", 12, 10), Some(7));
+        assert_eq!(own_fd_request("/proc/10/fd/63", 12, 10), Some(63));
+        assert_eq!(own_fd_request("/proc/self/task/12/fd/3", 12, 10), Some(3));
+        assert_eq!(own_fd_request("/proc/11/fd/0", 12, 10), None);
+        assert_eq!(own_fd_request("/proc/self/fd", 12, 10), None);
+        assert_eq!(own_fd_request("/proc/self/fd/0/x", 12, 10), None);
+        assert_eq!(own_fd_request("/proc/self/fd/-1", 12, 10), None);
+        assert_eq!(own_fd_request("/proc/self/fdinfo/0", 12, 10), None);
+        assert_eq!(own_fd_request("/tmp/fd/0", 12, 10), None);
+        if std::fs::read_link("/dev/stdin").is_ok_and(|l| l == std::path::Path::new("/proc/self/fd/0")) {
+            assert_eq!(own_fd_request("/dev/stdin", 12, 10), Some(0));
+        }
+        if std::fs::read_link("/dev/fd").is_ok_and(|l| l == std::path::Path::new("/proc/self/fd")) {
+            assert_eq!(own_fd_request("/dev/fd/5", 12, 10), Some(5));
+            assert_eq!(own_fd_request("/dev/fdx/5", 12, 10), None);
+        }
+    }
+
+    #[test]
+    fn test_own_proc_self_forms() {
+        assert_eq!(own_proc_self_forms("/proc/10/maps", 12, 10), ["/proc/self/maps"]);
+        assert!(own_proc_self_forms("/proc/11/maps", 12, 10).is_empty());
+        assert!(own_proc_self_forms("/etc/passwd", 12, 10).is_empty());
     }
 
     #[test]
