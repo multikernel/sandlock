@@ -41,7 +41,8 @@
 //! ```
 //!
 //! Verbs: `info` (mode), `config` (effective policy as
-//! `ProfileInput`), `ports` (virtual to real port map).
+//! `ProfileInput`), `ports` (virtual to real port map), `kill` (SIGKILL
+//! every process group the supervisor has recorded).
 
 use std::os::linux::net::SocketAddrExt;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
@@ -449,6 +450,7 @@ async fn serve_one(
         "info" => handle_info(&mut stream, info).await,
         "config" => handle_config(&mut stream, ctx, sandbox).await,
         "ports" => handle_ports(&mut stream, ctx).await,
+        "kill" => handle_kill(&mut stream, ctx).await,
         _ => {
             let resp = ControlResponse {
                 v: 1,
@@ -509,6 +511,32 @@ async fn handle_config(
         ok: true,
         data: Some(data),
         err: None,
+    };
+    let _ = write_response(stream, &resp).await;
+}
+
+/// Only the supervisor knows the groups a process has moved into, so
+/// `sandlock kill` asks here before it signals the child's own group.
+async fn handle_kill(stream: &mut ControlStream, ctx: Option<&Arc<SupervisorCtx>>) {
+    let resp = match ctx.map(|ctx| ctx.groups.signal(libc::SIGKILL)) {
+        Some(Ok(groups)) => ControlResponse {
+            v: 1,
+            ok: true,
+            data: Some(serde_json::json!({ "groups": groups })),
+            err: None,
+        },
+        Some(Err(e)) => ControlResponse {
+            v: 1,
+            ok: false,
+            data: None,
+            err: Some(format!("signal process groups: {}", e)),
+        },
+        None => ControlResponse {
+            v: 1,
+            ok: false,
+            data: None,
+            err: Some("no supervisor".into()),
+        },
     };
     let _ = write_response(stream, &resp).await;
 }
