@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io;
 use std::net::IpAddr;
-use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -60,7 +60,10 @@ impl OnInjectSuccess {
 /// moves it onto a worker task and never shares it by reference.  Requiring
 /// `Sync` of user futures would be a leaky bound (it would reject a future
 /// capturing, say, a `Cell`), so it is not required.
-pub struct Deferred(Pin<Box<dyn Future<Output = NotifAction> + Send + 'static>>);
+pub struct Deferred {
+    future: Pin<Box<dyn Future<Output = NotifAction> + Send + 'static>>,
+    patient: bool,
+}
 
 // Safety: `NotifAction` must stay `Sync` so it can live in `Sync` contexts
 // (handler `&self` state, etc.; the `Handler` trait is `Send + Sync`), which
@@ -81,13 +84,19 @@ impl std::fmt::Debug for Deferred {
 
 impl Deferred {
     pub fn new<F: Future<Output = NotifAction> + Send + 'static>(f: F) -> Self {
-        Self(Box::pin(f))
+        Self { future: Box::pin(f), patient: false }
+    }
+
+    /// A deferral with no deadline, for a syscall that natively waits as long
+    /// as it takes. The future has to end by itself once the child is gone.
+    pub(crate) fn patient<F: Future<Output = NotifAction> + Send + 'static>(f: F) -> Self {
+        Self { future: Box::pin(f), patient: true }
     }
 
     /// Drive the deferred future to its terminal action.  Consumes `self`
     /// because the future is run exactly once, on a worker task.
     pub async fn run(self) -> NotifAction {
-        self.0.await
+        self.future.await
     }
 }
 
@@ -646,7 +655,8 @@ fn reopen_existing_on_behalf(
     policy: &NotifPolicy,
     pfs: &super::state::PolicyFnState,
     processes: &super::state::ProcessIndex,
-    caller_tid: u32,
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
 ) -> NotifAction {
     // File exists. Refuse O_CREAT|O_EXCL the way the kernel would.
     if (flags & libc::O_CREAT as u64) != 0 && (flags & libc::O_EXCL as u64) != 0 {
@@ -656,7 +666,7 @@ fn reopen_existing_on_behalf(
         Some(p) => p,
         None => return NotifAction::Errno(libc::EACCES),
     };
-    if let Some(errno) = deny_open_verdict(&realpath, flags, policy, pfs, processes, caller_tid) {
+    if let Some(errno) = deny_open_verdict(&realpath, flags, policy, pfs, processes, notif.pid) {
         return NotifAction::Errno(errno);
     }
     // Identity check on the pinned file: a denied file reached via a hardlink,
@@ -671,12 +681,143 @@ fn reopen_existing_on_behalf(
     // Resolution-only flags are stripped from the reopen.
     let reopen_flags =
         flags as i32 & !(libc::O_CREAT | libc::O_EXCL | libc::O_PATH | libc::O_NOFOLLOW);
-    let proc_path = match std::ffi::CString::new(format!("/proc/self/fd/{}", probe.as_raw_fd())) {
-        Ok(c) => c,
-        Err(_) => return NotifAction::Errno(libc::EIO),
+    if blocks_until_a_partner_opens(&probe, reopen_flags) {
+        return reopen_fifo_when_partnered(probe, reopen_flags, flags, notif_fd, notif.id);
+    }
+    match reopen_pinned(&probe, reopen_flags) {
+        Ok(fd) => inject_open_result(fd.into_raw_fd(), flags),
+        Err(errno) => NotifAction::Errno(errno),
+    }
+}
+
+/// Open the file behind `pinned` through its `/proc/self/fd` magic link.
+fn reopen_pinned(pinned: &OwnedFd, flags: i32) -> Result<OwnedFd, i32> {
+    use std::os::unix::io::FromRawFd;
+    let path = std::ffi::CString::new(format!("/proc/self/fd/{}", pinned.as_raw_fd()))
+        .map_err(|_| libc::EIO)?;
+    let fd = unsafe { libc::open(path.as_ptr(), flags) };
+    if fd < 0 {
+        Err(last_errno(libc::EACCES))
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+}
+
+/// A FIFO opened for one direction without O_NONBLOCK waits for the other end.
+fn blocks_until_a_partner_opens(pinned: &OwnedFd, flags: i32) -> bool {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let is_fifo = unsafe { libc::fstat(pinned.as_raw_fd(), &mut st) } == 0
+        && st.st_mode & libc::S_IFMT == libc::S_IFIFO;
+    is_fifo && flags & libc::O_NONBLOCK == 0 && flags & libc::O_ACCMODE != libc::O_RDWR
+}
+
+/// How often a waiting FIFO open looks for a partner the supervisor cannot
+/// see, such as a host process. gVisor's gofer uses the same interval.
+const FIFO_PARTNER_CHECK: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Rung whenever the supervisor opens an end of a FIFO, so a partner waiting
+/// in the same process finds it at once instead of at its next check.
+static FIFO_END_OPENED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Whether the FIFO behind a nonblocking read end has a writer. Nothing else
+/// reports it: poll stays silent until data arrives. `tee` fails with EAGAIN
+/// on an empty pipe that has a writer and returns 0 on one that has none, and
+/// it consumes nothing from the FIFO.
+fn fifo_has_writer(reader: &OwnedFd) -> Result<bool, i32> {
+    use std::os::unix::io::FromRawFd;
+    static SCRATCH: std::sync::OnceLock<Option<std::sync::Mutex<(OwnedFd, OwnedFd)>>> =
+        std::sync::OnceLock::new();
+    let scratch = SCRATCH.get_or_init(|| {
+        let mut ends = [0; 2];
+        (unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) } == 0).then(|| unsafe {
+            std::sync::Mutex::new((OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])))
+        })
+    });
+    let Some(scratch) = scratch else { return Err(libc::EMFILE) };
+    let scratch = scratch.lock().unwrap_or_else(|e| e.into_inner());
+    let copied = unsafe {
+        libc::tee(reader.as_raw_fd(), scratch.1.as_raw_fd(), 1, libc::SPLICE_F_NONBLOCK)
     };
-    let fd = unsafe { libc::open(proc_path.as_ptr(), reopen_flags) };
-    inject_open_result(fd, flags)
+    match copied {
+        0 => Ok(false),
+        n if n > 0 => {
+            let mut byte = [0u8; 1];
+            unsafe { libc::read(scratch.0.as_raw_fd(), byte.as_mut_ptr().cast(), 1) };
+            Ok(true)
+        }
+        _ => match last_errno(libc::EIO) {
+            libc::EAGAIN => Ok(true),
+            errno => Err(errno),
+        },
+    }
+}
+
+fn clear_nonblock(fd: &OwnedFd) {
+    unsafe {
+        let status = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
+        libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, status & !libc::O_NONBLOCK);
+    }
+}
+
+/// Open a FIFO for a child that has to wait for the other end, without ever
+/// waiting in the kernel. On the supervisor loop that wait would never end:
+/// the other end can only be opened by a sandbox process, whose open is a
+/// notification the blocked loop never receives (issue #249).
+///
+/// Waiting, for the child, is its notification going unanswered. The ends are
+/// opened nonblocking, which never waits: a reader is opened at once and held
+/// until the FIFO has a writer, and a writer is retried until it stops failing
+/// with ENXIO. Like gVisor's, this sees a partner only while it is there.
+fn reopen_fifo_when_partnered(
+    pinned: OwnedFd,
+    reopen_flags: i32,
+    flags: u64,
+    notif_fd: RawFd,
+    id: u64,
+) -> NotifAction {
+    let wants_reader = reopen_flags & libc::O_ACCMODE == libc::O_RDONLY;
+    NotifAction::Defer(Deferred::patient(async move {
+        let mut held_reader: Option<OwnedFd> = None;
+        loop {
+            // Registered before the attempt, or an end opened in between is missed.
+            let end_opened = FIFO_END_OPENED.notified();
+            tokio::pin!(end_opened);
+            end_opened.as_mut().enable();
+
+            if wants_reader && held_reader.is_none() {
+                match reopen_pinned(&pinned, reopen_flags | libc::O_NONBLOCK) {
+                    Ok(fd) => held_reader = Some(fd),
+                    Err(errno) => return NotifAction::Errno(errno),
+                }
+                FIFO_END_OPENED.notify_waiters();
+            }
+            let partnered = match &held_reader {
+                Some(reader) => fifo_has_writer(reader).map(|has| has.then(|| held_reader.take()).flatten()),
+                None => match reopen_pinned(&pinned, reopen_flags | libc::O_NONBLOCK) {
+                    Ok(writer) => Ok(Some(writer)),
+                    Err(libc::ENXIO) => Ok(None),
+                    Err(errno) => Err(errno),
+                },
+            };
+            match partnered {
+                Ok(Some(fd)) => {
+                    clear_nonblock(&fd);
+                    FIFO_END_OPENED.notify_waiters();
+                    return inject_open_result(fd.into_raw_fd(), flags);
+                }
+                Ok(None) => {}
+                Err(errno) => return NotifAction::Errno(errno),
+            }
+            // A killed child leaves nobody to answer.
+            if id_valid(notif_fd, id).is_err() {
+                return NotifAction::Errno(libc::EINTR);
+            }
+            tokio::select! {
+                _ = &mut end_opened => {}
+                _ = tokio::time::sleep(FIFO_PARTNER_CHECK) => {}
+            }
+        }
+    }))
 }
 
 /// O_CREAT branch: resolve the parent directory race-free, vet the would-be
@@ -789,7 +930,7 @@ fn on_behalf_open_for_deny(
         .flatten();
     if let Some(own_fd) = own_fd {
         return match dup_fd_from_pid(notif.pid, own_fd) {
-            Ok(dup) => reopen_existing_on_behalf(dup, flags, policy, pfs, processes, notif.pid),
+            Ok(dup) => reopen_existing_on_behalf(dup, flags, policy, pfs, processes, notif, notif_fd),
             Err(_) => NotifAction::Errno(libc::ENOENT),
         };
     }
@@ -799,9 +940,9 @@ fn on_behalf_open_for_deny(
     let probe_flags = (libc::O_PATH | libc::O_CLOEXEC) as u64 | (flags & libc::O_NOFOLLOW as u64);
     match openat2_at(base.as_raw_fd(), &c_path, probe_flags, 0, RESOLVE_NO_MAGICLINKS | resolve) {
         Ok(probe) => match reprobe_in_callers_proc(&probe, notif.pid, nofollow, processes) {
-            Some(Ok(callers)) => reopen_existing_on_behalf(callers, flags, policy, pfs, processes, notif.pid),
+            Some(Ok(callers)) => reopen_existing_on_behalf(callers, flags, policy, pfs, processes, notif, notif_fd),
             Some(Err(errno)) => NotifAction::Errno(errno),
-            None => reopen_existing_on_behalf(probe, flags, policy, pfs, processes, notif.pid),
+            None => reopen_existing_on_behalf(probe, flags, policy, pfs, processes, notif, notif_fd),
         },
         Err(errno) if errno == libc::ENOENT && (flags & libc::O_CREAT as u64) != 0 => {
             create_new_on_behalf(&base, &path, flags, mode, resolve, policy, pfs, processes, notif.pid)
@@ -2255,7 +2396,10 @@ fn spawn_deferred(
 ) {
     tokio::spawn(async move {
         let _permit = permit; // released when the worker finishes
-        let action = run_deferred_within(deferred, DEFER_TIMEOUT).await;
+        let action = match deferred.patient {
+            true => finalize_deferred(deferred.run().await),
+            false => run_deferred_within(deferred, DEFER_TIMEOUT).await,
+        };
         let _ = send_response(fd, id, action);
     });
 }
@@ -2666,6 +2810,38 @@ pub(crate) async fn cleanup_pid(ctx: &super::ctx::SupervisorCtx, key: super::sta
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fifo_writer_probe_sees_a_writer_and_consumes_nothing() {
+        use std::os::unix::io::FromRawFd;
+        let dir = tempfile::TempDir::new().unwrap();
+        let fifo = std::ffi::CString::new(dir.path().join("f").as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let raw = unsafe { libc::open(fifo.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        let pinned = unsafe { OwnedFd::from_raw_fd(raw) };
+
+        assert!(blocks_until_a_partner_opens(&pinned, libc::O_RDONLY));
+        assert!(blocks_until_a_partner_opens(&pinned, libc::O_WRONLY));
+        assert!(!blocks_until_a_partner_opens(&pinned, libc::O_RDONLY | libc::O_NONBLOCK));
+        assert!(!blocks_until_a_partner_opens(&pinned, libc::O_RDWR));
+
+        assert_eq!(reopen_pinned(&pinned, libc::O_WRONLY | libc::O_NONBLOCK).err(), Some(libc::ENXIO));
+        let reader = reopen_pinned(&pinned, libc::O_RDONLY | libc::O_NONBLOCK).unwrap();
+        assert_eq!(fifo_has_writer(&reader), Ok(false));
+
+        let writer = reopen_pinned(&pinned, libc::O_WRONLY | libc::O_NONBLOCK).unwrap();
+        assert_eq!(fifo_has_writer(&reader), Ok(true), "an empty FIFO with a writer");
+
+        assert_eq!(unsafe { libc::write(writer.as_raw_fd(), b"data".as_ptr().cast(), 4) }, 4);
+        assert_eq!(fifo_has_writer(&reader), Ok(true));
+        clear_nonblock(&reader);
+        let mut buf = [0u8; 8];
+        let n = unsafe { libc::read(reader.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        assert_eq!(&buf[..n as usize], b"data", "the probe should leave the data in the FIFO");
+
+        drop(writer);
+        assert_eq!(fifo_has_writer(&reader), Ok(false));
+    }
     use std::os::unix::io::FromRawFd;
 
     fn gettid() -> u32 {
