@@ -917,61 +917,59 @@ async fn test_cancelled_wait_keeps_the_capture_for_the_next_wait() {
     );
 }
 
+/// A workload whose survivor holds the capture pipes past the main process's
+/// exit. `wait()` kills the main process's group on exit, so only a process
+/// that left the group can do that. It reports in before the parent exits
+/// (a survivor still in the group would be swept) and exits by itself, since
+/// `kill()` cannot reach it either.
+fn escaped_survivor_script(survivor_setup: &str) -> String {
+    format!(
+        concat!(
+            "import os, sys, time\n",
+            "sys.stdout.write('hello'); sys.stdout.flush()\n",
+            "r, w = os.pipe()\n",
+            "if os.fork() == 0:\n",
+            "  os.setsid()\n",
+            "  {setup}\n",
+            "  os.write(w, b'x')\n",
+            "  time.sleep(3)\n",
+            "  os._exit(0)\n",
+            "os.read(r, 1)\n",
+        ),
+        setup = survivor_setup,
+    )
+}
+
 /// The same promise, for a `wait()` cancelled while it is *joining* the drains.
 ///
 /// The child exits promptly, so the exit wait completes and `wait()` gets as
-/// far as the final join — which then blocks, because a background subshell
-/// inherited the write end of stdout and the read cannot reach EOF while it
-/// lives. That is the documented slow case, and it is where a caller's timeout
-/// lands. A join that took the handles out of the runtime before awaiting them
-/// would drop them with the cancelled future, and the next `wait()` would
-/// report no output at all even though the drain had read it.
-///
-/// Keeping that survivor alive takes some care. It has to be a subshell rather
-/// than a backgrounded external command, because an `execve` from a background
-/// job is not guaranteed to succeed under every policy — and a survivor that
-/// never starts leaves the join unblocked and this test vacuous. A shell also
-/// reopens a background job's stdin before running it, and the supervisor stops
-/// answering once the top-level child is reaped, so the shell is kept busy for
-/// a while after forking to let that finish first. An attempt whose first
-/// `wait()` completes anyway says nothing about the join and is retried;
-/// never blocking at all is a failure, not a pass. The contract this exercises
-/// is also pinned deterministically as a unit test on `join_parked_drain`.
+/// far as the final join, which then blocks: a survivor outside the process
+/// group inherited the write end of stdout and the read cannot reach EOF while
+/// it lives. That is the documented slow case, and it is where a caller's
+/// timeout lands. A join that took the handles out of the runtime before
+/// awaiting them would drop them with the cancelled future, and the next
+/// `wait()` would report no output at all even though the drain had read it.
+/// The contract is also pinned deterministically as a unit test on
+/// `join_parked_drain`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_wait_cancelled_during_the_drain_join_keeps_the_capture() {
-    // The subshell holds fd 1 open and execs nothing of its own; the counting
-    // loop is the parent shell outliving its own background job's start-up.
-    const CMD: &str =
-        "printf hello; (while :; do :; done) & i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done";
+    let script = escaped_survivor_script("pass");
+    let mut sb = capture_policy().with_name("drain-join-cancel");
+    sb.spawn(&["python3", "-c", &script]).await.unwrap();
 
-    for _ in 0..8 {
-        let mut sb = capture_policy().with_name("drain-join-cancel");
-        sb.spawn(&["sh", "-c", CMD]).await.unwrap();
+    let first = tokio::time::timeout(std::time::Duration::from_millis(1500), sb.wait()).await;
+    assert!(first.is_err(), "the survivor never held the write end: the join was not cancelled");
 
-        // The child exits, but the drain cannot: this cancellation lands on the
-        // join. A wait that completes means no survivor took the write end.
-        let first = tokio::time::timeout(std::time::Duration::from_millis(500), sb.wait()).await;
-        if first.is_ok() {
-            continue;
-        }
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), sb.wait())
+        .await
+        .expect("the second wait() hung")
+        .unwrap();
 
-        // Kills the whole process group, so the surviving subshell releases the
-        // write end and the parked drain can finally see EOF.
-        sb.kill().unwrap();
-
-        let result = tokio::time::timeout(std::time::Duration::from_secs(30), sb.wait())
-            .await
-            .expect("the second wait() hung")
-            .unwrap();
-
-        assert_eq!(
-            result.stdout.as_deref(),
-            Some(&b"hello"[..]),
-            "a wait() cancelled during the join must leave the drain parked for the next one",
-        );
-        return;
-    }
-    panic!("no attempt kept a descendant on the write end: the join was never cancelled");
+    assert_eq!(
+        result.stdout.as_deref(),
+        Some(&b"hello"[..]),
+        "a wait() cancelled during the join must leave the drain parked for the next one",
+    );
 }
 
 /// A capture-mode `wait()` must not park threads of the shared blocking pool
@@ -1031,37 +1029,24 @@ fn test_capture_wait_does_not_park_blocking_pool_threads() {
 ///
 /// The survivor closes fd 1 but keeps fd 2, so stdout reaches EOF while stderr
 /// cannot: the first join completes, the second blocks, and the cancellation
-/// lands exactly between them. An attempt whose first `wait()` completes had no
-/// survivor and is retried; never reaching that state at all is a failure.
+/// lands exactly between them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_a_finished_capture_survives_a_cancel_at_the_other_join() {
-    // `exec 1>&-` closes the subshell's stdout, so only stderr stays held. The
-    // counting loop keeps the parent shell alive past its background job's
-    // start-up (a survivor racing the parent's exit never takes the fd).
-    const CMD: &str =
-        "printf hello; (exec 1>&-; while :; do :; done) & i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done";
+    let script = escaped_survivor_script("os.close(1)");
+    let mut sb = capture_policy().with_name("sibling-join-cancel");
+    sb.spawn(&["python3", "-c", &script]).await.unwrap();
 
-    for _ in 0..8 {
-        let mut sb = capture_policy().with_name("sibling-join-cancel");
-        sb.spawn(&["sh", "-c", CMD]).await.unwrap();
+    let first = tokio::time::timeout(std::time::Duration::from_millis(1500), sb.wait()).await;
+    assert!(first.is_err(), "the survivor never held stderr: no cancellation between the joins");
 
-        let first = tokio::time::timeout(std::time::Duration::from_millis(600), sb.wait()).await;
-        if first.is_ok() {
-            continue;
-        }
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), sb.wait())
+        .await
+        .expect("the second wait() hung")
+        .unwrap();
 
-        sb.kill().unwrap();
-        let result = tokio::time::timeout(std::time::Duration::from_secs(30), sb.wait())
-            .await
-            .expect("the second wait() hung")
-            .unwrap();
-
-        assert_eq!(
-            result.stdout.as_deref(),
-            Some(&b"hello"[..]),
-            "a capture that finished before the cancellation must survive it",
-        );
-        return;
-    }
-    panic!("no attempt reached the cancellation between the two joins");
+    assert_eq!(
+        result.stdout.as_deref(),
+        Some(&b"hello"[..]),
+        "a capture that finished before the cancellation must survive it",
+    );
 }

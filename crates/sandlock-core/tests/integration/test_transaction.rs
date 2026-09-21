@@ -519,19 +519,14 @@ async fn test_txn_timeout_aborts_and_keeps_completed_stage_results() {
 /// (`fork`, no `execve`) really does survive, inherits the stage's fd 2 (the stderr
 /// pipe), and outlives the direct `sh`, which exits 1 immediately.
 ///
-/// Without the post-`wait()` process-group kill (`let _ = sb.kill();`), the pipe's
-/// write end stays open after the direct `sh` is reaped — there is no PID namespace
-/// to reap the lingering subshell — so the drain (which reads to EOF, i.e. until
-/// EVERY fd-2 holder closes) blocks. This drain runs AFTER the stage phase's
-/// timeout has already been satisfied by `wait()` returning, so the transaction's
-/// own 8s deadline does not fail it fast; the blocked drain is effectively
-/// unbounded. The harness-level `tokio::time::timeout(15s)` below is therefore
-/// mandatory: without the fix it trips and the test fails as a caught regression,
-/// instead of hanging CI. With the fix, `kill()` SIGKILLs the stage's whole
-/// process group, the pipe reaches EOF, and the run returns `StageFailed` in
-/// milliseconds. Runs on a multi-threaded runtime, as the real runner does (the
-/// notify supervisor and the blocking drain each want a thread, and a lingering
-/// supervised descendant must not starve the timer).
+/// `wait()` kills the stage's whole process group when the direct `sh` exits.
+/// If it did not, the pipe's write end would stay open after the `sh` is reaped
+/// (there is no PID namespace to reap the lingering subshell) and the drain,
+/// which reads to EOF, would block. That drain runs AFTER the stage phase's
+/// timeout has already been satisfied by `wait()` returning, so the
+/// transaction's own 8s deadline does not fail it fast. The harness-level
+/// `tokio::time::timeout(15s)` below is therefore mandatory: a regression trips
+/// it instead of hanging CI.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_txn_stage_failure_is_not_masked_by_a_backgrounded_descendant() {
     if !sandbox_available().await {
@@ -568,7 +563,7 @@ async fn test_txn_stage_failure_is_not_masked_by_a_backgrounded_descendant() {
         .run(Some(Duration::from_secs(8))),
     )
     .await
-    .expect("the drain must not hang: kill() must release the backgrounded fd-2 holder")
+    .expect("the drain must not hang: wait() must release the backgrounded fd-2 holder")
     .expect("transaction should run");
     let elapsed = start.elapsed();
 

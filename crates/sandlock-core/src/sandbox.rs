@@ -2864,19 +2864,41 @@ async fn wait_child_exit_via_pidfd(
             Ok(g) => g,
             Err(_) => return ExitStatus::Killed,
         };
-        let mut status: i32 = 0;
-        // The child has exited and is reapable now, so this never blocks.
-        let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-        if r > 0 {
-            return sandbox_wait_status_to_exit(status);
-        }
-        if r == 0 {
+        match sandbox_child_is_zombie(pid) {
+            Some(true) => return sandbox_sweep_group_and_reap(pid),
             // Spurious readiness (not yet reapable): clear and re-await.
-            guard.clear_ready();
-            continue;
+            Some(false) => guard.clear_ready(),
+            // ECHILD: already reaped elsewhere. Status is unavailable.
+            None => return ExitStatus::Killed,
         }
-        // r < 0 (e.g. ECHILD): already reaped elsewhere. Status is unavailable.
-        return ExitStatus::Killed;
+    }
+}
+
+/// Peeks rather than reaps: a group kill is only safe while the unreaped
+/// leader still pins the group id against reuse.
+fn sandbox_child_is_zombie(pid: libc::pid_t) -> Option<bool> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let flags = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+    if unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) } < 0 {
+        return None;
+    }
+    Some(matches!(info.si_code, libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED))
+}
+
+/// The sandbox ends with its main process: descendants left behind would run
+/// on with every supervised syscall failing, holding the caller's stdio.
+fn sandbox_sweep_group_and_reap(pid: libc::pid_t) -> crate::result::ExitStatus {
+    unsafe { libc::killpg(pid, libc::SIGKILL) };
+    let mut status: i32 = 0;
+    loop {
+        let ret = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if ret < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return crate::result::ExitStatus::Killed;
+        }
+        return sandbox_wait_status_to_exit(status);
     }
 }
 
@@ -2886,9 +2908,10 @@ async fn wait_child_exit_via_pidfd(
 async fn wait_child_exit_blocking(pid: libc::pid_t) -> crate::result::ExitStatus {
     use crate::result::ExitStatus;
     tokio::task::spawn_blocking(move || -> ExitStatus {
-        let mut status: i32 = 0;
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         loop {
-            let ret = unsafe { libc::waitpid(pid, &mut status, 0) };
+            let flags = libc::WEXITED | libc::WNOWAIT;
+            let ret = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) };
             if ret < 0 {
                 if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                     continue;
@@ -2897,7 +2920,7 @@ async fn wait_child_exit_blocking(pid: libc::pid_t) -> crate::result::ExitStatus
             }
             break;
         }
-        sandbox_wait_status_to_exit(status)
+        sandbox_sweep_group_and_reap(pid)
     })
     .await
     .unwrap_or(ExitStatus::Killed)
