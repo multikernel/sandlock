@@ -364,8 +364,15 @@ async fn main() -> Result<()> {
                     std::process::exit(1);
                 }
             };
-            // killpg takes the child's whole process group; the supervisor
-            // may sit in a different group, so signal it directly too.
+            // Groups the sandbox created are known only to the supervisor,
+            // and a wedged one cannot answer, so the child's own group is
+            // signalled here regardless. The supervisor may sit in a
+            // different group, so signal it directly too.
+            let _ = sandlock_core::control::send_control_request(
+                &name,
+                "kill",
+                serde_json::Value::Object(Default::default()),
+            );
             unsafe { libc::killpg(pids.child, libc::SIGKILL) };
             unsafe { libc::kill(pids.supervisor, libc::SIGKILL) };
             println!(

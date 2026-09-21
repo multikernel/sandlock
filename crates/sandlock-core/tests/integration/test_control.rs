@@ -647,6 +647,62 @@ fn test_control_kill_terminates_a_stopped_supervisor() {
     assert!(wait_for_gone(&name), "name should be free after kill");
 }
 
+/// A process that made itself a session leader is outside the child's
+/// group; `sandlock kill` reaches it through the supervisor.
+#[test]
+fn test_control_kill_reaches_a_process_outside_the_child_group() {
+    let name = format!("test-ctrl-killsid-{}", std::process::id());
+    let has_lib64 = std::path::Path::new("/lib64").exists();
+    let mut args = vec!["run", "--name", &name, "-r", "/usr", "-r", "/lib"];
+    if has_lib64 {
+        args.extend(["-r", "/lib64"]);
+    }
+    args.extend(["-r", "/bin", "-r", "/etc", "-r", "/proc", "-r", "/dev"]);
+    args.extend(["--", "sh", "-c", "setsid sleep 30 & exec sleep 30"]);
+    let mut child = sandlock_bin()
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn sandlock");
+    if let Err(e) = wait_for_sandbox(&name) {
+        let stderr_output = child_stderr(&mut child);
+        let _ = child.kill();
+        panic!("{}; child stderr: {}", e, stderr_output);
+    }
+    let pids = sandlock_core::control::sandbox_pids(&name).expect("pids");
+
+    let leader = (0..100)
+        .find_map(|_| {
+            child_outside_group(pids.child).or_else(|| {
+                std::thread::sleep(Duration::from_millis(50));
+                None
+            })
+        })
+        .expect("the setsid child never left the sandbox's group");
+
+    let out = sandlock_bin().args(["kill", &name]).output().expect("sandlock kill");
+    let _ = child.wait();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(wait_for_pid_gone(pids.child), "child {} should be dead", pids.child);
+    assert!(wait_for_pid_gone(leader), "session leader {} should be dead", leader);
+}
+
+/// A child of `parent` that runs in a process group other than `parent`'s.
+fn child_outside_group(parent: i32) -> Option<i32> {
+    for entry in std::fs::read_dir("/proc").ok()? {
+        let Ok(pid) = entry.ok()?.file_name().to_string_lossy().parse::<i32>() else { continue };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else { continue };
+        let mut fields = stat.rsplit_once(") ")?.1.split_whitespace();
+        let ppid: i32 = fields.nth(1)?.parse().ok()?;
+        let pgid: i32 = fields.next()?.parse().ok()?;
+        if ppid == parent && pgid != parent {
+            return Some(pid);
+        }
+    }
+    None
+}
+
 /// wait() must release the name before it returns: a caller that runs the
 /// same name twice in a row must not hit the collision check.
 #[tokio::test]
