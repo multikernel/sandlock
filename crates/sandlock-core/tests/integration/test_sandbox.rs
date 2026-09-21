@@ -311,6 +311,77 @@ async fn test_denied_path_hardlink_blocked() {
     );
 }
 
+/// Issue #249: with a deny active the supervisor performs the open, and a FIFO
+/// open waits for the other end, which only another sandbox open can provide.
+#[tokio::test]
+async fn test_fifo_opens_meet_with_a_deny_active() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
+        .fs_read("/bin").fs_read("/etc").fs_read("/dev")
+        .fs_write(tmp.path())
+        .fs_deny(tmp.path().join("secret.txt"))
+        .build()
+        .unwrap();
+
+    let cmd = format!(
+        concat!(
+            "cd {}; mkfifo r w; ",
+            "(sleep 1; echo reader-first > r) & cat r; wait; ",
+            "(sleep 1; cat w) & echo writer-first > w; wait; ",
+            // The supervisor must keep serving the sandbox while an open waits.
+            "cat r & sleep 1; echo still-served; echo late > r; wait",
+        ),
+        tmp.path().display(),
+    );
+    let mut sandbox = policy.clone();
+    let argv = ["sh", "-c", cmd.as_str()];
+    let result = tokio::time::timeout(std::time::Duration::from_secs(20), sandbox.run(&argv))
+        .await
+        .expect("a FIFO open should not stall the sandbox")
+        .unwrap();
+    assert_eq!(
+        result.stdout_str().unwrap_or_default().trim(),
+        "reader-first\nwriter-first\nstill-served\nlate"
+    );
+}
+
+/// The other end of a FIFO may belong to a process the supervisor never sees.
+/// Such a partner is only found by looking again, in both directions.
+#[tokio::test]
+async fn test_fifo_opens_meet_a_partner_outside_the_sandbox() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (from_host, to_host) = (tmp.path().join("from_host"), tmp.path().join("to_host"));
+    for fifo in [&from_host, &to_host] {
+        let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
+        .fs_read("/bin").fs_read("/etc").fs_read("/dev")
+        .fs_write(tmp.path())
+        .fs_deny(tmp.path().join("secret.txt"))
+        .build()
+        .unwrap();
+
+    let host = std::thread::spawn(move || {
+        // Late enough for the sandbox's reader to be waiting already.
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        std::fs::write(&from_host, "from-host\n").unwrap();
+        std::fs::read_to_string(&to_host).unwrap()
+    });
+
+    let cmd = format!("cd {}; cat from_host; echo to-host > to_host", tmp.path().display());
+    let mut sandbox = policy.clone();
+    let argv = ["sh", "-c", cmd.as_str()];
+    let result = tokio::time::timeout(std::time::Duration::from_secs(20), sandbox.run(&argv))
+        .await
+        .expect("a FIFO open should find a partner outside the sandbox")
+        .unwrap();
+    assert_eq!(result.stdout_str().unwrap_or_default().trim(), "from-host");
+    assert_eq!(host.join().unwrap().trim(), "to-host");
+}
+
 /// A pre-existing hardlink (an alias name for the denied inode, created before
 /// the sandbox starts) must not be readable. This is the non-racy bypass that
 /// only inode-identity deny closes: the alias path is not denied, but its inode
