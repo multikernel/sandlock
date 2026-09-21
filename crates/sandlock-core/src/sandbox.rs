@@ -842,8 +842,9 @@ impl Sandbox {
     }
 
     /// Signal every process group of the sandbox, returning how many had
-    /// members left.
-    fn signal_groups(&self, sig: i32) -> Result<usize, crate::error::SandlockError> {
+    /// members left. Groups stay reachable after the main process has been
+    /// reaped, so this can sweep what a `wait()` left behind.
+    pub fn signal(&self, sig: i32) -> Result<usize, crate::error::SandlockError> {
         use crate::error::SandboxRuntimeError;
         let rt = self.runtime.as_ref()
             .filter(|rt| rt.child_pid.is_some())
@@ -852,7 +853,7 @@ impl Sandbox {
     }
 
     fn signal_live_groups(&self, sig: i32) -> Result<(), crate::error::SandlockError> {
-        if self.signal_groups(sig)? == 0 {
+        if self.signal(sig)? == 0 {
             let gone = std::io::Error::from_raw_os_error(libc::ESRCH);
             return Err(crate::error::SandboxRuntimeError::Io(gone).into());
         }
@@ -875,7 +876,7 @@ impl Sandbox {
 
     /// Send SIGKILL to the sandbox's process groups.
     pub fn kill(&mut self) -> Result<(), crate::error::SandlockError> {
-        self.signal_groups(libc::SIGKILL).map(|_| ())
+        self.signal(libc::SIGKILL).map(|_| ())
     }
 
     /// Set a callback invoked whenever a port bind is recorded.
