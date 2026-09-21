@@ -841,48 +841,41 @@ impl Sandbox {
         }).unwrap_or(false)
     }
 
-    /// Send SIGSTOP to the child's process group.
-    pub fn pause(&mut self) -> Result<(), crate::error::SandlockError> {
+    /// Signal every process group of the sandbox, returning how many had
+    /// members left.
+    fn signal_groups(&self, sig: i32) -> Result<usize, crate::error::SandlockError> {
         use crate::error::SandboxRuntimeError;
-        let pid = self.runtime.as_ref()
-            .and_then(|rt| rt.child_pid)
+        let rt = self.runtime.as_ref()
+            .filter(|rt| rt.child_pid.is_some())
             .ok_or(SandboxRuntimeError::NotRunning)?;
-        let ret = unsafe { libc::killpg(pid, libc::SIGSTOP) };
-        if ret < 0 {
-            return Err(SandboxRuntimeError::Io(std::io::Error::last_os_error()).into());
+        Ok(rt.groups.signal(sig).map_err(SandboxRuntimeError::Io)?)
+    }
+
+    fn signal_live_groups(&self, sig: i32) -> Result<(), crate::error::SandlockError> {
+        if self.signal_groups(sig)? == 0 {
+            let gone = std::io::Error::from_raw_os_error(libc::ESRCH);
+            return Err(crate::error::SandboxRuntimeError::Io(gone).into());
         }
+        Ok(())
+    }
+
+    /// Send SIGSTOP to the sandbox's process groups.
+    pub fn pause(&mut self) -> Result<(), crate::error::SandlockError> {
+        self.signal_live_groups(libc::SIGSTOP)?;
         self.rt_mut().state = RuntimeState::Paused;
         Ok(())
     }
 
-    /// Send SIGCONT to the child's process group.
+    /// Send SIGCONT to the sandbox's process groups.
     pub fn resume(&mut self) -> Result<(), crate::error::SandlockError> {
-        use crate::error::SandboxRuntimeError;
-        let pid = self.runtime.as_ref()
-            .and_then(|rt| rt.child_pid)
-            .ok_or(SandboxRuntimeError::NotRunning)?;
-        let ret = unsafe { libc::killpg(pid, libc::SIGCONT) };
-        if ret < 0 {
-            return Err(SandboxRuntimeError::Io(std::io::Error::last_os_error()).into());
-        }
+        self.signal_live_groups(libc::SIGCONT)?;
         self.rt_mut().state = RuntimeState::Running;
         Ok(())
     }
 
-    /// Send SIGKILL to the child's process group.
+    /// Send SIGKILL to the sandbox's process groups.
     pub fn kill(&mut self) -> Result<(), crate::error::SandlockError> {
-        use crate::error::SandboxRuntimeError;
-        let pid = self.runtime.as_ref()
-            .and_then(|rt| rt.child_pid)
-            .ok_or(SandboxRuntimeError::NotRunning)?;
-        let ret = unsafe { libc::killpg(pid, libc::SIGKILL) };
-        if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() != Some(libc::ESRCH) {
-                return Err(SandboxRuntimeError::Io(err).into());
-            }
-        }
-        Ok(())
+        self.signal_groups(libc::SIGKILL).map(|_| ())
     }
 
     /// Set a callback invoked whenever a port bind is recorded.
@@ -1376,16 +1369,16 @@ impl Sandbox {
         self.do_create(&[name], false).await
     }
 
-    /// Freeze the sandbox: hold fork notifications + SIGSTOP the process group.
+    /// Freeze the sandbox: hold fork notifications + SIGSTOP the process groups.
     pub(crate) async fn freeze(&self) -> Result<(), crate::error::SandlockError> {
         use crate::error::{SandboxRuntimeError, SandlockError};
         let rt = self.runtime.as_ref().ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
-        let pid = rt.child_pid.ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
+        rt.child_pid.ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
         if let Some(ref resource) = rt.supervisor_resource {
             let mut rs = resource.lock().await;
             rs.hold_forks = true;
         }
-        unsafe { libc::killpg(pid, libc::SIGSTOP); }
+        let _ = rt.groups.signal(libc::SIGSTOP);
         Ok(())
     }
 
@@ -1393,13 +1386,13 @@ impl Sandbox {
     pub(crate) async fn thaw(&self) -> Result<(), crate::error::SandlockError> {
         use crate::error::{SandboxRuntimeError, SandlockError};
         let rt = self.runtime.as_ref().ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
-        let pid = rt.child_pid.ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
+        rt.child_pid.ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
         if let Some(ref resource) = rt.supervisor_resource {
             let mut rs = resource.lock().await;
             rs.hold_forks = false;
             rs.held_notif_ids.clear();
         }
-        unsafe { libc::killpg(pid, libc::SIGCONT); }
+        let _ = rt.groups.signal(libc::SIGCONT);
         Ok(())
     }
 
@@ -1573,6 +1566,9 @@ impl Sandbox {
         }
         self.rt_mut().child_pid = Some(pid);
         self.rt_mut().state = RuntimeState::Running;
+        if let Ok(leader) = crate::sys::syscall::pidfd_open(pid as u32, 0) {
+            self.rt_mut().groups.track(pid, leader);
+        }
 
         let ctrl_fd = ctrl_parent.as_raw_fd();
         let mut pid_buf = vec![0u8; n as usize * 4];
@@ -2388,8 +2384,8 @@ impl Sandbox {
 
         if let Some(cpu_pct) = self.max_cpu {
             if cpu_pct < 100 {
-                let child_pid = pid;
-                self.rt_mut().throttle_handle = Some(tokio::spawn(sandbox_throttle_cpu(child_pid, cpu_pct)));
+                let groups = Arc::clone(&self.rt_mut().groups);
+                self.rt_mut().throttle_handle = Some(tokio::spawn(sandbox_throttle_cpu(groups, cpu_pct)));
             }
         }
 
@@ -2521,7 +2517,10 @@ impl Drop for Sandbox {
         if let Some(ref mut rt) = self.runtime {
             if let Some(pid) = rt.child_pid {
                 if matches!(rt.state, RuntimeState::Created | RuntimeState::Running | RuntimeState::Paused) {
-                    unsafe { libc::killpg(pid, libc::SIGKILL) };
+                    let _ = rt.groups.signal(libc::SIGKILL);
+                    // The waitpid below must not hang on a child whose group
+                    // was never recorded. Unreaped, its pid is still ours.
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
                     let mut status: i32 = 0;
                     unsafe { libc::waitpid(pid, &mut status, 0) };
                 }
@@ -2572,16 +2571,16 @@ impl Drop for Sandbox {
 // CPU throttle
 // ================================================================
 
-async fn sandbox_throttle_cpu(pid: i32, cpu_pct: u8) {
+async fn sandbox_throttle_cpu(groups: Arc<crate::pgroup::ProcessGroups>, cpu_pct: u8) {
     use std::time::Duration;
     let period = Duration::from_millis(100);
     let run_time = period * cpu_pct as u32 / 100;
     let stop_time = period - run_time;
     loop {
         tokio::time::sleep(run_time).await;
-        if unsafe { libc::killpg(pid, libc::SIGSTOP) } < 0 { break; }
+        if !matches!(groups.signal(libc::SIGSTOP), Ok(n) if n > 0) { break; }
         tokio::time::sleep(stop_time).await;
-        if unsafe { libc::killpg(pid, libc::SIGCONT) } < 0 { break; }
+        if !matches!(groups.signal(libc::SIGCONT), Ok(n) if n > 0) { break; }
     }
 }
 
