@@ -145,7 +145,8 @@ impl NameVault {
 
     /// In the parent, after the fork: wait for the child's verdict without
     /// taking the socket out of flight. `AddrInUse` means a live sandbox of
-    /// this uid already owns the name. `child` is the child's pidfd, so a
+    /// this uid already owns the name. On any error the child has exited or
+    /// is about to, and wants reaping. `child` is the child's pidfd, so a
     /// child that died before publishing cannot hang this.
     pub(crate) fn published(&mut self, child: Option<RawFd>) -> std::io::Result<()> {
         self.child_end = None;
@@ -200,7 +201,9 @@ impl NamePublisher {
     /// In the child, after setpgid(). listen() records this pid, which is
     /// also its process group, as the socket's peer credential. The status
     /// goes to the parent either way; the socket goes with it on success.
-    pub(crate) fn publish(&self) {
+    /// False means the sandbox has no name and the child must not go on.
+    #[must_use]
+    pub(crate) fn publish(&self) -> bool {
         unsafe {
             let sock = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
             let addr = &self.addr.0 as *const _ as *const libc::sockaddr;
@@ -224,10 +227,21 @@ impl NamePublisher {
                 (*hdr).cmsg_len = libc::CMSG_LEN(4) as _;
                 std::ptr::write_unaligned(libc::CMSG_DATA(hdr) as *mut RawFd, sock);
             }
-            libc::sendmsg(self.to_vault, &msg, libc::MSG_NOSIGNAL);
+            let mut sent = libc::sendmsg(self.to_vault, &msg, libc::MSG_NOSIGNAL) >= 0;
+            if ok && !sent {
+                // The kernel refused to take the socket in flight; the
+                // parent still has to hear why.
+                let errno = (*libc::__errno_location()).to_ne_bytes();
+                std::ptr::copy_nonoverlapping(errno.as_ptr(), iov.iov_base as *mut u8, errno.len());
+                msg.msg_control = std::ptr::null_mut();
+                msg.msg_controllen = 0;
+                libc::sendmsg(self.to_vault, &msg, libc::MSG_NOSIGNAL);
+                sent = false;
+            }
             libc::close(sock);
             libc::close(self.to_vault);
             libc::close(self.vault);
+            ok && sent
         }
     }
 }
@@ -923,13 +937,20 @@ mod tests {
     /// Returns the vault and that child's pid, which the name is stamped
     /// with.
     fn claim(name: &str) -> std::io::Result<(NameVault, i32)> {
+        claim_after(name, || ())
+    }
+
+    /// As `claim`, with `in_child` run in the publishing child first. It
+    /// may only make syscalls.
+    fn claim_after(name: &str, in_child: impl FnOnce()) -> std::io::Result<(NameVault, i32)> {
         let mut vault = NameVault::new(name)?;
         let publisher = vault.publisher().unwrap();
         let child = unsafe { libc::fork() };
         assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
         if child == 0 {
-            publisher.publish();
-            unsafe { libc::_exit(0) };
+            in_child();
+            let ok = publisher.publish();
+            unsafe { libc::_exit(if ok { 0 } else { 127 }) };
         }
         let published = vault.published(None);
         unsafe { libc::waitpid(child, std::ptr::null_mut(), 0) };
@@ -946,6 +967,52 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
         drop(vault);
         assert!(!list_sandboxes().unwrap().contains(&name));
+    }
+
+    /// Every parked name is one fd in flight, which the kernel caps per
+    /// user at the sender's RLIMIT_NOFILE. Hitting the cap must be reported
+    /// as such, and must leave the name free.
+    #[test]
+    fn the_in_flight_limit_is_an_error_and_leaves_the_name_free() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // CAP_SYS_RESOURCE is exempt from the cap.
+        }
+        // 400 fds in flight for this user, at the cost of two fds here.
+        let mut pair = [0 as RawFd; 2];
+        assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0, pair.as_mut_ptr()) }, 0);
+        let (tx, _rx) = unsafe { (OwnedFd::from_raw_fd(pair[0]), OwnedFd::from_raw_fd(pair[1])) };
+        let fds = [tx.as_raw_fd(); 200];
+        for _ in 0..2 {
+            let mut byte = [0u8; 1];
+            let mut iov = libc::iovec { iov_base: byte.as_mut_ptr() as *mut libc::c_void, iov_len: 1 };
+            let mut cmsg = [0u64; 128];
+            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = cmsg.as_mut_ptr() as *mut libc::c_void;
+            msg.msg_controllen = unsafe { libc::CMSG_SPACE(800) } as _;
+            unsafe {
+                let hdr = libc::CMSG_FIRSTHDR(&msg);
+                (*hdr).cmsg_level = libc::SOL_SOCKET;
+                (*hdr).cmsg_type = libc::SCM_RIGHTS;
+                (*hdr).cmsg_len = libc::CMSG_LEN(800) as _;
+                std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(hdr) as *mut RawFd, fds.len());
+                let sent = libc::sendmsg(tx.as_raw_fd(), &msg, libc::MSG_DONTWAIT);
+                assert_eq!(sent, 1, "{}", std::io::Error::last_os_error());
+            }
+        }
+
+        let name = format!("test-ctrl-inflight-{}", std::process::id());
+        let err = claim_after(&name, || {
+            // Below what is in flight, above any fd the child still opens.
+            let low = libc::rlimit { rlim_cur: 256, rlim_max: 256 };
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &low) };
+        })
+        .err()
+        .expect("publishing past the limit must fail");
+        assert_eq!(err.raw_os_error(), Some(libc::ETOOMANYREFS), "got: {err}");
+
+        claim(&name).expect("the refused name must not stay bound");
     }
 
     /// The host can fork at any time, in ways no libc hook sees, and such a

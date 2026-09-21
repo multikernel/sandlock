@@ -2001,7 +2001,9 @@ impl Sandbox {
                 unsafe { libc::_exit(127) };
             }
             if let Some(publisher) = name_publisher {
-                publisher.publish();
+                if !publisher.publish() {
+                    unsafe { libc::_exit(127) };
+                }
             }
             let io_overrides = self.rt().io_overrides;
             if let Some((stdin_fd, stdout_fd, stderr_fd)) = io_overrides {
@@ -2095,28 +2097,31 @@ impl Sandbox {
             Err(_) => None,
         };
 
-        // The child binds the name, so a collision shows up only now; drop
-        // kills and reaps the child.
+        // The child binds the name, so a collision shows up only now. The
+        // child gives up by itself and has run nothing yet; reaping it here
+        // leaves the caller where a failure before the fork would have.
         let mut request_socket = None;
         if let Some(mut vault) = name_vault.take() {
-            match vault.published(pidfd.as_ref().map(|fd| fd.as_raw_fd())) {
-                Ok(()) => {
-                    request_socket = crate::control::bind_request_socket(&sandbox_name, pid).ok();
-                    self.rt_mut().name_vault = Some(vault);
+            if let Err(e) = vault.published(pidfd.as_ref().map(|fd| fd.as_raw_fd())) {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                    libc::waitpid(pid, std::ptr::null_mut(), 0);
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                    return Err(SandboxRuntimeError::Child(format!(
-                        "sandbox '{}' is already running",
+                self.rt_mut().child_pid = None;
+                let why = match e.raw_os_error() {
+                    Some(libc::EADDRINUSE) => format!("sandbox '{}' is already running", sandbox_name),
+                    // Each live sandbox keeps one fd in flight, and the kernel
+                    // caps those per user at RLIMIT_NOFILE.
+                    Some(libc::ETOOMANYREFS) => format!(
+                        "sandbox '{}': too many sandboxes for this user's RLIMIT_NOFILE",
                         sandbox_name
-                    ))
-                    .into());
-                }
-                Err(e) => eprintln!(
-                    "sandlock: control socket setup failed for '{}': {} \
-                     (introspection unavailable for this sandbox)",
-                    sandbox_name, e
-                ),
+                    ),
+                    _ => format!("sandbox '{}': publishing its name: {}", sandbox_name, e),
+                };
+                return Err(SandboxRuntimeError::Child(why).into());
             }
+            request_socket = crate::control::bind_request_socket(&sandbox_name, pid).ok();
+            self.rt_mut().name_vault = Some(vault);
         }
 
         let notif_fd_num = read_u32_fd(pipes.notif_r.as_raw_fd())

@@ -757,6 +757,28 @@ async fn test_control_name_survives_a_lingering_host_child() {
     assert!(took < Duration::from_millis(1500), "must not wait for the host's child, took {took:?}");
 }
 
+/// The child binds the name, so a collision is found after the fork. The
+/// caller must see what a failure before the fork would have left: an
+/// error, no child, and the owner of the name undisturbed.
+#[tokio::test]
+async fn test_control_name_collision_leaves_no_child() {
+    let policy = name_reuse_policy();
+    let name = format!("test-ctrl-collide-{}", std::process::id());
+    let mut owner = policy.clone().with_name(&name);
+    owner.create(&["true"]).await.unwrap();
+
+    let mut second = policy.with_name(&name);
+    let err = second.create(&["true"]).await.expect_err("the name is taken");
+    assert!(err.to_string().contains("is already running"), "got: {err}");
+    assert_eq!(second.pid(), None, "the losing child must be reaped, not left for drop");
+    drop(second);
+
+    let pids = sandlock_core::control::sandbox_pids(&name).expect("the owner keeps its name");
+    assert_eq!(Some(pids.child), owner.pid());
+    owner.start().unwrap();
+    assert!(owner.wait().await.unwrap().success());
+}
+
 /// `sandlock kill` has to work on a sandbox that was created but not
 /// started, so the child publishes its name before it parks, and an extra
 /// fd still reaches the command afterwards.
