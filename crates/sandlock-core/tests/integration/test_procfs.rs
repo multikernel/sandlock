@@ -443,3 +443,150 @@ async fn test_proc_cgroup_is_virtualized() {
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!(lines, ["0::/"; 4], "the host's cgroup path should not be visible");
 }
+
+fn no_proc_grant() -> sandlock_core::SandboxBuilder {
+    Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+}
+
+/// Prints 1 when the file can be opened, 0 otherwise. No pipeline and no
+/// redirect to /dev/null: a first stage that is refused exits at once, which
+/// can leave the last stage waiting forever until issue #235 is fixed, and
+/// /dev/null is not writable in these sandboxes.
+fn openable(path: &str) -> String {
+    format!("if ( : < {} ); then echo 1; else echo 0; fi", path)
+}
+
+/// Issue #218: a Landlock rule for /proc/self/maps names the first pid, so a
+/// forked child was denied the entry its parent could read.
+#[tokio::test]
+async fn test_listed_proc_self_entry_covers_every_process() {
+    let policy = no_proc_grant().fs_read("/proc/self/maps").build().unwrap();
+
+    let (ok, out) = run_sh(&policy, "exec grep -c . /proc/self/maps").await;
+    assert!(ok, "the first process should read its maps, got: {:?}", out);
+
+    // `; true` keeps sh from exec'ing grep in place of forking it.
+    let (ok, out) = run_sh(&policy, "grep -c . /proc/self/maps; true").await;
+    assert!(ok);
+    assert!(out.parse::<u32>().unwrap_or(0) > 0, "a forked child should read its maps, got: {:?}", out);
+}
+
+#[tokio::test]
+async fn test_unlisted_proc_self_entry_is_refused() {
+    let policy = no_proc_grant().fs_read("/proc/self/maps").build().unwrap();
+    let script = format!("{}; {}", openable("/proc/self/status"), openable("/proc/self/maps"));
+    let (_, out) = run_sh(&policy, &script).await;
+    assert_eq!(out, "0\n1", "only the listed entry should be served");
+
+    let policy = no_proc_grant().build().unwrap();
+    let script = format!("{}; {}", openable("/proc/self/maps"), openable("/etc/passwd"));
+    let (_, out) = run_sh(&policy, &script).await;
+    assert_eq!(out, "0\n1", "nothing under /proc/self should be served without a grant");
+}
+
+/// The fd a child gets has to describe the child, not the first process.
+#[tokio::test]
+async fn test_own_proc_self_resolves_to_the_caller() {
+    let policy = no_proc_grant().fs_read("/proc/self/stat").build().unwrap();
+    let inner = r#"read -r line < /proc/self/stat; echo "${line%% *} $$""#;
+    let (ok, out) = run_sh(&policy, &format!("sh -c '{}'; true", inner)).await;
+    assert!(ok);
+    let (from_stat, own_pid) = out.split_once(' ').unwrap_or_default();
+    assert!(!own_pid.is_empty() && from_stat == own_pid, "stat should name the caller, got: {:?}", out);
+}
+
+#[tokio::test]
+async fn test_own_proc_self_is_read_only() {
+    let policy = no_proc_grant().fs_read("/proc/self/comm").build().unwrap();
+    let script = "echo renamed > /proc/self/comm; read -r comm < /proc/self/comm; echo \"$comm\"";
+    let (_, out) = run_sh(&policy, script).await;
+    assert_eq!(out, "sh", "a read grant should not extend to writing");
+}
+
+/// `root`, `cwd` and `fd/N` lead out of /proc; their targets stay under the policy.
+#[tokio::test]
+async fn test_own_proc_self_does_not_follow_links_out() {
+    let secret = std::env::temp_dir().join(format!("sandlock-test-procself-{}", std::process::id()));
+    std::fs::write(&secret, "secret").unwrap();
+
+    let policy = no_proc_grant().fs_read("/proc/self").build().unwrap();
+    let script = format!("{}; {}", openable(&format!("/proc/self/root{}", secret.display())), openable("/proc/self/status"));
+    let (_, out) = run_sh(&policy, &script).await;
+    let _ = std::fs::remove_file(&secret);
+    assert_eq!(out, "0\n1", "only the link's target should be refused");
+}
+
+/// /proc/self/net is the host's network namespace, not the task's own data.
+#[tokio::test]
+async fn test_own_proc_self_excludes_net() {
+    let policy = no_proc_grant().fs_read("/proc/self").build().unwrap();
+    let script = format!("{}; {}", openable("/proc/self/net/arp"), openable("/proc/self/status"));
+    let (_, out) = run_sh(&policy, &script).await;
+    assert_eq!(out, "0\n1", "a /proc/self grant should not reach the net subtree");
+}
+
+/// The supervisor may hold capabilities the task lacks, and these files show
+/// more to a privileged opener.
+#[tokio::test]
+async fn test_own_proc_self_excludes_opener_privileged_files() {
+    let policy = no_proc_grant().fs_read("/proc/self").build().unwrap();
+    let script = [openable("/proc/self/pagemap"), openable("/proc/self/stack"), openable("/proc/self/status")].join("; ");
+    let (_, out) = run_sh(&policy, &script).await;
+    assert_eq!(out, "0\n0\n1", "pagemap and stack should not be opened on the task's behalf");
+}
+
+#[tokio::test]
+async fn test_own_proc_self_honors_fs_deny() {
+    let policy = no_proc_grant().fs_read("/proc/self").fs_deny("/proc/self/maps").build().unwrap();
+    // The shell reads the numeric path itself: for a forked reader, $$ would
+    // name its parent rather than its own directory.
+    let own_numeric = "if read -r line < /proc/$$/maps; then echo 1; else echo 0; fi";
+    let script = [&openable("/proc/self/maps"), own_numeric, &openable("/proc/self/status")].join("; ");
+    let (_, out) = run_sh(&policy, &script).await;
+    assert_eq!(out, "0\n0\n1", "the deny should hold under both spellings and nothing else");
+}
+
+/// /proc/self names the thread group, /proc/thread-self the calling thread,
+/// and a grant on the former reaches the latter as it does under Landlock.
+#[tokio::test]
+async fn test_own_proc_self_from_a_thread() {
+    let policy = no_proc_grant().fs_read("/proc/self").build().unwrap();
+    let script = concat!(
+        "import os, threading\n",
+        "def pid_of(path):\n",
+        "  return int(open(path).read().split()[0])\n",
+        "def work():\n",
+        "  print(pid_of('/proc/self/stat') == os.getpid(),\n",
+        "        pid_of('/proc/thread-self/stat') == threading.get_native_id())\n",
+        "t = threading.Thread(target=work)\n",
+        "t.start()\n",
+        "t.join()\n",
+    );
+    let result = policy.clone().run(&["python3", "-c", script]).await.unwrap();
+    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
+    assert_eq!(stdout.trim(), "True True", "stderr: {}", String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default()));
+}
+
+/// With a deny active, opens the handlers pass on are resolved by the
+/// supervisor, where /proc/self would be the supervisor's own directory.
+#[tokio::test]
+async fn test_own_proc_self_is_the_caller_with_a_deny_active() {
+    let policy = proc_grant().fs_deny("/tmp/sandlock-test-no-such-file").build().unwrap();
+    let (_, out) = run_sh(&policy, "cat /proc/self/comm; true").await;
+    assert_eq!(out, "cat");
+}
+
+/// Without a supervisor nothing serves /proc/self, so a listed entry has to
+/// remain a Landlock rule, first pid only as that is.
+#[tokio::test]
+async fn test_listed_proc_self_entry_survives_no_supervisor() {
+    let policy = no_proc_grant().fs_read("/proc/self/maps").no_supervisor(true).build().unwrap();
+    let (ok, out) = run_sh(&policy, "exec grep -c . /proc/self/maps").await;
+    assert!(ok);
+    assert!(out.parse::<u32>().unwrap_or(0) > 0, "got: {:?}", out);
+}
