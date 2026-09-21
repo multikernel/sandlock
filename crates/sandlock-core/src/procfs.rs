@@ -63,30 +63,41 @@ pub(crate) fn extract_proc_pid(path: &str) -> Option<i32> {
     component.parse::<i32>().ok()
 }
 
-/// Spell a per-task view of the network namespace as `/proc/net`.
-///
-/// `/proc/net` is a link to `self/net` and every task directory carries the
-/// same tree, so those spellings must reach the `/proc/net` virtualization
-/// instead of the host's tables.
-pub(crate) fn canon_proc_net(path: &str) -> std::borrow::Cow<'_, str> {
-    let tail = (|| {
-        let (task, rest) = path.strip_prefix("/proc/")?.split_once('/')?;
-        if task != "self" && task != "thread-self" && task.parse::<i32>().is_err() {
-            return None;
+const PROC_SELF: &str = "/proc/self";
+
+/// Per-task entries that show a namespace of the host, not the task.
+const NAMESPACE_ENTRIES: &[&str] = &["net", "mounts", "mountinfo", "mountstats"];
+
+/// Split `/proc/<task>[/task/<tid>]/<entry><tail>` for a namespace entry.
+fn proc_namespace_entry(path: &str) -> Option<(&'static str, &str)> {
+    let (task, rest) = path.strip_prefix("/proc/")?.split_once('/')?;
+    if task != "self" && task != "thread-self" && task.parse::<i32>().is_err() {
+        return None;
+    }
+    let rest = match rest.strip_prefix("task/") {
+        Some(thread) => {
+            let (tid, rest) = thread.split_once('/')?;
+            tid.parse::<i32>().ok()?;
+            rest
         }
-        let rest = match rest.strip_prefix("task/") {
-            Some(thread) => {
-                let (tid, rest) = thread.split_once('/')?;
-                tid.parse::<i32>().ok()?;
-                rest
-            }
-            None => rest,
-        };
-        let tail = rest.strip_prefix("net")?;
-        (tail.is_empty() || tail.starts_with('/')).then_some(tail)
-    })();
-    match tail {
-        Some(tail) => format!("/proc/net{}", tail).into(),
+        None => rest,
+    };
+    NAMESPACE_ENTRIES.iter().find_map(|&entry| {
+        let tail = rest.strip_prefix(entry)?;
+        (tail.is_empty() || tail.starts_with('/')).then_some((entry, tail))
+    })
+}
+
+/// Give every per-task spelling of a namespace entry the one name the
+/// virtualization matches.
+///
+/// `/proc/net` and `/proc/mounts` are links into `self`, and every task
+/// directory carries the same files, so any of those spellings would
+/// otherwise reach the host's tables.
+pub(crate) fn canon_proc_namespace(path: &str) -> std::borrow::Cow<'_, str> {
+    match proc_namespace_entry(path) {
+        Some(("net", tail)) => format!("/proc/net{}", tail).into(),
+        Some((entry, tail)) => format!("{}/{}{}", PROC_SELF, entry, tail).into(),
         None => path.into(),
     }
 }
@@ -321,6 +332,32 @@ pub(crate) fn generate_proc_mountinfo(
     buf.into_bytes()
 }
 
+/// Generate a virtual /proc/self/mountstats naming the same mounts as
+/// [`generate_proc_mounts`]. Read-only state is not part of this format.
+pub(crate) fn generate_proc_mountstats(
+    chroot_root: Option<&std::path::Path>,
+    chroot_mounts: &[(std::path::PathBuf, std::path::PathBuf)],
+) -> Vec<u8> {
+    let mut buf = String::new();
+
+    match chroot_root {
+        Some(root) => buf.push_str(&format!(
+            "device sandlock mounted on / with fstype {}\n", detect_fstype(root)
+        )),
+        None => buf.push_str("device rootfs mounted on / with fstype rootfs\n"),
+    }
+
+    for (virtual_path, host_path) in chroot_mounts {
+        buf.push_str(&format!(
+            "device sandlock mounted on {} with fstype {}\n",
+            virtual_path.to_string_lossy(),
+            detect_fstype(host_path),
+        ));
+    }
+
+    buf.into_bytes()
+}
+
 // ============================================================
 // /proc/net/dev and /proc/net/if_inet6 virtualization
 // ============================================================
@@ -470,7 +507,7 @@ pub(crate) async fn handle_proc_open(
         }
     }
 
-    let path = canon_proc_net(path);
+    let path = canon_proc_namespace(path);
     let path = path.as_ref();
 
     // Virtualize /proc/cpuinfo.
@@ -542,6 +579,14 @@ pub(crate) async fn handle_proc_open(
             root_is_read_only(policy),
         );
         return inject_memfd(&content);
+    }
+
+    // Virtualize /proc/self/mountstats.
+    if path == "/proc/self/mountstats" {
+        return inject_memfd(&generate_proc_mountstats(
+            policy.chroot_root.as_deref(),
+            &policy.chroot_mounts,
+        ));
     }
 
     NotifAction::Continue
@@ -1105,15 +1150,23 @@ mod tests {
     }
 
     #[test]
-    fn test_canon_proc_net() {
-        assert_eq!(canon_proc_net("/proc/self/net/dev"), "/proc/net/dev");
-        assert_eq!(canon_proc_net("/proc/thread-self/net/tcp6"), "/proc/net/tcp6");
-        assert_eq!(canon_proc_net("/proc/42/net"), "/proc/net");
-        assert_eq!(canon_proc_net("/proc/42/task/43/net/dev"), "/proc/net/dev");
-        assert_eq!(canon_proc_net("/proc/net/dev"), "/proc/net/dev");
-        assert_eq!(canon_proc_net("/proc/self/network"), "/proc/self/network");
-        assert_eq!(canon_proc_net("/proc/self/task/net/dev"), "/proc/self/task/net/dev");
-        assert_eq!(canon_proc_net("/proc/sys/net/core"), "/proc/sys/net/core");
+    fn test_canon_proc_namespace() {
+        assert_eq!(canon_proc_namespace("/proc/self/net/dev"), "/proc/net/dev");
+        assert_eq!(canon_proc_namespace("/proc/thread-self/net/tcp6"), "/proc/net/tcp6");
+        assert_eq!(canon_proc_namespace("/proc/42/net"), "/proc/net");
+        assert_eq!(canon_proc_namespace("/proc/42/task/43/net/dev"), "/proc/net/dev");
+        assert_eq!(canon_proc_namespace("/proc/net/dev"), "/proc/net/dev");
+        assert_eq!(canon_proc_namespace("/proc/self/network"), "/proc/self/network");
+        assert_eq!(canon_proc_namespace("/proc/self/task/net/dev"), "/proc/self/task/net/dev");
+        assert_eq!(canon_proc_namespace("/proc/sys/net/core"), "/proc/sys/net/core");
+
+        assert_eq!(canon_proc_namespace("/proc/thread-self/mounts"), "/proc/self/mounts");
+        assert_eq!(canon_proc_namespace("/proc/42/mountinfo"), "/proc/self/mountinfo");
+        assert_eq!(canon_proc_namespace("/proc/self/task/43/mounts"), "/proc/self/mounts");
+        assert_eq!(canon_proc_namespace("/proc/42/mountstats"), "/proc/self/mountstats");
+        assert_eq!(canon_proc_namespace("/proc/self/mountinfo"), "/proc/self/mountinfo");
+        assert_eq!(canon_proc_namespace("/proc/mounts"), "/proc/mounts");
+        assert_eq!(canon_proc_namespace("/proc/self/mountsx"), "/proc/self/mountsx");
     }
 
     #[test]
@@ -1304,6 +1357,21 @@ mod tests {
         let text = String::from_utf8(content).unwrap();
         assert!(text.contains("rootfs / rootfs rw 0 0"));
         assert_eq!(text.lines().count(), 1);
+    }
+
+    #[test]
+    fn test_generate_proc_mountstats() {
+        let text = String::from_utf8(generate_proc_mountstats(None, &[])).unwrap();
+        assert_eq!(text, "device rootfs mounted on / with fstype rootfs\n");
+
+        let tmp = std::env::temp_dir();
+        let mounts = vec![(std::path::PathBuf::from("/work"), tmp.clone())];
+        let text = String::from_utf8(generate_proc_mountstats(Some(tmp.as_path()), &mounts)).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("device sandlock mounted on / with fstype "), "got: {}", text);
+        assert!(lines[1].starts_with("device sandlock mounted on /work with fstype "), "got: {}", text);
+        assert!(!text.contains(tmp.to_str().unwrap()));
     }
 
     #[test]

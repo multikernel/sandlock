@@ -376,3 +376,56 @@ async fn test_proc_net_virt_covers_per_task_spellings() {
     let counts: Vec<&str> = stdout.lines().collect();
     assert_eq!(counts, ["1"; 5], "only loopback should be listed under every spelling");
 }
+
+fn proc_grant() -> sandlock_core::SandboxBuilder {
+    Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+}
+
+async fn run_sh(policy: &Sandbox, script: &str) -> (bool, String) {
+    let result = policy.clone().run(&["sh", "-c", script]).await.unwrap();
+    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
+    (result.success(), stdout.trim().to_string())
+}
+
+/// Every task directory carries the mount files, so with /proc readable no
+/// per-task spelling may show the host's table in place of the virtual one.
+#[tokio::test]
+async fn test_proc_mounts_virt_covers_per_task_spellings() {
+    let policy = proc_grant().build().unwrap();
+    let script = concat!(
+        "for p in /proc/mounts /proc/self/mounts /proc/thread-self/mounts ",
+        "/proc/$$/mounts /proc/self/task/$$/mounts /proc/self/mountinfo ",
+        "/proc/thread-self/mountinfo /proc/$$/mountinfo /proc/$$/task/$$/mountinfo ",
+        "/proc/self/mountstats /proc/$$/mountstats; do ",
+        "wc -l < $p; done",
+    );
+    let (_, out) = run_sh(&policy, script).await;
+    let counts: Vec<&str> = out.lines().map(str::trim).collect();
+    assert_eq!(counts, ["1"; 11], "only the sandbox root should be listed under every spelling");
+}
+
+/// mountstats is generated from the same --fs-mount list as /proc/mounts.
+#[tokio::test]
+async fn test_proc_mountstats_lists_fs_mounts() {
+    let host = std::env::temp_dir();
+    let policy = proc_grant()
+        .fs_mount("/work", &host)
+        .fs_mount_ro("/data", &host)
+        .build()
+        .unwrap();
+    let script = "cat /proc/mounts; echo; cat /proc/thread-self/mountstats";
+    let (_, out) = run_sh(&policy, script).await;
+    let (mounts, mountstats) = out.split_once("\n\n").expect("both files should print");
+
+    let mounted_on: Vec<&str> = mounts.lines().filter_map(|l| l.split(' ').nth(1)).collect();
+    let stats_on: Vec<&str> = mountstats.lines().filter_map(|l| l.split(' ').nth(4)).collect();
+    assert_eq!(mounted_on, ["/", "/work", "/data"], "got: {}", mounts);
+    assert_eq!(stats_on, mounted_on, "mountstats should name the mounts /proc/mounts does, got: {}", mountstats);
+    assert!(!out.contains(host.to_str().unwrap()), "host paths should not appear, got: {}", out);
+}
