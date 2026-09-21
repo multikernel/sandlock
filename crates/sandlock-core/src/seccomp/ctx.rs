@@ -33,6 +33,8 @@ pub struct SupervisorCtx {
     /// an internal RwLock, so handlers can query it synchronously
     /// without `.await`.
     pub processes: Arc<ProcessIndex>,
+    /// Process groups to signal for kill, pause and resume.
+    pub groups: Arc<crate::pgroup::ProcessGroups>,
     /// Immutable policy — no lock needed.
     pub policy: Arc<NotifPolicy>,
     /// pidfd for the child process (immutable after spawn).

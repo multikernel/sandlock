@@ -1037,6 +1037,7 @@ mod tests {
             chroot: Arc::new(Mutex::new(ChrootState::new())),
             netlink: Arc::new(NetlinkState::new()),
             processes: Arc::new(ProcessIndex::new()),
+            groups: Arc::new(crate::pgroup::ProcessGroups::new()),
             policy: Arc::new(fake_policy(argv_safety_required)),
             child_pidfd: None,
             notif_fd: -1,

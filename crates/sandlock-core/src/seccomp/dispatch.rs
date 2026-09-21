@@ -289,6 +289,22 @@ pub(crate) fn build_dispatch_table(
     }
 
     // ------------------------------------------------------------------
+    // Process groups (always on)
+    // ------------------------------------------------------------------
+    {
+        let groups = Arc::clone(&ctx.groups);
+        table.register(libc::SYS_setsid, move |cx: &HandlerCtx| {
+            let action = crate::pgroup::handle_setsid(&cx.notif, cx.notif_fd, &groups);
+            async move { action }
+        });
+        let groups = Arc::clone(&ctx.groups);
+        table.register(libc::SYS_setpgid, move |cx: &HandlerCtx| {
+            let action = crate::pgroup::handle_setpgid(&cx.notif, cx.notif_fd, &groups);
+            async move { action }
+        });
+    }
+
+    // ------------------------------------------------------------------
     // Memory management (conditional on has_memory_limit)
     // ------------------------------------------------------------------
     if policy.has_memory_limit {
@@ -1110,6 +1126,7 @@ mod handler_tests {
             chroot: Arc::new(Mutex::new(ChrootState::new())),
             netlink: Arc::new(NetlinkState::new()),
             processes: Arc::new(ProcessIndex::new()),
+            groups: Arc::new(crate::pgroup::ProcessGroups::new()),
             policy: Arc::new(NotifPolicy {
                 max_memory_bytes: 0,
                 max_processes: 0,
