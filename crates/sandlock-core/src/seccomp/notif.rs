@@ -425,7 +425,7 @@ fn last_errno(fallback: i32) -> i32 {
 }
 
 /// `openat2` relative to `dirfd`. Returns an owned fd or the errno.
-fn openat2_at(dirfd: RawFd, path: &std::ffi::CStr, flags: u64, mode: u64, resolve: u64)
+pub(crate) fn openat2_at(dirfd: RawFd, path: &std::ffi::CStr, flags: u64, mode: u64, resolve: u64)
     -> Result<OwnedFd, i32>
 {
     use std::os::unix::io::FromRawFd;
@@ -552,7 +552,7 @@ pub(crate) fn decode_open_args(notif: &SeccompNotif, notif_fd: RawFd) -> Option<
 
 /// Wrap a freshly opened raw fd into an `InjectFdSend`, honoring the child's
 /// `O_CLOEXEC` request. Ownership of `raw_fd` moves into the action.
-fn inject_open_result(raw_fd: i32, flags: u64) -> NotifAction {
+pub(crate) fn inject_open_result(raw_fd: i32, flags: u64) -> NotifAction {
     use std::os::unix::io::FromRawFd;
     if raw_fd < 0 {
         return NotifAction::Errno(last_errno(libc::EACCES));

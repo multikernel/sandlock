@@ -376,15 +376,20 @@ pub const MIN_ABI: u32 = 6;
 /// Requires Landlock ABI v6 or later. Returns an error if the kernel does
 /// not meet this requirement.
 pub fn confine(policy: &Sandbox) -> Result<(), SandlockError> {
-    confine_inner(policy, true)
+    confine_inner(policy, true, false)
+}
+
+/// As [`confine`], for a child whose opens the seccomp supervisor mediates.
+pub(crate) fn confine_supervised(policy: &Sandbox) -> Result<(), SandlockError> {
+    confine_inner(policy, true, true)
 }
 
 /// Apply Landlock filesystem confinement without TCP bind/connect rules.
 pub fn confine_filesystem(policy: &Sandbox) -> Result<(), SandlockError> {
-    confine_inner(policy, false)
+    confine_inner(policy, false, false)
 }
 
-fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError> {
+fn confine_inner(policy: &Sandbox, handle_net: bool, supervised: bool) -> Result<(), SandlockError> {
     // Step 1 — detect host ABI version.
     let abi = abi_version().map_err(|e| {
         SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
@@ -496,6 +501,11 @@ fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError
             if !host.exists() { continue; }
             host.as_path()
         } else {
+            // The supervisor serves a task's own /proc/self reads. A rule here
+            // would bind to the one pid adding it and treat the first process
+            // differently from its children. Without a supervisor that rule is
+            // all there is, so it stays.
+            if supervised && crate::procfs::is_own_proc_read_grant(path) { continue; }
             path.as_path()
         };
         add_path_rule(&ruleset_fd, rule_path, READ_ACCESS).map_err(|e| {

@@ -402,6 +402,11 @@ impl ProcessIndex {
             .unwrap_or(false)
     }
 
+    /// Thread-group leader of a tracked task: what `/proc/self` means to it.
+    pub fn tgid_of(&self, pid: i32) -> Option<i32> {
+        self.inner.read().ok()?.get(&pid).map(|e| e.tgid)
+    }
+
     /// Number of tracked processes (for /proc/loadavg total).
     pub fn len(&self) -> usize {
         self.inner.read().map(|g| g.len()).unwrap_or(0)
