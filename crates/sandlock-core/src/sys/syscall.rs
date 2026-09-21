@@ -194,6 +194,24 @@ pub fn pidfd_getfd(pidfd: &OwnedFd, targetfd: i32, flags: u32) -> io::Result<Own
     Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
 }
 
+/// Signal the process group led by the process behind `pidfd`. The group
+/// is named by the pidfd rather than by number, so a recycled pgid cannot
+/// redirect the signal, and it stays reachable after its leader is reaped.
+pub fn pidfd_signal_group(pidfd: &OwnedFd, sig: i32) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    const PIDFD_SIGNAL_PROCESS_GROUP: u64 = 1 << 2;
+    unsafe {
+        syscall4(
+            crate::arch::SYS_PIDFD_SEND_SIGNAL,
+            pidfd.as_raw_fd() as u64,
+            sig as u64,
+            0,
+            PIDFD_SIGNAL_PROCESS_GROUP,
+        )?
+    };
+    Ok(())
+}
+
 // ============================================================
 // memfd_create wrapper
 // ============================================================

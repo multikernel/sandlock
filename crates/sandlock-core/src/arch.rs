@@ -17,6 +17,7 @@ pub const SYS_SECCOMP: i64 = Sysno::seccomp as i64;
 pub const SYS_MEMFD_CREATE: i64 = Sysno::memfd_create as i64;
 pub const SYS_PIDFD_OPEN: i64 = Sysno::pidfd_open as i64;
 pub const SYS_PIDFD_GETFD: i64 = Sysno::pidfd_getfd as i64;
+pub const SYS_PIDFD_SEND_SIGNAL: i64 = Sysno::pidfd_send_signal as i64;
 
 #[cfg(target_arch = "x86_64")]
 mod imp {

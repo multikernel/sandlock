@@ -65,6 +65,10 @@ const BASE_NOTIF_SYSCALLS: &[i64] = &[
     // on its way out, so its exit can release its process slot.
     libc::SYS_exit,
     libc::SYS_exit_group,
+    // Signals reach the sandbox by process group, so the supervisor has to
+    // see every group the sandbox makes or tries to join.
+    libc::SYS_setsid,
+    libc::SYS_setpgid,
 ];
 
 const MEMORY_NOTIF_SYSCALLS: &[i64] = &[

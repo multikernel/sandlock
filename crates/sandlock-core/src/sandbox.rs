@@ -273,6 +273,7 @@ struct Runtime {
     state: RuntimeState,
     child_pid: Option<i32>,
     pidfd: Option<std::os::fd::OwnedFd>,
+    groups: Arc<crate::pgroup::ProcessGroups>,
     notif_handle: Option<JoinHandle<()>>,
     policy_fn_worker: Option<crate::policy_fn::PolicyFnWorker>,
     throttle_handle: Option<JoinHandle<()>>,
@@ -1616,6 +1617,7 @@ impl Sandbox {
                 }),
                 child_pid: Some(clone_pid),
                 pidfd: None,
+                groups: Arc::new(crate::pgroup::ProcessGroups::new()),
                 notif_handle: None,
                 policy_fn_worker: None,
                 throttle_handle: None,
@@ -1716,6 +1718,7 @@ impl Sandbox {
             state: RuntimeState::Created,
             child_pid: None,
             pidfd: None,
+            groups: Arc::new(crate::pgroup::ProcessGroups::new()),
             notif_handle: None,
             policy_fn_worker: None,
             throttle_handle: None,
@@ -2102,6 +2105,10 @@ impl Sandbox {
             Ok(fd) => Some(fd),
             Err(_) => None,
         };
+        // The child's first act is setpgid(0, 0), so its pid names its group.
+        if let Some(leader) = pidfd.as_ref().and_then(|pfd| pfd.try_clone().ok()) {
+            self.rt_mut().groups.track(pid, leader);
+        }
 
         let notif_fd_num = read_u32_fd(pipes.notif_r.as_raw_fd())
             .map_err(|e| SandboxRuntimeError::Child(format!("read notif fd from child: {}", e)))?;
@@ -2309,6 +2316,7 @@ impl Sandbox {
                 chroot: Arc::clone(&chroot_state),
                 netlink: Arc::new(crate::netlink::NetlinkState::new()),
                 processes: Arc::clone(&processes),
+                groups: Arc::clone(&self.rt_mut().groups),
                 policy: Arc::new(notif_policy),
                 child_pidfd: child_pidfd_raw,
                 notif_fd: notif_raw_fd,

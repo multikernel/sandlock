@@ -78,3 +78,6 @@ mod test_popen;
 
 #[path = "integration/test_tty.rs"]
 mod test_tty;
+
+#[path = "integration/test_process_groups.rs"]
+mod test_process_groups;
