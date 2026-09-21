@@ -79,11 +79,6 @@ fn request_socket_name(uid: u32, name: &str, child: i32) -> Vec<u8> {
     format!("sandlock/{uid}/{name}/{child}").into_bytes()
 }
 
-fn socket_addr(name: &str) -> std::io::Result<SocketAddr> {
-    let uid = unsafe { libc::getuid() };
-    SocketAddr::from_abstract_name(socket_name(uid, name))
-}
-
 fn request_socket_addr(name: &str, child: i32) -> std::io::Result<SocketAddr> {
     let uid = unsafe { libc::getuid() };
     SocketAddr::from_abstract_name(request_socket_name(uid, name, child))
@@ -677,6 +672,22 @@ pub(crate) fn parse_proc_net_unix(text: &str, uid: u32) -> Vec<String> {
 }
 
 /// Names of the caller's live sandboxes, sorted.
+/// Child pids of the request sockets `/proc/net/unix` lists for `name`. A
+/// released one can still be listed while a copy of its fd lingers in some
+/// forked child; it refuses connections, which is how the caller tells.
+pub(crate) fn parse_request_sockets(text: &str, uid: u32, name: &str) -> Vec<i32> {
+    let prefix = format!("@sandlock/{uid}/{name}/");
+    text.lines()
+        .skip(1)
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let flags = fields.nth(3)?;
+            let path = fields.nth(3)?;
+            (flags == "00010000").then(|| path.strip_prefix(&prefix)?.parse().ok()).flatten()
+        })
+        .collect()
+}
+
 pub fn list_sandboxes() -> std::io::Result<Vec<String>> {
     // Any process can bind an abstract name that is not UTF-8; ours are
     // ASCII, so a mangled foreign name just fails the prefix match.
@@ -714,15 +725,32 @@ fn connect_as(addr: &SocketAddr, my_uid: u32) -> Result<(UnixStream, libc::ucred
     }
 }
 
-fn connect_control(name: &str, my_uid: u32) -> Result<(UnixStream, libc::ucred), String> {
-    let addr = socket_addr(name).map_err(|e| format!("socket address for '{}': {}", name, e))?;
-    connect_as(&addr, my_uid).map_err(|e| match e.kind() {
-        std::io::ErrorKind::ConnectionRefused => format!("no sandbox named '{}'", name),
-        std::io::ErrorKind::PermissionDenied => {
-            format!("socket for '{}' is owned by another user", name)
-        }
-        _ => format!("connect to sandbox '{}': {}", name, e),
-    })
+/// The name socket's stamp: the child's pid and the owner's uid. Nobody
+/// accepts on that socket, so this connection stays in its backlog for the
+/// life of the sandbox and a full backlog would block a connect forever;
+/// hence non-blocking, and hence for `kill`, not for polling.
+fn name_socket_cred(name: &str, my_uid: u32) -> Result<libc::ucred, String> {
+    let (sun, len) = raw_addr(&socket_name(unsafe { libc::getuid() }, name));
+    let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK;
+    let fd = unsafe { libc::socket(libc::AF_UNIX, kind, 0) };
+    if fd < 0 {
+        return Err(format!("connect to sandbox '{}': {}", name, std::io::Error::last_os_error()));
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    if unsafe { libc::connect(fd.as_raw_fd(), &sun as *const _ as *const libc::sockaddr, len) } != 0 {
+        let e = std::io::Error::last_os_error();
+        return Err(match e.kind() {
+            std::io::ErrorKind::ConnectionRefused => format!("no sandbox named '{}'", name),
+            std::io::ErrorKind::WouldBlock => {
+                format!("sandbox '{}' has no pid lookups left: its name socket's backlog is full", name)
+            }
+            _ => format!("connect to sandbox '{}': {}", name, e),
+        });
+    }
+    match peer_cred(fd.as_raw_fd()) {
+        Some(cred) if cred.uid == my_uid => Ok(cred),
+        _ => Err(format!("socket for '{}' is owned by another user", name)),
+    }
 }
 
 /// The two pids `kill` needs, both stamped by the kernel at listen() time.
@@ -734,32 +762,60 @@ pub struct SandboxPids {
 }
 
 /// Needs no cooperation from the supervisor, so it works on one that is
-/// stopped or wedged.
+/// stopped or wedged. Each call uses up one slot of the name socket's
+/// backlog for the life of the sandbox, so this is not for polling.
 pub fn sandbox_pids(name: &str) -> Result<SandboxPids, String> {
     sandbox_pids_as(name, unsafe { libc::getuid() })
 }
 
 fn sandbox_pids_as(name: &str, my_uid: u32) -> Result<SandboxPids, String> {
-    let (stream, pids) = connect_request(name, my_uid)?;
-    drop(stream);
-    Ok(pids)
-}
-
-/// Connect to a sandbox's request socket, by way of its name socket.
-fn connect_request(name: &str, my_uid: u32) -> Result<(UnixStream, SandboxPids), String> {
-    let (_, child) = connect_control(name, my_uid)?;
-    let addr = request_socket_addr(name, child.pid)
-        .map_err(|e| format!("socket address for '{}': {}", name, e))?;
+    let child = name_socket_cred(name, my_uid)?.pid;
     // The name exists, so the child is up; the supervisor has not bound
     // its side yet if this is refused.
-    let (stream, supervisor) = connect_as(&addr, my_uid).map_err(|e| match e.kind() {
+    let (_, supervisor) = connect_request_socket(name, child, my_uid)?;
+    Ok(SandboxPids { child, supervisor: supervisor.pid })
+}
+
+fn connect_request_socket(name: &str, child: i32, my_uid: u32) -> Result<(UnixStream, libc::ucred), String> {
+    let addr = request_socket_addr(name, child)
+        .map_err(|e| format!("socket address for '{}': {}", name, e))?;
+    connect_as(&addr, my_uid).map_err(|e| match e.kind() {
         std::io::ErrorKind::ConnectionRefused => format!("sandbox '{}' is still starting", name),
         std::io::ErrorKind::PermissionDenied => {
             format!("socket for '{}' is owned by another user", name)
         }
         _ => format!("connect to sandbox '{}': {}", name, e),
-    })?;
-    Ok((stream, SandboxPids { child: child.pid, supervisor: supervisor.pid }))
+    })
+}
+
+/// Connect to a sandbox's request socket, found in the listing so that it
+/// costs the name socket nothing and can be done as often as one likes.
+/// The child's pid is then the one the supervisor put in the name, not a
+/// kernel stamp.
+fn connect_request(name: &str, my_uid: u32) -> Result<(UnixStream, SandboxPids), String> {
+    let text = std::fs::read("/proc/net/unix")
+        .map_err(|e| format!("list sockets for '{}': {}", name, e))?;
+    let text = String::from_utf8_lossy(&text);
+    let uid = unsafe { libc::getuid() };
+    if !parse_proc_net_unix(&text, uid).iter().any(|n| n == name) {
+        return Err(format!("no sandbox named '{}'", name));
+    }
+    let mut last = format!("sandbox '{}' is still starting", name);
+    for child in parse_request_sockets(&text, uid, name) {
+        match connect_request_socket(name, child, my_uid) {
+            Ok((stream, supervisor)) => {
+                return Ok((stream, SandboxPids { child, supervisor: supervisor.pid }));
+            }
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+/// Both pids of a sandbox for display, as often as one likes. `kill` wants
+/// [`sandbox_pids`] instead, where the kernel vouches for the child's pid.
+pub fn listed_sandbox_pids(name: &str) -> Result<SandboxPids, String> {
+    connect_request(name, unsafe { libc::getuid() }).map(|(_, pids)| pids)
 }
 
 /// Send a request to a sandbox's control socket and return the response.
@@ -850,6 +906,19 @@ mod tests {
         assert_eq!(parse_proc_net_unix(text, 1001), vec!["other"]);
     }
 
+    #[test]
+    fn finds_the_request_sockets_of_one_name() {
+        let text = "Num RefCount Protocol Flags Type St Inode Path\n\
+            0000000000000000: 00000002 00000000 00010000 0001 01 1 @sandlock/1000/beta\n\
+            0000000000000000: 00000002 00000000 00010000 0001 01 2 @sandlock/1000/beta/4242\n\
+            0000000000000000: 00000003 00000000 00000000 0001 03 3 @sandlock/1000/beta/4242\n\
+            0000000000000000: 00000002 00000000 00010000 0001 01 4 @sandlock/1000/beta/77\n\
+            0000000000000000: 00000002 00000000 00010000 0001 01 5 @sandlock/1000/beta/pgrp\n\
+            0000000000000000: 00000002 00000000 00010000 0001 01 6 @sandlock/1000/betamax/9\n\
+            0000000000000000: 00000002 00000000 00010000 0001 01 7 @sandlock/1001/beta/8\n";
+        assert_eq!(parse_request_sockets(text, 1000, "beta"), vec![4242, 77]);
+    }
+
     /// Claim `name` the way a sandbox does: a forked child publishes it.
     /// Returns the vault and that child's pid, which the name is stamped
     /// with.
@@ -928,6 +997,33 @@ mod tests {
         let expect = unsafe { libc::getuid() }.wrapping_add(1);
         let err = sandbox_pids_as(&name, expect).unwrap_err();
         assert!(err.contains("owned by another user"), "got: {err}");
+    }
+
+    /// Polling must cost the sandbox nothing, and a used-up name socket must
+    /// say so instead of blocking the caller forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_kernel_stamped_lookups_use_up_the_name_socket() {
+        let name = format!("test-ctrl-backlog-{}", std::process::id());
+        // The request socket has to be served, or its own backlog fills first.
+        let (_vault, task) = serve(&name, unsafe { libc::getuid() });
+        let n = name.clone();
+        let (used, err, listed) = tokio::task::spawn_blocking(move || {
+            let mut used = 0u32;
+            let err = loop {
+                match sandbox_pids(&n) {
+                    Ok(_) => used += 1,
+                    Err(e) => break e,
+                }
+                assert!(used < 1_000_000, "the backlog never filled");
+            };
+            (used, err, listed_sandbox_pids(&n))
+        })
+        .await
+        .unwrap();
+        task.abort();
+        assert!(err.contains("no pid lookups left"), "after {used} lookups: {err}");
+        let pids = listed.expect("the listing path must still work");
+        assert_eq!(pids.supervisor, std::process::id() as i32);
     }
 
     /// A request socket we let go of must refuse connections at once, even

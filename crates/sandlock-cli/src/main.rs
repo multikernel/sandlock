@@ -289,7 +289,8 @@ async fn main() -> Result<()> {
                 for name in &names {
                     // The pids need no answer from the supervisor; the rest
                     // does, and a supervisor that does not answer is still
-                    // alive because its socket is.
+                    // alive because its socket is. ps gets polled, so none
+                    // of this touches the name socket's backlog.
                     let (status, ports) = match sandlock_core::control::sandbox_info(name) {
                         Ok(info) => (
                             info.mode.unwrap_or_else(|| "running".to_string()),
@@ -297,7 +298,7 @@ async fn main() -> Result<()> {
                         ),
                         Err(_) => ("unresponsive".to_string(), "?".to_string()),
                     };
-                    let (pid, uptime, cmd) = match sandlock_core::control::sandbox_pids(name) {
+                    let (pid, uptime, cmd) = match sandlock_core::control::listed_sandbox_pids(name) {
                         Ok(pids) => (
                             pids.child.to_string(),
                             proc_uptime(pids.child).unwrap_or_else(|| "?".to_string()),
