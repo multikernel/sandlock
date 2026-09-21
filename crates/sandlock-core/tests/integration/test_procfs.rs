@@ -590,3 +590,50 @@ async fn test_listed_proc_self_entry_survives_no_supervisor() {
     assert!(ok);
     assert!(out.parse::<u32>().unwrap_or(0) > 0, "got: {:?}", out);
 }
+
+/// A directory of links for the sandbox to open, removed on drop.
+struct LinkDir(std::path::PathBuf);
+
+impl LinkDir {
+    fn new(tag: &str, links: &[(&str, &str)]) -> Self {
+        let dir = std::env::temp_dir().join(format!("sandlock-test-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, target) in links {
+            std::os::unix::fs::symlink(target, dir.join(name)).unwrap();
+        }
+        Self(dir)
+    }
+
+    fn path(&self, name: &str) -> String {
+        self.0.join(name).display().to_string()
+    }
+}
+
+impl Drop for LinkDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// With a deny active the supervisor performs the open, and it could open what
+/// the /proc handlers refuse: they only judged the string the child wrote.
+#[tokio::test]
+async fn test_deny_active_hides_proc_targets_behind_links() {
+    let links = LinkDir::new("proclinks", &[("init", "/proc/1"), ("syms", "/proc/kallsyms"), ("passwd", "/etc/passwd")]);
+    let policy = proc_grant()
+        .fs_read(&links.0)
+        .fs_deny("/tmp/sandlock-test-no-such-file")
+        .build()
+        .unwrap();
+    // No pipelines here: a first stage that is refused exits at once, and
+    // until issue #235 is fixed that can leave the last stage waiting forever.
+    let script = [
+        openable(&format!("{}/cmdline", links.path("init"))),
+        openable(&links.path("syms")),
+        openable(&links.path("passwd")),
+    ]
+    .join("; ");
+    let (_, out) = run_sh(&policy, &script).await;
+    assert_eq!(out, "0\n0\n1", "a link should not reach a /proc entry the direct path is refused");
+}

@@ -486,8 +486,24 @@ fn deny_open_verdict(
     flags: u64,
     policy: &NotifPolicy,
     pfs: &super::state::PolicyFnState,
+    processes: &super::state::ProcessIndex,
 ) -> Option<i32> {
-    if pfs.is_path_denied(&realpath.to_string_lossy()) {
+    let real = realpath.to_string_lossy();
+    if pfs.is_path_denied(&real) {
+        return Some(libc::EACCES);
+    }
+    // The /proc handlers judged the string the child wrote. A link elsewhere
+    // can lead here, and the supervisor's open would succeed where the
+    // child's own would not: on the supervisor's /proc entry above all.
+    if crate::procfs::is_hidden_proc_path(&real, processes) {
+        return Some(libc::EACCES);
+    }
+    let opener_privileged = realpath.starts_with("/proc")
+        && realpath
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| crate::procfs::OPENER_PRIVILEGED_FILES.contains(&name));
+    if opener_privileged {
         return Some(libc::EACCES);
     }
     let acc = flags as i32 & libc::O_ACCMODE;
@@ -574,6 +590,7 @@ fn reopen_existing_on_behalf(
     flags: u64,
     policy: &NotifPolicy,
     pfs: &super::state::PolicyFnState,
+    processes: &super::state::ProcessIndex,
 ) -> NotifAction {
     // File exists. Refuse O_CREAT|O_EXCL the way the kernel would.
     if (flags & libc::O_CREAT as u64) != 0 && (flags & libc::O_EXCL as u64) != 0 {
@@ -583,7 +600,7 @@ fn reopen_existing_on_behalf(
         Some(p) => p,
         None => return NotifAction::Errno(libc::EACCES),
     };
-    if let Some(errno) = deny_open_verdict(&realpath, flags, policy, pfs) {
+    if let Some(errno) = deny_open_verdict(&realpath, flags, policy, pfs, processes) {
         return NotifAction::Errno(errno);
     }
     // Identity check on the pinned file: a denied file reached via a hardlink,
@@ -617,6 +634,7 @@ fn create_new_on_behalf(
     resolve: u64,
     policy: &NotifPolicy,
     pfs: &super::state::PolicyFnState,
+    processes: &super::state::ProcessIndex,
 ) -> NotifAction {
     let p = std::path::Path::new(path);
     let file_name = match p.file_name() {
@@ -646,7 +664,7 @@ fn create_new_on_behalf(
         Some(p) => p,
         None => return NotifAction::Errno(libc::EACCES),
     };
-    if let Some(errno) = deny_open_verdict(&parent_real.join(file_name), flags, policy, pfs) {
+    if let Some(errno) = deny_open_verdict(&parent_real.join(file_name), flags, policy, pfs, processes) {
         return NotifAction::Errno(errno);
     }
     let c_name = match std::ffi::CString::new(file_name.as_encoded_bytes()) {
@@ -668,6 +686,7 @@ fn on_behalf_open_for_deny(
     notif: &SeccompNotif,
     policy: &NotifPolicy,
     pfs: &super::state::PolicyFnState,
+    processes: &super::state::ProcessIndex,
     notif_fd: RawFd,
 ) -> NotifAction {
     // No allowlist configured (Landlock is not allowlisting the filesystem):
@@ -700,9 +719,9 @@ fn on_behalf_open_for_deny(
     // final component and any `openat2` RESOLVE_* flags it requested.
     let probe_flags = (libc::O_PATH | libc::O_CLOEXEC) as u64 | (flags & libc::O_NOFOLLOW as u64);
     match openat2_at(base.as_raw_fd(), &c_path, probe_flags, 0, RESOLVE_NO_MAGICLINKS | resolve) {
-        Ok(probe) => reopen_existing_on_behalf(probe, flags, policy, pfs),
+        Ok(probe) => reopen_existing_on_behalf(probe, flags, policy, pfs, processes),
         Err(errno) if errno == libc::ENOENT && (flags & libc::O_CREAT as u64) != 0 => {
-            create_new_on_behalf(&base, &path, flags, mode, resolve, policy, pfs)
+            create_new_on_behalf(&base, &path, flags, mode, resolve, policy, pfs, processes)
         }
         Err(errno) => NotifAction::Errno(errno),
     }
@@ -2211,7 +2230,7 @@ async fn handle_notification(
                     || Some(nr) == arch::sys_open();
                 if matches!(action, NotifAction::Continue) && is_openat_family && has_denied {
                     let pfs = ctx.policy_fn.lock().await;
-                    on_behalf_open_for_deny(&notif, policy, &pfs, fd)
+                    on_behalf_open_for_deny(&notif, policy, &pfs, &ctx.processes, fd)
                 } else {
                     action
                 }
