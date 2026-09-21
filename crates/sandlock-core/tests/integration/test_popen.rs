@@ -156,6 +156,43 @@ async fn test_popen_group_killed_on_drop() {
     assert!(reaped, "grandchild {gc_pid} should be dead+reaped after group kill");
 }
 
+/// A descendant still running when the main process exits dies with it. Left
+/// alone it would run on unsupervised, holding the caller's stdio (issue #251).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_wait_kills_descendants_the_main_process_left_behind() {
+    let mut sb = base().with_name("popen-leftover");
+    // The trailing sleep keeps the shell alive until the background job has
+    // exec'd, so the survivor really exists when the shell exits.
+    let mut child = sb
+        .popen(
+            &["sh", "-c", "sleep 100 & echo $!; sleep 1"],
+            StdioMode::Inherit,
+            StdioMode::Piped,
+            StdioMode::Inherit,
+        )
+        .await
+        .unwrap();
+    let stdout = File::from(child.take_stdout().expect("stdout pipe"));
+    let mut line = String::new();
+    BufReader::new(stdout).read_line(&mut line).unwrap();
+    let bg_pid: i32 = line.trim().parse().expect("background pid");
+    assert!(unsafe { libc::kill(bg_pid, 0) } == 0, "background job should be alive");
+
+    let res = child.wait().await.unwrap();
+    assert!(res.success());
+
+    // A killed orphan stays a zombie until init/subreaper reaps it.
+    let mut gone = false;
+    for _ in 0..100 {
+        if unsafe { libc::kill(bg_pid, 0) } != 0 {
+            gone = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(gone, "background job {bg_pid} outlived the sandbox's main process");
+}
+
 /// Regression: capture-mode `run` still buffers stdout into the RunResult
 /// after the do_create stdio refactor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -721,15 +721,6 @@ async fn drive_txn_stages(
             tokio::task::spawn_blocking(move || drain_capped_tee(read_fd, STAGE_STDERR_CAP, tee));
 
         let mut result = sb.wait().await.map_err(at)?;
-        // Kill the stage's process group before awaiting the drain. The stage's
-        // fd 2 is a pipe (dup2 cleared its CLOEXEC), so a backgrounded descendant
-        // (`sh -c 'sleep 300 & exit 0'`) keeps the pipe's write end open after the
-        // direct child is reaped; there is no PID namespace on this path to reap
-        // it, so `drain` — which waits for EOF, i.e. every fd-2 holder to close —
-        // would otherwise block forever. `Sandbox::kill` SIGKILLs the child's
-        // whole process group (the child is the group leader), releasing any such
-        // holder. Best-effort: a group already gone is fine.
-        let _ = sb.kill();
         // wait() returns stderr: None on the inherit path; the captured bytes are
         // authoritative.
         result.stderr = Some(drain.await.unwrap_or_default());
