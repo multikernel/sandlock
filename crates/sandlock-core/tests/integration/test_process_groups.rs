@@ -93,3 +93,83 @@ print(left and os.waitpid(pid, 0)[1] == 0)
     .await;
     assert_eq!(out, "True");
 }
+
+fn wait_gone(pid: i32) -> bool {
+    for _ in 0..300 {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    false
+}
+
+/// Spawn a sandbox whose main process has started a session leader of its
+/// own, and return that leader's pid.
+async fn spawn_with_session_leader(sb: &mut Sandbox) -> i32 {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("leader");
+    let script = format!(
+        r#"
+import os, signal
+pid = os.fork()
+if pid == 0:
+    os.setsid()
+    signal.pause()
+open("{}.tmp", "w").write(str(pid))
+os.rename("{}.tmp", "{}")
+signal.pause()
+"#,
+        pid_file.display(),
+        pid_file.display(),
+        pid_file.display(),
+    );
+    sb.fs_writable.push(dir.path().to_path_buf());
+    sb.spawn(&["python3", "-c", &script]).await.unwrap();
+    for _ in 0..600 {
+        if let Ok(text) = std::fs::read_to_string(&pid_file) {
+            return text.trim().parse().unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the sandbox never reported its session leader");
+}
+
+/// The repro from #252: a setsid() child used to outlive `kill()`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_kill_reaches_a_process_that_left_the_main_group() {
+    let mut sb = policy().with_name("pgroup-kill");
+    let leader = spawn_with_session_leader(&mut sb).await;
+    assert_ne!(unsafe { libc::getpgid(leader) }, sb.pid().unwrap());
+
+    sb.kill().unwrap();
+    assert!(wait_gone(leader), "session leader {leader} survived kill()");
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), sb.wait()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_pause_stops_a_process_that_left_the_main_group() {
+    let mut sb = policy().with_name("pgroup-pause");
+    let leader = spawn_with_session_leader(&mut sb).await;
+
+    sb.pause().unwrap();
+    let state = || {
+        std::fs::read_to_string(format!("/proc/{leader}/stat"))
+            .ok()
+            .and_then(|s| s.rsplit_once(") ").map(|(_, rest)| rest.chars().next().unwrap()))
+    };
+    let mut stopped = false;
+    for _ in 0..300 {
+        if state() == Some('T') {
+            stopped = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(stopped, "session leader {leader} kept running through pause()");
+
+    sb.resume().unwrap();
+    sb.kill().unwrap();
+    assert!(wait_gone(leader));
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), sb.wait()).await;
+}
