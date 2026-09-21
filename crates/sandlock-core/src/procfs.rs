@@ -66,7 +66,7 @@ pub(crate) fn extract_proc_pid(path: &str) -> Option<i32> {
 const PROC_SELF: &str = "/proc/self";
 
 /// Per-task entries that show a namespace of the host, not the task.
-const NAMESPACE_ENTRIES: &[&str] = &["net", "mounts", "mountinfo", "mountstats"];
+const NAMESPACE_ENTRIES: &[&str] = &["net", "mounts", "mountinfo", "mountstats", "cgroup"];
 
 /// Split `/proc/<task>[/task/<tid>]/<entry><tail>` for a namespace entry.
 fn proc_namespace_entry(path: &str) -> Option<(&'static str, &str)> {
@@ -587,6 +587,12 @@ pub(crate) async fn handle_proc_open(
             policy.chroot_root.as_deref(),
             &policy.chroot_mounts,
         ));
+    }
+
+    // The real file names the host's slice and scope. This is what a task
+    // sees from inside a cgroup namespace of its own.
+    if path == "/proc/self/cgroup" {
+        return inject_memfd(b"0::/\n");
     }
 
     NotifAction::Continue
@@ -1166,6 +1172,9 @@ mod tests {
         assert_eq!(canon_proc_namespace("/proc/42/mountstats"), "/proc/self/mountstats");
         assert_eq!(canon_proc_namespace("/proc/self/mountinfo"), "/proc/self/mountinfo");
         assert_eq!(canon_proc_namespace("/proc/mounts"), "/proc/mounts");
+        assert_eq!(canon_proc_namespace("/proc/thread-self/cgroup"), "/proc/self/cgroup");
+        assert_eq!(canon_proc_namespace("/proc/42/task/43/cgroup"), "/proc/self/cgroup");
+        assert_eq!(canon_proc_namespace("/proc/cgroups"), "/proc/cgroups");
         assert_eq!(canon_proc_namespace("/proc/self/mountsx"), "/proc/self/mountsx");
     }
 

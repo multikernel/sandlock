@@ -429,3 +429,17 @@ async fn test_proc_mountstats_lists_fs_mounts() {
     assert_eq!(stats_on, mounted_on, "mountstats should name the mounts /proc/mounts does, got: {}", mountstats);
     assert!(!out.contains(host.to_str().unwrap()), "host paths should not appear, got: {}", out);
 }
+
+/// /proc/self/cgroup names the host's slice and scope, so every spelling
+/// shows the root of a cgroup namespace instead.
+#[tokio::test]
+async fn test_proc_cgroup_is_virtualized() {
+    let policy = proc_grant().build().unwrap();
+    let script = concat!(
+        "for p in /proc/self/cgroup /proc/thread-self/cgroup /proc/$$/cgroup ",
+        "/proc/self/task/$$/cgroup; do cat $p; done",
+    );
+    let (_, out) = run_sh(&policy, script).await;
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines, ["0::/"; 4], "the host's cgroup path should not be visible");
+}
