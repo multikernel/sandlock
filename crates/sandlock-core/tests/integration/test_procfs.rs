@@ -419,7 +419,9 @@ async fn test_proc_mountstats_lists_fs_mounts() {
         .fs_mount_ro("/data", &host)
         .build()
         .unwrap();
-    let script = "cat /proc/mounts; echo; cat /proc/thread-self/mountstats";
+    // Threads have no mountstats, and a cat that stats its operand first
+    // would see that, so name the process and let the shell do the open.
+    let script = "cat < /proc/mounts; echo; cat < /proc/$$/mountstats";
     let (_, out) = run_sh(&policy, script).await;
     let (mounts, mountstats) = out.split_once("\n\n").expect("both files should print");
 
@@ -435,9 +437,10 @@ async fn test_proc_mountstats_lists_fs_mounts() {
 #[tokio::test]
 async fn test_proc_cgroup_is_virtualized() {
     let policy = proc_grant().build().unwrap();
+    // task/$$ exists only under the shell, so the shell does the open.
     let script = concat!(
         "for p in /proc/self/cgroup /proc/thread-self/cgroup /proc/$$/cgroup ",
-        "/proc/self/task/$$/cgroup; do cat $p; done",
+        "/proc/self/task/$$/cgroup; do cat < $p; done",
     );
     let (_, out) = run_sh(&policy, script).await;
     let lines: Vec<&str> = out.lines().collect();
