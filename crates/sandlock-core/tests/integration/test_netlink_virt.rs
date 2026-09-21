@@ -476,3 +476,26 @@ async fn reply_sender_address_looks_like_the_kernel() {
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     assert_eq!(stdout.trim(), "(12, True)", "expected sizeof(sockaddr_nl) and nl_pid == 0");
 }
+
+/// iproute2 resolves `ip link show lo` with a non-dump `RTM_GETLINK` carrying
+/// `IFLA_IFNAME`, and reads anything but `RTM_NEWLINK` as a missing device.
+#[tokio::test]
+async fn link_lookup_by_name_finds_only_lo() {
+    let script = concat!(
+        "import socket, struct\n",
+        "s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE)\n",
+        "def lookup(name):\n",
+        "  attr = struct.pack('HH', 4 + len(name) + 1, 3) + name + b'\\0'\n",
+        "  attr += bytes(-len(attr) % 4)\n",
+        "  body = struct.pack('BBHiII', 0, 0, 0, 0, 0, 0) + attr\n",
+        "  s.send(struct.pack('IHHII', 16 + len(body), 18, 1, 1, 0) + body)\n",
+        "  data = s.recv(4096)\n",
+        "  mtype = struct.unpack_from('H', data, 4)[0]\n",
+        "  return mtype if mtype != 2 else struct.unpack_from('i', data, 16)[0]\n",
+        "print(lookup(b'lo'), lookup(b'eth0'))\n",
+    );
+    let policy = base_policy().build().unwrap();
+    let result = policy.clone().run(&["python3", "-c", script]).await.unwrap();
+    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
+    assert_eq!(stdout.trim(), "16 -19", "expected RTM_NEWLINK for lo and -ENODEV for eth0");
+}
