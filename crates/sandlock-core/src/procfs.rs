@@ -17,14 +17,21 @@
 //     read_link returned an error. None of these cases involve the
 //     supervisor approving a syscall based on user-controlled string
 //     contents, so the seccomp_unotify TOCTOU class doesn't apply.
+//   - A task's own /proc/self reads use InjectFdSend with an fd the
+//     supervisor opened from its own copy of the path, so a later swap of
+//     the string in child memory changes nothing.
 
 use std::collections::HashSet;
-use std::os::unix::io::RawFd;
+use std::ffi::CString;
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::seccomp::notif::{content_memfd, read_child_cstr, write_child_mem, NotifAction, NotifPolicy};
+use crate::seccomp::notif::{
+    content_memfd, decode_open_args, inject_open_result, openat2_at, read_child_cstr,
+    write_child_mem, NotifAction, NotifPolicy,
+};
 use crate::seccomp::state::{NetworkState, ProcessIndex};
 use crate::sys::structs::{SeccompNotif, EACCES};
 
@@ -64,6 +71,7 @@ pub(crate) fn extract_proc_pid(path: &str) -> Option<i32> {
 }
 
 const PROC_SELF: &str = "/proc/self";
+const PROC_THREAD_SELF: &str = "/proc/thread-self";
 
 /// Per-task entries that show a namespace of the host, not the task.
 const NAMESPACE_ENTRIES: &[&str] = &["net", "mounts", "mountinfo", "mountstats", "cgroup"];
@@ -464,6 +472,7 @@ fn read_path(notif: &SeccompNotif, addr: u64, notif_fd: RawFd) -> Option<String>
 ///
 /// - Denies access to sensitive kernel files.
 /// - Virtualizes /proc/cpuinfo and /proc/meminfo with fake content.
+/// - Serves the caller's own /proc/self entries that the read list covers.
 /// - Lets everything else through.
 pub(crate) async fn handle_proc_open(
     notif: &SeccompNotif,
@@ -595,7 +604,146 @@ pub(crate) async fn handle_proc_open(
         return inject_memfd(b"0::/\n");
     }
 
+    if let Some(action) = open_own_proc_on_behalf(notif, notif_fd, path, processes, policy) {
+        return action;
+    }
+
     NotifAction::Continue
+}
+
+// ============================================================
+// A task's own /proc/self
+// ============================================================
+
+const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+const RESOLVE_BENEATH: u64 = 0x08;
+
+const WRITE_SIDE_FLAGS: i32 = libc::O_WRONLY
+    | libc::O_RDWR
+    | libc::O_CREAT
+    | libc::O_TRUNC
+    | (libc::O_TMPFILE & !libc::O_DIRECTORY);
+
+// openat2 rejects an O_PATH open that carries any flag outside this set.
+const PATH_OPEN_FLAGS: i32 = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW;
+const READ_OPEN_FLAGS: i32 =
+    libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_LARGEFILE;
+
+/// What these show depends on the capabilities of whoever opened them, and
+/// the supervisor may hold more than the task it would be opening them for.
+const OPENER_PRIVILEGED_FILES: &[&str] = &["pagemap", "stack", "seccomp_cache"];
+
+/// True for a read grant the supervisor serves instead of Landlock, which
+/// could only bind it to the one pid that exists when the rule is added
+/// (issue #218). The net subtree is never served, so its grants stay rules.
+pub(crate) fn is_own_proc_read_grant(path: &std::path::Path) -> bool {
+    (path.starts_with(PROC_SELF) || path.starts_with(PROC_THREAD_SELF))
+        && path.to_str().is_some_and(|p| !matches!(proc_namespace_entry(p), Some(("net", _))))
+}
+
+/// A path inside the caller's own /proc directory.
+#[derive(Debug, PartialEq)]
+struct OwnProcTarget<'a> {
+    base: String,
+    rest: &'a str,
+    /// The pid-free spellings, which are what a policy entry can name.
+    self_forms: Vec<String>,
+}
+
+impl OwnProcTarget<'_> {
+    fn is_under_any(&self, list: &[std::path::PathBuf]) -> bool {
+        self.self_forms
+            .iter()
+            .any(|form| list.iter().any(|entry| std::path::Path::new(form).starts_with(entry)))
+    }
+}
+
+fn strip_dir_prefix<'a>(path: &'a str, dir: &str) -> Option<&'a str> {
+    let rest = path.strip_prefix(dir)?;
+    (rest.is_empty() || rest.starts_with('/')).then_some(rest)
+}
+
+fn own_proc_target(path: &str, tid: i32, tgid: i32) -> Option<OwnProcTarget<'_>> {
+    let own = format!("/proc/{}", tgid);
+    if let Some(rest) = strip_dir_prefix(path, PROC_THREAD_SELF) {
+        return Some(OwnProcTarget {
+            base: format!("{}/task/{}", own, tid),
+            rest,
+            // Landlock would let a grant on /proc/self reach a thread's
+            // directory, so the same grant has to cover it here.
+            self_forms: vec![
+                format!("{}{}", PROC_THREAD_SELF, rest),
+                format!("{}/task/{}{}", PROC_SELF, tid, rest),
+            ],
+        });
+    }
+    // A dirfd on /proc/self reads back as /proc/<tgid>, so the numeric
+    // spelling of the caller's own directory has to match too.
+    let rest = strip_dir_prefix(path, PROC_SELF).or_else(|| strip_dir_prefix(path, &own))?;
+    Some(OwnProcTarget { base: own, rest, self_forms: vec![format!("{}{}", PROC_SELF, rest)] })
+}
+
+/// Serve a read-only open inside the caller's own /proc directory, when the
+/// read list covers it.
+///
+/// A Landlock rule for /proc/self names one pid, so only the supervisor can
+/// give each task its own entry. `None` leaves the open to Landlock: a write,
+/// or a walk through a link such as `cwd` or `fd/N`, gets the kernel's
+/// verdict on the real target instead of ours.
+fn open_own_proc_on_behalf(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+    path: &str,
+    processes: &ProcessIndex,
+    policy: &NotifPolicy,
+) -> Option<NotifAction> {
+    // Chroot mode already services /proc on behalf of the child.
+    if policy.chroot_root.is_some() {
+        return None;
+    }
+    // A namespace entry that has no virtual form must not reach the real file.
+    if proc_namespace_entry(path).is_some() {
+        return None;
+    }
+    let tid = notif.pid as i32;
+    let target = own_proc_target(path, tid, processes.tgid_of(tid)?)?;
+    // The deny precheck matches the string the child wrote, which the
+    // numeric spelling of its own directory would slip past.
+    if !target.is_under_any(&policy.chroot_readable) || target.is_under_any(&policy.chroot_denied) {
+        return None;
+    }
+    let file_name = target.rest.rsplit('/').next().unwrap_or_default();
+    if OPENER_PRIVILEGED_FILES.contains(&file_name) {
+        return None;
+    }
+
+    let args = decode_open_args(notif, notif_fd)?;
+    let flags = args.flags as i32;
+    if flags & WRITE_SIDE_FLAGS != 0 {
+        return None;
+    }
+    let kept = if flags & libc::O_PATH != 0 { PATH_OPEN_FLAGS } else { READ_OPEN_FLAGS };
+
+    let base = CString::new(target.base).ok()?;
+    let base_fd = unsafe {
+        libc::open(base.as_ptr(), libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+    };
+    if base_fd < 0 {
+        return None;
+    }
+    let base_fd = unsafe { OwnedFd::from_raw_fd(base_fd) };
+
+    let rel = target.rest.trim_start_matches('/');
+    let rel = CString::new(if rel.is_empty() { "." } else { rel }).ok()?;
+    let fd = openat2_at(
+        base_fd.as_raw_fd(),
+        &rel,
+        ((flags & kept) | libc::O_CLOEXEC) as u64,
+        0,
+        RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
+    )
+    .ok()?;
+    Some(inject_open_result(fd.into_raw_fd(), args.flags))
 }
 
 // ============================================================
@@ -1153,6 +1301,58 @@ mod tests {
         assert_eq!(extract_proc_pid("/proc/net/tcp"), None);
         assert_eq!(extract_proc_pid("/etc/group"), None);
         assert_eq!(extract_proc_pid("/proc/"), None);
+    }
+
+    #[test]
+    fn test_own_proc_target() {
+        let target = own_proc_target("/proc/self/maps", 12, 10).unwrap();
+        assert_eq!((target.base.as_str(), target.rest), ("/proc/10", "/maps"));
+        assert_eq!(target.self_forms, ["/proc/self/maps"]);
+
+        let target = own_proc_target("/proc/thread-self/stat", 12, 10).unwrap();
+        assert_eq!((target.base.as_str(), target.rest), ("/proc/10/task/12", "/stat"));
+        assert_eq!(target.self_forms, ["/proc/thread-self/stat", "/proc/self/task/12/stat"]);
+
+        // What a dirfd on /proc/self reads back as.
+        let target = own_proc_target("/proc/10/maps", 12, 10).unwrap();
+        assert_eq!(target.self_forms, ["/proc/self/maps"]);
+
+        let target = own_proc_target("/proc/self", 10, 10).unwrap();
+        assert_eq!((target.rest, target.self_forms[0].as_str()), ("", "/proc/self"));
+
+        assert_eq!(own_proc_target("/proc/11/maps", 12, 10), None);
+        assert_eq!(own_proc_target("/proc/100/maps", 12, 10), None);
+        assert_eq!(own_proc_target("/proc/selfish", 12, 10), None);
+        assert_eq!(own_proc_target("/proc/cpuinfo", 12, 10), None);
+    }
+
+    #[test]
+    fn test_own_proc_target_is_under_any() {
+        use std::path::PathBuf;
+        let thread = own_proc_target("/proc/thread-self/stat", 12, 10).unwrap();
+        assert!(thread.is_under_any(&[PathBuf::from("/proc/thread-self/stat")]));
+        assert!(thread.is_under_any(&[PathBuf::from("/proc/self")]));
+        assert!(thread.is_under_any(&[PathBuf::from("/proc")]));
+        assert!(!thread.is_under_any(&[PathBuf::from("/proc/self/stat")]));
+
+        let maps = own_proc_target("/proc/10/maps", 12, 10).unwrap();
+        assert!(maps.is_under_any(&[PathBuf::from("/usr"), PathBuf::from("/proc/self/maps")]));
+        assert!(!maps.is_under_any(&[PathBuf::from("/proc/self/map")]));
+        assert!(!maps.is_under_any(&[]));
+    }
+
+    #[test]
+    fn test_is_own_proc_read_grant() {
+        use std::path::Path;
+        assert!(is_own_proc_read_grant(Path::new("/proc/self")));
+        assert!(is_own_proc_read_grant(Path::new("/proc/self/maps")));
+        assert!(is_own_proc_read_grant(Path::new("/proc/thread-self/stat")));
+        assert!(is_own_proc_read_grant(Path::new("/proc/self/mounts")));
+        assert!(!is_own_proc_read_grant(Path::new("/proc/self/net")));
+        assert!(!is_own_proc_read_grant(Path::new("/proc/thread-self/net/arp")));
+        assert!(!is_own_proc_read_grant(Path::new("/proc")));
+        assert!(!is_own_proc_read_grant(Path::new("/proc/selfish")));
+        assert!(!is_own_proc_read_grant(Path::new("/proc/1/maps")));
     }
 
     #[test]
