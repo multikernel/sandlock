@@ -637,3 +637,85 @@ async fn test_deny_active_hides_proc_targets_behind_links() {
     let (_, out) = run_sh(&policy, &script).await;
     assert_eq!(out, "0\n0\n1", "a link should not reach a /proc entry the direct path is refused");
 }
+
+/// Issue #246: the supervisor walks the path when a deny is active, so
+/// /proc/self would name the supervisor, and /dev/stdin, a link to
+/// /proc/self/fd/0, would be refused as a magic link.
+#[tokio::test]
+async fn test_deny_active_reads_proc_self_as_the_caller() {
+    let links = LinkDir::new("selflinks", &[("self", "/proc/self"), ("thread", "/proc/thread-self")]);
+    let policy = proc_grant()
+        .fs_read("/dev")
+        .fs_read(&links.0)
+        .fs_deny("/tmp/sandlock-test-no-such-file")
+        .build()
+        .unwrap();
+    // The pipes are made in the process itself: a shell pipeline whose first
+    // stage exits at once can hang until issue #235 is fixed.
+    let script = format!(
+        concat!(
+            "import os\n",
+            "def piped(path_of, text):\n",
+            "    r, w = os.pipe(); os.write(w, text); os.close(w)\n",
+            "    return open(path_of(r)).read()\n",
+            "print(open('{}/comm').read().strip(), open('{}/comm').read().strip())\n",
+            "print(piped(lambda fd: '/proc/self/fd/%d' % fd, b'proc-fd'))\n",
+            "print(piped(lambda fd: '/dev/fd/%d' % fd, b'dev-fd'))\n",
+            "os.dup2(os.pipe()[0], 0)\n",
+            "print('stdin', open('/dev/stdin').closed, flush=True)\n",
+            "open('/dev/stdout', 'w').write('stdout\\n')\n",
+        ),
+        links.path("self"),
+        links.path("thread"),
+    );
+    let result = policy.clone().run(&["python3", "-c", &script]).await.unwrap();
+    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
+    assert_eq!(
+        stdout.trim(),
+        "python3 python3\nproc-fd\ndev-fd\nstdin False\nstdout",
+        "stderr: {}",
+        String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default())
+    );
+}
+
+/// A grant on /proc/self has to cover the caller's entry when the supervisor
+/// reaches it under its numeric name, and a deny on it has to hold there too.
+#[tokio::test]
+async fn test_deny_active_matches_proc_self_under_its_pid() {
+    let links = LinkDir::new("selfforms", &[("self", "/proc/self")]);
+    let policy = no_proc_grant()
+        .fs_read("/proc/self")
+        .fs_read(&links.0)
+        .fs_deny("/tmp/sandlock-test-no-such-file")
+        .build()
+        .unwrap();
+    let (_, out) = run_sh(&policy, &format!("cat {}/comm; true", links.path("self"))).await;
+    assert_eq!(out, "cat", "a /proc/self grant should cover the entry behind a link");
+
+    let policy = proc_grant().fs_deny("/proc/self/maps").build().unwrap();
+    let own_numeric = "if read -r line < /proc/$$/maps; then echo 1; else echo 0; fi";
+    let script = [own_numeric, &openable("/proc/self/status")].join("; ");
+    let (_, out) = run_sh(&policy, &script).await;
+    assert_eq!(out, "0\n1", "the deny should hold under the numeric spelling with /proc readable");
+}
+
+/// What has a virtual form must not be served as the real file because a link
+/// led to it, and a link to a magic link stays refused: only the kernel could
+/// say whose fd it means.
+#[tokio::test]
+async fn test_deny_active_refuses_what_it_cannot_resolve_for_the_caller() {
+    let links = LinkDir::new("nslinks", &[("self", "/proc/self"), ("chain", "/proc/self/fd/0")]);
+    let policy = proc_grant()
+        .fs_read(&links.0)
+        .fs_deny("/tmp/sandlock-test-no-such-file")
+        .build()
+        .unwrap();
+    let script = [
+        openable(&format!("{}/mounts", links.path("self"))),
+        openable(&links.path("chain")),
+        openable(&format!("{}/status", links.path("self"))),
+    ]
+    .join("; ");
+    let (_, out) = run_sh(&policy, &script).await;
+    assert_eq!(out, "0\n0\n1");
+}
