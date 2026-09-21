@@ -59,6 +59,15 @@ pub(crate) fn is_sensitive_proc(path: &str) -> bool {
         .any(|&sensitive| path == sensitive || path.starts_with(&format!("{}/", sensitive)))
 }
 
+/// True for a /proc path the sandbox must never be handed: a sensitive
+/// kernel file, or the directory of a process outside the sandbox.
+///
+/// Directory listings already hide foreign PIDs, but a process could still
+/// open /proc/{ppid}/cmdline (or any guessed PID) directly.
+pub(crate) fn is_hidden_proc_path(path: &str, processes: &ProcessIndex) -> bool {
+    is_sensitive_proc(path) || extract_proc_pid(path).is_some_and(|pid| !processes.contains(pid))
+}
+
 /// Extract a numeric PID from a `/proc/{pid}/...` path.
 ///
 /// Returns `None` for non-numeric components like `/proc/self/...`,
@@ -501,19 +510,8 @@ pub(crate) async fn handle_proc_open(
         None => return NotifAction::Continue,
     };
 
-    // Block sensitive paths.
-    if is_sensitive_proc(path) {
+    if is_hidden_proc_path(path, processes) {
         return NotifAction::Errno(EACCES);
-    }
-
-    // Block access to /proc/{pid}/ entries for PIDs outside the sandbox.
-    // This complements the getdents64 PID filtering — directory listings
-    // already hide non-sandbox PIDs, but without this check a process
-    // could still open /proc/{ppid}/cmdline (or any guessed PID) directly.
-    if let Some(pid) = extract_proc_pid(path) {
-        if !processes.contains(pid) {
-            return NotifAction::Errno(EACCES);
-        }
     }
 
     let path = canon_proc_namespace(path);
@@ -631,7 +629,7 @@ const READ_OPEN_FLAGS: i32 =
 
 /// What these show depends on the capabilities of whoever opened them, and
 /// the supervisor may hold more than the task it would be opening them for.
-const OPENER_PRIVILEGED_FILES: &[&str] = &["pagemap", "stack", "seccomp_cache"];
+pub(crate) const OPENER_PRIVILEGED_FILES: &[&str] = &["pagemap", "stack", "seccomp_cache"];
 
 /// True for a read grant the supervisor serves instead of Landlock, which
 /// could only bind it to the one pid that exists when the rule is added
