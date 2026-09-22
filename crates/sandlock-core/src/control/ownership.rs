@@ -1,10 +1,10 @@
 use std::io;
 
 const HEADER: usize = 4;
-const SIGNATURE: [u16; 3] = [0x534c, 0x434f, 1];
+const SIGNATURE: [u16; 3] = [0x534c, 0x434f, 2];
 const NAME_BYTES: usize = 64;
 const TOKEN_WORDS: usize = 9;
-const SLOT_SIZE: usize = 2 + TOKEN_WORDS + NAME_BYTES;
+const SLOT_SIZE: usize = 3 + TOKEN_WORDS + NAME_BYTES;
 const SLOTS: usize = 256;
 const SEMAPHORES: usize = HEADER + SLOTS * SLOT_SIZE;
 
@@ -16,6 +16,7 @@ pub(crate) struct Claim {
     registry: Registry,
     slot: usize,
     owner: i32,
+    token: [u16; TOKEN_WORDS],
     pub entry: Entry,
 }
 
@@ -24,6 +25,7 @@ pub(crate) struct Entry {
     pub name: String,
     pub token: String,
     pub supervisor: i32,
+    pub child: Option<i32>,
 }
 
 #[repr(C)]
@@ -51,7 +53,7 @@ fn invalid() -> io::Error {
 impl Registry {
     fn open(create: bool) -> io::Result<Option<Self>> {
         let uid = unsafe { libc::getuid() };
-        let key = (uid ^ 0x534c4301).max(1) as libc::key_t;
+        let key = (uid ^ 0x534c4302).max(1) as libc::key_t;
         let flags = 0o600 | if create { libc::IPC_CREAT } else { 0 };
         let id = unsafe { libc::semget(key, SEMAPHORES as i32, flags) };
         if id < 0 && !create && io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
@@ -188,10 +190,21 @@ impl Registry {
                 .iter()
                 .map(|v| format!("{v:04x}"))
                 .collect();
+            let child = match data[SLOT_SIZE - 1] {
+                0 => None,
+                1 => {
+                    let pid = checked(unsafe {
+                        libc::semctl(self.0, (start + SLOT_SIZE - 1) as i32, libc::GETPID)
+                    })?;
+                    (pid > 0).then_some(pid)
+                }
+                _ => return Err(invalid()),
+            };
             entries.push(Entry {
                 name,
                 token,
                 supervisor,
+                child,
             });
         }
         Ok(entries)
@@ -253,11 +266,13 @@ impl Registry {
             name: name.into(),
             token: token.iter().map(|v| format!("{v:04x}")).collect(),
             supervisor: owner,
+            child: None,
         };
         Ok(Claim {
             registry: self,
             slot,
             owner,
+            token,
             entry,
         })
     }
@@ -276,7 +291,54 @@ impl Drop for Transaction {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ChildPublisher {
+    id: i32,
+    start: usize,
+    token: [u16; TOKEN_WORDS],
+}
+
+impl ChildPublisher {
+    pub(crate) fn publish(self) -> bool {
+        let mut ops = [libc::sembuf {
+            sem_num: 0,
+            sem_op: 0,
+            sem_flg: libc::IPC_NOWAIT as i16,
+        }; TOKEN_WORDS * 3 + 2];
+        // Check the generation atomically, so a delayed child cannot stamp a reused slot.
+        for (i, &word) in self.token.iter().enumerate() {
+            for (op, delta) in
+                ops[i * 3..i * 3 + 3]
+                    .iter_mut()
+                    .zip([-(word as i16), 0, word as i16])
+            {
+                op.sem_num = (self.start + 2 + i) as u16;
+                op.sem_op = delta;
+            }
+        }
+        for op in &mut ops[TOKEN_WORDS * 3..] {
+            op.sem_num = (self.start + SLOT_SIZE - 1) as u16;
+        }
+        ops[TOKEN_WORDS * 3 + 1].sem_op = 1;
+        loop {
+            if unsafe { libc::semop(self.id, ops.as_mut_ptr(), ops.len()) } == 0 {
+                return true;
+            }
+            if io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                return false;
+            }
+        }
+    }
+}
+
 impl Claim {
+    pub(crate) fn child_publisher(&self) -> ChildPublisher {
+        ChildPublisher {
+            id: self.registry.0,
+            start: HEADER + self.slot * SLOT_SIZE,
+            token: self.token,
+        }
+    }
     pub(crate) fn new(name: &str) -> io::Result<Self> {
         Registry::open(true)?.ok_or_else(invalid)?.claim(name)
     }
@@ -420,6 +482,39 @@ mod tests {
         std::io::stdout().flush().unwrap();
         let mut byte = [0];
         let _ = std::io::Read::read(&mut std::io::stdin(), &mut byte);
+    }
+
+    #[test]
+    fn child_publication_cannot_touch_a_reused_slot_or_its_owner_stamp() {
+        let registry = TestRegistry::new();
+        let first = registry.0.claim("first").unwrap();
+        let stale = first.child_publisher();
+        drop(first);
+        let replacement = registry.0.claim("replacement").unwrap();
+        assert!(!stale.publish());
+        let publisher = replacement.child_publisher();
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            let published = publisher.publish();
+            unsafe {
+                libc::_exit(if published { 0 } else { 1 });
+            }
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert_eq!(status, 0);
+        let entry = registry
+            .0
+            .entries(&registry.0.values().unwrap())
+            .unwrap()
+            .remove(0);
+        assert_eq!(entry.supervisor, unsafe { libc::getpid() });
+        assert_eq!(entry.child, Some(child));
+        assert!(
+            !publisher.publish(),
+            "a second publisher must not replace the child stamp"
+        );
     }
 
     #[test]

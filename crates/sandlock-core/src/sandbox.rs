@@ -1537,7 +1537,7 @@ impl Sandbox {
             }
         }
 
-        let pid = crate::control::fork_without_control_fds(None);
+        let pid = crate::control::fork_without_control_fds();
         if pid < 0 {
             unsafe { libc::close(ctrl_child_fd) };
             return Err(SandboxRuntimeError::Fork(std::io::Error::last_os_error()).into());
@@ -1976,7 +1976,7 @@ impl Sandbox {
 
         // Claim before fork so a name collision leaves no child to reap.
         let sandbox_name = self.rt().name.clone();
-        let mut control_sockets = match crate::control::bind_control_sockets(&sandbox_name) {
+        let mut control_socket = match crate::control::bind_control_socket(&sandbox_name) {
             Ok(s) => Some(s),
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                 return Err(SandboxRuntimeError::Child(format!(
@@ -1997,26 +1997,24 @@ impl Sandbox {
             }
             Err(e) => return Err(SandboxRuntimeError::Io(e).into()),
         };
-        let pgrp_socket = control_sockets.as_ref().map(|s| s.pgrp.as_raw_fd());
+        let child_publisher = control_socket.as_ref().and_then(|s| s.claim.as_ref()).map(|c| c.child_publisher());
 
-        let pid = crate::control::fork_without_control_fds(pgrp_socket);
+        let pid = crate::control::fork_without_control_fds();
         if pid < 0 {
             return Err(SandboxRuntimeError::Fork(std::io::Error::last_os_error()).into());
         }
 
         if pid == 0 {
             // ===== CHILD PROCESS =====
-            // killpg() needs the group to exist before anyone can connect,
-            // and the dup2 loops below have fixed targets that can be this
-            // socket's own fd number, so both come first.
+            // Publish only after the process group exists, before confinement denies IPC.
             if unsafe { libc::setpgid(0, 0) } != 0 {
                 use std::io::Write;
                 let err = std::io::Error::last_os_error();
                 let _ = writeln!(std::io::stderr(), "sandlock child: setpgid: {err}");
                 unsafe { libc::_exit(127) };
             }
-            if let Some(fd) = pgrp_socket {
-                crate::control::publish_pgrp(fd);
+            if let Some(publisher) = child_publisher {
+                if !publisher.publish() { unsafe { libc::_exit(127); } }
             }
             let io_overrides = self.rt().io_overrides;
             if let Some((stdin_fd, stdout_fd, stderr_fd)) = io_overrides {
@@ -2357,7 +2355,7 @@ impl Sandbox {
 
             // Independent of the seccomp-notify loop so accept() never adds
             // latency to syscall notification processing.
-            if let Some(mut sockets) = control_sockets.take() {
+            if let Some(mut sockets) = control_socket.take() {
                 self.rt_mut().control_claim = sockets.claim.take();
                 self.rt_mut().control_handle = Some(crate::control::spawn_control_loop(
                     sockets,
@@ -2382,7 +2380,7 @@ impl Sandbox {
 
         // No notify supervisor (--no-supervisor or nested): still answer ps,
         // inspect, and kill, with the static policy and no ports.
-        if let Some(mut sockets) = control_sockets.take() {
+        if let Some(mut sockets) = control_socket.take() {
             self.rt_mut().control_claim = sockets.claim.take();
             self.rt_mut().control_handle = Some(crate::control::spawn_control_loop(
                 sockets,

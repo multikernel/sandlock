@@ -2,10 +2,10 @@
 //!
 //! Names are owned by process-associated SEM_UNDO claims in a per-user
 //! SysV semaphore registry. Ordinary host forks cannot retain those claims.
-//! Each claim has a random instance token used for two abstract Unix sockets:
-//! the supervisor's request listener and the child's process-group listener.
+//! Each claim has a random instance token for one abstract Unix request socket.
+//! The child stamps its process-group identity into a dedicated semaphore.
 //! Socket copies can outlive a claim without reserving its human-readable name.
-//! Both peers authenticate SO_PEERCRED; the child calls listen() after setpgid().
+//! Request peers authenticate SO_PEERCRED; PID lookups use kernel GETPID stamps.
 //!
 //! ## Wire protocol
 //!
@@ -48,15 +48,14 @@ use crate::seccomp::ctx::SupervisorCtx;
 // Socket address
 // ============================================================
 
-fn instance_addr(token: &str, pgrp: bool) -> std::io::Result<SocketAddr> {
+fn instance_addr(token: &str) -> std::io::Result<SocketAddr> {
     let uid = unsafe { libc::getuid() };
-    let suffix = if pgrp { "/pgrp" } else { "" };
-    SocketAddr::from_abstract_name(format!("sandlock/{uid}/v2/{token}{suffix}"))
+    SocketAddr::from_abstract_name(format!("sandlock/{uid}/v2/{token}"))
 }
 
 #[cfg(test)]
 fn socket_addr(name: &str) -> std::io::Result<SocketAddr> {
-    instance_addr(&ownership::lookup(name)?.token, false)
+    instance_addr(&ownership::lookup(name)?.token)
 }
 
 // ============================================================
@@ -137,77 +136,36 @@ impl Drop for ControlFd {
     }
 }
 
-/// fork() with the live list locked. The child closes every control fd but
-/// `keep` before anything else runs, so the sandbox never holds one; `keep`
-/// is the child's own pgrp socket, which it still has to listen on.
-pub(crate) fn fork_without_control_fds(keep: Option<RawFd>) -> libc::pid_t {
+/// Close inherited control endpoints in Sandlock's own children.
+pub(crate) fn fork_without_control_fds() -> libc::pid_t {
     let live = live();
     let pid = unsafe { libc::fork() };
     if pid == 0 {
         for &fd in live.iter() {
-            if Some(fd) != keep {
-                unsafe { libc::close(fd) };
-            }
+            unsafe { libc::close(fd) };
         }
     }
     pid
 }
 
-/// Both sockets of one sandbox, bound before it forks. `control` already
-/// listens, from the supervisor. `pgrp` is bound only: the child calls
-/// listen() on it after setpgid(), so its peer pid is the group leader.
 #[derive(Debug)]
-pub(crate) struct ControlSockets {
+pub(crate) struct ControlSocket {
     pub control: ControlFd,
-    pub pgrp: ControlFd,
     pub claim: Option<ownership::Claim>,
 }
 
 /// `AddrInUse` means a live sandbox of this uid already owns the name.
-pub(crate) fn bind_control_sockets(name: &str) -> std::io::Result<ControlSockets> {
+pub(crate) fn bind_control_socket(name: &str) -> std::io::Result<ControlSocket> {
     let claim = ownership::Claim::new(name)?;
-    let control = ControlFd::register(UnixListener::bind_addr(&instance_addr(&claim.entry.token, false)?)?.into());
-    let pgrp = ControlFd::register(bind_only(&instance_addr(&claim.entry.token, true)?)?);
-    Ok(ControlSockets { control, pgrp, claim: Some(claim) })
-}
-
-/// std has no bind-without-listen, and listen() must be the child's call.
-fn bind_only(addr: &SocketAddr) -> std::io::Result<OwnedFd> {
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    let name = addr.as_abstract_name().expect("abstract address");
-    let mut sun: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    sun.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    for (dst, &src) in sun.sun_path[1..].iter_mut().zip(name) {
-        *dst = src as libc::c_char;
-    }
-    let len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + 1 + name.len();
-    let rc = unsafe {
-        libc::bind(fd.as_raw_fd(), &sun as *const _ as *const libc::sockaddr, len as libc::socklen_t)
-    };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(fd)
-}
-
-/// In the child, after setpgid(). listen() records this pid as the
-/// socket's peer credential; the supervisor keeps the socket alive.
-pub(crate) fn publish_pgrp(fd: RawFd) {
-    unsafe {
-        libc::listen(fd, libc::SOMAXCONN);
-        libc::close(fd);
-    }
+    let control = ControlFd::register(UnixListener::bind_addr(&instance_addr(&claim.entry.token)?)?.into());
+    Ok(ControlSocket { control, claim: Some(claim) })
 }
 
 // ============================================================
 // Control loop, spawned as a dedicated tokio task
 // ============================================================
 
-/// What the `info` verb reports. Pids are not here: the sockets carry them.
+/// What the `info` verb reports. PIDs are read from the registry.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct SandboxInfo {
     pub mode: Option<String>,
@@ -217,7 +175,7 @@ pub struct SandboxInfo {
 /// seccomp-notify supervisor (`--no-supervisor`, nested); those still
 /// answer `info` and the static `config`, and report no ports.
 pub(crate) fn spawn_control_loop(
-    sockets: ControlSockets,
+    sockets: ControlSocket,
     ctx: Option<Arc<SupervisorCtx>>,
     sandbox: Sandbox,
     info: SandboxInfo,
@@ -226,8 +184,8 @@ pub(crate) fn spawn_control_loop(
     // even though this clone's is None.
     let sandbox = Arc::new(tokio::sync::Mutex::new(sandbox));
     tokio::spawn(async move {
-        let ControlSockets { control, pgrp, claim: _claim } = sockets;
-        control_loop(control, Some(pgrp), ctx, sandbox, info, unsafe { libc::getuid() }).await;
+        let ControlSocket { control, claim: _claim } = sockets;
+        control_loop(control, ctx, sandbox, info, unsafe { libc::getuid() }).await;
     })
 }
 
@@ -309,39 +267,20 @@ impl tokio::io::AsyncWrite for ControlStream {
 /// Accept one connection at a time and serve one request per connection.
 /// `my_uid` is a parameter so a test can prove the refusal path without a
 /// second uid. The timeout keeps one stalled client from wedging
-/// introspection. Clients only connect to the pgrp socket for its peer
-/// credential and never speak, so those connections are accepted and
-/// dropped to keep its backlog empty; a child that never called listen()
-/// makes accept() fail with EINVAL, after which the socket is left alone.
+/// introspection.
 async fn control_loop(
     listener: ControlFd,
-    pgrp: Option<ControlFd>,
     ctx: Option<Arc<SupervisorCtx>>,
     sandbox: Arc<tokio::sync::Mutex<Sandbox>>,
     info: SandboxInfo,
     my_uid: u32,
 ) {
     let Some(listener) = into_async(listener) else { return };
-    let mut pgrp = pgrp.and_then(into_async);
 
     loop {
-        let drain = async {
-            match &pgrp {
-                Some(l) => accept(l).await,
-                None => std::future::pending().await,
-            }
-        };
-        let stream = tokio::select! {
-            accepted = accept(&listener) => match accepted {
-                Ok(stream) => stream,
-                Err(_) => return,
-            },
-            drained = drain => {
-                if drained.is_err() {
-                    pgrp = None;
-                }
-                continue;
-            }
+        let stream = match accept(&listener).await {
+            Ok(stream) => stream,
+            Err(_) => return,
         };
         // Abstract names have no permission bits, so this is the only gate.
         if peer_cred(stream.as_raw_fd()).map(|c| c.uid) != Some(my_uid) {
@@ -662,7 +601,7 @@ fn connect_control(name: &str, my_uid: u32) -> Result<(UnixStream, libc::ucred),
 }
 
 fn connect_entry(name: &str, entry: &ownership::Entry, my_uid: u32) -> Result<(UnixStream, libc::ucred), String> {
-    let addr = instance_addr(&entry.token, false).map_err(|e| e.to_string())?;
+    let addr = instance_addr(&entry.token).map_err(|e| e.to_string())?;
     let (stream, cred) = connect_as(&addr, my_uid).map_err(|e| match e.kind() {
         std::io::ErrorKind::ConnectionRefused => format!("sandbox '{name}' is still starting"),
         std::io::ErrorKind::PermissionDenied => format!("socket for '{name}' is owned by another user"),
@@ -674,7 +613,7 @@ fn connect_entry(name: &str, entry: &ownership::Entry, my_uid: u32) -> Result<(U
     Ok((stream, cred))
 }
 
-/// The two pids `kill` needs, both stamped by the kernel at listen() time.
+/// The two PIDs `kill` needs, stamped by the kernel at semaphore publication.
 #[derive(Debug, Clone, Copy)]
 pub struct SandboxPids {
     /// The child, which leads its own process group.
@@ -689,19 +628,12 @@ pub fn sandbox_pids(name: &str) -> Result<SandboxPids, String> {
 }
 
 fn sandbox_pids_as(name: &str, my_uid: u32) -> Result<SandboxPids, String> {
+    if my_uid != unsafe { libc::getuid() } {
+        return Err(format!("registry for '{name}' is owned by another user"));
+    }
     let entry = ownership::lookup(name).map_err(|e| e.to_string())?;
-    let (_, supervisor) = connect_entry(name, &entry, my_uid)?;
-    let addr = instance_addr(&entry.token, true).map_err(|e| e.to_string())?;
-    // The name exists, so the supervisor is up; the child has not reached
-    // listen() yet if this is refused.
-    let (_, child) = connect_as(&addr, my_uid).map_err(|e| match e.kind() {
-        std::io::ErrorKind::ConnectionRefused => format!("sandbox '{}' is still starting", name),
-        std::io::ErrorKind::PermissionDenied => {
-            format!("socket for '{}' is owned by another user", name)
-        }
-        _ => format!("connect to sandbox '{}': {}", name, e),
-    })?;
-    Ok(SandboxPids { child: child.pid, supervisor: supervisor.pid })
+    let child = entry.child.ok_or_else(|| format!("sandbox '{name}' is still starting"))?;
+    Ok(SandboxPids { child, supervisor: entry.supervisor })
 }
 
 /// Send a request to a sandbox's control socket and return the response.
@@ -775,7 +707,7 @@ mod tests {
     #[test]
     fn host_fork_cannot_reserve_a_released_name() {
         let name = format!("test-control-host-fork-{}", std::process::id());
-        let sockets = bind_control_sockets(&name).unwrap();
+        let sockets = bind_control_socket(&name).unwrap();
         let mut pipe = [0; 2];
         assert_eq!(unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
         let child = unsafe { libc::fork() };
@@ -790,7 +722,7 @@ mod tests {
         }
         unsafe { libc::close(pipe[0]); }
         drop(sockets);
-        let reused = bind_control_sockets(&name);
+        let reused = bind_control_socket(&name);
         unsafe {
             libc::close(pipe[1]);
             libc::waitpid(child, std::ptr::null_mut(), 0);
@@ -802,9 +734,9 @@ mod tests {
     fn bind_is_the_name_mutex_and_listing_follows_the_listener() {
         // Unique name: sandbox names are uid-wide, never reuse a fixed one.
         let name = format!("test-ctrl-unit-{}", std::process::id());
-        let sockets = bind_control_sockets(&name).unwrap();
+        let sockets = bind_control_socket(&name).unwrap();
         assert!(list_sandboxes().unwrap().contains(&name));
-        let err = bind_control_sockets(&name).unwrap_err();
+        let err = bind_control_socket(&name).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
         drop(sockets);
         assert!(!list_sandboxes().unwrap().contains(&name));
@@ -815,28 +747,26 @@ mod tests {
     #[test]
     fn live_list_follows_bind_and_drop() {
         let name = format!("test-ctrl-live-{}", std::process::id());
-        let sockets = bind_control_sockets(&name).unwrap();
-        let (control, pgrp) = (sockets.control.as_raw_fd(), sockets.pgrp.as_raw_fd());
-        assert!(live().contains(&control) && live().contains(&pgrp));
+        let sockets = bind_control_socket(&name).unwrap();
+        let control = sockets.control.as_raw_fd();
+        assert!(live().contains(&control));
         drop(sockets);
-        assert!(!live().contains(&control) && !live().contains(&pgrp));
+        assert!(!live().contains(&control));
     }
 
-    /// A forked child keeps only the pgrp socket it was told to, with no
-    /// help from /proc.
+    /// A forked child closes every inherited control endpoint.
     #[test]
-    fn forked_child_keeps_only_its_pgrp_socket() {
+    fn forked_child_closes_control_endpoints() {
         let pid = std::process::id();
-        let mine = bind_control_sockets(&format!("test-ctrl-fork-mine-{pid}")).unwrap();
-        let sibling = bind_control_sockets(&format!("test-ctrl-fork-sibling-{pid}")).unwrap();
-        let keep = mine.pgrp.as_raw_fd();
-        let closed = [mine.control.as_raw_fd(), sibling.control.as_raw_fd(), sibling.pgrp.as_raw_fd()];
+        let mine = bind_control_socket(&format!("test-ctrl-fork-mine-{pid}")).unwrap();
+        let sibling = bind_control_socket(&format!("test-ctrl-fork-sibling-{pid}")).unwrap();
+        let closed = [mine.control.as_raw_fd(), sibling.control.as_raw_fd()];
 
-        let child = fork_without_control_fds(Some(keep));
+        let child = fork_without_control_fds();
         assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
         if child == 0 {
             let is_open = |fd: RawFd| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0;
-            let ok = is_open(keep) && closed.iter().all(|&fd| !is_open(fd));
+            let ok = closed.iter().all(|&fd| !is_open(fd));
             unsafe { libc::_exit(if ok { 0 } else { 1 }) };
         }
         let mut status = 0;
@@ -844,20 +774,21 @@ mod tests {
         assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "child status {status:#x}");
     }
 
-    /// The pids come from the kernel's record of who called listen(), not
-    /// from anything the sandbox says; nobody serves these sockets here.
+    /// Registry PID lookups need no connections or running event loop.
     #[test]
     fn client_learns_both_pids_from_the_kernel() {
         let name = format!("test-ctrl-pids-{}", std::process::id());
-        let sockets = bind_control_sockets(&name).unwrap();
+        let sockets = bind_control_socket(&name).unwrap();
         let me = std::process::id() as i32;
 
         let err = sandbox_pids(&name).unwrap_err();
         assert!(err.contains("still starting"), "before listen: {err}");
 
-        assert_eq!(unsafe { libc::listen(sockets.pgrp.as_raw_fd(), 1) }, 0);
-        let pids = sandbox_pids(&name).unwrap();
-        assert_eq!((pids.child, pids.supervisor), (me, me));
+        assert!(sockets.claim.as_ref().unwrap().child_publisher().publish());
+        for _ in 0..16 {
+            let pids = sandbox_pids(&name).expect("PID lookup must not consume a socket backlog");
+            assert_eq!((pids.child, pids.supervisor), (me, me));
+        }
 
         let expect = unsafe { libc::getuid() }.wrapping_add(1);
         let err = sandbox_pids_as(&name, expect).unwrap_err();
@@ -878,11 +809,11 @@ mod tests {
     /// Bind a listener for `name`, run the control loop on it with
     /// `expected_uid`, and return the task handle.
     fn serve(name: &str, expected_uid: u32) -> tokio::task::JoinHandle<()> {
-        let sockets = bind_control_sockets(name).unwrap();
+        let sockets = bind_control_socket(name).unwrap();
         let sandbox = Arc::new(tokio::sync::Mutex::new(test_sandbox()));
         tokio::spawn(async move {
             let _claim = sockets.claim;
-            control_loop(sockets.control, None, None, sandbox, info(), expected_uid).await;
+            control_loop(sockets.control, None, sandbox, info(), expected_uid).await;
         })
     }
 
@@ -942,7 +873,7 @@ mod tests {
         let addr = SocketAddr::from_abstract_name(b"sandlock-probe-\xff\xfe").unwrap();
         let _foreign = UnixListener::bind_addr(&addr).unwrap();
         let name = format!("test-ctrl-utf8-{}", std::process::id());
-        let _ours = bind_control_sockets(&name).unwrap();
+        let _ours = bind_control_socket(&name).unwrap();
         assert!(list_sandboxes().unwrap().contains(&name));
     }
 }

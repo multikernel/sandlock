@@ -475,3 +475,67 @@ async fn test_tcp_always_allowed() {
     );
     assert!(result.success());
 }
+
+async fn check_control_semaphore_is_inaccessible(no_supervisor: bool) {
+    struct Canary(i32);
+    impl Drop for Canary {
+        fn drop(&mut self) {
+            unsafe { libc::semctl(self.0, 0, libc::IPC_RMID); }
+        }
+    }
+    let id = unsafe { libc::semget(libc::IPC_PRIVATE, 1, 0o600) };
+    assert!(id >= 0);
+    let canary = Canary(id);
+    assert_eq!(unsafe { libc::semctl(id, 0, libc::SETVAL, 7 as libc::c_int) }, 0);
+
+    let mut holder = base_policy().build().unwrap();
+    holder.create(&["true"]).await.unwrap();
+    let key = (unsafe { libc::getuid() } ^ 0x534c4302).max(1) as libc::key_t;
+    let registry = unsafe { libc::semget(key, 0, 0o600) };
+    assert!(registry >= 0);
+    assert!(unsafe { libc::semctl(registry, 0, libc::GETVAL) } >= 0);
+
+    let script = format!(r#"
+import ctypes, errno
+c = ctypes.CDLL(None, use_errno=True)
+class Op(ctypes.Structure):
+    _fields_ = [('num', ctypes.c_ushort), ('op', ctypes.c_short), ('flags', ctypes.c_short)]
+class Timespec(ctypes.Structure):
+    _fields_ = [('sec', ctypes.c_long), ('nsec', ctypes.c_long)]
+ops = (Op * 1)(Op(0, -1, 0o4000 | 0o10000))
+checks = [
+    ('semget', lambda: c.semget({key}, 0, 0o600)),
+    ('registry GETVAL', lambda: c.semctl({registry}, 0, 12)),
+    ('registry GETPID', lambda: c.semctl({registry}, 0, 11)),
+    ('canary GETALL', lambda: c.semctl({id}, 0, 13, (ctypes.c_ushort * 1)())),
+    ('canary SETVAL', lambda: c.semctl({id}, 0, 16, 0)),
+    ('canary IPC_RMID', lambda: c.semctl({id}, 0, 0)),
+    ('semop', lambda: c.semop({id}, ops, 1)),
+    ('semtimedop', lambda: c.semtimedop({id}, ops, 1, ctypes.byref(Timespec(0, 0)))),
+]
+for name, call in checks:
+    ctypes.set_errno(0)
+    result = call()
+    error = ctypes.get_errno()
+    assert result == -1 and error == errno.EPERM, (name, result, error)
+print('all semaphore access denied')
+"#);
+    let result = base_policy().no_supervisor(no_supervisor).build().unwrap()
+        .run(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "semaphore access escaped policy: {result:?}");
+    assert!(result.stdout_str().unwrap_or("").contains("all semaphore access denied"));
+    assert_eq!(unsafe { libc::semctl(id, 0, libc::GETVAL) }, 7);
+    assert!(unsafe { libc::semctl(registry, 0, libc::GETVAL) } >= 0);
+    drop(holder);
+    drop(canary);
+}
+
+#[tokio::test]
+async fn test_control_semaphore_denied_by_default() {
+    check_control_semaphore_is_inaccessible(false).await;
+}
+
+#[tokio::test]
+async fn test_control_semaphore_denied_without_supervisor() {
+    check_control_semaphore_is_inaccessible(true).await;
+}

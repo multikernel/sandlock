@@ -87,16 +87,23 @@ live names per UID and IPC namespace. Exhaustion and registry transaction errors
 fail sandbox creation. Transaction waits are bounded to two seconds.
 
 The registry is accessible only to its owning UID. Processes with that same UID
-are trusted, as with the control sockets. Clients still authenticate socket peers
-with `SO_PEERCRED`, including the child's process-group identity. Control clients
-and supervisors must share both the IPC namespace used for discovery and the
+are trusted, as with the control socket. The child publishes its process-group
+identity in a dedicated semaphore before confinement; `GETPID` returns its kernel-recorded PID. This replaces the
+process-group socket. A single abstract request socket remains for control
+requests, and clients authenticate its supervisor with `SO_PEERCRED`. Control
+clients and supervisors must share both the IPC namespace used for discovery and the
 network namespace containing their abstract sockets. This protocol does not
 discover sandboxes started by older versions using name-based socket addresses.
 
-Sandlock does not create an IPC namespace. Its default SysV IPC deny policy is
-unchanged: a nested sandbox that cannot access the registry can execute without
-control introspection, with a diagnostic. Ordinary host forks do not inherit
-semaphore undo state, but a host explicitly using `CLONE_SYSVSEM` can share it and
+Sandlock does not create an IPC namespace. The default seccomp policy denies
+`semget`, `semctl`, `semop`, and `semtimedop`, including in unsupervised mode.
+Knowing the registry ID does not let a confined workload read, modify, or remove
+it. The child publication creates no undo adjustment, and ordinary forks do not
+inherit the supervisor's undo adjustments. Explicitly allowing `sysv_ipc` restores
+same-UID access to the registry and therefore requires trusting the workload.
+A nested sandbox that cannot access the registry can execute without control
+introspection, with a diagnostic. A host explicitly using `CLONE_SYSVSEM` can
+share undo state and
 delay automatic cleanup until the last sharer exits. Explicit sandbox cleanup
 still releases the claim.
 
