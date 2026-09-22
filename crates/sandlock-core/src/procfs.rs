@@ -29,8 +29,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::seccomp::notif::{
-    content_memfd, decode_open_args, inject_open_result, openat2_at, read_child_cstr,
-    write_child_mem, NotifAction, NotifPolicy,
+    content_memfd, inject_open_result, openat2_at, write_child_mem, NotifAction, NotifPolicy,
+    OpenArgs, OpenRequest,
 };
 use crate::seccomp::state::{NetworkState, ProcessIndex};
 use crate::sys::structs::{SeccompNotif, EACCES};
@@ -568,15 +568,6 @@ fn inject_memfd(content: &[u8]) -> NotifAction {
 }
 
 // ============================================================
-// Read path from child memory
-// ============================================================
-
-/// Read a NUL-terminated path string from child memory.
-fn read_path(notif: &SeccompNotif, addr: u64, notif_fd: RawFd) -> Option<String> {
-    read_child_cstr(notif_fd, notif.id, notif.pid, addr, 4096)
-}
-
-// ============================================================
 // handle_proc_open — intercept openat for /proc virtualization
 // ============================================================
 
@@ -588,30 +579,13 @@ fn read_path(notif: &SeccompNotif, addr: u64, notif_fd: RawFd) -> Option<String>
 /// - Lets everything else through.
 pub(crate) async fn handle_proc_open(
     notif: &SeccompNotif,
+    open: &OpenRequest,
     processes: &Arc<ProcessIndex>,
     resource: &Arc<Mutex<crate::seccomp::state::ResourceState>>,
     network: &Arc<Mutex<NetworkState>>,
     policy: &NotifPolicy,
-    notif_fd: RawFd,
 ) -> NotifAction {
-    // Resolve open/openat/openat2 to a normalized absolute path so the
-    // sensitive-path deny, the per-PID filter, and the virtualization
-    // string-matches below all see the same canonical form regardless of
-    // how the caller spelled it (dirfd-relative, `..`-laden, etc.).
-    let resolved = match resolve_open_target(
-        notif,
-        notif_fd,
-        policy.chroot_root.as_deref(),
-        &policy.chroot_mounts,
-        processes,
-    ) {
-        Some(p) => p,
-        None => return NotifAction::Continue,
-    };
-    let path = match resolved.to_str() {
-        Some(p) => p,
-        None => return NotifAction::Continue,
-    };
+    let Some(path) = open.target_str() else { return NotifAction::Continue };
 
     if is_hidden_proc_path(path, processes) {
         return NotifAction::Errno(EACCES);
@@ -629,7 +603,7 @@ pub(crate) async fn handle_proc_open(
     let path = canon_proc_namespace(path);
     let path = path.as_ref();
 
-    if let Some(action) = open_own_proc_on_behalf(notif, notif_fd, path, processes, policy) {
+    if let Some(action) = open_own_proc_on_behalf(notif, &open.args, path, processes, policy) {
         return action;
     }
 
@@ -777,7 +751,7 @@ pub(crate) fn own_fd_request(path: &str, tid: i32, tgid: i32) -> Option<i32> {
 /// verdict on the real target instead of ours.
 fn open_own_proc_on_behalf(
     notif: &SeccompNotif,
-    notif_fd: RawFd,
+    args: &OpenArgs,
     path: &str,
     processes: &ProcessIndex,
     policy: &NotifPolicy,
@@ -802,7 +776,6 @@ fn open_own_proc_on_behalf(
         return None;
     }
 
-    let args = decode_open_args(notif, notif_fd)?;
     let flags = args.flags as i32;
     if flags & WRITE_SIDE_FLAGS != 0 {
         return None;
@@ -913,83 +886,22 @@ pub(crate) fn handle_uname(
     }
 }
 
-/// Handle open/openat/openat2 targeting /etc/hostname — return a memfd
-/// with the virtual hostname. Path is resolved and lexically normalized
-/// via [`resolve_open_target`] so dirfd-relative and non-canonical
-/// spellings all hit the shim.
-pub(crate) fn handle_hostname_open(
-    notif: &SeccompNotif,
-    hostname: &str,
-    notif_fd: RawFd,
-    chroot_root: Option<&std::path::Path>,
-    chroot_mounts: &[(std::path::PathBuf, std::path::PathBuf)],
-    processes: &ProcessIndex,
-) -> Option<NotifAction> {
-    let resolved = resolve_open_target(notif, notif_fd, chroot_root, chroot_mounts, processes)?;
-    if resolved != std::path::Path::new("/etc/hostname") {
+/// Answer an open of /etc/hostname with the virtual hostname.
+pub(crate) fn handle_hostname_open(open: &OpenRequest, hostname: &str) -> Option<NotifAction> {
+    if open.target.as_deref() != Some(std::path::Path::new("/etc/hostname")) {
         return None;
     }
-    let content = format!("{}\n", hostname);
-    Some(inject_memfd(content.as_bytes()))
+    Some(inject_memfd(format!("{}\n", hostname).as_bytes()))
 }
 
-/// Intercept any `open`/`openat`/`openat2` of `/etc/hosts` and return a memfd
-/// with virtual content.
-///
-/// Every sandbox gets a fixed loopback view (`127.0.0.1 localhost` /
-/// `::1 localhost`) plus any concrete hostnames pre-resolved from
-/// `net_allow`, so the host's on-disk `/etc/hosts` never leaks in and
-/// glibc's `files` NSS backend resolves allowed hostnames without DNS.
-pub(crate) fn handle_etc_hosts_open(
-    notif: &SeccompNotif,
-    etc_hosts_content: &str,
-    notif_fd: RawFd,
-    chroot_root: Option<&std::path::Path>,
-    chroot_mounts: &[(std::path::PathBuf, std::path::PathBuf)],
-    processes: &ProcessIndex,
-) -> Option<NotifAction> {
-    let resolved = resolve_open_target(notif, notif_fd, chroot_root, chroot_mounts, processes)?;
-    if resolved != std::path::Path::new("/etc/hosts") {
+/// Answer an open of /etc/hosts with the virtual file: a fixed loopback view
+/// plus the hostnames pre-resolved from `net_allow`, so the host's own file
+/// never leaks in and glibc's `files` backend resolves allowed names.
+pub(crate) fn handle_etc_hosts_open(open: &OpenRequest, etc_hosts_content: &str) -> Option<NotifAction> {
+    if open.target.as_deref() != Some(std::path::Path::new("/etc/hosts")) {
         return None;
     }
     Some(inject_memfd(etc_hosts_content.as_bytes()))
-}
-
-/// Resolve the path argument of an open-family syscall (`open`, `openat`,
-/// or `openat2`) to a lexically-normalized absolute host-side path.
-///
-/// Used by every `openat`-shaped handler so the security and
-/// virtualization checks operate on the same canonical form regardless
-/// of how the caller spelled the path. The literal-string compare used
-/// before this helper missed four bypass shapes: legacy `open`,
-/// `openat2`, dirfd-relative spellings like `openat(open("/etc"),
-/// "hosts", ...)`, and non-canonical absolutes like `/etc/../etc/hosts`
-/// or `//etc/hosts`.
-///
-/// Returns `None` if the notif isn't an open variant, the path can't be
-/// read from child memory, the dirfd can't be resolved, or the path
-/// walks above `/`. Callers treat `None` as "fall through to the kernel"
-/// (`NotifAction::Continue`).
-pub(crate) fn resolve_open_target(
-    notif: &SeccompNotif,
-    notif_fd: RawFd,
-    chroot_root: Option<&std::path::Path>,
-    chroot_mounts: &[(std::path::PathBuf, std::path::PathBuf)],
-    processes: &ProcessIndex,
-) -> Option<std::path::PathBuf> {
-    let nr = notif.data.nr as i64;
-    let (dirfd, path_ptr): (i64, u64) = if Some(nr) == crate::arch::sys_open() {
-        // open(path, flags, mode) — no dirfd, behaves as AT_FDCWD.
-        (libc::AT_FDCWD as i64, notif.data.args[0])
-    } else if nr == libc::SYS_openat || nr == crate::arch::SYS_OPENAT2 {
-        // openat(dirfd, path, ...) and openat2(dirfd, path, ...) share
-        // the same first two argument slots.
-        (notif.data.args[0] as i64, notif.data.args[1])
-    } else {
-        return None;
-    };
-    let path = read_path(notif, path_ptr, notif_fd)?;
-    resolve_to_normalized_absolute(notif.pid, dirfd, &path, chroot_root, chroot_mounts, processes)
 }
 
 /// Lexical normalization of `(pid, dirfd, path)`:
@@ -1003,7 +915,7 @@ pub(crate) fn resolve_open_target(
 ///
 /// Then collapses `.`, `..`, and redundant `/` components. Returns
 /// `None` if the dirfd cannot be resolved or the path walks above `/`.
-fn resolve_to_normalized_absolute(
+pub(crate) fn resolve_to_normalized_absolute(
     pid: u32,
     dirfd: i64,
     path: &str,

@@ -621,6 +621,43 @@ pub(crate) fn decode_open_args(notif: &SeccompNotif, notif_fd: RawFd) -> Option<
     }
 }
 
+/// An open-family request, decoded once per notification and shared by every
+/// handler in the chain. Each handler used to read the string again, which
+/// added nothing: a handler is safe by how it answers, not by rereading.
+pub(crate) struct OpenRequest {
+    pub(crate) args: OpenArgs,
+    /// The string the child wrote.
+    pub(crate) path: String,
+    /// Its lexically normalized absolute spelling in the sandbox's namespace,
+    /// or `None` when it walks above the root.
+    pub(crate) target: Option<std::path::PathBuf>,
+}
+
+impl OpenRequest {
+    pub(crate) fn decode(
+        notif: &SeccompNotif,
+        notif_fd: RawFd,
+        policy: &NotifPolicy,
+        processes: &super::state::ProcessIndex,
+    ) -> Option<Self> {
+        let args = decode_open_args(notif, notif_fd)?;
+        let path = read_child_cstr(notif_fd, notif.id, notif.pid, args.path_ptr, 4096)?;
+        let target = crate::procfs::resolve_to_normalized_absolute(
+            notif.pid,
+            args.dirfd,
+            &path,
+            policy.chroot_root.as_deref(),
+            &policy.chroot_mounts,
+            processes,
+        );
+        Some(Self { args, path, target })
+    }
+
+    pub(crate) fn target_str(&self) -> Option<&str> {
+        self.target.as_deref()?.to_str()
+    }
+}
+
 /// Wrap a freshly opened raw fd into an `InjectFdSend`, honoring the child's
 /// `O_CLOEXEC` request. Ownership of `raw_fd` moves into the action.
 pub(crate) fn inject_open_result(raw_fd: i32, flags: u64) -> NotifAction {
@@ -892,6 +929,7 @@ fn is_procfs(fd: RawFd) -> bool {
 /// else is judged by Landlock on the real inode.
 async fn on_behalf_open(
     notif: &SeccompNotif,
+    open: &OpenRequest,
     ctx: &super::ctx::SupervisorCtx,
     pfs: &super::state::PolicyFnState,
     notif_fd: RawFd,
@@ -906,17 +944,9 @@ async fn on_behalf_open(
         return NotifAction::Continue;
     }
 
-    let OpenArgs { dirfd, path_ptr, flags, mode, resolve } =
-        match decode_open_args(notif, notif_fd) {
-            Some(a) => a,
-            None => return NotifAction::Continue, // kernel's re-read fails the same way
-        };
-
-    let path = match read_child_cstr(notif_fd, notif.id, notif.pid, path_ptr, 4096) {
-        Some(p) => p,
-        None => return NotifAction::Continue, // kernel's re-read fails the same way
-    };
-    let c_path = match std::ffi::CString::new(path.clone()) {
+    let OpenArgs { dirfd, flags, mode, resolve, .. } = open.args;
+    let path = &open.path;
+    let c_path = match std::ffi::CString::new(path.as_str()) {
         Ok(c) => c,
         Err(_) => return NotifAction::Errno(libc::EINVAL),
     };
@@ -941,10 +971,7 @@ async fn on_behalf_open(
     let own_fd = (has_denied && follows_links)
         .then(|| {
             let tgid = processes.tgid_of(notif.pid as i32)?;
-            let target = crate::procfs::resolve_open_target(
-                notif, notif_fd, policy.chroot_root.as_deref(), &policy.chroot_mounts, processes,
-            )?;
-            crate::procfs::own_fd_request(target.to_str()?, notif.pid as i32, tgid)
+            crate::procfs::own_fd_request(open.target_str()?, notif.pid as i32, tgid)
         })
         .flatten();
     if let Some(own_fd) = own_fd {
@@ -975,7 +1002,7 @@ async fn on_behalf_open(
         },
         Err(_) if !has_denied => NotifAction::Continue,
         Err(errno) if errno == libc::ENOENT && (flags & libc::O_CREAT as u64) != 0 => {
-            create_new_on_behalf(base_fd, &path, flags, mode, resolve, policy, pfs, processes, notif.pid)
+            create_new_on_behalf(base_fd, path, flags, mode, resolve, policy, pfs, processes, notif.pid)
         }
         Err(errno) => NotifAction::Errno(errno),
     }
@@ -2476,6 +2503,10 @@ async fn handle_notification(
     let is_openat_family =
         nr == libc::SYS_openat || nr == arch::SYS_OPENAT2 || Some(nr) == arch::sys_open();
     let has_denied = policy.chroot_root.is_none() && ctx.policy_fn.lock().await.has_denied_paths();
+    let open = is_openat_family
+        .then(|| OpenRequest::decode(&notif, fd, policy, &ctx.processes))
+        .flatten()
+        .map(Arc::new);
     let mut action = {
         let denied = has_denied
             && crate::seccomp_plan::fs_denied_path_syscalls().contains(&nr)
@@ -2485,21 +2516,19 @@ async fn handle_notification(
         } else {
             // Dispatch runs first so /proc virtualization and the other
             // handlers still win for their paths.
-            let action = dispatch_table.dispatch(notif, fd).await;
+            let action = dispatch_table.dispatch(notif, fd, open.clone()).await;
             // A bare Continue for an open is the racy window: the kernel
             // re-resolves the path after it, and a racing thread can swap a
             // link to reach a denied carve-out inside a granted tree (issue
             // #111) or a procfs entry the handlers hide by name (issue
             // #236). The open is done against the pinned inode instead.
-            if matches!(action, NotifAction::Continue)
-                && is_openat_family
-                && policy.chroot_root.is_none()
-                && (has_denied || policy.resolves_opens())
-            {
-                let pfs = ctx.policy_fn.lock().await;
-                on_behalf_open(&notif, ctx, &pfs, fd, has_denied).await
-            } else {
-                action
+            let resolves = policy.chroot_root.is_none() && (has_denied || policy.resolves_opens());
+            match (&action, &open) {
+                (NotifAction::Continue, Some(open)) if resolves => {
+                    let pfs = ctx.policy_fn.lock().await;
+                    on_behalf_open(&notif, open, ctx, &pfs, fd, has_denied).await
+                }
+                _ => action,
             }
         }
     };

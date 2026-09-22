@@ -4,7 +4,6 @@
 // CA PEM, and inject the combined bytes as a sealed memfd. Landlock is never
 // consulted for the intercepted open (the syscall result is our memfd).
 
-use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 
 use crate::seccomp::notif::NotifAction;
@@ -44,15 +43,12 @@ pub(crate) fn path_matches(resolved: &Path, inject_paths: &[PathBuf]) -> bool {
 /// normal open proceed, subject to the rest of the policy.
 pub(crate) fn handle_ca_inject_open(
     notif: &SeccompNotif,
+    open: &crate::seccomp::notif::OpenRequest,
     inject_paths: &[PathBuf],
     ca_pem: &[u8],
-    notif_fd: RawFd,
-    chroot_root: Option<&std::path::Path>,
-    chroot_mounts: &[(PathBuf, PathBuf)],
-    processes: &crate::seccomp::state::ProcessIndex,
 ) -> Option<NotifAction> {
-    let resolved = crate::procfs::resolve_open_target(notif, notif_fd, chroot_root, chroot_mounts, processes)?;
-    if !path_matches(&resolved, inject_paths) {
+    let resolved = open.target.as_deref()?;
+    if !path_matches(resolved, inject_paths) {
         return None;
     }
     // Read the file as the child sees it (chroot/COW aware) via /proc/<pid>/root.

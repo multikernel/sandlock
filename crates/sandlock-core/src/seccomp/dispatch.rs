@@ -21,7 +21,7 @@ use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
 use super::ctx::SupervisorCtx;
-use super::notif::{NotifAction, NotifPolicy};
+use super::notif::{NotifAction, NotifPolicy, OpenRequest};
 use super::state::ResourceState;
 use super::syscall::SyscallError;
 use crate::arch;
@@ -76,6 +76,18 @@ pub trait Handler: Send + Sync + 'static {
 pub struct HandlerCtx {
     pub notif: SeccompNotif,
     pub notif_fd: RawFd,
+    /// The open-family request decoded once for this notification.
+    open: Option<Arc<OpenRequest>>,
+}
+
+impl HandlerCtx {
+    pub fn new(notif: SeccompNotif, notif_fd: RawFd) -> Self {
+        Self { notif, notif_fd, open: None }
+    }
+
+    pub(crate) fn open(&self) -> Option<Arc<OpenRequest>> {
+        self.open.clone()
+    }
 }
 
 // Blanket impl: any Fn(&HandlerCtx) -> Future is a Handler.
@@ -236,10 +248,11 @@ impl DispatchTable {
         &self,
         notif: SeccompNotif,
         notif_fd: RawFd,
+        open: Option<Arc<OpenRequest>>,
     ) -> NotifAction {
         let nr = notif.data.nr as i64;
         if let Some(chain) = self.chains.get(&nr) {
-            let handler_ctx = HandlerCtx { notif, notif_fd };
+            let handler_ctx = HandlerCtx { notif, notif_fd, open };
             for handler in &chain.handlers {
                 let action = handler.handle(&handler_ctx).await;
                 if !matches!(action, NotifAction::Continue) {
@@ -393,24 +406,16 @@ pub(crate) fn build_dispatch_table(
     if policy.has_random_seed {
         for nr in open_family_syscalls() {
             let __sup = Arc::clone(ctx);
-            let policy_rand = Arc::clone(policy);
             table.register(nr, move |cx: &HandlerCtx| {
-                let notif = cx.notif;
                 let sup = Arc::clone(&__sup);
-                let policy = Arc::clone(&policy_rand);
-                let notif_fd = cx.notif_fd;
+                let open = cx.open();
                 async move {
+                    let Some(open) = open else { return NotifAction::Continue };
                     let mut tr = sup.time_random.lock().await;
-                    if let Some(ref mut rng) = tr.random_state {
-                        if let Some(action) = crate::random::handle_random_open(
-                            &notif, rng, notif_fd,
-                            policy.chroot_root.as_deref(), &policy.chroot_mounts,
-                            &sup.processes,
-                        ) {
-                            return action;
-                        }
+                    match tr.random_state.as_mut() {
+                        Some(rng) => crate::random::handle_random_open(&open, rng).unwrap_or(NotifAction::Continue),
+                        None => NotifAction::Continue,
                     }
-                    NotifAction::Continue
                 }
             });
         }
@@ -453,24 +458,12 @@ pub(crate) fn build_dispatch_table(
         let etc_hosts = policy.virtual_etc_hosts.clone();
         for nr in open_family_syscalls() {
             let etc_hosts = etc_hosts.clone();
-            let policy_hosts = Arc::clone(policy);
-            let processes_for_open = Arc::clone(&ctx.processes);
             table.register(nr, move |cx: &HandlerCtx| {
-                let notif = cx.notif;
-                let notif_fd = cx.notif_fd;
                 let etc_hosts = etc_hosts.clone();
-                let policy = Arc::clone(&policy_hosts);
-                let processes = Arc::clone(&processes_for_open);
+                let open = cx.open();
                 async move {
-                    if let Some(action) = crate::procfs::handle_etc_hosts_open(
-                        &notif, &etc_hosts, notif_fd,
-                        policy.chroot_root.as_deref(), &policy.chroot_mounts,
-                        &processes,
-                    ) {
-                        action
-                    } else {
-                        NotifAction::Continue
-                    }
+                    open.and_then(|open| crate::procfs::handle_etc_hosts_open(&open, &etc_hosts))
+                        .unwrap_or(NotifAction::Continue)
                 }
             });
         }
@@ -488,21 +481,15 @@ pub(crate) fn build_dispatch_table(
             for nr in open_family_syscalls() {
                 let ca_pem = std::sync::Arc::clone(&ca_pem);
                 let inject_paths = std::sync::Arc::clone(&inject_paths);
-                let policy_ca = Arc::clone(policy);
-                let processes_for_open = Arc::clone(&ctx.processes);
                 table.register(nr, move |cx: &HandlerCtx| {
                     let notif = cx.notif;
-                    let notif_fd = cx.notif_fd;
                     let ca_pem = std::sync::Arc::clone(&ca_pem);
                     let inject_paths = std::sync::Arc::clone(&inject_paths);
-                    let policy = Arc::clone(&policy_ca);
-                    let processes = Arc::clone(&processes_for_open);
+                    let open = cx.open();
                     async move {
-                        crate::ca_inject::handle_ca_inject_open(
-                            &notif, &inject_paths, &ca_pem, notif_fd,
-                            policy.chroot_root.as_deref(), &policy.chroot_mounts,
-                            &processes,
-                        )
+                        open.and_then(|open| {
+                            crate::ca_inject::handle_ca_inject_open(&notif, &open, &inject_paths, &ca_pem)
+                        })
                         .unwrap_or(NotifAction::Continue)
                     }
                 });
@@ -527,13 +514,14 @@ pub(crate) fn build_dispatch_table(
         table.register(nr, move |cx: &HandlerCtx| {
             let notif = cx.notif;
             let sup = Arc::clone(&__sup);
-            let notif_fd = cx.notif_fd;
             let policy = Arc::clone(&policy_for_proc_open);
             let resource = Arc::clone(&resource_for_proc_open);
+            let open = cx.open();
             async move {
+                let Some(open) = open else { return NotifAction::Continue };
                 let processes = Arc::clone(&sup.processes);
                 let network = Arc::clone(&sup.network);
-                crate::procfs::handle_proc_open(&notif, &processes, &resource, &network, &policy, notif_fd).await
+                crate::procfs::handle_proc_open(&notif, &open, &processes, &resource, &network, &policy).await
             }
         });
     }
@@ -608,24 +596,12 @@ pub(crate) fn build_dispatch_table(
         });
         for nr in open_family_syscalls() {
             let hostname = hostname_for_open.clone();
-            let policy_hostname = Arc::clone(policy);
-            let processes_for_open = Arc::clone(&ctx.processes);
             table.register(nr, move |cx: &HandlerCtx| {
-                let notif = cx.notif;
-                let notif_fd = cx.notif_fd;
                 let hostname = hostname.clone();
-                let policy = Arc::clone(&policy_hostname);
-                let processes = Arc::clone(&processes_for_open);
+                let open = cx.open();
                 async move {
-                    if let Some(action) = crate::procfs::handle_hostname_open(
-                        &notif, &hostname, notif_fd,
-                        policy.chroot_root.as_deref(), &policy.chroot_mounts,
-                        &processes,
-                    ) {
-                        action
-                    } else {
-                        NotifAction::Continue
-                    }
+                    open.and_then(|open| crate::procfs::handle_hostname_open(&open, &hostname))
+                        .unwrap_or(NotifAction::Continue)
                 }
             });
         }
@@ -1222,7 +1198,7 @@ mod handler_tests {
 
         let _ctx = fake_supervisor_ctx();
         let action = table
-            .dispatch(fake_notif(libc::SYS_openat as i32), -1)
+            .dispatch(fake_notif(libc::SYS_openat as i32), -1, None)
             .await;
 
         assert!(matches!(action, NotifAction::Continue));
@@ -1275,7 +1251,7 @@ mod handler_tests {
 
         let _ctx = fake_supervisor_ctx();
         let action = table
-            .dispatch(fake_notif(libc::SYS_openat as i32), -1)
+            .dispatch(fake_notif(libc::SYS_openat as i32), -1, None)
             .await;
 
         assert!(matches!(action, NotifAction::Continue));
@@ -1326,7 +1302,7 @@ mod handler_tests {
 
         let _ctx = fake_supervisor_ctx();
         let action = table
-            .dispatch(fake_notif(libc::SYS_openat as i32), -1)
+            .dispatch(fake_notif(libc::SYS_openat as i32), -1, None)
             .await;
 
         match action {
@@ -1367,7 +1343,7 @@ mod handler_tests {
 
         let _ctx = fake_supervisor_ctx();
         let action = table
-            .dispatch(fake_notif(libc::SYS_openat as i32), -1)
+            .dispatch(fake_notif(libc::SYS_openat as i32), -1, None)
             .await;
 
         assert!(
@@ -1431,7 +1407,7 @@ mod handler_tests {
 
         let _sup = fake_supervisor_ctx();
         let notif = fake_notif(libc::SYS_openat as i32);
-        let cx = HandlerCtx { notif, notif_fd: -1 };
+        let cx = HandlerCtx::new(notif, -1);
 
         let action = h.handle(&cx).await;
         assert!(matches!(action, NotifAction::Continue));
@@ -1479,7 +1455,7 @@ mod handler_tests {
         // Walker MUST hit the struct's handle() each time, accumulating
         // state on &self.calls.
         for _ in 0..3 {
-            let action = table.dispatch(notif, -1).await;
+            let action = table.dispatch(notif, -1, None).await;
             assert!(matches!(action, NotifAction::Continue));
         }
 
