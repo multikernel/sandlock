@@ -702,9 +702,8 @@ async fn test_deny_active_matches_proc_self_under_its_pid() {
     assert_eq!(out, "0\n1", "the deny should hold under the numeric spelling with /proc readable");
 }
 
-/// What has a virtual form must not be served as the real file because a link
-/// led to it, and a link to a magic link stays refused: only the kernel could
-/// say whose fd it means.
+/// A link to a magic link stays refused: only the kernel could say whose fd
+/// it means.
 #[tokio::test]
 async fn test_deny_active_refuses_what_it_cannot_resolve_for_the_caller() {
     let links = LinkDir::new("nslinks", &[("self", "/proc/self"), ("chain", "/proc/self/fd/0")]);
@@ -713,14 +712,9 @@ async fn test_deny_active_refuses_what_it_cannot_resolve_for_the_caller() {
         .fs_deny("/tmp/sandlock-test-no-such-file")
         .build()
         .unwrap();
-    let script = [
-        openable(&format!("{}/mounts", links.path("self"))),
-        openable(&links.path("chain")),
-        openable(&format!("{}/status", links.path("self"))),
-    ]
-    .join("; ");
+    let script = [openable(&links.path("chain")), openable(&format!("{}/status", links.path("self")))].join("; ");
     let (_, out) = run_sh(&policy, &script).await;
-    assert_eq!(out, "0\n0\n1");
+    assert_eq!(out, "0\n1");
 }
 
 /// Issue #236: Landlock granted all of /proc, so a link or /proc/self/root
@@ -757,4 +751,33 @@ async fn test_proc_grant_serves_unvirtualized_net_entries() {
     .join("; ");
     let (_, out) = run_sh(&policy, &script).await;
     assert_eq!(out, "1\n1\n1\n1");
+}
+
+/// A link reaches the real file behind a virtual one, and the on-behalf open
+/// used to hand that file out; the generated content is the only right answer.
+#[tokio::test]
+async fn test_links_to_virtual_files_show_the_virtual_content() {
+    let links = LinkDir::new(
+        "virtlinks",
+        &[("cpu", "/proc/cpuinfo"), ("self", "/proc/self"), ("host", "/etc/hostname"), ("hosts", "/etc/hosts")],
+    );
+    let script = format!(
+        concat!(
+            "grep -c ^processor {cpu}; wc -l < {self}/mounts; ",
+            "[ \"$(cat /etc/hostname)\" = \"$(cat {host})\" ] && echo same-hostname; ",
+            "[ \"$(cat /etc/hosts)\" = \"$(cat {hosts})\" ] && echo same-hosts"
+        ),
+        cpu = links.path("cpu"),
+        self = links.path("self"),
+        host = links.path("host"),
+        hosts = links.path("hosts"),
+    );
+    for deny_active in [false, true] {
+        let mut policy = proc_grant().fs_read(&links.0).num_cpus(2);
+        if deny_active {
+            policy = policy.fs_deny("/tmp/sandlock-test-no-such-file");
+        }
+        let (_, out) = run_sh(&policy.build().unwrap(), &script).await;
+        assert_eq!(out, "2\n1\nsame-hostname\nsame-hosts", "deny active: {}", deny_active);
+    }
 }

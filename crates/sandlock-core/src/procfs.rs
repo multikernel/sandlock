@@ -119,17 +119,106 @@ pub(crate) fn canon_proc_namespace(path: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// Whether an open of `path` is answered with generated content under
-/// `policy`, so the real file must never be handed out in its place.
-pub(crate) fn has_virtual_form(path: &str, policy: &NotifPolicy) -> bool {
-    match canon_proc_namespace(path).as_ref() {
-        "/proc/cpuinfo" => policy.num_cpus.is_some(),
-        "/proc/meminfo" => policy.max_memory_bytes > 0,
-        "/proc/uptime" => policy.has_time_start,
-        "/proc/net/tcp" | "/proc/net/tcp6" => policy.port_remap,
-        "/proc/loadavg" | "/proc/net/dev" | "/proc/net/if_inet6" | "/proc/self/mounts"
-        | "/proc/self/mountinfo" | "/proc/self/mountstats" | "/proc/self/cgroup" => true,
-        _ => false,
+/// Files under /etc whose open is answered with generated content.
+pub(crate) const SHADOWED_ETC_FILES: &[&str] = &["/etc/hostname", "/etc/hosts"];
+
+/// A file whose open is answered with generated content.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum VirtualFile {
+    CpuInfo,
+    MemInfo,
+    Uptime,
+    LoadAvg,
+    NetDev,
+    NetIfInet6,
+    NetTcp { v6: bool },
+    Mounts,
+    MountInfo,
+    MountStats,
+    Cgroup,
+    Hostname,
+    EtcHosts,
+}
+
+/// The virtual file `path` names under `policy`, with every per-task
+/// spelling of a namespace entry collapsed first. The real file behind it
+/// must never be handed out in its place.
+pub(crate) fn virtual_file(path: &str, policy: &NotifPolicy) -> Option<VirtualFile> {
+    Some(match canon_proc_namespace(path).as_ref() {
+        "/proc/cpuinfo" if policy.num_cpus.is_some() => VirtualFile::CpuInfo,
+        "/proc/meminfo" if policy.max_memory_bytes > 0 => VirtualFile::MemInfo,
+        "/proc/uptime" if policy.has_time_start => VirtualFile::Uptime,
+        "/proc/loadavg" => VirtualFile::LoadAvg,
+        "/proc/net/dev" => VirtualFile::NetDev,
+        "/proc/net/if_inet6" => VirtualFile::NetIfInet6,
+        "/proc/net/tcp" if policy.port_remap => VirtualFile::NetTcp { v6: false },
+        "/proc/net/tcp6" if policy.port_remap => VirtualFile::NetTcp { v6: true },
+        "/proc/mounts" | "/proc/self/mounts" => VirtualFile::Mounts,
+        "/proc/self/mountinfo" => VirtualFile::MountInfo,
+        "/proc/self/mountstats" => VirtualFile::MountStats,
+        "/proc/self/cgroup" => VirtualFile::Cgroup,
+        "/etc/hostname" if policy.virtual_hostname.is_some() => VirtualFile::Hostname,
+        "/etc/hosts" if !policy.virtual_etc_hosts.is_empty() => VirtualFile::EtcHosts,
+        _ => return None,
+    })
+}
+
+/// The content of a virtual file at this moment.
+pub(crate) async fn render_virtual_file(
+    file: VirtualFile,
+    processes: &ProcessIndex,
+    resource: &Mutex<crate::seccomp::state::ResourceState>,
+    network: &Mutex<NetworkState>,
+    policy: &NotifPolicy,
+) -> Vec<u8> {
+    let mounts_args = || {
+        (
+            policy.chroot_root.as_deref(),
+            &policy.chroot_mounts,
+            &policy.chroot_mount_ro,
+            root_is_read_only(policy),
+        )
+    };
+    match file {
+        VirtualFile::CpuInfo => generate_cpuinfo(policy.num_cpus.unwrap_or(1)),
+        VirtualFile::MemInfo => {
+            let rs = resource.lock().await;
+            generate_meminfo(policy.max_memory_bytes, rs.mem_used)
+        }
+        VirtualFile::Uptime => {
+            let rs = resource.lock().await;
+            generate_uptime(rs.start_instant.elapsed().as_secs_f64())
+        }
+        VirtualFile::LoadAvg => {
+            let total = processes.len() as u32;
+            let last_pid = processes.max_pid().unwrap_or(0);
+            let rs = resource.lock().await;
+            generate_loadavg(&rs.load_avg, rs.proc_count, total, last_pid)
+        }
+        VirtualFile::NetDev => generate_proc_net_dev(),
+        VirtualFile::NetIfInet6 => generate_proc_net_if_inet6(),
+        VirtualFile::NetTcp { v6 } => {
+            let ns = network.lock().await;
+            generate_proc_net_tcp(&ns.port_map.bound_ports, v6)
+        }
+        VirtualFile::Mounts => {
+            let (root, mounts, ro, root_ro) = mounts_args();
+            generate_proc_mounts(root, mounts, ro, root_ro)
+        }
+        VirtualFile::MountInfo => {
+            let (root, mounts, ro, root_ro) = mounts_args();
+            generate_proc_mountinfo(root, mounts, ro, root_ro)
+        }
+        VirtualFile::MountStats => {
+            generate_proc_mountstats(policy.chroot_root.as_deref(), &policy.chroot_mounts)
+        }
+        // The real file names the host's slice and scope. This is what a
+        // task sees from inside a cgroup namespace of its own.
+        VirtualFile::Cgroup => b"0::/\n".to_vec(),
+        VirtualFile::Hostname => {
+            format!("{}\n", policy.virtual_hostname.as_deref().unwrap_or_default()).into_bytes()
+        }
+        VirtualFile::EtcHosts => policy.virtual_etc_hosts.clone().into_bytes(),
     }
 }
 
@@ -528,93 +617,17 @@ pub(crate) async fn handle_proc_open(
         return NotifAction::Errno(EACCES);
     }
 
-    let path = canon_proc_namespace(path);
-    let path = path.as_ref();
-
-    // Virtualize /proc/cpuinfo.
-    if path == "/proc/cpuinfo" {
-        if let Some(num_cpus) = policy.num_cpus {
-            let content = generate_cpuinfo(num_cpus);
+    // The /etc shims are handlers of their own, ordered around the chroot
+    // handler so that its grant check comes first.
+    if path.starts_with("/proc/") {
+        if let Some(file) = virtual_file(path, policy) {
+            let content = render_virtual_file(file, processes, resource, network, policy).await;
             return inject_memfd(&content);
         }
     }
 
-    // Virtualize /proc/meminfo.
-    if path == "/proc/meminfo" && policy.max_memory_bytes > 0 {
-        let rs = resource.lock().await;
-        let content = generate_meminfo(policy.max_memory_bytes, rs.mem_used);
-        return inject_memfd(&content);
-    }
-
-    // Virtualize /proc/uptime when time_start is set.
-    if path == "/proc/uptime" && policy.has_time_start {
-        let rs = resource.lock().await;
-        let elapsed = rs.start_instant.elapsed().as_secs_f64();
-        let content = generate_uptime(elapsed);
-        return inject_memfd(&content);
-    }
-
-    // Virtualize /proc/loadavg when proc virtualization is active.
-    if path == "/proc/loadavg" {
-        let total = processes.len() as u32;
-        let last_pid = processes.max_pid().unwrap_or(0);
-        let rs = resource.lock().await;
-        let running = rs.proc_count;
-        let content = generate_loadavg(&rs.load_avg, running, total, last_pid);
-        return inject_memfd(&content);
-    }
-
-    // Virtualize /proc/net/dev and /proc/net/if_inet6 — show loopback only.
-    if path == "/proc/net/dev" {
-        return inject_memfd(&generate_proc_net_dev());
-    }
-    if path == "/proc/net/if_inet6" {
-        return inject_memfd(&generate_proc_net_if_inet6());
-    }
-
-    // Virtualize /proc/net/tcp and /proc/net/tcp6 when port_remap is active.
-    if policy.port_remap && (path == "/proc/net/tcp" || path == "/proc/net/tcp6") {
-        let is_v6 = path.ends_with('6');
-        let ns = network.lock().await;
-        let content = generate_proc_net_tcp(&ns.port_map.bound_ports, is_v6);
-        return inject_memfd(&content);
-    }
-
-    // Virtualize /proc/mounts and /proc/self/mounts.
-    if path == "/proc/mounts" || path == "/proc/self/mounts" {
-        let content = generate_proc_mounts(
-            policy.chroot_root.as_deref(),
-            &policy.chroot_mounts,
-            &policy.chroot_mount_ro,
-            root_is_read_only(policy),
-        );
-        return inject_memfd(&content);
-    }
-
-    // Virtualize /proc/self/mountinfo.
-    if path == "/proc/self/mountinfo" {
-        let content = generate_proc_mountinfo(
-            policy.chroot_root.as_deref(),
-            &policy.chroot_mounts,
-            &policy.chroot_mount_ro,
-            root_is_read_only(policy),
-        );
-        return inject_memfd(&content);
-    }
-
-    // Virtualize /proc/self/mountstats.
-    if path == "/proc/self/mountstats" {
-        return inject_memfd(&generate_proc_mountstats(
-            policy.chroot_root.as_deref(),
-            &policy.chroot_mounts,
-        ));
-    }
-
-    // The real file names the host's slice and scope. This is what a task
-    // sees from inside a cgroup namespace of its own.
-    if path == "/proc/self/cgroup" {
-        return inject_memfd(b"0::/\n");
-    }
+    let path = canon_proc_namespace(path);
+    let path = path.as_ref();
 
     if let Some(action) = open_own_proc_on_behalf(notif, notif_fd, path, processes, policy) {
         return action;
