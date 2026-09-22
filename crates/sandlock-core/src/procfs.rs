@@ -119,6 +119,20 @@ pub(crate) fn canon_proc_namespace(path: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// Whether an open of `path` is answered with generated content under
+/// `policy`, so the real file must never be handed out in its place.
+pub(crate) fn has_virtual_form(path: &str, policy: &NotifPolicy) -> bool {
+    match canon_proc_namespace(path).as_ref() {
+        "/proc/cpuinfo" => policy.num_cpus.is_some(),
+        "/proc/meminfo" => policy.max_memory_bytes > 0,
+        "/proc/uptime" => policy.has_time_start,
+        "/proc/net/tcp" | "/proc/net/tcp6" => policy.port_remap,
+        "/proc/loadavg" | "/proc/net/dev" | "/proc/net/if_inet6" | "/proc/self/mounts"
+        | "/proc/self/mountinfo" | "/proc/self/mountstats" | "/proc/self/cgroup" => true,
+        _ => false,
+    }
+}
+
 // ============================================================
 // /proc/cpuinfo generator
 // ============================================================
@@ -631,12 +645,11 @@ const READ_OPEN_FLAGS: i32 =
 /// the supervisor may hold more than the task it would be opening them for.
 pub(crate) const OPENER_PRIVILEGED_FILES: &[&str] = &["pagemap", "stack", "seccomp_cache"];
 
-/// True for a read grant the supervisor serves instead of Landlock, which
-/// could only bind it to the one pid that exists when the rule is added
-/// (issue #218). The net subtree is never served, so its grants stay rules.
-pub(crate) fn is_own_proc_read_grant(path: &std::path::Path) -> bool {
-    (path.starts_with(PROC_SELF) || path.starts_with(PROC_THREAD_SELF))
-        && path.to_str().is_some_and(|p| !matches!(proc_namespace_entry(p), Some(("net", _))))
+/// True for a read grant the supervisor serves instead of Landlock. A rule
+/// on procfs would let any link reach the entries the handlers hide by name
+/// (issue #236), and one on /proc/self binds to a single pid (issue #218).
+pub(crate) fn is_supervised_proc_grant(path: &std::path::Path) -> bool {
+    path.starts_with("/proc")
 }
 
 /// A path inside the caller's own /proc directory.
@@ -684,7 +697,25 @@ fn own_proc_target(path: &str, tid: i32, tgid: i32) -> Option<OwnProcTarget<'_>>
 /// The pid-free spellings of a path inside the caller's own /proc directory,
 /// which are the only ones a grant or a deny can name. Empty for any other path.
 pub(crate) fn own_proc_self_forms(path: &str, tid: i32, tgid: i32) -> Vec<String> {
-    own_proc_target(path, tid, tgid).map(|target| target.self_forms).unwrap_or_default()
+    let mut forms = own_proc_target(path, tid, tgid).map(|target| target.self_forms).unwrap_or_default();
+    // /proc/net is a link into the caller's directory, and a policy may name it.
+    if let Some(("net", tail)) = proc_namespace_entry(path) {
+        forms.push(format!("/proc/net{}", tail));
+    }
+    forms
+}
+
+/// Whether `grant` reaches `form`, a pid-free spelling of the caller's own
+/// entry. The net subtree is the host's network namespace, not the task's
+/// own data, so through this spelling only a grant naming net reaches it.
+pub(crate) fn own_grant_covers(form: &str, grant: &std::path::Path) -> bool {
+    if !std::path::Path::new(form).starts_with(grant) {
+        return false;
+    }
+    match proc_namespace_entry(form) {
+        Some(("net", tail)) => grant.starts_with(&form[..form.len() - tail.len()]),
+        _ => true,
+    }
 }
 
 /// The /dev names that are links into the caller's fd directory on this host.
@@ -1404,6 +1435,22 @@ mod tests {
     }
 
     #[test]
+    fn test_own_grant_covers() {
+        use std::path::Path;
+        assert!(own_grant_covers("/proc/self/status", Path::new("/proc/self")));
+        assert!(own_grant_covers("/proc/self/status", Path::new("/proc")));
+        assert!(!own_grant_covers("/proc/self/net/arp", Path::new("/proc/self")));
+        assert!(!own_grant_covers("/proc/thread-self/net/arp", Path::new("/proc/thread-self")));
+        assert!(!own_grant_covers("/proc/self/task/7/net/arp", Path::new("/proc/self")));
+        assert!(own_grant_covers("/proc/self/net/arp", Path::new("/proc/self/net")));
+        assert!(own_grant_covers("/proc/self/net/arp", Path::new("/proc/self/net/arp")));
+        assert!(!own_grant_covers("/proc/self/net/arp", Path::new("/proc")));
+        assert!(own_grant_covers("/proc/net/arp", Path::new("/proc")));
+        assert!(own_grant_covers("/proc/net/arp", Path::new("/proc/net")));
+        assert!(!own_grant_covers("/proc/self/status", Path::new("/proc/self/status/x")));
+    }
+
+    #[test]
     fn test_own_proc_self_forms() {
         assert_eq!(own_proc_self_forms("/proc/10/maps", 12, 10), ["/proc/self/maps"]);
         assert!(own_proc_self_forms("/proc/11/maps", 12, 10).is_empty());
@@ -1411,17 +1458,14 @@ mod tests {
     }
 
     #[test]
-    fn test_is_own_proc_read_grant() {
+    fn test_is_supervised_proc_grant() {
         use std::path::Path;
-        assert!(is_own_proc_read_grant(Path::new("/proc/self")));
-        assert!(is_own_proc_read_grant(Path::new("/proc/self/maps")));
-        assert!(is_own_proc_read_grant(Path::new("/proc/thread-self/stat")));
-        assert!(is_own_proc_read_grant(Path::new("/proc/self/mounts")));
-        assert!(!is_own_proc_read_grant(Path::new("/proc/self/net")));
-        assert!(!is_own_proc_read_grant(Path::new("/proc/thread-self/net/arp")));
-        assert!(!is_own_proc_read_grant(Path::new("/proc")));
-        assert!(!is_own_proc_read_grant(Path::new("/proc/selfish")));
-        assert!(!is_own_proc_read_grant(Path::new("/proc/1/maps")));
+        assert!(is_supervised_proc_grant(Path::new("/proc")));
+        assert!(is_supervised_proc_grant(Path::new("/proc/self/maps")));
+        assert!(is_supervised_proc_grant(Path::new("/proc/thread-self/net/arp")));
+        assert!(is_supervised_proc_grant(Path::new("/proc/1/maps")));
+        assert!(!is_supervised_proc_grant(Path::new("/procfs")));
+        assert!(!is_supervised_proc_grant(Path::new("/etc")));
     }
 
     #[test]

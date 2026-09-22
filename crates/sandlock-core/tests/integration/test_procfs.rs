@@ -722,3 +722,39 @@ async fn test_deny_active_refuses_what_it_cannot_resolve_for_the_caller() {
     let (_, out) = run_sh(&policy, &script).await;
     assert_eq!(out, "0\n0\n1");
 }
+
+/// Issue #236: Landlock granted all of /proc, so a link or /proc/self/root
+/// took the kernel to entries the handlers refuse by name.
+#[tokio::test]
+async fn test_links_into_proc_cannot_reach_hidden_entries() {
+    let links = LinkDir::new("proc236", &[("init", "/proc/1"), ("syms", "/proc/kallsyms"), ("self", "/proc/self")]);
+    let policy = proc_grant().fs_read(&links.0).build().unwrap();
+    let script = [
+        openable(&format!("{}/cmdline", links.path("init"))),
+        openable(&links.path("syms")),
+        openable("/proc/self/root/proc/1/cmdline"),
+        openable(&format!("{}/comm", links.path("self"))),
+        openable("/proc/$$/status"),
+        openable("/proc/sys/kernel/pid_max"),
+        "ls /proc | grep -c '^cpuinfo$'".to_string(),
+    ]
+    .join("; ");
+    let (_, out) = run_sh(&policy, &script).await;
+    assert_eq!(out, "0\n0\n0\n1\n1\n1\n1");
+}
+
+/// A /proc grant covers the net entries that have no virtual form, and the
+/// supervisor shares the network namespace, so it can serve them.
+#[tokio::test]
+async fn test_proc_grant_serves_unvirtualized_net_entries() {
+    let policy = proc_grant().build().unwrap();
+    let script = [
+        openable("/proc/net/unix"),
+        openable("/proc/self/net/route"),
+        openable("/proc/$$/net/arp"),
+        "grep -c : /proc/net/dev".to_string(),
+    ]
+    .join("; ");
+    let (_, out) = run_sh(&policy, &script).await;
+    assert_eq!(out, "1\n1\n1\n1");
+}

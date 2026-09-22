@@ -482,10 +482,6 @@ fn realpath_of_fd(fd: RawFd) -> Option<std::path::PathBuf> {
 }
 
 
-fn path_under_any(path: &std::path::Path, list: &[std::path::PathBuf]) -> bool {
-    list.iter().any(|p| path.starts_with(p))
-}
-
 /// Decide whether `realpath` may be opened with `flags` under the deny set
 /// and the (conservative) grant lists. Returns `Some(errno)` to refuse,
 /// `None` to allow. Never over-allows relative to the configured grants: a
@@ -535,12 +531,13 @@ fn deny_open_verdict(
         || acc == libc::O_RDWR
         || (flags & libc::O_TRUNC as u64) != 0
         || (flags & libc::O_CREAT as u64) != 0;
-    let granted = |path: &str| {
-        let path = std::path::Path::new(path);
-        path_under_any(path, &policy.chroot_writable)
-            || (!is_write && path_under_any(path, &policy.chroot_readable))
+    let grants = || {
+        let reads = (!is_write).then_some(policy.chroot_readable.iter()).into_iter().flatten();
+        policy.chroot_writable.iter().chain(reads)
     };
-    if spellings().any(granted) { None } else { Some(libc::EACCES) }
+    let granted = grants().any(|grant| realpath.starts_with(grant))
+        || self_forms.iter().any(|form| grants().any(|grant| crate::procfs::own_grant_covers(form, grant)));
+    if granted { None } else { Some(libc::EACCES) }
 }
 
 /// Resolve again, inside the caller's /proc directory, a probe that landed in
@@ -555,6 +552,7 @@ fn reprobe_in_callers_proc(
     caller_tid: u32,
     nofollow: bool,
     processes: &super::state::ProcessIndex,
+    policy: &NotifPolicy,
 ) -> Option<Result<OwnedFd, i32>> {
     let real = realpath_of_fd(found.as_raw_fd())?;
     let own = format!("/proc/{}", std::process::id());
@@ -564,9 +562,9 @@ fn reprobe_in_callers_proc(
         Ok(rest) => (rest, format!("/proc/{}/task/{}", caller_tgid, caller_tid)),
         Err(_) => (real.strip_prefix(&own).ok()?, format!("/proc/{}", caller_tgid)),
     };
-    // These have a virtual form that this open would go around.
+    // The generated content is what the child must see, not the real file.
     let target = std::path::Path::new(&callers).join(rest);
-    if target.to_str().is_none_or(|t| crate::procfs::proc_namespace_entry(t).is_some()) {
+    if target.to_str().is_none_or(|t| crate::procfs::has_virtual_form(t, policy)) {
         return Some(Err(libc::EACCES));
     }
 
@@ -874,18 +872,29 @@ fn create_new_on_behalf(
     inject_open_result(fd, flags)
 }
 
-/// Perform `openat`/`open` on behalf of the child, race-free, when a deny is
-/// active. Resolves once (pinning the inode), enforces deny + grant on the
-/// pinned target, then hands the child an fd to that exact inode via
-/// `InjectFdSend`. Returns `Continue` only when no allow/deny decision was
-/// made on content we resolved (unreadable path / no allowlist configured),
-/// matching the precheck's existing soft fall-through.
-fn on_behalf_open_for_deny(
+/// Whether the file behind `fd` lives on procfs.
+fn is_procfs(fd: RawFd) -> bool {
+    const PROC_SUPER_MAGIC: i64 = 0x9fa0;
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstatfs(fd, &mut st) };
+    rc == 0 && st.f_type as i64 == PROC_SUPER_MAGIC
+}
+
+/// Perform `openat`/`open` on behalf of the child, race-free. Resolves once
+/// (pinning the inode), enforces deny + grant on the pinned target, then hands
+/// the child an fd to that exact inode via `InjectFdSend`.
+///
+/// With a deny active every open is taken over, since the kernel cannot
+/// re-resolve past the deny. Otherwise only an open that lands on procfs is:
+/// procfs has no Landlock grant, so it can only be reached through here, and
+/// a `Continue` for anything else is judged by Landlock on the real inode.
+fn on_behalf_open(
     notif: &SeccompNotif,
     policy: &NotifPolicy,
     pfs: &super::state::PolicyFnState,
     processes: &super::state::ProcessIndex,
     notif_fd: RawFd,
+    has_denied: bool,
 ) -> NotifAction {
     // No allowlist configured (Landlock is not allowlisting the filesystem):
     // there is no grant to check against, so taking over the open could only
@@ -929,6 +938,11 @@ fn on_behalf_open_for_deny(
         })
         .flatten();
     if let Some(own_fd) = own_fd {
+        // Without a deny the kernel's own reopen is faithful and Landlock
+        // judges the fd's target, as it would for a native reopen.
+        if !has_denied {
+            return NotifAction::Continue;
+        }
         return match dup_fd_from_pid(notif.pid, own_fd) {
             Ok(dup) => reopen_existing_on_behalf(dup, flags, policy, pfs, processes, notif, notif_fd),
             Err(_) => NotifAction::Errno(libc::ENOENT),
@@ -939,11 +953,13 @@ fn on_behalf_open_for_deny(
     // final component and any `openat2` RESOLVE_* flags it requested.
     let probe_flags = (libc::O_PATH | libc::O_CLOEXEC) as u64 | (flags & libc::O_NOFOLLOW as u64);
     match openat2_at(base.as_raw_fd(), &c_path, probe_flags, 0, RESOLVE_NO_MAGICLINKS | resolve) {
-        Ok(probe) => match reprobe_in_callers_proc(&probe, notif.pid, nofollow, processes) {
+        Ok(probe) => match reprobe_in_callers_proc(&probe, notif.pid, nofollow, processes, policy) {
             Some(Ok(callers)) => reopen_existing_on_behalf(callers, flags, policy, pfs, processes, notif, notif_fd),
             Some(Err(errno)) => NotifAction::Errno(errno),
+            None if !has_denied && !is_procfs(probe.as_raw_fd()) => NotifAction::Continue,
             None => reopen_existing_on_behalf(probe, flags, policy, pfs, processes, notif, notif_fd),
         },
+        Err(_) if !has_denied => NotifAction::Continue,
         Err(errno) if errno == libc::ENOENT && (flags & libc::O_CREAT as u64) != 0 => {
             create_new_on_behalf(&base, &path, flags, mode, resolve, policy, pfs, processes, notif.pid)
         }
@@ -1047,6 +1063,13 @@ pub struct NotifPolicy {
 }
 
 impl NotifPolicy {
+    /// Whether procfs reads are the supervisor's to serve: a grant under
+    /// /proc is never a Landlock rule while a supervisor runs.
+    pub(crate) fn serves_procfs(&self) -> bool {
+        self.chroot_root.is_none()
+            && self.chroot_readable.iter().any(|p| crate::procfs::is_supervised_proc_grant(p))
+    }
+
     /// Whether an IP-family `connect()` must be handled on-behalf by the
     /// supervisor, given the destination's loopback-ness.
     ///
@@ -2455,9 +2478,12 @@ async fn handle_notification(
                 let is_openat_family = nr == libc::SYS_openat
                     || nr == arch::SYS_OPENAT2
                     || Some(nr) == arch::sys_open();
-                if matches!(action, NotifAction::Continue) && is_openat_family && has_denied {
+                if matches!(action, NotifAction::Continue)
+                    && is_openat_family
+                    && (has_denied || policy.serves_procfs())
+                {
                     let pfs = ctx.policy_fn.lock().await;
-                    on_behalf_open_for_deny(&notif, policy, &pfs, &ctx.processes, fd)
+                    on_behalf_open(&notif, policy, &pfs, &ctx.processes, fd, has_denied)
                 } else {
                     action
                 }

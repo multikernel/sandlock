@@ -501,11 +501,10 @@ fn confine_inner(policy: &Sandbox, handle_net: bool, supervised: bool) -> Result
             if !host.exists() { continue; }
             host.as_path()
         } else {
-            // The supervisor serves a task's own /proc/self reads. A rule here
-            // would bind to the one pid adding it and treat the first process
-            // differently from its children. Without a supervisor that rule is
-            // all there is, so it stays.
-            if supervised && crate::procfs::is_own_proc_read_grant(path) { continue; }
+            // The supervisor serves procfs reads: a rule would let any link
+            // reach what the handlers hide by name. Without a supervisor the
+            // rule is all there is, so it stays.
+            if supervised && crate::procfs::is_supervised_proc_grant(path) { continue; }
             path.as_path()
         };
         add_path_rule(&ruleset_fd, rule_path, READ_ACCESS).map_err(|e| {
