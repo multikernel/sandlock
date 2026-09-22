@@ -275,7 +275,12 @@ fn chroot_path_syscalls() -> Vec<i64> {
 /// content, so there is nothing to deny at creation time. A later open
 /// through the created name resolves to the real target and is denied
 /// race-free on the open path (issue #111).
-pub(crate) fn fs_denied_path_syscalls() -> Vec<i64> {
+pub(crate) fn fs_denied_path_syscalls() -> &'static [i64] {
+    static SET: std::sync::OnceLock<Vec<i64>> = std::sync::OnceLock::new();
+    SET.get_or_init(build_fs_denied_path_syscalls)
+}
+
+fn build_fs_denied_path_syscalls() -> Vec<i64> {
     let mut v = vec![
         libc::SYS_openat,
         arch::SYS_OPENAT2,

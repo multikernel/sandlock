@@ -2468,51 +2468,42 @@ async fn handle_notification(
         maybe_patch_vdso(notif.pid as i32, &mut pfs, policy);
     }
 
-    // Check dynamic path denials before dispatch. The gated syscall set is
-    // shared with the BPF notif list so enforcement scope cannot drift from
-    // interception scope; see `fs_denied_path_syscalls` for what is gated
-    // and why symlink/mkdir are not.
+    // Path denials are checked before dispatch, on the syscall set the BPF
+    // notif list gates for them; see `fs_denied_path_syscalls`. Nothing is
+    // resolved for it unless a deny exists: with none, there is nothing a
+    // path could be denied against.
+    let nr = notif.data.nr as i64;
+    let is_openat_family =
+        nr == libc::SYS_openat || nr == arch::SYS_OPENAT2 || Some(nr) == arch::sys_open();
+    let has_denied = policy.chroot_root.is_none() && ctx.policy_fn.lock().await.has_denied_paths();
     let mut action = {
-        let nr = notif.data.nr as i64;
-        let should_precheck_denied = policy.chroot_root.is_none()
-            && crate::seccomp_plan::fs_denied_path_syscalls().contains(&nr);
-        if should_precheck_denied {
-            let pfs = ctx.policy_fn.lock().await;
-            if is_path_denied_for_notif(&pfs, &notif, fd) {
-                NotifAction::Errno(libc::EACCES)
-            } else {
-                let has_denied = pfs.has_denied_paths();
-                drop(pfs);
-                // Let normal dispatch run first so /proc virtualization and
-                // other handlers still win for their paths.
-                let action = dispatch_table.dispatch(notif, fd).await;
-                // A bare `Continue` for openat/open is the racy window: the
-                // supervisor's resolution said "not denied", but the kernel
-                // re-resolves after Continue and a racing thread can swap a
-                // symlink to reach a denied carve-out inside a granted tree
-                // (issue #111). Run the open on-behalf against the pinned
-                // inode and inject the fd so the kernel never re-resolves.
-                // Other path syscalls keep the best-effort precheck above
-                // (documented follow-up — they return no fd to inject).
-                let is_openat_family = nr == libc::SYS_openat
-                    || nr == arch::SYS_OPENAT2
-                    || Some(nr) == arch::sys_open();
-                if matches!(action, NotifAction::Continue)
-                    && is_openat_family
-                    && (has_denied || policy.resolves_opens())
-                {
-                    let pfs = ctx.policy_fn.lock().await;
-                    on_behalf_open(&notif, ctx, &pfs, fd, has_denied).await
-                } else {
-                    action
-                }
-            }
+        let denied = has_denied
+            && crate::seccomp_plan::fs_denied_path_syscalls().contains(&nr)
+            && is_path_denied_for_notif(&*ctx.policy_fn.lock().await, &notif, fd);
+        if denied {
+            NotifAction::Errno(libc::EACCES)
         } else {
-            dispatch_table.dispatch(notif, fd).await
+            // Dispatch runs first so /proc virtualization and the other
+            // handlers still win for their paths.
+            let action = dispatch_table.dispatch(notif, fd).await;
+            // A bare Continue for an open is the racy window: the kernel
+            // re-resolves the path after it, and a racing thread can swap a
+            // link to reach a denied carve-out inside a granted tree (issue
+            // #111) or a procfs entry the handlers hide by name (issue
+            // #236). The open is done against the pinned inode instead.
+            if matches!(action, NotifAction::Continue)
+                && is_openat_family
+                && policy.chroot_root.is_none()
+                && (has_denied || policy.resolves_opens())
+            {
+                let pfs = ctx.policy_fn.lock().await;
+                on_behalf_open(&notif, ctx, &pfs, fd, has_denied).await
+            } else {
+                action
+            }
         }
     };
 
-    let nr = notif.data.nr as i64;
     let fork_counted = matches!(action, NotifAction::Continue)
         && crate::resource::fork_counted_on_continue(&notif, fd);
 
