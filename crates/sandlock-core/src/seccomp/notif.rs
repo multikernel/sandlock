@@ -823,7 +823,7 @@ fn reopen_fifo_when_partnered(
 /// target, then create the leaf inside that pinned parent (the dir inode is
 /// fixed, only the leaf name is appended).
 fn create_new_on_behalf(
-    base: &OwnedFd,
+    base: RawFd,
     path: &str,
     flags: u64,
     mode: u64,
@@ -848,7 +848,7 @@ fn create_new_on_behalf(
         Err(_) => return NotifAction::Errno(libc::EINVAL),
     };
     let parent_fd = match openat2_at(
-        base.as_raw_fd(),
+        base,
         &c_parent,
         (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
         0,
@@ -920,18 +920,25 @@ async fn on_behalf_open(
         Ok(c) => c,
         Err(_) => return NotifAction::Errno(libc::EINVAL),
     };
-    let base = match open_base_dir(notif.pid, dirfd) {
-        Ok(b) => b,
-        Err(e) => return NotifAction::Errno(e),
+    // An absolute path ignores the directory it is opened against.
+    let base = match path.starts_with('/') {
+        true => None,
+        false => match open_base_dir(notif.pid, dirfd) {
+            Ok(b) => Some(b),
+            Err(e) => return NotifAction::Errno(e),
+        },
     };
+    let base_fd = base.as_ref().map_or(libc::AT_FDCWD, |b| b.as_raw_fd());
 
     let nofollow = flags & libc::O_NOFOLLOW as u64 != 0;
     let follows_links = !nofollow && resolve & (RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS) == 0;
 
     // /proc/self/fd/N, /dev/stdin and their kin ask for the caller's own fd.
     // The walk below would refuse that magic link, because in this context it
-    // is the supervisor's, so the fd is taken from the caller directly.
-    let own_fd = follows_links
+    // is the supervisor's, so the fd is taken from the caller directly. Without
+    // a deny the kernel's own reopen is faithful and Landlock judges the fd's
+    // target, as it would for a native reopen, so the probe's ELOOP continues.
+    let own_fd = (has_denied && follows_links)
         .then(|| {
             let tgid = processes.tgid_of(notif.pid as i32)?;
             let target = crate::procfs::resolve_open_target(
@@ -941,11 +948,6 @@ async fn on_behalf_open(
         })
         .flatten();
     if let Some(own_fd) = own_fd {
-        // Without a deny the kernel's own reopen is faithful and Landlock
-        // judges the fd's target, as it would for a native reopen.
-        if !has_denied {
-            return NotifAction::Continue;
-        }
         return match dup_fd_from_pid(notif.pid, own_fd) {
             Ok(dup) => reopen_existing_on_behalf(dup, flags, ctx, pfs, notif, notif_fd).await,
             Err(_) => NotifAction::Errno(libc::ENOENT),
@@ -955,7 +957,7 @@ async fn on_behalf_open(
     // Side-effect-free probe; mirror the child's no-follow intent for the
     // final component and any `openat2` RESOLVE_* flags it requested.
     let probe_flags = (libc::O_PATH | libc::O_CLOEXEC) as u64 | (flags & libc::O_NOFOLLOW as u64);
-    match openat2_at(base.as_raw_fd(), &c_path, probe_flags, 0, RESOLVE_NO_MAGICLINKS | resolve) {
+    match openat2_at(base_fd, &c_path, probe_flags, 0, RESOLVE_NO_MAGICLINKS | resolve) {
         Ok(probe) => match reprobe_in_callers_proc(&probe, notif.pid, nofollow, processes) {
             Some(Ok(callers)) => reopen_existing_on_behalf(callers, flags, ctx, pfs, notif, notif_fd).await,
             Some(Err(errno)) => NotifAction::Errno(errno),
@@ -973,7 +975,7 @@ async fn on_behalf_open(
         },
         Err(_) if !has_denied => NotifAction::Continue,
         Err(errno) if errno == libc::ENOENT && (flags & libc::O_CREAT as u64) != 0 => {
-            create_new_on_behalf(&base, &path, flags, mode, resolve, policy, pfs, processes, notif.pid)
+            create_new_on_behalf(base_fd, &path, flags, mode, resolve, policy, pfs, processes, notif.pid)
         }
         Err(errno) => NotifAction::Errno(errno),
     }
