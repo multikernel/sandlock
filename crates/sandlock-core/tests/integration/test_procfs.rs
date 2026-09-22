@@ -781,3 +781,22 @@ async fn test_links_to_virtual_files_show_the_virtual_content() {
         assert_eq!(out, "2\n1\nsame-hostname\nsame-hosts", "deny active: {}", deny_active);
     }
 }
+
+/// The real /etc/hostname keeps no Landlock grant: a spelling the supervisor
+/// cannot resolve, such as a magic link, goes to the kernel and must not
+/// reach it. The rest of /etc stays readable and listable.
+#[tokio::test]
+async fn test_virtualized_etc_file_has_no_grant_on_its_real_inode() {
+    let Ok(real) = std::fs::read_to_string("/etc/hostname") else { return };
+    let policy = proc_grant().build().unwrap();
+    let script = concat!(
+        "cd /etc && printf 'cwd:%s\n' \"$(cat /proc/self/cwd/hostname 2>&1)\"; ",
+        "set -- /etc/pass*; echo $1; cat /etc/hostname"
+    );
+    let (_, out) = run_sh(&policy, script).await;
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 3, "{:?}", out);
+    assert!(!lines[0].contains(real.trim()), "the real hostname leaked through a magic link: {:?}", out);
+    assert_eq!(lines[1], "/etc/passwd");
+    assert!(lines[2].starts_with("sandbox-"), "{:?}", out);
+}

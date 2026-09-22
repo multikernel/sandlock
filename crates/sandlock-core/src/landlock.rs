@@ -148,6 +148,40 @@ pub fn abi_version() -> Result<u32, ConfinementError> {
 // Rule helpers
 // ============================================================
 
+/// Files the supervisor answers for with generated content. Their real
+/// inode must not be granted, or any other spelling of them reads the host's.
+fn shadowed_files() -> impl Iterator<Item = &'static Path> {
+    crate::procfs::SHADOWED_ETC_FILES.iter().map(Path::new)
+}
+
+/// Install a read grant on `dir` as rules on its entries, leaving out the
+/// shadowed files beneath it. Landlock cannot deny a file inside a granted
+/// tree, so this is the only way to grant the rest. A file created directly
+/// in `dir` after this is not covered; the grants this applies to are
+/// read-only host trees such as /etc.
+fn add_read_rules_around_shadowed(ruleset_fd: &OwnedFd, dir: &Path) -> Result<(), ConfinementError> {
+    add_path_rule(ruleset_fd, dir, LANDLOCK_ACCESS_FS_READ_DIR)?;
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| ConfinementError::Landlock(format!("read dir {:?}: {}", dir, e)))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // A link is never the object of an access; its target has its own rule.
+        if shadowed_files().any(|f| f == path) || entry.file_type().is_ok_and(|t| t.is_symlink()) {
+            continue;
+        }
+        if crate::procfs::is_supervised_proc_grant(&path) {
+            continue;
+        }
+        if shadowed_files().any(|f| f.starts_with(&path)) {
+            add_read_rules_around_shadowed(ruleset_fd, &path)?;
+        } else {
+            // An entry that vanished or cannot be referenced costs only itself.
+            let _ = add_path_rule(ruleset_fd, &path, READ_ACCESS);
+        }
+    }
+    Ok(())
+}
+
 /// Open `path` and add a Landlock path-beneath rule to `ruleset_fd`.
 fn add_path_rule(ruleset_fd: &OwnedFd, path: &Path, access: u64) -> Result<(), ConfinementError> {
     use std::os::fd::FromRawFd;
@@ -505,6 +539,13 @@ fn confine_inner(policy: &Sandbox, handle_net: bool, supervised: bool) -> Result
             // reach what the handlers hide by name. Without a supervisor the
             // rule is all there is, so it stays.
             if supervised && crate::procfs::is_supervised_proc_grant(path) { continue; }
+            if supervised && shadowed_files().any(|f| f == path) { continue; }
+            if supervised && shadowed_files().any(|f| f.starts_with(path)) {
+                add_read_rules_around_shadowed(&ruleset_fd, path).map_err(|e| {
+                    SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
+                })?;
+                continue;
+            }
             path.as_path()
         };
         add_path_rule(&ruleset_fd, rule_path, READ_ACCESS).map_err(|e| {
