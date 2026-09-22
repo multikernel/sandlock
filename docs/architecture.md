@@ -80,31 +80,50 @@ process exit, including `SIGKILL`, releases it in the kernel. Each new claim use
 a random abstract Unix socket address. An inherited descriptor for an earlier
 instance therefore cannot prevent reuse of the sandbox name.
 
-The registry uses no files, shared-memory segments, helper processes, dedicated
-threads, or io_uring. Its versioned semaphore set persists after the last sandbox
-exits and is reused by later processes. The initial implementation supports 256
-live names per UID and IPC namespace. Exhaustion and registry transaction errors
-fail sandbox creation. Transaction waits are bounded to two seconds.
+The registry grows in segments of 4,096 names, with no compiled-in total
+sandbox limit. Each segment has one set of 8,196 semaphores and one shared-memory
+segment for names, 128-bit instance tokens, and index links. Each sandbox uses
+two semaphores: supervisor ownership and the child's PID stamp. A shared root
+directory has 65,536 hash buckets, so name lookup and reservation scan only the
+matching bucket rather than every sandbox. The bucket count does not limit the
+number of names; collisions form chains across segments.
+
+A root transaction lock serializes metadata access, name reservation, and child
+instance-token checks. A small insertion journal lets the next process finish
+or discard an index update interrupted by a crash. Each segment's metadata
+header identifies its root and ordinal before its semaphore set is used, so an
+IPC key collision fails without modifying another segment's reservations.
+
+The registry uses no filesystem paths, helper processes, dedicated threads, or
+io_uring. Its versioned IPC objects persist and reuse inactive entries within
+each hash bucket. Allocated storage therefore tracks historical demand per
+bucket, not just the current live count. Host semaphore, shared-memory, and
+memory limits bound growth. Resource exhaustion and registry transaction errors
+fail sandbox creation; transaction waits are bounded to two seconds. SEM_UNDO
+releases both ownership and transaction locks after a process exits.
 
 The registry is accessible only to its owning UID. Processes with that same UID
 are trusted, as with the control socket. The child publishes its process-group
-identity in a dedicated semaphore before confinement; `GETPID` returns its kernel-recorded PID. This replaces the
+identity in a dedicated semaphore before confinement; `GETPID` returns its
+kernel-recorded PID. This replaces the
 process-group socket. A single abstract request socket remains for control
 requests, and clients authenticate its supervisor with `SO_PEERCRED`. Control
-clients and supervisors must share both the IPC namespace used for discovery and the
+clients and supervisors must share the IPC namespace used for discovery and the
 network namespace containing their abstract sockets. This protocol does not
 discover sandboxes started by older versions using name-based socket addresses.
 
 Sandlock does not create an IPC namespace. The default seccomp policy denies
-`semget`, `semctl`, `semop`, and `semtimedop`, including in unsupervised mode.
+semaphore and shared-memory syscalls, including in unsupervised mode.
 Knowing the registry ID does not let a confined workload read, modify, or remove
-it. The child publication creates no undo adjustment, and ordinary forks do not
+it. Metadata is attached only during registry operations, marked
+`MADV_DONTFORK` under the sandbox fork lock, and detached before confinement.
+This also protects in-process entrypoints that do not exec. The child PID stamp
+creates no undo adjustment, and ordinary forks do not
 inherit the supervisor's undo adjustments. Explicitly allowing `sysv_ipc` restores
 same-UID access to the registry and therefore requires trusting the workload.
 A nested sandbox that cannot access the registry can execute without control
 introspection, with a diagnostic. A host explicitly using `CLONE_SYSVSEM` can
-share undo state and
-delay automatic cleanup until the last sharer exits. Explicit sandbox cleanup
+share undo state and delay automatic cleanup until the last sharer exits. Explicit sandbox cleanup
 still releases the claim.
 
 ## Custom Handlers

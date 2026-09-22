@@ -477,23 +477,42 @@ async fn test_tcp_always_allowed() {
 }
 
 async fn check_control_semaphore_is_inaccessible(no_supervisor: bool) {
-    struct Canary(i32);
+    struct Canary(i32, i32);
     impl Drop for Canary {
         fn drop(&mut self) {
-            unsafe { libc::semctl(self.0, 0, libc::IPC_RMID); }
+            unsafe {
+                libc::semctl(self.0, 0, libc::IPC_RMID);
+                libc::shmctl(self.1, libc::IPC_RMID, std::ptr::null_mut());
+            }
         }
     }
     let id = unsafe { libc::semget(libc::IPC_PRIVATE, 1, 0o600) };
     assert!(id >= 0);
-    let canary = Canary(id);
+    let shared_canary = unsafe { libc::shmget(libc::IPC_PRIVATE, 4096, 0o600) };
+    assert!(shared_canary >= 0);
+    let canary = Canary(id, shared_canary);
     assert_eq!(unsafe { libc::semctl(id, 0, libc::SETVAL, 7 as libc::c_int) }, 0);
 
     let mut holder = base_policy().build().unwrap();
     holder.create(&["true"]).await.unwrap();
-    let key = (unsafe { libc::getuid() } ^ 0x534c4302).max(1) as libc::key_t;
+    let key = (unsafe { libc::getuid() } ^ 0x534c4305).max(1) as libc::key_t;
     let registry = unsafe { libc::semget(key, 0, 0o600) };
     assert!(registry >= 0);
     assert!(unsafe { libc::semctl(registry, 0, libc::GETVAL) } >= 0);
+
+    let metadata = unsafe { libc::shmget(key, 0, 0o600) };
+    assert!(metadata >= 0);
+    let address = unsafe { libc::shmat(metadata, std::ptr::null(), libc::SHM_RDONLY) };
+    assert_ne!(address, (-1isize) as *mut libc::c_void);
+    let salt = unsafe { std::slice::from_raw_parts(address.cast::<u64>(), 2) };
+    let mut segment_key = salt[0] ^ salt[1];
+    segment_key = (segment_key ^ (segment_key >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    segment_key = (segment_key ^ (segment_key >> 27)).wrapping_mul(0x94d049bb133111eb);
+    let segment_key = ((segment_key ^ (segment_key >> 31)) as u32).max(1) as libc::key_t;
+    assert_eq!(unsafe { libc::shmdt(address) }, 0);
+    let segment_registry = unsafe { libc::semget(segment_key, 0, 0o600) };
+    let segment_metadata = unsafe { libc::shmget(segment_key, 0, 0o600) };
+    assert!(segment_registry >= 0 && segment_metadata >= 0);
 
     let script = format!(r#"
 import ctypes, errno
@@ -507,6 +526,13 @@ checks = [
     ('semget', lambda: c.semget({key}, 0, 0o600)),
     ('registry GETVAL', lambda: c.semctl({registry}, 0, 12)),
     ('registry GETPID', lambda: c.semctl({registry}, 0, 11)),
+    ('segment registry GETVAL', lambda: c.semctl({segment_registry}, 0, 12)),
+    ('segment metadata attach', lambda: c.shmat({segment_metadata}, None, 0)),
+    ('metadata shmget', lambda: c.shmget({key}, 0, 0o600)),
+    ('metadata attach', lambda: c.shmat({metadata}, None, 0)),
+    ('metadata readonly attach', lambda: c.shmat({metadata}, None, 0o10000)),
+    ('metadata stat', lambda: c.shmctl({metadata}, 2, ctypes.create_string_buffer(512))),
+    ('shared canary IPC_RMID', lambda: c.shmctl({shared_canary}, 0, None)),
     ('canary GETALL', lambda: c.semctl({id}, 0, 13, (ctypes.c_ushort * 1)())),
     ('canary SETVAL', lambda: c.semctl({id}, 0, 16, 0)),
     ('canary IPC_RMID', lambda: c.semctl({id}, 0, 0)),
@@ -518,6 +544,8 @@ for name, call in checks:
     result = call()
     error = ctypes.get_errno()
     assert result == -1 and error == errno.EPERM, (name, result, error)
+with open('/proc/self/maps') as maps:
+    assert '/SYSV{key:08x}' not in maps.read()
 print('all semaphore access denied')
 "#);
     let result = base_policy().no_supervisor(no_supervisor).build().unwrap()
@@ -526,6 +554,9 @@ print('all semaphore access denied')
     assert!(result.stdout_str().unwrap_or("").contains("all semaphore access denied"));
     assert_eq!(unsafe { libc::semctl(id, 0, libc::GETVAL) }, 7);
     assert!(unsafe { libc::semctl(registry, 0, libc::GETVAL) } >= 0);
+    let mut stat: libc::shmid_ds = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::shmctl(shared_canary, libc::IPC_STAT, &mut stat) }, 0);
+    assert_eq!(unsafe { libc::shmctl(metadata, libc::IPC_STAT, &mut stat) }, 0);
     drop(holder);
     drop(canary);
 }

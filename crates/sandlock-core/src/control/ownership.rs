@@ -1,22 +1,98 @@
 use std::io;
 
 const HEADER: usize = 4;
-const SIGNATURE: [u16; 3] = [0x534c, 0x434f, 2];
+const SIGNATURE: [u16; 3] = [0x534c, 0x434f, 5];
 const NAME_BYTES: usize = 64;
-const TOKEN_WORDS: usize = 9;
-const SLOT_SIZE: usize = 3 + TOKEN_WORDS + NAME_BYTES;
-const SLOTS: usize = 256;
-const SEMAPHORES: usize = HEADER + SLOTS * SLOT_SIZE;
+const SLOTS: usize = 4096;
+const SEMAPHORES: usize = HEADER + 2 * SLOTS;
+const METADATA_HEADER: usize = 32;
+const METADATA_BYTES: usize = METADATA_HEADER + SLOTS * std::mem::size_of::<Record>();
+const BUCKETS: usize = 65_536;
+const DIRECTORY_WORDS: usize = 5 + BUCKETS;
+const DIRECTORY_BYTES: usize = DIRECTORY_WORDS * 8;
 
 #[derive(Clone, Copy, Debug)]
-struct Registry(i32);
+struct Registry(i32, i32, i32);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Record {
+    name: [u8; NAME_BYTES],
+    token: [u8; 16],
+    len: u8,
+    next: u64,
+}
+
+struct Mapping(*mut Record);
+
+impl Mapping {
+    fn attach(id: i32, readonly: bool) -> io::Result<Self> {
+        Self::attach_bytes(id, readonly, METADATA_BYTES)
+    }
+
+    fn attach_bytes(id: i32, readonly: bool, bytes: usize) -> io::Result<Self> {
+        let _fork_guard = super::live();
+        let address = unsafe {
+            libc::shmat(
+                id,
+                std::ptr::null(),
+                if readonly { libc::SHM_RDONLY } else { 0 },
+            )
+        };
+        if address == (-1isize) as *mut libc::c_void {
+            return Err(io::Error::last_os_error());
+        }
+        // In-process sandbox entrypoints must not inherit another thread's attachment.
+        if unsafe { libc::madvise(address, bytes, libc::MADV_DONTFORK) } != 0 {
+            let error = io::Error::last_os_error();
+            unsafe {
+                libc::shmdt(address);
+            }
+            return Err(error);
+        }
+        Ok(Self(address.cast()))
+    }
+
+    fn read(&self, slot: usize) -> Record {
+        assert!(slot < SLOTS);
+        unsafe {
+            self.0
+                .cast::<u8>()
+                .add(METADATA_HEADER)
+                .cast::<Record>()
+                .add(slot)
+                .read_volatile()
+        }
+    }
+
+    fn write(&mut self, slot: usize, record: Record) {
+        assert!(slot < SLOTS);
+        unsafe {
+            self.0
+                .cast::<u8>()
+                .add(METADATA_HEADER)
+                .cast::<Record>()
+                .add(slot)
+                .write_volatile(record);
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for Mapping {
+    fn drop(&mut self) {
+        unsafe {
+            libc::shmdt(self.0.cast());
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct Claim {
     registry: Registry,
     slot: usize,
     owner: i32,
-    token: [u16; TOKEN_WORDS],
+    token: [u8; 16],
     pub entry: Entry,
 }
 
@@ -50,66 +126,345 @@ fn invalid() -> io::Error {
     )
 }
 
-impl Registry {
+fn validate_permissions(perm: &libc::ipc_perm) -> io::Result<()> {
+    let uid = unsafe { libc::getuid() };
+    if perm.uid != uid || perm.cuid != uid || perm.mode & 0o777 != 0o600 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "control registry owned by another user or has unsafe permissions",
+        ));
+    }
+    Ok(())
+}
+
+fn open_semaphores(key: libc::key_t, count: usize, create: bool) -> io::Result<i32> {
+    let id = checked(unsafe {
+        libc::semget(
+            key,
+            count as i32,
+            0o600 | if create { libc::IPC_CREAT } else { 0 },
+        )
+    })?;
+    let mut stat: libc::semid_ds = unsafe { std::mem::zeroed() };
+    checked(unsafe { libc::semctl(id, 0, libc::IPC_STAT, SemArg { stat: &mut stat }) })?;
+    validate_permissions(&stat.sem_perm)?;
+    if stat.sem_nsems as usize != count {
+        return Err(invalid());
+    }
+    Ok(id)
+}
+
+fn values(id: i32, count: usize) -> io::Result<Vec<u16>> {
+    let mut values = vec![0; count];
+    checked(unsafe {
+        libc::semctl(
+            id,
+            0,
+            libc::GETALL,
+            SemArg {
+                array: values.as_mut_ptr(),
+            },
+        )
+    })?;
+    Ok(values)
+}
+
+fn open_memory(key: libc::key_t, bytes: usize, create: bool) -> io::Result<i32> {
+    let id = checked(unsafe {
+        libc::shmget(key, bytes, 0o600 | if create { libc::IPC_CREAT } else { 0 })
+    })?;
+    let mut stat: libc::shmid_ds = unsafe { std::mem::zeroed() };
+    checked(unsafe { libc::shmctl(id, libc::IPC_STAT, &mut stat) })?;
+    validate_permissions(&stat.shm_perm)?;
+    if stat.shm_segsz != bytes {
+        return Err(invalid());
+    }
+    Ok(id)
+}
+
+fn initialize_signature(id: i32, count: usize) -> io::Result<()> {
+    let snapshot = values(id, count)?;
+    if snapshot[1..HEADER] == SIGNATURE {
+        return Ok(());
+    }
+    if snapshot[1..].iter().any(|&v| v != 0) {
+        return Err(invalid());
+    }
+    let mut ops: Vec<_> = SIGNATURE
+        .iter()
+        .enumerate()
+        .map(|(i, &value)| libc::sembuf {
+            sem_num: (i + 1) as u16,
+            sem_op: value as i16,
+            sem_flg: libc::IPC_NOWAIT as i16,
+        })
+        .collect();
+    checked(unsafe { libc::semop(id, ops.as_mut_ptr(), ops.len()) })?;
+    Ok(())
+}
+
+struct Directory(Mapping);
+impl Directory {
+    fn word(&self, index: usize) -> u64 {
+        assert!(index < DIRECTORY_WORDS);
+        unsafe { self.0 .0.cast::<u64>().add(index).read_volatile() }
+    }
+    fn put(&self, index: usize, value: u64) {
+        assert!(index < DIRECTORY_WORDS);
+        unsafe {
+            self.0 .0.cast::<u64>().add(index).write_volatile(value);
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    }
+    fn salt(&self) -> [u64; 2] {
+        [self.word(0), self.word(1)]
+    }
+    fn recover(&self) -> io::Result<()> {
+        let pending = self.word(3);
+        if pending == 0 {
+            return Ok(());
+        }
+        let cursor = self.word(2);
+        let bucket = usize::try_from(self.word(4)).map_err(|_| invalid())?;
+        if bucket >= BUCKETS
+            || (pending != cursor && pending != cursor.checked_add(1).ok_or_else(invalid)?)
+        {
+            return Err(invalid());
+        }
+        if self.word(5 + bucket) == pending {
+            self.put(2, pending);
+        } else if pending <= cursor {
+            return Err(invalid());
+        }
+        self.put(3, 0);
+        Ok(())
+    }
+}
+
+fn hash_name(name: &[u8]) -> u64 {
+    name.iter().fold(0xcbf29ce484222325u64, |h, &byte| {
+        (h ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
+fn segment_key(salt: [u64; 2], segment: u64) -> libc::key_t {
+    let mut value = segment.wrapping_add(salt[0]) ^ salt[1];
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+    ((value ^ (value >> 31)) as u32).max(1) as libc::key_t
+}
+
+#[derive(Clone, Copy)]
+struct Catalog {
+    lock: i32,
+    metadata: i32,
+}
+impl Catalog {
     fn open(create: bool) -> io::Result<Option<Self>> {
-        let uid = unsafe { libc::getuid() };
-        let key = (uid ^ 0x534c4302).max(1) as libc::key_t;
-        let flags = 0o600 | if create { libc::IPC_CREAT } else { 0 };
-        let id = unsafe { libc::semget(key, SEMAPHORES as i32, flags) };
-        if id < 0 && !create && io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+        let key = (unsafe { libc::getuid() } ^ 0x534c4305).max(1) as libc::key_t;
+        let lock = match open_semaphores(key, HEADER, create) {
+            Ok(id) => id,
+            Err(e) if !create && e.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let _lock = Registry(lock, -1, lock).lock()?;
+        let signature = values(lock, HEADER)?;
+        let initialize = signature[1..] == [0; 3];
+        if !initialize && signature[1..] != SIGNATURE {
+            return Err(invalid());
+        }
+        if initialize && !create {
             return Ok(None);
         }
-        let registry = Self(checked(id)?);
-        let mut stat: libc::semid_ds = unsafe { std::mem::zeroed() };
-        checked(unsafe { libc::semctl(id, 0, libc::IPC_STAT, SemArg { stat: &mut stat }) })?;
-        if stat.sem_perm.uid != uid
-            || stat.sem_perm.cuid != uid
-            || stat.sem_perm.mode & 0o777 != 0o600
-        {
+        let metadata = open_memory(key, DIRECTORY_BYTES, create && initialize)?;
+        let catalog = Self { lock, metadata };
+        let directory = catalog.directory()?;
+        if initialize {
+            let salt = uuid::Uuid::new_v4().as_u128();
+            directory.put(0, salt as u64);
+            directory.put(1, (salt >> 64) as u64);
+            initialize_signature(lock, HEADER)?;
+        }
+        directory.recover()?;
+        Ok(Some(catalog))
+    }
+
+    fn directory(self) -> io::Result<Directory> {
+        Ok(Directory(Mapping::attach_bytes(
+            self.metadata,
+            false,
+            DIRECTORY_BYTES,
+        )?))
+    }
+
+    fn segment(self, directory: &Directory, ordinal: u64, create: bool) -> io::Result<Registry> {
+        Registry::open_segment(directory.salt(), ordinal, self.lock, create)
+    }
+
+    fn claim(self, name: &str) -> io::Result<Claim> {
+        if name.is_empty() || name.len() > NAME_BYTES {
             return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "control registry owned by another user or has unsafe permissions",
+                io::ErrorKind::InvalidInput,
+                "control name must contain 1 to 64 bytes",
             ));
         }
-        if stat.sem_nsems as usize != SEMAPHORES {
+        let _lock = Registry(self.lock, -1, self.lock).lock()?;
+        let directory = self.directory()?;
+        directory.recover()?;
+        let bucket = hash_name(name.as_bytes()) as usize % BUCKETS;
+        let mut reference = directory.word(5 + bucket);
+        let mut available = None;
+        let mut traversed = 0;
+        while reference != 0 {
+            if reference > directory.word(2) || traversed >= directory.word(2) {
+                return Err(invalid());
+            }
+            traversed += 1;
+            let registry = self.segment(&directory, (reference - 1) / SLOTS as u64, false)?;
+            let slot = ((reference - 1) % SLOTS as u64) as usize;
+            let mapping = Mapping::attach(registry.1, true)?;
+            let record = mapping.read(slot);
+            let owner =
+                checked(unsafe { libc::semctl(registry.0, (HEADER + slot) as i32, libc::GETVAL) })?;
+            if owner == 0 {
+                available.get_or_insert(reference);
+            } else {
+                if owner != 1 || record.len == 0 || record.len as usize > NAME_BYTES {
+                    return Err(invalid());
+                }
+                if &record.name[..record.len as usize] == name.as_bytes() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        "sandbox name is already claimed",
+                    ));
+                }
+            }
+            reference = record.next;
+        }
+        let fresh = available.is_none();
+        let reference = available.unwrap_or(directory.word(2).checked_add(1).ok_or_else(invalid)?);
+        let registry = self.segment(&directory, (reference - 1) / SLOTS as u64, fresh)?;
+        let slot = ((reference - 1) % SLOTS as u64) as usize;
+        let mut mapping = Mapping::attach(registry.1, false)?;
+        let next = if fresh {
+            directory.word(5 + bucket)
+        } else {
+            mapping.read(slot).next
+        };
+        if fresh {
+            directory.put(4, bucket as u64);
+            directory.put(3, reference);
+        }
+        let token = *uuid::Uuid::new_v4().as_bytes();
+        let mut record = Record {
+            name: [0; NAME_BYTES],
+            token,
+            len: name.len() as u8,
+            next,
+        };
+        record.name[..name.len()].copy_from_slice(name.as_bytes());
+        mapping.write(slot, record);
+        checked(unsafe {
+            libc::semctl(
+                registry.0,
+                (HEADER + SLOTS + slot) as i32,
+                libc::SETVAL,
+                SemArg { value: 0 },
+            )
+        })?;
+        if fresh {
+            directory.put(5 + bucket, reference);
+            directory.put(2, reference);
+            directory.put(3, 0);
+        }
+        registry.adjust(HEADER + slot, 1)?;
+        let owner = unsafe { libc::getpid() };
+        Ok(Claim {
+            registry,
+            slot,
+            owner,
+            token,
+            entry: Entry {
+                name: name.into(),
+                token: uuid::Uuid::from_bytes(token).simple().to_string(),
+                supervisor: owner,
+                child: None,
+            },
+        })
+    }
+
+    fn lookup(self, name: &str) -> io::Result<Option<Entry>> {
+        let _lock = Registry(self.lock, -1, self.lock).lock()?;
+        let directory = self.directory()?;
+        directory.recover()?;
+        let bucket = hash_name(name.as_bytes()) as usize % BUCKETS;
+        let mut reference = directory.word(5 + bucket);
+        let mut traversed = 0;
+        while reference != 0 {
+            if reference > directory.word(2) || traversed >= directory.word(2) {
+                return Err(invalid());
+            }
+            traversed += 1;
+            let registry = self.segment(&directory, (reference - 1) / SLOTS as u64, false)?;
+            let slot = ((reference - 1) % SLOTS as u64) as usize;
+            let record = Mapping::attach(registry.1, true)?.read(slot);
+            if record.len as usize > NAME_BYTES {
+                return Err(invalid());
+            }
+            if &record.name[..record.len as usize] == name.as_bytes() {
+                let owner = checked(unsafe {
+                    libc::semctl(registry.0, (HEADER + slot) as i32, libc::GETVAL)
+                })? as u16;
+                let child = checked(unsafe {
+                    libc::semctl(registry.0, (HEADER + SLOTS + slot) as i32, libc::GETVAL)
+                })? as u16;
+                if let Some(entry) = registry.entry(slot, record, owner, child)? {
+                    return Ok(Some(entry));
+                }
+            }
+            reference = record.next;
+        }
+        Ok(None)
+    }
+
+    fn list(self) -> io::Result<Vec<Entry>> {
+        let _lock = Registry(self.lock, -1, self.lock).lock()?;
+        let directory = self.directory()?;
+        directory.recover()?;
+        let mut entries = Vec::new();
+        for ordinal in 0..directory.word(2).div_ceil(SLOTS as u64) {
+            let registry = self.segment(&directory, ordinal, false)?;
+            entries.extend(registry.entries(&registry.values()?)?);
+        }
+        Ok(entries)
+    }
+}
+
+impl Registry {
+    fn open_segment(salt: [u64; 2], segment: u64, lock: i32, create: bool) -> io::Result<Self> {
+        let key = segment_key(salt, segment);
+        let metadata = open_memory(key, METADATA_BYTES, create)?;
+        let header = Directory(Mapping::attach(metadata, false)?);
+        let expected = [salt[0], salt[1], segment, 0x534c_434f_0000_0005];
+        if header.word(3) == 0 && create {
+            for (i, &value) in expected.iter().enumerate() {
+                if header.word(i) != 0 && header.word(i) != value {
+                    return Err(invalid());
+                }
+            }
+            for (i, &value) in expected.iter().enumerate() {
+                header.put(i, value);
+            }
+        } else if (0..4).any(|i| header.word(i) != expected[i]) {
             return Err(invalid());
         }
-        let values = registry.values()?;
-        if values[1..HEADER] != SIGNATURE && values[1..].iter().any(|&v| v != 0) {
-            return Err(invalid());
-        }
-        let _lock = registry.lock()?;
-        let values = registry.values()?;
-        if values[1..HEADER] == [0; 3] && values[HEADER..].iter().all(|&v| v == 0) {
-            let mut ops: Vec<_> = SIGNATURE
-                .iter()
-                .enumerate()
-                .map(|(i, &value)| libc::sembuf {
-                    sem_num: (i + 1) as u16,
-                    sem_op: value as i16,
-                    sem_flg: libc::IPC_NOWAIT as i16,
-                })
-                .collect();
-            checked(unsafe { libc::semop(id, ops.as_mut_ptr(), ops.len()) })?;
-        } else if values[1..HEADER] != SIGNATURE {
-            return Err(invalid());
-        }
-        Ok(Some(registry))
+        let sem = open_semaphores(key, SEMAPHORES, create)?;
+        initialize_signature(sem, SEMAPHORES)?;
+        Ok(Self(sem, metadata, lock))
     }
 
     fn values(self) -> io::Result<Vec<u16>> {
-        let mut values = vec![0; SEMAPHORES];
-        checked(unsafe {
-            libc::semctl(
-                self.0,
-                0,
-                libc::GETALL,
-                SemArg {
-                    array: values.as_mut_ptr(),
-                },
-            )
-        })?;
-        Ok(values)
+        values(self.0, SEMAPHORES)
     }
 
     fn lock(self) -> io::Result<Transaction> {
@@ -135,7 +490,7 @@ impl Registry {
             let result = unsafe {
                 libc::syscall(
                     libc::SYS_semtimedop,
-                    self.0,
+                    self.2,
                     ops.as_mut_ptr(),
                     ops.len(),
                     &timeout,
@@ -144,7 +499,7 @@ impl Registry {
             match checked(result) {
                 Ok(_) => {
                     return Ok(Transaction {
-                        registry: self,
+                        registry: Registry(self.2, -1, self.2),
                         owner: unsafe { libc::getpid() },
                     })
                 }
@@ -165,51 +520,63 @@ impl Registry {
         checked(unsafe { libc::semop(self.0, &mut op, 1) }).map(|_| ())
     }
 
-    fn entries(self, values: &[u16]) -> io::Result<Vec<Entry>> {
+    fn entry(
+        self,
+        slot: usize,
+        record: Record,
+        owner: u16,
+        child: u16,
+    ) -> io::Result<Option<Entry>> {
+        if owner == 0 {
+            return Ok(None);
+        }
+        if owner != 1 || record.len == 0 || record.len as usize > NAME_BYTES {
+            return Err(invalid());
+        }
+        let supervisor =
+            checked(unsafe { libc::semctl(self.0, (HEADER + slot) as i32, libc::GETPID) })?;
+        if supervisor <= 0 {
+            return Ok(None);
+        }
+        let child = match child {
+            0 => None,
+            1 => {
+                let pid = checked(unsafe {
+                    libc::semctl(self.0, (HEADER + SLOTS + slot) as i32, libc::GETPID)
+                })?;
+                (pid > 0).then_some(pid)
+            }
+            _ => return Err(invalid()),
+        };
+        Ok(Some(Entry {
+            name: String::from_utf8(record.name[..record.len as usize].to_vec())
+                .map_err(|_| invalid())?,
+            token: uuid::Uuid::from_bytes(record.token).simple().to_string(),
+            supervisor,
+            child,
+        }))
+    }
+
+    fn entries(self, owners: &[u16]) -> io::Result<Vec<Entry>> {
+        let metadata = Mapping::attach(self.1, true)?;
         let mut entries = Vec::new();
         for slot in 0..SLOTS {
-            let start = HEADER + slot * SLOT_SIZE;
-            let data = &values[start..start + SLOT_SIZE];
-            if data[0] == 0 {
+            if owners[HEADER + slot] == 0 {
                 continue;
             }
-            let len = data[1] as usize;
-            if data[0] != 1 || len == 0 || len > NAME_BYTES {
-                return Err(invalid());
+            if let Some(entry) = self.entry(
+                slot,
+                metadata.read(slot),
+                owners[HEADER + slot],
+                owners[HEADER + SLOTS + slot],
+            )? {
+                entries.push(entry);
             }
-            let bytes = data[2 + TOKEN_WORDS..2 + TOKEN_WORDS + len]
-                .iter()
-                .map(|&v| u8::try_from(v).map_err(|_| invalid()))
-                .collect::<io::Result<Vec<_>>>()?;
-            let name = String::from_utf8(bytes).map_err(|_| invalid())?;
-            let supervisor = checked(unsafe { libc::semctl(self.0, start as i32, libc::GETPID) })?;
-            if supervisor <= 0 {
-                continue;
-            }
-            let token = data[2..2 + TOKEN_WORDS]
-                .iter()
-                .map(|v| format!("{v:04x}"))
-                .collect();
-            let child = match data[SLOT_SIZE - 1] {
-                0 => None,
-                1 => {
-                    let pid = checked(unsafe {
-                        libc::semctl(self.0, (start + SLOT_SIZE - 1) as i32, libc::GETPID)
-                    })?;
-                    (pid > 0).then_some(pid)
-                }
-                _ => return Err(invalid()),
-            };
-            entries.push(Entry {
-                name,
-                token,
-                supervisor,
-                child,
-            });
         }
         Ok(entries)
     }
 
+    #[cfg(test)]
     fn claim(self, name: &str) -> io::Result<Claim> {
         if name.is_empty() || name.len() > NAME_BYTES {
             return Err(io::Error::new(
@@ -217,54 +584,53 @@ impl Registry {
                 "control name must contain 1 to 64 bytes",
             ));
         }
-        let mut nonce = uuid::Uuid::new_v4().as_u128();
-        let mut token = [0u16; TOKEN_WORDS];
-        for word in &mut token {
-            *word = (nonce & 0x7fff) as u16;
-            nonce >>= 15;
-        }
+        let token = *uuid::Uuid::new_v4().as_bytes();
         let _lock = self.lock()?;
-        let values = self.values()?;
-        if self
-            .entries(&values)?
-            .iter()
-            .any(|entry| entry.name == name)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::AddrInUse,
-                "sandbox name is already claimed",
-            ));
+        let owners = self.values()?;
+        let mut metadata = Mapping::attach(self.1, false)?;
+        let mut available = None;
+        for slot in 0..SLOTS {
+            if owners[HEADER + slot] == 0 {
+                available.get_or_insert(slot);
+                continue;
+            }
+            let record = metadata.read(slot);
+            if owners[HEADER + slot] != 1 || record.len == 0 || record.len as usize > NAME_BYTES {
+                return Err(invalid());
+            }
+            if &record.name[..record.len as usize] == name.as_bytes() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "sandbox name is already claimed",
+                ));
+            }
         }
-        let slot = (0..SLOTS)
-            .find(|&slot| values[HEADER + slot * SLOT_SIZE] == 0)
-            .ok_or_else(|| {
-                io::Error::other("control registry is full (256 live sandboxes per user)")
-            })?;
-        let start = HEADER + slot * SLOT_SIZE;
-        let mut metadata = [0u16; SLOT_SIZE - 1];
-        metadata[0] = name.len() as u16;
-        metadata[1..1 + TOKEN_WORDS].copy_from_slice(&token);
-        for (dst, &byte) in metadata[1 + TOKEN_WORDS..].iter_mut().zip(name.as_bytes()) {
-            *dst = byte as u16;
-        }
-        // SETALL would erase the undo adjustments of every live owner.
-        for (offset, &value) in metadata.iter().enumerate() {
-            checked(unsafe {
-                libc::semctl(
-                    self.0,
-                    (start + 1 + offset) as i32,
-                    libc::SETVAL,
-                    SemArg {
-                        value: value as i32,
-                    },
-                )
-            })?;
-        }
-        self.adjust(start, 1)?;
+        let slot = available.ok_or_else(|| {
+            io::Error::other(format!(
+                "control registry is full ({SLOTS} live sandboxes per user)"
+            ))
+        })?;
+        let mut record = Record {
+            name: [0; NAME_BYTES],
+            token,
+            len: name.len() as u8,
+            next: 0,
+        };
+        record.name[..name.len()].copy_from_slice(name.as_bytes());
+        metadata.write(slot, record);
+        checked(unsafe {
+            libc::semctl(
+                self.0,
+                (HEADER + SLOTS + slot) as i32,
+                libc::SETVAL,
+                SemArg { value: 0 },
+            )
+        })?;
+        self.adjust(HEADER + slot, 1)?;
         let owner = unsafe { libc::getpid() };
         let entry = Entry {
             name: name.into(),
-            token: token.iter().map(|v| format!("{v:04x}")).collect(),
+            token: uuid::Uuid::from_bytes(token).simple().to_string(),
             supervisor: owner,
             child: None,
         };
@@ -282,7 +648,6 @@ struct Transaction {
     registry: Registry,
     owner: i32,
 }
-
 impl Drop for Transaction {
     fn drop(&mut self) {
         if unsafe { libc::getpid() } == self.owner {
@@ -293,39 +658,39 @@ impl Drop for Transaction {
 
 #[derive(Clone, Copy)]
 pub(crate) struct ChildPublisher {
-    id: i32,
-    start: usize,
-    token: [u16; TOKEN_WORDS],
+    registry: Registry,
+    slot: usize,
+    token: [u8; 16],
 }
-
 impl ChildPublisher {
     pub(crate) fn publish(self) -> bool {
-        let mut ops = [libc::sembuf {
-            sem_num: 0,
-            sem_op: 0,
-            sem_flg: libc::IPC_NOWAIT as i16,
-        }; TOKEN_WORDS * 3 + 2];
-        // Check the generation atomically, so a delayed child cannot stamp a reused slot.
-        for (i, &word) in self.token.iter().enumerate() {
-            for (op, delta) in
-                ops[i * 3..i * 3 + 3]
-                    .iter_mut()
-                    .zip([-(word as i16), 0, word as i16])
-            {
-                op.sem_num = (self.start + 2 + i) as u16;
-                op.sem_op = delta;
-            }
+        self.try_publish().is_ok()
+    }
+
+    fn try_publish(self) -> io::Result<()> {
+        let _lock = self.registry.lock()?;
+        let metadata = Mapping::attach(self.registry.1, true)?;
+        // Serialize the generation check with slot reuse without touching its owner stamp.
+        if metadata.read(self.slot).token != self.token {
+            return Err(io::Error::from_raw_os_error(libc::ESTALE));
         }
-        for op in &mut ops[TOKEN_WORDS * 3..] {
-            op.sem_num = (self.start + SLOT_SIZE - 1) as u16;
-        }
-        ops[TOKEN_WORDS * 3 + 1].sem_op = 1;
+        let mut ops = [
+            libc::sembuf {
+                sem_num: (HEADER + SLOTS + self.slot) as u16,
+                sem_op: 0,
+                sem_flg: libc::IPC_NOWAIT as i16,
+            },
+            libc::sembuf {
+                sem_num: (HEADER + SLOTS + self.slot) as u16,
+                sem_op: 1,
+                sem_flg: libc::IPC_NOWAIT as i16,
+            },
+        ];
         loop {
-            if unsafe { libc::semop(self.id, ops.as_mut_ptr(), ops.len()) } == 0 {
-                return true;
-            }
-            if io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-                return false;
+            match checked(unsafe { libc::semop(self.registry.0, ops.as_mut_ptr(), ops.len()) }) {
+                Ok(_) => return Ok(()),
+                Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                Err(e) => return Err(e),
             }
         }
     }
@@ -334,43 +699,42 @@ impl ChildPublisher {
 impl Claim {
     pub(crate) fn child_publisher(&self) -> ChildPublisher {
         ChildPublisher {
-            id: self.registry.0,
-            start: HEADER + self.slot * SLOT_SIZE,
+            registry: self.registry,
+            slot: self.slot,
             token: self.token,
         }
     }
     pub(crate) fn new(name: &str) -> io::Result<Self> {
-        Registry::open(true)?.ok_or_else(invalid)?.claim(name)
+        Catalog::open(true)?.ok_or_else(invalid)?.claim(name)
     }
 }
-
 impl Drop for Claim {
     fn drop(&mut self) {
         // A host may drop inherited Rust objects after fork; it owns no undo adjustment.
         if unsafe { libc::getpid() } == self.owner {
-            let _ = self.registry.adjust(HEADER + self.slot * SLOT_SIZE, -1);
+            let _ = self.registry.adjust(HEADER + self.slot, -1);
         }
     }
 }
 
 pub(crate) fn list() -> io::Result<Vec<Entry>> {
-    let Some(registry) = Registry::open(false)? else {
+    let Some(catalog) = Catalog::open(false)? else {
         return Ok(Vec::new());
     };
-    let _lock = registry.lock()?;
-    registry.entries(&registry.values()?)
+    catalog.list()
 }
 
 pub(crate) fn lookup(name: &str) -> io::Result<Entry> {
-    list()?
-        .into_iter()
-        .find(|entry| entry.name == name)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("no sandbox named '{name}'"),
-            )
-        })
+    let not_found = || {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no sandbox named '{name}'"),
+        )
+    };
+    Catalog::open(false)?
+        .ok_or_else(not_found)?
+        .lookup(name)?
+        .ok_or_else(not_found)
 }
 
 #[cfg(test)]
@@ -385,7 +749,9 @@ mod tests {
         fn new() -> Self {
             let id = checked(unsafe { libc::semget(libc::IPC_PRIVATE, SEMAPHORES as i32, 0o600) })
                 .unwrap();
-            Self(Registry(id))
+            let metadata =
+                checked(unsafe { libc::shmget(libc::IPC_PRIVATE, METADATA_BYTES, 0o600) }).unwrap();
+            Self(Registry(id, metadata, id))
         }
     }
 
@@ -393,8 +759,130 @@ mod tests {
         fn drop(&mut self) {
             unsafe {
                 libc::semctl(self.0 .0, 0, libc::IPC_RMID);
+                libc::shmctl(self.0 .1, libc::IPC_RMID, std::ptr::null_mut());
             }
         }
+    }
+
+    struct TestCatalog(Catalog);
+    impl TestCatalog {
+        fn new() -> Self {
+            let lock = open_semaphores(libc::IPC_PRIVATE, HEADER, true).unwrap();
+            let metadata = open_memory(libc::IPC_PRIVATE, DIRECTORY_BYTES, true).unwrap();
+            let catalog = Catalog { lock, metadata };
+            let directory = catalog.directory().unwrap();
+            let salt = uuid::Uuid::new_v4().as_u128();
+            directory.put(0, salt as u64);
+            directory.put(1, (salt >> 64) as u64);
+            initialize_signature(lock, HEADER).unwrap();
+            Self(catalog)
+        }
+    }
+    impl Drop for TestCatalog {
+        fn drop(&mut self) {
+            let directory = self.0.directory().unwrap();
+            for ordinal in 0..=directory.word(2).max(directory.word(3)) / SLOTS as u64 {
+                let key = segment_key(directory.salt(), ordinal);
+                unsafe {
+                    let sem = libc::semget(key, 0, 0o600);
+                    if sem >= 0 {
+                        libc::semctl(sem, 0, libc::IPC_RMID);
+                    }
+                    let memory = libc::shmget(key, 0, 0o600);
+                    if memory >= 0 {
+                        libc::shmctl(memory, libc::IPC_RMID, std::ptr::null_mut());
+                    }
+                }
+            }
+            unsafe {
+                libc::semctl(self.0.lock, 0, libc::IPC_RMID);
+                libc::shmctl(self.0.metadata, libc::IPC_RMID, std::ptr::null_mut());
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_grows_past_31000_and_reuses_indexed_reservations() {
+        let catalog = TestCatalog::new();
+        let mut claims = Vec::new();
+        for i in 0..40_000 {
+            claims.push(catalog.0.claim(&format!("dense-{i}")).unwrap());
+        }
+        assert_eq!(catalog.0.list().unwrap().len(), 40_000);
+        for i in [0, 4095, 4096, 30_999, 31_000, 39_999] {
+            let entry = catalog.0.lookup(&format!("dense-{i}")).unwrap().unwrap();
+            assert_eq!(entry.token, claims[i].entry.token);
+        }
+        assert_eq!(
+            catalog.0.claim("dense-39999").unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        let allocated = catalog.0.directory().unwrap().word(2);
+        let old = claims.pop().unwrap().entry.token.clone();
+        let replacement = catalog.0.claim("dense-39999").unwrap();
+        assert_ne!(replacement.entry.token, old);
+        assert_eq!(catalog.0.directory().unwrap().word(2), allocated);
+    }
+
+    #[test]
+    fn indexed_bucket_checks_duplicates_past_an_inactive_head() {
+        let catalog = TestCatalog::new();
+        let first = "first";
+        let bucket = hash_name(first.as_bytes()) as usize % BUCKETS;
+        let second = (0..)
+            .map(|i| format!("collision-{i}"))
+            .find(|name| hash_name(name.as_bytes()) as usize % BUCKETS == bucket)
+            .unwrap();
+        let _first = catalog.0.claim(first).unwrap();
+        let second_claim = catalog.0.claim(&second).unwrap();
+        drop(second_claim);
+        assert_eq!(
+            catalog.0.claim(first).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        assert!(catalog.0.lookup(first).unwrap().is_some());
+        let _reused = catalog.0.claim(&second).unwrap();
+        assert_eq!(catalog.0.list().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn killed_index_publisher_recovers_each_publication_stage() {
+        for stage in [
+            "index-before-head",
+            "index-after-head",
+            "index-after-cursor",
+        ] {
+            let catalog = TestCatalog::new();
+            let mut helper = Helper::start(
+                Registry(catalog.0.lock, catalog.0.metadata, catalog.0.lock),
+                stage,
+            );
+            helper.0.kill().unwrap();
+            helper.0.wait().unwrap();
+            assert!(catalog.0.list().unwrap().is_empty());
+            let _claim = catalog.0.claim("interrupted").unwrap();
+            assert!(catalog.0.lookup("interrupted").unwrap().is_some());
+            assert_eq!(catalog.0.directory().unwrap().word(2), 1);
+        }
+    }
+
+    #[test]
+    fn segment_identity_mismatch_preserves_existing_objects() {
+        let catalog = TestCatalog::new();
+        let claim = catalog.0.claim("owner").unwrap();
+        let header = Directory(Mapping::attach(claim.registry.1, false).unwrap());
+        let salt = header.word(0);
+        header.put(0, salt ^ 1);
+        assert_eq!(
+            catalog.0.lookup("owner").unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            unsafe { libc::semctl(claim.registry.0, (HEADER + claim.slot) as i32, libc::GETVAL) },
+            1
+        );
+        header.put(0, salt);
+        assert!(catalog.0.lookup("owner").unwrap().is_some());
     }
 
     struct Helper(Child, Option<i32>);
@@ -407,7 +895,10 @@ mod tests {
                     "control::ownership::tests::process_helper",
                     "--nocapture",
                 ])
-                .env("SANDLOCK_TEST_SEMID", registry.0.to_string())
+                .env(
+                    "SANDLOCK_TEST_SEMID",
+                    format!("{},{},{}", registry.0, registry.1, registry.2),
+                )
                 .env("SANDLOCK_TEST_SEM_MODE", mode)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -445,8 +936,40 @@ mod tests {
         let Ok(id) = std::env::var("SANDLOCK_TEST_SEMID") else {
             return;
         };
-        let registry = Registry(id.parse().unwrap());
+        let ids: Vec<i32> = id.split(',').map(|v| v.parse().unwrap()).collect();
+        let registry = Registry(ids[0], ids[1], ids[2]);
         let mode = std::env::var("SANDLOCK_TEST_SEM_MODE").unwrap();
+        if mode.starts_with("index-") {
+            let catalog = Catalog {
+                lock: registry.0,
+                metadata: registry.1,
+            };
+            let _lock = registry.lock().unwrap();
+            let directory = catalog.directory().unwrap();
+            let segment = catalog.segment(&directory, 0, true).unwrap();
+            let bucket = hash_name(b"interrupted") as usize % BUCKETS;
+            directory.put(4, bucket as u64);
+            directory.put(3, 1);
+            let mut record = Record {
+                name: [0; NAME_BYTES],
+                token: [0; 16],
+                len: 11,
+                next: 0,
+            };
+            record.name[..11].copy_from_slice(b"interrupted");
+            Mapping::attach(segment.1, false).unwrap().write(0, record);
+            if mode != "index-before-head" {
+                directory.put(5 + bucket, 1);
+            }
+            if mode == "index-after-cursor" {
+                directory.put(2, 1);
+            }
+            std::io::stdout().write_all(b"READY\n").unwrap();
+            std::io::stdout().flush().unwrap();
+            let mut byte = [0];
+            let _ = std::io::Read::read(&mut std::io::stdin(), &mut byte);
+            return;
+        }
         let _claim;
         let _lock;
         if mode == "claim" {
@@ -455,16 +978,16 @@ mod tests {
         } else {
             _claim = None;
             _lock = Some(registry.lock().unwrap());
-            // Simulate a publisher dying after one metadata write, before its claim.
-            checked(unsafe {
-                libc::semctl(
-                    registry.0,
-                    (HEADER + 1) as i32,
-                    libc::SETVAL,
-                    SemArg { value: 61 },
-                )
-            })
-            .unwrap();
+            let mut metadata = Mapping::attach(registry.1, false).unwrap();
+            metadata.write(
+                0,
+                Record {
+                    name: [0; NAME_BYTES],
+                    token: [0; 16],
+                    len: 61,
+                    next: 0,
+                },
+            );
         }
         if mode == "claim" {
             let pid = unsafe { libc::fork() };
@@ -493,7 +1016,7 @@ mod tests {
         let replacement = registry.0.claim("replacement").unwrap();
         assert!(!stale.publish());
         let publisher = replacement.child_publisher();
-        let child = unsafe { libc::fork() };
+        let child = super::super::fork_without_control_fds();
         assert!(child >= 0);
         if child == 0 {
             let published = publisher.publish();
@@ -515,6 +1038,26 @@ mod tests {
             !publisher.publish(),
             "a second publisher must not replace the child stamp"
         );
+    }
+
+    #[test]
+    fn metadata_mapping_is_not_inherited_by_a_sandbox_child() {
+        let registry = TestRegistry::new();
+        let mapping = Mapping::attach(registry.0 .1, false).unwrap();
+        let pid = super::super::fork_without_control_fds();
+        assert!(pid >= 0);
+        if pid == 0 {
+            let mut residency = 0u8;
+            let result = unsafe { libc::mincore(mapping.0.cast(), 1, &mut residency) };
+            let absent =
+                result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ENOMEM);
+            unsafe {
+                libc::_exit(if absent { 0 } else { 1 });
+            }
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert_eq!(status, 0);
     }
 
     #[test]
