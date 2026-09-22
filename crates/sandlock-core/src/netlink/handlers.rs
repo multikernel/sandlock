@@ -163,20 +163,20 @@ pub async fn handle_socket(
     // same process (glibc compares incoming nlmsg_pid against the value
     // it read back from getsockname — they must agree).
     let tgid = tgid_of(notif.pid as i32);
-    proxy::spawn_responder(responder_fd, tgid as u32);
 
     let Some(cookie) = crate::netlink::state::socket_cookie(&child_fd) else {
         return NotifAction::Errno(libc::ENOMEM);
     };
 
-    // The entry lands in the map from the on-success callback, before the
-    // child's syscall unblocks, keyed by the exact slot the kernel allocated.
+    // Start the responder only after registration so an immediate peer close
+    // cannot finish cleanup before the entry exists.
     let state = Arc::clone(state);
     NotifAction::InjectFdSendTracked {
         srcfd: child_fd,
         newfd_flags: libc::O_CLOEXEC as u32,
         on_success: OnInjectSuccess::new(move |child_fd_num| {
-            state.register(tgid, child_fd_num, cookie);
+            let registration = state.register(tgid, child_fd_num, cookie);
+            proxy::spawn_responder(responder_fd, tgid as u32, registration);
         }),
     }
 }
