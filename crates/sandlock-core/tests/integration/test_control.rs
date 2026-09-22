@@ -2,7 +2,7 @@
 //!
 //! Each test starts a real sandbox through the CLI binary and drives the
 //! abstract control sockets the way `sandlock ps`, `inspect`, `ports`, and
-//! `kill` do: discovery through /proc/net/unix, pids from SO_PEERCRED,
+//! `kill` do: discovery through SysV semaphores, pids from SO_PEERCRED,
 //! then info/config/ports.
 
 use std::process::Command;
@@ -784,9 +784,9 @@ fn make_fd_table_contiguous(keep: &mut Vec<std::os::fd::OwnedFd>) -> i32 {
     }
 }
 
-/// The fd number in this process bound to `name`'s pgrp socket.
-fn pgrp_fd_of(name: &str) -> Option<i32> {
-    let want = format!("\0sandlock/{}/{}/pgrp", unsafe { libc::getuid() }, name);
+/// This isolated test process has only one live process-group listener.
+fn pgrp_fd() -> Option<i32> {
+    let prefix = format!("\0sandlock/{}/v2/", unsafe { libc::getuid() });
     (0..4096).find(|&fd| {
         let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
         let mut len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
@@ -796,7 +796,7 @@ fn pgrp_fd_of(name: &str) -> Option<i32> {
         }
         let path_len = (len as usize).saturating_sub(std::mem::offset_of!(libc::sockaddr_un, sun_path));
         let path: Vec<u8> = addr.sun_path[..path_len].iter().map(|&c| c as u8).collect();
-        path == want.as_bytes()
+        path.starts_with(prefix.as_bytes()) && path.ends_with(b"/pgrp")
     })
 }
 
@@ -851,7 +851,7 @@ async fn pgrp_published_before_extra_fd_dup2() {
         .create_with_gather_io(&["true"], None, Some(probe_out_w.as_raw_fd()), None, Vec::new())
         .await
         .unwrap();
-    let offset = pgrp_fd_of(&probe_name).expect("probe pgrp socket") - base;
+    let offset = pgrp_fd().expect("probe pgrp socket") - base;
     probe.start().unwrap();
     probe.wait().await.unwrap();
     drop(probe);
@@ -877,7 +877,7 @@ async fn pgrp_published_before_extra_fd_dup2() {
     )
     .await
     .unwrap();
-    assert_eq!(pgrp_fd_of(&name), Some(target), "fd layout assumption broke");
+    assert_eq!(pgrp_fd(), Some(target), "fd layout assumption broke");
 
     let pids = sandlock_core::control::sandbox_pids(&name).expect("pgrp socket listens before start");
     assert_eq!(Some(pids.child), sb.pid());
@@ -950,4 +950,42 @@ fn test_control_cli_kill_nonexistent() {
         "kill nonexistent should say 'no sandbox named', got: {}",
         stderr
     );
+}
+
+#[tokio::test]
+async fn test_control_failed_creation_releases_its_name() {
+    let root = tempfile::tempdir().unwrap();
+    let name = format!("test-ctrl-failed-create-{}", std::process::id());
+    let mut failed = sandlock_core::Sandbox::builder()
+        .cwd(root.path().join("missing"))
+        .build().unwrap().with_name(&name);
+    assert!(failed.create(&["true"]).await.is_err());
+    assert!(!sandlock_core::control::list_sandboxes().unwrap().contains(&name));
+
+    let mut replacement = sandlock_core::Sandbox::builder()
+        .fs_read("/usr").fs_read("/bin").fs_read("/lib")
+        .fs_read_if_exists("/lib64").build().unwrap().with_name(&name);
+    replacement.create(&["true"]).await.unwrap();
+    drop(replacement);
+    drop(failed);
+}
+
+#[tokio::test]
+async fn test_control_cancelled_creation_releases_its_name() {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let name = format!("test-ctrl-cancel-create-{}", std::process::id());
+    let mut cancelled = sandlock_core::Sandbox::builder()
+        .fs_read("/usr").fs_read("/bin").fs_read("/lib")
+        .fs_read_if_exists("/lib64").build().unwrap().with_name(&name);
+    let mut creation = Box::pin(cancelled.create(&["true"]));
+    std::future::poll_fn(|cx| {
+        assert!(creation.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    }).await;
+    assert!(sandlock_core::control::list_sandboxes().unwrap().contains(&name));
+    drop(creation);
+    assert!(!sandlock_core::control::list_sandboxes().unwrap().contains(&name));
+    drop(cancelled);
 }

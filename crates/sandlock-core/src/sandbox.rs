@@ -279,6 +279,7 @@ struct Runtime {
     throttle_handle: Option<JoinHandle<()>>,
     loadavg_handle: Option<JoinHandle<()>>,
     control_handle: Option<JoinHandle<()>>,
+    control_claim: Option<crate::control::ownership::Claim>,
     _stdout_read: Option<std::os::fd::OwnedFd>,
     _stderr_read: Option<std::os::fd::OwnedFd>,
     // Drains of the capture pipes above, each holding either the task still
@@ -998,12 +999,12 @@ impl Sandbox {
         }
 
         let rt = self.rt_mut();
+        rt.control_claim = None;
         if let Some(h) = rt.notif_handle.take() { h.abort(); }
         rt.policy_fn_worker = None;
         if let Some(h) = rt.throttle_handle.take() { h.abort(); }
         if let Some(h) = rt.loadavg_handle.take() { h.abort(); }
-        // Awaiting the aborted task drops its listener, so the name is free
-        // for reuse the moment wait() returns.
+        // Finish shutting down the old endpoint before wait() returns.
         if let Some(h) = rt.control_handle.take() {
             h.abort();
             let _ = h.await;
@@ -1643,6 +1644,7 @@ impl Sandbox {
                 shared_cow: None,
                 tty_foreground_taken: false,
                 control_handle: None,
+                control_claim: None,
             }));
             clones.push(clone_sb);
         }
@@ -1725,6 +1727,7 @@ impl Sandbox {
             throttle_handle: None,
             loadavg_handle: None,
             control_handle: None,
+            control_claim: None,
             _stdout_read: None,
             _stderr_read: None,
             stdout_drain: None,
@@ -1971,8 +1974,7 @@ impl Sandbox {
         let foreground = stdio.all_inherit();
         let tty_foreground_taken = foreground && unsafe { libc::isatty(0) } == 1;
 
-        // Bound before the fork so a name collision fails with no child to
-        // reap. The child sheds its copies as it forks.
+        // Claim before fork so a name collision leaves no child to reap.
         let sandbox_name = self.rt().name.clone();
         let mut control_sockets = match crate::control::bind_control_sockets(&sandbox_name) {
             Ok(s) => Some(s),
@@ -1983,9 +1985,9 @@ impl Sandbox {
                 ))
                 .into());
             }
-            Err(e) => {
-                // A nested sandlock whose outer policy denies AF_UNIX lands
-                // here; the sandbox still runs, it is just not introspectable.
+            Err(e) if matches!(e.raw_os_error(), Some(libc::EPERM | libc::EACCES | libc::ENOSYS)) => {
+                // Nested policies may deny AF_UNIX or SysV IPC; execution can
+                // still proceed without introspection.
                 eprintln!(
                     "sandlock: control socket setup failed for '{}': {} \
                      (introspection unavailable for this sandbox)",
@@ -1993,6 +1995,7 @@ impl Sandbox {
                 );
                 None
             }
+            Err(e) => return Err(SandboxRuntimeError::Io(e).into()),
         };
         let pgrp_socket = control_sockets.as_ref().map(|s| s.pgrp.as_raw_fd());
 
@@ -2354,7 +2357,8 @@ impl Sandbox {
 
             // Independent of the seccomp-notify loop so accept() never adds
             // latency to syscall notification processing.
-            if let Some(sockets) = control_sockets.take() {
+            if let Some(mut sockets) = control_sockets.take() {
+                self.rt_mut().control_claim = sockets.claim.take();
                 self.rt_mut().control_handle = Some(crate::control::spawn_control_loop(
                     sockets,
                     Some(control_ctx),
@@ -2378,7 +2382,8 @@ impl Sandbox {
 
         // No notify supervisor (--no-supervisor or nested): still answer ps,
         // inspect, and kill, with the static policy and no ports.
-        if let Some(sockets) = control_sockets.take() {
+        if let Some(mut sockets) = control_sockets.take() {
+            self.rt_mut().control_claim = sockets.claim.take();
             self.rt_mut().control_handle = Some(crate::control::spawn_control_loop(
                 sockets,
                 None,
@@ -2539,8 +2544,7 @@ impl Drop for Sandbox {
             rt.policy_fn_worker = None;
             if let Some(h) = rt.throttle_handle.take() { h.abort(); }
             if let Some(h) = rt.loadavg_handle.take() { h.abort(); }
-            // Drop cannot await; the name is released when the runtime drops
-            // the aborted task. wait() is the synchronous path.
+            rt.control_claim = None;
             if let Some(h) = rt.control_handle.take() { h.abort(); }
 
             // Nobody is left to collect these; aborting closes the read ends.

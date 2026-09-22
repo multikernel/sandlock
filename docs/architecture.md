@@ -71,6 +71,35 @@ The async notification supervisor (tokio) handles intercepted syscalls:
 | `getdents64` | PID filtering, COW directory merging |
 | `getsockname` | Port remap translation |
 
+## Control discovery
+
+Sandbox names are reserved in a per-user System V semaphore registry in the
+current IPC namespace. Claims use `SEM_UNDO`, so an ordinary fork cannot retain
+its parent's reservation. A completed or dropped sandbox releases its claim;
+process exit, including `SIGKILL`, releases it in the kernel. Each new claim uses
+a random abstract Unix socket address. An inherited descriptor for an earlier
+instance therefore cannot prevent reuse of the sandbox name.
+
+The registry uses no files, shared-memory segments, helper processes, dedicated
+threads, or io_uring. Its versioned semaphore set persists after the last sandbox
+exits and is reused by later processes. The initial implementation supports 256
+live names per UID and IPC namespace. Exhaustion and registry transaction errors
+fail sandbox creation. Transaction waits are bounded to two seconds.
+
+The registry is accessible only to its owning UID. Processes with that same UID
+are trusted, as with the control sockets. Clients still authenticate socket peers
+with `SO_PEERCRED`, including the child's process-group identity. Control clients
+and supervisors must share both the IPC namespace used for discovery and the
+network namespace containing their abstract sockets. This protocol does not
+discover sandboxes started by older versions using name-based socket addresses.
+
+Sandlock does not create an IPC namespace. Its default SysV IPC deny policy is
+unchanged: a nested sandbox that cannot access the registry can execute without
+control introspection, with a diagnostic. Ordinary host forks do not inherit
+semaphore undo state, but a host explicitly using `CLONE_SYSVSEM` can share it and
+delay automatic cleanup until the last sharer exits. Explicit sandbox cleanup
+still releases the claim.
+
 ## Custom Handlers
 
 Downstream Rust crates can append their own seccomp-notification
