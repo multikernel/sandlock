@@ -536,11 +536,10 @@ fn relocate_high_moves_fd_above_stdio_range() {
 
 /// A `wait()` cancelled while it is joining the drains must leave the drain
 /// parked, so a later `wait()` still returns the capture. Reaching that state
-/// end to end needs a descendant holding the write end past the child's exit,
-/// which is inherently racy (the integration test retries for it), so the
-/// contract itself is pinned here: a pending join leaves the task parked, a
-/// finished one leaves the bytes parked, and only an explicit take hands them
-/// over.
+/// end to end needs a holder of the write end past the child's exit, and
+/// `wait()` now kills every sandboxed process on exit, so the contract is
+/// pinned here: a pending join leaves the task parked, a finished one leaves
+/// the bytes parked, and only an explicit take hands them over.
 #[tokio::test]
 async fn a_cancelled_join_leaves_the_drain_parked() {
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();

@@ -173,3 +173,36 @@ async fn test_pause_stops_a_process_that_left_the_main_group() {
     assert!(wait_gone(leader));
     let _ = tokio::time::timeout(std::time::Duration::from_secs(30), sb.wait()).await;
 }
+
+/// The sweep at the main process's exit covers groups the sandbox created,
+/// not only the main one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_exit_sweep_reaches_a_process_that_left_the_main_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("leader");
+    let script = format!(
+        r#"
+import os, signal
+pid = os.fork()
+if pid == 0:
+    os.setsid()
+    signal.pause()
+open("{0}.tmp", "w").write(str(pid))
+os.rename("{0}.tmp", "{0}")
+"#,
+        pid_file.display(),
+    );
+    let mut sb = policy().with_name("pgroup-exit-sweep");
+    sb.fs_writable.push(dir.path().to_path_buf());
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        sb.run(&["python3", "-c", &script]),
+    )
+    .await
+    .expect("run() hung")
+    .unwrap();
+    assert!(result.success());
+
+    let leader: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+    assert!(wait_gone(leader), "session leader {leader} outlived the main process");
+}
