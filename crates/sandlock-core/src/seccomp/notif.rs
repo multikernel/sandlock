@@ -482,10 +482,6 @@ fn realpath_of_fd(fd: RawFd) -> Option<std::path::PathBuf> {
 }
 
 
-fn path_under_any(path: &std::path::Path, list: &[std::path::PathBuf]) -> bool {
-    list.iter().any(|p| path.starts_with(p))
-}
-
 /// Decide whether `realpath` may be opened with `flags` under the deny set
 /// and the (conservative) grant lists. Returns `Some(errno)` to refuse,
 /// `None` to allow. Never over-allows relative to the configured grants: a
@@ -535,12 +531,13 @@ fn deny_open_verdict(
         || acc == libc::O_RDWR
         || (flags & libc::O_TRUNC as u64) != 0
         || (flags & libc::O_CREAT as u64) != 0;
-    let granted = |path: &str| {
-        let path = std::path::Path::new(path);
-        path_under_any(path, &policy.chroot_writable)
-            || (!is_write && path_under_any(path, &policy.chroot_readable))
+    let grants = || {
+        let reads = (!is_write).then_some(policy.chroot_readable.iter()).into_iter().flatten();
+        policy.chroot_writable.iter().chain(reads)
     };
-    if spellings().any(granted) { None } else { Some(libc::EACCES) }
+    let granted = grants().any(|grant| realpath.starts_with(grant))
+        || self_forms.iter().any(|form| grants().any(|grant| crate::procfs::own_grant_covers(form, grant)));
+    if granted { None } else { Some(libc::EACCES) }
 }
 
 /// Resolve again, inside the caller's /proc directory, a probe that landed in
@@ -551,25 +548,23 @@ fn deny_open_verdict(
 /// the sandbox can name resolves there, which makes the test exact. `None`
 /// means the probe is elsewhere.
 fn reprobe_in_callers_proc(
-    found: &OwnedFd,
+    real: &std::path::Path,
     caller_tid: u32,
     nofollow: bool,
     processes: &super::state::ProcessIndex,
-) -> Option<Result<OwnedFd, i32>> {
-    let real = realpath_of_fd(found.as_raw_fd())?;
-    let own = format!("/proc/{}", std::process::id());
-    let own_thread = format!("{}/task/{}", own, unsafe { libc::syscall(libc::SYS_gettid) });
+) -> Option<Result<(OwnedFd, std::path::PathBuf), i32>> {
+    static OWN_PID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    thread_local! {
+        static OWN_TID: u32 = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
+    }
+    let own = format!("/proc/{}", OWN_PID.get_or_init(std::process::id));
+    let own_thread = format!("{}/task/{}", own, OWN_TID.with(|tid| *tid));
     let caller_tgid = processes.tgid_of(caller_tid as i32)?;
     let (rest, callers) = match real.strip_prefix(&own_thread) {
         Ok(rest) => (rest, format!("/proc/{}/task/{}", caller_tgid, caller_tid)),
         Err(_) => (real.strip_prefix(&own).ok()?, format!("/proc/{}", caller_tgid)),
     };
-    // These have a virtual form that this open would go around.
-    let target = std::path::Path::new(&callers).join(rest);
-    if target.to_str().is_none_or(|t| crate::procfs::proc_namespace_entry(t).is_some()) {
-        return Some(Err(libc::EACCES));
-    }
-
+    let callers_real = std::path::Path::new(&callers).join(rest);
     let c_base = std::ffi::CString::new(callers).ok()?;
     let c_rest = match rest.as_os_str().is_empty() {
         true => c".".to_owned(),
@@ -580,7 +575,8 @@ fn reprobe_in_callers_proc(
             .and_then(|base| {
                 let flags = libc::O_PATH | libc::O_CLOEXEC | if nofollow { libc::O_NOFOLLOW } else { 0 };
                 openat2_at(base.as_raw_fd(), &c_rest, flags as u64, 0, RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)
-            }),
+            })
+            .map(|fd| (fd, callers_real)),
     )
 }
 
@@ -630,6 +626,43 @@ pub(crate) fn decode_open_args(notif: &SeccompNotif, notif_fd: RawFd) -> Option<
     }
 }
 
+/// An open-family request, decoded once per notification and shared by every
+/// handler in the chain. Each handler used to read the string again, which
+/// added nothing: a handler is safe by how it answers, not by rereading.
+pub(crate) struct OpenRequest {
+    pub(crate) args: OpenArgs,
+    /// The string the child wrote.
+    pub(crate) path: String,
+    /// Its lexically normalized absolute spelling in the sandbox's namespace,
+    /// or `None` when it walks above the root.
+    pub(crate) target: Option<std::path::PathBuf>,
+}
+
+impl OpenRequest {
+    pub(crate) fn decode(
+        notif: &SeccompNotif,
+        notif_fd: RawFd,
+        policy: &NotifPolicy,
+        processes: &super::state::ProcessIndex,
+    ) -> Option<Self> {
+        let args = decode_open_args(notif, notif_fd)?;
+        let path = read_child_cstr(notif_fd, notif.id, notif.pid, args.path_ptr, 4096)?;
+        let target = crate::procfs::resolve_to_normalized_absolute(
+            notif.pid,
+            args.dirfd,
+            &path,
+            policy.chroot_root.as_deref(),
+            &policy.chroot_mounts,
+            processes,
+        );
+        Some(Self { args, path, target })
+    }
+
+    pub(crate) fn target_str(&self) -> Option<&str> {
+        self.target.as_deref()?.to_str()
+    }
+}
+
 /// Wrap a freshly opened raw fd into an `InjectFdSend`, honoring the child's
 /// `O_CLOEXEC` request. Ownership of `raw_fd` moves into the action.
 pub(crate) fn inject_open_result(raw_fd: i32, flags: u64) -> NotifAction {
@@ -649,23 +682,21 @@ pub(crate) fn inject_open_result(raw_fd: i32, flags: u64) -> NotifAction {
 /// Existing-file branch: vet the pinned inode behind `probe`, then reopen it
 /// race-free via its `/proc/self/fd` magic link with the child's real access
 /// mode (binds to the inode, not the original path).
-fn reopen_existing_on_behalf(
+async fn reopen_existing_on_behalf(
     probe: OwnedFd,
+    realpath: std::path::PathBuf,
     flags: u64,
-    policy: &NotifPolicy,
+    ctx: &super::ctx::SupervisorCtx,
     pfs: &super::state::PolicyFnState,
-    processes: &super::state::ProcessIndex,
     notif: &SeccompNotif,
     notif_fd: RawFd,
 ) -> NotifAction {
+    let policy = &*ctx.policy;
+    let processes = &*ctx.processes;
     // File exists. Refuse O_CREAT|O_EXCL the way the kernel would.
     if (flags & libc::O_CREAT as u64) != 0 && (flags & libc::O_EXCL as u64) != 0 {
         return NotifAction::Errno(libc::EEXIST);
     }
-    let realpath = match realpath_of_fd(probe.as_raw_fd()) {
-        Some(p) => p,
-        None => return NotifAction::Errno(libc::EACCES),
-    };
     if let Some(errno) = deny_open_verdict(&realpath, flags, policy, pfs, processes, notif.pid) {
         return NotifAction::Errno(errno);
     }
@@ -677,6 +708,13 @@ fn reopen_existing_on_behalf(
         if pfs.is_id_denied(&id) {
             return NotifAction::Errno(libc::EACCES);
         }
+    }
+    // The /proc and /etc handlers judged the string the child wrote; the
+    // real file behind a virtual one is reached by any other spelling.
+    if let Some(file) = crate::procfs::virtual_file(&realpath.to_string_lossy(), policy) {
+        let content =
+            crate::procfs::render_virtual_file(file, processes, &ctx.resource, &ctx.network, policy).await;
+        return NotifAction::inject_bytes(&content);
     }
     // Resolution-only flags are stripped from the reopen.
     let reopen_flags =
@@ -824,7 +862,7 @@ fn reopen_fifo_when_partnered(
 /// target, then create the leaf inside that pinned parent (the dir inode is
 /// fixed, only the leaf name is appended).
 fn create_new_on_behalf(
-    base: &OwnedFd,
+    base: RawFd,
     path: &str,
     flags: u64,
     mode: u64,
@@ -849,7 +887,7 @@ fn create_new_on_behalf(
         Err(_) => return NotifAction::Errno(libc::EINVAL),
     };
     let parent_fd = match openat2_at(
-        base.as_raw_fd(),
+        base,
         &c_parent,
         (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
         0,
@@ -874,19 +912,25 @@ fn create_new_on_behalf(
     inject_open_result(fd, flags)
 }
 
-/// Perform `openat`/`open` on behalf of the child, race-free, when a deny is
-/// active. Resolves once (pinning the inode), enforces deny + grant on the
-/// pinned target, then hands the child an fd to that exact inode via
-/// `InjectFdSend`. Returns `Continue` only when no allow/deny decision was
-/// made on content we resolved (unreadable path / no allowlist configured),
-/// matching the precheck's existing soft fall-through.
-fn on_behalf_open_for_deny(
+/// Perform `openat`/`open` on behalf of the child, race-free. Resolves once
+/// (pinning the inode), enforces deny + grant on the pinned target, then hands
+/// the child an fd to that exact inode via `InjectFdSend`.
+///
+/// With a deny active every open is taken over, since the kernel cannot
+/// re-resolve past the deny. Otherwise only an open that lands on procfs or
+/// on a virtualized file is: neither has a Landlock grant to its real inode,
+/// so they can only be reached through here, and a `Continue` for anything
+/// else is judged by Landlock on the real inode.
+async fn on_behalf_open(
     notif: &SeccompNotif,
-    policy: &NotifPolicy,
+    open: &OpenRequest,
+    ctx: &super::ctx::SupervisorCtx,
     pfs: &super::state::PolicyFnState,
-    processes: &super::state::ProcessIndex,
     notif_fd: RawFd,
+    has_denied: bool,
 ) -> NotifAction {
+    let policy = &*ctx.policy;
+    let processes = &*ctx.processes;
     // No allowlist configured (Landlock is not allowlisting the filesystem):
     // there is no grant to check against, so taking over the open could only
     // wrongly deny. Leave it to the existing precheck/kernel path.
@@ -894,43 +938,42 @@ fn on_behalf_open_for_deny(
         return NotifAction::Continue;
     }
 
-    let OpenArgs { dirfd, path_ptr, flags, mode, resolve } =
-        match decode_open_args(notif, notif_fd) {
-            Some(a) => a,
-            None => return NotifAction::Continue, // kernel's re-read fails the same way
-        };
-
-    let path = match read_child_cstr(notif_fd, notif.id, notif.pid, path_ptr, 4096) {
-        Some(p) => p,
-        None => return NotifAction::Continue, // kernel's re-read fails the same way
-    };
-    let c_path = match std::ffi::CString::new(path.clone()) {
+    let OpenArgs { dirfd, flags, mode, resolve, .. } = open.args;
+    let path = &open.path;
+    let c_path = match std::ffi::CString::new(path.as_str()) {
         Ok(c) => c,
         Err(_) => return NotifAction::Errno(libc::EINVAL),
     };
-    let base = match open_base_dir(notif.pid, dirfd) {
-        Ok(b) => b,
-        Err(e) => return NotifAction::Errno(e),
+    // An absolute path ignores the directory it is opened against.
+    let base = match path.starts_with('/') {
+        true => None,
+        false => match open_base_dir(notif.pid, dirfd) {
+            Ok(b) => Some(b),
+            Err(e) => return NotifAction::Errno(e),
+        },
     };
+    let base_fd = base.as_ref().map_or(libc::AT_FDCWD, |b| b.as_raw_fd());
 
     let nofollow = flags & libc::O_NOFOLLOW as u64 != 0;
     let follows_links = !nofollow && resolve & (RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS) == 0;
 
     // /proc/self/fd/N, /dev/stdin and their kin ask for the caller's own fd.
     // The walk below would refuse that magic link, because in this context it
-    // is the supervisor's, so the fd is taken from the caller directly.
-    let own_fd = follows_links
+    // is the supervisor's, so the fd is taken from the caller directly. Without
+    // a deny the kernel's own reopen is faithful and Landlock judges the fd's
+    // target, as it would for a native reopen, so the probe's ELOOP continues.
+    let own_fd = (has_denied && follows_links)
         .then(|| {
             let tgid = processes.tgid_of(notif.pid as i32)?;
-            let target = crate::procfs::resolve_open_target(
-                notif, notif_fd, policy.chroot_root.as_deref(), &policy.chroot_mounts, processes,
-            )?;
-            crate::procfs::own_fd_request(target.to_str()?, notif.pid as i32, tgid)
+            crate::procfs::own_fd_request(open.target_str()?, notif.pid as i32, tgid)
         })
         .flatten();
     if let Some(own_fd) = own_fd {
         return match dup_fd_from_pid(notif.pid, own_fd) {
-            Ok(dup) => reopen_existing_on_behalf(dup, flags, policy, pfs, processes, notif, notif_fd),
+            Ok(dup) => match realpath_of_fd(dup.as_raw_fd()) {
+                Some(real) => reopen_existing_on_behalf(dup, real, flags, ctx, pfs, notif, notif_fd).await,
+                None => NotifAction::Errno(libc::EACCES),
+            },
             Err(_) => NotifAction::Errno(libc::ENOENT),
         };
     }
@@ -938,14 +981,34 @@ fn on_behalf_open_for_deny(
     // Side-effect-free probe; mirror the child's no-follow intent for the
     // final component and any `openat2` RESOLVE_* flags it requested.
     let probe_flags = (libc::O_PATH | libc::O_CLOEXEC) as u64 | (flags & libc::O_NOFOLLOW as u64);
-    match openat2_at(base.as_raw_fd(), &c_path, probe_flags, 0, RESOLVE_NO_MAGICLINKS | resolve) {
-        Ok(probe) => match reprobe_in_callers_proc(&probe, notif.pid, nofollow, processes) {
-            Some(Ok(callers)) => reopen_existing_on_behalf(callers, flags, policy, pfs, processes, notif, notif_fd),
-            Some(Err(errno)) => NotifAction::Errno(errno),
-            None => reopen_existing_on_behalf(probe, flags, policy, pfs, processes, notif, notif_fd),
-        },
+    match openat2_at(base_fd, &c_path, probe_flags, 0, RESOLVE_NO_MAGICLINKS | resolve) {
+        Ok(probe) => {
+            let Some(real) = realpath_of_fd(probe.as_raw_fd()) else {
+                return if has_denied { NotifAction::Errno(libc::EACCES) } else { NotifAction::Continue };
+            };
+            match reprobe_in_callers_proc(&real, notif.pid, nofollow, processes) {
+                Some(Ok((callers, real))) => {
+                    reopen_existing_on_behalf(callers, real, flags, ctx, pfs, notif, notif_fd).await
+                }
+                Some(Err(errno)) => NotifAction::Errno(errno),
+                None => {
+                    // Whether the target is procfs is only a routing hint: a
+                    // procfs mount elsewhere would be left to Landlock, which
+                    // grants it nothing.
+                    let served_here = has_denied
+                        || real.starts_with("/proc")
+                        || crate::procfs::virtual_file(&real.to_string_lossy(), policy).is_some();
+                    if served_here {
+                        reopen_existing_on_behalf(probe, real, flags, ctx, pfs, notif, notif_fd).await
+                    } else {
+                        NotifAction::Continue
+                    }
+                }
+            }
+        }
+        Err(_) if !has_denied => NotifAction::Continue,
         Err(errno) if errno == libc::ENOENT && (flags & libc::O_CREAT as u64) != 0 => {
-            create_new_on_behalf(&base, &path, flags, mode, resolve, policy, pfs, processes, notif.pid)
+            create_new_on_behalf(base_fd, path, flags, mode, resolve, policy, pfs, processes, notif.pid)
         }
         Err(errno) => NotifAction::Errno(errno),
     }
@@ -1047,6 +1110,18 @@ pub struct NotifPolicy {
 }
 
 impl NotifPolicy {
+    /// Whether an open may land on something the supervisor answers for
+    /// whatever the spelling: procfs, which is never a Landlock rule while a
+    /// supervisor runs, or a virtualized file inside a read grant.
+    pub(crate) fn resolves_opens(&self) -> bool {
+        let granted = |path: &str| self.chroot_readable.iter().any(|g| std::path::Path::new(path).starts_with(g));
+        self.chroot_root.is_none()
+            && (self.chroot_readable.iter().any(|p| crate::procfs::is_supervised_proc_grant(p))
+                || crate::procfs::SHADOWED_ETC_FILES
+                    .iter()
+                    .any(|f| crate::procfs::virtual_file(f, self).is_some() && granted(f)))
+    }
+
     /// Whether an IP-family `connect()` must be handled on-behalf by the
     /// supervisor, given the destination's loopback-ness.
     ///
@@ -2426,48 +2501,44 @@ async fn handle_notification(
         maybe_patch_vdso(notif.pid as i32, &mut pfs, policy);
     }
 
-    // Check dynamic path denials before dispatch. The gated syscall set is
-    // shared with the BPF notif list so enforcement scope cannot drift from
-    // interception scope; see `fs_denied_path_syscalls` for what is gated
-    // and why symlink/mkdir are not.
+    // Path denials are checked before dispatch, on the syscall set the BPF
+    // notif list gates for them; see `fs_denied_path_syscalls`. Nothing is
+    // resolved for it unless a deny exists: with none, there is nothing a
+    // path could be denied against.
+    let nr = notif.data.nr as i64;
+    let is_openat_family =
+        nr == libc::SYS_openat || nr == arch::SYS_OPENAT2 || Some(nr) == arch::sys_open();
+    let has_denied = policy.chroot_root.is_none() && ctx.policy_fn.lock().await.has_denied_paths();
+    let open = is_openat_family
+        .then(|| OpenRequest::decode(&notif, fd, policy, &ctx.processes))
+        .flatten()
+        .map(Arc::new);
     let mut action = {
-        let nr = notif.data.nr as i64;
-        let should_precheck_denied = policy.chroot_root.is_none()
-            && crate::seccomp_plan::fs_denied_path_syscalls().contains(&nr);
-        if should_precheck_denied {
-            let pfs = ctx.policy_fn.lock().await;
-            if is_path_denied_for_notif(&pfs, &notif, fd) {
-                NotifAction::Errno(libc::EACCES)
-            } else {
-                let has_denied = pfs.has_denied_paths();
-                drop(pfs);
-                // Let normal dispatch run first so /proc virtualization and
-                // other handlers still win for their paths.
-                let action = dispatch_table.dispatch(notif, fd).await;
-                // A bare `Continue` for openat/open is the racy window: the
-                // supervisor's resolution said "not denied", but the kernel
-                // re-resolves after Continue and a racing thread can swap a
-                // symlink to reach a denied carve-out inside a granted tree
-                // (issue #111). Run the open on-behalf against the pinned
-                // inode and inject the fd so the kernel never re-resolves.
-                // Other path syscalls keep the best-effort precheck above
-                // (documented follow-up — they return no fd to inject).
-                let is_openat_family = nr == libc::SYS_openat
-                    || nr == arch::SYS_OPENAT2
-                    || Some(nr) == arch::sys_open();
-                if matches!(action, NotifAction::Continue) && is_openat_family && has_denied {
-                    let pfs = ctx.policy_fn.lock().await;
-                    on_behalf_open_for_deny(&notif, policy, &pfs, &ctx.processes, fd)
-                } else {
-                    action
-                }
-            }
+        let denied = has_denied
+            && crate::seccomp_plan::fs_denied_path_syscalls().contains(&nr)
+            && is_path_denied_for_notif(&*ctx.policy_fn.lock().await, &notif, fd);
+        if denied {
+            NotifAction::Errno(libc::EACCES)
         } else {
-            dispatch_table.dispatch(notif, fd).await
+            // Dispatch runs first so /proc virtualization and the other
+            // handlers still win for their paths.
+            let action = dispatch_table.dispatch(notif, fd, open.clone()).await;
+            // A bare Continue for an open is the racy window: the kernel
+            // re-resolves the path after it, and a racing thread can swap a
+            // link to reach a denied carve-out inside a granted tree (issue
+            // #111) or a procfs entry the handlers hide by name (issue
+            // #236). The open is done against the pinned inode instead.
+            let resolves = policy.chroot_root.is_none() && (has_denied || policy.resolves_opens());
+            match (&action, &open) {
+                (NotifAction::Continue, Some(open)) if resolves => {
+                    let pfs = ctx.policy_fn.lock().await;
+                    on_behalf_open(&notif, open, ctx, &pfs, fd, has_denied).await
+                }
+                _ => action,
+            }
         }
     };
 
-    let nr = notif.data.nr as i64;
     let fork_counted = matches!(action, NotifAction::Continue)
         && crate::resource::fork_counted_on_continue(&notif, fd);
 

@@ -281,8 +281,8 @@ use sandlock_core::{SeccompData, SeccompNotif};
 use sandlock_ffi::handler::FfiHandler;
 
 fn fake_ctx() -> HandlerCtx {
-    HandlerCtx {
-        notif: SeccompNotif {
+    HandlerCtx::new(
+        SeccompNotif {
             id: 1,
             pid: std::process::id(),
             flags: 0,
@@ -293,8 +293,8 @@ fn fake_ctx() -> HandlerCtx {
                 args: [0; 6],
             },
         },
-        notif_fd: -1,
-    }
+        -1,
+    )
 }
 
 /// Spawn a `sleep 30` child that immediately calls `setpgid(0, 0)` so
@@ -346,8 +346,8 @@ fn fake_ctx_with_isolated_child() -> (HandlerCtx, std::process::Child) {
         resolved, supervisor_pgid,
         "precondition: child's pgid must differ from supervisor's",
     );
-    let ctx = HandlerCtx {
-        notif: SeccompNotif {
+    let ctx = HandlerCtx::new(
+        SeccompNotif {
             id: 1,
             pid: child_pid as u32,
             flags: 0,
@@ -358,8 +358,8 @@ fn fake_ctx_with_isolated_child() -> (HandlerCtx, std::process::Child) {
                 args: [0; 6],
             },
         },
-        notif_fd: -1,
-    };
+        -1,
+    );
     (ctx, child)
 }
 
@@ -825,8 +825,8 @@ async fn ffi_handler_translates_kill_zero_pgid_substitutes_child_pgid() {
     };
     // Safety: see `ffi_handler_translates_continue`.
     let h = unsafe { FfiHandler::from_raw(raw) };
-    let cx = HandlerCtx {
-        notif: SeccompNotif {
+    let cx = HandlerCtx::new(
+        SeccompNotif {
             id: 1,
             pid: child_pid as u32,
             flags: 0,
@@ -837,8 +837,8 @@ async fn ffi_handler_translates_kill_zero_pgid_substitutes_child_pgid() {
                 args: [0; 6],
             },
         },
-        notif_fd: -1,
-    };
+        -1,
+    );
     let action = h.handle(&cx).await;
 
     // Reap the child regardless of assertion outcome.
@@ -862,8 +862,8 @@ async fn ffi_handler_translates_kill_zero_pgid_substitutes_child_pgid() {
 // fallback pgid for `Kill { pgid: 0 }` actions.
 
 fn fake_ctx_with_pid(pid: u32) -> HandlerCtx {
-    HandlerCtx {
-        notif: SeccompNotif {
+    HandlerCtx::new(
+        SeccompNotif {
             id: 1,
             pid,
             flags: 0,
@@ -874,8 +874,8 @@ fn fake_ctx_with_pid(pid: u32) -> HandlerCtx {
                 args: [0; 6],
             },
         },
-        notif_fd: -1,
-    }
+        -1,
+    )
 }
 
 extern "C-unwind" fn k_handler_set_kill_sigkill_zero_pgid(

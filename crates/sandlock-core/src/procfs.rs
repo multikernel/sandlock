@@ -29,8 +29,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::seccomp::notif::{
-    content_memfd, decode_open_args, inject_open_result, openat2_at, read_child_cstr,
-    write_child_mem, NotifAction, NotifPolicy,
+    content_memfd, inject_open_result, openat2_at, write_child_mem, NotifAction, NotifPolicy,
+    OpenArgs, OpenRequest,
 };
 use crate::seccomp::state::{NetworkState, ProcessIndex};
 use crate::sys::structs::{SeccompNotif, EACCES};
@@ -116,6 +116,109 @@ pub(crate) fn canon_proc_namespace(path: &str) -> std::borrow::Cow<'_, str> {
         Some(("net", tail)) => format!("/proc/net{}", tail).into(),
         Some((entry, tail)) => format!("{}/{}{}", PROC_SELF, entry, tail).into(),
         None => path.into(),
+    }
+}
+
+/// Files under /etc whose open is answered with generated content.
+pub(crate) const SHADOWED_ETC_FILES: &[&str] = &["/etc/hostname", "/etc/hosts"];
+
+/// A file whose open is answered with generated content.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum VirtualFile {
+    CpuInfo,
+    MemInfo,
+    Uptime,
+    LoadAvg,
+    NetDev,
+    NetIfInet6,
+    NetTcp { v6: bool },
+    Mounts,
+    MountInfo,
+    MountStats,
+    Cgroup,
+    Hostname,
+    EtcHosts,
+}
+
+/// The virtual file `path` names under `policy`, with every per-task
+/// spelling of a namespace entry collapsed first. The real file behind it
+/// must never be handed out in its place.
+pub(crate) fn virtual_file(path: &str, policy: &NotifPolicy) -> Option<VirtualFile> {
+    Some(match canon_proc_namespace(path).as_ref() {
+        "/proc/cpuinfo" if policy.num_cpus.is_some() => VirtualFile::CpuInfo,
+        "/proc/meminfo" if policy.max_memory_bytes > 0 => VirtualFile::MemInfo,
+        "/proc/uptime" if policy.has_time_start => VirtualFile::Uptime,
+        "/proc/loadavg" => VirtualFile::LoadAvg,
+        "/proc/net/dev" => VirtualFile::NetDev,
+        "/proc/net/if_inet6" => VirtualFile::NetIfInet6,
+        "/proc/net/tcp" if policy.port_remap => VirtualFile::NetTcp { v6: false },
+        "/proc/net/tcp6" if policy.port_remap => VirtualFile::NetTcp { v6: true },
+        "/proc/mounts" | "/proc/self/mounts" => VirtualFile::Mounts,
+        "/proc/self/mountinfo" => VirtualFile::MountInfo,
+        "/proc/self/mountstats" => VirtualFile::MountStats,
+        "/proc/self/cgroup" => VirtualFile::Cgroup,
+        "/etc/hostname" if policy.virtual_hostname.is_some() => VirtualFile::Hostname,
+        "/etc/hosts" if !policy.virtual_etc_hosts.is_empty() => VirtualFile::EtcHosts,
+        _ => return None,
+    })
+}
+
+/// The content of a virtual file at this moment.
+pub(crate) async fn render_virtual_file(
+    file: VirtualFile,
+    processes: &ProcessIndex,
+    resource: &Mutex<crate::seccomp::state::ResourceState>,
+    network: &Mutex<NetworkState>,
+    policy: &NotifPolicy,
+) -> Vec<u8> {
+    let mounts_args = || {
+        (
+            policy.chroot_root.as_deref(),
+            &policy.chroot_mounts,
+            &policy.chroot_mount_ro,
+            root_is_read_only(policy),
+        )
+    };
+    match file {
+        VirtualFile::CpuInfo => generate_cpuinfo(policy.num_cpus.unwrap_or(1)),
+        VirtualFile::MemInfo => {
+            let rs = resource.lock().await;
+            generate_meminfo(policy.max_memory_bytes, rs.mem_used)
+        }
+        VirtualFile::Uptime => {
+            let rs = resource.lock().await;
+            generate_uptime(rs.start_instant.elapsed().as_secs_f64())
+        }
+        VirtualFile::LoadAvg => {
+            let total = processes.len() as u32;
+            let last_pid = processes.max_pid().unwrap_or(0);
+            let rs = resource.lock().await;
+            generate_loadavg(&rs.load_avg, rs.proc_count, total, last_pid)
+        }
+        VirtualFile::NetDev => generate_proc_net_dev(),
+        VirtualFile::NetIfInet6 => generate_proc_net_if_inet6(),
+        VirtualFile::NetTcp { v6 } => {
+            let ns = network.lock().await;
+            generate_proc_net_tcp(&ns.port_map.bound_ports, v6)
+        }
+        VirtualFile::Mounts => {
+            let (root, mounts, ro, root_ro) = mounts_args();
+            generate_proc_mounts(root, mounts, ro, root_ro)
+        }
+        VirtualFile::MountInfo => {
+            let (root, mounts, ro, root_ro) = mounts_args();
+            generate_proc_mountinfo(root, mounts, ro, root_ro)
+        }
+        VirtualFile::MountStats => {
+            generate_proc_mountstats(policy.chroot_root.as_deref(), &policy.chroot_mounts)
+        }
+        // The real file names the host's slice and scope. This is what a
+        // task sees from inside a cgroup namespace of its own.
+        VirtualFile::Cgroup => b"0::/\n".to_vec(),
+        VirtualFile::Hostname => {
+            format!("{}\n", policy.virtual_hostname.as_deref().unwrap_or_default()).into_bytes()
+        }
+        VirtualFile::EtcHosts => policy.virtual_etc_hosts.clone().into_bytes(),
     }
 }
 
@@ -465,15 +568,6 @@ fn inject_memfd(content: &[u8]) -> NotifAction {
 }
 
 // ============================================================
-// Read path from child memory
-// ============================================================
-
-/// Read a NUL-terminated path string from child memory.
-fn read_path(notif: &SeccompNotif, addr: u64, notif_fd: RawFd) -> Option<String> {
-    read_child_cstr(notif_fd, notif.id, notif.pid, addr, 4096)
-}
-
-// ============================================================
 // handle_proc_open — intercept openat for /proc virtualization
 // ============================================================
 
@@ -485,124 +579,31 @@ fn read_path(notif: &SeccompNotif, addr: u64, notif_fd: RawFd) -> Option<String>
 /// - Lets everything else through.
 pub(crate) async fn handle_proc_open(
     notif: &SeccompNotif,
+    open: &OpenRequest,
     processes: &Arc<ProcessIndex>,
     resource: &Arc<Mutex<crate::seccomp::state::ResourceState>>,
     network: &Arc<Mutex<NetworkState>>,
     policy: &NotifPolicy,
-    notif_fd: RawFd,
 ) -> NotifAction {
-    // Resolve open/openat/openat2 to a normalized absolute path so the
-    // sensitive-path deny, the per-PID filter, and the virtualization
-    // string-matches below all see the same canonical form regardless of
-    // how the caller spelled it (dirfd-relative, `..`-laden, etc.).
-    let resolved = match resolve_open_target(
-        notif,
-        notif_fd,
-        policy.chroot_root.as_deref(),
-        &policy.chroot_mounts,
-        processes,
-    ) {
-        Some(p) => p,
-        None => return NotifAction::Continue,
-    };
-    let path = match resolved.to_str() {
-        Some(p) => p,
-        None => return NotifAction::Continue,
-    };
+    let Some(path) = open.target_str() else { return NotifAction::Continue };
 
     if is_hidden_proc_path(path, processes) {
         return NotifAction::Errno(EACCES);
     }
 
-    let path = canon_proc_namespace(path);
-    let path = path.as_ref();
-
-    // Virtualize /proc/cpuinfo.
-    if path == "/proc/cpuinfo" {
-        if let Some(num_cpus) = policy.num_cpus {
-            let content = generate_cpuinfo(num_cpus);
+    // The /etc shims are handlers of their own, ordered around the chroot
+    // handler so that its grant check comes first.
+    if path.starts_with("/proc/") {
+        if let Some(file) = virtual_file(path, policy) {
+            let content = render_virtual_file(file, processes, resource, network, policy).await;
             return inject_memfd(&content);
         }
     }
 
-    // Virtualize /proc/meminfo.
-    if path == "/proc/meminfo" && policy.max_memory_bytes > 0 {
-        let rs = resource.lock().await;
-        let content = generate_meminfo(policy.max_memory_bytes, rs.mem_used);
-        return inject_memfd(&content);
-    }
+    let path = canon_proc_namespace(path);
+    let path = path.as_ref();
 
-    // Virtualize /proc/uptime when time_start is set.
-    if path == "/proc/uptime" && policy.has_time_start {
-        let rs = resource.lock().await;
-        let elapsed = rs.start_instant.elapsed().as_secs_f64();
-        let content = generate_uptime(elapsed);
-        return inject_memfd(&content);
-    }
-
-    // Virtualize /proc/loadavg when proc virtualization is active.
-    if path == "/proc/loadavg" {
-        let total = processes.len() as u32;
-        let last_pid = processes.max_pid().unwrap_or(0);
-        let rs = resource.lock().await;
-        let running = rs.proc_count;
-        let content = generate_loadavg(&rs.load_avg, running, total, last_pid);
-        return inject_memfd(&content);
-    }
-
-    // Virtualize /proc/net/dev and /proc/net/if_inet6 — show loopback only.
-    if path == "/proc/net/dev" {
-        return inject_memfd(&generate_proc_net_dev());
-    }
-    if path == "/proc/net/if_inet6" {
-        return inject_memfd(&generate_proc_net_if_inet6());
-    }
-
-    // Virtualize /proc/net/tcp and /proc/net/tcp6 when port_remap is active.
-    if policy.port_remap && (path == "/proc/net/tcp" || path == "/proc/net/tcp6") {
-        let is_v6 = path.ends_with('6');
-        let ns = network.lock().await;
-        let content = generate_proc_net_tcp(&ns.port_map.bound_ports, is_v6);
-        return inject_memfd(&content);
-    }
-
-    // Virtualize /proc/mounts and /proc/self/mounts.
-    if path == "/proc/mounts" || path == "/proc/self/mounts" {
-        let content = generate_proc_mounts(
-            policy.chroot_root.as_deref(),
-            &policy.chroot_mounts,
-            &policy.chroot_mount_ro,
-            root_is_read_only(policy),
-        );
-        return inject_memfd(&content);
-    }
-
-    // Virtualize /proc/self/mountinfo.
-    if path == "/proc/self/mountinfo" {
-        let content = generate_proc_mountinfo(
-            policy.chroot_root.as_deref(),
-            &policy.chroot_mounts,
-            &policy.chroot_mount_ro,
-            root_is_read_only(policy),
-        );
-        return inject_memfd(&content);
-    }
-
-    // Virtualize /proc/self/mountstats.
-    if path == "/proc/self/mountstats" {
-        return inject_memfd(&generate_proc_mountstats(
-            policy.chroot_root.as_deref(),
-            &policy.chroot_mounts,
-        ));
-    }
-
-    // The real file names the host's slice and scope. This is what a task
-    // sees from inside a cgroup namespace of its own.
-    if path == "/proc/self/cgroup" {
-        return inject_memfd(b"0::/\n");
-    }
-
-    if let Some(action) = open_own_proc_on_behalf(notif, notif_fd, path, processes, policy) {
+    if let Some(action) = open_own_proc_on_behalf(notif, &open.args, path, processes, policy) {
         return action;
     }
 
@@ -631,12 +632,11 @@ const READ_OPEN_FLAGS: i32 =
 /// the supervisor may hold more than the task it would be opening them for.
 pub(crate) const OPENER_PRIVILEGED_FILES: &[&str] = &["pagemap", "stack", "seccomp_cache"];
 
-/// True for a read grant the supervisor serves instead of Landlock, which
-/// could only bind it to the one pid that exists when the rule is added
-/// (issue #218). The net subtree is never served, so its grants stay rules.
-pub(crate) fn is_own_proc_read_grant(path: &std::path::Path) -> bool {
-    (path.starts_with(PROC_SELF) || path.starts_with(PROC_THREAD_SELF))
-        && path.to_str().is_some_and(|p| !matches!(proc_namespace_entry(p), Some(("net", _))))
+/// True for a read grant the supervisor serves instead of Landlock. A rule
+/// on procfs would let any link reach the entries the handlers hide by name
+/// (issue #236), and one on /proc/self binds to a single pid (issue #218).
+pub(crate) fn is_supervised_proc_grant(path: &std::path::Path) -> bool {
+    path.starts_with("/proc")
 }
 
 /// A path inside the caller's own /proc directory.
@@ -684,7 +684,25 @@ fn own_proc_target(path: &str, tid: i32, tgid: i32) -> Option<OwnProcTarget<'_>>
 /// The pid-free spellings of a path inside the caller's own /proc directory,
 /// which are the only ones a grant or a deny can name. Empty for any other path.
 pub(crate) fn own_proc_self_forms(path: &str, tid: i32, tgid: i32) -> Vec<String> {
-    own_proc_target(path, tid, tgid).map(|target| target.self_forms).unwrap_or_default()
+    let mut forms = own_proc_target(path, tid, tgid).map(|target| target.self_forms).unwrap_or_default();
+    // /proc/net is a link into the caller's directory, and a policy may name it.
+    if let Some(("net", tail)) = proc_namespace_entry(path) {
+        forms.push(format!("/proc/net{}", tail));
+    }
+    forms
+}
+
+/// Whether `grant` reaches `form`, a pid-free spelling of the caller's own
+/// entry. The net subtree is the host's network namespace, not the task's
+/// own data, so through this spelling only a grant naming net reaches it.
+pub(crate) fn own_grant_covers(form: &str, grant: &std::path::Path) -> bool {
+    if !std::path::Path::new(form).starts_with(grant) {
+        return false;
+    }
+    match proc_namespace_entry(form) {
+        Some(("net", tail)) => grant.starts_with(&form[..form.len() - tail.len()]),
+        _ => true,
+    }
 }
 
 /// The /dev names that are links into the caller's fd directory on this host.
@@ -733,7 +751,7 @@ pub(crate) fn own_fd_request(path: &str, tid: i32, tgid: i32) -> Option<i32> {
 /// verdict on the real target instead of ours.
 fn open_own_proc_on_behalf(
     notif: &SeccompNotif,
-    notif_fd: RawFd,
+    args: &OpenArgs,
     path: &str,
     processes: &ProcessIndex,
     policy: &NotifPolicy,
@@ -758,7 +776,6 @@ fn open_own_proc_on_behalf(
         return None;
     }
 
-    let args = decode_open_args(notif, notif_fd)?;
     let flags = args.flags as i32;
     if flags & WRITE_SIDE_FLAGS != 0 {
         return None;
@@ -869,83 +886,22 @@ pub(crate) fn handle_uname(
     }
 }
 
-/// Handle open/openat/openat2 targeting /etc/hostname — return a memfd
-/// with the virtual hostname. Path is resolved and lexically normalized
-/// via [`resolve_open_target`] so dirfd-relative and non-canonical
-/// spellings all hit the shim.
-pub(crate) fn handle_hostname_open(
-    notif: &SeccompNotif,
-    hostname: &str,
-    notif_fd: RawFd,
-    chroot_root: Option<&std::path::Path>,
-    chroot_mounts: &[(std::path::PathBuf, std::path::PathBuf)],
-    processes: &ProcessIndex,
-) -> Option<NotifAction> {
-    let resolved = resolve_open_target(notif, notif_fd, chroot_root, chroot_mounts, processes)?;
-    if resolved != std::path::Path::new("/etc/hostname") {
+/// Answer an open of /etc/hostname with the virtual hostname.
+pub(crate) fn handle_hostname_open(open: &OpenRequest, hostname: &str) -> Option<NotifAction> {
+    if open.target.as_deref() != Some(std::path::Path::new("/etc/hostname")) {
         return None;
     }
-    let content = format!("{}\n", hostname);
-    Some(inject_memfd(content.as_bytes()))
+    Some(inject_memfd(format!("{}\n", hostname).as_bytes()))
 }
 
-/// Intercept any `open`/`openat`/`openat2` of `/etc/hosts` and return a memfd
-/// with virtual content.
-///
-/// Every sandbox gets a fixed loopback view (`127.0.0.1 localhost` /
-/// `::1 localhost`) plus any concrete hostnames pre-resolved from
-/// `net_allow`, so the host's on-disk `/etc/hosts` never leaks in and
-/// glibc's `files` NSS backend resolves allowed hostnames without DNS.
-pub(crate) fn handle_etc_hosts_open(
-    notif: &SeccompNotif,
-    etc_hosts_content: &str,
-    notif_fd: RawFd,
-    chroot_root: Option<&std::path::Path>,
-    chroot_mounts: &[(std::path::PathBuf, std::path::PathBuf)],
-    processes: &ProcessIndex,
-) -> Option<NotifAction> {
-    let resolved = resolve_open_target(notif, notif_fd, chroot_root, chroot_mounts, processes)?;
-    if resolved != std::path::Path::new("/etc/hosts") {
+/// Answer an open of /etc/hosts with the virtual file: a fixed loopback view
+/// plus the hostnames pre-resolved from `net_allow`, so the host's own file
+/// never leaks in and glibc's `files` backend resolves allowed names.
+pub(crate) fn handle_etc_hosts_open(open: &OpenRequest, etc_hosts_content: &str) -> Option<NotifAction> {
+    if open.target.as_deref() != Some(std::path::Path::new("/etc/hosts")) {
         return None;
     }
     Some(inject_memfd(etc_hosts_content.as_bytes()))
-}
-
-/// Resolve the path argument of an open-family syscall (`open`, `openat`,
-/// or `openat2`) to a lexically-normalized absolute host-side path.
-///
-/// Used by every `openat`-shaped handler so the security and
-/// virtualization checks operate on the same canonical form regardless
-/// of how the caller spelled the path. The literal-string compare used
-/// before this helper missed four bypass shapes: legacy `open`,
-/// `openat2`, dirfd-relative spellings like `openat(open("/etc"),
-/// "hosts", ...)`, and non-canonical absolutes like `/etc/../etc/hosts`
-/// or `//etc/hosts`.
-///
-/// Returns `None` if the notif isn't an open variant, the path can't be
-/// read from child memory, the dirfd can't be resolved, or the path
-/// walks above `/`. Callers treat `None` as "fall through to the kernel"
-/// (`NotifAction::Continue`).
-pub(crate) fn resolve_open_target(
-    notif: &SeccompNotif,
-    notif_fd: RawFd,
-    chroot_root: Option<&std::path::Path>,
-    chroot_mounts: &[(std::path::PathBuf, std::path::PathBuf)],
-    processes: &ProcessIndex,
-) -> Option<std::path::PathBuf> {
-    let nr = notif.data.nr as i64;
-    let (dirfd, path_ptr): (i64, u64) = if Some(nr) == crate::arch::sys_open() {
-        // open(path, flags, mode) — no dirfd, behaves as AT_FDCWD.
-        (libc::AT_FDCWD as i64, notif.data.args[0])
-    } else if nr == libc::SYS_openat || nr == crate::arch::SYS_OPENAT2 {
-        // openat(dirfd, path, ...) and openat2(dirfd, path, ...) share
-        // the same first two argument slots.
-        (notif.data.args[0] as i64, notif.data.args[1])
-    } else {
-        return None;
-    };
-    let path = read_path(notif, path_ptr, notif_fd)?;
-    resolve_to_normalized_absolute(notif.pid, dirfd, &path, chroot_root, chroot_mounts, processes)
 }
 
 /// Lexical normalization of `(pid, dirfd, path)`:
@@ -959,7 +915,7 @@ pub(crate) fn resolve_open_target(
 ///
 /// Then collapses `.`, `..`, and redundant `/` components. Returns
 /// `None` if the dirfd cannot be resolved or the path walks above `/`.
-fn resolve_to_normalized_absolute(
+pub(crate) fn resolve_to_normalized_absolute(
     pid: u32,
     dirfd: i64,
     path: &str,
@@ -1020,7 +976,46 @@ fn resolve_to_normalized_absolute(
             Component::Normal(c) => out.push(c),
         }
     }
-    Some(out)
+    Some(match chroot_root {
+        None => through_task_root_and_cwd(out, pid, processes),
+        Some(_) => out,
+    })
+}
+
+/// A sandbox task's root link is / when there is no chroot, and its cwd link
+/// is wherever it is. Spell a path through them the way the caller could
+/// spell it directly, so a virtual or hidden file is recognized under it.
+fn through_task_root_and_cwd(
+    mut path: std::path::PathBuf,
+    caller: u32,
+    processes: &ProcessIndex,
+) -> std::path::PathBuf {
+    for _ in 0..8 {
+        let Some((task, rest)) = path.to_str().and_then(|p| p.strip_prefix("/proc/")?.split_once('/')) else {
+            break;
+        };
+        let pid = match task {
+            "self" | "thread-self" => caller as i32,
+            numeric => match numeric.parse::<i32>() {
+                Ok(pid) if processes.contains(pid) => pid,
+                _ => break,
+            },
+        };
+        let (link, tail) = rest.split_once('/').unwrap_or((rest, ""));
+        let base = match link {
+            "root" => std::path::PathBuf::from("/"),
+            "cwd" => match processes.virtual_cwd(pid) {
+                Some(cwd) => cwd,
+                None => match std::fs::read_link(format!("/proc/{}/cwd", pid)) {
+                    Ok(cwd) => cwd,
+                    Err(_) => break,
+                },
+            },
+            _ => break,
+        };
+        path = base.join(tail);
+    }
+    path
 }
 
 // ============================================================
@@ -1404,6 +1399,22 @@ mod tests {
     }
 
     #[test]
+    fn test_own_grant_covers() {
+        use std::path::Path;
+        assert!(own_grant_covers("/proc/self/status", Path::new("/proc/self")));
+        assert!(own_grant_covers("/proc/self/status", Path::new("/proc")));
+        assert!(!own_grant_covers("/proc/self/net/arp", Path::new("/proc/self")));
+        assert!(!own_grant_covers("/proc/thread-self/net/arp", Path::new("/proc/thread-self")));
+        assert!(!own_grant_covers("/proc/self/task/7/net/arp", Path::new("/proc/self")));
+        assert!(own_grant_covers("/proc/self/net/arp", Path::new("/proc/self/net")));
+        assert!(own_grant_covers("/proc/self/net/arp", Path::new("/proc/self/net/arp")));
+        assert!(!own_grant_covers("/proc/self/net/arp", Path::new("/proc")));
+        assert!(own_grant_covers("/proc/net/arp", Path::new("/proc")));
+        assert!(own_grant_covers("/proc/net/arp", Path::new("/proc/net")));
+        assert!(!own_grant_covers("/proc/self/status", Path::new("/proc/self/status/x")));
+    }
+
+    #[test]
     fn test_own_proc_self_forms() {
         assert_eq!(own_proc_self_forms("/proc/10/maps", 12, 10), ["/proc/self/maps"]);
         assert!(own_proc_self_forms("/proc/11/maps", 12, 10).is_empty());
@@ -1411,17 +1422,14 @@ mod tests {
     }
 
     #[test]
-    fn test_is_own_proc_read_grant() {
+    fn test_is_supervised_proc_grant() {
         use std::path::Path;
-        assert!(is_own_proc_read_grant(Path::new("/proc/self")));
-        assert!(is_own_proc_read_grant(Path::new("/proc/self/maps")));
-        assert!(is_own_proc_read_grant(Path::new("/proc/thread-self/stat")));
-        assert!(is_own_proc_read_grant(Path::new("/proc/self/mounts")));
-        assert!(!is_own_proc_read_grant(Path::new("/proc/self/net")));
-        assert!(!is_own_proc_read_grant(Path::new("/proc/thread-self/net/arp")));
-        assert!(!is_own_proc_read_grant(Path::new("/proc")));
-        assert!(!is_own_proc_read_grant(Path::new("/proc/selfish")));
-        assert!(!is_own_proc_read_grant(Path::new("/proc/1/maps")));
+        assert!(is_supervised_proc_grant(Path::new("/proc")));
+        assert!(is_supervised_proc_grant(Path::new("/proc/self/maps")));
+        assert!(is_supervised_proc_grant(Path::new("/proc/thread-self/net/arp")));
+        assert!(is_supervised_proc_grant(Path::new("/proc/1/maps")));
+        assert!(!is_supervised_proc_grant(Path::new("/procfs")));
+        assert!(!is_supervised_proc_grant(Path::new("/etc")));
     }
 
     #[test]

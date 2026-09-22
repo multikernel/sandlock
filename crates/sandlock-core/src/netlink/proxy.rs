@@ -19,7 +19,7 @@ use std::os::unix::io::{AsRawFd, OwnedFd};
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
 
-use crate::netlink::{proto, synth};
+use crate::netlink::{proto, state::Registration, synth};
 
 const RECV_BUF: usize = 8192;
 
@@ -32,12 +32,17 @@ const RECV_BUF: usize = 8192;
 /// Must be called from within the supervisor's tokio runtime (all
 /// seccomp-notify handlers satisfy this). The supervisor-side fd must
 /// be non-blocking; see `handle_socket` for the `F_SETFL` call.
-pub fn spawn_responder(fd: OwnedFd, reply_pid: u32) {
+pub fn spawn_responder(
+    fd: OwnedFd,
+    reply_pid: u32,
+    registration: Registration,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let _registration = registration;
         if let Err(e) = responder_loop(fd, reply_pid).await {
             eprintln!("sandlock netlink responder error: {e}");
         }
-    });
+    })
 }
 
 async fn responder_loop(fd: OwnedFd, reply_pid: u32) -> std::io::Result<()> {

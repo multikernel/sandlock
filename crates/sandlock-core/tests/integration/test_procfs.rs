@@ -702,9 +702,8 @@ async fn test_deny_active_matches_proc_self_under_its_pid() {
     assert_eq!(out, "0\n1", "the deny should hold under the numeric spelling with /proc readable");
 }
 
-/// What has a virtual form must not be served as the real file because a link
-/// led to it, and a link to a magic link stays refused: only the kernel could
-/// say whose fd it means.
+/// A link to a magic link stays refused: only the kernel could say whose fd
+/// it means.
 #[tokio::test]
 async fn test_deny_active_refuses_what_it_cannot_resolve_for_the_caller() {
     let links = LinkDir::new("nslinks", &[("self", "/proc/self"), ("chain", "/proc/self/fd/0")]);
@@ -713,12 +712,106 @@ async fn test_deny_active_refuses_what_it_cannot_resolve_for_the_caller() {
         .fs_deny("/tmp/sandlock-test-no-such-file")
         .build()
         .unwrap();
+    let script = [openable(&links.path("chain")), openable(&format!("{}/status", links.path("self")))].join("; ");
+    let (_, out) = run_sh(&policy, &script).await;
+    assert_eq!(out, "0\n1");
+}
+
+/// Issue #236: Landlock granted all of /proc, so a link or /proc/self/root
+/// took the kernel to entries the handlers refuse by name.
+#[tokio::test]
+async fn test_links_into_proc_cannot_reach_hidden_entries() {
+    let links = LinkDir::new("proc236", &[("init", "/proc/1"), ("syms", "/proc/kallsyms"), ("self", "/proc/self")]);
+    let policy = proc_grant().fs_read(&links.0).build().unwrap();
     let script = [
-        openable(&format!("{}/mounts", links.path("self"))),
-        openable(&links.path("chain")),
-        openable(&format!("{}/status", links.path("self"))),
+        openable(&format!("{}/cmdline", links.path("init"))),
+        openable(&links.path("syms")),
+        openable("/proc/self/root/proc/1/cmdline"),
+        openable(&format!("{}/comm", links.path("self"))),
+        openable("/proc/$$/status"),
+        openable("/proc/sys/kernel/pid_max"),
+        "ls /proc | grep -c '^cpuinfo$'".to_string(),
     ]
     .join("; ");
     let (_, out) = run_sh(&policy, &script).await;
-    assert_eq!(out, "0\n0\n1");
+    assert_eq!(out, "0\n0\n0\n1\n1\n1\n1");
+}
+
+/// A /proc grant covers the net entries that have no virtual form, and the
+/// supervisor shares the network namespace, so it can serve them.
+#[tokio::test]
+async fn test_proc_grant_serves_unvirtualized_net_entries() {
+    let policy = proc_grant().build().unwrap();
+    let script = [
+        openable("/proc/net/unix"),
+        openable("/proc/self/net/route"),
+        openable("/proc/$$/net/arp"),
+        "grep -c : /proc/net/dev".to_string(),
+    ]
+    .join("; ");
+    let (_, out) = run_sh(&policy, &script).await;
+    assert_eq!(out, "1\n1\n1\n1");
+}
+
+/// A link reaches the real file behind a virtual one, and the on-behalf open
+/// used to hand that file out; the generated content is the only right answer.
+#[tokio::test]
+async fn test_links_to_virtual_files_show_the_virtual_content() {
+    let links = LinkDir::new(
+        "virtlinks",
+        &[("cpu", "/proc/cpuinfo"), ("self", "/proc/self"), ("host", "/etc/hostname"), ("hosts", "/etc/hosts")],
+    );
+    let script = format!(
+        concat!(
+            "grep -c ^processor {cpu}; wc -l < {self}/mounts; ",
+            "[ \"$(cat /etc/hostname)\" = \"$(cat {host})\" ] && echo same-hostname; ",
+            "[ \"$(cat /etc/hosts)\" = \"$(cat {hosts})\" ] && echo same-hosts"
+        ),
+        cpu = links.path("cpu"),
+        self = links.path("self"),
+        host = links.path("host"),
+        hosts = links.path("hosts"),
+    );
+    for deny_active in [false, true] {
+        let mut policy = proc_grant().fs_read(&links.0).num_cpus(2);
+        if deny_active {
+            policy = policy.fs_deny("/tmp/sandlock-test-no-such-file");
+        }
+        let (_, out) = run_sh(&policy.build().unwrap(), &script).await;
+        assert_eq!(out, "2\n1\nsame-hostname\nsame-hosts", "deny active: {}", deny_active);
+    }
+}
+
+/// The real /etc/hostname keeps no Landlock grant: a spelling the supervisor
+/// cannot resolve, such as a magic link, goes to the kernel and must not
+/// reach it. The rest of /etc stays readable and listable.
+#[tokio::test]
+async fn test_virtualized_etc_file_has_no_grant_on_its_real_inode() {
+    let Ok(real) = std::fs::read_to_string("/etc/hostname") else { return };
+    let policy = proc_grant().build().unwrap();
+    let script = concat!(
+        "cd /etc && printf 'cwd:%s\n' \"$(cat /proc/self/cwd/hostname 2>&1)\"; ",
+        "set -- /etc/pass*; echo $1; cat /etc/hostname"
+    );
+    let (_, out) = run_sh(&policy, script).await;
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 3, "{:?}", out);
+    assert!(!lines[0].contains(real.trim()), "the real hostname leaked through a magic link: {:?}", out);
+    assert_eq!(lines[1], "/etc/passwd");
+    assert!(lines[2].starts_with("sandbox-"), "{:?}", out);
+}
+
+/// /proc/self/root is / for a sandbox without a chroot and cwd is where the
+/// task is, so a spelling through them names the same file, virtual or hidden.
+#[tokio::test]
+async fn test_root_and_cwd_magic_links_name_the_virtual_file() {
+    let policy = proc_grant().build().unwrap();
+    let script = concat!(
+        "[ \"$(cat /proc/self/root/etc/hostname)\" = \"$(cat /etc/hostname)\" ] && echo root-hostname; ",
+        "grep -c : /proc/self/root/proc/net/dev; ",
+        "cd /etc && [ \"$(cat /proc/self/cwd/hostname)\" = \"$(cat /etc/hostname)\" ] && echo cwd-hostname; ",
+        "[ \"$(cat /proc/$$/root/etc/hosts)\" = \"$(cat /etc/hosts)\" ] && echo pid-root-hosts"
+    );
+    let (_, out) = run_sh(&policy, script).await;
+    assert_eq!(out, "root-hostname\n1\ncwd-hostname\npid-root-hosts");
 }

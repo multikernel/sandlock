@@ -126,16 +126,14 @@ fn procfs_hosts_notif_syscalls() -> Vec<i64> {
 //   recvfrom, recvmsg         -- zero msg_name so glibc accepts the reply
 //                                (kernel only writes sun_family on unix
 //                                 recvmsg, leaving nl_pid uninitialized)
-//   close                     -- unregister (pid, fd) so reuse doesn't
-//                                collide with the cookie set
-// Send traffic flows through the real socketpair untouched.
+// Send traffic flows through the real socketpair untouched. A reused fd
+// slot is recognised by the socket cookie, so close is not trapped.
 const NETLINK_NOTIF_SYSCALLS: &[i64] = &[
     libc::SYS_socket,
     libc::SYS_bind,
     libc::SYS_getsockname,
     libc::SYS_recvfrom,
     libc::SYS_recvmsg,
-    libc::SYS_close,
 ];
 
 fn cow_path_syscalls() -> Vec<i64> {
@@ -277,7 +275,12 @@ fn chroot_path_syscalls() -> Vec<i64> {
 /// content, so there is nothing to deny at creation time. A later open
 /// through the created name resolves to the real target and is denied
 /// race-free on the open path (issue #111).
-pub(crate) fn fs_denied_path_syscalls() -> Vec<i64> {
+pub(crate) fn fs_denied_path_syscalls() -> &'static [i64] {
+    static SET: std::sync::OnceLock<Vec<i64>> = std::sync::OnceLock::new();
+    SET.get_or_init(build_fs_denied_path_syscalls)
+}
+
+fn build_fs_denied_path_syscalls() -> Vec<i64> {
     let mut v = vec![
         libc::SYS_openat,
         arch::SYS_OPENAT2,

@@ -53,18 +53,10 @@ const RANDOM_MEMFD_SIZE: usize = 1 << 20; // 1 MiB
 /// replace them with a memfd filled with deterministic PRNG bytes. The child
 /// sees a normal readable fd and gets seeded data instead of real entropy.
 pub(crate) fn handle_random_open(
-    notif: &SeccompNotif,
+    open: &crate::seccomp::notif::OpenRequest,
     rng: &mut ChaCha8Rng,
-    notif_fd: RawFd,
-    chroot_root: Option<&std::path::Path>,
-    chroot_mounts: &[(std::path::PathBuf, std::path::PathBuf)],
-    processes: &crate::seccomp::state::ProcessIndex,
 ) -> Option<NotifAction> {
-    // Resolve the open path so dirfd-relative or non-canonical spellings
-    // (`/dev/../dev/urandom`, `openat(open("/dev"), "urandom", ...)`)
-    // can't sidestep the seed and read real kernel entropy.
-    let resolved = crate::procfs::resolve_open_target(notif, notif_fd, chroot_root, chroot_mounts, processes)?;
-    let path = resolved.to_str()?;
+    let path = open.target_str()?;
     if path != "/dev/urandom" && path != "/dev/random" {
         return None;
     }
