@@ -531,3 +531,53 @@ async fn close_is_not_a_notified_syscall() {
     let notified = sandlock_core::context::notif_syscalls(&policy, None);
     assert!(!notified.contains(&(libc::SYS_close as u32)));
 }
+
+async fn check_socket_alias(setup: &str) {
+    let script = format!(r#"
+import fcntl, os, socket, struct, sys
+original = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE)
+owner = os.getpid()
+{setup}
+s.bind((0, 0))
+assert s.getsockname() == (owner, 0), s.getsockname()
+for receive in (s.recvfrom, s.recvmsg):
+    s.send(struct.pack('IHHII', 16, 999, 1, 1, 0))
+    reply = receive(4096)
+    assert struct.unpack_from('I', reply[0], 12)[0] == owner
+    assert len(reply[-1]) == 10 and reply[-1][2:6] == bytes(4), reply[-1]
+print('OK', flush=True)
+"#);
+    let policy = base_policy().build().unwrap();
+    let result = policy.clone().run(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "stderr: {}",
+        String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default()));
+    assert_eq!(result.stdout.as_deref().unwrap_or_default(), b"OK\n");
+}
+
+#[tokio::test]
+async fn duplicated_netlink_socket_retains_its_identity() {
+    check_socket_alias(r#"
+first = os.dup(original.fileno())
+second = fcntl.fcntl(first, fcntl.F_DUPFD_CLOEXEC, 0)
+s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE)
+os.dup2(second, s.fileno())
+os.close(first)
+os.close(second)
+plain = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+os.dup2(plain.fileno(), original.fileno())
+assert original.getsockname() == ''
+original.close()
+"#).await;
+}
+
+#[tokio::test]
+async fn inherited_netlink_socket_retains_its_port_id() {
+    check_socket_alias(r#"
+child = os.fork()
+if child:
+    original.close()
+    _, status = os.waitpid(child, 0)
+    sys.exit(os.waitstatus_to_exitcode(status))
+s = original
+"#).await;
+}

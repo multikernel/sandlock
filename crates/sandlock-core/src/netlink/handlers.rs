@@ -1,21 +1,14 @@
-//! Netlink virtualization handlers — interpose AF_NETLINK sockets as
-//! unix socketpairs driven by a synthesized NETLINK_ROUTE responder.
+//! Netlink virtualization through unix socketpairs and a NETLINK_ROUTE responder.
 //!
-//! Continue safety (issue #27): every Continue here is dispatch routing
-//! based on register args (socket domain, fd number) or a fall-through
-//! after harmless cosmetic adjustments (recvmsg pre-zeroing). Decisions
-//! that require security enforcement (non-NETLINK_ROUTE protocol) return
-//! Errno; substitution returns InjectFdSendTracked. The fd-cookie check
-//! (`state.is_cookie(tgid, fd)`) examines a register arg, not user memory,
-//! so the seccomp_unotify TOCTOU class doesn't apply: a racing thread
-//! cannot change the fd number stored in another thread's syscall
-//! registers.
+//! Socket identity selects cosmetic netlink fixups, not security permissions.
+//! A sibling can replace an fd after lookup; checks on protocol creation
+//! therefore deny directly rather than relying on a later Continue.
 
 use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 use crate::netlink::{proxy, state::NetlinkState};
-use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction, OnInjectSuccess};
+use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction};
 use crate::sys::structs::SeccompNotif;
 
 const AF_UNIX: u64 = 1;
@@ -156,28 +149,17 @@ pub async fn handle_socket(
     let responder_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
     let child_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
 
-    // tgid, not tid: fds are process-scoped, so the cookie set must be
-    // keyed per-process to be visible across threads of the same app.
-    // The responder also uses tgid as `nlmsg_pid` in its replies so the
-    // value is consistent with what `handle_getsockname` writes for the
-    // same process (glibc compares incoming nlmsg_pid against the value
-    // it read back from getsockname — they must agree).
-    let tgid = tgid_of(notif.pid as i32);
+    let port_id = tgid_of(notif.pid as i32) as u32;
 
     let Some(cookie) = crate::netlink::state::socket_cookie(&child_fd) else {
         return NotifAction::Errno(libc::ENOMEM);
     };
 
-    // Start the responder only after registration so an immediate peer close
-    // cannot finish cleanup before the entry exists.
-    let state = Arc::clone(state);
-    NotifAction::InjectFdSendTracked {
+    let registration = state.register(cookie, port_id);
+    proxy::spawn_responder(responder_fd, port_id, registration);
+    NotifAction::InjectFdSend {
         srcfd: child_fd,
         newfd_flags: libc::O_CLOEXEC as u32,
-        on_success: OnInjectSuccess::new(move |child_fd_num| {
-            let registration = state.register(tgid, child_fd_num, cookie);
-            proxy::spawn_responder(responder_fd, tgid as u32, registration);
-        }),
     }
 }
 
@@ -197,8 +179,7 @@ pub async fn handle_netlink_recvmsg(
     notif_fd: RawFd,
 ) -> NotifAction {
     let fd = notif.data.args[0] as i32;
-    let tgid = tgid_of(notif.pid as i32);
-    if !state.is_cookie(tgid, fd) {
+    if state.port_id(notif.pid, fd).is_none() {
         return NotifAction::Continue;
     }
 
@@ -238,35 +219,27 @@ pub async fn handle_bind(
     state: &Arc<NetlinkState>,
 ) -> NotifAction {
     let fd = notif.data.args[0] as i32;
-    let tgid = tgid_of(notif.pid as i32);
-    if state.is_cookie(tgid, fd) {
+    if state.port_id(notif.pid, fd).is_some() {
         return NotifAction::ReturnValue(0);
     }
     NotifAction::Continue
 }
 
-/// Remove `(tgid, fd)` from the cookie set when the child closes a
-/// tracked netlink socket.  Lets the kernel actually close the fd too.
+/// Report the socket's port ID even when accessed through an inherited fd.
 pub async fn handle_getsockname(
     notif: &SeccompNotif,
     state: &Arc<NetlinkState>,
     notif_fd: RawFd,
 ) -> NotifAction {
     let fd = notif.data.args[0] as i32;
-    let tgid = tgid_of(notif.pid as i32);
-    if !state.is_cookie(tgid, fd) {
+    let Some(port_id) = state.port_id(notif.pid, fd) else {
         return NotifAction::Continue;
-    }
+    };
 
-    // struct sockaddr_nl { u16 nl_family; u16 _pad; u32 nl_pid; u32 nl_groups; }
-    //
-    // We use the tgid as the synthesized nl_pid so it's stable across
-    // threads of the same process — matching the real kernel's netlink
-    // auto-bind behavior which assigns one nl_pid per netlink socket.
     let mut addr = [0u8; 12];
     let nl_family = libc::AF_NETLINK as u16;
     addr[0..2].copy_from_slice(&nl_family.to_ne_bytes());
-    addr[4..8].copy_from_slice(&(tgid as u32).to_ne_bytes());
+    addr[4..8].copy_from_slice(&port_id.to_ne_bytes());
 
     let addr_ptr = notif.data.args[1] as u64;
     let addrlen_ptr = notif.data.args[2] as u64;
