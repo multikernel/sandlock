@@ -1064,7 +1064,46 @@ fn resolve_to_normalized_absolute(
             Component::Normal(c) => out.push(c),
         }
     }
-    Some(out)
+    Some(match chroot_root {
+        None => through_task_root_and_cwd(out, pid, processes),
+        Some(_) => out,
+    })
+}
+
+/// A sandbox task's root link is / when there is no chroot, and its cwd link
+/// is wherever it is. Spell a path through them the way the caller could
+/// spell it directly, so a virtual or hidden file is recognized under it.
+fn through_task_root_and_cwd(
+    mut path: std::path::PathBuf,
+    caller: u32,
+    processes: &ProcessIndex,
+) -> std::path::PathBuf {
+    for _ in 0..8 {
+        let Some((task, rest)) = path.to_str().and_then(|p| p.strip_prefix("/proc/")?.split_once('/')) else {
+            break;
+        };
+        let pid = match task {
+            "self" | "thread-self" => caller as i32,
+            numeric => match numeric.parse::<i32>() {
+                Ok(pid) if processes.contains(pid) => pid,
+                _ => break,
+            },
+        };
+        let (link, tail) = rest.split_once('/').unwrap_or((rest, ""));
+        let base = match link {
+            "root" => std::path::PathBuf::from("/"),
+            "cwd" => match processes.virtual_cwd(pid) {
+                Some(cwd) => cwd,
+                None => match std::fs::read_link(format!("/proc/{}/cwd", pid)) {
+                    Ok(cwd) => cwd,
+                    Err(_) => break,
+                },
+            },
+            _ => break,
+        };
+        path = base.join(tail);
+    }
+    path
 }
 
 // ============================================================

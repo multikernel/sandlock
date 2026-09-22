@@ -800,3 +800,18 @@ async fn test_virtualized_etc_file_has_no_grant_on_its_real_inode() {
     assert_eq!(lines[1], "/etc/passwd");
     assert!(lines[2].starts_with("sandbox-"), "{:?}", out);
 }
+
+/// /proc/self/root is / for a sandbox without a chroot and cwd is where the
+/// task is, so a spelling through them names the same file, virtual or hidden.
+#[tokio::test]
+async fn test_root_and_cwd_magic_links_name_the_virtual_file() {
+    let policy = proc_grant().build().unwrap();
+    let script = concat!(
+        "[ \"$(cat /proc/self/root/etc/hostname)\" = \"$(cat /etc/hostname)\" ] && echo root-hostname; ",
+        "grep -c : /proc/self/root/proc/net/dev; ",
+        "cd /etc && [ \"$(cat /proc/self/cwd/hostname)\" = \"$(cat /etc/hostname)\" ] && echo cwd-hostname; ",
+        "[ \"$(cat /proc/$$/root/etc/hosts)\" = \"$(cat /etc/hosts)\" ] && echo pid-root-hosts"
+    );
+    let (_, out) = run_sh(&policy, script).await;
+    assert_eq!(out, "root-hostname\n1\ncwd-hostname\npid-root-hosts");
+}
