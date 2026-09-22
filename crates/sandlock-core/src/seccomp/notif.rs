@@ -548,19 +548,23 @@ fn deny_open_verdict(
 /// the sandbox can name resolves there, which makes the test exact. `None`
 /// means the probe is elsewhere.
 fn reprobe_in_callers_proc(
-    found: &OwnedFd,
+    real: &std::path::Path,
     caller_tid: u32,
     nofollow: bool,
     processes: &super::state::ProcessIndex,
-) -> Option<Result<OwnedFd, i32>> {
-    let real = realpath_of_fd(found.as_raw_fd())?;
-    let own = format!("/proc/{}", std::process::id());
-    let own_thread = format!("{}/task/{}", own, unsafe { libc::syscall(libc::SYS_gettid) });
+) -> Option<Result<(OwnedFd, std::path::PathBuf), i32>> {
+    static OWN_PID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    thread_local! {
+        static OWN_TID: u32 = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
+    }
+    let own = format!("/proc/{}", OWN_PID.get_or_init(std::process::id));
+    let own_thread = format!("{}/task/{}", own, OWN_TID.with(|tid| *tid));
     let caller_tgid = processes.tgid_of(caller_tid as i32)?;
     let (rest, callers) = match real.strip_prefix(&own_thread) {
         Ok(rest) => (rest, format!("/proc/{}/task/{}", caller_tgid, caller_tid)),
         Err(_) => (real.strip_prefix(&own).ok()?, format!("/proc/{}", caller_tgid)),
     };
+    let callers_real = std::path::Path::new(&callers).join(rest);
     let c_base = std::ffi::CString::new(callers).ok()?;
     let c_rest = match rest.as_os_str().is_empty() {
         true => c".".to_owned(),
@@ -571,7 +575,8 @@ fn reprobe_in_callers_proc(
             .and_then(|base| {
                 let flags = libc::O_PATH | libc::O_CLOEXEC | if nofollow { libc::O_NOFOLLOW } else { 0 };
                 openat2_at(base.as_raw_fd(), &c_rest, flags as u64, 0, RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)
-            }),
+            })
+            .map(|fd| (fd, callers_real)),
     )
 }
 
@@ -679,6 +684,7 @@ pub(crate) fn inject_open_result(raw_fd: i32, flags: u64) -> NotifAction {
 /// mode (binds to the inode, not the original path).
 async fn reopen_existing_on_behalf(
     probe: OwnedFd,
+    realpath: std::path::PathBuf,
     flags: u64,
     ctx: &super::ctx::SupervisorCtx,
     pfs: &super::state::PolicyFnState,
@@ -691,10 +697,6 @@ async fn reopen_existing_on_behalf(
     if (flags & libc::O_CREAT as u64) != 0 && (flags & libc::O_EXCL as u64) != 0 {
         return NotifAction::Errno(libc::EEXIST);
     }
-    let realpath = match realpath_of_fd(probe.as_raw_fd()) {
-        Some(p) => p,
-        None => return NotifAction::Errno(libc::EACCES),
-    };
     if let Some(errno) = deny_open_verdict(&realpath, flags, policy, pfs, processes, notif.pid) {
         return NotifAction::Errno(errno);
     }
@@ -910,14 +912,6 @@ fn create_new_on_behalf(
     inject_open_result(fd, flags)
 }
 
-/// Whether the file behind `fd` lives on procfs.
-fn is_procfs(fd: RawFd) -> bool {
-    const PROC_SUPER_MAGIC: i64 = 0x9fa0;
-    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::fstatfs(fd, &mut st) };
-    rc == 0 && st.f_type as i64 == PROC_SUPER_MAGIC
-}
-
 /// Perform `openat`/`open` on behalf of the child, race-free. Resolves once
 /// (pinning the inode), enforces deny + grant on the pinned target, then hands
 /// the child an fd to that exact inode via `InjectFdSend`.
@@ -976,7 +970,10 @@ async fn on_behalf_open(
         .flatten();
     if let Some(own_fd) = own_fd {
         return match dup_fd_from_pid(notif.pid, own_fd) {
-            Ok(dup) => reopen_existing_on_behalf(dup, flags, ctx, pfs, notif, notif_fd).await,
+            Ok(dup) => match realpath_of_fd(dup.as_raw_fd()) {
+                Some(real) => reopen_existing_on_behalf(dup, real, flags, ctx, pfs, notif, notif_fd).await,
+                None => NotifAction::Errno(libc::EACCES),
+            },
             Err(_) => NotifAction::Errno(libc::ENOENT),
         };
     }
@@ -985,21 +982,30 @@ async fn on_behalf_open(
     // final component and any `openat2` RESOLVE_* flags it requested.
     let probe_flags = (libc::O_PATH | libc::O_CLOEXEC) as u64 | (flags & libc::O_NOFOLLOW as u64);
     match openat2_at(base_fd, &c_path, probe_flags, 0, RESOLVE_NO_MAGICLINKS | resolve) {
-        Ok(probe) => match reprobe_in_callers_proc(&probe, notif.pid, nofollow, processes) {
-            Some(Ok(callers)) => reopen_existing_on_behalf(callers, flags, ctx, pfs, notif, notif_fd).await,
-            Some(Err(errno)) => NotifAction::Errno(errno),
-            None => {
-                let has_virtual_form = || {
-                    realpath_of_fd(probe.as_raw_fd())
-                        .is_some_and(|p| crate::procfs::virtual_file(&p.to_string_lossy(), policy).is_some())
-                };
-                if has_denied || is_procfs(probe.as_raw_fd()) || has_virtual_form() {
-                    reopen_existing_on_behalf(probe, flags, ctx, pfs, notif, notif_fd).await
-                } else {
-                    NotifAction::Continue
+        Ok(probe) => {
+            let Some(real) = realpath_of_fd(probe.as_raw_fd()) else {
+                return if has_denied { NotifAction::Errno(libc::EACCES) } else { NotifAction::Continue };
+            };
+            match reprobe_in_callers_proc(&real, notif.pid, nofollow, processes) {
+                Some(Ok((callers, real))) => {
+                    reopen_existing_on_behalf(callers, real, flags, ctx, pfs, notif, notif_fd).await
+                }
+                Some(Err(errno)) => NotifAction::Errno(errno),
+                None => {
+                    // Whether the target is procfs is only a routing hint: a
+                    // procfs mount elsewhere would be left to Landlock, which
+                    // grants it nothing.
+                    let served_here = has_denied
+                        || real.starts_with("/proc")
+                        || crate::procfs::virtual_file(&real.to_string_lossy(), policy).is_some();
+                    if served_here {
+                        reopen_existing_on_behalf(probe, real, flags, ctx, pfs, notif, notif_fd).await
+                    } else {
+                        NotifAction::Continue
+                    }
                 }
             }
-        },
+        }
         Err(_) if !has_denied => NotifAction::Continue,
         Err(errno) if errno == libc::ENOENT && (flags & libc::O_CREAT as u64) != 0 => {
             create_new_on_behalf(base_fd, path, flags, mode, resolve, policy, pfs, processes, notif.pid)
