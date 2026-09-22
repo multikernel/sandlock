@@ -499,3 +499,35 @@ async fn link_lookup_by_name_finds_only_lo() {
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     assert_eq!(stdout.trim(), "16 -19", "expected RTM_NEWLINK for lo and -ENODEV for eth0");
 }
+
+/// dup2 replaces the cookie fd without a close() the supervisor could see,
+/// so the netlink fixups must recognise the cookie by what the fd is, not
+/// by its number.
+#[tokio::test]
+async fn dup2_over_the_cookie_fd_ends_the_netlink_fixups() {
+    let out = temp_out("dup2-cookie");
+    let script = format!(concat!(
+        "import socket, os\n",
+        "nl = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 0)\n",
+        "plain = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)\n",
+        "os.dup2(plain.fileno(), nl.fileno())\n",
+        "open('{out}', 'w').write(repr(nl.getsockname()))\n",
+    ), out = out.display());
+
+    let policy = base_policy().build().unwrap();
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+
+    let contents = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert!(result.success(), "stderr: {}", String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default()));
+    assert_eq!(contents.trim(), "''", "the fd is an unbound unix socket now");
+}
+
+/// The netlink cookie is recognised by identity, so close() need not be
+/// trapped for it; close is one of the hottest syscalls a program makes.
+#[tokio::test]
+async fn close_is_not_a_notified_syscall() {
+    let policy = base_policy().build().unwrap();
+    let notified = sandlock_core::context::notif_syscalls(&policy, None);
+    assert!(!notified.contains(&(libc::SYS_close as u32)));
+}

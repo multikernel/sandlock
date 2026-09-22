@@ -126,16 +126,14 @@ fn procfs_hosts_notif_syscalls() -> Vec<i64> {
 //   recvfrom, recvmsg         -- zero msg_name so glibc accepts the reply
 //                                (kernel only writes sun_family on unix
 //                                 recvmsg, leaving nl_pid uninitialized)
-//   close                     -- unregister (pid, fd) so reuse doesn't
-//                                collide with the cookie set
-// Send traffic flows through the real socketpair untouched.
+// Send traffic flows through the real socketpair untouched. A reused fd
+// slot is recognised by the socket cookie, so close is not trapped.
 const NETLINK_NOTIF_SYSCALLS: &[i64] = &[
     libc::SYS_socket,
     libc::SYS_bind,
     libc::SYS_getsockname,
     libc::SYS_recvfrom,
     libc::SYS_recvmsg,
-    libc::SYS_close,
 ];
 
 fn cow_path_syscalls() -> Vec<i64> {

@@ -165,18 +165,18 @@ pub async fn handle_socket(
     let tgid = tgid_of(notif.pid as i32);
     proxy::spawn_responder(responder_fd, tgid as u32);
 
-    // Record the (tgid, fd) once the kernel's ADDFD ioctl returns the
-    // child-side fd number.  Doing it from the on-success callback
-    // (rather than guessing via inode matching afterwards) closes the
-    // TOCTOU gap: the entry lands in the state map *before* the child's
-    // syscall unblocks, and the key is the exact fd slot the kernel
-    // allocated — not derivable by racing the child.
+    let Some(cookie) = crate::netlink::state::socket_cookie(&child_fd) else {
+        return NotifAction::Errno(libc::ENOMEM);
+    };
+
+    // The entry lands in the map from the on-success callback, before the
+    // child's syscall unblocks, keyed by the exact slot the kernel allocated.
     let state = Arc::clone(state);
     NotifAction::InjectFdSendTracked {
         srcfd: child_fd,
         newfd_flags: libc::O_CLOEXEC as u32,
         on_success: OnInjectSuccess::new(move |child_fd_num| {
-            state.register(tgid, child_fd_num);
+            state.register(tgid, child_fd_num, cookie);
         }),
     }
 }
@@ -247,18 +247,6 @@ pub async fn handle_bind(
 
 /// Remove `(tgid, fd)` from the cookie set when the child closes a
 /// tracked netlink socket.  Lets the kernel actually close the fd too.
-pub async fn handle_close(
-    notif: &SeccompNotif,
-    state: &Arc<NetlinkState>,
-) -> NotifAction {
-    let fd = notif.data.args[0] as i32;
-    let tgid = tgid_of(notif.pid as i32);
-    if state.is_cookie(tgid, fd) {
-        state.unregister(tgid, fd);
-    }
-    NotifAction::Continue
-}
-
 pub async fn handle_getsockname(
     notif: &SeccompNotif,
     state: &Arc<NetlinkState>,
