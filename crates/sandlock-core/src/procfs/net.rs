@@ -3,9 +3,11 @@ use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
 
+use super::sock_diag::{self, Record};
 use crate::netlink::{state::socket_cookie, NetlinkState};
-use crate::seccomp::notif::{dup_fd_from_pid, NotifPolicy};
+use crate::seccomp::notif::NotifPolicy;
 use crate::seccomp::state::{read_pid_start_time, ProcessIndex};
+use crate::sys::syscall::{pidfd_getfd, pidfd_open};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NetFile {
@@ -75,6 +77,12 @@ impl SocketSnapshot {
             if read_pid_start_time(pid) != Some(key.start_time) {
                 continue;
             }
+            let Some(tgid) = processes.tgid_of(pid) else {
+                continue;
+            };
+            let Ok(pidfd) = pidfd_open(tgid as u32, 0) else {
+                continue;
+            };
             let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
                 continue;
             };
@@ -87,24 +95,17 @@ impl SocketSnapshot {
                 else {
                     continue;
                 };
-                let Ok(socket) = dup_fd_from_pid(pid as u32, fd) else {
+                let Ok(socket) = pidfd_getfd(&pidfd, fd, 0) else {
                     continue;
                 };
-                let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-                if unsafe { libc::fstat(socket.as_raw_fd(), &mut stat) } != 0
-                    || stat.st_mode & libc::S_IFMT != libc::S_IFSOCK
-                {
-                    continue;
-                }
                 let Some(cookie) = socket_cookie(&socket) else {
                     continue;
                 };
                 if netlink.contains_cookie(cookie) {
                     continue;
                 }
-                task_sockets.entry(stat.st_ino).or_insert(socket);
+                task_sockets.entry(cookie).or_insert(socket);
             }
-            // Keep descriptors pinned so a closed socket's inode cannot be reused by a host row.
             if processes.key_for(pid) == Some(key)
                 && read_pid_start_time(pid) == Some(key.start_time)
             {
@@ -114,7 +115,7 @@ impl SocketSnapshot {
         Self { sockets }
     }
 
-    fn inodes(&self) -> HashSet<u64> {
+    fn cookies(&self) -> HashSet<u64> {
         self.sockets.keys().copied().collect()
     }
 
@@ -157,76 +158,97 @@ fn socket_option(fd: &OwnedFd, option: i32) -> Option<i32> {
 const INET_HEADER: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
 const UNIX_HEADER: &str = "Num       RefCount Protocol Flags    Type St Inode Path\n";
 
-fn filter_inet(
-    input: &str,
-    inodes: &HashSet<u64>,
+fn render_inet(
+    records: &[Record],
     ports: &HashMap<u16, u16>,
     remap: bool,
+    protocol: i32,
 ) -> String {
+    use std::fmt::Write;
+
     let mut output = String::from(INET_HEADER);
-    let mut index = 0;
-    for row in input.lines().skip(1) {
-        let mut fields: Vec<String> = row.split_whitespace().map(str::to_owned).collect();
-        if fields.len() < 10 {
-            continue;
-        }
-        if !fields[9]
-            .parse::<u64>()
-            .ok()
-            .is_some_and(|i| i != 0 && inodes.contains(&i))
-        {
-            continue;
-        }
-        let Some((address, port)) = fields[1].split_once(':') else {
-            continue;
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+    for (index, record) in records
+        .iter()
+        .filter_map(|record| match record {
+            Record::Inet(record) => Some(record),
+            _ => None,
+        })
+        .enumerate()
+    {
+        let address = |bytes: &[u8; 16]| -> String {
+            let len = if record.family == libc::AF_INET as u8 {
+                4
+            } else {
+                16
+            };
+            bytes[..len]
+                .chunks_exact(4)
+                .map(|word| format!("{:08X}", u32::from_ne_bytes(word.try_into().unwrap())))
+                .collect()
         };
-        let Ok(port) = u16::from_str_radix(port, 16) else {
-            continue;
+        let local_port = if remap {
+            ports
+                .get(&record.local_port)
+                .copied()
+                .unwrap_or(record.local_port)
+        } else {
+            record.local_port
         };
-        if remap {
-            fields[1] = format!(
-                "{}:{:04X}",
-                address,
-                ports.get(&port).copied().unwrap_or(port)
-            );
-        }
-        fields[0] = format!("{index}:");
-        if fields.len() > 11 {
-            fields[11] = "0000000000000000".into();
-        }
-        output.push_str(&fields.join(" "));
-        output.push('\n');
-        index += 1;
+        let tx_queue = if record.state == 10 {
+            0
+        } else {
+            record.tx_queue
+        };
+        let expires = record.expires_ms as u64 * ticks / 1000;
+        let (retransmits, probes) = if matches!(record.timer, 2 | 4) {
+            (0, record.retransmits)
+        } else {
+            (record.retransmits, 0)
+        };
+        // Keep procfs columns present even when diagnostics cannot supply their counters.
+        let counters = if protocol == libc::IPPROTO_TCP {
+            "0 0 0 0 0"
+        } else {
+            "0"
+        };
+        writeln!(output,
+            "{index}: {}:{local_port:04X} {}:{:04X} {:02X} {tx_queue:08X}:{:08X} {:02X}:{expires:08X} {retransmits:08X} {} {probes} {} 0 0000000000000000 {counters}",
+            address(&record.local_address), address(&record.remote_address), record.remote_port,
+            record.state, record.rx_queue, record.timer, record.uid, record.inode,
+        ).unwrap();
     }
     output
 }
 
-fn filter_unix(
-    input: &[u8],
-    inodes: &HashSet<u64>,
-    map_path: impl Fn(&str) -> Option<String>,
-) -> String {
+fn render_unix(records: &[Record], map_path: impl Fn(&str) -> Option<String>) -> String {
+    use std::fmt::Write;
+
     let mut output = String::from(UNIX_HEADER);
-    for row in input.split(|byte| *byte == b'\n').skip(1) {
-        let Ok(row) = std::str::from_utf8(row) else {
+    for record in records {
+        let Record::Unix(record) = record else {
             continue;
         };
-        let mut rest = row;
-        let mut fields = Vec::new();
-        for _ in 0..7 {
-            rest = rest.trim_start();
-            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-            fields.push(&rest[..end]);
-            rest = &rest[end..];
-        }
-        if !fields[6]
-            .parse::<u64>()
-            .ok()
-            .is_some_and(|i| i != 0 && inodes.contains(&i))
-        {
+        let name = if record.name.first() == Some(&0) {
+            record
+                .name
+                .iter()
+                .map(|byte| if *byte == 0 { b'@' } else { *byte })
+                .collect::<Vec<_>>()
+        } else {
+            record
+                .name
+                .split(|byte| *byte == 0)
+                .next()
+                .unwrap_or_default()
+                .to_vec()
+        };
+        let Ok(path) = std::str::from_utf8(&name) else {
+            continue;
+        };
+        if path.contains(['\n', '\r']) {
             continue;
         }
-        let path = rest.trim_start();
         let path = if path.is_empty() {
             String::new()
         } else {
@@ -235,8 +257,14 @@ fn filter_unix(
             };
             path
         };
-        fields[0] = "0000000000000000:";
-        output.push_str(&fields.join(" "));
+        let flags = if record.state == 10 { 0x10000 } else { 0 };
+        let state = if record.state == 1 { 3 } else { 1 };
+        write!(
+            output,
+            "0000000000000000: 00000000 00000000 {flags:08X} {:04X} {state:02X} {}",
+            record.kind, record.inode
+        )
+        .unwrap();
         if !path.is_empty() {
             output.push(' ');
             output.push_str(&path);
@@ -304,16 +332,25 @@ pub(crate) fn render(
         return Ok(text.as_bytes().to_vec());
     }
     let snapshot = SocketSnapshot::collect(processes, netlink);
-    let inodes = snapshot.inodes();
+    let cookies = snapshot.cookies();
     let text = match file {
         NetFile::Tcp | NetFile::Tcp6 | NetFile::Udp | NetFile::Udp6 => {
-            let name = FILES.iter().find(|(_, entry)| *entry == file).unwrap().0;
-            let input = std::fs::read_to_string(format!("/proc/net/{name}"))?;
-            filter_inet(&input, &inodes, port_map, policy.port_remap)
+            let family = if matches!(file, NetFile::Tcp6 | NetFile::Udp6) {
+                libc::AF_INET6
+            } else {
+                libc::AF_INET
+            };
+            let protocol = if matches!(file, NetFile::Tcp | NetFile::Tcp6) {
+                libc::IPPROTO_TCP
+            } else {
+                libc::IPPROTO_UDP
+            };
+            let records = sock_diag::dump(family, protocol, &cookies)?;
+            render_inet(&records, port_map, policy.port_remap, protocol)
         }
         NetFile::Unix => {
-            let input = std::fs::read("/proc/net/unix")?;
-            filter_unix(&input, &inodes, |path| {
+            let records = sock_diag::dump(libc::AF_UNIX, 0, &cookies)?;
+            render_unix(&records, |path| {
                 if path.starts_with('@') { return Some(path.into()); }
                 if policy.cow_enabled || !path.starts_with('/') { return None; }
                 visible_unix_path(path, policy.chroot_root.as_deref(), &policy.chroot_mounts)
@@ -350,34 +387,96 @@ mod tests {
         }
     }
 
-    #[test]
-    fn inet_rows_require_owned_inode_and_only_translate_local_port() {
-        let input = "header\n 8: 0100007F:C350 0100007F:C350 01 0:0 00:0 0 1000 0 123 1 00000000\n 9: 0100007F:C350 00000000:0000 0A 0:0 00:0 0 1000 0 999 1 00000000\n 10: 0100007F:C350 00000000:0000 06 0:0 00:0 0 1000 0 0 1 00000000\nmalformed\n";
-        let owned = HashSet::from([123]);
-        let ports = HashMap::from([(50000, 8080)]);
-        let output = filter_inet(input, &owned, &ports, true);
-        assert_eq!(output.lines().count(), 2);
-        assert!(output.contains("0: 0100007F:1F90 0100007F:C350"));
-        assert!(!output.contains("999"));
-        assert!(filter_inet(input, &owned, &ports, false).contains("0100007F:C350 0100007F:C350"));
+    fn inet_record(family: i32) -> Record {
+        use super::super::sock_diag::InetRecord;
+        let mut local_address = [0; 16];
+        local_address[..4].copy_from_slice(&0x0100007fu32.to_ne_bytes());
+        Record::Inet(InetRecord {
+            cookie: 7,
+            inode: 123,
+            family: family as u8,
+            state: 1,
+            timer: 0,
+            retransmits: 0,
+            local_port: 50000,
+            remote_port: 50000,
+            local_address,
+            remote_address: local_address,
+            expires_ms: 0,
+            rx_queue: 16,
+            tx_queue: 32,
+            uid: 1000,
+        })
     }
 
     #[test]
-    fn ipv6_udp_rows_keep_endpoints_and_drop_unverifiable_rows() {
-        let input = "header\n 30: 00000000000000000000000001000000:C350 00000000000000000000000000000000:0000 07 0:0 00:0 0 1000 0 42 2 0000000012345678 0\n 31: 00000000000000000000000001000000:C350 00000000000000000000000000000000:0000 07 0:0 00:0 0 1000 0 invalid\n";
-        let output = filter_inet(
-            input,
-            &HashSet::from([42]),
-            &HashMap::from([(50000, 53)]),
-            true,
-        );
+    fn inet_rows_only_translate_local_port() {
+        let records = [inet_record(libc::AF_INET)];
+        let ports = HashMap::from([(50000, 8080)]);
+        let output = render_inet(&records, &ports, true, libc::IPPROTO_TCP);
         assert_eq!(output.lines().count(), 2);
-        assert!(output.contains("00000000000000000000000001000000:0035"));
-        assert!(!output.contains("12345678"));
+        assert!(output.contains("0: 0100007F:1F90 0100007F:C350 01 00000020:00000010"));
+        assert!(output.contains("1000 0 123 0 0000000000000000"));
+        assert!(render_inet(&records, &ports, false, libc::IPPROTO_TCP)
+            .contains("0100007F:C350 0100007F:C350"));
         assert_eq!(
-            filter_inet(input, &HashSet::new(), &HashMap::new(), false),
+            render_inet(&[], &ports, false, libc::IPPROTO_TCP),
             INET_HEADER
         );
+    }
+
+    #[test]
+    fn ipv6_rows_keep_all_address_words_and_listener_queue_semantics() {
+        let mut record = inet_record(libc::AF_INET6);
+        let Record::Inet(info) = &mut record else {
+            unreachable!()
+        };
+        info.local_address[12..16].copy_from_slice(&0x12345678u32.to_ne_bytes());
+        info.state = 10;
+        let output = render_inet(
+            &[record],
+            &HashMap::from([(50000, 53)]),
+            true,
+            libc::IPPROTO_TCP,
+        );
+        assert!(output.contains("0100007F000000000000000012345678:0035"));
+        assert!(output.contains("0A 00000000:00000010"));
+    }
+
+    #[test]
+    fn inet_rows_preserve_protocol_column_counts() {
+        for (protocol, fields) in [(libc::IPPROTO_TCP, 17), (libc::IPPROTO_UDP, 13)] {
+            let output = render_inet(
+                &[inet_record(libc::AF_INET)],
+                &HashMap::new(),
+                false,
+                protocol,
+            );
+            assert_eq!(
+                output.lines().nth(1).unwrap().split_whitespace().count(),
+                fields
+            );
+        }
+    }
+
+    #[test]
+    fn inet_probe_counts_are_not_reported_as_retransmissions() {
+        for (timer, retransmits, probes) in [
+            (1, "00000003", "0"),
+            (2, "00000000", "3"),
+            (4, "00000000", "3"),
+        ] {
+            let mut record = inet_record(libc::AF_INET);
+            let Record::Inet(info) = &mut record else {
+                unreachable!()
+            };
+            info.timer = timer;
+            info.retransmits = 3;
+            let output = render_inet(&[record], &HashMap::new(), false, libc::IPPROTO_TCP);
+            let fields: Vec<_> = output.lines().nth(1).unwrap().split_whitespace().collect();
+            assert_eq!(fields[6], retransmits);
+            assert_eq!(fields[8], probes);
+        }
     }
 
     #[test]
@@ -393,35 +492,52 @@ mod tests {
         assert_eq!(visible_unix_path("/rootfs/../secret", root, &mounts), None);
     }
 
+    fn unix_record(inode: u32, name: &[u8], state: u8) -> Record {
+        Record::Unix(super::super::sock_diag::UnixRecord {
+            cookie: inode as u64 + 1000,
+            inode,
+            kind: libc::SOCK_STREAM as u8,
+            state,
+            name: name.to_vec(),
+        })
+    }
+
     #[test]
-    fn unix_binary_names_do_not_hide_representable_owned_sockets() {
-        let input = b"header\n00000000: 00000002 00000000 00000000 0001 03 42 @visible\n00000000: 00000002 00000000 00000000 0001 03 43 @\xff\n00000000: 00000002 00000000 00000000 0001 03 999 @\xfe\n";
-        let output = filter_unix(input, &HashSet::from([42, 43]), |p| Some(p.into()));
+    fn unix_unrepresentable_names_cannot_inject_rows() {
+        let records = [
+            unix_record(42, b"\0visible", 1),
+            unix_record(43, b"\0\xff", 1),
+            unix_record(44, b"\0name\nforged row", 1),
+        ];
+        let output = render_unix(&records, |p| Some(p.into()));
         assert_eq!(output.lines().count(), 2);
         assert!(output.contains("42 @visible"));
     }
 
     #[test]
     fn unix_unnamed_and_abstract_sockets_survive() {
-        let input = "header\n00000000: 00000002 00000000 00000000 0001 03 42\n00000000: 00000002 00000000 00000000 0001 03 43 @sandbox name\n";
-        let output = filter_unix(input.as_bytes(), &HashSet::from([42, 43]), |p| {
-            Some(p.into())
-        });
+        let records = [
+            unix_record(42, b"", 1),
+            unix_record(43, b"\0sandbox name\0tail", 1),
+        ];
+        let output = render_unix(&records, |p| Some(p.into()));
         assert_eq!(output.lines().count(), 3);
-        assert!(output.contains("43 @sandbox name\n"));
+        assert!(output.contains("43 @sandbox name@tail\n"));
         assert!(output.contains("03 42\n"));
     }
 
     #[test]
-    fn unix_rows_hide_foreign_inodes_and_unmapped_paths() {
-        let input = "header\n0000000000001234: 00000002 00000000 00010000 0001 01 123 /rootfs/run/a socket\n0000000000005678: 00000002 00000000 00010000 0001 01 456 /host/secret\n0000000000009876: 00000002 00000000 00010000 0001 01 999 @foreign\n";
-        let output = filter_unix(input.as_bytes(), &HashSet::from([123, 456]), |path| {
+    fn unix_rows_hide_unmapped_paths_and_render_listener_flags() {
+        let records = [
+            unix_record(123, b"/rootfs/run/a socket\0", 10),
+            unix_record(456, b"/host/secret\0", 10),
+        ];
+        let output = render_unix(&records, |path| {
             path.strip_prefix("/rootfs").map(str::to_owned)
         });
         assert_eq!(output.lines().count(), 2);
-        assert!(output.contains("123 /run/a socket"));
+        assert!(output.contains("00010000 0001 01 123 /run/a socket"));
         assert!(!output.contains("rootfs"));
         assert!(!output.contains("secret"));
-        assert!(!output.contains("1234:"));
     }
 }

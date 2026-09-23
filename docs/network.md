@@ -243,3 +243,15 @@ virtual netlink transports and Unix socket paths that cannot be mapped into
 the sandbox are omitted too. Network files do not expose host-wide traffic
 counters. `O_PATH` opens return `EOPNOTSUPP` because seccomp cannot inject
 that descriptor type.
+
+The supervisor matches `NETLINK_SOCK_DIAG` records against `SO_COOKIE` values
+from pinned task descriptors. Inode numbers remain in the output for procfs
+compatibility, but do not authorize visibility. These read-only queries need
+no additional capabilities in the supervisor's network namespace. An empty
+ownership snapshot returns only the table header without a diagnostic query.
+The supervisor reuses one pidfd throughout each task's descriptor scan. The sandbox
+continues to deny direct socket diagnostic access. The kernel must provide
+INET, TCP, UDP, and UNIX diagnostic support for their respective tables;
+failed or interrupted dumps return an error without an inode-based fallback.
+Reference counts and counters unavailable through diagnostics are zero. UNIX
+names that cannot be represented as UTF-8 on one line are omitted.

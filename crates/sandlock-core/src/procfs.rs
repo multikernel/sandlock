@@ -22,6 +22,7 @@
 //     the string in child memory changes nothing.
 
 pub(crate) mod net;
+mod sock_diag;
 pub(crate) mod net_dispatch;
 mod net_metadata;
 pub(crate) use net_dispatch::{handle_net_open, handle_net_directory};
