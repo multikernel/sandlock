@@ -604,7 +604,17 @@ pub(crate) async fn handle_chroot_open(
         return NotifAction::Errno(libc::EACCES);
     }
 
-    // COW path — COW operates on host paths, must use libc::open.
+    // openat2 rejects a non-zero mode unless O_CREAT/O_TMPFILE is set (stricter
+    // than openat), so only supply a creation mode when the child asks to create.
+    // O_TMPFILE is a composite (__O_TMPFILE | O_DIRECTORY), so it must be matched
+    // as a full mask, not with a bitwise-and that any O_DIRECTORY open would trip.
+    let flags_i = flags as i32;
+    let creates = flags_i & libc::O_CREAT != 0 || flags_i & libc::O_TMPFILE == libc::O_TMPFILE;
+    let mode = if creates { 0o666 } else { 0 };
+
+    // COW path: the branch picks the layer, the kernel resolves the rest.
+    // A symlink in the image is followed inside that layer's root, never on
+    // the host, because the supervisor holds no chroot of its own.
     {
         let mut cs = cow_state.lock().await;
         if let Some(cow) = cs.branch.as_mut() {
@@ -612,15 +622,19 @@ pub(crate) async fn handle_chroot_open(
             if cow.matches(&host_str) {
                 match cow.handle_open(&host_str, flags) {
                     Ok(Some(real_path)) => {
+                        let upper_root = cow.upper_dir().to_path_buf();
+                        let workdir_root = cow.workdir().to_path_buf();
                         drop(cs);
-                        let c_path = match path_cstr(&real_path, libc::EINVAL) {
-                            Ok(c) => c,
-                            Err(a) => return a,
+                        let fd = match crate::cow::dispatch::open_confined(
+                            &upper_root,
+                            &workdir_root,
+                            &real_path,
+                            flags_i,
+                            mode,
+                        ) {
+                            Ok(fd) => fd,
+                            Err(errno) => return NotifAction::Errno(errno),
                         };
-                        let fd = unsafe { libc::open(c_path.as_ptr(), flags as i32, 0o666) };
-                        if fd < 0 {
-                            return NotifAction::Errno(last_errno(libc::EIO));
-                        }
                         let newfd_flags = if flags & libc::O_CLOEXEC as u64 != 0 {
                             libc::O_CLOEXEC as u32
                         } else {
@@ -659,14 +673,6 @@ pub(crate) async fn handle_chroot_open(
     // Resolve the path to an fd to hand the child: either a freshly opened tree
     // file or a dup of one of the child's own fds (a magic link). See
     // `open_in_namespace`.
-    //
-    // openat2 rejects a non-zero mode unless O_CREAT/O_TMPFILE is set (stricter
-    // than openat), so only supply a creation mode when the child asks to create.
-    // O_TMPFILE is a composite (__O_TMPFILE | O_DIRECTORY), so it must be matched
-    // as a full mask, not with a bitwise-and that any O_DIRECTORY open would trip.
-    let flags_i = flags as i32;
-    let creates = flags_i & libc::O_CREAT != 0 || flags_i & libc::O_TMPFILE == libc::O_TMPFILE;
-    let mode = if creates { 0o666 } else { 0 };
     let newfd_flags = if flags & libc::O_CLOEXEC as u64 != 0 {
         libc::O_CLOEXEC as u32
     } else {

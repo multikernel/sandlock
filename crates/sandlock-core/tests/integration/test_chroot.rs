@@ -2294,3 +2294,57 @@ async fn test_chroot_fchmodat2_resolves_in_rootfs() {
     assert_eq!(got_inside, 0o600, "the rootfs file must carry the new mode");
     assert_eq!(got_decoy, 0o644, "the host file at the same path must be untouched");
 }
+
+/// An absolute symlink inside the image names a path in the sandbox's root,
+/// never on the host. The COW open path used to hand the resolved lower or
+/// upper path to a plain open in the supervisor, which followed the link out
+/// of the rootfs: an image could read and write any host file the supervisor
+/// can, and reach the host's /proc.
+#[tokio::test]
+async fn test_chroot_cow_symlink_stays_inside_the_rootfs() {
+    let rootfs = build_test_rootfs("cow-symlink");
+    let host_dir = temp_dir("cow-symlink-host");
+    let host_secret = host_dir.join("secret");
+    let host_written = host_dir.join("written");
+    fs::write(&host_secret, "host secret").unwrap();
+    let _ = fs::remove_file(&host_written);
+    std::os::unix::fs::symlink(&host_secret, rootfs.join("tmp/l_secret")).unwrap();
+    std::os::unix::fs::symlink(&host_written, rootfs.join("tmp/l_written")).unwrap();
+    std::os::unix::fs::symlink("/proc/1/status", rootfs.join("tmp/l_init")).unwrap();
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/")
+        .fs_write("/tmp")
+        .workdir(&rootfs)
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+
+    let read = policy.clone().run(&["rootfs-helper", "cat", "/tmp/l_secret"]).await;
+    let init = policy.clone().run(&["rootfs-helper", "cat", "/tmp/l_init"]).await;
+    let write = policy.clone().run(&["rootfs-helper", "write", "/tmp/l_written", "escaped"]).await;
+    match (read, init, write) {
+        (Ok(read), Ok(init), Ok(write)) => {
+            let out = read.stdout_str().unwrap_or("");
+            assert!(!out.contains("host secret"), "read a host file through an image symlink: {out:?}");
+            let out = init.stdout_str().unwrap_or("");
+            assert!(!out.contains("Name:"), "read host /proc/1 through an image symlink: {out:?}");
+            assert!(
+                !host_written.exists(),
+                "wrote a host file through an image symlink (write stderr: {})",
+                write.stderr_str().unwrap_or("")
+            );
+        }
+        (read, init, write) => {
+            for r in [read, init, write] {
+                if let Err(e) = r {
+                    eprintln!("Chroot test skipped: {}", e);
+                }
+            }
+        }
+    }
+
+    let _ = fs::remove_dir_all(&host_dir);
+    cleanup_rootfs(&rootfs);
+}
