@@ -515,6 +515,9 @@ fn confine_inner(policy: &Sandbox, handle_net: bool, supervised: bool) -> Result
     // which preserves the subset property.)
     let fs_write_mask = write_access(abi) & handled_access_fs;
     for path in &policy.fs_writable {
+        if supervised && chroot_root.is_none() && crate::procfs::is_supervised_proc_grant(path) {
+            continue;
+        }
         let host;
         let rule_path = if let Some(root) = chroot_root {
             host = root.join(path.strip_prefix("/").unwrap_or(path));

@@ -422,6 +422,7 @@ fn is_denied_with_symlink_resolve(
 const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
 const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 const RESOLVE_BENEATH: u64 = 0x08;
+const RESOLVE_IN_ROOT: u64 = 0x10;
 
 /// Kernel `struct open_how` for `openat2`.
 #[repr(C)]
@@ -513,12 +514,7 @@ fn deny_open_verdict(
     if crate::procfs::is_hidden_proc_path(&real, processes) {
         return Some(libc::EACCES);
     }
-    let opener_privileged = realpath.starts_with("/proc")
-        && realpath
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| crate::procfs::OPENER_PRIVILEGED_FILES.contains(&name));
-    if opener_privileged {
+    if crate::procfs::is_opener_sensitive_proc(realpath, flags) {
         return Some(libc::EACCES);
     }
     // A pipe, socket or memfd has no place in the tree for a grant to cover.
@@ -526,11 +522,7 @@ fn deny_open_verdict(
     if !realpath.is_absolute() || real.starts_with("/memfd:") {
         return None;
     }
-    let acc = flags as i32 & libc::O_ACCMODE;
-    let is_write = acc == libc::O_WRONLY
-        || acc == libc::O_RDWR
-        || (flags & libc::O_TRUNC as u64) != 0
-        || (flags & libc::O_CREAT as u64) != 0;
+    let is_write = crate::procfs::proc_open_is_write(flags);
     let grants = || {
         let reads = (!is_write).then_some(policy.chroot_readable.iter()).into_iter().flatten();
         policy.chroot_writable.iter().chain(reads)
@@ -944,8 +936,8 @@ async fn on_behalf_open(
         Ok(c) => c,
         Err(_) => return NotifAction::Errno(libc::EINVAL),
     };
-    // An absolute path ignores the directory it is opened against.
-    let base = match path.starts_with('/') {
+    // IN_ROOT uses the caller's directory even for an absolute path.
+    let base = match path.starts_with('/') && resolve & RESOLVE_IN_ROOT == 0 {
         true => None,
         false => match open_base_dir(notif.pid, dirfd) {
             Ok(b) => Some(b),
@@ -1116,7 +1108,8 @@ impl NotifPolicy {
     pub(crate) fn resolves_opens(&self) -> bool {
         let granted = |path: &str| self.chroot_readable.iter().any(|g| std::path::Path::new(path).starts_with(g));
         self.chroot_root.is_none()
-            && (self.chroot_readable.iter().any(|p| crate::procfs::is_supervised_proc_grant(p))
+            && (self.chroot_readable.iter().chain(&self.chroot_writable)
+                .any(|p| crate::procfs::is_supervised_proc_grant(p))
                 || crate::procfs::SHADOWED_ETC_FILES
                     .iter()
                     .any(|f| crate::procfs::virtual_file(f, self).is_some() && granted(f)))
