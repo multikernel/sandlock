@@ -209,8 +209,8 @@ under [`sandbox-reference.md#config`](sandbox-reference.md#config).
 Each sandbox gets a full virtual port space. Multiple sandboxes can bind
 the same port without conflicts. The supervisor performs `bind()` on behalf
 of the child via `pidfd_getfd` (TOCTOU-safe). When a port conflicts, a
-different real port is allocated transparently. `/proc/net/tcp` is filtered
-to only show the sandbox's own ports.
+different real port is allocated transparently. Socket tables under `/proc/net` show only sockets held by sandbox tasks,
+with remapped local ports translated back to their virtual values.
 
 Use `sandlock ps` to see all running sandboxes and their port mappings,
 and `sandlock kill` to stop them (see [`cli.md`](cli.md#managing-running-sandboxes)).
@@ -226,3 +226,20 @@ sandlock run --name web.local --port-remap --net-allow-bind 8080 -r /usr -r /lib
 
 This enables external reverse proxies (nginx, envoy) to route traffic
 by name to the correct real port.
+
+## Network information in procfs
+
+With read access to `/proc`, Sandlock exposes a fixed `/proc/net` directory.
+`dev`, `if_inet6`, `route`, `ipv6_route`, `fib_trie`, and `arp` describe a
+loopback-only topology. `tcp`, `tcp6`, `udp`, `udp6`, and `unix` contain only
+verified sockets held by sandbox tasks, whether port remapping is enabled
+or disabled. `sockstat` and `sockstat6` count those sockets; untracked memory,
+orphan, TIME_WAIT, and fragment counters are zero. Other entries are absent.
+Per-task spellings such as `/proc/self/net` expose the same view.
+
+Each file open produces a read-only snapshot. Sockets without a live task
+file descriptor, including ownerless TIME_WAIT sockets, are omitted. Internal
+virtual netlink transports and Unix socket paths that cannot be mapped into
+the sandbox are omitted too. Network files do not expose host-wide traffic
+counters. `O_PATH` opens return `EOPNOTSUPP` because seccomp cannot inject
+that descriptor type.

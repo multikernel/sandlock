@@ -21,6 +21,12 @@
 //     supervisor opened from its own copy of the path, so a later swap of
 //     the string in child memory changes nothing.
 
+pub(crate) mod net;
+pub(crate) mod net_dispatch;
+mod net_metadata;
+pub(crate) use net_dispatch::{handle_net_open, handle_net_directory};
+pub(crate) use net_metadata::{handle_net_metadata, handle_pinned_metadata};
+
 use std::collections::HashSet;
 use std::ffi::CString;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
@@ -32,7 +38,7 @@ use crate::seccomp::notif::{
     content_memfd, inject_open_result, openat2_at, write_child_mem, NotifAction, NotifPolicy,
     OpenArgs, OpenRequest,
 };
-use crate::seccomp::state::{NetworkState, ProcessIndex};
+use crate::seccomp::state::ProcessIndex;
 use crate::sys::structs::{SeccompNotif, EACCES};
 
 // ============================================================
@@ -129,9 +135,6 @@ pub(crate) enum VirtualFile {
     MemInfo,
     Uptime,
     LoadAvg,
-    NetDev,
-    NetIfInet6,
-    NetTcp { v6: bool },
     Mounts,
     MountInfo,
     MountStats,
@@ -149,10 +152,6 @@ pub(crate) fn virtual_file(path: &str, policy: &NotifPolicy) -> Option<VirtualFi
         "/proc/meminfo" if policy.max_memory_bytes > 0 => VirtualFile::MemInfo,
         "/proc/uptime" if policy.has_time_start => VirtualFile::Uptime,
         "/proc/loadavg" => VirtualFile::LoadAvg,
-        "/proc/net/dev" => VirtualFile::NetDev,
-        "/proc/net/if_inet6" => VirtualFile::NetIfInet6,
-        "/proc/net/tcp" if policy.port_remap => VirtualFile::NetTcp { v6: false },
-        "/proc/net/tcp6" if policy.port_remap => VirtualFile::NetTcp { v6: true },
         "/proc/mounts" | "/proc/self/mounts" => VirtualFile::Mounts,
         "/proc/self/mountinfo" => VirtualFile::MountInfo,
         "/proc/self/mountstats" => VirtualFile::MountStats,
@@ -168,7 +167,6 @@ pub(crate) async fn render_virtual_file(
     file: VirtualFile,
     processes: &ProcessIndex,
     resource: &Mutex<crate::seccomp::state::ResourceState>,
-    network: &Mutex<NetworkState>,
     policy: &NotifPolicy,
 ) -> Vec<u8> {
     let mounts_args = || {
@@ -194,12 +192,6 @@ pub(crate) async fn render_virtual_file(
             let last_pid = processes.max_pid().unwrap_or(0);
             let rs = resource.lock().await;
             generate_loadavg(&rs.load_avg, rs.proc_count, total, last_pid)
-        }
-        VirtualFile::NetDev => generate_proc_net_dev(),
-        VirtualFile::NetIfInet6 => generate_proc_net_if_inet6(),
-        VirtualFile::NetTcp { v6 } => {
-            let ns = network.lock().await;
-            generate_proc_net_tcp(&ns.port_map.bound_ports, v6)
         }
         VirtualFile::Mounts => {
             let (root, mounts, ro, root_ro) = mounts_args();
@@ -478,88 +470,6 @@ pub(crate) fn generate_proc_mountstats(
     buf.into_bytes()
 }
 
-// ============================================================
-// /proc/net/dev and /proc/net/if_inet6 virtualization
-// ============================================================
-
-/// Generate a synthetic /proc/net/dev showing only the loopback interface.
-pub(crate) fn generate_proc_net_dev() -> Vec<u8> {
-    concat!(
-        "Inter-|   Receive                                                |  Transmit\n",
-        " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n",
-        "    lo:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0\n",
-    ).as_bytes().to_vec()
-}
-
-/// Generate a synthetic /proc/net/if_inet6 showing only loopback (::1).
-pub(crate) fn generate_proc_net_if_inet6() -> Vec<u8> {
-    // Format: address ifindex prefix_len scope flags ifname
-    b"00000000000000000000000000000001 01 80 10 80       lo\n".to_vec()
-}
-
-// ============================================================
-// /proc/net/tcp filtering
-// ============================================================
-
-/// Generate a filtered /proc/net/tcp (or tcp6) showing only the sandbox's own ports.
-///
-/// Reads the real /proc/net/tcp, parses each line's local port, and keeps only
-/// lines whose port is in `bound_ports`. The header line is always included.
-pub(crate) fn generate_proc_net_tcp(bound_ports: &HashSet<u16>, is_v6: bool) -> Vec<u8> {
-    let path = if is_v6 { "/proc/net/tcp6" } else { "/proc/net/tcp" };
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-
-    let mut result = String::new();
-    for (i, line) in content.lines().enumerate() {
-        if i == 0 {
-            // Header line — always include
-            result.push_str(line);
-            result.push('\n');
-            continue;
-        }
-        // Each line looks like:
-        //   sl  local_address rem_address   st ...
-        //    0: 0100007F:1F90 00000000:0000 0A ...
-        // The local port is the hex after the colon in field 1 (0-indexed).
-        if let Some(local_port) = parse_proc_net_tcp_port(line) {
-            if bound_ports.contains(&local_port) {
-                result.push_str(line);
-                result.push('\n');
-            }
-        }
-    }
-    result.into_bytes()
-}
-
-/// Parse the local port from a /proc/net/tcp line.
-/// Format: "  sl  local_addr:PORT remote_addr:PORT ..."
-fn parse_proc_net_tcp_port(line: &str) -> Option<u16> {
-    let fields: Vec<&str> = line.split_whitespace().collect();
-    if fields.len() < 2 {
-        return None;
-    }
-    // fields[1] is "ADDR:PORT" in hex
-    let local = fields[1];
-    let colon = local.rfind(':')?;
-    let port_hex = &local[colon + 1..];
-    u16::from_str_radix(port_hex, 16).ok()
-}
-
-// ============================================================
-// memfd injection
-// ============================================================
-
-/// Create a sealed memfd of `content` and inject it as the child's openat
-/// result. The memfd is created in the supervisor, sealed read-only, and
-/// handed to the child via NOTIF_ADDFD, so the kernel never re-resolves the
-/// virtualized /proc path string after injection.
-///
-/// On memfd allocation failure we fall through to `Continue` (let the real
-/// open proceed) rather than `Errno`, preserving this module's long-standing
-/// behavior: a failure to synthesise /proc content is not a denial.
 fn inject_memfd(content: &[u8]) -> NotifAction {
     match content_memfd(content, true) {
         Ok(fd) => NotifAction::InjectFdSend { srcfd: fd, newfd_flags: libc::O_CLOEXEC as u32 },
@@ -582,7 +492,6 @@ pub(crate) async fn handle_proc_open(
     open: &OpenRequest,
     processes: &Arc<ProcessIndex>,
     resource: &Arc<Mutex<crate::seccomp::state::ResourceState>>,
-    network: &Arc<Mutex<NetworkState>>,
     policy: &NotifPolicy,
 ) -> NotifAction {
     let Some(path) = open.target_str() else { return NotifAction::Continue };
@@ -595,7 +504,7 @@ pub(crate) async fn handle_proc_open(
     // handler so that its grant check comes first.
     if path.starts_with("/proc/") {
         if let Some(file) = virtual_file(path, policy) {
-            let content = render_virtual_file(file, processes, resource, network, policy).await;
+            let content = render_virtual_file(file, processes, resource, policy).await;
             return inject_memfd(&content);
         }
     }
@@ -1091,6 +1000,10 @@ pub(crate) async fn handle_sorted_getdents(
         Ok(t) => t,
         Err(_) => return NotifAction::Continue,
     };
+
+    if net::lookup(&canon_proc_namespace(&dir_path.to_string_lossy())) != net::NetEntry::Outside {
+        return NotifAction::Continue;
+    }
 
     let entry = match processes.entry_for(pid as i32) {
         Some(e) => e,

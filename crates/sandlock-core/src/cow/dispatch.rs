@@ -1186,6 +1186,12 @@ pub(crate) async fn handle_cow_getdents(
         Err(_) => return NotifAction::Continue,
     };
 
+    if crate::procfs::net::lookup(&crate::procfs::canon_proc_namespace(&target))
+        != crate::procfs::net::NetEntry::Outside
+    {
+        return NotifAction::Continue;
+    }
+
     // Compute rel_path under the global COW lock, but do not hold it
     // across the per-process lock acquired below.
     let rel_path = {

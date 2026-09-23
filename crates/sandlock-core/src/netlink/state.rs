@@ -49,6 +49,10 @@ impl NetlinkState {
         Registration { state: Arc::clone(self), cookie }
     }
 
+    pub(crate) fn contains_cookie(&self, cookie: u64) -> bool {
+        self.cookies.lock().map(|cookies| cookies.contains_key(&cookie)).unwrap_or(true)
+    }
+
     pub fn port_id(&self, pid: u32, fd: i32) -> Option<u32> {
         let socket = crate::seccomp::notif::dup_fd_from_pid(pid, fd).ok()?;
         let cookie = socket_cookie(&socket)?;
