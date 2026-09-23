@@ -16,6 +16,9 @@ mod test_checkpoint;
 #[path = "integration/test_procfs.rs"]
 mod test_procfs;
 
+#[path = "integration/test_proc_net.rs"]
+mod test_proc_net;
+
 #[path = "integration/test_port_remap.rs"]
 mod test_port_remap;
 

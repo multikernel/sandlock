@@ -911,10 +911,9 @@ async fn test_links_into_proc_cannot_reach_hidden_entries() {
     assert_eq!(out, "0\n0\n0\n1\n1\n1\n1");
 }
 
-/// A /proc grant covers the net entries that have no virtual form, and the
-/// supervisor shares the network namespace, so it can serve them.
+/// A /proc grant covers the supported synthetic network files.
 #[tokio::test]
-async fn test_proc_grant_serves_unvirtualized_net_entries() {
+async fn test_proc_grant_serves_virtual_net_entries() {
     let policy = proc_grant().build().unwrap();
     let script = [
         openable("/proc/net/unix"),
@@ -988,4 +987,251 @@ async fn test_root_and_cwd_magic_links_name_the_virtual_file() {
     );
     let (_, out) = run_sh(&policy, script).await;
     assert_eq!(out, "root-hostname\n1\ncwd-hostname\npid-root-hosts");
+}
+
+#[tokio::test]
+async fn test_proc_net_closed_view() {
+    let mut policy = proc_grant().build().unwrap();
+    let script = r#"
+import os, errno, stat, time, ctypes, struct
+libc = ctypes.CDLL(None, use_errno=True)
+now = time.time()
+expected = {'dev', 'if_inet6', 'route', 'ipv6_route', 'fib_trie', 'arp',
+            'tcp', 'tcp6', 'udp', 'udp6', 'unix', 'sockstat', 'sockstat6'}
+for base in ['/proc/net', '/proc/self/net', '/proc/thread-self/net',
+             f'/proc/{os.getpid()}/net', f'/proc/{os.getpid()}/task/{os.getpid()}/net']:
+    assert set(os.listdir(base)) == expected, (base, os.listdir(base))
+    fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY)
+    for name in expected:
+        assert stat.S_ISREG(os.stat(name, dir_fd=fd).st_mode), name
+        child = os.open(name, os.O_RDONLY, dir_fd=fd)
+        by_path, by_fd = os.stat(name, dir_fd=fd), os.fstat(child)
+        assert (by_path.st_ino, by_path.st_mode, by_path.st_size) == (by_fd.st_ino, by_fd.st_mode, by_fd.st_size), name
+        for attr in ['st_atime_ns', 'st_mtime_ns', 'st_ctime_ns']:
+            timestamp = getattr(by_path, attr)
+            assert abs(timestamp / 1e9 - now) < 60, (name, attr, timestamp, now)
+            assert timestamp == getattr(by_fd, attr), (name, attr)
+            assert timestamp == getattr(os.stat(name, dir_fd=fd), attr), (name, attr)
+        buf = ctypes.create_string_buffer(256)
+        assert libc.statx(fd, name.encode(), 0, 0x7ff, buf) == 0, ctypes.get_errno()
+        for offset, attr in [(64, 'st_atime_ns'), (96, 'st_ctime_ns'), (112, 'st_mtime_ns')]:
+            seconds, nanos = struct.unpack_from('=qI', buf.raw, offset)
+            assert seconds * 1000000000 + nanos == getattr(by_path, attr), (name, attr)
+        os.read(child, 8192)
+        os.close(child)
+    for name in ['snmp', 'netstat', 'dev_mcast', 'netfilter', 'unknown']:
+        for operation in [lambda: os.open(name, os.O_RDONLY, dir_fd=fd),
+                          lambda: os.stat(name, dir_fd=fd)]:
+            try:
+                operation()
+            except OSError as e:
+                assert e.errno == errno.ENOENT, (name, e)
+            else:
+                raise AssertionError(name)
+    os.close(fd)
+print('OK')
+"#;
+    let result = policy.run(&["python3", "-c", script]).await.unwrap();
+    assert!(result.success(), "{}", String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default()));
+}
+
+#[tokio::test]
+async fn test_proc_net_owned_sockets_without_remap() {
+    let host_tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let host_udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    use std::os::fd::AsRawFd;
+    fn inode(fd: i32) -> u64 {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(fd, &mut st) }, 0);
+        st.st_ino
+    }
+    let script = format!(r#"
+import os, socket
+sockets = []
+for kind, table, foreign in [(socket.SOCK_STREAM, 'tcp', {tcp}), (socket.SOCK_DGRAM, 'udp', {udp})]:
+    s = socket.socket(socket.AF_INET, kind)
+    s.bind(('127.0.0.1', 0))
+    if kind == socket.SOCK_STREAM: s.listen()
+    sockets.append(s)
+    own = os.fstat(s.fileno()).st_ino
+    rows = open('/proc/net/' + table).read().splitlines()[1:]
+    found = {{int(row.split()[9]) for row in rows}}
+    assert own in found, (table, own, rows)
+    assert foreign not in found, (table, foreign, rows)
+print('OK')
+"#, tcp = inode(host_tcp.as_raw_fd()), udp = inode(host_udp.as_raw_fd()));
+    let mut policy = proc_grant().net_allow("udp://127.0.0.1:53").net_allow_bind("0").build().unwrap();
+    let result = policy.run(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "{}", String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default()));
+}
+
+#[tokio::test]
+async fn test_proc_net_directory_stream() {
+    let mut policy = proc_grant().build().unwrap();
+    let script = r#"
+import os, ctypes, errno, platform
+libc = ctypes.CDLL(None, use_errno=True)
+nr = 217 if platform.machine() == 'x86_64' else 61
+fd = os.open('/proc/net', os.O_RDONLY | os.O_DIRECTORY)
+other = os.dup(fd)
+buf = ctypes.create_string_buffer(4096)
+def read(fd, count=4096, addr=None, syscall=nr):
+    n = libc.syscall(syscall, fd, ctypes.byref(buf) if addr is None else addr, count)
+    if n < 0: return n, ctypes.get_errno()
+    names = []
+    offset = 0
+    while offset < n:
+        length = int.from_bytes(buf.raw[offset+16:offset+18], 'little')
+        start = 19 if syscall == nr else 18
+        names.append(buf.raw[offset+start:offset+length].split(b'\0')[0].decode())
+        offset += length
+    return n, names
+assert read(fd, 1) == (-1, errno.EINVAL)
+assert read(fd, 4096, ctypes.c_void_p(1)) == (-1, errno.EFAULT)
+assert read(fd, 24)[1] == ['.']
+assert read(other, 24)[1] == ['..']
+pid = os.fork()
+if pid == 0:
+    try:
+        assert read(fd)[0] > 0
+    except BaseException:
+        os._exit(1)
+    os._exit(0)
+assert os.waitpid(pid, 0)[1] == 0
+assert read(fd) == (0, [])
+assert read(other) == (0, [])
+assert read(fd) == (0, [])
+os.lseek(other, 0, os.SEEK_SET)
+assert read(fd, 24)[1] == ['.']
+if platform.machine() == 'x86_64':
+    os.lseek(fd, 0, os.SEEK_SET)
+    assert read(fd, 24, syscall=78)[1] == ['.']
+os.close(other)
+os.close(fd)
+fd = os.open('/proc/net', os.O_RDONLY | os.O_DIRECTORY)
+assert read(fd, 24)[1] == ['.']
+os.close(fd)
+fd = os.open('/usr/lib', os.O_RDONLY | os.O_DIRECTORY)
+position = os.lseek(fd, 0, os.SEEK_CUR)
+assert read(fd, 4096, ctypes.c_void_p(1)) == (-1, errno.EFAULT)
+assert os.lseek(fd, 0, os.SEEK_CUR) == position
+os.close(fd)
+print('OK')
+"#;
+    let result = policy.run(&["python3", "-c", script]).await.unwrap();
+    assert!(result.success(), "{}", String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default()));
+}
+
+#[tokio::test]
+async fn test_proc_net_chroot_and_cow_aliases() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("proc")).unwrap();
+    let python = std::fs::read("/usr/bin/python3").unwrap();
+    let elf = goblin::elf::Elf::parse(&python).unwrap();
+    let interpreter = elf.interpreter.unwrap();
+    let target = root.path().join(interpreter.trim_start_matches('/'));
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::copy(interpreter, target).unwrap();
+    std::os::unix::fs::symlink("/proc/self/net", root.path().join("network")).unwrap();
+    let script = r#"
+import os, errno, stat
+assert stat.S_ISLNK(os.lstat('/proc/net').st_mode)
+assert os.readlink('/proc/net') == 'self/net'
+if os.path.exists('/p'):
+    assert stat.S_ISLNK(os.lstat('/p/net').st_mode)
+    assert os.readlink('/p/net') == 'self/net'
+for base in ['/proc/net', '/network', '/mapped']:
+    assert 'tcp' in os.listdir(base)
+    assert 'snmp' not in os.listdir(base)
+    fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY)
+    assert b'lo:' in os.read(os.open('dev', os.O_RDONLY, dir_fd=fd), 4096)
+    assert stat.S_ISREG(os.stat('dev', dir_fd=fd).st_mode)
+    try: os.open('snmp', os.O_RDONLY, dir_fd=fd)
+    except OSError as e: assert e.errno == errno.ENOENT
+    else: raise AssertionError('host snmp opened')
+    os.close(fd)
+print('OK')
+"#;
+    let mut builder = proc_grant().chroot(root.path()).fs_read("/network")
+        .fs_mount("/mapped", "/proc/net")
+        .fs_mount("/proc", "/proc").fs_mount("/p", "/proc");
+    for path in ["/usr", "/lib", "/lib64", "/bin", "/etc"] {
+        if std::path::Path::new(path).exists() { builder = builder.fs_mount(path, path); }
+    }
+    let result = builder.build().unwrap().run(&["/usr/bin/python3", "-c", script]).await.unwrap();
+    assert!(result.success(), "{}", result.stderr_str().unwrap_or(""));
+
+    let work = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink("/proc/self/net", work.path().join("network")).unwrap();
+    let script = script.replace("'/network'", &format!("{:?}", work.path().join("network")))
+        .replace(", '/mapped'", "");
+    let mut policy = proc_grant().workdir(work.path()).fs_write(work.path())
+        .on_exit(sandlock_core::sandbox::BranchAction::Abort).build().unwrap();
+    let result = policy.run(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "{}", result.stderr_str().unwrap_or(""));
+}
+
+#[tokio::test]
+async fn test_proc_net_open_flags_and_metadata() {
+    let mut policy = proc_grant().build().unwrap();
+    let script = r#"
+import os, errno, stat, fcntl
+assert os.readlink('/proc/net') == 'self/net'
+assert stat.S_ISLNK(os.lstat('/proc/net').st_mode)
+assert stat.S_ISDIR(os.stat('/proc/net').st_mode)
+assert stat.S_ISDIR(os.lstat('/proc/net/.').st_mode)
+assert not os.access('/proc/net/snmp', os.F_OK)
+assert not os.access('/proc/net/tcp', os.W_OK)
+for flags in [os.O_RDONLY, os.O_RDONLY | os.O_CLOEXEC]:
+    fd = os.open('/proc/net/tcp', flags)
+    assert fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_PATH == flags & os.O_PATH
+    if flags & os.O_PATH:
+        try: os.read(fd, 1)
+        except OSError as e: assert e.errno == errno.EBADF
+        else: raise AssertionError('read O_PATH')
+    os.close(fd)
+for path, flags, expected in [('/proc/net', os.O_RDONLY | os.O_NOFOLLOW, errno.ELOOP),
+                              ('/proc/net/tcp', os.O_DIRECTORY, errno.ENOTDIR),
+                              ('/proc/net/tcp/', os.O_RDONLY, errno.ENOTDIR),
+                              ('/proc/net/tcp', os.O_WRONLY, errno.EACCES),
+                              ('/proc/net/snmp', os.O_PATH, errno.ENOENT),
+                              ('/proc/net/tcp', os.O_PATH, errno.EOPNOTSUPP)]:
+    try: os.open(path, flags)
+    except OSError as e: assert e.errno == expected, (path, flags, e)
+    else: raise AssertionError((path, flags))
+print('OK')
+"#;
+    let result = policy.run(&["python3", "-c", script]).await.unwrap();
+    assert!(result.success(), "{}", result.stderr_str().unwrap_or(""));
+}
+
+#[tokio::test]
+async fn test_proc_net_openat2_respects_resolution_root() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("proc/net")).unwrap();
+    std::fs::write(root.path().join("proc/net/tcp"), b"ordinary file").unwrap();
+    let script = format!(r#"
+import os, ctypes, errno
+libc = ctypes.CDLL(None, use_errno=True)
+class How(ctypes.Structure):
+    _fields_ = [('flags', ctypes.c_uint64), ('mode', ctypes.c_uint64), ('resolve', ctypes.c_uint64)]
+def openat2(dirfd, path, resolve):
+    how = How(os.O_RDONLY, 0, resolve)
+    return libc.syscall(437, dirfd, path.encode(), ctypes.byref(how), ctypes.sizeof(how))
+root = os.open({root:?}, os.O_RDONLY | os.O_DIRECTORY)
+fd = openat2(root, '/proc/net/tcp', 0x10)
+assert fd >= 0, ctypes.get_errno()
+assert os.read(fd, 128) == b'ordinary file'
+os.close(fd)
+fd = openat2(-100, '/proc/net/dev', 4)
+assert fd == -1 and ctypes.get_errno() == errno.ELOOP
+fd = openat2(-100, '/proc/net/dev', 2)
+assert fd >= 0, ctypes.get_errno()
+assert b'lo:' in os.read(fd, 4096)
+os.close(fd)
+print('OK')
+"#, root = root.path().to_str().unwrap());
+    let mut policy = proc_grant().fs_read(root.path()).build().unwrap();
+    let result = policy.run(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "{}", result.stderr_str().unwrap_or(""));
 }

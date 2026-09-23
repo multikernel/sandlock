@@ -187,6 +187,10 @@ impl NotifAction {
 /// Most callers want [`NotifAction::inject_bytes`], which wraps this in the
 /// common sealed + `O_CLOEXEC` configuration.
 pub fn content_memfd(content: &[u8], seal: bool) -> io::Result<OwnedFd> {
+    named_content_memfd(content, seal, "sandlock-content")
+}
+
+pub(crate) fn named_content_memfd(content: &[u8], seal: bool, name: &str) -> io::Result<OwnedFd> {
     use std::io::{Seek, SeekFrom, Write};
     use std::os::unix::io::FromRawFd;
 
@@ -195,7 +199,7 @@ pub fn content_memfd(content: &[u8], seal: bool) -> io::Result<OwnedFd> {
     } else {
         libc::MFD_CLOEXEC as u32
     };
-    let memfd = crate::sys::syscall::memfd_create("sandlock-content", flags)?;
+    let memfd = crate::sys::syscall::memfd_create(name, flags)?;
 
     // Write the content and rewind. Borrow the raw fd for File I/O without
     // transferring ownership: `memfd` (the OwnedFd) keeps owning it.
@@ -461,7 +465,7 @@ pub(crate) fn openat2_at(dirfd: RawFd, path: &std::ffi::CStr, flags: u64, mode: 
 /// Capture an `O_PATH` fd to the directory the child's open resolves against,
 /// taken from the child's own view so a concurrent `chdir`/dirfd swap cannot
 /// move the resolution base after we read it.
-fn open_base_dir(pid: u32, dirfd: i64) -> Result<OwnedFd, i32> {
+pub(crate) fn open_base_dir(pid: u32, dirfd: i64) -> Result<OwnedFd, i32> {
     use std::os::unix::io::FromRawFd;
     if dirfd as i32 == libc::AT_FDCWD {
         let cwd = std::ffi::CString::new(format!("/proc/{}/cwd", pid)).map_err(|_| libc::EINVAL)?;
@@ -539,7 +543,7 @@ fn deny_open_verdict(
 /// so a link to it would hand the child the supervisor's entry. Nothing else
 /// the sandbox can name resolves there, which makes the test exact. `None`
 /// means the probe is elsewhere.
-fn reprobe_in_callers_proc(
+pub(crate) fn reprobe_in_callers_proc(
     real: &std::path::Path,
     caller_tid: u32,
     nofollow: bool,
@@ -701,11 +705,15 @@ async fn reopen_existing_on_behalf(
             return NotifAction::Errno(libc::EACCES);
         }
     }
+    let net_entry = crate::procfs::net::lookup(&crate::procfs::canon_proc_namespace(&realpath.to_string_lossy()));
+    if net_entry != crate::procfs::net::NetEntry::Outside {
+        return crate::procfs::net_dispatch::serve_entry(net_entry, flags, notif, ctx).await;
+    }
     // The /proc and /etc handlers judged the string the child wrote; the
     // real file behind a virtual one is reached by any other spelling.
     if let Some(file) = crate::procfs::virtual_file(&realpath.to_string_lossy(), policy) {
         let content =
-            crate::procfs::render_virtual_file(file, processes, &ctx.resource, &ctx.network, policy).await;
+            crate::procfs::render_virtual_file(file, processes, &ctx.resource, policy).await;
         return NotifAction::inject_bytes(&content);
     }
     // Resolution-only flags are stripped from the reopen.
@@ -2531,6 +2539,10 @@ async fn handle_notification(
             }
         }
     };
+
+    if let Some(open) = &open {
+        action = crate::procfs::net_dispatch::guard_injection(action, &notif, open, ctx).await;
+    }
 
     let fork_counted = matches!(action, NotifAction::Continue)
         && crate::resource::fork_counted_on_continue(&notif);

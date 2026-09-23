@@ -290,7 +290,7 @@ const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 /// supervisor walks from the sandbox root instead, so replaying them there
 /// would refuse paths the child never asked to refuse. They are dropped, and
 /// the sandbox's own RESOLVE_IN_ROOT is what bounds the walk in their place.
-fn honorable_resolve_flags(resolve: u64) -> u64 {
+pub(crate) fn honorable_resolve_flags(resolve: u64) -> u64 {
     resolve & (RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)
 }
 
@@ -302,7 +302,7 @@ fn honorable_resolve_flags(resolve: u64) -> u64 {
 /// the child's flags first and hand back the kernel's own ELOOP. Any other
 /// failure (a missing O_CREAT target, most of all) belongs to the normal path
 /// below, which knows how to create and how to phrase the error.
-fn enforce_resolve_flags(
+pub(crate) fn enforce_resolve_flags(
     notif: &SeccompNotif,
     dirfd: i64,
     rel_path: &str,

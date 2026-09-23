@@ -519,9 +519,29 @@ pub(crate) fn build_dispatch_table(
             async move {
                 let Some(open) = open else { return NotifAction::Continue };
                 let processes = Arc::clone(&sup.processes);
-                let network = Arc::clone(&sup.network);
-                crate::procfs::handle_proc_open(&notif, &open, &processes, &resource, &network, &policy).await
+                let action = crate::procfs::handle_net_open(&notif, &open, &sup).await;
+                if !matches!(action, NotifAction::Continue) { return action; }
+                crate::procfs::handle_proc_open(&notif, &open, &processes, &resource, &policy).await
             }
+        });
+    }
+
+    for nr in crate::procfs::net_dispatch::metadata_syscalls() {
+        let sup = Arc::clone(ctx);
+        table.register(nr, move |cx: &HandlerCtx| {
+            let sup = Arc::clone(&sup);
+            let notif = cx.notif;
+            let notif_fd = cx.notif_fd;
+            async move { crate::procfs::handle_net_metadata(&notif, &sup, notif_fd).await }
+        });
+    }
+    for nr in [Some(libc::SYS_getdents64), arch::sys_getdents(), Some(libc::SYS_lseek)].into_iter().flatten() {
+        let sup = Arc::clone(ctx);
+        table.register(nr, move |cx: &HandlerCtx| {
+            let sup = Arc::clone(&sup);
+            let notif = cx.notif;
+            let notif_fd = cx.notif_fd;
+            async move { crate::procfs::handle_net_directory(&notif, &sup, notif_fd, false).await }
         });
     }
 
@@ -725,6 +745,28 @@ pub(crate) fn build_dispatch_table(
     // ------------------------------------------------------------------
     for (nr, h) in pending_handlers {
         table.register_arc(nr, h);
+    }
+
+    for nr in [Some(libc::SYS_getdents64), arch::sys_getdents()].into_iter().flatten() {
+        let sup = Arc::clone(ctx);
+        table.register(nr, move |cx: &HandlerCtx| {
+            let sup = Arc::clone(&sup);
+            let notif = cx.notif;
+            let notif_fd = cx.notif_fd;
+            async move { crate::procfs::handle_net_directory(&notif, &sup, notif_fd, true).await }
+        });
+    }
+
+    {
+        for nr in crate::procfs::net_dispatch::metadata_syscalls() {
+            let sup = Arc::clone(ctx);
+            table.register(nr, move |cx: &HandlerCtx| {
+                let sup = Arc::clone(&sup);
+                let notif = cx.notif;
+                let notif_fd = cx.notif_fd;
+                async move { crate::procfs::handle_pinned_metadata(&notif, &sup, notif_fd).await }
+            });
+        }
     }
 
     table

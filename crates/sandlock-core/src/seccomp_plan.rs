@@ -117,6 +117,8 @@ const TIME_NOTIF_SYSCALLS: &[i64] = &[
 fn procfs_hosts_notif_syscalls() -> Vec<i64> {
     let mut v = vec![libc::SYS_openat, arch::SYS_OPENAT2, libc::SYS_getdents64];
     v.extend([arch::sys_open(), arch::sys_getdents()].into_iter().flatten());
+    v.push(libc::SYS_lseek);
+    v.extend(crate::procfs::net_dispatch::metadata_syscalls());
     v
 }
 

@@ -61,6 +61,7 @@ impl ResourceState {
 /// `PerProcessState::procfs_dir_cache`. This struct only holds truly
 /// global virtualization state.
 pub struct ProcfsState {
+    pub created_at: std::time::Duration,
     /// Base address of the last vDSO we patched (0 = not yet patched).
     pub vdso_patched_addr: u64,
 }
@@ -68,6 +69,9 @@ pub struct ProcfsState {
 impl ProcfsState {
     pub fn new() -> Self {
         Self {
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default(),
             vdso_patched_addr: 0,
         }
     }
