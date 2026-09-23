@@ -154,6 +154,35 @@ sandlock run --no-supervisor -r /proc -r /usr -r /lib -r /lib64 -r /bin -r /etc 
   sandlock run -r /usr -w /tmp -- untrusted-command
 ```
 
+## Procfs access
+
+With supervision enabled, grants under `/proc/self` apply to each process's
+own entries, including those of forked children. `/proc/thread-self` refers
+to the calling thread. Use read grants for inspecting process state and write
+grants for changing it; a write grant also permits reads.
+
+| Grant | Access |
+| --- | --- |
+| `-r /proc/self/maps` | Each process can read its own memory mappings. |
+| `-w /proc/self/comm` | Each process can read and change its own name. |
+| `-w /proc/self/task` | Threads can read and change names within their process's task directory. |
+| `-w /proc/thread-self/comm` | Each thread can read and change its own name. |
+
+Explicit filesystem denies still take precedence. Grants do not allow
+following procfs links such as `cwd`, `root`, or `fd/N` to files outside the
+filesystem policy.
+
+Some entries remain restricted even with a grant. Supervised opens refuse
+`pagemap`, `stack`, and `seccomp_cache`; supervised writes also refuse `mem`,
+the `attr` subtree, `uid_map`, `gid_map`, `setgroups`, and `projid_map` in
+process and thread directories. Opening these files as the supervisor can
+change their permission checks, so these restrictions are stricter than
+native procfs permissions.
+
+Without supervision, procfs grants use native Landlock rules. A grant on
+`/proc/self` then binds to the first process's entries and does not extend
+to forked children.
+
 ## Profiles
 
 Save reusable sandbox profiles as TOML files in

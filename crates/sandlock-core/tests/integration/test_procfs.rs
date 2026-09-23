@@ -511,6 +511,180 @@ async fn test_own_proc_self_is_read_only() {
     assert_eq!(out, "sh", "a read grant should not extend to writing");
 }
 
+#[tokio::test]
+async fn test_proc_self_write_grant_covers_forked_children() {
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_write("/proc/self/comm")
+        .build()
+        .unwrap();
+    let script = concat!(
+        "echo parent > /proc/self/comm || exit 1; ",
+        "sh -c 'echo child > /proc/self/comm && ",
+        "read -r name < /proc/self/comm && test \"$name\" = child' || exit 2; ",
+        "read -r name < /proc/self/comm && test \"$name\" = parent",
+    );
+    let (ok, out) = run_sh(&policy, script).await;
+    assert!(ok, "each process should write only its own comm: {:?}", out);
+}
+
+#[tokio::test]
+async fn test_proc_self_write_grant_honors_denies() {
+    let policy = no_proc_grant()
+        .fs_write("/proc/self")
+        .fs_deny("/proc/self/comm")
+        .build()
+        .unwrap();
+    let script = "for p in /proc/self/comm /proc/$$/comm; do if ( : > $p ); then exit 1; fi; done";
+    let (ok, _) = run_sh(&policy, script).await;
+    assert!(ok, "a write grant must not override a deny under either spelling");
+}
+
+#[tokio::test]
+async fn test_proc_self_task_write_grant_covers_threads() {
+    let script = r#"
+import ctypes, os, sys, threading
+libc = ctypes.CDLL(None, use_errno=True)
+errors = []
+def work():
+    try:
+        for path in ['/proc/thread-self/comm',
+                     f'/proc/self/task/{threading.get_native_id()}/comm']:
+            fd = libc.syscall(int(sys.argv[1]), -100, path.encode(), os.O_WRONLY, 0o600)
+            assert fd >= 0, (path, ctypes.get_errno())
+            os.write(fd, b'worker')
+            os.close(fd)
+            with open(path, 'w') as f:
+                f.write('worker')
+            with open(path) as f:
+                assert f.read().strip() == 'worker'
+    except Exception as e:
+        errors.append(e)
+t = threading.Thread(target=work)
+t.start()
+t.join()
+assert not errors, errors
+try:
+    os.open('/proc/self/comm', os.O_WRONLY)
+except PermissionError:
+    pass
+else:
+    raise AssertionError('task grant allowed the process-level comm')
+"#;
+    for grant in ["/proc/self/task", "/proc/thread-self/comm"] {
+        let policy = no_proc_grant().fs_write(grant).build().unwrap();
+        let result = policy.clone().run(&["python3", "-c", script, &libc::SYS_openat.to_string()]).await.unwrap();
+        assert!(result.success(), "grant {}: {}", grant, String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default()));
+    }
+}
+
+#[tokio::test]
+async fn test_proc_self_write_honors_thread_self_deny() {
+    let policy = no_proc_grant()
+        .fs_write("/proc/self/task")
+        .fs_deny("/proc/thread-self/comm")
+        .build()
+        .unwrap();
+    let script = r#"
+import os, threading
+allowed = []
+def work():
+    for path in [f'/proc/self/task/{threading.get_native_id()}/comm',
+                 f'/proc/{os.getpid()}/task/{threading.get_native_id()}/comm']:
+        try:
+            fd = os.open(path, os.O_WRONLY)
+        except PermissionError:
+            continue
+        os.close(fd)
+        allowed.append(path)
+t = threading.Thread(target=work)
+t.start()
+t.join()
+assert not allowed, allowed
+"#;
+    let result = policy.clone().run(&["python3", "-c", script]).await.unwrap();
+    assert!(result.success(), "{}", String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default()));
+}
+
+#[tokio::test]
+async fn test_proc_self_write_grant_survives_no_supervisor() {
+    let policy = no_proc_grant()
+        .fs_write("/proc/self/comm")
+        .no_supervisor(true)
+        .build()
+        .unwrap();
+    let (ok, _) = run_sh(&policy, "echo parent > /proc/self/comm").await;
+    assert!(ok, "the first process should retain its native Landlock write grant");
+}
+
+#[tokio::test]
+async fn test_proc_self_write_openat2_preserves_constraints() {
+    let policy = no_proc_grant().fs_write("/proc/self/comm").build().unwrap();
+    let script = r#"
+import ctypes, errno, os, sys
+class OpenHow(ctypes.Structure):
+    _fields_ = [('flags', ctypes.c_uint64), ('mode', ctypes.c_uint64),
+                ('resolve', ctypes.c_uint64)]
+libc = ctypes.CDLL(None, use_errno=True)
+os.chdir('/')
+for flags, mode, resolve, expected in [
+    (os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, 0, errno.EEXIST),
+    (os.O_WRONLY, 0o600, 0, errno.EINVAL),
+    (os.O_WRONLY, 0, 0x10, 0),
+    (os.O_RDONLY, 0, 0x10, 0),
+]:
+    how = OpenHow(flags, mode, resolve)
+    fd = libc.syscall(int(sys.argv[1]), -100, b'/proc/self/comm',
+                      ctypes.byref(how), ctypes.sizeof(how))
+    if expected:
+        assert fd == -1 and ctypes.get_errno() == expected, (fd, ctypes.get_errno(), expected)
+    else:
+        assert fd >= 0, ctypes.get_errno()
+        os.close(fd)
+"#;
+    let result = policy.clone().run(&["python3", "-c", script, &libc::SYS_openat2.to_string()]).await.unwrap();
+    assert!(result.success(), "{}", String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default()));
+}
+
+#[tokio::test]
+async fn test_proc_self_writes_refuse_opener_sensitive_entries() {
+    let aliases = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink("/proc/self/mem", aliases.path().join("alias")).unwrap();
+    let policy = no_proc_grant()
+        .fs_write("/proc/self")
+        .fs_write("/proc/thread-self")
+        .fs_read(aliases.path())
+        .build()
+        .unwrap();
+    let script = r#"
+import errno, os, sys
+pid = os.getpid()
+bases = ['/proc/self', '/proc/thread-self', f'/proc/{pid}',
+         f'/proc/self/task/{pid}', f'/proc/{pid}/task/{pid}']
+entries = ['mem', 'attr/current', 'uid_map', 'gid_map', 'setgroups', 'projid_map']
+paths = [f'{base}/{entry}' for base in bases for entry in entries]
+paths.append(sys.argv[1] + '/alias')
+for path in paths:
+    for flags in [os.O_WRONLY, os.O_RDWR, os.O_RDONLY | os.O_TRUNC]:
+        try:
+            fd = os.open(path, flags)
+        except OSError as e:
+            assert e.errno in (errno.EACCES, errno.ENOENT), (path, flags, e)
+        else:
+            os.close(fd)
+            raise AssertionError(f'write-open allowed: {path}, flags={flags}')
+with open('/proc/self/uid_map') as f:
+    assert f.read().strip()
+print('ok')
+"#;
+    let result = policy.clone().run(&["python3", "-c", script, aliases.path().to_str().unwrap()]).await.unwrap();
+    assert!(result.success(), "{}", String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default()));
+    assert_eq!(result.stdout.as_deref(), Some(b"ok\n".as_slice()));
+}
+
 /// `root`, `cwd` and `fd/N` lead out of /proc; their targets stay under the policy.
 #[tokio::test]
 async fn test_own_proc_self_does_not_follow_links_out() {

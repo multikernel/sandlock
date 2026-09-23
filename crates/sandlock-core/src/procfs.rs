@@ -17,7 +17,7 @@
 //     read_link returned an error. None of these cases involve the
 //     supervisor approving a syscall based on user-controlled string
 //     contents, so the seccomp_unotify TOCTOU class doesn't apply.
-//   - A task's own /proc/self reads use InjectFdSend with an fd the
+//   - A task's own /proc/self opens use InjectFdSend with an fd the
 //     supervisor opened from its own copy of the path, so a later swap of
 //     the string in child memory changes nothing.
 
@@ -575,7 +575,7 @@ fn inject_memfd(content: &[u8]) -> NotifAction {
 ///
 /// - Denies access to sensitive kernel files.
 /// - Virtualizes /proc/cpuinfo and /proc/meminfo with fake content.
-/// - Serves the caller's own /proc/self entries that the read list covers.
+/// - Serves the caller's own /proc/self entries covered by the grant lists.
 /// - Lets everything else through.
 pub(crate) async fn handle_proc_open(
     notif: &SeccompNotif,
@@ -630,11 +630,39 @@ const READ_OPEN_FLAGS: i32 =
 
 /// What these show depends on the capabilities of whoever opened them, and
 /// the supervisor may hold more than the task it would be opening them for.
-pub(crate) const OPENER_PRIVILEGED_FILES: &[&str] = &["pagemap", "stack", "seccomp_cache"];
+const OPENER_PRIVILEGED_FILES: &[&str] = &["pagemap", "stack", "seccomp_cache"];
 
-/// True for a read grant the supervisor serves instead of Landlock. A rule
+pub(crate) fn proc_open_is_write(flags: u64) -> bool {
+    flags as i32 & WRITE_SIDE_FLAGS != 0
+}
+
+/// These opens cannot safely borrow the supervisor's credentials.
+pub(crate) fn is_opener_sensitive_proc(path: &std::path::Path, flags: u64) -> bool {
+    let Ok(relative) = path.strip_prefix("/proc") else { return false };
+    if path.file_name().and_then(|name| name.to_str()).is_some_and(|name| OPENER_PRIVILEGED_FILES.contains(&name)) {
+        return true;
+    }
+    if !proc_open_is_write(flags) {
+        return false;
+    }
+    let mut parts = relative.iter().filter_map(|part| part.to_str());
+    let Some(task) = parts.next() else { return false };
+    if task != "self" && task != "thread-self" && task.parse::<u32>().is_err() {
+        return false;
+    }
+    let mut entry = parts.next();
+    if entry == Some("task") {
+        if parts.next().and_then(|tid| tid.parse::<u32>().ok()).is_none() {
+            return false;
+        }
+        entry = parts.next();
+    }
+    matches!(entry, Some("mem" | "attr" | "uid_map" | "gid_map" | "setgroups" | "projid_map"))
+}
+
+/// True for a grant the supervisor serves instead of Landlock. A rule
 /// on procfs would let any link reach the entries the handlers hide by name
-/// (issue #236), and one on /proc/self binds to a single pid (issue #218).
+/// (issue #236), and one on /proc/self binds to a single pid (issues #218, #232).
 pub(crate) fn is_supervised_proc_grant(path: &std::path::Path) -> bool {
     path.starts_with("/proc")
 }
@@ -678,7 +706,11 @@ fn own_proc_target(path: &str, tid: i32, tgid: i32) -> Option<OwnProcTarget<'_>>
     // A dirfd on /proc/self reads back as /proc/<tgid>, so the numeric
     // spelling of the caller's own directory has to match too.
     let rest = strip_dir_prefix(path, PROC_SELF).or_else(|| strip_dir_prefix(path, &own))?;
-    Some(OwnProcTarget { base: own, rest, self_forms: vec![format!("{}{}", PROC_SELF, rest)] })
+    let mut self_forms = vec![format!("{}{}", PROC_SELF, rest)];
+    if let Some(thread_rest) = strip_dir_prefix(rest, &format!("/task/{}", tid)) {
+        self_forms.push(format!("{}{}", PROC_THREAD_SELF, thread_rest));
+    }
+    Some(OwnProcTarget { base: own, rest, self_forms })
 }
 
 /// The pid-free spellings of a path inside the caller's own /proc directory,
@@ -742,13 +774,11 @@ pub(crate) fn own_fd_request(path: &str, tid: i32, tgid: i32) -> Option<i32> {
     fd.bytes().all(|b| b.is_ascii_digit()).then(|| fd.parse().ok()).flatten()
 }
 
-/// Serve a read-only open inside the caller's own /proc directory, when the
-/// read list covers it.
+/// Serve a policy-listed open inside the caller's own /proc directory.
 ///
 /// A Landlock rule for /proc/self names one pid, so only the supervisor can
-/// give each task its own entry. `None` leaves the open to Landlock: a write,
-/// or a walk through a link such as `cwd` or `fd/N`, gets the kernel's
-/// verdict on the real target instead of ours.
+/// give each task its own entry. Links fall through to the general open
+/// handler, which checks the pinned target before serving procfs opens.
 fn open_own_proc_on_behalf(
     notif: &SeccompNotif,
     args: &OpenArgs,
@@ -760,6 +790,10 @@ fn open_own_proc_on_behalf(
     if policy.chroot_root.is_some() {
         return None;
     }
+    // Caller resolution constraints need the original dirfd in the general handler.
+    if args.resolve != 0 {
+        return None;
+    }
     // A namespace entry that has no virtual form must not reach the real file.
     if proc_namespace_entry(path).is_some() {
         return None;
@@ -768,19 +802,24 @@ fn open_own_proc_on_behalf(
     let target = own_proc_target(path, tid, processes.tgid_of(tid)?)?;
     // The deny precheck matches the string the child wrote, which the
     // numeric spelling of its own directory would slip past.
-    if !target.is_under_any(&policy.chroot_readable) || target.is_under_any(&policy.chroot_denied) {
+    let is_write = proc_open_is_write(args.flags);
+    let granted = target.is_under_any(&policy.chroot_writable)
+        || (!is_write && target.is_under_any(&policy.chroot_readable));
+    if !granted || target.is_under_any(&policy.chroot_denied) {
         return None;
     }
-    let file_name = target.rest.rsplit('/').next().unwrap_or_default();
-    if OPENER_PRIVILEGED_FILES.contains(&file_name) {
+    if is_opener_sensitive_proc(std::path::Path::new(path), args.flags) {
         return None;
     }
 
     let flags = args.flags as i32;
-    if flags & WRITE_SIDE_FLAGS != 0 {
-        return None;
-    }
-    let kept = if flags & libc::O_PATH != 0 { PATH_OPEN_FLAGS } else { READ_OPEN_FLAGS };
+    let open_flags = if is_write {
+        flags
+    } else if flags & libc::O_PATH != 0 {
+        flags & PATH_OPEN_FLAGS
+    } else {
+        flags & READ_OPEN_FLAGS
+    };
 
     let base = CString::new(target.base).ok()?;
     let base_fd = unsafe {
@@ -793,14 +832,23 @@ fn open_own_proc_on_behalf(
 
     let rel = target.rest.trim_start_matches('/');
     let rel = CString::new(if rel.is_empty() { "." } else { rel }).ok()?;
-    let fd = openat2_at(
+    let creates = flags & libc::O_CREAT != 0 || flags & libc::O_TMPFILE == libc::O_TMPFILE;
+    let mode = if is_write && (creates || notif.data.nr as i64 == crate::arch::SYS_OPENAT2) {
+        args.mode
+    } else {
+        0
+    };
+    let fd = match openat2_at(
         base_fd.as_raw_fd(),
         &rel,
-        ((flags & kept) | libc::O_CLOEXEC) as u64,
-        0,
+        (open_flags | libc::O_CLOEXEC) as u64,
+        mode,
         RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
-    )
-    .ok()?;
+    ) {
+        Ok(fd) => fd,
+        Err(errno) if is_write && errno != libc::ELOOP => return Some(NotifAction::Errno(errno)),
+        Err(_) => return None,
+    };
     Some(inject_open_result(fd.into_raw_fd(), args.flags))
 }
 
