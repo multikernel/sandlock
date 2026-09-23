@@ -42,7 +42,13 @@ async fn test_proc_net_socket_tables_isolate_families_and_unix() {
     let owned_path = directory.path().join("owned.sock");
     let script = format!(
         r#"
-import os, socket
+import errno, os, socket
+try:
+    socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 4)
+except OSError as error:
+    assert error.errno == errno.EAFNOSUPPORT, error
+else:
+    raise AssertionError('sandbox opened NETLINK_SOCK_DIAG')
 sockets = []
 fixtures = [(socket.AF_INET, socket.SOCK_STREAM, '127.0.0.1', 'tcp', {tcp}),
             (socket.AF_INET, socket.SOCK_DGRAM, '127.0.0.1', 'udp', {udp}),
@@ -212,6 +218,37 @@ print('OK')
             .net_allow("udp://127.0.0.1:53")
             .net_allow_bind("*"),
         script,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_proc_net_worker_thread_reads_all_owned_sockets() {
+    run_python(
+        proc_grant().net_allow_bind("*"),
+        r#"
+import os, socket, threading, traceback
+sockets = []
+for _ in range(8):
+    sock = socket.socket()
+    sock.bind(('127.0.0.1', 0))
+    sock.listen()
+    sockets.append(sock)
+expected = {os.fstat(sock.fileno()).st_ino for sock in sockets}
+errors = []
+def check():
+    try:
+        for _ in range(3):
+            rows = open('/proc/net/tcp').read().splitlines()[1:]
+            assert {int(row.split()[9]) for row in rows} == expected, rows
+    except BaseException:
+        errors.append(traceback.format_exc())
+worker = threading.Thread(target=check)
+worker.start()
+worker.join()
+assert not errors, errors
+print('OK')
+"#,
     )
     .await;
 }
