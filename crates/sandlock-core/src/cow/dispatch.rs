@@ -175,7 +175,7 @@ fn pick_root_rel<'a>(
     Ok((root, rel.to_str().ok_or(libc::EINVAL)?.to_string()))
 }
 
-fn open_confined(
+pub(crate) fn open_confined(
     upper_root: &Path,
     workdir_root: &Path,
     real_path: &Path,
