@@ -25,7 +25,8 @@ install-go-lib: ffi
 	install -Dm755 target/release/libsandlock_ffi.so $(LIBDIR)/libsandlock_ffi.so
 	install -Dm644 crates/sandlock-ffi/include/sandlock.h $(INCLUDEDIR)/sandlock.h
 	install -d $(PCDIR)
-	sed -e 's|@PREFIX@|$(PREFIX)|g' -e 's|@VERSION@|$(VERSION)|g' \
+	sed -e 's|@PREFIX@|$(PREFIX)|g' -e 's|@LIBDIR@|$${exec_prefix}/lib|g' \
+		-e 's|@VERSION@|$(VERSION)|g' \
 		go/sandlock.pc.in > $(PCDIR)/sandlock.pc
 
 uninstall-go-lib:
