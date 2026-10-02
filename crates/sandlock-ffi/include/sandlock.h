@@ -455,7 +455,9 @@ sandlock_builder_t *sandlock_sandbox_builder_fs_mount_ro(sandlock_builder_t *b,
 
 /**
  * Set the COW branch action on successful exit.
- * `action`: 0 = Commit, 1 = Abort, 2 = Keep, 3 = Defer.
+ * `action`: 0 = Commit, 1 = Abort, 2 = Keep, 3 = Defer. Any other value
+ * frees the builder and returns null, so the eventual build fails rather
+ * than guessing an action that may write into the workdir.
  *
  * # Safety
  * `b` must be a valid builder pointer.
@@ -464,7 +466,9 @@ sandlock_builder_t *sandlock_sandbox_builder_on_exit(sandlock_builder_t *b, uint
 
 /**
  * Set the COW branch action on error exit.
- * `action`: 0 = Commit, 1 = Abort, 2 = Keep, 3 = Defer.
+ * `action`: 0 = Commit, 1 = Abort, 2 = Keep, 3 = Defer. Any other value
+ * frees the builder and returns null, so the eventual build fails rather
+ * than guessing an action that may write into the workdir.
  *
  * # Safety
  * `b` must be a valid builder pointer.

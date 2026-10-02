@@ -304,7 +304,9 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_fs_mount_ro(
 }
 
 /// Set the COW branch action on successful exit.
-/// `action`: 0 = Commit, 1 = Abort, 2 = Keep, 3 = Defer.
+/// `action`: 0 = Commit, 1 = Abort, 2 = Keep, 3 = Defer. Any other value
+/// frees the builder and returns null, so the eventual build fails rather
+/// than guessing an action that may write into the workdir.
 ///
 /// # Safety
 /// `b` must be a valid builder pointer.
@@ -317,12 +319,16 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_on_exit(
         return b;
     }
     let builder = *Box::from_raw(b);
-    let action = branch_action(action);
-    Box::into_raw(Box::new(builder.on_exit(action)))
+    match try_branch_action_from_raw(action) {
+        Some(action) => Box::into_raw(Box::new(builder.on_exit(action))),
+        None => ptr::null_mut(),
+    }
 }
 
 /// Set the COW branch action on error exit.
-/// `action`: 0 = Commit, 1 = Abort, 2 = Keep, 3 = Defer.
+/// `action`: 0 = Commit, 1 = Abort, 2 = Keep, 3 = Defer. Any other value
+/// frees the builder and returns null, so the eventual build fails rather
+/// than guessing an action that may write into the workdir.
 ///
 /// # Safety
 /// `b` must be a valid builder pointer.
@@ -335,16 +341,19 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_on_error(
         return b;
     }
     let builder = *Box::from_raw(b);
-    let action = branch_action(action);
-    Box::into_raw(Box::new(builder.on_error(action)))
+    match try_branch_action_from_raw(action) {
+        Some(action) => Box::into_raw(Box::new(builder.on_error(action))),
+        None => ptr::null_mut(),
+    }
 }
 
-fn branch_action(discriminant: u8) -> BranchAction {
-    match discriminant {
-        1 => BranchAction::Abort,
-        2 => BranchAction::Keep,
-        3 => BranchAction::Defer,
-        _ => BranchAction::Commit,
+fn try_branch_action_from_raw(raw: u8) -> Option<BranchAction> {
+    match raw {
+        0 => Some(BranchAction::Commit),
+        1 => Some(BranchAction::Abort),
+        2 => Some(BranchAction::Keep),
+        3 => Some(BranchAction::Defer),
+        _ => None,
     }
 }
 
