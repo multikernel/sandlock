@@ -173,6 +173,11 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 	if err := s.validateStrings(); err != nil {
 		return nil, err
 	}
+	for _, a := range []BranchAction{s.OnExit, s.OnError} {
+		if a > BranchActionDefer {
+			return nil, fmt.Errorf("sandlock: invalid BranchAction %d", a)
+		}
+	}
 
 	b := C.sandlock_sandbox_builder_new()
 

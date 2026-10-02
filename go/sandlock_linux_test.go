@@ -148,6 +148,17 @@ func TestRunNULRejected(t *testing.T) {
 	}
 }
 
+func TestRunUnknownBranchActionRejected(t *testing.T) {
+	for _, sb := range []*sandlock.Sandbox{
+		{OnExit: sandlock.BranchActionDefer + 1},
+		{OnError: sandlock.BranchAction(255)},
+	} {
+		if _, err := sb.Run(context.Background(), "true"); err == nil || !strings.Contains(err.Error(), "invalid BranchAction") {
+			t.Fatalf("err = %v, want invalid BranchAction", err)
+		}
+	}
+}
+
 func TestSyscallEventArgvContains(t *testing.T) {
 	ev := sandlock.SyscallEvent{Argv: []string{"python3", "-c", "print(1)"}}
 	if !ev.ArgvContains("python") {
