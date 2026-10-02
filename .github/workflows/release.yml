@@ -79,6 +79,67 @@ jobs:
           name: sandlock-${{ matrix.target }}
           path: sandlock-${{ matrix.target }}.tar.gz
 
+  # Wrap each arch's release build in a .deb and an .rpm for the GitHub
+  # Release. They are not submitted to any distro.
+  packages:
+    name: Packages (${{ matrix.target }})
+    needs: build
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.experimental || false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            goarch: amd64
+          - target: aarch64-unknown-linux-gnu
+            goarch: arm64
+          - target: riscv64gc-unknown-linux-gnu
+            goarch: riscv64
+            experimental: true
+    env:
+      NFPM_VERSION: 2.47.0
+      NFPM_SHA256: 0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build
+        uses: actions/download-artifact@v4
+        with:
+          name: sandlock-${{ matrix.target }}
+
+      - name: Install nfpm
+        run: |
+          tarball=nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz
+          curl -fsSLO "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/${tarball}"
+          echo "${NFPM_SHA256}  ${tarball}" | sha256sum -c
+          sudo tar -xzf "${tarball}" -C /usr/local/bin nfpm
+
+      - name: Build packages
+        run: |
+          mkdir bin && tar -xzf sandlock-${{ matrix.target }}.tar.gz -C bin
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          packaging/build.sh bin "$version" ${{ matrix.goarch }} dist
+
+      # Only the runner's own arch can be installed and run here.
+      - name: Smoke-test the .deb and .rpm
+        if: matrix.goarch == 'amd64'
+        run: |
+          smoke='set -e; sandlock --version
+            sandlock run -r /usr -r /lib -r /lib64 -r /bin -r /etc -- /bin/echo ok
+            pkg-config --exists sandlock; ldconfig -p | grep -q libsandlock_ffi'
+          sudo apt-get update
+          sudo apt-get install -y ./dist/*.deb pkg-config
+          sh -c "$smoke"
+          docker run --rm --security-opt seccomp=unconfined -v "$PWD/dist:/dist:ro" rockylinux:9 \
+            sh -c "dnf install -y -q /dist/*.rpm pkgconf-pkg-config && $smoke"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.target }}
+          path: dist/*
+
   # Build Python sdist (includes setup.py that builds Rust on install)
   sdist:
     name: Build Python sdist
@@ -335,7 +396,7 @@ jobs:
   # Create GitHub Release with Rust binaries
   github-release:
     name: GitHub Release
-    needs: [build, test, go-libs]
+    needs: [build, test, go-libs, packages]
     # Only cut a GitHub Release on a real tag push, not on a manual
     # workflow_dispatch (which has no tag to attach assets to).
     if: github.event_name == 'push'
@@ -351,5 +412,8 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/*.tar.gz
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.deb
+            artifacts/**/*.rpm
           generate_release_notes: true

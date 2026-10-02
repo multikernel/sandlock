@@ -1,0 +1,65 @@
+# Driven by packaging/build.sh, which runs nfpm from the staging directory.
+# NAME is sandlock-dev for .deb and sandlock-devel for .rpm.
+name: ${NAME}
+version: ${VERSION}
+arch: ${ARCH}
+platform: linux
+section: libdevel
+priority: optional
+maintainer: Cong Wang <cwang@multikernel.io>
+description: |
+  Development files for the sandlock C library
+  libsandlock_ffi, its header and its pkg-config file, for building programs
+  (including ones using the Go SDK) that embed the sandlock sandbox.
+homepage: https://github.com/multikernel/sandlock
+license: Apache-2.0
+
+contents:
+  - src: ./sandlock.h
+    dst: /usr/include/sandlock.h
+    file_info: {mode: 0644}
+  - src: ./LICENSE
+    dst: /usr/share/doc/sandlock-dev/copyright
+    file_info: {mode: 0644}
+    packager: deb
+  - src: ./LICENSE
+    dst: /usr/share/licenses/sandlock-devel/LICENSE
+    type: license
+    file_info: {mode: 0644}
+    packager: rpm
+
+  # Fedora and RHEL only search /usr/lib64 for 64-bit libraries.
+  - src: ./libsandlock_ffi.so
+    dst: /usr/lib/libsandlock_ffi.so
+    file_info: {mode: 0755}
+    packager: deb
+  - src: ./sandlock-lib.pc
+    dst: /usr/lib/pkgconfig/sandlock.pc
+    file_info: {mode: 0644}
+    packager: deb
+  - src: ./libsandlock_ffi.so
+    dst: /usr/lib64/libsandlock_ffi.so
+    file_info: {mode: 0755}
+    packager: rpm
+  - src: ./sandlock-lib64.pc
+    dst: /usr/lib64/pkgconfig/sandlock.pc
+    file_info: {mode: 0644}
+    packager: rpm
+
+overrides:
+  deb:
+    depends:
+      - libc6 (>= 2.34)
+      - libgcc-s1
+  rpm:
+    depends:
+      - glibc >= 2.34
+      - libgcc
+
+deb:
+  triggers:
+    activate_noawait:
+      - ldconfig
+
+rpm:
+  group: Development/Libraries

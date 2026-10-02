@@ -1,0 +1,44 @@
+# Driven by packaging/build.sh, which runs nfpm from the staging directory.
+name: sandlock
+version: ${VERSION}
+arch: ${ARCH}
+platform: linux
+section: admin
+priority: optional
+maintainer: Cong Wang <cwang@multikernel.io>
+description: |
+  Lightweight process sandbox for Linux
+  Confines a process with Landlock, seccomp and seccomp user notification,
+  without root, containers or VMs.
+homepage: https://github.com/multikernel/sandlock
+license: Apache-2.0
+
+contents:
+  - src: ./sandlock
+    dst: /usr/bin/sandlock
+    file_info: {mode: 0755}
+  - src: ./sandlock-oci
+    dst: /usr/bin/sandlock-oci
+    file_info: {mode: 0755}
+  - src: ./LICENSE
+    dst: /usr/share/doc/sandlock/copyright
+    file_info: {mode: 0644}
+    packager: deb
+  - src: ./LICENSE
+    dst: /usr/share/licenses/sandlock/LICENSE
+    type: license
+    file_info: {mode: 0644}
+    packager: rpm
+
+overrides:
+  deb:
+    depends:
+      - libc6 (>= 2.34)
+      - libgcc-s1
+  rpm:
+    depends:
+      - glibc >= 2.34
+      - libgcc
+
+rpm:
+  group: System Environment/Base
