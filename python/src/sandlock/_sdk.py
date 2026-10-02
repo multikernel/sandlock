@@ -13,7 +13,7 @@ from enum import IntEnum
 from pathlib import Path
 from typing import Any, NamedTuple, Sequence
 
-from .sandbox import Change, Entry, Image, ImageConfig, Sandbox as PolicyDataclass
+from .sandbox import BranchAction, Change, Entry, Image, ImageConfig, Sandbox as PolicyDataclass
 
 # ----------------------------------------------------------------
 # Load the shared library
@@ -1201,13 +1201,13 @@ class _NativePolicy:
 
         # COW branch actions (0=Commit, 1=Abort, 2=Keep, 3=Defer)
         _action_map = {"commit": 0, "abort": 1, "keep": 2, "defer": 3}
-        on_exit_val = policy.on_exit.value if hasattr(policy.on_exit, 'value') else str(policy.on_exit)
-        on_error_val = policy.on_error.value if hasattr(policy.on_error, 'value') else str(policy.on_error)
+        on_exit_val = BranchAction(policy.on_exit).value
+        on_error_val = BranchAction(policy.on_error).value
         # An image's writes are always discarded, and the native build rejects
         # any other exit action, so leave the COMMIT default unsent for it.
         if policy.image is None or on_exit_val != "commit":
-            b = _b_on_exit(b, _action_map.get(on_exit_val, 0))
-        b = _b_on_error(b, _action_map.get(on_error_val, 1))
+            b = _b_on_exit(b, _action_map[on_exit_val])
+        b = _b_on_error(b, _action_map[on_error_val])
 
         if policy.max_memory is not None:
             if isinstance(policy.max_memory, str):

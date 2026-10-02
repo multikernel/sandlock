@@ -529,6 +529,8 @@ class Sandbox:
                 raise ValueError("sandbox name must not contain '/'")
             if self.name in (".", ".."):
                 raise ValueError("sandbox name must not be '.' or '..'")
+        self.on_exit = BranchAction(self.on_exit)
+        self.on_error = BranchAction(self.on_error)
         # Runtime state — not dataclass fields, not serialized
         self._native = None   # _NativePolicy created lazily on first use
         self._handle = None   # live sandbox handle during start()/run()

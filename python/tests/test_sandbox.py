@@ -811,6 +811,15 @@ class TestPauseResume:
 class TestBranchAction:
     """Every run reports its changes; DEFER hands the disposition to the caller."""
 
+    def test_string_action_is_coerced(self):
+        p = Sandbox(on_exit="abort", on_error="keep")
+        assert (p.on_exit, p.on_error) == (BranchAction.ABORT, BranchAction.KEEP)
+
+    @pytest.mark.parametrize("field", ["on_exit", "on_error"])
+    def test_unknown_action_is_rejected(self, field):
+        with pytest.raises(ValueError):
+            Sandbox(**{field: "Abort"})
+
     def test_abort_reports_added_file_without_creating_it(self, tmp_path):
         workdir = tmp_path / "add"
         workdir.mkdir()
