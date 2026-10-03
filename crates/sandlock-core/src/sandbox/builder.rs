@@ -426,6 +426,38 @@ impl SandboxBuilder {
         }
     }
 
+    /// Add the minimal standard character devices without granting `/dev`.
+    /// Null is read/write; zero and the two random sources are read-only.
+    /// Missing nodes are skipped. Unexpected types, symlinks or device numbers
+    /// fail closed. Library callers opt in; the CLI enables this by default.
+    pub fn standard_devices(mut self) -> Result<Self, SandboxError> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        for (name, minor, writable) in [
+            ("/dev/null", 3, true),
+            ("/dev/zero", 5, false),
+            ("/dev/random", 8, false),
+            ("/dev/urandom", 9, false),
+        ] {
+            let host = self.chroot.as_ref().map_or_else(
+                || PathBuf::from(name), |root| root.join(name.trim_start_matches('/')));
+            let metadata = match std::fs::symlink_metadata(&host) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(SandboxError::Invalid(format!("standard device {name}: {e}"))),
+            };
+            if !metadata.file_type().is_char_device()
+                || libc::major(metadata.rdev()) != 1 || libc::minor(metadata.rdev()) != minor
+            {
+                return Err(SandboxError::Invalid(format!("unexpected standard device: {name}")));
+            }
+            let grants = if writable { &mut self.fs_writable } else { &mut self.fs_readable };
+            if !grants.iter().any(|p| p == std::path::Path::new(name)) {
+                grants.push(PathBuf::from(name));
+            }
+        }
+        Ok(self)
+    }
+
     pub fn fs_deny(mut self, path: impl Into<PathBuf>) -> Self {
         self.fs_denied.push(path.into());
         self
