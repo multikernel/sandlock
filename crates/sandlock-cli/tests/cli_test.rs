@@ -717,3 +717,14 @@ fn test_dry_run_reports_changes_and_writes_nothing() {
     assert!(!sentinel.exists(), "a dry run must not write the workdir");
     assert!(stderr.contains("A  planned.txt"), "change list missing from stderr: {stderr}");
 }
+
+#[test]
+fn test_explicit_read_write_flag() {
+    let output = sandlock_bin()
+        .args(args_for_host(&["run", "-r", "/usr", "-r", "/lib", "-r", "/lib64", "-r", "/bin",
+            "--fs-read-write", "/tmp", "--", "sh", "-c",
+            "f=$(mktemp); printf rw > \"$f\"; cat \"$f\"; rm \"$f\""]))
+        .output().expect("run CLI read/write grant");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "rw");
+}

@@ -124,6 +124,14 @@ pub struct ConfinementBuilder {
 }
 
 impl ConfinementBuilder {
+    /// Grant both read/execute and write access to a path.
+    pub fn fs_read_write(mut self, path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        self.fs_readable.push(path.clone());
+        self.fs_writable.push(path);
+        self
+    }
+
     pub fn fs_write(mut self, path: impl Into<PathBuf>) -> Self {
         self.fs_writable.push(path.into());
         self

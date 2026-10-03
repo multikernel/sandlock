@@ -181,9 +181,10 @@ const (
 // control, which returns an independent *Process handle.
 type Sandbox struct {
 	// Filesystem (Landlock).
-	FSReadable []string // paths the sandbox may read (and execute)
-	FSWritable []string // paths the sandbox may read and write
-	FSDenied   []string // paths explicitly denied
+	FSReadable  []string // paths the sandbox may read (and execute)
+	FSWritable  []string // paths the sandbox may read and write
+	FSReadWrite []string // explicit read/execute and write grants
+	FSDenied    []string // paths explicitly denied
 
 	Workdir string // copy-on-write root; enables COW protection of this tree
 	Cwd     string // child working directory (chdir target)

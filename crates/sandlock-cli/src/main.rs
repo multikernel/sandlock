@@ -571,6 +571,7 @@ async fn run_command(args: RunArgs) -> Result<i32> {
     // CLI overrides — fields from flattened SandboxBuilder
     for p in &pb.fs_readable { builder = builder.fs_read(p); }
     for p in &pb.fs_writable { builder = builder.fs_write(p); }
+    for p in &pb.fs_read_write { builder = builder.fs_read_write(p); }
     if let Some(n) = pb.max_processes { builder = builder.max_processes(n); }
     for spec in &pb.net_allow { builder = builder.net_allow(spec); }
     for spec in &pb.net_deny { builder = builder.net_deny(spec); }

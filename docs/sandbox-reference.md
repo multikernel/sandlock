@@ -35,7 +35,7 @@ sandbox = Sandbox(
     no_supervisor=False,
 
     # [filesystem]
-    fs_readable=(), fs_writable=(), fs_denied=(),
+    fs_readable=(), fs_writable=(), fs_read_write=(), fs_denied=(),
     chroot=None, fs_mount={}, fs_mount_ro={},
     on_exit=BranchAction.COMMIT, on_error=BranchAction.ABORT,
 
@@ -317,6 +317,7 @@ filesystem isolation.
 | -------------- | ----------- | ------------------- | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
 | `fs_readable`  | `read`      | `Sequence[str]`     | `()`                    | Paths the sandbox may read (in addition to `fs_writable`).                                                                   |
 | `fs_writable`  | `write`     | `Sequence[str]`     | `()`                    | Paths the sandbox may read and write.                                                                                        |
+| `fs_read_write` | `read_write` | `Sequence[str]` | `()` | Explicitly grant both read/execute and write access. |
 | `fs_denied`    | `deny`      | `Sequence[str]`     | `()`                    | Paths explicitly denied (neither read nor write), even if implied by a broader rule.                                         |
 | `chroot`       | `chroot`    | `str \| None`       | `None`                  | Path to `chroot` into before applying other confinement.                                                                     |
 | `fs_mount`     | `mount`     | `Mapping[str, str]` | `{}`                    | Map virtual paths inside the chroot to host directories. Python form: `{"/work": "/host/sandbox/work"}`. TOML form: list of `"VIRTUAL:HOST"` strings. A trailing `:ro` (or the default `:rw`) selects a read-only mount: the CLI honours it in `--fs-mount` and in profiles, and `sandlock inspect --toml` writes `:ro` back out. The Python SDK loads `:ro` entries into `fs_mount_ro`. |
@@ -565,3 +566,17 @@ parse_ports([80, "443", "8000-8005"])
    `fs_denied`) or in `ctx.deny_path()` for runtime additions.
    `event.argv` is exposed and TOCTOU-safe; the supervisor freezes
    peer tasks before exposing it.
+
+### Explicit read/write grants
+
+Use Rust `Sandbox::builder().fs_read_write(path)` (also available on
+`Confinement::builder()`), CLI `--fs-read-write PATH`, Python
+`Sandbox(fs_read_write=[path])`, Go `Sandbox{FSReadWrite: []string{path}}`, or
+`[filesystem].read_write = ["/path"]` in a profile to request both authorities.
+The C ABI exposes `sandlock_sandbox_builder_fs_read_write`.
+
+These grants normalize to entries in both the readable and writable lists.
+Exported profiles may therefore use `read` and `write` rather than preserving
+the original `read_write` spelling; loading them retains both permissions.
+This explicit entry point prepares the #150 migration. The existing `fs_write`
+semantics are unchanged by this addition and still include read access.

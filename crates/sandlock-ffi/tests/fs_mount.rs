@@ -23,7 +23,7 @@ use sandlock_ffi::{
     sandlock_result_stdout, sandlock_result_success, sandlock_run, sandlock_sandbox_build,
     sandlock_sandbox_builder_chroot, sandlock_sandbox_builder_fs_mount,
     sandlock_sandbox_builder_fs_mount_ro, sandlock_sandbox_builder_fs_read,
-    sandlock_sandbox_builder_fs_write, sandlock_sandbox_builder_new, sandlock_sandbox_free,
+    sandlock_sandbox_builder_fs_write, sandlock_sandbox_builder_fs_read_write, sandlock_sandbox_builder_new, sandlock_sandbox_free,
     sandlock_sandbox_t, sandlock_string_free,
 };
 
@@ -467,4 +467,14 @@ fn read_only_mount_allows_reads_and_denies_writes() {
     let _ = fs::remove_dir_all(&rootfs);
     let _ = fs::remove_dir_all(&ro_host);
     let _ = fs::remove_dir_all(&rw_host);
+}
+
+#[test]
+fn builder_explicit_read_write_grants_both_authorities() {
+    let path = cstr("/tmp");
+    let sandbox = build_via_ffi(|b| unsafe {
+        sandlock_sandbox_builder_fs_read_write(b, path.as_ptr())
+    });
+    assert_eq!(sandbox.fs_readable, vec![PathBuf::from("/tmp")]);
+    assert_eq!(sandbox.fs_writable, vec![PathBuf::from("/tmp")]);
 }

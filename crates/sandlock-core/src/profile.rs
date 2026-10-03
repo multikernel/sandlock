@@ -100,6 +100,9 @@ pub struct FilesystemSection {
     pub read: Vec<PathBuf>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub write: Vec<PathBuf>,
+    /// Explicit union of read/execute and write authority.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub read_write: Vec<PathBuf>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -378,6 +381,11 @@ pub fn resolve(input: ProfileInput) -> Result<ResolvedProfile, SandlockError> {
     let p = input.program;
     let f = input.filesystem;
     let l = input.limits;
+    let read_write = paths(&mut ex, "[filesystem].read_write", f.read_write)?;
+    let mut fs_readable = paths(&mut ex, "[filesystem].read", f.read)?;
+    let mut fs_writable = paths(&mut ex, "[filesystem].write", f.write)?;
+    fs_readable.extend(read_write.iter().cloned());
+    fs_writable.extend(read_write);
     Ok(ResolvedProfile {
         http_ca: path(&mut ex, "[config].http_ca", c.http_ca)?,
         http_key: path(&mut ex, "[config].http_key", c.http_key)?,
@@ -401,8 +409,8 @@ pub fn resolve(input: ProfileInput) -> Result<ResolvedProfile, SandlockError> {
         no_coredump: p.no_coredump,
         no_huge_pages: p.no_huge_pages,
 
-        fs_readable: paths(&mut ex, "[filesystem].read", f.read)?,
-        fs_writable: paths(&mut ex, "[filesystem].write", f.write)?,
+        fs_readable,
+        fs_writable,
         fs_denied: paths(&mut ex, "[filesystem].deny", f.deny)?,
         chroot: path(&mut ex, "[filesystem].chroot", f.chroot)?,
         fs_mount,
@@ -732,6 +740,8 @@ pub fn sandbox_to_profile(s: &Sandbox, extra_denied: &[String]) -> ProfileInput 
                 .cloned()
                 .collect(),
             write: s.fs_writable.clone(),
+            // Runtime policy stores the normalized union in read and write.
+            read_write: Vec::new(),
             deny: fs_deny,
             chroot: s.chroot.clone(),
             mount: mount_specs,
@@ -952,6 +962,19 @@ mod tests {
         "#;
         let (policy, _spec) = parse_profile(toml).unwrap();
         assert_eq!(policy.fs_readable, vec![PathBuf::from("/usr/lib")]);
+    }
+
+    #[test]
+    fn read_write_grants_survive_profile_normalization() {
+        let (policy, _) = parse_profile("[filesystem]\nread = [\"/usr\"]\nread_write = [\"/tmp\"]").unwrap();
+        assert_eq!(policy.fs_readable, vec![PathBuf::from("/usr"), PathBuf::from("/tmp")]);
+        assert_eq!(policy.fs_writable, vec![PathBuf::from("/tmp")]);
+        let rendered = toml::to_string(&sandbox_to_profile(&policy, &[])).unwrap();
+        let (again, _) = parse_profile(&rendered).unwrap();
+        assert_eq!(again.fs_readable, policy.fs_readable);
+        assert_eq!(again.fs_writable, policy.fs_writable);
+        let error = parse_profile("[filesystem]\nread_write = [\"${NOPE}/out\"]").unwrap_err().to_string();
+        assert!(error.contains("[filesystem].read_write"), "{error}");
     }
 
     #[test]

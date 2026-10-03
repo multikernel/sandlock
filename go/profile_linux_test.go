@@ -153,3 +153,25 @@ func TestProfileReadOnlyMountIsEnforced(t *testing.T) {
 		}
 	}
 }
+
+func TestExplicitReadWrite(t *testing.T) {
+	sb, err := sandlock.ParseProfile("[filesystem]\nread_write = [\"/tmp\"]\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(sb.FSReadable, []string{"/tmp"}) || !reflect.DeepEqual(sb.FSWritable, []string{"/tmp"}) {
+		t.Fatalf("read_write did not grant both: %+v", sb)
+	}
+}
+
+func TestExplicitReadWriteSDK(t *testing.T) {
+	dir := t.TempDir()
+	sb := &sandlock.Sandbox{FSReadable: rootfs, FSReadWrite: []string{dir}}
+	result, err := sb.Run(context.Background(), "sh", "-c", `printf rw > "$1/out"; cat "$1/out"`, "sh", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Success || string(result.Stdout) != "rw" {
+		t.Fatalf("read/write SDK: %+v", result)
+	}
+}

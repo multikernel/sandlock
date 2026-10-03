@@ -366,6 +366,12 @@ sandlock_builder_t *sandlock_sandbox_builder_fs_write(sandlock_builder_t *b, con
  * # Safety
  * `b` and `path` must be valid pointers.
  */
+sandlock_builder_t *sandlock_sandbox_builder_fs_read_write(sandlock_builder_t *b, const char *path);
+
+/**
+ * # Safety
+ * `b` and `path` must be valid pointers.
+ */
 sandlock_builder_t *sandlock_sandbox_builder_fs_deny(sandlock_builder_t *b, const char *path);
 
 /**

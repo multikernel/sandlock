@@ -330,3 +330,16 @@ class TestMergeCliOverrides:
         base = Sandbox(clean_env=False)
         result = merge_cli_overrides(base, {"clean_env": True})
         assert result.clean_env is True
+
+
+def test_explicit_read_write_profile_normalizes_both_grants():
+    p = load('[filesystem]\nread_write = ["/tmp"]')
+    assert p.fs_readable == ["/tmp"]
+    assert p.fs_writable == ["/tmp"]
+
+
+def test_explicit_read_write_sdk_runs(tmp_path):
+    sb = Sandbox(fs_readable=["/usr", "/lib", "/bin"], fs_read_write=[str(tmp_path)])
+    result = sb.run(["sh", "-c", 'printf rw > "$1/out"; cat "$1/out"', "sh", str(tmp_path)])
+    assert result.exit_code == 0
+    assert result.stdout == b"rw"

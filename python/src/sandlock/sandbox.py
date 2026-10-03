@@ -244,6 +244,9 @@ class Sandbox:
     fs_readable: Sequence[str] = field(default_factory=list)
     """Paths the sandbox can read (in addition to writable paths)."""
 
+    fs_read_write: Sequence[str] = field(default_factory=list)
+    """Paths explicitly granted both read/execute and write access."""
+
     fs_denied: Sequence[str] = field(default_factory=list)
     """Paths explicitly denied (neither read nor write)."""
 

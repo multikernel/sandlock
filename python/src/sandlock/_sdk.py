@@ -74,6 +74,7 @@ def _builder_fn(name, *extra_args):
 
 _b_fs_read = _builder_fn("sandlock_sandbox_builder_fs_read", ctypes.c_char_p)
 _b_fs_write = _builder_fn("sandlock_sandbox_builder_fs_write", ctypes.c_char_p)
+_b_fs_read_write = _builder_fn("sandlock_sandbox_builder_fs_read_write", ctypes.c_char_p)
 _b_fs_deny = _builder_fn("sandlock_sandbox_builder_fs_deny", ctypes.c_char_p)
 _b_fs_storage = _builder_fn("sandlock_sandbox_builder_fs_storage", ctypes.c_char_p)
 _b_gpu_devices = _builder_fn("sandlock_sandbox_builder_gpu_devices", ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32)
@@ -1144,7 +1145,7 @@ class _NativePolicy:
     # managed outside it (policy_fn is wired in from_dataclass; notif_policy
     # is Python-side only; no_coredump is a Python convenience alias).
     _HANDLED_FIELDS: set[str] = {
-        "fs_writable", "fs_readable", "fs_denied", "fs_storage",
+        "fs_writable", "fs_readable", "fs_read_write", "fs_denied", "fs_storage",
         "workdir", "cwd", "chroot", "image", "fs_mount", "fs_mount_ro", "on_exit", "on_error",
         "max_memory", "max_disk", "max_processes", "max_cpu", "num_cpus",
         "cpu_cores", "gpu_devices",
@@ -1176,6 +1177,8 @@ class _NativePolicy:
             b = _b_fs_read(b, _encode(str(p)))
         for p in (policy.fs_writable or []):
             b = _b_fs_write(b, _encode(str(p)))
+        for p in (policy.fs_read_write or []):
+            b = _b_fs_read_write(b, _encode(str(p)))
         for p in (policy.fs_denied or []):
             b = _b_fs_deny(b, _encode(str(p)))
 

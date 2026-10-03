@@ -100,6 +100,21 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_fs_write(
 /// # Safety
 /// `b` and `path` must be valid pointers.
 #[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_fs_read_write(
+    b: *mut SandboxBuilder,
+    path: *const c_char,
+) -> *mut SandboxBuilder {
+    if b.is_null() || path.is_null() {
+        return b;
+    }
+    let path = CStr::from_ptr(path).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.fs_read_write(path)))
+}
+
+/// # Safety
+/// `b` and `path` must be valid pointers.
+#[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_fs_deny(
     b: *mut SandboxBuilder,
     path: *const c_char,

@@ -128,7 +128,7 @@ func goPolicyDrop(userData unsafe.Pointer) {
 // buildPolicy infallible with respect to string conversion.
 func (s *Sandbox) validateStrings() error {
 	groups := [][]string{
-		s.FSReadable, s.FSWritable, s.FSDenied,
+		s.FSReadable, s.FSWritable, s.FSReadWrite, s.FSDenied,
 		s.NetAllow, s.NetDeny, s.NetAllowBind, s.NetDenyBind,
 		s.HTTPAllow, s.HTTPDeny,
 		s.ExtraAllowSyscalls, s.ExtraDenySyscalls,
@@ -196,6 +196,11 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 	for _, p := range s.FSWritable {
 		str(func(b *C.sandlock_builder_t, c *C.char) *C.sandlock_builder_t {
 			return C.sandlock_sandbox_builder_fs_write(b, c)
+		}, p)
+	}
+	for _, p := range s.FSReadWrite {
+		str(func(b *C.sandlock_builder_t, c *C.char) *C.sandlock_builder_t {
+			return C.sandlock_sandbox_builder_fs_read_write(b, c)
 		}, p)
 	}
 	for _, p := range s.FSDenied {

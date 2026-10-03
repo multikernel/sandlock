@@ -13,6 +13,10 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(short = 'w', long = "fs-write", value_name = "PATH"))]
     pub fs_writable: Vec<PathBuf>,
 
+    /// Grant both read/execute and write access. Repeatable.
+    #[cfg_attr(feature = "cli", arg(long = "fs-read-write", value_name = "PATH"))]
+    pub fs_read_write: Vec<PathBuf>,
+
     #[cfg_attr(feature = "cli", arg(long = "fs-deny", value_name = "PATH"))]
     pub fs_denied: Vec<PathBuf>,
 
@@ -242,6 +246,7 @@ impl std::fmt::Debug for SandboxBuilder {
         f.debug_struct("SandboxBuilder")
             .field("fs_readable", &self.fs_readable)
             .field("fs_writable", &self.fs_writable)
+            .field("fs_read_write", &self.fs_read_write)
             .field("max_memory", &self.max_memory)
             .field("max_processes", &self.max_processes)
             .field("policy_fn", &self.policy_fn.as_ref().map(|_| "<callback>"))
@@ -254,6 +259,7 @@ impl Default for SandboxBuilder {
         Self {
             fs_readable: Vec::new(),
             fs_writable: Vec::new(),
+            fs_read_write: Vec::new(),
             fs_denied: Vec::new(),
             extra_deny_syscalls: Vec::new(),
             extra_allow_syscalls: Vec::new(),
@@ -318,6 +324,7 @@ impl Clone for SandboxBuilder {
         Self {
             fs_readable: self.fs_readable.clone(),
             fs_writable: self.fs_writable.clone(),
+            fs_read_write: self.fs_read_write.clone(),
             fs_denied: self.fs_denied.clone(),
             extra_deny_syscalls: self.extra_deny_syscalls.clone(),
             extra_allow_syscalls: self.extra_allow_syscalls.clone(),
@@ -404,6 +411,12 @@ impl SandboxBuilder {
     /// enforced only where the kernel supports it.
     pub fn disable(mut self, protection: Protection) -> Self {
         self.protection_policy.set(protection, ProtectionState::Disabled);
+        self
+    }
+
+    /// Grant both read/execute and write access to a path.
+    pub fn fs_read_write(mut self, path: impl Into<PathBuf>) -> Self {
+        self.fs_read_write.push(path.into());
         self
     }
 
@@ -814,7 +827,9 @@ impl SandboxBuilder {
     /// validation, but **without** the cross-section checks that
     /// `Sandbox::validate` performs. Use this in tests that deliberately
     /// construct sandboxes violating cross-section invariants.
-    pub fn build_unchecked(self) -> Result<Sandbox, SandboxError> {
+    pub fn build_unchecked(mut self) -> Result<Sandbox, SandboxError> {
+        self.fs_readable.extend(self.fs_read_write.iter().cloned());
+        self.fs_writable.append(&mut self.fs_read_write);
         validate_syscall_names(&self.extra_deny_syscalls)?;
         validate_allow_groups(&self.extra_allow_syscalls)?;
         validate_allow_deny_disjoint(&self.extra_allow_syscalls, &self.extra_deny_syscalls)?;
