@@ -13,16 +13,17 @@ use crate::sys::structs::{SeccompNotif, ECONNREFUSED};
 
 use super::materialize::{
     classify_dest_shape, materialize_msg, mmsg_entry_ptr, mmsg_msglen_addr,
-    named_unix_socket_path, parse_ip_from_sockaddr, parse_port_from_sockaddr, ChildMsghdr,
-    MaterializedMsg, MAX_SEND_BUF,
+    classify_unix_addr, parse_ip_from_sockaddr, parse_port_from_sockaddr,
+    snapshot_mmsg_headers, ChildMsghdr, MaterializedMsg, UnixAddr, MAX_SEND_BUF,
 };
 use super::send_engine::{batch_send_step, resolve_send, wants_blocking, BatchStep};
 use super::unix::{
-    mmsg_entry_named_unix_path, sendmmsg_named_unix_on_behalf, sendto_named_unix_on_behalf,
+    materialize_named_unix_msghdr_pinned, sendmmsg_named_unix_on_behalf,
+    sendto_named_unix_on_behalf, sendto_pinned_target_on_behalf,
     sendto_pinned_unix_on_behalf, unix_sendmsg_gate,
 };
 use super::verdict::{
-    check_ip_destination, classify_send_path, path_under_any, DestShape, SendPath,
+    check_ip_destination, classify_send_path, DestShape, SendPath,
 };
 use super::{query_socket_protocol, socket_is_unix, Protocol};
 
@@ -108,13 +109,18 @@ pub(super) async fn sendto_on_behalf(
         // Non-IP family. Gate a NAMED AF_UNIX datagram the same way as connect:
         // sendto to a named socket is a WRITE on its inode, so deny unless the
         // resolved real target is under an fs-write grant.
-        match named_unix_socket_path(&addr_bytes) {
-            Some(path) if ctx.policy.has_unix_fs_gate => {
+        match classify_unix_addr(&addr_bytes) {
+            UnixAddr::Named(path) if ctx.policy.has_unix_fs_gate => {
                 if ctx.policy.chroot_root.is_some() {
-                    if path_under_any(&path, &ctx.policy.chroot_writable) {
-                        NotifAction::Continue
-                    } else {
-                        NotifAction::Errno(libc::EACCES)
+                    let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
+                        Ok(fd) => fd,
+                        Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
+                    };
+                    match crate::chroot::dispatch::pin_named_unix_target(notif, &path, ctx).await {
+                        Ok(pinned) => sendto_pinned_target_on_behalf(
+                            notif, notif_fd, dup_fd, buf_ptr, buf_len, flags, pinned,
+                        ),
+                        Err(action) => action,
                     }
                 } else {
                     sendto_named_unix_on_behalf(
@@ -129,6 +135,9 @@ pub(super) async fn sendto_on_behalf(
                     )
                 }
             }
+            UnixAddr::Malformed(errno) if ctx.policy.has_unix_fs_gate => {
+                NotifAction::Errno(errno)
+            }
             _ => {
                 // Non-IP destination with no fs-path gate: an abstract unix
                 // address, a named unix address with the fs-gate off, a non-unix
@@ -141,7 +150,7 @@ pub(super) async fn sendto_on_behalf(
                 // out to a denied IP. Pin the fd and gate on its STABLE socket
                 // domain instead. NOTE: this fails closed for non-IP sends on
                 // non-unix sockets and for AF_UNIX destinations we cannot pin in
-                // the child's context (abstract / empty / non-UTF-8 `sun_path`)
+                // the child's context (abstract / empty `sun_path`)
                 // under a destination policy — see the PR description.
                 if !ctx.policy.has_net_destination_policy {
                     return NotifAction::Continue;
@@ -246,7 +255,9 @@ pub(super) async fn sendmsg_on_behalf(
     // IP path below only covers AF_INET/AF_INET6, and would pass a unix target
     // straight through.
     if ctx.policy.has_unix_fs_gate {
-        if let Some(action) = unix_sendmsg_gate(notif, ctx, notif_fd, sockfd, msghdr_ptr, flags) {
+        if let Some(action) =
+            unix_sendmsg_gate(notif, ctx, notif_fd, sockfd, msghdr_ptr, flags).await
+        {
             return action;
         }
     }
@@ -423,6 +434,117 @@ async fn send_msghdr_on_behalf(
 /// hops + one sendmsg).
 const MAX_MMSGHDR_ENTRIES: usize = 256;
 
+async fn sendmmsg_chroot_named_unix_on_behalf(
+    notif: &SeccompNotif,
+    ctx: &Arc<SupervisorCtx>,
+    notif_fd: RawFd,
+    sockfd: i32,
+    flags: i32,
+    headers: Vec<(u64, ChildMsghdr)>,
+    addresses: Vec<Vec<u8>>,
+    destinations: Vec<Option<std::path::PathBuf>>,
+) -> NotifAction {
+    let mut sent = 0usize;
+    let mut first_errno = None;
+    let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
+        Ok(fd) => fd,
+        Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
+    };
+    let protocol = query_socket_protocol(dup_fd.as_raw_fd());
+    for (((entry_ptr, hdr), addr_bytes), destination) in
+        headers.into_iter().zip(addresses).zip(destinations)
+    {
+        let message = if let Some(path) = destination {
+            let pinned = match crate::chroot::dispatch::pin_named_unix_target(notif, &path, ctx).await {
+                Ok(pinned) => pinned,
+                Err(NotifAction::Errno(errno)) => {
+                    first_errno = Some(errno);
+                    break;
+                }
+                Err(_) => {
+                    first_errno = Some(libc::EACCES);
+                    break;
+                }
+            };
+            match materialize_named_unix_msghdr_pinned(notif, notif_fd, hdr, pinned) {
+                Ok(message) => message,
+                Err(errno) => {
+                    first_errno = Some(errno);
+                    break;
+                }
+            }
+        } else {
+            match send_mmsg_other_entry(notif, ctx, notif_fd, &dup_fd, protocol, hdr, addr_bytes).await {
+                Ok(message) => message,
+                Err(errno) => {
+                    first_errno = Some(errno);
+                    break;
+                }
+            }
+        };
+        match batch_send_step(
+            &dup_fd,
+            message,
+            flags,
+            notif_fd,
+            notif.id,
+            notif.pid,
+            mmsg_msglen_addr(entry_ptr),
+            sent,
+        ) {
+            BatchStep::Sent => sent += 1,
+            BatchStep::Done(action) => return action,
+            BatchStep::Stop(errno) => {
+                if sent == 0 {
+                    first_errno = Some(errno);
+                }
+                break;
+            }
+        }
+    }
+    if sent > 0 {
+        NotifAction::ReturnValue(sent as i64)
+    } else {
+        NotifAction::Errno(first_errno.unwrap_or(libc::EACCES))
+    }
+}
+
+async fn send_mmsg_other_entry(
+    notif: &SeccompNotif,
+    ctx: &Arc<SupervisorCtx>,
+    notif_fd: RawFd,
+    dup_fd: &std::os::unix::io::OwnedFd,
+    protocol: Option<Protocol>,
+    hdr: ChildMsghdr,
+    addr_bytes: Vec<u8>,
+) -> Result<MaterializedMsg, i32> {
+    if matches!(classify_unix_addr(&addr_bytes), UnixAddr::Pathless) {
+        // A named-unix batch is executed by the supervisor, outside the
+        // child's Landlock abstract-socket scope. Stop before sending an
+        // abstract entry rather than widening that scope.
+        return Err(libc::EAFNOSUPPORT);
+    }
+    if !hdr.connected() {
+        if let Some(ip) = parse_ip_from_sockaddr(&addr_bytes) {
+            if ctx.policy.has_net_destination_policy {
+                let port = parse_port_from_sockaddr(&addr_bytes);
+                let protocol = protocol.ok_or(ECONNREFUSED)?;
+                check_ip_destination(ctx, notif.pid, protocol, ip, port).await?;
+            }
+        } else if ctx.policy.has_net_destination_policy {
+            return Err(libc::EAFNOSUPPORT);
+        }
+    }
+    materialize_msg(
+        notif,
+        notif_fd,
+        &hdr,
+        addr_bytes,
+        socket_is_unix(dup_fd.as_raw_fd()),
+        None,
+    )
+}
+
 /// Perform `sendmmsg()` on behalf of the child. Pre-scans every entry
 /// for Continue cases (NULL `msg_name` or non-IP family) — if any
 /// entry would Continue, we Continue the whole syscall to match
@@ -455,27 +577,46 @@ pub(super) async fn sendmmsg_on_behalf(
     // call on the first non-IP entry, which would let a unix entry bypass the
     // gate.
     if ctx.policy.has_unix_fs_gate {
-        let mut named_unix = false;
-        for i in 0..vlen {
-            let entry_ptr = mmsg_entry_ptr(msgvec_ptr, i);
-            if mmsg_entry_named_unix_path(notif, notif_fd, entry_ptr).is_some() {
-                named_unix = true;
-                break;
+        let headers = match snapshot_mmsg_headers(notif, notif_fd, msgvec_ptr, vlen) {
+            Ok(headers) => headers,
+            Err(errno) => return NotifAction::Errno(errno),
+        };
+        let mut addresses = Vec::with_capacity(headers.len());
+        for (_, hdr) in &headers {
+            if hdr.connected() {
+                addresses.push(Vec::new());
+            } else {
+                match super::read_sockaddr(
+                    notif_fd,
+                    notif.id,
+                    notif.pid,
+                    hdr.name_ptr,
+                    hdr.namelen as usize,
+                ) {
+                    Ok(bytes) => addresses.push(bytes),
+                    Err(errno) => return NotifAction::Errno(errno),
+                }
             }
         }
+        let mut destinations = Vec::with_capacity(addresses.len());
+        for ((_, hdr), bytes) in headers.iter().zip(&addresses) {
+            if hdr.connected() {
+                destinations.push(None);
+                continue;
+            }
+            match classify_unix_addr(bytes) {
+                UnixAddr::Named(path) => destinations.push(Some(path)),
+                UnixAddr::Malformed(errno) => return NotifAction::Errno(errno),
+                UnixAddr::NotUnix | UnixAddr::Pathless => destinations.push(None),
+            }
+        }
+        let named_unix = destinations.iter().any(Option::is_some);
         if named_unix {
             if ctx.policy.chroot_root.is_some() {
-                // Chroot: lexical check; deny the whole call if any named-unix
-                // entry is outside the (virtual) write grants.
-                for i in 0..vlen {
-                    let entry_ptr = mmsg_entry_ptr(msgvec_ptr, i);
-                    if let Some(path) = mmsg_entry_named_unix_path(notif, notif_fd, entry_ptr) {
-                        if !path_under_any(&path, &ctx.policy.chroot_writable) {
-                            return NotifAction::Errno(libc::EACCES);
-                        }
-                    }
-                }
-                // All granted: fall through to the existing path.
+                return sendmmsg_chroot_named_unix_on_behalf(
+                    notif, ctx, notif_fd, sockfd, flags, headers, addresses, destinations,
+                )
+                .await;
             } else {
                 return sendmmsg_named_unix_on_behalf(
                     notif,

@@ -2547,16 +2547,20 @@ async fn handle_notification(
     let fork_counted = matches!(action, NotifAction::Continue)
         && crate::resource::fork_counted_on_continue(&notif);
 
-    // TOCTOU-close for execve (issue #27): freeze every sandbox task
-    // that could mutate argv before policy_fn reads argv and before the
-    // kernel re-reads it after Continue. This covers two writer classes:
+    // Exec argv protection (issue #27): freeze every tracked sandbox task
+    // that could mutate argv before policy_fn reads it. The kernel's
+    // post-Continue consumption boundary is not observable here, and an
+    // outside process with a shared mapping is not enumerable via
+    // ProcessIndex; do not claim this freeze closes those remaining races.
+    // For tracked tasks, this covers two writer classes:
     //   1. Sibling threads of the calling tid (same TGID, share mm).
     //   2. Peer processes in other TGIDs that alias argv pages via
     //      MAP_SHARED mappings or share mm via clone(CLONE_VM).
     //
-    // The freeze enumerates ProcessIndex. With policy_fn active, that
-    // index is complete: fork-like syscalls are traced at creation time
-    // below, before new children can run user code.
+    // The freeze enumerates ProcessIndex. With policy_fn active, sandbox
+    // fork-like syscalls are traced at creation time below, before new
+    // children can run user code. This does not include unrelated external
+    // processes mapping the same MAP_SHARED backing object.
     //
     // Strict on failure: if we cannot establish the freeze, we cannot
     // safely expose argv or allow execve, so we deny with EPERM.
@@ -2592,8 +2596,9 @@ async fn handle_notification(
     }
 
     // Emit event to policy_fn callback if active. For execve, argv is
-    // only populated after `exec_freeze` has stopped every possible
-    // writer, and those tasks stay stopped until after NOTIF_SEND.
+    // populated after tracked tasks have been stopped. Peer tasks currently
+    // stay stopped until NOTIF_SEND returns; that return is not proof that
+    // the kernel has consumed all execve user-memory arguments.
     if let Some(verdict) = emit_policy_event(&notif, &action, &ctx.policy_fn, fd).await {
         use crate::policy_fn::Verdict;
         match verdict {

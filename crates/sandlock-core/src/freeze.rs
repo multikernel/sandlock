@@ -18,7 +18,11 @@
 //!    that share the calling task's `mm_struct` via
 //!    `clone(CLONE_VM)` without `CLONE_THREAD`.
 //!
-//! `freeze_sandbox_for_execve` closes both classes. When `policy_fn`
+//! `freeze_sandbox_for_execve` covers tracked sandbox tasks in both classes.
+//! It cannot discover a process outside `ProcessIndex` that independently
+//! maps the same `MAP_SHARED` backing object; that writer class remains an
+//! explicit limitation unless the backing object is otherwise controlled.
+//! When `policy_fn`
 //! is active, every fork-like syscall is traced for one ptrace
 //! fork/clone/vfork event and the child is registered in
 //! `ProcessIndex` before it can run user code. The exec freeze can
@@ -36,9 +40,12 @@
 //! siblings and peers because `de_thread` will not run.
 //!
 //! Peer threads (different TGID) survive execve. The supervisor must
-//! `PTRACE_DETACH` them after `NOTIF_SEND` so they can resume normal
-//! execution. The freeze function returns the peer TID list for that
-//! purpose; siblings are not returned because they need no follow-up.
+//! eventually `PTRACE_DETACH` them so they can resume normal execution.
+//! The current implementation detaches them after `NOTIF_SEND` succeeds,
+//! but notification-send success is not documented here as proof that the
+//! kernel has consumed execve's user-memory arguments. That ordering needs
+//! a kernel-observable completion boundary before this can be claimed as a
+//! complete TOCTOU guarantee.
 //!
 //! # Failure modes (strict)
 //!
@@ -192,10 +199,7 @@ fn list_threads_of_tgid(tgid: i32) -> io::Result<Vec<i32>> {
     let dir = fs::read_dir(format!("/proc/{}/task", tgid))?;
     let mut tids = Vec::new();
     for entry in dir {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+        let entry = entry?;
         let name = entry.file_name();
         let name_str = match name.to_str() {
             Some(s) => s,
@@ -206,6 +210,13 @@ fn list_threads_of_tgid(tgid: i32) -> io::Result<Vec<i32>> {
         }
     }
     Ok(tids)
+}
+
+/// `ESRCH`/`ENOENT` mean the process or task directory disappeared during
+/// enumeration. Other errors mean enumeration was incomplete and must not
+/// be treated as a successful freeze.
+fn task_directory_disappeared(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::ESRCH | libc::ENOENT))
 }
 
 /// Read the TGID containing `tid`, as an `io::Result` so a missing or
@@ -255,9 +266,13 @@ impl std::fmt::Display for FreezeError {
     }
 }
 
-/// Freeze every sandbox thread that could mutate execve argv before
-/// the supervisor reads it for `policy_fn` and before the kernel
-/// re-reads it.
+/// Freeze every enumerated, tracked sandbox thread that could mutate
+/// execve argv before the supervisor reads it for `policy_fn`.
+///
+/// This cannot discover external processes outside `ProcessIndex` that
+/// independently map the same shared backing object. The caller also must
+/// not treat `NOTIF_SEND` success as proof that the kernel has consumed the
+/// execve user-memory arguments.
 ///
 /// Walks every TGID in `processes`, enumerates each TGID's threads via
 /// `/proc/<tgid>/task/`, and `PTRACE_SEIZE` + `PTRACE_INTERRUPT`s
@@ -289,10 +304,23 @@ pub(crate) fn freeze_sandbox_for_execve(
 
     for tgid in &tgids {
         // /proc/<tgid>/task may disappear if the TGID exited between
-        // snapshot and walk — that's fine, no threads to freeze.
+        // snapshot and walk — that's fine. Any other enumeration error
+        // means the freeze would be incomplete, so roll back and fail.
         let tids = match list_threads_of_tgid(*tgid) {
             Ok(t) => t,
-            Err(_) => continue,
+            Err(e) if task_directory_disappeared(&e) => continue,
+            Err(e) => {
+                for t in &sibling_tids {
+                    detach(*t);
+                }
+                for t in &peer_tids {
+                    detach(*t);
+                }
+                return Err(FreezeError {
+                    error: e,
+                    pending_tids,
+                });
+            }
         };
         for tid in tids {
             if tid == caller_tid {
@@ -418,6 +446,22 @@ mod tests {
         assert!(requires_freeze_on_continue(libc::SYS_execveat));
         assert!(!requires_freeze_on_continue(libc::SYS_openat));
         assert!(!requires_freeze_on_continue(libc::SYS_connect));
+    }
+
+    #[test]
+    fn only_disappeared_task_directories_are_ignored() {
+        assert!(task_directory_disappeared(&io::Error::from_raw_os_error(
+            libc::ESRCH
+        )));
+        assert!(task_directory_disappeared(&io::Error::from_raw_os_error(
+            libc::ENOENT
+        )));
+        assert!(!task_directory_disappeared(&io::Error::from_raw_os_error(
+            libc::EACCES
+        )));
+        assert!(!task_directory_disappeared(&io::Error::from_raw_os_error(
+            libc::EIO
+        )));
     }
 
     /// Regression test for the cross-process TOCTOU concern raised on

@@ -57,15 +57,20 @@ positive int = deny with errno, `"audit"`/`-2` = allow + flag.
 >   belongs in static Landlock rules (`fs_readable` / `fs_writable` /
 >   `fs_denied`), kernel-enforced and TOCTOU-immune. Use
 >   `ctx.deny_path()` for runtime additions.
-> - **`event.argv` is exposed and TOCTOU-safe.** Before exposing
->   `argv` to `policy_fn` or returning `Continue` for an
->   `execve`, the supervisor freezes every task in `ProcessIndex`,
->   including peer processes that may alias argv through shared memory.
+> - **`event.argv` is read after a tracked-task freeze, with a remaining
+>   completion-boundary limitation.** Before exposing `argv` to
+>   `policy_fn`, the supervisor attempts to freeze every task in
+>   `ProcessIndex`, including tracked peers that may alias argv through
+>   shared memory. This cannot discover an outside process that independently
+>   maps the same `MAP_SHARED` backing object. Also, successful
+>   `SECCOMP_IOCTL_NOTIF_SEND` is not proof that the kernel has finished
+>   consuming execve's user-memory arguments; the current peer-release point
+>   therefore does not establish a complete TOCTOU guarantee.
 >   With `policy_fn` active, fork-like syscalls are traced for one
 >   ptrace creation event, so children are registered in `ProcessIndex`
->   before they can run user code. If the freeze or creation tracking
->   cannot be established (e.g., YAMA blocks ptrace), the syscall is
->   denied with `EPERM`; the safety invariant is never silently relaxed.
+>   before they can run user code. If thread enumeration, the freeze, or
+>   creation tracking cannot be established (e.g., YAMA blocks ptrace), the
+>   syscall is denied with `EPERM`.
 
 **Context methods:**
 - `ctx.restrict_network(ips)` / `ctx.grant_network(ips)`: network control

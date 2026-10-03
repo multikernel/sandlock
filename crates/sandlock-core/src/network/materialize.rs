@@ -6,6 +6,7 @@
 // never re-read child memory.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
 
 use crate::seccomp::notif::read_child_mem;
@@ -198,28 +199,50 @@ fn materialize_control(
 
 /// Extract the filesystem path of a NAMED `AF_UNIX` connect target from a raw
 /// `sockaddr`. Returns `None` for abstract sockets (`sun_path[0] == 0`),
-/// unnamed sockets, or any non-`AF_UNIX` family (none of which the fs gate
-/// applies to).
+/// unnamed sockets, malformed addresses, or any non-`AF_UNIX` family. Callers
+/// enforcing a filesystem gate must use [`classify_unix_addr`] to distinguish
+/// malformed input from a genuine pathless address.
 pub(crate) fn named_unix_socket_path(addr_bytes: &[u8]) -> Option<std::path::PathBuf> {
-    // sockaddr_un layout: u16 sun_family, then sun_path. Need the family plus
-    // at least one path byte.
-    if addr_bytes.len() < 3 {
-        return None;
+    match classify_unix_addr(addr_bytes) {
+        UnixAddr::Named(path) => Some(path),
+        _ => None,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum UnixAddr {
+    NotUnix,
+    Pathless,
+    Named(std::path::PathBuf),
+    Malformed(i32),
+}
+
+/// Parse a copied sockaddr while distinguishing pathless AF_UNIX addresses
+/// from truncated or oversized AF_UNIX structures.
+pub(crate) fn classify_unix_addr(addr_bytes: &[u8]) -> UnixAddr {
+    if addr_bytes.len() < std::mem::size_of::<libc::sa_family_t>() {
+        return UnixAddr::Malformed(libc::EINVAL);
     }
     let family = u16::from_ne_bytes([addr_bytes[0], addr_bytes[1]]);
     if family != libc::AF_UNIX as u16 {
-        return None;
+        return UnixAddr::NotUnix;
+    }
+    // An address containing only sa_family_t is a valid unnamed AF_UNIX
+    // address (sun_path has length zero); it is not a truncated pathname.
+    if addr_bytes.len() == std::mem::size_of::<libc::sa_family_t>() {
+        return UnixAddr::Pathless;
+    }
+    if addr_bytes.len() > std::mem::size_of::<libc::sockaddr_un>() {
+        return UnixAddr::Malformed(libc::EINVAL);
     }
     let sun_path = &addr_bytes[2..];
     if sun_path[0] == 0 {
-        return None; // abstract namespace (Landlock scope handles it)
+        return UnixAddr::Pathless;
     }
     let end = sun_path.iter().position(|&b| b == 0).unwrap_or(sun_path.len());
-    let raw = &sun_path[..end];
-    if raw.is_empty() {
-        return None;
-    }
-    std::str::from_utf8(raw).ok().map(std::path::PathBuf::from)
+    UnixAddr::Named(std::path::PathBuf::from(std::ffi::OsString::from_vec(
+        sun_path[..end].to_vec(),
+    )))
 }
 
 /// Classify a raw destination `sockaddr` into the [`DestShape`] the non-IP send
@@ -231,18 +254,11 @@ pub(crate) fn named_unix_socket_path(addr_bytes: &[u8]) -> Option<std::path::Pat
 /// `AF_UNIX` sockaddr both yield no pathname, but they must take opposite
 /// paths — see [`DestShape`].
 pub(crate) fn classify_dest_shape(addr_bytes: &[u8]) -> DestShape {
-    // Below two bytes there is no family to read; fail closed by reporting the
-    // shape the caller refuses.
-    if addr_bytes.len() < 2 {
-        return DestShape::UnixNoPath;
-    }
-    let family = u16::from_ne_bytes([addr_bytes[0], addr_bytes[1]]);
-    if family != libc::AF_UNIX as u16 {
-        return DestShape::NotUnix;
-    }
-    match named_unix_socket_path(addr_bytes) {
-        Some(path) => DestShape::UnixNamed(path),
-        None => DestShape::UnixNoPath,
+    match classify_unix_addr(addr_bytes) {
+        UnixAddr::NotUnix => DestShape::NotUnix,
+        UnixAddr::Pathless => DestShape::UnixNoPath,
+        UnixAddr::Named(path) => DestShape::UnixNamed(path),
+        UnixAddr::Malformed(errno) => DestShape::UnixMalformed(errno),
     }
 }
 
@@ -299,7 +315,7 @@ impl ChildMsghdr {
 
 /// `struct mmsghdr` on LP64: the 56-byte msghdr + 4-byte `msg_len` result +
 /// 4 bytes tail padding = 64 bytes, `msg_len` at offset 56.
-const MMSGHDR_SIZE: usize = 64;
+pub(crate) const MMSGHDR_SIZE: usize = 64;
 const MSG_LEN_OFFSET: usize = 56;
 
 /// Address of `sendmmsg` entry `i` in the child's `msgvec` array. The entry's
@@ -307,6 +323,40 @@ const MSG_LEN_OFFSET: usize = 56;
 /// what [`ChildMsghdr::read`] takes for the entry.
 pub(crate) fn mmsg_entry_ptr(msgvec_ptr: u64, i: usize) -> u64 {
     msgvec_ptr + (i * MMSGHDR_SIZE) as u64
+}
+
+/// Snapshot the complete bounded mmsghdr vector in one child-memory read.
+/// The syscall handler uses these owned headers for both destination checks
+/// and execution, so another thread cannot replace entries between the gate
+/// and the on-behalf sends.
+pub(crate) fn snapshot_mmsg_headers(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+    msgvec_ptr: u64,
+    vlen: usize,
+) -> Result<Vec<(u64, ChildMsghdr)>, i32> {
+    let bytes_len = vlen.checked_mul(MMSGHDR_SIZE).ok_or(libc::EINVAL)?;
+    let bytes = read_child_mem(notif_fd, notif.id, notif.pid, msgvec_ptr, bytes_len)
+        .map_err(|_| libc::EFAULT)?;
+    if bytes.len() != bytes_len {
+        return Err(libc::EFAULT);
+    }
+    parse_mmsg_headers(msgvec_ptr, &bytes)
+}
+
+fn parse_mmsg_headers(msgvec_ptr: u64, bytes: &[u8]) -> Result<Vec<(u64, ChildMsghdr)>, i32> {
+    if bytes.len() % MMSGHDR_SIZE != 0 {
+        return Err(libc::EFAULT);
+    }
+    bytes
+        .chunks_exact(MMSGHDR_SIZE)
+        .enumerate()
+        .map(|(i, entry)| {
+            ChildMsghdr::parse(entry)
+                .map(|hdr| (mmsg_entry_ptr(msgvec_ptr, i), hdr))
+                .ok_or(libc::EFAULT)
+        })
+        .collect()
 }
 
 /// Address of the `msg_len` result field inside the entry at `entry_ptr`.
@@ -489,6 +539,20 @@ mod tests {
         assert_eq!(mmsg_msglen_addr(0x1000), 0x1000 + MSG_LEN_OFFSET as u64);
     }
 
+    #[test]
+    fn mmsg_header_snapshot_parser_keeps_entry_addresses_and_fields() {
+        let mut bytes = vec![0u8; 2 * MMSGHDR_SIZE];
+        bytes[0..8].copy_from_slice(&0x1234u64.to_ne_bytes());
+        bytes[MMSGHDR_SIZE..MMSGHDR_SIZE + 8].copy_from_slice(&0x5678u64.to_ne_bytes());
+        let parsed = parse_mmsg_headers(0x1000, &bytes).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].0, 0x1000);
+        assert_eq!(parsed[0].1.name_ptr, 0x1234);
+        assert_eq!(parsed[1].0, 0x1000 + MMSGHDR_SIZE as u64);
+        assert_eq!(parsed[1].1.name_ptr, 0x5678);
+        assert_eq!(parse_mmsg_headers(0x1000, &bytes[..bytes.len() - 1]), Err(libc::EFAULT));
+    }
+
     // --- parse_ip_from_sockaddr tests (sockaddr bytes, child-controlled) ---
 
     fn v6_sockaddr_bytes(ip: Ipv6Addr, port: u16) -> Vec<u8> {
@@ -551,9 +615,7 @@ mod tests {
 
     #[test]
     fn dest_shape_pathless_unix_addresses_are_unix_no_path() {
-        // Abstract (leading NUL), unnamed (no path at all), and non-UTF-8
-        // sun_path all land in the arm that fails closed: there is nothing the
-        // supervisor can re-resolve in the child's root view.
+        // Abstract and unnamed addresses have no filesystem pathname.
         assert_eq!(
             classify_dest_shape(&unix_sockaddr_bytes(b"\0abstract-name")),
             DestShape::UnixNoPath
@@ -562,12 +624,41 @@ mod tests {
             classify_dest_shape(&unix_sockaddr_bytes(b"")),
             DestShape::UnixNoPath
         );
+        let raw_path =
+            std::path::PathBuf::from(std::ffi::OsString::from_vec(b"/run/\xff\xfe".to_vec()));
         assert_eq!(
             classify_dest_shape(&unix_sockaddr_bytes(b"/run/\xff\xfe\0")),
-            DestShape::UnixNoPath
+            DestShape::UnixNamed(raw_path.clone())
         );
-        // Too short to even carry a family: fail closed, do not guess.
-        assert_eq!(classify_dest_shape(&[1]), DestShape::UnixNoPath);
+        assert_eq!(
+            named_unix_socket_path(&unix_sockaddr_bytes(b"/run/\xff\xfe\0")),
+            Some(raw_path)
+        );
+        // Abstract is a genuine pathless address; truncation is distinct.
+        assert_eq!(classify_dest_shape(&[1]), DestShape::UnixMalformed(libc::EINVAL));
+        assert_eq!(
+            classify_unix_addr(&(libc::AF_UNIX as u16).to_ne_bytes()),
+            UnixAddr::Pathless
+        );
+        assert_eq!(
+            classify_unix_addr(&unix_sockaddr_bytes(b"\0abstract-name")),
+            UnixAddr::Pathless
+        );
+    }
+
+    #[test]
+    fn unix_address_length_boundaries_fail_closed() {
+        let family = (libc::AF_UNIX as u16).to_ne_bytes();
+        for len in 0..family.len() {
+            assert_eq!(classify_unix_addr(&family[..len]), UnixAddr::Malformed(libc::EINVAL));
+        }
+        let mut address = family.to_vec();
+        address.resize(std::mem::size_of::<libc::sockaddr_un>(), b'x');
+        assert!(matches!(classify_unix_addr(&address), UnixAddr::Named(_)));
+        address.push(0);
+        assert_eq!(classify_unix_addr(&address), UnixAddr::Malformed(libc::EINVAL));
+        address[family.len()] = 0;
+        assert_eq!(classify_unix_addr(&address), UnixAddr::Malformed(libc::EINVAL));
     }
 
     #[test]

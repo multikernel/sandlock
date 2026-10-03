@@ -49,6 +49,8 @@
 
 use std::ffi::CString;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::collections::VecDeque;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -60,6 +62,7 @@ use crate::chroot::resolve::{
 };
 use crate::sys::fs::{openat2_in_root, openat2_in_root_with_resolve};
 use crate::seccomp::notif::{decode_open_args, read_child_mem, write_child_mem, NotifAction, NotifPolicy};
+use crate::seccomp::ctx::SupervisorCtx;
 use crate::seccomp::state::{ChrootState, CowState, ProcessIndex};
 use crate::sys::structs::{SeccompNotif, SeccompNotifAddfd, SECCOMP_IOCTL_NOTIF_ADDFD};
 
@@ -167,6 +170,35 @@ impl ChrootCtx<'_> {
             format!("/{}", sub.to_string_lossy())
         };
         Some((mount_hp, sub_str))
+    }
+
+    /// Return the physical root and root-relative spelling used to resolve a
+    /// virtual path, honoring the most-specific bind mount.
+    fn root_and_subpath(&self, virtual_path: &Path) -> (PathBuf, PathBuf) {
+        let mut best: Option<(&Path, &Path)> = None;
+        for (virtual_mount, host_mount) in self.mounts {
+            if virtual_path.starts_with(virtual_mount)
+                && best.map_or(true, |(old, _)| {
+                    virtual_mount.as_os_str().len() > old.as_os_str().len()
+                })
+            {
+                best = Some((virtual_mount, host_mount));
+            }
+        }
+        match best {
+            Some((virtual_mount, host_mount)) => {
+                let relative = virtual_path
+                    .strip_prefix(virtual_mount)
+                    .expect("the most-specific mount prefix matched");
+                let subpath = if relative.as_os_str().is_empty() {
+                    PathBuf::from("/")
+                } else {
+                    Path::new("/").join(relative)
+                };
+                (host_mount.to_path_buf(), subpath)
+            }
+            None => (self.root.to_path_buf(), virtual_path.to_path_buf()),
+        }
     }
 
     /// Resolve a virtual path against mounts, using `resolver` for the part
@@ -461,6 +493,243 @@ fn resolve_chroot_path_existing(
         return Some(result);
     }
     resolve_existing_in_root(ctx.root, &full_path)
+}
+
+/// Resolve and pin a named AF_UNIX target in the same virtual chroot/mount/COW
+/// view used by path syscalls. The returned descriptor names the exact socket
+/// inode that was authorized; callers must use `/proc/self/fd/<n>` to perform
+/// the operation rather than returning a pathname to the kernel.
+pub(crate) async fn pin_named_unix_target(
+    notif: &SeccompNotif,
+    sun_path: &Path,
+    supervisor: &Arc<SupervisorCtx>,
+) -> Result<OwnedFd, NotifAction> {
+    let chroot = ChrootCtx::new(&supervisor.policy, &supervisor.processes);
+    let joined = if sun_path.is_absolute() {
+        sun_path.to_path_buf()
+    } else {
+        virtual_cwd_of(notif, &chroot)
+            .ok_or(NotifAction::Errno(libc::EACCES))?
+            .join(sun_path)
+    };
+    let virtual_path = canon_proc_self_path(&joined, notif.pid);
+
+    if chroot.is_denied(&crate::chroot::resolve::confine_path(&virtual_path)) {
+        return Err(NotifAction::Errno(libc::EACCES));
+    }
+
+    let cow = supervisor.cow.lock().await;
+    let (pinned, resolved_virtual) =
+        resolve_chroot_unix_target(&chroot, &virtual_path, cow.branch.as_ref())
+            .map_err(NotifAction::Errno)?;
+
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(pinned.as_raw_fd(), &mut stat) } != 0 {
+        return Err(NotifAction::Errno(libc::EACCES));
+    }
+    if stat.st_mode & libc::S_IFMT != libc::S_IFSOCK {
+        return Err(NotifAction::Errno(libc::ENOTSOCK));
+    }
+
+    let actual = std::fs::read_link(format!("/proc/self/fd/{}", pinned.as_raw_fd()))
+        .map_err(|_| NotifAction::Errno(libc::EACCES))?;
+    let logical = match cow.branch.as_ref() {
+        Some(branch) if actual.starts_with(branch.upper_dir()) => branch.workdir().join(
+            actual.strip_prefix(branch.upper_dir()).expect("upper path prefix matched"),
+        ),
+        _ => actual,
+    };
+    let actual_virtual = chroot
+        .host_to_virtual(&logical)
+        .ok_or(NotifAction::Errno(libc::EACCES))?;
+    if !chroot.can_write(&resolved_virtual) || !chroot.can_write(&actual_virtual) {
+        return Err(NotifAction::Errno(libc::EACCES));
+    }
+
+    Ok(pinned)
+}
+
+/// Rewrite procfs self aliases to the task that issued the notification.
+/// The resolver runs in the supervisor, where `/proc/self` would name the
+/// supervisor itself.
+fn canon_proc_self_path(path: &Path, pid: u32) -> PathBuf {
+    let bytes = path.as_os_str().as_bytes();
+    for magic in [b"/proc/self".as_slice(), b"/proc/thread-self".as_slice()] {
+        if bytes == magic || bytes.strip_prefix(magic).is_some_and(|tail| tail.starts_with(b"/")) {
+            let tail = &bytes[magic.len()..];
+            let mut rewritten = format!("/proc/{pid}").into_bytes();
+            rewritten.extend_from_slice(tail);
+            return PathBuf::from(std::ffi::OsString::from_vec(rewritten));
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Resolve a pathname component by component so symlink targets can cross
+/// virtual mount points and COW layers exactly where the child-visible path
+/// does. Every component is opened without following symlinks; symlink text is
+/// expanded as virtual path bytes and resolution restarts at the virtual root.
+fn resolve_chroot_unix_target(
+    chroot: &ChrootCtx<'_>,
+    path: &Path,
+    cow: Option<&crate::cow::seccomp::SeccompCowBranch>,
+) -> Result<(OwnedFd, PathBuf), i32> {
+    if requires_directory(path) {
+        return Err(libc::ENOTDIR);
+    }
+    let mut pending = path
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(_) | std::path::Component::ParentDir => {
+                Some(part_or_parent(component))
+            }
+            _ => None,
+        })
+        .collect::<VecDeque<_>>();
+    let mut virtual_prefix = PathBuf::from("/");
+    let mut symlink_count = 0usize;
+
+    while let Some(component) = pending.pop_front() {
+        if component == ".." {
+            virtual_prefix.pop();
+            continue;
+        }
+        if component == "." || component.is_empty() {
+            continue;
+        }
+
+        virtual_prefix.push(&component);
+        if virtual_prefix.as_os_str().len() > 4096 {
+            return Err(libc::ENAMETOOLONG);
+        }
+        let fd = open_chroot_unix_component(chroot, &virtual_prefix, cow)?;
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) } != 0 {
+            return Err(last_errno(libc::EACCES));
+        }
+        if stat.st_mode & libc::S_IFMT != libc::S_IFLNK {
+            if pending.is_empty() {
+                // Keep the descriptor we inspected instead of resolving the
+                // final pathname again after another task can replace it.
+                return Ok((fd, virtual_prefix));
+            }
+            if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+                return Err(libc::ENOTDIR);
+            }
+            continue;
+        }
+
+        symlink_count += 1;
+        if symlink_count > 40 {
+            return Err(libc::ELOOP);
+        }
+        let empty = CString::new(Vec::<u8>::new()).expect("empty CString");
+        let mut target = vec![0u8; 4096];
+        let length = unsafe {
+            libc::readlinkat(
+                fd.as_raw_fd(),
+                empty.as_ptr(),
+                target.as_mut_ptr() as *mut libc::c_char,
+                target.len(),
+            )
+        };
+        if length < 0 {
+            return Err(last_errno(libc::EACCES));
+        }
+        if length as usize == target.len() {
+            return Err(libc::ENAMETOOLONG);
+        }
+        target.truncate(length as usize);
+        let target_path = PathBuf::from(std::ffi::OsString::from_vec(target));
+        if pending.is_empty() && requires_directory(&target_path) {
+            return Err(libc::ENOTDIR);
+        }
+        if target_path.is_absolute() {
+            virtual_prefix = PathBuf::from("/");
+        } else {
+            virtual_prefix.pop();
+        }
+        let pending_bytes = pending
+            .iter()
+            .map(|part| part.as_os_str().len().saturating_add(1))
+            .sum::<usize>();
+        if virtual_prefix
+            .as_os_str()
+            .len()
+            .saturating_add(target_path.as_os_str().len())
+            .saturating_add(pending_bytes)
+            > 4096
+        {
+            return Err(libc::ENAMETOOLONG);
+        }
+        let mut replacement = target_path
+            .components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(part) => Some(part.to_os_string()),
+                std::path::Component::ParentDir => Some(std::ffi::OsString::from("..")),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        replacement.extend(pending);
+        pending = replacement.into();
+    }
+
+    let pinned = open_chroot_unix_component(chroot, &virtual_prefix, cow)?;
+    Ok((pinned, virtual_prefix))
+}
+
+fn requires_directory(path: &Path) -> bool {
+    let bytes = path.as_os_str().as_bytes();
+    bytes.ends_with(b"/") || bytes.ends_with(b"/.") || bytes == b"."
+}
+
+fn part_or_parent(component: std::path::Component<'_>) -> std::ffi::OsString {
+    match component {
+        std::path::Component::Normal(part) => part.to_os_string(),
+        std::path::Component::ParentDir => std::ffi::OsString::from(".."),
+        _ => unreachable!("only normal and parent components are retained"),
+    }
+}
+
+fn open_chroot_unix_component(
+    chroot: &ChrootCtx<'_>,
+    virtual_path: &Path,
+    cow: Option<&crate::cow::seccomp::SeccompCowBranch>,
+) -> Result<OwnedFd, i32> {
+    let (root, subpath) = chroot.root_and_subpath(virtual_path);
+    let candidate = root.join(subpath.strip_prefix("/").unwrap_or(&subpath));
+    let (root, subpath): (PathBuf, PathBuf) = if let Some(branch) = cow {
+        if let Some(candidate_utf8) = candidate.to_str().filter(|p| branch.matches(p)) {
+            let effective = branch.handle_stat(candidate_utf8).ok_or(libc::ENOENT)?;
+            if effective.starts_with(branch.upper_dir()) {
+                (
+                    branch.upper_dir().to_path_buf(),
+                    PathBuf::from("/").join(effective.strip_prefix(branch.upper_dir()).map_err(|_| libc::EACCES)?),
+                )
+            } else if effective.starts_with(branch.workdir()) {
+                (
+                    branch.workdir().to_path_buf(),
+                    PathBuf::from("/").join(effective.strip_prefix(branch.workdir()).map_err(|_| libc::EACCES)?),
+                )
+            } else {
+                return Err(libc::EACCES);
+            }
+        } else if candidate.starts_with(branch.workdir()) && candidate.to_str().is_none() {
+            return Err(libc::EACCES);
+        } else {
+            (root, subpath)
+        }
+    } else {
+        (root, subpath)
+    };
+    let fd = crate::sys::fs::openat2_in_root_path_with_resolve(
+        &root,
+        &subpath,
+        libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+        RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS,
+    )?;
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 /// Convert a Path to CString, returning Errno on failure.
@@ -2657,7 +2926,11 @@ mod self_rewrite_tests {
 
 #[cfg(test)]
 mod mount_ro_tests {
-    use super::{ChrootCtx, ProcessIndex};
+    use super::{resolve_chroot_unix_target, ChrootCtx, ProcessIndex};
+    use std::fs;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::net::UnixListener;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
@@ -2701,5 +2974,130 @@ mod mount_ro_tests {
         let c = ctx(&mounts, &ro, &writable, &processes);
         assert!(c.can_read(Path::new("/data/file")));
         assert!(c.can_write(Path::new("/data/file")));
+    }
+
+    #[test]
+    fn target_resolution_uses_the_most_specific_mount_and_keeps_raw_bytes() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let mounts = vec![
+            (PathBuf::from("/data"), PathBuf::from("/host/data")),
+            (
+                PathBuf::from("/data/nested"),
+                PathBuf::from("/host/special"),
+            ),
+        ];
+        let processes = Arc::new(ProcessIndex::new());
+        let c = ctx(&mounts, &[], &[], &processes);
+        let raw_name = PathBuf::from(std::ffi::OsString::from_vec(
+            [b"/data/nested/", &[0xff][..]].concat(),
+        ));
+
+        let (root, subpath) = c.root_and_subpath(&raw_name);
+        assert_eq!(root, Path::new("/host/special"));
+        assert_eq!(subpath.as_os_str().as_bytes(), b"/\xff");
+    }
+
+    #[test]
+    fn unix_target_resolution_follows_virtual_symlink_across_mount() {
+        let temp = std::env::temp_dir().join(format!(
+            "sandlock-chroot-unix-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = temp.join("root");
+        let mounted = temp.join("mounted");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&mounted).unwrap();
+        let socket_path = mounted.join("endpoint.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        std::os::unix::fs::symlink("/mnt/endpoint.sock", root.join("alias.sock")).unwrap();
+
+        let mounts = vec![(PathBuf::from("/mnt"), mounted)];
+        let writable = vec![PathBuf::from("/mnt")];
+        let processes = Arc::new(ProcessIndex::new());
+        let context = ChrootCtx {
+            root: &root,
+            readable: &[],
+            writable: &writable,
+            denied: &[],
+            mounts: &mounts,
+            mount_ro: &[],
+            processes: &processes,
+        };
+
+        let (pinned, resolved) = resolve_chroot_unix_target(
+            &context,
+            Path::new("/alias.sock"),
+            None,
+        )
+        .unwrap();
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(pinned.as_raw_fd(), &mut stat) }, 0);
+        assert_eq!(stat.st_mode & libc::S_IFMT, libc::S_IFSOCK);
+        assert_eq!(resolved, Path::new("/mnt/endpoint.sock"));
+        assert!(context.can_write(&resolved));
+        assert!(listener.local_addr().is_ok());
+
+        // Replace the pathname after resolution. An on-behalf connection
+        // through the pin must still reach the original listener.
+        fs::rename(&socket_path, socket_path.with_extension("old")).unwrap();
+        let replacement = UnixListener::bind(&socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        replacement.set_nonblocking(true).unwrap();
+        let stream = std::os::unix::net::UnixStream::connect(format!(
+            "/proc/self/fd/{}", pinned.as_raw_fd()
+        )).unwrap();
+        assert!(listener.accept().is_ok(), "pinned inode must receive the connection");
+        assert_eq!(replacement.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        drop(stream);
+        drop(replacement);
+        drop(listener);
+        drop(pinned);
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn unix_target_resolution_preserves_non_utf8_socket_name() {
+        let temp = std::env::temp_dir().join(format!(
+            "sandlock-chroot-unix-byte-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let name = std::ffi::OsString::from_vec(b"socket-\xff".to_vec());
+        let path = temp.join(name);
+        let listener = UnixListener::bind(&path).unwrap();
+        let processes = Arc::new(ProcessIndex::new());
+        let writable = vec![PathBuf::from("/")];
+        let context = ChrootCtx {
+            root: &temp,
+            readable: &[],
+            writable: &writable,
+            denied: &[],
+            mounts: &[],
+            mount_ro: &[],
+            processes: &processes,
+        };
+
+        let raw_virtual = PathBuf::from(std::ffi::OsString::from_vec(
+            [b"/socket-", &[0xff][..]].concat(),
+        ));
+        let (pinned, resolved) =
+            resolve_chroot_unix_target(&context, &raw_virtual, None).unwrap();
+        assert_eq!(
+            resolved.as_os_str().as_bytes(),
+            [b"/socket-", &[0xff][..]].concat()
+        );
+        assert!(context.can_write(&resolved));
+        drop(listener);
+        drop(pinned);
+        fs::remove_dir_all(temp).unwrap();
     }
 }

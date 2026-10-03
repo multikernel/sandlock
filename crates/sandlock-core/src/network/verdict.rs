@@ -94,8 +94,10 @@ pub(crate) fn real_path_under_any(real: &std::path::Path, prefixes: &[std::path:
 /// filesystem), is at or under any of the granted `prefixes`. Mirrors the
 /// prefix matching the chroot fs enforcement uses.
 pub(crate) fn path_under_any(path: &std::path::Path, prefixes: &[std::path::PathBuf]) -> bool {
-    let norm = crate::chroot::resolve::confine(&path.to_string_lossy());
-    prefixes.iter().any(|p| norm.starts_with(p))
+    let norm = crate::chroot::resolve::confine_path(path);
+    prefixes
+        .iter()
+        .any(|prefix| norm.starts_with(&crate::chroot::resolve::confine_path(prefix)))
 }
 
 /// The shape of a non-IP destination sockaddr, keyed on its ADDRESS FAMILY
@@ -113,9 +115,10 @@ pub(crate) enum DestShape {
     /// re-resolve in the child's root view.
     UnixNamed(std::path::PathBuf),
     /// `sa_family == AF_UNIX` with no usable pathname: an ABSTRACT address
-    /// (`sun_path[0] == 0`), an unnamed one, a non-UTF-8 `sun_path`, or a
-    /// buffer too short to carry a family at all.
+    /// (`sun_path[0] == 0`) or an unnamed one.
     UnixNoPath,
+    /// AF_UNIX sockaddr malformed before the kernel could interpret a target.
+    UnixMalformed(i32),
     /// `sa_family != AF_UNIX`. Reached here only for families
     /// `parse_ip_from_sockaddr` does not handle: `AF_NETLINK`, `AF_PACKET`,
     /// `AF_VSOCK`, ...
@@ -163,7 +166,7 @@ pub(crate) enum SendPath {
     /// Everything else, failed closed with `EAFNOSUPPORT`:
     ///   - a non-IP address on a non-unix socket — the address-family-swap shape;
     ///   - an `AF_UNIX` destination we cannot pin in the child's context: an
-    ///     ABSTRACT address, an empty one, or a non-UTF-8 `sun_path`.
+    ///     ABSTRACT or empty AF_UNIX address.
     ///
     /// Abstract addresses fail closed because an on-behalf send is executed by
     /// the supervisor, which carries no Landlock domain, and
@@ -200,7 +203,7 @@ pub(crate) fn classify_send_path(
         None if !is_unix_socket => SendPath::Reject,
         None => match dest {
             DestShape::UnixNamed(_) => SendPath::NamedUnixOnBehalf,
-            DestShape::UnixNoPath => SendPath::Reject,
+            DestShape::UnixNoPath | DestShape::UnixMalformed(_) => SendPath::Reject,
             DestShape::NotUnix => SendPath::RawDestOnBehalf,
         },
     }
@@ -352,8 +355,25 @@ mod tests {
     }
 
     #[test]
+    fn chroot_unix_grant_prefix_matches_raw_bytes_exactly() {
+        use std::os::unix::ffi::OsStringExt;
+        let granted = std::path::PathBuf::from(std::ffi::OsString::from_vec(b"/run/\xff".to_vec()));
+        let allowed =
+            std::path::PathBuf::from(std::ffi::OsString::from_vec(b"/run/\xff/service".to_vec()));
+        let different =
+            std::path::PathBuf::from(std::ffi::OsString::from_vec(b"/run/\xfe/service".to_vec()));
+
+        assert!(path_under_any(&allowed, std::slice::from_ref(&granted)));
+        assert!(!path_under_any(&different, std::slice::from_ref(&granted)));
+        assert!(path_under_any(
+            std::path::Path::new("/run/../run/service"),
+            &[std::path::PathBuf::from("/run")]
+        ));
+    }
+
+    #[test]
     fn send_path_abstract_unix_destination_is_rejected() {
-        // An abstract (or empty, or non-UTF-8) AF_UNIX address has no pathname
+        // An abstract or empty AF_UNIX address has no pathname
         // to pin. It must fail closed rather than be sent on-behalf — the
         // supervisor carries no Landlock domain, so an on-behalf abstract send
         // would escape the child's LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET.
