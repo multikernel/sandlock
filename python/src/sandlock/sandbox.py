@@ -24,41 +24,9 @@ from typing import TYPE_CHECKING, Callable, Mapping, Sequence
 _name_counter = itertools.count(1)
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from ._notif_policy import NotifPolicy
-
-
-# --- Memory size parsing (from branching/process/limits.py) ---
-
-_UNITS = {
-    "K": 1024,
-    "M": 1024 ** 2,
-    "G": 1024 ** 3,
-    "T": 1024 ** 4,
-}
-
-_SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([KMGT])?\s*$", re.IGNORECASE)
-
-
-def parse_memory_size(s: str) -> int:
-    """Parse a human-friendly memory size string to bytes.
-
-    Accepts plain integers (bytes) or suffixed values: ``'512M'``, ``'1G'``,
-    ``'100K'``.  The suffix is case-insensitive.
-
-    Returns:
-        Size in bytes (integer).
-
-    Raises:
-        ValueError: If the string cannot be parsed.
-    """
-    m = _SIZE_RE.match(s)
-    if m is None:
-        raise ValueError(f"invalid memory size: {s!r}")
-    value = float(m.group(1))
-    suffix = m.group(2)
-    if suffix is not None:
-        value *= _UNITS[suffix.upper()]
-    return int(value)
 
 
 _PORT_RANGE_RE = re.compile(r"^(\d+)(?:-(\d+))?$")
@@ -341,7 +309,8 @@ class Sandbox:
 
     # Resource limits
     max_memory: str | int | None = None
-    """Memory limit. String like '512M' or int bytes."""
+    """Memory limit: a size such as ``'512M'``, or int bytes. The core
+    parses it, so the spelling is the one ``--max-memory`` takes."""
 
     max_processes: int | None = None
     """Maximum concurrent processes in the sandbox (threads do not
@@ -386,11 +355,11 @@ class Sandbox:
     """Seed for deterministic randomness. When set, getrandom() returns
     deterministic bytes from a seeded PRNG. Same seed = same output."""
 
-    time_start: float | str | None = None
+    time_start: datetime | str | None = None
     """Start timestamp for time virtualization. When set, clock_gettime()
-    and gettimeofday() return shifted time starting from this epoch.
-    Accepts a Unix timestamp (float) or ISO 8601 string.
-    Time ticks at real speed from the given start point."""
+    and gettimeofday() return shifted time starting from this instant.
+    Accepts an RFC 3339 string with an offset (``'2000-01-01T00:00:00Z'``)
+    or an aware datetime. Time ticks at real speed from the given point."""
 
     no_randomize_memory: bool = False
     """Disable Address Space Layout Randomization (ASLR) inside the sandbox.
@@ -474,8 +443,8 @@ class Sandbox:
     fs_storage: str | None = None
     """Separate storage directory for the seccomp COW upper layer / deltas."""
 
-    max_disk: str | None = None
-    """Disk quota for COW storage (e.g. ``'1G'``).
+    max_disk: str | int | None = None
+    """Disk quota for COW storage (e.g. ``'1G'``, or int bytes).
     Enforced by the COW layer (returns ENOSPC)."""
 
     on_exit: BranchAction = BranchAction.COMMIT
@@ -567,29 +536,6 @@ class Sandbox:
     # ------------------------------------------------------------------
     # Config helper methods
     # ------------------------------------------------------------------
-
-    def memory_bytes(self) -> int | None:
-        """Return max_memory as bytes, or None if unset."""
-        if self.max_memory is None:
-            return None
-        if isinstance(self.max_memory, int):
-            return self.max_memory
-        return parse_memory_size(self.max_memory)
-
-    def time_start_timestamp(self) -> float | None:
-        """Return time_start as a Unix timestamp float, or None if unset."""
-        if self.time_start is None:
-            return None
-        if isinstance(self.time_start, (int, float)):
-            return float(self.time_start)
-        from datetime import datetime, timezone
-        s = self.time_start
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.timestamp()
 
     def cpu_pct(self) -> int | None:
         """Return max_cpu as a clamped percentage (1–100), or None."""

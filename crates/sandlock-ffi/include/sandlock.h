@@ -476,16 +476,22 @@ sandlock_builder_t *sandlock_sandbox_builder_on_exit(sandlock_builder_t *b, uint
 sandlock_builder_t *sandlock_sandbox_builder_on_error(sandlock_builder_t *b, uint8_t action);
 
 /**
+ * `size` uses the CLI and profile grammar, e.g. "512M". A value that does not
+ * parse fails the build with the reason; a null `size` returns null.
+ *
  * # Safety
- * `b` must be a valid builder pointer.
+ * `b` must be a valid builder pointer; `size` a NUL-terminated string or null.
  */
-sandlock_builder_t *sandlock_sandbox_builder_max_memory(sandlock_builder_t *b, uint64_t bytes);
+sandlock_builder_t *sandlock_sandbox_builder_max_memory(sandlock_builder_t *b, const char *size);
 
 /**
+ * `size` uses the CLI and profile grammar, e.g. "10G". A value that does not
+ * parse fails the build with the reason; a null `size` returns null.
+ *
  * # Safety
- * `b` must be a valid builder pointer.
+ * `b` must be a valid builder pointer; `size` a NUL-terminated string or null.
  */
-sandlock_builder_t *sandlock_sandbox_builder_max_disk(sandlock_builder_t *b, uint64_t bytes);
+sandlock_builder_t *sandlock_sandbox_builder_max_disk(sandlock_builder_t *b, const char *size);
 
 /**
  * # Safety
@@ -633,10 +639,15 @@ sandlock_builder_t *sandlock_sandbox_builder_env_var(sandlock_builder_t *b,
                                                      const char *value);
 
 /**
+ * `timestamp` is RFC 3339 with an offset, e.g. "2000-01-01T00:00:00Z". A value
+ * that does not parse fails the build with the reason; null returns null.
+ *
  * # Safety
- * `b` must be a valid builder pointer. `epoch_secs` is seconds since UNIX epoch.
+ * `b` must be a valid builder pointer; `timestamp` a NUL-terminated string
+ * or null.
  */
-sandlock_builder_t *sandlock_sandbox_builder_time_start(sandlock_builder_t *b, uint64_t epoch_secs);
+sandlock_builder_t *sandlock_sandbox_builder_time_start(sandlock_builder_t *b,
+                                                        const char *timestamp);
 
 /**
  * # Safety

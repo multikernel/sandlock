@@ -30,8 +30,6 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
-
-	"github.com/multikernel/sandlock/go/internal/policy"
 )
 
 // hasNUL reports whether s contains an interior NUL byte, which cannot survive
@@ -299,20 +297,14 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 
 	// Resource limits.
 	if s.MaxMemory != "" {
-		v, err := policy.ParseMemory(s.MaxMemory)
-		if err != nil {
-			freeBuilderViaBuild(b)
-			return nil, err
-		}
-		b = C.sandlock_sandbox_builder_max_memory(b, C.uint64_t(v))
+		str(func(b *C.sandlock_builder_t, c *C.char) *C.sandlock_builder_t {
+			return C.sandlock_sandbox_builder_max_memory(b, c)
+		}, s.MaxMemory)
 	}
 	if s.MaxDisk != "" {
-		v, err := policy.ParseMemory(s.MaxDisk)
-		if err != nil {
-			freeBuilderViaBuild(b)
-			return nil, err
-		}
-		b = C.sandlock_sandbox_builder_max_disk(b, C.uint64_t(v))
+		str(func(b *C.sandlock_builder_t, c *C.char) *C.sandlock_builder_t {
+			return C.sandlock_sandbox_builder_max_disk(b, c)
+		}, s.MaxDisk)
 	}
 	if s.MaxProcesses > 0 {
 		b = C.sandlock_sandbox_builder_max_processes(b, C.uint32_t(s.MaxProcesses))
@@ -354,12 +346,9 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 		b = C.sandlock_sandbox_builder_random_seed(b, C.uint64_t(*s.RandomSeed))
 	}
 	if s.TimeStart != "" {
-		secs, err := policy.ParseTimeStart(s.TimeStart)
-		if err != nil {
-			freeBuilderViaBuild(b)
-			return nil, err
-		}
-		b = C.sandlock_sandbox_builder_time_start(b, C.uint64_t(secs))
+		str(func(b *C.sandlock_builder_t, c *C.char) *C.sandlock_builder_t {
+			return C.sandlock_sandbox_builder_time_start(b, c)
+		}, s.TimeStart)
 	}
 	if s.NoRandomizeMemory {
 		b = C.sandlock_sandbox_builder_no_randomize_memory(b, cbool(true))
@@ -432,8 +421,8 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 // freeBuilderViaBuild consumes a builder that will not be used, so it is not
 // leaked. The FFI exposes no builder-free entry point; build() is the only
 // consumer, so we build and immediately free the resulting policy (or discard
-// a build error). Reached only on the rare numeric-parse error paths after the
-// builder already exists.
+// a build error). Reached only on a validation error found after the builder
+// already exists.
 func freeBuilderViaBuild(b *C.sandlock_builder_t) {
 	var errCode C.int
 	var errMsg *C.char

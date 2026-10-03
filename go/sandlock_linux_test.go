@@ -159,6 +159,34 @@ func TestRunUnknownBranchActionRejected(t *testing.T) {
 	}
 }
 
+func TestSizeAndTimeRefusedByCore(t *testing.T) {
+	cases := []struct {
+		sb   *sandlock.Sandbox
+		knob string
+	}{
+		{&sandlock.Sandbox{MaxMemory: "1.5G"}, "max_memory"},
+		{&sandlock.Sandbox{MaxDisk: "1T"}, "max_disk"},
+		{&sandlock.Sandbox{TimeStart: "1767225600"}, "time_start"},
+	}
+	for _, c := range cases {
+		if _, err := c.sb.Run(context.Background(), "true"); err == nil || !strings.Contains(err.Error(), c.knob) {
+			t.Fatalf("err = %v, want a %s refusal", err, c.knob)
+		}
+	}
+}
+
+func TestTimeStartBeforeEpoch(t *testing.T) {
+	requireLandlock(t)
+	sb := &sandlock.Sandbox{FSReadable: rootfs, MaxMemory: "64M", TimeStart: "1969-07-20T20:17:00Z"}
+	res, err := sb.Run(context.Background(), "date", "-u", "+%Y")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := strings.TrimSpace(string(res.Stdout)); got != "1969" {
+		t.Fatalf("year = %q, want 1969 (stderr=%q)", got, res.Stderr)
+	}
+}
+
 func TestSyscallEventArgvContains(t *testing.T) {
 	ev := sandlock.SyscallEvent{Argv: []string{"python3", "-c", "print(1)"}}
 	if !ev.ArgvContains("python") {

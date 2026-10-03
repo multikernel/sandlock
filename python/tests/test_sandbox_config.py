@@ -7,43 +7,49 @@ import pytest
 
 from sandlock.sandbox import (
     Sandbox,
-    parse_memory_size,
     parse_ports,
 )
 
 
-class TestParseMemorySize:
-    def test_plain_bytes(self):
-        assert parse_memory_size("1024") == 1024
+class TestCoreOwnsSizeAndTimeGrammar:
+    """Size and timestamp fields are forwarded verbatim; the core decides."""
 
-    def test_kilobytes(self):
-        assert parse_memory_size("100K") == 100 * 1024
+    @pytest.mark.parametrize("field,value", [
+        ("max_memory", "512M"),
+        ("max_memory", 1024),
+        ("max_disk", "1G"),
+        ("time_start", "1969-07-20T20:17:00Z"),
+        ("time_start", "2026-01-01T00:00:00.5+08:00"),
+    ])
+    def test_accepted(self, field, value):
+        Sandbox(**{field: value})._ensure_native()
 
-    def test_megabytes(self):
-        assert parse_memory_size("512M") == 512 * 1024 ** 2
+    @pytest.mark.parametrize("field,value", [
+        ("max_memory", "1.5G"),
+        ("max_memory", "1T"),
+        ("max_disk", "lots"),
+        ("time_start", "1767225600"),
+        ("time_start", 1767225600.5),
+    ])
+    def test_refused_with_core_reason(self, field, value):
+        with pytest.raises(RuntimeError, match=field):
+            Sandbox(**{field: value})._ensure_native()
 
-    def test_gigabytes(self):
-        assert parse_memory_size("1G") == 1024 ** 3
+    def test_aware_datetime_is_forwarded(self):
+        from datetime import datetime, timezone
+        Sandbox(time_start=datetime(1969, 7, 20, tzinfo=timezone.utc))._ensure_native()
 
-    def test_terabytes(self):
-        assert parse_memory_size("2T") == 2 * 1024 ** 4
+    def test_naive_datetime_is_refused(self):
+        from datetime import datetime
+        with pytest.raises(RuntimeError, match="time_start"):
+            Sandbox(time_start=datetime(2000, 1, 1))._ensure_native()
 
-    def test_case_insensitive(self):
-        assert parse_memory_size("512m") == 512 * 1024 ** 2
 
-    def test_fractional(self):
-        assert parse_memory_size("1.5G") == int(1.5 * 1024 ** 3)
-
-    def test_whitespace(self):
-        assert parse_memory_size("  512M  ") == 512 * 1024 ** 2
-
-    def test_invalid(self):
-        with pytest.raises(ValueError):
-            parse_memory_size("not_a_size")
-
-    def test_empty(self):
-        with pytest.raises(ValueError):
-            parse_memory_size("")
+class TestHttpPorts:
+    @pytest.mark.parametrize("port", [-1, 70000])
+    def test_out_of_range_port_is_refused(self, port):
+        with pytest.raises(ValueError, match="http_ports"):
+            Sandbox(http_ports=[port])._ensure_native()
 
 
 class TestEnsureNative:
@@ -88,18 +94,6 @@ class TestPolicy:
         p.max_memory = "1G"
         assert p.max_memory == "1G"
 
-    def test_memory_bytes_string(self):
-        p = Sandbox(max_memory="512M")
-        assert p.memory_bytes() == 512 * 1024 ** 2
-
-    def test_memory_bytes_int(self):
-        p = Sandbox(max_memory=1024)
-        assert p.memory_bytes() == 1024
-
-    def test_memory_bytes_none(self):
-        p = Sandbox()
-        assert p.memory_bytes() is None
-
     def test_cpu_pct(self):
         p = Sandbox(max_cpu=50)
         assert p.cpu_pct() == 50
@@ -127,11 +121,6 @@ class TestDiskQuotaPolicy:
         p = Sandbox(max_disk="512M")
         p.max_disk = "1G"
         assert p.max_disk == "1G"
-
-    def test_parse_memory_size_for_disk(self):
-        assert parse_memory_size("1G") == 1024 ** 3
-        assert parse_memory_size("512M") == 512 * 1024 ** 2
-        assert parse_memory_size("100K") == 100 * 1024
 
 
 class TestParsePorts:

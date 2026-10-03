@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import datetime
 import json
 import os
 import signal
@@ -85,8 +86,8 @@ _b_fs_mount = _builder_fn("sandlock_sandbox_builder_fs_mount", ctypes.c_char_p, 
 _b_fs_mount_ro = _builder_fn("sandlock_sandbox_builder_fs_mount_ro", ctypes.c_char_p, ctypes.c_char_p)
 _b_on_exit = _builder_fn("sandlock_sandbox_builder_on_exit", ctypes.c_uint8)
 _b_on_error = _builder_fn("sandlock_sandbox_builder_on_error", ctypes.c_uint8)
-_b_max_memory = _builder_fn("sandlock_sandbox_builder_max_memory", ctypes.c_uint64)
-_b_max_disk = _builder_fn("sandlock_sandbox_builder_max_disk", ctypes.c_uint64)
+_b_max_memory = _builder_fn("sandlock_sandbox_builder_max_memory", ctypes.c_char_p)
+_b_max_disk = _builder_fn("sandlock_sandbox_builder_max_disk", ctypes.c_char_p)
 _b_max_processes = _builder_fn("sandlock_sandbox_builder_max_processes", ctypes.c_uint32)
 _b_max_cpu = _builder_fn("sandlock_sandbox_builder_max_cpu", ctypes.c_uint8)
 _b_num_cpus = _builder_fn("sandlock_sandbox_builder_num_cpus", ctypes.c_uint32)
@@ -106,7 +107,7 @@ _b_user = _builder_fn("sandlock_sandbox_builder_user", ctypes.c_uint32, ctypes.c
 _b_random_seed = _builder_fn("sandlock_sandbox_builder_random_seed", ctypes.c_uint64)
 _b_clean_env = _builder_fn("sandlock_sandbox_builder_clean_env", ctypes.c_bool)
 _b_env_var = _builder_fn("sandlock_sandbox_builder_env_var", ctypes.c_char_p, ctypes.c_char_p)
-_b_time_start = _builder_fn("sandlock_sandbox_builder_time_start", ctypes.c_uint64)
+_b_time_start = _builder_fn("sandlock_sandbox_builder_time_start", ctypes.c_char_p)
 _b_extra_deny_syscalls = _builder_fn("sandlock_sandbox_builder_extra_deny_syscalls", ctypes.c_char_p)
 _b_extra_allow_syscalls = _builder_fn("sandlock_sandbox_builder_extra_allow_syscalls", ctypes.c_char_p)
 _b_max_open_files = _builder_fn("sandlock_sandbox_builder_max_open_files", ctypes.c_uint32)
@@ -1166,8 +1167,6 @@ class _NativePolicy:
     @staticmethod
     def _build_from_policy(policy: PolicyDataclass):
         """Build a native builder from a Python Sandbox dataclass. Returns builder pointer."""
-        from .sandbox import parse_memory_size
-
         b = _lib.sandlock_sandbox_builder_new()
 
         for p in (policy.fs_readable or []):
@@ -1210,18 +1209,9 @@ class _NativePolicy:
         b = _b_on_error(b, _action_map[on_error_val])
 
         if policy.max_memory is not None:
-            if isinstance(policy.max_memory, str):
-                mem_bytes = parse_memory_size(policy.max_memory)
-            else:
-                mem_bytes = int(policy.max_memory)
-            b = _b_max_memory(b, mem_bytes)
-
+            b = _b_max_memory(b, _encode(policy.max_memory))
         if policy.max_disk is not None:
-            if isinstance(policy.max_disk, str):
-                disk_bytes = parse_memory_size(policy.max_disk)
-            else:
-                disk_bytes = int(policy.max_disk)
-            b = _b_max_disk(b, disk_bytes)
+            b = _b_max_disk(b, _encode(policy.max_disk))
 
         if policy.max_processes is not None:
             b = _b_max_processes(b, policy.max_processes)
@@ -1252,6 +1242,9 @@ class _NativePolicy:
         for rule in (policy.http_deny or []):
             b = _b_http_deny(b, _encode(str(rule)))
         for port in (policy.http_ports or []):
+            # ctypes truncates to the u16 the ABI carries, so 70000 would arrive as 4464.
+            if not 0 <= int(port) <= 0xFFFF:
+                raise ValueError(f"http_ports: {port} is not a TCP port")
             b = _b_http_port(b, int(port))
         if policy.http_ca:
             b = _b_http_ca(b, _encode(str(policy.http_ca)))
@@ -1273,8 +1266,10 @@ class _NativePolicy:
         if policy.random_seed is not None:
             b = _b_random_seed(b, policy.random_seed)
         if policy.time_start is not None:
-            epoch_secs = int(policy.time_start.timestamp()) if hasattr(policy.time_start, 'timestamp') else int(policy.time_start)
-            b = _b_time_start(b, epoch_secs)
+            ts = policy.time_start
+            if isinstance(ts, datetime.datetime):
+                ts = ts.isoformat()
+            b = _b_time_start(b, _encode(ts))
         if policy.clean_env:
             b = _b_clean_env(b, True)
         for k, v in (policy.env or {}).items():

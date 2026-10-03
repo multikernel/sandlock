@@ -235,6 +235,11 @@ pub struct SandboxBuilder {
     // COW fork work function: runs in each COW clone.
     #[cfg_attr(feature = "cli", clap(skip))]
     pub(crate) work_fn: Option<Arc<dyn Fn(u32) + Send + Sync + 'static>>,
+
+    // Setters are infallible by design, so a `*_spec` value that does not
+    // parse is held here and `build()` reports it.
+    #[cfg_attr(feature = "cli", clap(skip))]
+    rejected: Option<String>,
 }
 
 impl std::fmt::Debug for SandboxBuilder {
@@ -305,6 +310,7 @@ impl Default for SandboxBuilder {
             mode: None,
             init_fn: None,
             work_fn: None,
+            rejected: None,
         }
     }
 }
@@ -371,6 +377,7 @@ impl Clone for SandboxBuilder {
             init_fn: None,
             // work_fn is Arc-wrapped; clone bumps the reference count.
             work_fn: self.work_fn.clone(),
+            rejected: self.rejected.clone(),
         }
     }
 }
@@ -561,6 +568,14 @@ impl SandboxBuilder {
         self
     }
 
+    /// [`max_memory`](Self::max_memory) from its text form, e.g. `"512M"`.
+    pub fn max_memory_spec(self, spec: &str) -> Self {
+        match ByteSize::parse(spec) {
+            Ok(size) => self.max_memory(size),
+            Err(e) => self.reject(format!("max_memory: {}", detail(e))),
+        }
+    }
+
     pub fn max_processes(mut self, n: u32) -> Self {
         self.max_processes = Some(n);
         self
@@ -625,6 +640,19 @@ impl SandboxBuilder {
         self
     }
 
+    /// [`time_start`](Self::time_start) from an RFC 3339 instant.
+    pub fn time_start_spec(self, spec: &str) -> Self {
+        match super::parse_timestamp("time_start", spec) {
+            Ok(t) => self.time_start(t),
+            Err(e) => self.reject(detail(e)),
+        }
+    }
+
+    fn reject(mut self, msg: String) -> Self {
+        self.rejected.get_or_insert(msg);
+        self
+    }
+
     pub fn no_randomize_memory(mut self, v: bool) -> Self {
         self.no_randomize_memory = v;
         self
@@ -663,6 +691,14 @@ impl SandboxBuilder {
     pub fn max_disk(mut self, size: ByteSize) -> Self {
         self.max_disk = Some(size);
         self
+    }
+
+    /// [`max_disk`](Self::max_disk) from its text form, e.g. `"10G"`.
+    pub fn max_disk_spec(self, spec: &str) -> Self {
+        match ByteSize::parse(spec) {
+            Ok(size) => self.max_disk(size),
+            Err(e) => self.reject(format!("max_disk: {}", detail(e))),
+        }
     }
 
     pub fn on_exit(mut self, action: BranchAction) -> Self {
@@ -815,6 +851,9 @@ impl SandboxBuilder {
     /// `Sandbox::validate` performs. Use this in tests that deliberately
     /// construct sandboxes violating cross-section invariants.
     pub fn build_unchecked(self) -> Result<Sandbox, SandboxError> {
+        if let Some(msg) = self.rejected {
+            return Err(SandboxError::Invalid(msg));
+        }
         validate_syscall_names(&self.extra_deny_syscalls)?;
         validate_allow_groups(&self.extra_allow_syscalls)?;
         validate_allow_deny_disjoint(&self.extra_allow_syscalls, &self.extra_deny_syscalls)?;
@@ -1102,6 +1141,15 @@ impl SandboxBuilder {
     }
 }
 
+/// The message inside `e`, without the "invalid sandbox" prefix that
+/// `build()` adds back when it reports a rejected spec.
+fn detail(e: SandboxError) -> String {
+    match e {
+        SandboxError::Invalid(msg) => msg,
+        other => other.to_string(),
+    }
+}
+
 /// An fs grant that exposes a credential file to the sandboxed child, with the
 /// path an operator should hand `--fs-deny` to actually close the hole.
 struct Exposure {
@@ -1177,6 +1225,42 @@ fn exposing_grant<'a>(
 mod tests {
     use super::exposing_grant;
     use std::path::PathBuf;
+
+    #[test]
+    fn spec_setters_take_the_core_grammar() {
+        let sb = super::SandboxBuilder::default()
+            .max_memory_spec("512M")
+            .max_disk_spec("1024")
+            .time_start_spec("1969-07-20T20:17:00Z")
+            .build()
+            .unwrap();
+        assert_eq!(sb.max_memory, Some(super::ByteSize::mib(512)));
+        assert_eq!(sb.max_disk, Some(super::ByteSize(1024)));
+        let moon = std::time::UNIX_EPOCH - std::time::Duration::from_secs(14_182_980);
+        assert_eq!(sb.time_start, Some(moon));
+    }
+
+    #[test]
+    fn spec_setters_fail_the_build_naming_the_knob() {
+        for (b, knob) in [
+            (super::SandboxBuilder::default().max_memory_spec("1.5G"), "max_memory"),
+            (super::SandboxBuilder::default().max_disk_spec("1T"), "max_disk"),
+            (super::SandboxBuilder::default().time_start_spec("1767225600"), "time_start"),
+        ] {
+            let msg = b.build().expect_err("must not build").to_string();
+            assert!(msg.starts_with(&format!("invalid sandbox: {knob}: ")), "got: {msg}");
+        }
+    }
+
+    #[test]
+    fn first_rejected_spec_wins_over_a_later_valid_one() {
+        let err = super::SandboxBuilder::default()
+            .max_memory_spec("lots")
+            .max_memory_spec("1G")
+            .build()
+            .expect_err("a rejected value must not be overwritten silently");
+        assert!(err.to_string().contains("lots"), "got: {err}");
+    }
 
     #[test]
     fn max_open_files_zero_is_rejected_at_build() {

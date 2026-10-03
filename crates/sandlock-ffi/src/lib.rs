@@ -9,7 +9,7 @@ use std::ptr;
 use std::time::Duration;
 
 use sandlock_core::pipeline::Stage;
-use sandlock_core::sandbox::{BranchAction, ByteSize, SandboxBuilder};
+use sandlock_core::sandbox::{BranchAction, SandboxBuilder};
 use sandlock_core::{ExitStatus, Protection, RunResult, Sandbox, StdioMode};
 
 pub mod handler;
@@ -361,32 +361,46 @@ fn try_branch_action_from_raw(raw: u8) -> Option<BranchAction> {
 // Sandbox Builder — resource limits
 // ----------------------------------------------------------------
 
+/// `size` uses the CLI and profile grammar, e.g. "512M". A value that does not
+/// parse fails the build with the reason; a null `size` returns null.
+///
 /// # Safety
-/// `b` must be a valid builder pointer.
+/// `b` must be a valid builder pointer; `size` a NUL-terminated string or null.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_max_memory(
     b: *mut SandboxBuilder,
-    bytes: u64,
+    size: *const c_char,
 ) -> *mut SandboxBuilder {
     if b.is_null() {
         return b;
     }
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.max_memory(ByteSize(bytes))))
+    if size.is_null() {
+        return ptr::null_mut();
+    }
+    let size = CStr::from_ptr(size).to_string_lossy();
+    Box::into_raw(Box::new(builder.max_memory_spec(&size)))
 }
 
+/// `size` uses the CLI and profile grammar, e.g. "10G". A value that does not
+/// parse fails the build with the reason; a null `size` returns null.
+///
 /// # Safety
-/// `b` must be a valid builder pointer.
+/// `b` must be a valid builder pointer; `size` a NUL-terminated string or null.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_max_disk(
     b: *mut SandboxBuilder,
-    bytes: u64,
+    size: *const c_char,
 ) -> *mut SandboxBuilder {
     if b.is_null() {
         return b;
     }
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.max_disk(ByteSize(bytes))))
+    if size.is_null() {
+        return ptr::null_mut();
+    }
+    let size = CStr::from_ptr(size).to_string_lossy();
+    Box::into_raw(Box::new(builder.max_disk_spec(&size)))
 }
 
 /// # Safety
@@ -724,19 +738,26 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_env_var(
     Box::into_raw(Box::new(builder.env_var(key, value)))
 }
 
+/// `timestamp` is RFC 3339 with an offset, e.g. "2000-01-01T00:00:00Z". A value
+/// that does not parse fails the build with the reason; null returns null.
+///
 /// # Safety
-/// `b` must be a valid builder pointer. `epoch_secs` is seconds since UNIX epoch.
+/// `b` must be a valid builder pointer; `timestamp` a NUL-terminated string
+/// or null.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_time_start(
     b: *mut SandboxBuilder,
-    epoch_secs: u64,
+    timestamp: *const c_char,
 ) -> *mut SandboxBuilder {
     if b.is_null() {
         return b;
     }
     let builder = *Box::from_raw(b);
-    let t = std::time::UNIX_EPOCH + Duration::from_secs(epoch_secs);
-    Box::into_raw(Box::new(builder.time_start(t)))
+    if timestamp.is_null() {
+        return ptr::null_mut();
+    }
+    let timestamp = CStr::from_ptr(timestamp).to_string_lossy();
+    Box::into_raw(Box::new(builder.time_start_spec(&timestamp)))
 }
 
 /// # Safety

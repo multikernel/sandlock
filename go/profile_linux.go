@@ -49,7 +49,7 @@ type resolvedProfile struct {
 	NetAllow           []string          `json:"net_allow"`
 	NetDeny            []string          `json:"net_deny"`
 	PortRemap          bool              `json:"port_remap"`
-	HTTPPorts          []int             `json:"http_ports"`
+	HTTPPorts          []uint16          `json:"http_ports"`
 	HTTPAllow          []string          `json:"http_allow"`
 	HTTPDeny           []string          `json:"http_deny"`
 	ExtraAllowSyscalls []string          `json:"extra_allow_syscalls"`

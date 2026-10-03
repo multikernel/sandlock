@@ -19,16 +19,19 @@ const CLOCK_BOOTTIME: u32 = 7;
 /// offset = desired_start_time - current_real_time
 /// So that: virtual_time = real_time + offset
 pub(crate) fn calculate_time_offset(time_start: SystemTime) -> i64 {
-    let now = SystemTime::now();
-    let desired = time_start
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let actual = now
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    desired - actual
+    epoch_secs(time_start) - epoch_secs(SystemTime::now())
+}
+
+/// Whole seconds since the epoch, floored, so an instant before 1970 keeps
+/// its sign instead of collapsing onto the epoch.
+fn epoch_secs(t: SystemTime) -> i64 {
+    match t.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(e) => {
+            let d = e.duration();
+            -(d.as_secs() as i64) - i64::from(d.subsec_nanos() > 0)
+        }
+    }
 }
 
 /// Handle clock_nanosleep/timerfd_settime/timer_settime with TIMER_ABSTIME.
@@ -126,6 +129,19 @@ mod tests {
         let now = SystemTime::now();
         let offset = calculate_time_offset(now);
         assert!(offset.abs() <= 2, "offset for 'now' should be near zero, got {}", offset);
+    }
+
+    #[test]
+    fn test_calculate_time_offset_before_epoch() {
+        let moon = SystemTime::UNIX_EPOCH - Duration::from_secs(14_182_980);
+        let expected = -14_182_980 - epoch_secs(SystemTime::now());
+        assert!((calculate_time_offset(moon) - expected).abs() <= 2);
+    }
+
+    #[test]
+    fn test_epoch_secs_floors_before_epoch() {
+        let t = SystemTime::UNIX_EPOCH - Duration::from_millis(1500);
+        assert_eq!(epoch_secs(t), -2);
     }
 
     #[test]

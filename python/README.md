@@ -252,7 +252,7 @@ Sandlock always applies its default syscall blocklist.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `random_seed` | `int \| None` | `None` | Seed for deterministic getrandom() |
-| `time_start` | `datetime \| float \| str \| None` | `None` | Start timestamp for time virtualization |
+| `time_start` | `datetime \| str \| None` | `None` | Start time for time virtualization: RFC 3339 with an offset, or an aware `datetime` |
 | `no_randomize_memory` | `bool` | `False` | Disable ASLR |
 | `no_huge_pages` | `bool` | `False` | Disable Transparent Huge Pages |
 | `deterministic_dirs` | `bool` | `False` | Sort directory entries lexicographically |
@@ -283,7 +283,7 @@ Sandlock always applies its default syscall blocklist.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `fs_storage` | `str \| None` | `None` | Storage directory for the seccomp COW upper layer / deltas |
-| `max_disk` | `str \| None` | `None` | Disk quota for COW storage (e.g. `"1G"`) |
+| `max_disk` | `str \| int \| None` | `None` | Disk quota for COW storage, e.g. `"1G"` or int bytes |
 | `on_exit` | `BranchAction` | `COMMIT` | `COMMIT`, `ABORT`, `KEEP`, or `DEFER` |
 | `on_error` | `BranchAction` | `ABORT` | `COMMIT`, `ABORT`, `KEEP`, or `DEFER` |
 

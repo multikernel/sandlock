@@ -1027,6 +1027,12 @@ class TestNewPolicyFields:
         assert result.success
         assert result.stdout.strip() == b"2000"
 
+    def test_time_start_before_epoch(self):
+        p = _policy(time_start="1969-07-20T20:17:00Z")
+        result = p.run(["date", "-u", "+%Y"])
+        assert result.success
+        assert result.stdout.strip() == b"1969"
+
     def test_extra_deny_syscalls(self):
         p = _policy(extra_deny_syscalls=["mount"])
         result = p.run(["echo", "ok"])

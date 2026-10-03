@@ -77,6 +77,21 @@ impl ByteSize {
     }
 }
 
+/// Parse a `time_start` value: an RFC 3339 instant with an explicit offset,
+/// the one spelling every surface (flag, profile, C ABI) accepts. `knob`
+/// names the surface the value came through, for the error.
+pub fn parse_timestamp(knob: &str, s: &str) -> Result<SystemTime, SandboxError> {
+    let ts: jiff::Timestamp = s
+        .parse()
+        .map_err(|e| SandboxError::Invalid(format!("{knob}: invalid timestamp {s:?}: {e}")))?;
+    Ok(ts.into())
+}
+
+/// Render `t` in the grammar [`parse_timestamp`] reads, losing nothing.
+pub fn format_timestamp(t: SystemTime) -> Option<String> {
+    jiff::Timestamp::try_from(t).ok().map(|ts| ts.to_string())
+}
+
 /// Identity to run the sandboxed process as.
 ///
 /// Applied via a single-entry user-namespace map (`unshare(CLONE_NEWUSER)` +

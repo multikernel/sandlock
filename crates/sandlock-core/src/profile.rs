@@ -3,7 +3,6 @@ use crate::error::SandlockError;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::collections::HashMap;
-use std::time::SystemTime;
 
 /// Program identity supplied by a profile alongside the policy.
 /// Not a `Sandbox` field — passed separately to the sandbox runner.
@@ -446,7 +445,11 @@ impl ResolvedProfile {
         if let Some(p) = self.workdir     { b = b.workdir(p); }
 
         if let Some(s) = self.random_seed { b = b.random_seed(s); }
-        if let Some(s) = self.time_start.as_deref() { b = b.time_start(parse_time_start(s)?); }
+        if let Some(s) = self.time_start.as_deref() {
+            let t = crate::sandbox::parse_timestamp("[determinism].time_start", s)
+                .map_err(SandlockError::Sandbox)?;
+            b = b.time_start(t);
+        }
         if self.deterministic_dirs        { b = b.deterministic_dirs(true); }
         if self.no_randomize_memory       { b = b.no_randomize_memory(true); }
 
@@ -557,17 +560,6 @@ pub fn parse_mount_spec(s: &str) -> Result<(PathBuf, PathBuf, bool), SandlockErr
     Ok((PathBuf::from(virt), PathBuf::from(host), read_only))
 }
 
-/// Parses an RFC3339 timestamp string into `SystemTime`.
-fn parse_time_start(s: &str) -> Result<SystemTime, SandlockError> {
-    use crate::error::SandboxError;
-    let ts: jiff::Timestamp = s.parse().map_err(|e| {
-        SandlockError::Sandbox(SandboxError::Invalid(
-            format!("invalid [determinism].time_start {s:?}: {e}"),
-        ))
-    })?;
-    Ok(ts.into())
-}
-
 // ============================================================
 // Reverse serialization: Sandbox -> ProfileInput (and JSON/TOML)
 // ============================================================
@@ -645,13 +637,6 @@ fn byte_size_str(b: crate::sandbox::ByteSize) -> String {
     }
 }
 
-/// Render an RFC3339 timestamp from a `SystemTime` (inverse of `parse_time_start`).
-fn time_start_str(t: SystemTime) -> Option<String> {
-    let d = t.duration_since(SystemTime::UNIX_EPOCH).ok()?;
-    let ts = jiff::Timestamp::from_second(d.as_secs() as i64).ok()?;
-    Some(ts.to_string())
-}
-
 /// Build a `ProfileInput` from a `Sandbox` (the effective policy).
 ///
 /// This is the reverse of `parse_input`: it flattens the `Sandbox` dataclass
@@ -710,7 +695,7 @@ pub fn sandbox_to_profile(s: &Sandbox, extra_denied: &[String]) -> ProfileInput 
         },
         determinism: DeterminismSection {
             random_seed: s.random_seed,
-            time_start: s.time_start.and_then(time_start_str),
+            time_start: s.time_start.and_then(crate::sandbox::format_timestamp),
             deterministic_dirs: s.deterministic_dirs,
             no_randomize_memory: s.no_randomize_memory,
         },
@@ -1201,6 +1186,18 @@ mod tests {
         let err = parse_profile(toml).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("time_start"), "got: {msg}");
+    }
+
+    #[test]
+    fn profile_time_start_round_trips_before_epoch_and_below_a_second() {
+        for stamp in ["1969-07-20T20:17:00Z", "2026-01-01T00:00:00.9999999Z"] {
+            let toml = format!(
+                "[program]\nexec = \"/bin/true\"\n[determinism]\ntime_start = \"{stamp}\"\n"
+            );
+            let (policy, _spec) = parse_profile(&toml).unwrap();
+            let rendered = sandbox_to_profile(&policy, &[]);
+            assert_eq!(rendered.determinism.time_start.as_deref(), Some(stamp));
+        }
     }
 
     #[test]
