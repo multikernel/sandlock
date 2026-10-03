@@ -1046,8 +1046,8 @@ fn register_cow_handlers(table: &mut DispatchTable, ctx: &Arc<SupervisorCtx>) {
         table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_open));
     }
 
-    let mut stat_nrs = vec![libc::SYS_newfstatat, libc::SYS_faccessat];
-    stat_nrs.extend([arch::sys_stat(), arch::sys_lstat(), arch::sys_access()].into_iter().flatten());
+    let mut stat_nrs = vec![libc::SYS_newfstatat];
+    stat_nrs.extend([arch::sys_stat(), arch::sys_lstat()].into_iter().flatten());
     for nr in stat_nrs {
         table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_stat));
     }

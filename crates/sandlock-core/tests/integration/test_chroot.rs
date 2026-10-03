@@ -2465,3 +2465,204 @@ async fn test_chroot_shebang_loop_is_eloop() {
     );
     cleanup_rootfs(&rootfs);
 }
+
+/// O_RDONLY describes the returned fd, not all effects of open(2): O_TRUNC
+/// and O_CREAT still mutate the filesystem in the supervisor's context.
+#[tokio::test]
+async fn test_chroot_readonly_open_cannot_mutate_files() {
+    check_readonly_open_effects(false).await;
+}
+
+#[tokio::test]
+async fn test_chroot_cow_readonly_open_cannot_mutate_files() {
+    check_readonly_open_effects(true).await;
+}
+
+async fn check_readonly_open_effects(cow: bool) {
+    let rootfs = build_test_rootfs(&format!("readonly-open-mutation-{cow}"));
+    let mounted = temp_dir(&format!("readonly-open-mutation-mount-{cow}"));
+    fs::create_dir_all(rootfs.join("ro")).unwrap();
+    fs::create_dir_all(rootfs.join("rw")).unwrap();
+    fs::create_dir_all(rootfs.join("mnt")).unwrap();
+    let mut builder = minimal_exec_policy(&rootfs)
+        .fs_read("/ro")
+        .fs_write("/rw")
+        .fs_mount_ro("/mnt", &mounted);
+    if cow { builder = builder.workdir(&rootfs).on_exit(BranchAction::Commit); }
+    let policy = builder.build().unwrap();
+    let mut failures = Vec::new();
+    for spelling in ["open", "openat", "openat2"] {
+        for (virtual_dir, host_dir, allowed) in [
+            ("/ro", rootfs.join("ro"), false),
+            ("/mnt", mounted.clone(), false),
+            ("/rw", rootfs.join("rw"), true),
+        ] {
+            for (name, flags, exists) in [
+                ("read", libc::O_RDONLY, true),
+                ("truncate", libc::O_RDONLY | libc::O_TRUNC, true),
+                ("create", libc::O_RDONLY | libc::O_CREAT, false),
+                ("create-exclusive", libc::O_RDONLY | libc::O_CREAT | libc::O_EXCL, false),
+                ("path-only", libc::O_PATH | libc::O_TRUNC, true),
+            ] {
+                let basename = format!("{spelling}-{name}");
+                let host = host_dir.join(&basename);
+                if exists { fs::write(&host, b"KEEP").unwrap(); }
+                let path = format!("{virtual_dir}/{basename}");
+                let flags_text = flags.to_string();
+                let result = policy.clone().run(&[
+                    "rootfs-helper", "open-flags", spelling, &path, &flags_text,
+                ]).await.expect("sandbox must run: no skip on setup errors");
+                assert!(result.success(), "helper failed: {:?}", result.stderr_str());
+                let mutates = name != "read" && name != "path-only";
+                let denied = mutates && !allowed;
+                let expected = if name == "path-only" {
+                    format!("ERR:{}", libc::EINVAL)
+                } else if denied { format!("ERR:{}", libc::EACCES) } else { "OPENED".into() };
+                let output = result.stdout_str().unwrap().trim();
+                if output != expected {
+                    failures.push(format!("{path}: expected {expected}, got {output}"));
+                }
+                if denied || !mutates {
+                    if exists {
+                        if fs::read(&host).unwrap() != b"KEEP" {
+                            failures.push(format!("{path}: original bytes changed"));
+                        }
+                    } else if host.exists() {
+                        failures.push(format!("{path}: forbidden file was created"));
+                    }
+                } else if !host.exists() || !fs::read(&host).unwrap().is_empty() {
+                    failures.push(format!("{path}: allowed operation did not take effect"));
+                }
+            }
+        }
+    }
+    cleanup_rootfs(&rootfs);
+    fs::remove_dir_all(mounted).unwrap();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
+async fn test_chroot_access_modes_match_grants() {
+    check_access_modes(false).await;
+}
+
+#[tokio::test]
+async fn test_chroot_cow_access_modes_match_grants() {
+    check_access_modes(true).await;
+}
+
+async fn check_access_modes(cow: bool) {
+    let rootfs = build_test_rootfs(&format!("access-modes-{cow}"));
+    let mounted = temp_dir(&format!("access-modes-mount-{cow}"));
+    for directory in ["ro", "rw", "mnt"] {
+        fs::create_dir_all(rootfs.join(directory)).unwrap();
+    }
+    for dir in [rootfs.join("ro"), rootfs.join("rw"), mounted.clone()] {
+        fs::write(dir.join("data"), b"KEEP").unwrap();
+        fs::set_permissions(dir.join("data"), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(dir.join("exec"), b"executable").unwrap();
+        fs::set_permissions(dir.join("exec"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(dir.join("lower-ro"), b"KEEP").unwrap();
+        fs::set_permissions(dir.join("lower-ro"), fs::Permissions::from_mode(0o400)).unwrap();
+        fs::write(dir.join("unreadable"), b"KEEP").unwrap();
+        fs::set_permissions(dir.join("unreadable"), fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    let mut builder = minimal_exec_policy(&rootfs)
+        .fs_read("/ro").fs_write("/rw").fs_mount_ro("/mnt", &mounted);
+    if cow { builder = builder.workdir(&rootfs).on_exit(BranchAction::Abort); }
+    let policy = builder.build().unwrap();
+    let mut failures = Vec::new();
+    for spelling in ["access", "faccessat", "faccessat2"] {
+        for (directory, writable) in [("/ro", false), ("/rw", true), ("/mnt", false)] {
+            for (name, mode, errno) in [
+                ("data", libc::F_OK, 0),
+                ("data", libc::R_OK, 0),
+                ("data", libc::W_OK, if writable { 0 } else { libc::EACCES }),
+                ("data", libc::R_OK | libc::W_OK, if writable { 0 } else { libc::EACCES }),
+                ("data", libc::X_OK, libc::EACCES),
+                ("exec", libc::R_OK | libc::X_OK, 0),
+                ("lower-ro", libc::W_OK, if cow && writable { 0 } else { libc::EACCES }),
+                ("unreadable", libc::R_OK | libc::W_OK, libc::EACCES),
+                ("data", 8, libc::EINVAL),
+                ("absent", libc::F_OK, libc::ENOENT),
+            ] {
+                let path = format!("{directory}/{name}");
+                let text = mode.to_string();
+                let result = policy.clone().run(&[
+                    "rootfs-helper", "access-mode", spelling, &path, &text,
+                ]).await.expect("access test must run without a skip");
+                assert!(result.success(), "helper: {:?}", result.stderr_str());
+                let expected = if errno == 0 { "OK".into() } else { format!("ERR:{errno}") };
+                if result.stdout_str().unwrap().trim() != expected {
+                    failures.push(format!("{spelling}({path}, {mode}): expected {expected}, got {:?}", result.stdout_str()));
+                }
+            }
+        }
+    }
+    cleanup_rootfs(&rootfs);
+    fs::remove_dir_all(mounted).unwrap();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
+async fn test_chroot_empty_path_access_respects_virtual_view() {
+    check_empty_path_access(false).await;
+}
+
+#[tokio::test]
+async fn test_chroot_cow_empty_path_access_respects_virtual_view() {
+    check_empty_path_access(true).await;
+}
+
+async fn check_empty_path_access(cow: bool) {
+    let rootfs = build_test_rootfs(&format!("empty-access-{cow}"));
+    let mounted = temp_dir(&format!("empty-access-mount-{cow}"));
+    for directory in ["ro", "rw", "mnt"] {
+        fs::create_dir_all(rootfs.join(directory)).unwrap();
+    }
+    for dir in [rootfs.join("ro"), rootfs.join("rw"), mounted.clone()] {
+        fs::write(dir.join("data"), b"KEEP").unwrap();
+        fs::set_permissions(dir.join("data"), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(dir.join("lower-ro"), b"KEEP").unwrap();
+        fs::set_permissions(dir.join("lower-ro"), fs::Permissions::from_mode(0o400)).unwrap();
+    }
+    let mut builder = minimal_exec_policy(&rootfs)
+        .fs_read("/ro").fs_write("/rw").fs_mount_ro("/mnt", &mounted);
+    if cow { builder = builder.workdir(&rootfs).on_exit(BranchAction::Abort); }
+    let policy = builder.build().unwrap();
+    let empty = libc::AT_EMPTY_PATH;
+    let mut failures = Vec::new();
+    for (kind, path, mode, flags, errno) in [
+        ("fd", "/ro/data", libc::R_OK, empty, 0),
+        ("fd", "/ro/data", libc::W_OK, empty, libc::EACCES),
+        ("fd", "/mnt/data", libc::W_OK, empty, libc::EACCES),
+        ("fd", "/rw/data", libc::R_OK | libc::W_OK, empty, 0),
+        ("upper", "/rw/data", libc::R_OK | libc::W_OK, empty, 0),
+        ("name", "/ro/data", libc::R_OK, empty, 0),
+        ("name", "/ro/data", libc::W_OK, empty, libc::EACCES),
+        ("name", "/rw/data", libc::W_OK, empty, 0),
+        ("cwd", "/ro", libc::W_OK, empty, libc::EACCES),
+        ("cwd", "/rw", libc::R_OK | libc::W_OK, empty, 0),
+        ("fd", "/rw/data", libc::R_OK, 0, libc::ENOENT),
+        ("invalid", "/rw/data", libc::F_OK, empty, libc::EBADF),
+        ("fd", "/rw/data", 8, empty, libc::EINVAL),
+        ("fd", "/ro/data", libc::R_OK, empty | libc::AT_EACCESS, 0),
+        ("fd", "/ro/data", libc::R_OK, empty | libc::AT_SYMLINK_NOFOLLOW, 0),
+        ("fd", "/rw/lower-ro", libc::W_OK, empty, libc::EACCES),
+        ("fd", "/rw/data", libc::F_OK, empty | 0x400000, libc::EINVAL),
+        ("anonymous", "/unused", libc::R_OK | libc::W_OK, empty, 0),
+        ("deleted", "/rw/data", libc::R_OK | libc::W_OK, empty, 0),
+    ] {
+        let result = policy.clone().run(&[
+            "rootfs-helper", "access-empty", kind, path, &mode.to_string(), &flags.to_string(),
+        ]).await.expect("sandbox must run without a skip");
+        assert!(result.success(), "helper: {:?}", result.stderr_str());
+        let expected = if errno == 0 { "OK".into() } else { format!("ERR:{errno}") };
+        if result.stdout_str().unwrap().trim() != expected {
+            failures.push(format!("{kind}({path}, {mode}, {flags}): expected {expected}, got {:?}", result.stdout_str()));
+        }
+    }
+    cleanup_rootfs(&rootfs);
+    fs::remove_dir_all(mounted).unwrap();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

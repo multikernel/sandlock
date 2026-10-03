@@ -24,7 +24,7 @@
 //! provided by Landlock (or by the chroot dispatcher, when chroot mode
 //! is active and runs before COW).
 
-use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -701,9 +701,9 @@ pub(crate) async fn handle_cow_write(
 // access() handler — fake W_OK for COW-managed paths
 // ============================================================
 
-/// Handle faccessat/faccessat2/access — return success for W_OK checks on
-/// COW-managed paths so programs that pre-check write permissions (like dpkg)
-/// don't fail before the COW layer can redirect their writes.
+/// Check access against the visible COW layer. Only W_OK is waived: the
+/// lower layer may be read-only because writes will go to the upper layer.
+/// Read/execute checks and pathname resolution still have to succeed.
 pub(crate) async fn handle_cow_access(
     notif: &SeccompNotif,
     cow_state: &Arc<Mutex<CowState>>,
@@ -711,54 +711,61 @@ pub(crate) async fn handle_cow_access(
     notif_fd: RawFd,
 ) -> NotifAction {
     let nr = notif.data.nr as i64;
-    let virtual_cwd = current_virtual_cwd(processes, notif.pid).await;
-
-    // access(pathname, mode): args[0]=path, args[1]=mode
-    // faccessat(dirfd, pathname, mode, flags): args[0]=dirfd, args[1]=path, args[2]=mode
-    let (path, mode) = if Some(nr) == arch::sys_access() {
-        let p = match read_path(notif, notif.data.args[0], notif_fd) {
-            Some(p) => resolve_at_path_with_virtual(
-                notif,
-                libc::AT_FDCWD as i64,
-                &p,
-                virtual_cwd.as_deref(),
-            ),
-            None => return NotifAction::Continue,
-        };
-        (p, notif.data.args[1] as i32)
+    let (dirfd, path_ptr, mode) = if Some(nr) == arch::sys_access() {
+        (libc::AT_FDCWD as i64, notif.data.args[0], notif.data.args[1] as i32)
     } else {
-        let dirfd = notif.data.args[0] as i64;
-        let p = match read_path(notif, notif.data.args[1], notif_fd) {
-            Some(p) => resolve_at_path_with_virtual(notif, dirfd, &p, virtual_cwd.as_deref()),
-            None => return NotifAction::Continue,
-        };
-        (p, notif.data.args[2] as i32)
+        (notif.data.args[0] as i64, notif.data.args[1], notif.data.args[2] as i32)
     };
-
-    // Only intercept W_OK checks
-    if mode & libc::W_OK == 0 {
-        return NotifAction::Continue;
-    }
-
-    let st = cow_state.lock().await;
-    let cow = match st.branch.as_ref() {
-        Some(c) => c,
+    // The raw faccessat syscall has only three arguments.
+    let flags = if nr == arch::SYS_FACCESSAT2 { notif.data.args[3] as i32 } else { 0 };
+    let raw_path = match read_path(notif, path_ptr, notif_fd) {
+        Some(p) => p,
         None => return NotifAction::Continue,
     };
-
-    let path = map_cow_upper_path(cow, &path);
-    if !cow.matches(&path) {
+    // An empty path refers to an actual held descriptor (or the kernel cwd),
+    // not a pathname to redirect. In particular it must not gain fake W_OK.
+    if raw_path.is_empty() {
         return NotifAction::Continue;
     }
-
-    // Path is under workdir and W_OK was requested — writes will be
-    // redirected to the COW upper layer, so report success.
-    // Check the path actually exists on the real filesystem.
-    if std::path::Path::new(&path).exists() || cow.handle_stat(&path).is_some() {
-        return NotifAction::ReturnValue(0);
+    let virtual_cwd = current_virtual_cwd(processes, notif.pid).await;
+    let path = resolve_at_path_with_virtual(notif, dirfd, &raw_path, virtual_cwd.as_deref());
+    let pinned = {
+        let st = cow_state.lock().await;
+        let cow = match st.branch.as_ref() {
+            Some(c) => c,
+            None => return NotifAction::Continue,
+        };
+        let path = map_cow_upper_path(cow, &path);
+        if !cow.matches(&path) {
+            return NotifAction::Continue;
+        }
+        if mode & !(libc::R_OK | libc::W_OK | libc::X_OK) != 0
+            || flags & !(libc::AT_EACCESS | libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH) != 0
+        {
+            return NotifAction::Errno(libc::EINVAL);
+        }
+        let real = match cow.handle_stat(&path) {
+            Some(p) => p,
+            None => return NotifAction::Errno(libc::ENOENT),
+        };
+        let open_flags = libc::O_PATH | libc::O_CLOEXEC
+            | if flags & libc::AT_SYMLINK_NOFOLLOW != 0 { libc::O_NOFOLLOW } else { 0 };
+        match open_confined(cow.upper_dir(), cow.workdir(), &real, open_flags, 0) {
+            Ok(fd) => unsafe { OwnedFd::from_raw_fd(fd) },
+            Err(e) => return NotifAction::Errno(e),
+        }
+    };
+    // Query the pinned object, avoiding a second pathname resolution after
+    // confinement. The supervisor shares the sandbox's filesystem identity.
+    let result = unsafe {
+        libc::syscall(arch::SYS_FACCESSAT2, pinned.as_raw_fd(), c"".as_ptr(),
+            mode & !libc::W_OK, flags | libc::AT_EMPTY_PATH)
+    };
+    if result < 0 {
+        NotifAction::Errno(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
+    } else {
+        NotifAction::ReturnValue(0)
     }
-
-    NotifAction::Continue
 }
 
 // ============================================================
@@ -841,7 +848,7 @@ pub(crate) async fn handle_cow_utimensat(
 // Read operation handlers (stat, readlink, getdents)
 // ============================================================
 
-/// Handle newfstatat / faccessat — resolve path then Continue to let kernel stat.
+/// Handle newfstatat / stat / lstat against the visible COW layer.
 /// The trick: we rewrite the path pointer in child memory to point to the resolved path.
 /// Actually, simpler: for stat, we do the stat ourselves and write the result.
 pub(crate) async fn handle_cow_stat(
@@ -853,8 +860,7 @@ pub(crate) async fn handle_cow_stat(
     let nr = notif.data.nr as i64;
 
     // newfstatat(dirfd, pathname, statbuf, flags)
-    // faccessat(dirfd, pathname, mode, flags)
-    // stat/lstat(pathname, statbuf), access(pathname, mode)
+    // stat/lstat(pathname, statbuf)
     //
     // The legacy x86_64 variants carry the path in args[0] and have no
     // dirfd or flags. Parsing them with the at-variant layout reads the
@@ -862,7 +868,7 @@ pub(crate) async fn handle_cow_stat(
     // through to the kernel, which leaks whiteouted lower entries to any
     // static-libc child that emits legacy stat (same register-layout bug
     // handle_cow_open fixed for legacy open).
-    let legacy = [arch::sys_stat(), arch::sys_lstat(), arch::sys_access()]
+    let legacy = [arch::sys_stat(), arch::sys_lstat()]
         .into_iter()
         .flatten()
         .any(|l| l == nr);
@@ -895,22 +901,6 @@ pub(crate) async fn handle_cow_stat(
         };
         (real, upper_root, workdir_root)
     };
-
-    if nr == libc::SYS_faccessat
-        || nr == crate::arch::SYS_FACCESSAT2
-        || arch::sys_access() == Some(nr)
-    {
-        // Existence check, confined: lstat succeeds for any present entry
-        // (including a dangling symlink), matching the prior semantics.
-        let (root, rel) = match pick_root_rel(&upper_root, &workdir_root, &real_path) {
-            Ok(v) => v,
-            Err(_) => return NotifAction::Errno(libc::ENOENT),
-        };
-        if crate::sys::fs::statat_in_root(root, &rel, false).is_ok() {
-            return NotifAction::ReturnValue(0);
-        }
-        return NotifAction::Errno(libc::ENOENT);
-    }
 
     // newfstatat/stat/lstat — stat the resolved path (confined to its layer
     // root) and write the native libc layout back to the child. Do not

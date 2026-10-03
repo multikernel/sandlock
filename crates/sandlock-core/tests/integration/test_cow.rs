@@ -1538,3 +1538,61 @@ async fn test_seccomp_cow_fchmodat2_is_virtualized() {
     assert!(!workdir.join("made").exists());
     let _ = fs::remove_dir_all(&workdir);
 }
+
+/// COW may waive lower-layer W_OK, but must still check every other bit
+/// against the visible layer, including after a whiteout or copy-up.
+#[tokio::test]
+async fn test_seccomp_cow_access_modes_and_visible_layer() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let workdir = temp_dir("access-modes-visible");
+    for (name, mode) in [("readable", 0o400), ("unreadable", 0o000),
+                         ("executable", 0o500), ("removed", 0o600)] {
+        fs::write(workdir.join(name), b"KEEP").unwrap();
+        fs::set_permissions(workdir.join(name), fs::Permissions::from_mode(mode)).unwrap();
+    }
+    symlink("absent", workdir.join("dangling")).unwrap();
+    let helper = helper_binary();
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
+        .fs_read("/bin").fs_read("/etc").fs_read(&helper)
+        .fs_write(&workdir).workdir(&workdir).cwd(&workdir)
+        .on_exit(BranchAction::Abort).build().unwrap();
+    let mut script = String::from("set -e\n");
+    let mut expected = Vec::new();
+    for changed in [false, true] {
+        if changed {
+            script.push_str("chmod 000 readable\nchmod 500 executable\nrm removed\n");
+        }
+        for spelling in ["access", "faccessat", "faccessat2"] {
+            for (name, mode, errno) in [
+                ("readable", libc::W_OK, 0),
+                ("readable", libc::R_OK, if changed { libc::EACCES } else { 0 }),
+                ("readable", libc::R_OK | libc::W_OK, if changed { libc::EACCES } else { 0 }),
+                ("readable", libc::W_OK | libc::X_OK, libc::EACCES),
+                ("unreadable", libc::R_OK | libc::W_OK, libc::EACCES),
+                ("executable", libc::R_OK | libc::W_OK | libc::X_OK, 0),
+                ("readable", 10, libc::EINVAL),
+                ("removed", libc::W_OK, if changed { libc::ENOENT } else { 0 }),
+                ("dangling", libc::F_OK, libc::ENOENT),
+                ("dangling", libc::W_OK, libc::ENOENT),
+                ("absent", libc::F_OK, libc::ENOENT),
+            ] {
+                script.push_str(&format!("'{}' access-mode {spelling} {name} {mode}\n", helper.display()));
+                expected.push(if errno == 0 { "OK".into() } else { format!("ERR:{errno}") });
+            }
+        }
+        for (name, mode, flags, errno) in [
+            ("dangling", 0, libc::AT_SYMLINK_NOFOLLOW, 0),
+            ("readable", 2, 0x40000000, libc::EINVAL),
+            ("readable", 2, libc::AT_EMPTY_PATH, 0),
+        ] {
+            script.push_str(&format!("'{}' access-empty name {name} {mode} {flags}\n", helper.display()));
+            expected.push(if errno == 0 { "OK".into() } else { format!("ERR:{errno}") });
+        }
+    }
+    let result = policy.clone().run(&["sh", "-c", &script]).await.expect("COW access regression must run");
+    assert!(result.success(), "helper failed: {:?}", result.stderr_str());
+    let actual: Vec<_> = result.stdout_str().unwrap().lines().collect();
+    assert_eq!(actual, expected, "COW access must preserve DAC and visible-layer existence");
+    fs::remove_dir_all(workdir).unwrap();
+}
