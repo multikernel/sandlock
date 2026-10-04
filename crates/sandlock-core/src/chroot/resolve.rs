@@ -27,6 +27,25 @@ pub fn confine(virtual_path: &str) -> PathBuf {
     result
 }
 
+/// Byte-preserving variant of [`confine`] for Linux filesystem names that do
+/// not originate in UTF-8 APIs, such as pathname AF_UNIX addresses.
+pub fn confine_path(virtual_path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut result = PathBuf::from("/");
+    for component in virtual_path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => {
+                result.pop();
+            }
+            Component::Normal(part) => result.push(part),
+            Component::Prefix(prefix) => result.push(prefix.as_os_str()),
+        }
+    }
+    result
+}
+
 /// Strip chroot root prefix from host path.
 /// Returns None if host path is not under chroot root.
 pub fn to_virtual_path(chroot_root: &Path, host_path: &Path) -> Option<PathBuf> {
@@ -197,8 +216,26 @@ pub fn resolve_chroot_mounts(mounts: &[(PathBuf, PathBuf)]) -> Vec<(PathBuf, Pat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
+
+    #[test]
+    fn confine_path_preserves_non_utf8_components_and_clamps_parent() {
+        let raw = PathBuf::from(std::ffi::OsString::from_vec(
+            b"/allowed/\xff/../service/../../../../etc".to_vec(),
+        ));
+        assert_eq!(
+            confine_path(&raw).as_os_str().as_encoded_bytes(),
+            b"/etc"
+        );
+
+        let raw = PathBuf::from(std::ffi::OsString::from_vec(b"/allowed/\xff/service".to_vec()));
+        assert_eq!(
+            confine_path(&raw).as_os_str().as_encoded_bytes(),
+            b"/allowed/\xff/service"
+        );
+    }
 
     #[test]
     fn resolve_chroot_root_none_is_ok_none() {

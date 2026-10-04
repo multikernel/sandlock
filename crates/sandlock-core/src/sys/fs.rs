@@ -6,6 +6,7 @@
 //! path opens through it (see issue #112).
 
 use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::RawFd;
 use std::path::Path;
 
@@ -40,7 +41,7 @@ pub(crate) fn openat2_in_root(
     flags: i32,
     mode: u32,
 ) -> Result<RawFd, i32> {
-    openat2_in_root_with_resolve(root, path, flags, mode, 0)
+    openat2_in_root_path_with_resolve(root, Path::new(path), flags, mode, 0)
 }
 
 /// As [`openat2_in_root`], plus the caller's own `RESOLVE_*` flags.
@@ -57,7 +58,21 @@ pub(crate) fn openat2_in_root_with_resolve(
     mode: u32,
     extra_resolve: u64,
 ) -> Result<RawFd, i32> {
-    let c_root = CString::new(root.to_str().unwrap_or("")).map_err(|_| libc::EINVAL)?;
+    openat2_in_root_path_with_resolve(root, Path::new(path), flags, mode, extra_resolve)
+}
+
+/// Byte-preserving variant of [`openat2_in_root_with_resolve`]. Filesystem
+/// names on Linux are arbitrary non-NUL byte strings; this is needed for
+/// pathname AF_UNIX targets and other kernel names that do not pass through a
+/// UTF-8 API.
+pub(crate) fn openat2_in_root_path_with_resolve(
+    root: &Path,
+    path: &Path,
+    flags: i32,
+    mode: u32,
+    extra_resolve: u64,
+) -> Result<RawFd, i32> {
+    let c_root = CString::new(root.as_os_str().as_bytes()).map_err(|_| libc::EINVAL)?;
     let root_fd = unsafe {
         libc::open(
             c_root.as_ptr(),
@@ -68,9 +83,13 @@ pub(crate) fn openat2_in_root_with_resolve(
         return Err(last_errno(libc::EIO));
     }
 
-    let rel_path = path.strip_prefix('/').unwrap_or(path);
-    let rel_path = if rel_path.is_empty() { "." } else { rel_path };
-    let c_path = CString::new(rel_path).map_err(|_| {
+    let rel_path = path.strip_prefix("/").unwrap_or(path);
+    let rel_path = if rel_path.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        rel_path
+    };
+    let c_path = CString::new(rel_path.as_os_str().as_bytes()).map_err(|_| {
         unsafe { libc::close(root_fd) };
         libc::EINVAL
     })?;
@@ -605,6 +624,32 @@ mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
+
+    #[test]
+    fn openat2_in_root_preserves_non_utf8_path_components() {
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::io::FromRawFd;
+
+        let tmp = TempDir::new().unwrap();
+        let path = std::ffi::OsString::from_vec(b"entry-\xff".to_vec());
+        std::fs::write(tmp.path().join(&path), b"pinned").unwrap();
+
+        let fd = match openat2_in_root_path_with_resolve(
+            tmp.path(),
+            Path::new(&path),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+            0,
+            0,
+        ) {
+            Ok(fd) => fd,
+            Err(libc::ENOSYS) => return,
+            Err(errno) => panic!("openat2 failed: {errno}"),
+        };
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mut contents = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut contents).unwrap();
+        assert_eq!(contents, b"pinned");
+    }
 
     #[test]
     fn openat2_in_root_confines_absolute_symlink() {

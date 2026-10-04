@@ -12,11 +12,11 @@ use crate::seccomp::notif::NotifAction;
 use crate::sys::structs::{SeccompNotif, ECONNREFUSED};
 
 use super::materialize::{
-    named_unix_socket_path, parse_ip_from_sockaddr, parse_port_from_sockaddr,
+    classify_unix_addr, parse_ip_from_sockaddr, parse_port_from_sockaddr, UnixAddr,
     set_port_in_sockaddr, sockaddr_is_ipv6,
 };
-use super::unix::connect_named_unix_on_behalf;
-use super::verdict::{layered_destination_verdict, path_under_any};
+use super::unix::{connect_named_unix_on_behalf, connect_pinned_unix_on_behalf};
+use super::verdict::layered_destination_verdict;
 use super::query_socket_protocol;
 
 // ============================================================
@@ -128,17 +128,16 @@ pub(super) async fn connect_on_behalf(
         // EACCES. The decision is made on `addr_bytes` (our immune copy) and we
         // never return Continue on the deny path, so it is TOCTOU-safe.
         // Abstract sockets (no path) are handled by the Landlock abstract scope.
-        match named_unix_socket_path(&addr_bytes) {
-            Some(path) if ctx.policy.has_unix_fs_gate => {
+        match classify_unix_addr(&addr_bytes) {
+            UnixAddr::Named(path) if ctx.policy.has_unix_fs_gate => {
                 if ctx.policy.chroot_root.is_some() {
-                    // Chroot mode: the child's paths are virtual, so a lexical
-                    // check against the (virtual) write grants is consistent,
-                    // and host socket paths are absent from the chroot view
-                    // anyway. Deny unless under a write grant.
-                    if path_under_any(&path, &ctx.policy.chroot_writable) {
-                        NotifAction::Continue
-                    } else {
-                        NotifAction::Errno(libc::EACCES)
+                    let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
+                        Ok(fd) => fd,
+                        Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
+                    };
+                    match crate::chroot::dispatch::pin_named_unix_target(notif, &path, ctx).await {
+                        Ok(pinned) => connect_pinned_unix_on_behalf(dup_fd, pinned),
+                        Err(action) => action,
                     }
                 } else {
                     // Non-chroot: resolve the symlink-followed real target and
@@ -151,6 +150,9 @@ pub(super) async fn connect_on_behalf(
                         &ctx.policy.chroot_writable,
                     )
                 }
+            }
+            UnixAddr::Malformed(errno) if ctx.policy.has_unix_fs_gate => {
+                NotifAction::Errno(errno)
             }
             // Abstract/unnamed socket, non-AF_UNIX family, or gate disabled.
             _ => NotifAction::Continue,
@@ -463,4 +465,3 @@ mod tests {
     }
 
 }
-

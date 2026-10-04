@@ -6,6 +6,7 @@
 // and the syscall runs on-behalf against `/proc/self/fd/<pin>` so the
 // checked inode is the one acted on (TOCTOU- and symlink-safe).
 
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
@@ -14,11 +15,11 @@ use crate::seccomp::notif::{read_child_mem, NotifAction};
 use crate::sys::structs::{SeccompNotif, ECONNREFUSED};
 
 use super::materialize::{
-    materialize_msg, mmsg_entry_ptr, mmsg_msglen_addr, named_unix_socket_path, ChildMsghdr,
-    MaterializedMsg,
+    classify_unix_addr, materialize_msg, mmsg_entry_ptr, mmsg_msglen_addr,
+    named_unix_socket_path, ChildMsghdr, MaterializedMsg, UnixAddr,
 };
 use super::send_engine::{batch_send_step, resolve_send, wants_blocking, BatchStep};
-use super::verdict::{path_under_any, real_path_under_any};
+use super::verdict::real_path_under_any;
 
 /// Render the supervisor-side path that addresses `sun_path` **in the child's
 /// root view**, i.e. `/proc/<pid>/root` + the child's absolute `sun_path`.
@@ -34,11 +35,13 @@ use super::verdict::{path_under_any, real_path_under_any};
 /// (`/proc/42/rootsvc.dgram`); the explicit check makes the fail-closed
 /// property intentional rather than incidental, and keeps it under a refactor
 /// to `Path::join`, which would silently drop the prefix.
-fn child_root_path(child_pid: u32, sun_path: &std::path::Path) -> Option<String> {
+fn child_root_path(child_pid: u32, sun_path: &std::path::Path) -> Option<std::ffi::OsString> {
     if !sun_path.is_absolute() {
         return None;
     }
-    Some(format!("/proc/{}/root{}", child_pid, sun_path.display()))
+    let mut bytes = format!("/proc/{}/root", child_pid).into_bytes();
+    bytes.extend_from_slice(sun_path.as_os_str().as_bytes());
+    Some(std::ffi::OsString::from_vec(bytes))
 }
 
 /// Pin the inode a named unix socket `sun_path` resolves to **in the child's
@@ -60,7 +63,7 @@ fn pin_child_unix_target(
     };
     // `O_PATH` follows symlinks to the real socket inode and pins it without
     // performing any I/O on the socket.
-    let c_proc = std::ffi::CString::new(proc_path)
+    let c_proc = std::ffi::CString::new(proc_path.as_os_str().as_bytes())
         .map_err(|_| NotifAction::Errno(libc::EACCES))?;
     let pinned_raw = unsafe { libc::open(c_proc.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
     if pinned_raw < 0 {
@@ -131,13 +134,20 @@ pub(super) fn connect_named_unix_on_behalf(
         Ok(fd) => fd,
         Err(action) => return action,
     };
-    let (sun, len) = match proc_self_fd_sockaddr(pinned.as_raw_fd()) {
-        Some(s) => s,
-        None => return NotifAction::Errno(libc::ENAMETOOLONG),
-    };
     let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(child_pid, sockfd) {
         Ok(fd) => fd,
         Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
+    };
+    connect_pinned_unix_on_behalf(dup_fd, pinned)
+}
+
+pub(super) fn connect_pinned_unix_on_behalf(
+    dup_fd: OwnedFd,
+    pinned: OwnedFd,
+) -> NotifAction {
+    let (sun, len) = match proc_self_fd_sockaddr(pinned.as_raw_fd()) {
+        Some(s) => s,
+        None => return NotifAction::Errno(libc::ENAMETOOLONG),
     };
     let ret = unsafe {
         libc::connect(
@@ -166,10 +176,28 @@ pub(super) fn sendto_named_unix_on_behalf(
     sun_path: &std::path::Path,
     writable: &[std::path::PathBuf],
 ) -> NotifAction {
+    let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
+        Ok(fd) => fd,
+        Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
+    };
     let pinned = match resolve_named_unix_target(notif.pid, sun_path, writable) {
         Ok(fd) => fd,
         Err(action) => return action,
     };
+    sendto_pinned_target_on_behalf(
+        notif, notif_fd, dup_fd, buf_ptr, buf_len, flags, pinned,
+    )
+}
+
+pub(super) fn sendto_pinned_target_on_behalf(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+    dup_fd: OwnedFd,
+    buf_ptr: u64,
+    buf_len: usize,
+    flags: i32,
+    pinned: OwnedFd,
+) -> NotifAction {
     let (sun, len) = match proc_self_fd_sockaddr(pinned.as_raw_fd()) {
         Some(s) => s,
         None => return NotifAction::Errno(libc::ENAMETOOLONG),
@@ -177,10 +205,6 @@ pub(super) fn sendto_named_unix_on_behalf(
     let data = match read_child_mem(notif_fd, notif.id, notif.pid, buf_ptr, buf_len) {
         Ok(b) => b,
         Err(_) => return NotifAction::Errno(libc::EIO),
-    };
-    let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
-        Ok(fd) => fd,
-        Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
     };
     // Route through resolve_send like the sendmsg path instead of an inline
     // blocking sendto: the dup shares the child's blocking mode, so an inline
@@ -262,7 +286,7 @@ pub(super) fn sendto_pinned_unix_on_behalf(
 /// unix socket. Returns `Some(action)` when the target is a named `AF_UNIX`
 /// socket (handled here), or `None` to fall through to the IP path (connected
 /// socket, IP family, abstract socket, or an unreadable header).
-pub(super) fn unix_sendmsg_gate(
+pub(super) async fn unix_sendmsg_gate(
     notif: &SeccompNotif,
     ctx: &Arc<SupervisorCtx>,
     notif_fd: RawFd,
@@ -270,20 +294,43 @@ pub(super) fn unix_sendmsg_gate(
     msghdr_ptr: u64,
     flags: i32,
 ) -> Option<NotifAction> {
-    let hdr = ChildMsghdr::read(notif, notif_fd, msghdr_ptr).ok()?;
+    let hdr = match ChildMsghdr::read(notif, notif_fd, msghdr_ptr) {
+        Ok(hdr) => hdr,
+        Err(errno) => return Some(NotifAction::Errno(errno)),
+    };
     if hdr.connected() {
         return None; // connected socket: no address to gate
     }
-    let addr_bytes =
-        super::read_sockaddr(notif_fd, notif.id, notif.pid, hdr.name_ptr, hdr.namelen as usize).ok()?;
-    // None unless this is a NAMED AF_UNIX target; IP/abstract fall through.
-    let path = named_unix_socket_path(&addr_bytes)?;
+    let addr_bytes = match super::read_sockaddr(
+        notif_fd,
+        notif.id,
+        notif.pid,
+        hdr.name_ptr,
+        hdr.namelen as usize,
+    ) {
+        Ok(bytes) => bytes,
+        Err(errno) => return Some(NotifAction::Errno(errno)),
+    };
+    let path = match classify_unix_addr(&addr_bytes) {
+        UnixAddr::Named(path) => path,
+        UnixAddr::Malformed(errno) => return Some(NotifAction::Errno(errno)),
+        UnixAddr::NotUnix | UnixAddr::Pathless => return None,
+    };
 
     if ctx.policy.chroot_root.is_some() {
-        return Some(if path_under_any(&path, &ctx.policy.chroot_writable) {
-            NotifAction::Continue
-        } else {
-            NotifAction::Errno(libc::EACCES)
+        let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
+            Ok(fd) => fd,
+            Err(e) => return Some(NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF))),
+        };
+        return Some(match crate::chroot::dispatch::pin_named_unix_target(notif, &path, ctx).await {
+            Err(action) => action,
+            Ok(pinned) => match materialize_named_unix_msghdr_pinned(notif, notif_fd, hdr, pinned) {
+                Ok(message) => {
+                    let blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
+                    resolve_send(dup_fd, message, flags, blocking)
+                }
+                Err(errno) => NotifAction::Errno(errno),
+            },
         });
     }
     Some(sendmsg_named_unix_on_behalf(
@@ -337,9 +384,30 @@ fn send_named_unix_msghdr(
         Err(NotifAction::Errno(e)) => return Err(e),
         Err(_) => return Err(libc::EACCES),
     };
-    let (sun, sun_len) = proc_self_fd_sockaddr(pinned.as_raw_fd()).ok_or(libc::ENAMETOOLONG)?;
-
     let hdr = ChildMsghdr::read(notif, notif_fd, msghdr_ptr)?;
+    send_named_unix_msghdr_pinned(notif, notif_fd, sockfd, hdr, pinned)
+}
+
+pub(super) fn send_named_unix_msghdr_pinned(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+    sockfd: i32,
+    hdr: ChildMsghdr,
+    pinned: OwnedFd,
+) -> Result<(OwnedFd, MaterializedMsg), i32> {
+    let message = materialize_named_unix_msghdr_pinned(notif, notif_fd, hdr, pinned)?;
+    let dup_fd = crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd)
+        .map_err(|e| e.raw_os_error().unwrap_or(libc::EBADF))?;
+    Ok((dup_fd, message))
+}
+
+pub(super) fn materialize_named_unix_msghdr_pinned(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+    hdr: ChildMsghdr,
+    pinned: OwnedFd,
+) -> Result<MaterializedMsg, i32> {
+    let (sun, sun_len) = proc_self_fd_sockaddr(pinned.as_raw_fd()).ok_or(libc::ENAMETOOLONG)?;
 
     // The destination is the `/proc/self/fd/<pinned>` sockaddr; `pinned` must
     // stay open (and at the same fd number) for that path to resolve, so the
@@ -347,12 +415,7 @@ fn send_named_unix_msghdr(
     let addr = sockaddr_un_bytes(&sun, sun_len);
 
     // Named target is always AF_UNIX, so translate SCM_RIGHTS / reject creds.
-    let m = materialize_msg(notif, notif_fd, &hdr, addr, true, Some(pinned))?;
-
-    let dup_fd = crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd)
-        .map_err(|e| e.raw_os_error().unwrap_or(libc::EBADF))?;
-
-    Ok((dup_fd, m))
+    materialize_msg(notif, notif_fd, &hdr, addr, true, Some(pinned))
 }
 
 /// Read a `sendmmsg` entry's `msg_name` and return its NAMED `AF_UNIX` path, or
@@ -364,6 +427,14 @@ pub(super) fn mmsg_entry_named_unix_path(
     entry_ptr: u64,
 ) -> Option<std::path::PathBuf> {
     let hdr = ChildMsghdr::read(notif, notif_fd, entry_ptr).ok()?;
+    mmsg_header_named_unix_path(notif, notif_fd, &hdr)
+}
+
+pub(super) fn mmsg_header_named_unix_path(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+    hdr: &ChildMsghdr,
+) -> Option<std::path::PathBuf> {
     if hdr.connected() {
         return None;
     }
@@ -438,8 +509,8 @@ mod tests {
     #[test]
     fn child_root_path_resolves_in_the_childs_root_view() {
         assert_eq!(
-            child_root_path(4242, std::path::Path::new("/run/svc.dgram")).as_deref(),
-            Some("/proc/4242/root/run/svc.dgram")
+            child_root_path(4242, std::path::Path::new("/run/svc.dgram")),
+            Some(std::ffi::OsString::from("/proc/4242/root/run/svc.dgram"))
         );
     }
 
@@ -457,6 +528,17 @@ mod tests {
             child_root_path(4242, std::path::Path::new("svc.dgram")),
             None,
             "a relative sun_path must be refused, not concatenated"
+        );
+    }
+
+    #[test]
+    fn child_root_path_preserves_non_utf8_components() {
+        let path =
+            std::path::PathBuf::from(std::ffi::OsString::from_vec(b"/run/\xff/socket".to_vec()));
+        let rendered = child_root_path(4242, &path).unwrap();
+        assert_eq!(
+            rendered.as_os_str().as_bytes(),
+            b"/proc/4242/root/run/\xff/socket"
         );
     }
 
