@@ -143,6 +143,25 @@ impl ChrootCtx<'_> {
         self.writable.iter().any(|p| virtual_path.starts_with(p))
     }
 
+    /// The access mode governs the returned fd; creation and truncation are
+    /// separate effects, even when the requested fd is O_RDONLY. The
+    /// supervisor opens on behalf of the child, so Landlock cannot enforce
+    /// these checks on the supervisor's open.
+    fn can_open(&self, virtual_path: &Path, flags: i32) -> bool {
+        if flags & libc::O_PATH != 0 {
+            // O_PATH does not mutate or open file contents. Invalid flag
+            // combinations are still rejected by the openat2 path below.
+            return self.can_read(virtual_path);
+        }
+        let mode = flags & libc::O_ACCMODE;
+        let reads = mode != libc::O_WRONLY;
+        let writes = mode == libc::O_WRONLY
+            || mode == libc::O_RDWR
+            || flags & (libc::O_CREAT | libc::O_TRUNC) != 0
+            || flags & libc::O_TMPFILE == libc::O_TMPFILE;
+        (!reads || self.can_read(virtual_path)) && (!writes || self.can_write(virtual_path))
+    }
+
     /// Check if a virtual path falls under any mount point.
     fn is_mounted(&self, virtual_path: &Path) -> bool {
         self.mounts.iter().any(|(vp, _)| virtual_path.starts_with(vp))
@@ -594,13 +613,8 @@ pub(crate) async fn handle_chroot_open(
         None => return NotifAction::Errno(libc::EACCES),
     };
 
-    // Access check: writes need can_write, reads need can_read
-    let is_write = (flags as i32 & (libc::O_WRONLY | libc::O_RDWR)) != 0;
-    if is_write {
-        if !ctx.can_write(&virtual_path) {
-            return NotifAction::Errno(libc::EACCES);
-        }
-    } else if !ctx.can_read(&virtual_path) {
+    // Check both descriptor access and effects before any COW/open work.
+    if !ctx.can_open(&virtual_path, flags as i32) {
         return NotifAction::Errno(libc::EACCES);
     }
 
@@ -1680,6 +1694,63 @@ fn stat_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path) -> NotifAc
     NotifAction::ReturnValue(0)
 }
 
+/// An empty faccessat2 path names an existing descriptor, not a pathname
+/// to reopen. Pin it before awaiting COW state, map upper-layer names back
+/// to policy names, and query the same descriptor after authorization.
+async fn access_empty_path(
+    notif: &SeccompNotif,
+    cow_state: &Arc<Mutex<CowState>>,
+    ctx: &ChrootCtx<'_>,
+    mode: i32,
+    flags: i32,
+) -> NotifAction {
+    let dirfd = notif.data.args[0] as i32;
+    let pinned = if dirfd == libc::AT_FDCWD {
+        // chdir is virtual: /proc/<pid>/cwd can still name the old cwd.
+        let cwd = match virtual_cwd_of(notif, ctx) {
+            Some(cwd) => cwd,
+            None => return NotifAction::Errno(libc::EACCES),
+        };
+        match open_in_namespace(ctx, notif.pid, &cwd, libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC, 0, 0) {
+            Ok(fd) => fd,
+            Err(errno) => return NotifAction::Errno(errno),
+        }
+    } else {
+        match crate::seccomp::notif::dup_fd_from_pid(notif.pid, dirfd) {
+            Ok(fd) => fd,
+            Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
+        }
+    };
+    let actual = match std::fs::read_link(format!("/proc/self/fd/{}", pinned.as_raw_fd())) {
+        Ok(path) => path,
+        Err(_) => return NotifAction::Errno(libc::EACCES),
+    };
+    let cs = cow_state.lock().await;
+    let logical = match cs.branch.as_ref() {
+        Some(cow) => match actual.strip_prefix(cow.upper_dir()) {
+            Ok(relative) => cow.workdir().join(relative),
+            Err(_) => actual.clone(),
+        },
+        None => actual.clone(),
+    };
+    drop(cs);
+    // Anonymous objects already held by the child carry no filesystem path
+    // authority. For tree objects, require the virtual read/write grants.
+    if logical.is_absolute() && !logical.as_os_str().as_encoded_bytes().starts_with(b"/memfd:") {
+        let vp = match ctx.host_to_virtual(&logical) {
+            Some(vp) => vp,
+            None => return NotifAction::Errno(libc::EACCES),
+        };
+        if !ctx.can_read(&vp) || (mode & libc::W_OK != 0 && !ctx.can_write(&vp)) {
+            return NotifAction::Errno(libc::EACCES);
+        }
+    }
+    // Do not fake W_OK on a lower fd: this query names the held inode, not
+    // a future pathname open that could copy it up to a different inode.
+    let ret = unsafe { libc::faccessat(pinned.as_raw_fd(), c"".as_ptr(), mode, flags) };
+    if ret == 0 { NotifAction::ReturnValue(0) } else { NotifAction::Errno(last_errno(libc::EACCES)) }
+}
+
 pub(crate) async fn handle_chroot_stat(
     notif: &SeccompNotif,
     _chroot_state: &Arc<Mutex<ChrootState>>,
@@ -1688,36 +1759,119 @@ pub(crate) async fn handle_chroot_stat(
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
     let nr = notif.data.nr as i64;
-    let flags = notif.data.args[3];
+    let is_access = nr == libc::SYS_faccessat || nr == crate::arch::SYS_FACCESSAT2;
+    // The original faccessat syscall has three arguments; its fourth
+    // register is not a flags argument and must never affect resolution.
+    let flags = if nr == libc::SYS_faccessat { 0 } else { notif.data.args[3] };
+    let mode = notif.data.args[2] as i32;
+    if is_access {
+        if mode & !(libc::R_OK | libc::W_OK | libc::X_OK) != 0
+            || flags & !((libc::AT_EACCESS | libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH) as u64) != 0
+        {
+            return NotifAction::Errno(libc::EINVAL);
+        }
+        let path = match read_path(notif, notif.data.args[1], notif_fd) {
+            Some(path) => path,
+            None => return NotifAction::Errno(libc::EFAULT),
+        };
+        if path.is_empty() {
+            return if flags & libc::AT_EMPTY_PATH as u64 != 0 {
+                access_empty_path(notif, cow_state, ctx, mode, flags as i32).await
+            } else {
+                NotifAction::Errno(libc::ENOENT)
+            };
+        }
+    }
 
     // AT_EMPTY_PATH: fstat(fd, &statbuf) — the fd already points to the
     // correct file (injected by the chroot handler or inherited). Let the
     // kernel stat it directly.
-    if (flags & libc::AT_EMPTY_PATH as u64) != 0 {
+    if !is_access && (flags & libc::AT_EMPTY_PATH as u64) != 0 {
         return NotifAction::Continue;
     }
 
     let resolved = if (flags & libc::AT_SYMLINK_NOFOLLOW as u64) != 0 {
         read_and_resolve_nofollow(notif, notif_fd, ctx, 0, 1)
+    } else if is_access {
+        // Keep a missing basename so access can report ENOENT, rather
+        // than turning every failed existing-target lookup into EACCES.
+        read_and_resolve(notif, notif_fd, ctx, 0, 1)
     } else {
         read_and_resolve_existing(notif, notif_fd, ctx, 0, 1)
     };
-    let (_, host_path, vp) = match resolved {
+    let (requested_path, host_path, vp) = match resolved {
         Ok(r) => r,
         Err(a) => return a,
     };
     if !ctx.can_read(&vp) { return NotifAction::Errno(libc::EACCES); }
+    if is_access && mode & libc::W_OK != 0 && !ctx.can_write(&vp) {
+        return NotifAction::Errno(libc::EACCES);
+    }
 
     let real_path = match cow_resolve(cow_state, &host_path).await {
         Ok(p) => p,
         Err(a) => return a,
     };
 
-    if nr == libc::SYS_faccessat || nr == crate::arch::SYS_FACCESSAT2 {
-        return if real_path.exists() || real_path.is_symlink() {
+    if is_access {
+        // COW writes target the upper layer, so a read-only lower inode
+        // must not veto an authorized W_OK. Read/execute permissions and
+        // existence must still be checked instead of reporting success.
+        let cs = cow_state.lock().await;
+        let open_flags = libc::O_PATH | libc::O_CLOEXEC
+            | if flags & libc::AT_SYMLINK_NOFOLLOW as u64 != 0 { libc::O_NOFOLLOW } else { 0 };
+        // Never follow a resolved host pathname with faccessat: its final
+        // component (or an ancestor) may have become a host-absolute link.
+        // Resolve within the selected virtual root, retain the resulting
+        // inode, and authorize that inode's virtual name before querying it.
+        let pinned = if let Some(cow) = cs.branch.as_ref().filter(|cow| real_path.starts_with(cow.upper_dir())) {
+            match crate::cow::dispatch::open_confined(cow.upper_dir(), cow.workdir(), &real_path, open_flags, 0) {
+                Ok(fd) => unsafe { OwnedFd::from_raw_fd(fd) },
+                Err(errno) => return NotifAction::Errno(errno),
+            }
+        } else {
+            // Pin the original virtual request rather than reopening an
+            // intermediate resolved name; authorize the retained object below.
+            // Object selection still relies on the kernel's confined lookup.
+            let requested_vp = match build_virtual_path(notif, notif.data.args[0] as i64, &requested_path, ctx) {
+                Some(path) => PathBuf::from(path),
+                None => return NotifAction::Errno(libc::EACCES),
+            };
+            match open_in_namespace(ctx, notif.pid, &requested_vp, open_flags, 0, 0) {
+                Ok(fd) => fd,
+                Err(errno) => return NotifAction::Errno(errno),
+            }
+        };
+        let actual = match std::fs::read_link(format!("/proc/self/fd/{}", pinned.as_raw_fd())) {
+            Ok(path) => path,
+            Err(_) => return NotifAction::Errno(libc::EACCES),
+        };
+        let logical = match cs.branch.as_ref() {
+            Some(cow) => match actual.strip_prefix(cow.upper_dir()) {
+                Ok(relative) => cow.workdir().join(relative),
+                Err(_) => actual,
+            },
+            None => actual,
+        };
+        let actual_vp = match ctx.host_to_virtual(&logical) {
+            Some(path) => path,
+            None => return NotifAction::Errno(libc::EACCES),
+        };
+        if !ctx.can_read(&actual_vp) || (mode & libc::W_OK != 0 && !ctx.can_write(&actual_vp)) {
+            return NotifAction::Errno(libc::EACCES);
+        }
+        let copied_on_write = cs.branch.as_ref().is_some_and(|cow| {
+            logical.to_str().is_some_and(|path| cow.matches(path))
+        });
+        let kernel_mode = if copied_on_write { mode & !libc::W_OK } else { mode };
+        let ret = unsafe {
+            libc::syscall(crate::arch::SYS_FACCESSAT2, pinned.as_raw_fd(), c"".as_ptr(),
+                kernel_mode, flags as i32 | libc::AT_EMPTY_PATH)
+        };
+        return if ret == 0 {
             NotifAction::ReturnValue(0)
         } else {
-            NotifAction::Errno(libc::ENOENT)
+            NotifAction::Errno(last_errno(libc::EACCES))
         };
     }
 
@@ -2455,7 +2609,7 @@ pub(crate) async fn handle_chroot_legacy_access(
     let mut synth = notif_with_args(notif, [
         libc::AT_FDCWD as u64,
         notif.data.args[0], // path
-        0,                  // statbuf (unused for faccessat path)
+        notif.data.args[1], // access mode (not a stat buffer)
         0,                  // flags
         0, 0,
     ]);
@@ -2701,5 +2855,25 @@ mod mount_ro_tests {
         let c = ctx(&mounts, &ro, &writable, &processes);
         assert!(c.can_read(Path::new("/data/file")));
         assert!(c.can_write(Path::new("/data/file")));
+    }
+
+    #[test]
+    fn open_effects_require_write_permission_independently_of_fd_mode() {
+        let mounts = vec![(PathBuf::from("/ro"), PathBuf::from("/host"))];
+        let read_only = vec![PathBuf::from("/ro")];
+        let writable = vec![PathBuf::from("/")];
+        let processes = Arc::new(ProcessIndex::new());
+        let c = ctx(&mounts, &read_only, &writable, &processes);
+        for flags in [libc::O_RDONLY, libc::O_RDONLY | libc::O_DIRECTORY, libc::O_PATH] {
+            assert!(c.can_open(Path::new("/ro/file"), flags), "{flags:#x}");
+        }
+        for flags in [
+            libc::O_WRONLY, libc::O_RDWR, libc::O_RDONLY | libc::O_CREAT,
+            libc::O_RDONLY | libc::O_TRUNC, libc::O_RDONLY | libc::O_CREAT | libc::O_EXCL,
+            libc::O_RDWR | libc::O_TMPFILE,
+        ] {
+            assert!(!c.can_open(Path::new("/ro/file"), flags), "{flags:#x}");
+            assert!(c.can_open(Path::new("/rw/file"), flags), "{flags:#x}");
+        }
     }
 }

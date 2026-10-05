@@ -759,6 +759,16 @@ pub(crate) fn build_dispatch_table(
 
     {
         for nr in crate::procfs::net_dispatch::metadata_syscalls() {
+            // COW has already answered changed access targets. Its Continue
+            // for unchanged paths must reach the caller's kernel, not become
+            // another permission query under supervisor credentials. Keep
+            // the earlier proc-net handlers and user handler chain intact.
+            if policy.cow_enabled && policy.chroot_root.is_none()
+                && (nr == libc::SYS_faccessat || nr == arch::SYS_FACCESSAT2
+                    || Some(nr) == arch::sys_access())
+            {
+                continue;
+            }
             let sup = Arc::clone(ctx);
             table.register(nr, move |cx: &HandlerCtx| {
                 let sup = Arc::clone(&sup);
@@ -1046,8 +1056,8 @@ fn register_cow_handlers(table: &mut DispatchTable, ctx: &Arc<SupervisorCtx>) {
         table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_open));
     }
 
-    let mut stat_nrs = vec![libc::SYS_newfstatat, libc::SYS_faccessat];
-    stat_nrs.extend([arch::sys_stat(), arch::sys_lstat(), arch::sys_access()].into_iter().flatten());
+    let mut stat_nrs = vec![libc::SYS_newfstatat];
+    stat_nrs.extend([arch::sys_stat(), arch::sys_lstat()].into_iter().flatten());
     for nr in stat_nrs {
         table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_stat));
     }
