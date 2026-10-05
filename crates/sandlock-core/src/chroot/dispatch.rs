@@ -143,6 +143,25 @@ impl ChrootCtx<'_> {
         self.writable.iter().any(|p| virtual_path.starts_with(p))
     }
 
+    /// The access mode governs the returned fd; creation and truncation are
+    /// separate effects, even when the requested fd is O_RDONLY. The
+    /// supervisor opens on behalf of the child, so Landlock cannot enforce
+    /// these checks on the supervisor's open.
+    fn can_open(&self, virtual_path: &Path, flags: i32) -> bool {
+        if flags & libc::O_PATH != 0 {
+            // O_PATH does not mutate or open file contents. Invalid flag
+            // combinations are still rejected by the openat2 path below.
+            return self.can_read(virtual_path);
+        }
+        let mode = flags & libc::O_ACCMODE;
+        let reads = mode != libc::O_WRONLY;
+        let writes = mode == libc::O_WRONLY
+            || mode == libc::O_RDWR
+            || flags & (libc::O_CREAT | libc::O_TRUNC) != 0
+            || flags & libc::O_TMPFILE == libc::O_TMPFILE;
+        (!reads || self.can_read(virtual_path)) && (!writes || self.can_write(virtual_path))
+    }
+
     /// Check if a virtual path falls under any mount point.
     fn is_mounted(&self, virtual_path: &Path) -> bool {
         self.mounts.iter().any(|(vp, _)| virtual_path.starts_with(vp))
@@ -594,13 +613,8 @@ pub(crate) async fn handle_chroot_open(
         None => return NotifAction::Errno(libc::EACCES),
     };
 
-    // Access check: writes need can_write, reads need can_read
-    let is_write = (flags as i32 & (libc::O_WRONLY | libc::O_RDWR)) != 0;
-    if is_write {
-        if !ctx.can_write(&virtual_path) {
-            return NotifAction::Errno(libc::EACCES);
-        }
-    } else if !ctx.can_read(&virtual_path) {
+    // Check both descriptor access and effects before any COW/open work.
+    if !ctx.can_open(&virtual_path, flags as i32) {
         return NotifAction::Errno(libc::EACCES);
     }
 
@@ -2701,5 +2715,25 @@ mod mount_ro_tests {
         let c = ctx(&mounts, &ro, &writable, &processes);
         assert!(c.can_read(Path::new("/data/file")));
         assert!(c.can_write(Path::new("/data/file")));
+    }
+
+    #[test]
+    fn open_effects_require_write_permission_independently_of_fd_mode() {
+        let mounts = vec![(PathBuf::from("/ro"), PathBuf::from("/host"))];
+        let read_only = vec![PathBuf::from("/ro")];
+        let writable = vec![PathBuf::from("/")];
+        let processes = Arc::new(ProcessIndex::new());
+        let c = ctx(&mounts, &read_only, &writable, &processes);
+        for flags in [libc::O_RDONLY, libc::O_RDONLY | libc::O_DIRECTORY, libc::O_PATH] {
+            assert!(c.can_open(Path::new("/ro/file"), flags), "{flags:#x}");
+        }
+        for flags in [
+            libc::O_WRONLY, libc::O_RDWR, libc::O_RDONLY | libc::O_CREAT,
+            libc::O_RDONLY | libc::O_TRUNC, libc::O_RDONLY | libc::O_CREAT | libc::O_EXCL,
+            libc::O_RDWR | libc::O_TMPFILE,
+        ] {
+            assert!(!c.can_open(Path::new("/ro/file"), flags), "{flags:#x}");
+            assert!(c.can_open(Path::new("/rw/file"), flags), "{flags:#x}");
+        }
     }
 }

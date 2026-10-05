@@ -2465,3 +2465,78 @@ async fn test_chroot_shebang_loop_is_eloop() {
     );
     cleanup_rootfs(&rootfs);
 }
+
+/// O_RDONLY describes the returned fd, not all effects of open(2): O_TRUNC
+/// and O_CREAT still mutate the filesystem in the supervisor's context.
+#[tokio::test]
+async fn test_chroot_readonly_open_cannot_mutate_files() {
+    check_readonly_open_effects(false).await;
+}
+
+#[tokio::test]
+async fn test_chroot_cow_readonly_open_cannot_mutate_files() {
+    check_readonly_open_effects(true).await;
+}
+
+async fn check_readonly_open_effects(cow: bool) {
+    let rootfs = build_test_rootfs(&format!("readonly-open-mutation-{cow}"));
+    let mounted = temp_dir(&format!("readonly-open-mutation-mount-{cow}"));
+    fs::create_dir_all(rootfs.join("ro")).unwrap();
+    fs::create_dir_all(rootfs.join("rw")).unwrap();
+    fs::create_dir_all(rootfs.join("mnt")).unwrap();
+    let mut builder = minimal_exec_policy(&rootfs)
+        .fs_read("/ro")
+        .fs_write("/rw")
+        .fs_mount_ro("/mnt", &mounted);
+    if cow { builder = builder.workdir(&rootfs).on_exit(BranchAction::Commit); }
+    let policy = builder.build().unwrap();
+    let mut failures = Vec::new();
+    for spelling in ["open", "openat", "openat2"] {
+        for (virtual_dir, host_dir, allowed) in [
+            ("/ro", rootfs.join("ro"), false),
+            ("/mnt", mounted.clone(), false),
+            ("/rw", rootfs.join("rw"), true),
+        ] {
+            for (name, flags, exists) in [
+                ("read", libc::O_RDONLY, true),
+                ("truncate", libc::O_RDONLY | libc::O_TRUNC, true),
+                ("create", libc::O_RDONLY | libc::O_CREAT, false),
+                ("create-exclusive", libc::O_RDONLY | libc::O_CREAT | libc::O_EXCL, false),
+                ("path-only", libc::O_PATH | libc::O_TRUNC, true),
+            ] {
+                let basename = format!("{spelling}-{name}");
+                let host = host_dir.join(&basename);
+                if exists { fs::write(&host, b"KEEP").unwrap(); }
+                let path = format!("{virtual_dir}/{basename}");
+                let flags_text = flags.to_string();
+                let result = policy.clone().run(&[
+                    "rootfs-helper", "open-flags", spelling, &path, &flags_text,
+                ]).await.expect("sandbox must run: no skip on setup errors");
+                assert!(result.success(), "helper failed: {:?}", result.stderr_str());
+                let mutates = name != "read" && name != "path-only";
+                let denied = mutates && !allowed;
+                let expected = if name == "path-only" {
+                    format!("ERR:{}", libc::EINVAL)
+                } else if denied { format!("ERR:{}", libc::EACCES) } else { "OPENED".into() };
+                let output = result.stdout_str().unwrap().trim();
+                if output != expected {
+                    failures.push(format!("{path}: expected {expected}, got {output}"));
+                }
+                if denied || !mutates {
+                    if exists {
+                        if fs::read(&host).unwrap() != b"KEEP" {
+                            failures.push(format!("{path}: original bytes changed"));
+                        }
+                    } else if host.exists() {
+                        failures.push(format!("{path}: forbidden file was created"));
+                    }
+                } else if !host.exists() || !fs::read(&host).unwrap().is_empty() {
+                    failures.push(format!("{path}: allowed operation did not take effect"));
+                }
+            }
+        }
+    }
+    cleanup_rootfs(&rootfs);
+    fs::remove_dir_all(mounted).unwrap();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
