@@ -385,7 +385,22 @@ pub(crate) async fn handle_pinned_metadata(
                 )
             };
             if count < 0 {
-                return errno_action();
+                let errno = std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO);
+                // An empty-path readlinkat on a non-link returns ENOENT,
+                // while the caller's non-empty pathname requires EINVAL.
+                // Preserve explicit empty-path requests and errors from
+                // actual links (e.g. a procfs link whose target vanished).
+                if !path.is_empty() && errno == libc::ENOENT {
+                    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } == 0
+                        && st.st_mode & libc::S_IFMT != libc::S_IFLNK
+                    {
+                        return NotifAction::Errno(libc::EINVAL);
+                    }
+                }
+                return NotifAction::Errno(errno);
             }
             if resolved == "/proc/self" {
                 target = tgid.to_string().into_bytes();

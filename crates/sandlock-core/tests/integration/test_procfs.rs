@@ -1,5 +1,5 @@
 use sandlock_core::sandbox::ByteSize;
-use sandlock_core::{Sandbox};
+use sandlock_core::{Protection, Sandbox};
 
 /// Test that num_cpus virtualizes both /proc/cpuinfo and sched_getaffinity.
 #[tokio::test]
@@ -1237,4 +1237,160 @@ print('OK')
     let mut policy = proc_grant().fs_read(root.path()).build().unwrap();
     let result = policy.run(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "{}", result.stderr_str().unwrap_or(""));
+}
+
+// Preserve readlink errno, including the EINVAL that libc realpath expects
+// for ordinary files and directories.
+const READLINK_HELPERS: &str = r#"
+import ctypes, errno, os, sys
+
+root = sys.argv[1]
+os.chdir(root)
+libc = ctypes.CDLL(None, use_errno=True)
+libc.readlink.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t]
+libc.readlink.restype = ctypes.c_ssize_t
+libc.readlinkat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t]
+libc.readlinkat.restype = ctypes.c_ssize_t
+dirfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+
+def check_readlink(path, expected, fd=None, size=4096):
+    buf = ctypes.create_string_buffer(max(size, 1))
+    ctypes.set_errno(0)
+    if fd is None:
+        count = libc.readlink(os.fsencode(path), buf, size)
+    else:
+        count = libc.readlinkat(fd, os.fsencode(path), buf, size)
+    if isinstance(expected, int):
+        actual = (count, ctypes.get_errno())
+        assert actual == (-1, expected), (path, fd, size, actual, expected)
+    else:
+        actual = (count, buf.raw[:max(count, 0)])
+        assert actual == (len(expected), expected), (path, fd, size, actual, expected)
+"#;
+
+async fn run_readlink_test(body: &str) {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("file"), b"fixture\n").unwrap();
+    std::fs::create_dir(root.path().join("dir")).unwrap();
+    std::os::unix::fs::symlink("file", root.path().join("link")).unwrap();
+    std::os::unix::fs::symlink("missing", root.path().join("dangling")).unwrap();
+
+    let script = format!("{READLINK_HELPERS}\n{body}\nprint('OK')\n");
+    // These metadata semantics do not require the newer Landlock rights.
+    // Unsupported rights may degrade, but the sandbox run must still succeed.
+    let mut policy = proc_grant()
+        .fs_read(root.path())
+        .allow_degraded(Protection::NetTcp)
+        .allow_degraded(Protection::FsIoctlDev)
+        .allow_degraded(Protection::SignalScope)
+        .allow_degraded(Protection::AbstractUnixSocketScope)
+        .build()
+        .unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        policy.run(&["python3", "-c", &script, root.path().to_str().unwrap()]),
+    )
+    .await
+    .expect("readlink regression test timed out")
+    .unwrap();
+    assert!(result.success(), "{}", result.stderr_str().unwrap_or(""));
+    assert_eq!(result.stdout_str().unwrap_or("").trim(), "OK");
+}
+
+#[tokio::test]
+async fn test_readlink_non_symlinks_return_einval() {
+    let script = r#"
+for name in ['file', 'dir']:
+    absolute = os.path.join(root, name)
+    check_readlink(absolute, errno.EINVAL)
+    check_readlink(name, errno.EINVAL)
+    check_readlink(absolute, errno.EINVAL, dirfd)
+    check_readlink(name, errno.EINVAL, dirfd)
+"#;
+    run_readlink_test(script).await;
+}
+
+#[tokio::test]
+async fn test_readlink_symlinks_and_path_errors() {
+    let script = r#"
+for name, expected in [
+    ('link', b'file'),
+    ('dangling', b'missing'),
+    ('missing', errno.ENOENT),
+    ('file/child', errno.ENOTDIR),
+]:
+    check_readlink(os.path.join(root, name), expected)
+    check_readlink(name, expected, dirfd)
+"#;
+    run_readlink_test(script).await;
+}
+
+#[tokio::test]
+async fn test_readlinkat_empty_path_preserves_errno() {
+    let script = r#"
+# An explicit empty-path request on a non-link must retain ENOENT, not EINVAL.
+for name, expected in [
+    ('file', errno.ENOENT),
+    ('dir', errno.ENOENT),
+    ('link', b'file'),
+    ('dangling', b'missing'),
+]:
+    fd = os.open(name, os.O_PATH | os.O_NOFOLLOW)
+    check_readlink('', expected, fd)
+    os.close(fd)
+check_readlink('link', errno.EBADF, -1)
+check_readlink('', errno.EBADF, -1)
+"#;
+    run_readlink_test(script).await;
+}
+
+#[tokio::test]
+async fn test_readlink_buffer_sizes() {
+    let script = r#"
+check_readlink('link', errno.EINVAL, size=0)
+check_readlink('link', b'fi', size=2)
+"#;
+    run_readlink_test(script).await;
+}
+
+#[tokio::test]
+async fn test_readlink_proc_links() {
+    let script = r#"
+check_readlink('/proc/net', b'self/net')
+check_readlink('/proc/self', str(os.getpid()).encode())
+fd = os.open('file', os.O_RDONLY)
+check_readlink('/proc/self/fd/' + str(fd), os.fsencode(os.path.join(root, 'file')))
+os.close(fd)
+"#;
+    run_readlink_test(script).await;
+}
+
+#[tokio::test]
+async fn test_readlink_libc_realpath() {
+    // Python's os.path.realpath tolerates the wrong readlink errno, so call
+    // libc realpath itself to reproduce the reported regression on glibc.
+    let script = r#"
+libc.realpath.argtypes = [ctypes.c_char_p, ctypes.c_void_p]
+libc.realpath.restype = ctypes.c_void_p
+libc.free.argtypes = [ctypes.c_void_p]
+libc.free.restype = None
+for name, target in [
+    ('file', 'file'),
+    ('dir', 'dir'),
+    ('link', 'file'),
+    ('dangling', None),
+    ('missing', None),
+]:
+    ctypes.set_errno(0)
+    resolved = libc.realpath(os.fsencode(os.path.join(root, name)), None)
+    if target is None:
+        assert not resolved and ctypes.get_errno() == errno.ENOENT, (name, ctypes.get_errno())
+    else:
+        assert resolved, (name, ctypes.get_errno())
+        actual = ctypes.string_at(resolved)
+        libc.free(resolved)
+        expected = os.fsencode(os.path.join(root, target))
+        assert actual == expected, (name, actual, expected)
+"#;
+    run_readlink_test(script).await;
 }
