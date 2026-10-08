@@ -931,6 +931,7 @@ mod mask_contract_tests {
         );
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn net_mask_http_only_keeps_connect_tcp() {
         // HTTP-only has no explicit allow rules but generates a finite
@@ -952,6 +953,7 @@ mod mask_contract_tests {
         );
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn net_mask_deny_only_http_stays_wildcard() {
         // Deny-only + HTTP stays default-allow: HTTP reachability must not
@@ -973,6 +975,7 @@ mod mask_contract_tests {
         );
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn net_mask_combined_http_keeps_connect_tcp() {
         let pol = ProtectionPolicy::strict_all();

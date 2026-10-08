@@ -380,6 +380,7 @@ mod tests {
         assert!(loaded.net_allow_is_active());
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn image_round_trip_preserves_deny_only_http_as_default_allow() {
         let policy = Sandbox::builder()
@@ -397,6 +398,7 @@ mod tests {
         assert_eq!(loaded.effective_net_allow().len(), 1);
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn image_round_trip_preserves_http_only_as_restrictive_allowlist() {
         let policy = Sandbox::builder()

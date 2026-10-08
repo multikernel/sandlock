@@ -2,6 +2,19 @@ use super::*;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+#[cfg(not(feature = "http"))]
+#[test]
+fn http_options_need_the_http_feature() {
+    for builder in [
+        Sandbox::builder().http_allow("GET example.com/*"),
+        Sandbox::builder().http_ca("/ca.pem").http_key("/ca.key"),
+        Sandbox::builder().credential("openai", "env:OPENAI_API_KEY"),
+    ] {
+        let err = builder.build().unwrap_err();
+        assert!(matches!(err, SandboxError::FeatureDisabled { feature: "http", .. }), "{err}");
+    }
+}
+
 #[test]
 fn run_as_parses_uid_and_gid() {
     let r = RunAs::from_str("1000:2000").unwrap();
@@ -49,6 +62,7 @@ fn resolve_sandbox_path_mount_takes_precedence() {
     assert_eq!(r, PathBuf::from("/host/ssl/x.pem"));
 }
 
+#[cfg(feature = "http")]
 #[tokio::test]
 async fn inject_ca_nonexistent_path_errors_at_run() {
     // Wildcard host rule avoids DNS; the missing inject path must error
@@ -64,6 +78,7 @@ async fn inject_ca_nonexistent_path_errors_at_run() {
 
 // --- SandboxBuilder integration ---
 
+#[cfg(feature = "http")]
 #[test]
 fn builder_http_rules() {
     let policy = Sandbox::builder()
@@ -109,6 +124,7 @@ fn builder_http_key_without_ca_returns_error() {
     assert!(result.is_err());
 }
 
+#[cfg(feature = "http")]
 #[test]
 fn builder_http_ca_and_key_together_ok() {
     let policy = Sandbox::builder()
@@ -120,6 +136,7 @@ fn builder_http_ca_and_key_together_ok() {
     assert!(policy.http_key.is_some());
 }
 
+#[cfg(feature = "http")]
 #[test]
 fn inject_ca_adds_443_and_requires_http_rule() {
     // No http rule -> error.
@@ -138,6 +155,7 @@ fn inject_ca_adds_443_and_requires_http_rule() {
     assert_eq!(policy.http_inject_ca.len(), 1);
 }
 
+#[cfg(feature = "http")]
 #[test]
 fn http_ca_out_requires_trigger() {
     let err = Sandbox::builder()
@@ -309,6 +327,7 @@ fn builder_combines_net_allow_and_net_deny() {
     assert!(policy.net_allow_is_active());
 }
 
+#[cfg(feature = "http")]
 #[test]
 fn builder_keeps_http_reachability_out_of_net_allow() {
     // `net_allow` holds only explicit rules; HTTP reachability is generated
@@ -323,6 +342,7 @@ fn builder_keeps_http_reachability_out_of_net_allow() {
     assert_eq!(policy.effective_net_allow().len(), 1);
 }
 
+#[cfg(feature = "http")]
 #[test]
 fn builder_http_only_stays_restrictive_allowlist() {
     let policy = Sandbox::builder()
@@ -335,6 +355,7 @@ fn builder_http_only_stays_restrictive_allowlist() {
     assert_eq!(policy.effective_net_allow().len(), 1);
 }
 
+#[cfg(feature = "http")]
 #[test]
 fn builder_deny_only_http_stays_default_allow() {
     let policy = Sandbox::builder()
@@ -349,6 +370,7 @@ fn builder_deny_only_http_stays_default_allow() {
     assert_eq!(policy.effective_net_allow().len(), 1);
 }
 
+#[cfg(feature = "http")]
 #[test]
 fn builder_combined_http_merges_at_resolution_time() {
     let policy = Sandbox::builder()
@@ -363,6 +385,7 @@ fn builder_combined_http_merges_at_resolution_time() {
     assert_eq!(policy.effective_net_allow().len(), 3);
 }
 
+#[cfg(feature = "http")]
 #[test]
 fn outbound_mode_survives_policy_bincode_round_trip() {
     for builder in [

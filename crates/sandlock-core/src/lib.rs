@@ -1,5 +1,9 @@
 pub mod error;
 pub mod http;
+#[cfg(feature = "http")]
+pub(crate) mod credential;
+#[cfg(not(feature = "http"))]
+#[path = "credential_disabled.rs"]
 pub(crate) mod credential;
 pub mod sandbox;     // formerly `policy`; contains Sandbox + SandboxBuilder + Confinement
 pub mod profile;
@@ -34,6 +38,10 @@ pub mod fork;
 pub(crate) mod ca_inject;
 pub(crate) mod chroot;
 pub mod control;
+#[cfg(feature = "http")]
+mod transparent_proxy;
+#[cfg(not(feature = "http"))]
+#[path = "transparent_proxy/disabled.rs"]
 mod transparent_proxy;
 
 pub use error::SandlockError;

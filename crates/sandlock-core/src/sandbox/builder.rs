@@ -939,6 +939,25 @@ impl SandboxBuilder {
             ));
         }
 
+        #[cfg(not(feature = "http"))]
+        {
+            let set = [
+                ("--http-allow", !self.http_allow.is_empty()),
+                ("--http-deny", !self.http_deny.is_empty()),
+                ("--http-port", !self.http_ports.is_empty()),
+                ("--http-ca", self.http_ca.is_some()),
+                ("--http-key", self.http_key.is_some()),
+                ("--http-inject-ca", !self.http_inject_ca.is_empty()),
+                ("--http-ca-out", self.http_ca_out.is_some()),
+                ("--http-auth", !self.http_auth.is_empty()),
+                ("--credential", !self.credentials.is_empty()),
+                ("http_log_fn", self.http_log_fn.is_some()),
+            ];
+            if let Some((what, _)) = set.iter().find(|(_, on)| *on) {
+                return Err(SandboxError::FeatureDisabled { what: what.to_string(), feature: "http" });
+            }
+        }
+
         // Validate: http_ca and http_key must both be set or both unset
         if self.http_ca.is_some() != self.http_key.is_some() {
             return Err(SandboxError::Invalid(

@@ -979,6 +979,7 @@ mod tests {
         assert_eq!(parsed.filesystem, FilesystemSection::default());
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn config_section_maps_to_policy_http_fields() {
         let toml = r#"
@@ -994,6 +995,7 @@ mod tests {
         assert_eq!(policy.http_key.as_deref(), Some(std::path::Path::new("/tmp/ca.key")));
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn parses_http_inject_ca_and_ca_out() {
         let toml = r#"
@@ -1068,6 +1070,7 @@ mod tests {
         assert!(msg.contains("non-empty"), "got: {msg}");
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn parse_profile_full_example() {
         let toml = r#"
@@ -1246,6 +1249,7 @@ mod tests {
         assert_eq!(round_tripped.net_deny_bind, policy.net_deny_bind);
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn profile_deny_only_http_policy_does_not_promote_generated_allow_rules() {
         let toml = r#"
@@ -1270,6 +1274,7 @@ mod tests {
         assert_eq!(round_tripped.effective_net_allow().len(), 1);
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn profile_http_only_round_trips_as_restrictive_allowlist() {
         let toml = r#"
@@ -1293,6 +1298,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn profile_combined_http_round_trips_without_duplicating_derived_rules() {
         let toml = r#"
