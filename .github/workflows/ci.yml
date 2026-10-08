@@ -41,6 +41,32 @@ jobs:
         timeout-minutes: 20
         run: cargo test --release --workspace --no-fail-fast -- --test-threads=1
 
+  rust-minimal:
+    name: Rust without optional features
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Minimal build pulls in no HTTP stack
+        run: |
+          if cargo tree --workspace --no-default-features -e normal --prefix none \
+              | grep -E '^(hyper|rustls|rcgen|bollard) '; then
+            exit 1
+          fi
+
+      - name: Run all tests
+        timeout-minutes: 20
+        run: cargo test --release --workspace --no-default-features --no-fail-fast -- --test-threads=1
+
   rust-low-abi:
     name: Rust low-ABI (ubuntu-22.04)
     runs-on: ubuntu-22.04
