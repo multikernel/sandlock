@@ -585,12 +585,15 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         .max_memory(sandlock_core::sandbox::ByteSize(1 << 43)) // 8 TiB
         .policy_fn(move |event, _ctx| observer_cb.on_event(event));
 
-    let http_requests_cb = Arc::clone(&observer.http_requests);
-    let http_log: Arc<dyn Fn(&str, &str, &str) + Send + Sync> =
-        Arc::new(move |method, host, path| {
-            http_requests_cb.lock().unwrap().insert(format!("{method} {host}{path}"));
-        });
-    builder = builder.http_log_fn(http_log);
+    #[cfg(feature = "http")]
+    {
+        let http_requests_cb = Arc::clone(&observer.http_requests);
+        let http_log: Arc<dyn Fn(&str, &str, &str) + Send + Sync> =
+            Arc::new(move |method, host, path| {
+                http_requests_cb.lock().unwrap().insert(format!("{method} {host}{path}"));
+            });
+        builder = builder.http_log_fn(http_log);
+    }
     for path in &args.http_inject_ca {
         builder = builder.http_inject_ca(path);
     }
