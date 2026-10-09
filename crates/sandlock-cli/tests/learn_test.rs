@@ -994,6 +994,7 @@ fn spawn_http_server() -> u16 {
 }
 
 /// A plaintext HTTP request is captured and written as an [http] allow rule.
+#[cfg(feature = "http")]
 #[test]
 fn test_learn_captures_http_request() {
     let port = spawn_http_server();
@@ -1015,6 +1016,7 @@ fn test_learn_captures_http_request() {
 }
 
 /// --http-port writes only the intercepted port to [http].ports, not port 80.
+#[cfg(feature = "http")]
 #[test]
 fn test_learn_http_port_not_inflated() {
     let port = spawn_http_server();
@@ -1033,6 +1035,7 @@ fn test_learn_http_port_not_inflated() {
 }
 
 /// Multiple distinct requests to different paths are all recorded and deduplicated.
+#[cfg(feature = "http")]
 #[test]
 fn test_learn_captures_http_multiple_paths() {
     let port = spawn_http_server();
@@ -1082,6 +1085,7 @@ fn https_reachable(host: &str) -> bool {
 /// Uses a real HTTPS server (example.com) so that TLS termination, MITM cert signing,
 /// CA injection, and proxy forwarding are all exercised end to end.
 /// Skipped if example.com is unreachable or no system CA bundle is found.
+#[cfg(feature = "http")]
 #[test]
 fn test_learn_captures_https_request() {
     if !https_reachable("example.com") {

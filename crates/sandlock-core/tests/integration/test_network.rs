@@ -1551,6 +1551,7 @@ async fn test_combined_hostname_resolving_into_denied_cidr_refused() {
 /// HTTP-derived rules live outside `net_allow` and must not promote the
 /// policy to combined. A live listener on an address outside both the HTTP
 /// allow host and the denylist must still connect.
+#[cfg(feature = "http")]
 #[tokio::test]
 async fn test_deny_only_with_http_allow_stays_deny_only() {
     let listener = TcpListener::bind("127.0.0.2:0").unwrap();

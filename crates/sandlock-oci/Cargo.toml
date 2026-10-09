@@ -16,8 +16,12 @@ path = "src/lib.rs"
 name = "sandlock-oci"
 path = "src/main.rs"
 
+[features]
+default = ["http"]
+http = ["sandlock-core/http"]
+
 [dependencies]
-sandlock-core = { version = "0.8.9", path = "../sandlock-core" }
+sandlock-core = { version = "0.8.9", path = "../sandlock-core", default-features = false }
 anyhow      = "1"
 clap        = { version = "4", features = ["derive"] }
 tokio       = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
@@ -29,4 +33,4 @@ oci-spec    = { version = "0.7", features = ["runtime"] }
 [dev-dependencies]
 tempfile = "3"
 tokio    = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
-sandlock-core = { path = "../sandlock-core" }
+sandlock-core = { path = "../sandlock-core", default-features = false }

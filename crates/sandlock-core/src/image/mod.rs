@@ -28,9 +28,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{SandboxRuntimeError, SandlockError};
 
+#[cfg(feature = "http")]
 mod docker;
 mod layer;
 mod oci;
+#[cfg(feature = "http")]
 mod registry;
 
 /// An unpacked image: its root filesystem and how it expects to be run.
@@ -66,8 +68,16 @@ impl ImageConfig {
 pub async fn pull(reference: &str, cache_dir: Option<&Path>) -> Result<Image, SandlockError> {
     let cache = Cache::new(cache_dir);
     match Source::parse(reference)? {
+        #[cfg(feature = "http")]
         Source::Registry(name) => registry::pull(&cache, &name).await,
+        #[cfg(feature = "http")]
         Source::DockerDaemon(name) => docker::pull(&cache, &name).await,
+        #[cfg(not(feature = "http"))]
+        Source::Registry(_) | Source::DockerDaemon(_) => Err(crate::error::SandboxError::FeatureDisabled {
+            what: format!("image reference {reference:?}"),
+            feature: "http",
+        }
+        .into()),
         Source::OciDir { path, tag } => {
             blocking(move || {
                 let blobs = oci::LayoutDir::open(&path)?;
@@ -255,6 +265,15 @@ impl Cache {
 mod tests {
     use super::*;
     use oci::tests::{tar_of, TestLayout};
+
+    #[cfg(not(feature = "http"))]
+    #[tokio::test]
+    async fn network_transports_need_the_http_feature() {
+        for reference in ["docker://alpine", "docker-daemon:alpine"] {
+            let err = pull(reference, Some(Path::new("/nonexistent"))).await.unwrap_err();
+            assert!(err.to_string().contains("\"http\" feature"), "{err}");
+        }
+    }
 
     #[test]
     fn default_cmd_combines_entrypoint_and_cmd() {

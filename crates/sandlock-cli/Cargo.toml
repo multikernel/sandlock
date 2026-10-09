@@ -12,8 +12,12 @@ description = "CLI for sandlock process sandbox"
 name = "sandlock"
 path = "src/main.rs"
 
+[features]
+default = ["http"]
+http = ["sandlock-core/http"]
+
 [dependencies]
-sandlock-core = { version = "0.8.9", path = "../sandlock-core", features = ["cli"] }
+sandlock-core = { version = "0.8.9", path = "../sandlock-core", default-features = false, features = ["cli"] }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"

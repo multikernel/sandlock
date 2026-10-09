@@ -58,6 +58,7 @@ mod test_chroot;
 #[path = "integration/test_branch_action.rs"]
 mod test_branch_action;
 
+#[cfg(feature = "http")]
 #[path = "integration/test_http_acl.rs"]
 mod test_http_acl;
 
@@ -70,9 +71,11 @@ mod test_control;
 #[path = "integration/test_protection.rs"]
 mod test_protection;
 
+#[cfg(feature = "http")]
 #[path = "integration/test_http_inject_ca.rs"]
 mod test_http_inject_ca;
 
+#[cfg(feature = "http")]
 #[path = "integration/test_http_strict_tls.rs"]
 mod test_http_strict_tls;
 

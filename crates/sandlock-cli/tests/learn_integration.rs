@@ -464,6 +464,7 @@ fn spawn_http_server() -> u16 {
 /// Learn HTTP traffic then run with the learned profile:
 /// - the learned path is allowed and returns the real response
 /// - a different path that was not observed is blocked (403 from proxy)
+#[cfg(feature = "http")]
 #[test]
 fn test_learn_then_run_http() {
     let profile = tempfile::NamedTempFile::new().expect("tempfile");
@@ -533,6 +534,7 @@ fn https_reachable(host: &str) -> bool {
 /// - the learned HTTPS path is allowed
 /// - an unlearned path is blocked (403 from proxy)
 /// Skipped if example.com is unreachable or no system CA bundle is found.
+#[cfg(feature = "http")]
 #[test]
 fn test_learn_then_run_https() {
     if !https_reachable("example.com") {
@@ -584,6 +586,7 @@ fn test_learn_then_run_https() {
 
 /// --merge carries [http].allow and [http].ports from the observed run into the
 /// existing profile.
+#[cfg(feature = "http")]
 #[test]
 fn test_learn_then_run_merge_http() {
     let profile = tempfile::NamedTempFile::new().expect("tempfile");

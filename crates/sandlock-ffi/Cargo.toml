@@ -11,9 +11,13 @@ description = "C ABI for sandlock process sandbox"
 [lib]
 crate-type = ["cdylib", "staticlib", "rlib"]
 
+[features]
+default = ["http"]
+http = ["sandlock-core/http"]
+
 [dependencies]
 libc = "0.2"
-sandlock-core = { version = "0.8.9", path = "../sandlock-core" }
+sandlock-core = { version = "0.8.9", path = "../sandlock-core", default-features = false }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 

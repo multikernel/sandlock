@@ -26,24 +26,28 @@ ring = "0.17"
 toml = "0.8"
 jiff = "0.2"
 pathdiff = "0.2"
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
-hyper = { version = "1", features = ["server", "client", "http1"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
-http-body-util = "0.1"
-hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "native-tokio", "http1", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
+rcgen = { version = "0.13", features = ["pem", "x509-parser"], optional = true }
+hyper = { version = "1", features = ["server", "client", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "native-tokio", "http1", "tls12", "logging"], optional = true }
 tar = "0.4"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 ruzstd = "0.9"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"], optional = true }
-bollard = "0.21"
-futures-util = "0.3"
+bollard = { version = "0.21", optional = true }
+futures-util = { version = "0.3", optional = true }
 
 [features]
-default = []
+default = ["http"]
 cli = ["dep:clap"]
+http = [
+    "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:hyper-rustls",
+    "dep:tokio-rustls", "dep:rustls", "dep:rcgen", "dep:bollard", "dep:futures-util",
+]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }

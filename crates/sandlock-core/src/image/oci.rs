@@ -96,8 +96,10 @@ impl Blobs for LayoutDir {
 }
 
 /// A bare directory of blobs named by their sha256 hex.
+#[cfg(feature = "http")]
 pub(super) struct BlobDir(pub PathBuf);
 
+#[cfg(feature = "http")]
 impl Blobs for BlobDir {
     fn index(&self) -> io::Result<Vec<u8>> {
         Err(io::Error::new(io::ErrorKind::Unsupported, "a blob directory has no index"))
@@ -407,6 +409,7 @@ pub(super) mod tests {
     use super::*;
     use std::fs;
 
+    #[cfg(feature = "http")]
     pub(in crate::image) fn host_arch_for_tests() -> &'static str {
         host_arch()
     }

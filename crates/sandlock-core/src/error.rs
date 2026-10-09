@@ -28,6 +28,9 @@ pub enum SandboxError {
     #[error("confine() only accepts Landlock filesystem policy; unsupported fields: {0}")]
     UnsupportedForConfine(String),
 
+    #[error("{what} needs sandlock built with the \"{feature}\" feature")]
+    FeatureDisabled { what: String, feature: &'static str },
+
     #[error("chroot path {path} does not exist or is inaccessible: {source}")]
     ChrootNotFound {
         path: std::path::PathBuf,
