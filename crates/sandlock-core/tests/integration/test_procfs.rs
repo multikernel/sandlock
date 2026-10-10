@@ -1238,3 +1238,69 @@ print('OK')
     let result = policy.run(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "{}", result.stderr_str().unwrap_or(""));
 }
+
+fn readlink_fixture() -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("file"), b"").unwrap();
+    std::fs::create_dir(root.path().join("dir")).unwrap();
+    std::os::unix::fs::symlink("file", root.path().join("link")).unwrap();
+    std::os::unix::fs::symlink("missing", root.path().join("dangling")).unwrap();
+    root
+}
+
+/// readlink on an existing non-link must fail with EINVAL, as it does
+/// natively, even though the handler reads through an empty-path readlinkat,
+/// for which the kernel reports ENOENT.
+#[tokio::test]
+async fn test_readlink_errno_matches_native() {
+    let root = readlink_fixture();
+    let script = r#"
+import os, sys, errno
+root = sys.argv[1]
+def check(path, expected, **kw):
+    try: actual = os.readlink(path, **kw)
+    except OSError as e: actual = e.errno
+    assert actual == expected, (path, kw, actual, expected)
+dirfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+for name, expected in [('file', errno.EINVAL), ('dir', errno.EINVAL), ('link', 'file'),
+                       ('dangling', 'missing'), ('missing', errno.ENOENT),
+                       ('file/child', errno.ENOTDIR)]:
+    check(os.path.join(root, name), expected)
+    check(name, expected, dir_fd=dirfd)
+# An explicit empty path keeps the kernel's ENOENT for a non-link.
+for name, expected in [('file', errno.ENOENT), ('dir', errno.ENOENT), ('link', 'file')]:
+    fd = os.open(os.path.join(root, name), os.O_PATH | os.O_NOFOLLOW)
+    check('', expected, dir_fd=fd)
+    os.close(fd)
+check('/proc/self', str(os.getpid()))
+check('/proc/self/fd/%d' % dirfd, root)
+print('OK')
+"#;
+    let mut policy = proc_grant().fs_read(root.path()).build().unwrap();
+    let result = policy.run(&["python3", "-c", script, root.path().to_str().unwrap()]).await.unwrap();
+    assert!(result.success(), "{}", result.stderr_str().unwrap_or(""));
+}
+
+/// glibc realpath(3) takes EINVAL from readlink to mean "not a link" but
+/// fails on ENOENT, so a wrong errno made existing paths unresolvable.
+/// Python's os.path.realpath tolerates either, hence the libc call.
+#[tokio::test]
+async fn test_readlink_libc_realpath() {
+    let root = readlink_fixture();
+    let script = r#"
+import ctypes, os, sys
+root = sys.argv[1]
+libc = ctypes.CDLL(None, use_errno=True)
+libc.realpath.restype = ctypes.c_char_p
+buf = ctypes.create_string_buffer(4096)
+for name, target in [('file', 'file'), ('dir', 'dir'), ('link', 'file'),
+                     ('dangling', None), ('missing', None)]:
+    resolved = libc.realpath(os.fsencode(os.path.join(root, name)), buf)
+    expected = target and os.fsencode(os.path.join(root, target))
+    assert resolved == expected, (name, resolved, ctypes.get_errno())
+print('OK')
+"#;
+    let mut policy = proc_grant().fs_read(root.path()).build().unwrap();
+    let result = policy.run(&["python3", "-c", script, root.path().to_str().unwrap()]).await.unwrap();
+    assert!(result.success(), "{}", result.stderr_str().unwrap_or(""));
+}

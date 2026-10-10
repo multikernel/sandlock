@@ -375,6 +375,13 @@ pub(crate) async fn handle_pinned_metadata(
             if request.size == 0 || request.size > i32::MAX as u64 {
                 return NotifAction::Errno(libc::EINVAL);
             }
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } < 0 {
+                return errno_action();
+            }
+            if !path.is_empty() && st.st_mode & libc::S_IFMT != libc::S_IFLNK {
+                return NotifAction::Errno(libc::EINVAL);
+            }
             let mut target = vec![0u8; (request.size as usize).min(4096)];
             let count = unsafe {
                 libc::readlinkat(
