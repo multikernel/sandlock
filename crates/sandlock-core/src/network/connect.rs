@@ -103,21 +103,17 @@ pub(super) async fn connect_on_behalf(
             Err(e) => return NotifAction::Errno(e),
         };
 
-        // Execute. Record the original destination *before* connect to prevent
-        // a TOCTOU race: the proxy may receive the request before we write the
-        // mapping if we did it after connect(). The IP comes from `addr_bytes`
-        // (our immune copy). The dup from the SO_PROTOCOL probe above is
-        // reused rather than pidfd_getfd-ing a second time.
-        if plan.record_orig_dest {
-            if let Some(ref map) = orig_dest_map {
-                // The local-address probe must bind in the socket's own
-                // family, which for a v4-mapped destination is AF_INET6
-                // even though the canonical `ip` is V4.
-                record_orig_dest(map, dup_fd.as_raw_fd(), sockaddr_is_ipv6(&addr_bytes), ip);
+        let metadata_addr = addr_bytes.clone();
+        NotifAction::prepare(&metadata_addr, dup_fd.as_raw_fd(), move || {
+            // Record the original destination before connect so the proxy
+            // cannot receive the connection before its mapping is available.
+            if plan.record_orig_dest {
+                if let Some(ref map) = orig_dest_map {
+                    record_orig_dest(map, dup_fd.as_raw_fd(), sockaddr_is_ipv6(&addr_bytes), ip);
+                }
             }
-        }
-        connect_dup(dup_fd.as_raw_fd(), &plan.addr)
-        // dup_fd dropped here, closing supervisor's copy
+            connect_dup(dup_fd.as_raw_fd(), &plan.addr)
+        })
     } else {
         // Non-IP family. A NAMED (pathname) AF_UNIX connect is a gap Landlock
         // cannot close (it has no access right for unix-socket connect), so a
@@ -463,4 +459,3 @@ mod tests {
     }
 
 }
-

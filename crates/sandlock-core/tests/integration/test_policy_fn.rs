@@ -95,6 +95,59 @@ async fn test_policy_fn_deny_connect() {
     assert_eq!(content, "BLOCKED:1", "connect should be denied by policy_fn (EPERM)");
 }
 
+#[tokio::test]
+async fn test_policy_fn_deny_connect_does_not_leave_socket_connected() {
+    let out = temp_file("deny-connect-no-send");
+    let (listener, port) = loopback_listener("127.0.0.1");
+    listener.set_nonblocking(true).unwrap();
+
+    let mut policy = base_policy()
+        .policy_fn(|event, _ctx| {
+            if event.syscall == "connect" {
+                Verdict::Deny
+            } else {
+                Verdict::Allow
+            }
+        })
+        .build()
+        .unwrap();
+
+    let script = format!(concat!(
+        "import socket\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+        "s.settimeout(2)\n",
+        "try:\n",
+        "  s.connect(('127.0.0.1', {port}))\n",
+        "  connect_result = 'CONNECTED'\n",
+        "except OSError as e:\n",
+        "  connect_result = 'DENIED:%d' % e.errno\n",
+        "try:\n",
+        "  s.sendall(b'escaped')\n",
+        "  send_result = 'SENT'\n",
+        "except OSError as e:\n",
+        "  send_result = 'BLOCKED:%d' % e.errno\n",
+        "open('{out}', 'w').write(connect_result + ';' + send_result)\n",
+    ), port = port, out = out.display());
+
+    let result = policy
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(result.success());
+
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert!(
+        content.starts_with("DENIED:1;"),
+        "connect should be denied, got {content:?}"
+    );
+    assert!(
+        !content.ends_with(";SENT"),
+        "denied socket still sent data: {content:?}"
+    );
+    assert!(listener.accept().is_err(), "denied connect reached the listener");
+}
+
 /// restrict_network narrows outbound to the listed IPs and is enforced. The
 /// previous version called `restrict_network(&[])` — an empty list is a no-op —
 /// and connected to a dead port, so it verified nothing. Use two live loopback
@@ -676,6 +729,7 @@ async fn test_policy_fn_deny_openat2() {
 async fn test_policy_fn_deny_sendmsg() {
     let out = temp_file("deny-sendmsg-out");
     let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    receiver.set_nonblocking(true).unwrap();
     let port = receiver.local_addr().unwrap().port();
 
     let policy = base_policy()
@@ -705,4 +759,83 @@ async fn test_policy_fn_deny_sendmsg() {
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
     assert_eq!(content, "BLOCKED:1", "sendmsg should be denied by policy_fn (EPERM)");
+    let mut buf = [0; 16];
+    assert!(receiver.recv_from(&mut buf).is_err(), "denied sendmsg reached the receiver");
+}
+
+#[tokio::test]
+async fn test_policy_fn_deny_sendmmsg_has_no_side_effect() {
+    let out = temp_file("deny-sendmmsg");
+    let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    receiver.set_nonblocking(true).unwrap();
+    let port = receiver.local_addr().unwrap().port();
+    let mut policy = base_policy()
+        .net_allow(format!("udp://127.0.0.1:{port}"))
+        .policy_fn(|event, _ctx| {
+            if event.syscall == "sendmmsg" { Verdict::Deny } else { Verdict::Allow }
+        })
+        .build().unwrap();
+    let script = format!(concat!(
+        "import ctypes, socket, struct\n",
+        "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
+        "libc.sendmmsg.restype = ctypes.c_int\n",
+        "\n",
+        "class iovec(ctypes.Structure):\n",
+        "    _fields_ = [('iov_base', ctypes.c_void_p), ('iov_len', ctypes.c_size_t)]\n",
+        "\n",
+        "class msghdr(ctypes.Structure):\n",
+        "    _fields_ = [\n",
+        "        ('msg_name', ctypes.c_void_p),\n",
+        "        ('msg_namelen', ctypes.c_uint),\n",
+        "        ('_p1', ctypes.c_uint),\n",
+        "        ('msg_iov', ctypes.c_void_p),\n",
+        "        ('msg_iovlen', ctypes.c_size_t),\n",
+        "        ('msg_control', ctypes.c_void_p),\n",
+        "        ('msg_controllen', ctypes.c_size_t),\n",
+        "        ('msg_flags', ctypes.c_int),\n",
+        "        ('_p2', ctypes.c_uint),\n",
+        "    ]\n",
+        "\n",
+        "class mmsghdr(ctypes.Structure):\n",
+        "    _fields_ = [('msg_hdr', msghdr), ('msg_len', ctypes.c_uint), ('_p', ctypes.c_uint)]\n",
+        "\n",
+        "def sai(ip, port):\n",
+        "    return struct.pack('=HH4s8x', socket.AF_INET, socket.htons(port), socket.inet_aton(ip))\n",
+        "\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
+        "\n",
+        "addr_ok = ctypes.create_string_buffer(sai('127.0.0.1', {port}))\n",
+        "addr_blk = ctypes.create_string_buffer(sai('127.0.0.1', {port}))\n",
+        "data = ctypes.create_string_buffer(b'x')\n",
+        "\n",
+        "iovs = (iovec * 2)()\n",
+        "iovs[0].iov_base = ctypes.cast(data, ctypes.c_void_p).value\n",
+        "iovs[0].iov_len = 1\n",
+        "iovs[1].iov_base = ctypes.cast(data, ctypes.c_void_p).value\n",
+        "iovs[1].iov_len = 1\n",
+        "\n",
+        "vec = (mmsghdr * 2)()\n",
+        "vec[0].msg_hdr.msg_name = ctypes.cast(addr_ok, ctypes.c_void_p).value\n",
+        "vec[0].msg_hdr.msg_namelen = 16\n",
+        "vec[0].msg_hdr.msg_iov = ctypes.cast(ctypes.pointer(iovs[0]), ctypes.c_void_p).value\n",
+        "vec[0].msg_hdr.msg_iovlen = 1\n",
+        "vec[1].msg_hdr.msg_name = ctypes.cast(addr_blk, ctypes.c_void_p).value\n",
+        "vec[1].msg_hdr.msg_namelen = 16\n",
+        "vec[1].msg_hdr.msg_iov = ctypes.cast(ctypes.pointer(iovs[1]), ctypes.c_void_p).value\n",
+        "vec[1].msg_hdr.msg_iovlen = 1\n",
+        "\n",
+        "ret = libc.sendmmsg(s.fileno(), vec, 2, 0)\n",
+        "errno = ctypes.get_errno()\n",
+        "msg0_len = vec[0].msg_len\n",
+        "open('{out}', 'w').write(f'ret={{ret}} errno={{errno}} msg0_len={{msg0_len}}')\n",
+        "s.close()\n",
+    ), out = out.display(), port = port);
+
+    let result = policy.run_interactive(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success());
+    let content = std::fs::read_to_string(&out).unwrap();
+    let _ = std::fs::remove_file(out);
+    assert_eq!(content, "ret=-1 errno=1 msg0_len=0");
+    let mut buf = [0; 1];
+    assert_eq!(receiver.recv_from(&mut buf).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
 }
