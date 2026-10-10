@@ -100,6 +100,30 @@ impl Deferred {
     }
 }
 
+/// An owned operation whose side effects require callback approval.
+pub struct PreparedOperation {
+    pub(crate) host: Option<std::net::IpAddr>,
+    pub(crate) port: Option<u16>,
+    pub(crate) protocol: Option<String>,
+    pub(crate) extra_destinations: Vec<(Option<std::net::IpAddr>, Option<u16>)>,
+    execute: Box<dyn FnOnce() -> NotifAction + Send + Sync>,
+}
+
+impl PreparedOperation {
+    pub(crate) fn execute(self) -> NotifAction {
+        (self.execute)()
+    }
+}
+
+impl std::fmt::Debug for PreparedOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedOperation")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .finish_non_exhaustive()
+    }
+}
+
 /// How the supervisor should respond to a notification.
 #[derive(Debug)]
 pub enum NotifAction {
@@ -139,9 +163,31 @@ pub enum NotifAction {
     /// so it short-circuits the handler chain — a deferring handler makes a
     /// terminal decision.  See [`Deferred`].
     Defer(Deferred),
+    /// Execute only after the policy callback permits the operation.
+    Prepared(PreparedOperation),
 }
 
 impl NotifAction {
+    pub(crate) fn prepare(
+        addr: &[u8],
+        socket: RawFd,
+        execute: impl FnOnce() -> NotifAction + Send + Sync + 'static,
+    ) -> Self {
+        use crate::network::materialize::{parse_ip_from_sockaddr, parse_port_from_sockaddr};
+        use crate::network::{query_socket_protocol, Protocol};
+        Self::Prepared(PreparedOperation {
+            host: parse_ip_from_sockaddr(addr),
+            port: parse_port_from_sockaddr(addr),
+            protocol: query_socket_protocol(socket).map(|p| match p {
+                Protocol::Tcp => "tcp",
+                Protocol::Udp => "udp",
+                Protocol::Icmp => "icmp",
+            }.to_string()),
+            extra_destinations: Vec::new(),
+            execute: Box::new(execute),
+        })
+    }
+
     /// Construct a [`NotifAction::Defer`] from a `'static` future.  Ergonomic
     /// shorthand for `NotifAction::Defer(Deferred::new(fut))`.
     pub fn defer<F: Future<Output = NotifAction> + Send + 'static>(fut: F) -> Self {
@@ -229,7 +275,7 @@ pub(crate) fn named_content_memfd(content: &[u8], seal: bool, name: &str) -> io:
 /// definite response instead of wedging forever waiting for one.
 fn finalize_deferred(action: NotifAction) -> NotifAction {
     match action {
-        NotifAction::Defer(_) => NotifAction::Errno(libc::EIO),
+        NotifAction::Defer(_) | NotifAction::Prepared(_) => NotifAction::Errno(libc::EIO),
         other => other,
     }
 }
@@ -1802,11 +1848,9 @@ fn send_response(fd: RawFd, id: u64, action: NotifAction) -> io::Result<()> {
         }
         NotifAction::ReturnValue(val) => respond_value(fd, id, val),
         NotifAction::Hold => Ok(()), // Don't send a response.
-        NotifAction::Defer(_) => {
-            // Defer is intercepted in `handle_notification` and never reaches
-            // here on the normal path. If it ever does, fail closed with EIO
-            // rather than dropping the future and wedging the child.
-            debug_assert!(false, "Defer reached send_response; should be intercepted earlier");
+        NotifAction::Defer(_) | NotifAction::Prepared(_) => {
+            // Unexecuted work must never become a successful syscall response.
+            debug_assert!(false, "unexecuted operation reached send_response");
             respond_errno(fd, id, libc::EIO)
         }
         NotifAction::KillGroup { sig, pgid } => {
@@ -2267,55 +2311,61 @@ async fn emit_policy_event(
             .map(std::path::PathBuf::from);
     }
 
-    // connect(fd, addr, addrlen) and bind(fd, addr, addrlen): sockaddr in args[1]/args[2].
-    if nr == libc::SYS_connect || nr == libc::SYS_bind {
-        let (h, p) = read_sockaddr_for_event(notif, notif.data.args[1], notif.data.args[2] as usize, notif_fd);
-        host = h;
-        port = p;
-    }
+    let mut protocol = None;
+    if let NotifAction::Prepared(operation) = action {
+        host = operation.host;
+        port = operation.port;
+        protocol = operation.protocol.clone();
+    } else {
+        // connect(fd, addr, addrlen) and bind(fd, addr, addrlen): sockaddr in args[1]/args[2].
+        if nr == libc::SYS_connect || nr == libc::SYS_bind {
+            let (h, p) = read_sockaddr_for_event(notif, notif.data.args[1], notif.data.args[2] as usize, notif_fd);
+            host = h;
+            port = p;
+        }
 
-    // AF_UNIX named bind: no IP/port, but the sun_path needs a MAKE_SOCK grant on its parent directory.
-    if nr == libc::SYS_bind && host.is_none() {
-        path = read_unix_bind_path_for_notif(notif, notif_fd);
-    }
+        // AF_UNIX named bind: no IP/port, but the sun_path needs a MAKE_SOCK grant on its parent directory.
+        if nr == libc::SYS_bind && host.is_none() {
+            path = read_unix_bind_path_for_notif(notif, notif_fd);
+        }
 
-    // sendto(fd, buf, len, flags, addr, addrlen): sockaddr in args[4]/args[5].
-    if nr == libc::SYS_sendto {
-        let (h, p) = read_sockaddr_for_event(notif, notif.data.args[4], notif.data.args[5] as usize, notif_fd);
-        host = h;
-        port = p;
-    }
+        // sendto(fd, buf, len, flags, addr, addrlen): sockaddr in args[4]/args[5].
+        if nr == libc::SYS_sendto {
+            let (h, p) = read_sockaddr_for_event(notif, notif.data.args[4], notif.data.args[5] as usize, notif_fd);
+            host = h;
+            port = p;
+        }
 
-    // sendmsg/sendmmsg: sockaddr is inside struct msghdr at args[1].
-    // msghdr layout: msg_name ptr (u64 @ offset 0), msg_namelen u32 (@ offset 8).
-    // For sendmmsg the first mmsghdr entry's msghdr starts at offset 0, same layout.
-    // Remaining entries (1..vlen) are emitted as observation-only events below.
-    if nr == libc::SYS_sendmsg || nr == libc::SYS_sendmmsg {
-        if let Ok(hdr) = read_child_mem(notif_fd, notif.id, notif.pid, notif.data.args[1], 12) {
-            if hdr.len() >= 12 {
-                let name_ptr = u64::from_ne_bytes(hdr[0..8].try_into().unwrap());
-                let name_len = u32::from_ne_bytes(hdr[8..12].try_into().unwrap()) as usize;
-                let (h, p) = read_sockaddr_for_event(notif, name_ptr, name_len, notif_fd);
-                host = h;
-                port = p;
+        // sendmsg/sendmmsg: sockaddr is inside struct msghdr at args[1].
+        // msghdr layout: msg_name ptr (u64 @ offset 0), msg_namelen u32 (@ offset 8).
+        // For sendmmsg the first mmsghdr entry's msghdr starts at offset 0, same layout.
+        // Remaining entries (1..vlen) are emitted as observation-only events below.
+        if nr == libc::SYS_sendmsg || nr == libc::SYS_sendmmsg {
+            if let Ok(hdr) = read_child_mem(notif_fd, notif.id, notif.pid, notif.data.args[1], 12) {
+                if hdr.len() >= 12 {
+                    let name_ptr = u64::from_ne_bytes(hdr[0..8].try_into().unwrap());
+                    let name_len = u32::from_ne_bytes(hdr[8..12].try_into().unwrap()) as usize;
+                    let (h, p) = read_sockaddr_for_event(notif, name_ptr, name_len, notif_fd);
+                    host = h;
+                    port = p;
+                }
             }
         }
-    }
 
-    // Resolve the real socket protocol via SO_PROTOCOL on a dup'd fd.
-    // args[0] is the socket fd for connect, sendto, sendmsg, sendmmsg.
-    let mut protocol: Option<String> = None;
-    if nr == libc::SYS_connect || nr == libc::SYS_sendto
-        || nr == libc::SYS_sendmsg || nr == libc::SYS_sendmmsg
-    {
-        if let Ok(sock) = dup_fd_from_pid(notif.pid, notif.data.args[0] as i32) {
-            use std::os::unix::io::AsRawFd;
-            protocol = crate::network::query_socket_protocol(sock.as_raw_fd())
-                .map(|p| match p {
-                    crate::network::Protocol::Tcp => "tcp",
-                    crate::network::Protocol::Udp => "udp",
-                    crate::network::Protocol::Icmp => "icmp",
-                }.to_string());
+        // Resolve the real socket protocol via SO_PROTOCOL on a dup'd fd.
+        // args[0] is the socket fd for connect, sendto, sendmsg, sendmmsg.
+        if nr == libc::SYS_connect || nr == libc::SYS_sendto
+            || nr == libc::SYS_sendmsg || nr == libc::SYS_sendmmsg
+        {
+            if let Ok(sock) = dup_fd_from_pid(notif.pid, notif.data.args[0] as i32) {
+                use std::os::unix::io::AsRawFd;
+                protocol = crate::network::query_socket_protocol(sock.as_raw_fd())
+                    .map(|p| match p {
+                        crate::network::Protocol::Tcp => "tcp",
+                        crate::network::Protocol::Udp => "udp",
+                        crate::network::Protocol::Icmp => "icmp",
+                    }.to_string());
+            }
         }
     }
 
@@ -2349,12 +2399,6 @@ async fn emit_policy_event(
         path2 = resolve_second_path_for_notif(notif, notif_fd).map(std::path::PathBuf::from);
     }
 
-    
-    // Decode remaining sendmmsg entries before unblocking the child.
-    let sendmmsg_extras = decode_sendmmsg_extras(
-        notif, notif_fd, nr, name, category, event_pid, parent_pid, denied, &protocol,
-    );
-
     let sock_fd = if nr == libc::SYS_connect || nr == libc::SYS_sendto
         || nr == libc::SYS_sendmsg || nr == libc::SYS_sendmmsg
         || nr == libc::SYS_bind
@@ -2379,6 +2423,19 @@ async fn emit_policy_event(
         flags,
         protocol,
         fd: sock_fd,
+    };
+
+    let sendmmsg_extras = if let NotifAction::Prepared(operation) = action {
+        operation.extra_destinations.iter().map(|&(host, port)| {
+            let mut extra = event.clone();
+            extra.host = host;
+            extra.port = port;
+            extra
+        }).collect()
+    } else {
+        decode_sendmmsg_extras(
+            notif, notif_fd, nr, name, category, event_pid, parent_pid, denied, &event.protocol,
+        )
     };
 
     // Hold syscalls where the callback's verdict matters: exec, every open
@@ -2602,6 +2659,10 @@ async fn handle_notification(
             Verdict::Audit => { /* allow, but could log here */ }
             Verdict::Allow => {}
         }
+    }
+
+    if let NotifAction::Prepared(operation) = action {
+        action = operation.execute();
     }
 
     if fork_counted && !matches!(action, NotifAction::Continue) {

@@ -17,7 +17,7 @@ use super::materialize::{
     materialize_msg, mmsg_entry_ptr, mmsg_msglen_addr, named_unix_socket_path, ChildMsghdr,
     MaterializedMsg,
 };
-use super::send_engine::{batch_send_step, resolve_send, wants_blocking, BatchStep};
+use super::send_engine::{prepare_batch, prepare_send, wants_blocking};
 use super::verdict::{path_under_any, real_path_under_any};
 
 /// Render the supervisor-side path that addresses `sun_path` **in the child's
@@ -139,18 +139,22 @@ pub(super) fn connect_named_unix_on_behalf(
         Ok(fd) => fd,
         Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
     };
-    let ret = unsafe {
-        libc::connect(
-            dup_fd.as_raw_fd(),
-            &sun as *const libc::sockaddr_un as *const libc::sockaddr,
-            len,
-        )
-    };
-    if ret == 0 {
-        NotifAction::ReturnValue(0)
-    } else {
-        NotifAction::Errno(unsafe { *libc::__errno_location() })
-    }
+    let addr = sockaddr_un_bytes(&sun, len);
+    NotifAction::prepare(&addr.clone(), dup_fd.as_raw_fd(), move || {
+        let _pinned = pinned;
+        let ret = unsafe {
+            libc::connect(
+                dup_fd.as_raw_fd(),
+                addr.as_ptr() as *const libc::sockaddr,
+                addr.len() as libc::socklen_t,
+            )
+        };
+        if ret == 0 {
+            NotifAction::ReturnValue(0)
+        } else {
+            NotifAction::Errno(unsafe { *libc::__errno_location() })
+        }
+    })
 }
 
 /// On-behalf `sendto()` for a NAMED `AF_UNIX` datagram in non-chroot mode:
@@ -182,7 +186,7 @@ pub(super) fn sendto_named_unix_on_behalf(
         Ok(fd) => fd,
         Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
     };
-    // Route through resolve_send like the sendmsg path instead of an inline
+    // Route through prepare_send like the sendmsg path instead of an inline
     // blocking sendto: the dup shares the child's blocking mode, so an inline
     // send on the notification loop wedges the whole loop when a child fills a
     // datagram queue it never drains — the same DoS this change fixes elsewhere.
@@ -197,7 +201,7 @@ pub(super) fn sendto_named_unix_on_behalf(
         _pinned: Some(pinned),
     };
     let blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
-    resolve_send(dup_fd, m, flags, blocking)
+    prepare_send(dup_fd, m, flags, blocking)
 }
 
 /// On-behalf `sendto()` for a NAMED `AF_UNIX` datagram on a sandbox that
@@ -255,7 +259,7 @@ pub(super) fn sendto_pinned_unix_on_behalf(
         _pinned: Some(pinned),
     };
     let blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
-    resolve_send(dup_fd, m, flags, blocking)
+    prepare_send(dup_fd, m, flags, blocking)
 }
 
 /// Apply the named-unix fs gate to a `sendmsg()` whose `msg_name` may address a
@@ -312,7 +316,7 @@ fn sendmsg_named_unix_on_behalf(
     match send_named_unix_msghdr(notif, notif_fd, sockfd, msghdr_ptr, sun_path, writable) {
         Ok((dup_fd, m)) => {
             let blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
-            resolve_send(dup_fd, m, flags, blocking)
+            prepare_send(dup_fd, m, flags, blocking)
         }
         Err(errno) => NotifAction::Errno(errno),
     }
@@ -387,7 +391,8 @@ pub(super) fn sendmmsg_named_unix_on_behalf(
     flags: i32,
     writable: &[std::path::PathBuf],
 ) -> NotifAction {
-    let mut sent: usize = 0;
+    let mut entries = Vec::new();
+    let mut batch_bytes = 0usize;
     let mut first_errno: Option<i32> = None;
     for i in 0..vlen {
         let entry_ptr = mmsg_entry_ptr(msgvec_ptr, i);
@@ -404,25 +409,15 @@ pub(super) fn sendmmsg_named_unix_on_behalf(
                 break;
             }
         };
-        match batch_send_step(
-            &dup_fd, m, flags, notif_fd, notif.id, notif.pid,
-            mmsg_msglen_addr(entry_ptr), sent,
-        ) {
-            BatchStep::Sent => sent += 1,
-            BatchStep::Done(action) => return action,
-            BatchStep::Stop(errno) => {
-                if sent == 0 {
-                    first_errno = Some(errno);
-                }
-                break;
-            }
+        batch_bytes += m.data.len();
+        if batch_bytes > super::materialize::MAX_SEND_BUF {
+            first_errno = Some(libc::EMSGSIZE);
+            break;
         }
+        entries.push((dup_fd, m, mmsg_msglen_addr(entry_ptr)));
     }
-    if sent > 0 {
-        NotifAction::ReturnValue(sent as i64)
-    } else {
-        NotifAction::Errno(first_errno.unwrap_or(libc::EACCES))
-    }
+    prepare_batch(entries, flags, notif_fd, notif.id, notif.pid,
+        first_errno.unwrap_or(libc::EACCES))
 }
 
 #[cfg(test)]

@@ -50,6 +50,13 @@ fn send_materialized_at(fd: RawFd, m: &MaterializedMsg, offset: usize, flags: i3
     unsafe { libc::sendmsg(fd, &msg, flags) }
 }
 
+/// Prepare a send without writing to the socket before callback approval.
+pub(crate) fn prepare_send(dup_fd: OwnedFd, m: MaterializedMsg, flags: i32, child_blocking: bool) -> NotifAction {
+    NotifAction::prepare(&m.addr.clone(), dup_fd.as_raw_fd(), move || {
+        execute_send(dup_fd, m, flags, child_blocking)
+    })
+}
+
 /// Resolve a materialized send to a terminal action. The first attempt is
 /// non-blocking (`MSG_DONTWAIT`) on the seccomp loop, so it never blocks there.
 /// A non-blocking child gets whatever that one attempt returns (short count or
@@ -58,7 +65,7 @@ fn send_materialized_at(fd: RawFd, m: &MaterializedMsg, offset: usize, flags: i3
 /// kernel's "a blocking send of N returns N" contract without occupying the
 /// loop or a worker thread — a stream send that partially fit continues from
 /// the sent offset; a full send buffer defers from offset 0.
-pub(crate) fn resolve_send(dup_fd: OwnedFd, m: MaterializedMsg, flags: i32, child_blocking: bool) -> NotifAction {
+fn execute_send(dup_fd: OwnedFd, m: MaterializedMsg, flags: i32, child_blocking: bool) -> NotifAction {
     let ret = send_materialized_at(dup_fd.as_raw_fd(), &m, 0, flags | libc::MSG_DONTWAIT);
     if ret >= 0 {
         let sent = ret as usize;
@@ -76,6 +83,44 @@ pub(crate) fn resolve_send(dup_fd: OwnedFd, m: MaterializedMsg, flags: i32, chil
         return NotifAction::Errno(libc::EAGAIN);
     }
     NotifAction::Errno(err)
+}
+
+pub(crate) fn prepare_batch(
+    entries: Vec<(OwnedFd, MaterializedMsg, u64)>,
+    flags: i32,
+    notif_fd: RawFd,
+    notif_id: u64,
+    notif_pid: u32,
+    error: i32,
+) -> NotifAction {
+    let Some((socket, first, _)) = entries.first() else {
+        return NotifAction::Errno(error);
+    };
+    use super::materialize::{parse_ip_from_sockaddr, parse_port_from_sockaddr};
+    let extra_destinations = entries.iter().skip(1).map(|(_, message, _)| {
+        (parse_ip_from_sockaddr(&message.addr), parse_port_from_sockaddr(&message.addr))
+    }).collect();
+    let addr = first.addr.clone();
+    let fd = socket.as_raw_fd();
+    let mut action = NotifAction::prepare(&addr, fd, move || {
+        let mut sent = 0;
+        for (socket, message, msglen_addr) in entries {
+            match batch_send_step(&socket, message, flags, notif_fd, notif_id, notif_pid, msglen_addr, sent) {
+                BatchStep::Sent => sent += 1,
+                BatchStep::Done(action) => return action,
+                BatchStep::Stop(errno) => return if sent == 0 {
+                    NotifAction::Errno(errno)
+                } else {
+                    NotifAction::ReturnValue(sent as i64)
+                },
+            }
+        }
+        NotifAction::ReturnValue(sent as i64)
+    });
+    if let NotifAction::Prepared(operation) = &mut action {
+        operation.extra_destinations = extra_destinations;
+    }
+    action
 }
 
 /// Byte-level completion core: await writability on the dup'd fd through the
@@ -117,7 +162,7 @@ async fn push_until_done(
     }
 }
 
-/// Deferred tail of [`resolve_send`] for a single message: complete the send and
+/// Deferred tail of [`prepare_send`] for a single message: complete the send and
 /// return the byte count (matching a blocking send of N returning N; a partial
 /// stream then error returns the partial count).
 async fn defer_send(dup_fd: OwnedFd, m: MaterializedMsg, flags: i32, offset: usize) -> NotifAction {
@@ -252,4 +297,56 @@ pub(crate) fn batch_send_step(
         return BatchStep::Stop(libc::EAGAIN);
     }
     BatchStep::Stop(err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+
+    #[tokio::test]
+    async fn prepared_send_waits_for_approval_and_can_defer_completion() {
+        let (sender, mut receiver) = UnixStream::pair().unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let capacity: libc::c_int = 4096;
+        assert_eq!(unsafe {
+            libc::setsockopt(sender.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF,
+                &capacity as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&capacity) as libc::socklen_t)
+        }, 0);
+        let data = vec![42; 1024 * 1024];
+        let expected = data.clone();
+        let message = MaterializedMsg {
+            data, addr: Vec::new(), control: None,
+            _scm_fds: Vec::new(), _pinned: None,
+        };
+        let action = prepare_send(sender.into(), message, 0, true);
+        let mut probe = [0; 1];
+        assert_eq!(receiver.read(&mut probe).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        let NotifAction::Prepared(operation) = action else { panic!("expected prepared send") };
+        let NotifAction::Defer(deferred) = operation.execute() else { panic!("expected partial send to defer") };
+        receiver.set_nonblocking(false).unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut received = vec![0; expected.len()];
+            receiver.read_exact(&mut received).unwrap();
+            assert_eq!(received, expected);
+        });
+        assert!(matches!(deferred.run().await, NotifAction::ReturnValue(n) if n == 1024 * 1024));
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn dropping_prepared_send_has_no_side_effect() {
+        let (sender, mut receiver) = UnixStream::pair().unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let fd = sender.try_clone().unwrap().into();
+        let message = MaterializedMsg {
+            data: b"denied".to_vec(), addr: Vec::new(), control: None,
+            _scm_fds: Vec::new(), _pinned: None,
+        };
+        drop(prepare_send(fd, message, 0, false));
+        let mut buf = [0; 6];
+        assert_eq!(receiver.read(&mut buf).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    }
 }

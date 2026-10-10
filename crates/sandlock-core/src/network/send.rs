@@ -16,7 +16,7 @@ use super::materialize::{
     named_unix_socket_path, parse_ip_from_sockaddr, parse_port_from_sockaddr, ChildMsghdr,
     MaterializedMsg, MAX_SEND_BUF,
 };
-use super::send_engine::{batch_send_step, resolve_send, wants_blocking, BatchStep};
+use super::send_engine::{prepare_batch, prepare_send, wants_blocking};
 use super::unix::{
     mmsg_entry_named_unix_path, sendmmsg_named_unix_on_behalf, sendto_named_unix_on_behalf,
     sendto_pinned_unix_on_behalf, unix_sendmsg_gate,
@@ -103,7 +103,7 @@ pub(super) async fn sendto_on_behalf(
             _pinned: None,
         };
         let blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
-        resolve_send(dup_fd, m, flags, blocking)
+        prepare_send(dup_fd, m, flags, blocking)
     } else {
         // Non-IP family. Gate a NAMED AF_UNIX datagram the same way as connect:
         // sendto to a named socket is a WRITE on its inode, so deny unless the
@@ -202,7 +202,7 @@ pub(super) async fn sendto_on_behalf(
                             _pinned: None,
                         };
                         let blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
-                        resolve_send(dup_fd, m, flags, blocking)
+                        prepare_send(dup_fd, m, flags, blocking)
                     }
                     // Reject (a non-IP address on a non-unix socket — the
                     // address-family-swap shape — or an AF_UNIX address with no
@@ -289,7 +289,7 @@ pub(super) async fn sendmsg_on_behalf(
     match send_msghdr_on_behalf(notif, ctx, notif_fd, &dup_fd, protocol, msghdr_ptr).await {
         Ok(m) => {
             let blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
-            resolve_send(dup_fd, m, flags, blocking)
+            prepare_send(dup_fd, m, flags, blocking)
         }
         Err(errno) => NotifAction::Errno(errno),
     }
@@ -357,7 +357,7 @@ fn prescan_msghdr(
 /// rather than escaping the allowlist.
 ///
 /// Returns a [`MaterializedMsg`] the caller sends (inline and, if it would
-/// block, deferred) via [`resolve_send`] / [`send_materialized`]; or an errno.
+/// block, deferred) via [`prepare_send`] / [`send_materialized`]; or an errno.
 /// ECONNREFUSED is used both for "destination blocked by policy" and for
 /// "couldn't parse a port from the sockaddr"; EIO for sub-buffer read failures.
 async fn send_msghdr_on_behalf(
@@ -508,7 +508,8 @@ pub(super) async fn sendmmsg_on_behalf(
         // rather than refused with ECONNREFUSED. On-behalf (not Continue) keeps
         // it TOCTOU-safe against a racing fd swap.
         let protocol = query_socket_protocol(dup_fd.as_raw_fd());
-        let mut sent: usize = 0;
+        let mut entries = Vec::new();
+        let mut batch_bytes = 0usize;
         let mut first_errno: Option<i32> = None;
         for i in 0..vlen {
             let entry_ptr = mmsg_entry_ptr(msgvec_ptr, i);
@@ -521,25 +522,19 @@ pub(super) async fn sendmmsg_on_behalf(
                     break;
                 }
             };
-            match batch_send_step(
-                &dup_fd, m, flags, notif_fd, notif.id, notif.pid,
-                mmsg_msglen_addr(entry_ptr), sent,
-            ) {
-                BatchStep::Sent => sent += 1,
-                BatchStep::Done(action) => return action,
-                BatchStep::Stop(errno) => {
-                    if sent == 0 {
-                        first_errno = Some(errno);
-                    }
-                    break;
-                }
+            let socket = match dup_fd.try_clone() {
+                Ok(socket) => socket,
+                Err(_) => { first_errno = Some(libc::EIO); break; }
+            };
+            batch_bytes += m.data.len();
+            if batch_bytes > super::materialize::MAX_SEND_BUF {
+                first_errno = Some(libc::EMSGSIZE);
+                break;
             }
+            entries.push((socket, m, mmsg_msglen_addr(entry_ptr)));
         }
-        return if sent > 0 {
-            NotifAction::ReturnValue(sent as i64)
-        } else {
-            NotifAction::Errno(first_errno.unwrap_or(ECONNREFUSED))
-        };
+        return prepare_batch(entries, flags, notif_fd, notif.id, notif.pid,
+            first_errno.unwrap_or(ECONNREFUSED));
     }
 
     // No destination policy: the connected fast path is safe (nothing to
@@ -565,7 +560,8 @@ pub(super) async fn sendmmsg_on_behalf(
         None => return NotifAction::Errno(ECONNREFUSED),
     };
 
-    let mut sent: usize = 0;
+    let mut entries = Vec::new();
+    let mut batch_bytes = 0usize;
     let mut first_errno: Option<i32> = None;
 
     for i in 0..vlen {
@@ -579,27 +575,18 @@ pub(super) async fn sendmmsg_on_behalf(
                 break;
             }
         };
-        match batch_send_step(
-            &dup_fd, m, flags, notif_fd, notif.id, notif.pid,
-            mmsg_msglen_addr(entry_ptr), sent,
-        ) {
-            BatchStep::Sent => sent += 1,
-            BatchStep::Done(action) => return action,
-            BatchStep::Stop(errno) => {
-                if sent == 0 {
-                    first_errno = Some(errno);
-                }
-                break;
-            }
+        let socket = match dup_fd.try_clone() {
+            Ok(socket) => socket,
+            Err(_) => { first_errno = Some(libc::EIO); break; }
+        };
+        batch_bytes += m.data.len();
+        if batch_bytes > super::materialize::MAX_SEND_BUF {
+            first_errno = Some(libc::EMSGSIZE);
+            break;
         }
+        entries.push((socket, m, mmsg_msglen_addr(entry_ptr)));
     }
 
-    if sent > 0 {
-        NotifAction::ReturnValue(sent as i64)
-    } else {
-        // Defensive: vlen > 0 + no successes means at least one attempt
-        // failed, so first_errno is set. Fall back to ECONNREFUSED
-        // rather than panicking on the unwrap if invariants ever drift.
-        NotifAction::Errno(first_errno.unwrap_or(ECONNREFUSED))
-    }
+    prepare_batch(entries, flags, notif_fd, notif.id, notif.pid,
+        first_errno.unwrap_or(ECONNREFUSED))
 }
