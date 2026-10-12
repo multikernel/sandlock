@@ -2195,21 +2195,6 @@ fn read_argv_for_event(notif: &SeccompNotif, argv_ptr: u64, notif_fd: RawFd) -> 
     if args.is_empty() { None } else { Some(args) }
 }
 
-/// Resolve a held syscall's policy_fn gate outcome into a verdict.
-///
-/// `received` is the verdict the callback sent, or `None` if the gate timed
-/// out or its channel closed before a decision arrived. A held syscall is one
-/// whose verdict matters (execve, connect, openat, ...); when no decision
-/// arrives we fail closed and deny rather than letting the syscall proceed.
-fn resolve_held_gate(
-    received: Option<crate::policy_fn::Verdict>,
-) -> Option<crate::policy_fn::Verdict> {
-    match received {
-        Some(v) => Some(v),
-        None => Some(crate::policy_fn::Verdict::Deny),
-    }
-}
-
 /// Decode sendmmsg entries 1..vlen into observation-only `SyscallEvent`s.
 /// Entry 0 is handled by the main `emit_policy_event` path; this covers the rest.
 fn decode_sendmmsg_extras(
@@ -2266,6 +2251,8 @@ async fn emit_policy_event(
         Some(tx) => tx.clone(),
         None => return None,
     };
+    let timeout = pfs.verdict_timeout;
+    let cancellation = pfs.cancellation.clone();
     drop(pfs);
 
     let nr = notif.data.nr as i64;
@@ -2463,11 +2450,7 @@ async fn emit_policy_event(
             event,
             gate: Some(gate_tx),
         }));
-        let received = match tokio::time::timeout(std::time::Duration::from_secs(5), gate_rx).await {
-            Ok(Ok(verdict)) => Some(verdict),
-            _ => None, // timeout or channel closed
-        };
-        resolve_held_gate(received)
+        Some(crate::policy_fn::wait_for_verdict(gate_rx, timeout, &cancellation).await)
     } else {
         let _ = tx.send(crate::policy_fn::PolicyMsg::Event(crate::policy_fn::PolicyEvent {
             event,
@@ -3155,32 +3138,6 @@ mod tests {
         );
         assert_ne!(resp.error, 0, "fd-injection failure must be a denial");
         assert_eq!(resp.error, -libc::EACCES);
-    }
-
-    #[test]
-    fn held_gate_no_decision_denies() {
-        use crate::policy_fn::Verdict;
-        // A held syscall whose policy_fn gate times out or whose channel closes
-        // (received == None) must fail closed: deny, not allow the syscall.
-        assert!(matches!(resolve_held_gate(None), Some(Verdict::Deny)));
-    }
-
-    #[test]
-    fn held_gate_passes_through_callback_verdict() {
-        use crate::policy_fn::Verdict;
-        // A real verdict from the callback is forwarded unchanged.
-        assert!(matches!(
-            resolve_held_gate(Some(Verdict::Allow)),
-            Some(Verdict::Allow)
-        ));
-        assert!(matches!(
-            resolve_held_gate(Some(Verdict::Deny)),
-            Some(Verdict::Deny)
-        ));
-        assert!(matches!(
-            resolve_held_gate(Some(Verdict::DenyWith(13))),
-            Some(Verdict::DenyWith(13))
-        ));
     }
 
     #[test]

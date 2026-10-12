@@ -36,6 +36,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 	"unsafe"
 )
 
@@ -156,6 +157,17 @@ type PolicyContext struct {
 // worker thread. Callbacks may be invoked concurrently with other sandbox
 // activity, so captured state should be synchronized when mutated.
 type PolicyFunc func(event SyscallEvent, ctx *PolicyContext) PolicyDecision
+
+// NoTimeout disables the verdict deadline for a PolicyFn.
+const NoTimeout time.Duration = -1
+
+// PolicyFn groups a dynamic policy callback with its held-verdict settings.
+type PolicyFn struct {
+	Callback PolicyFunc
+	// VerdictTimeout includes queue time. Zero uses five seconds; a negative
+	// value, conventionally NoTimeout, disables the deadline.
+	VerdictTimeout time.Duration
+}
 
 // Protection identifies a single Landlock protection whose enforcement
 // posture can be opted out of via the Sandbox AllowDegraded / Disable fields.
@@ -289,7 +301,7 @@ type Sandbox struct {
 
 	// PolicyFn receives dynamic syscall events and may return an allow/deny
 	// decision or modify live policy through the supplied context.
-	PolicyFn PolicyFunc
+	PolicyFn *PolicyFn
 }
 
 // ExitReason is why a sandboxed process terminated. It mirrors the C

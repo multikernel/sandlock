@@ -195,6 +195,7 @@ _lib.sandlock_sandbox_builder_policy_fn.restype = _c_builder_p
 _lib.sandlock_sandbox_builder_policy_fn.argtypes = [
     _c_builder_p,
     _POLICY_FN_TYPE,
+    ctypes.c_int64,
     ctypes.c_void_p,
     ctypes.c_void_p,
 ]
@@ -204,6 +205,9 @@ _lib.sandlock_ctx_restrict_network.argtypes = [_c_ctx_p, ctypes.POINTER(ctypes.c
 
 _lib.sandlock_ctx_grant_network.restype = None
 _lib.sandlock_ctx_grant_network.argtypes = [_c_ctx_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint32]
+
+_lib.sandlock_ctx_is_cancelled.restype = ctypes.c_bool
+_lib.sandlock_ctx_is_cancelled.argtypes = [_c_ctx_p]
 
 _lib.sandlock_ctx_restrict_max_memory.restype = None
 _lib.sandlock_ctx_restrict_max_memory.argtypes = [_c_ctx_p, ctypes.c_uint64]
@@ -717,6 +721,10 @@ class PolicyContext:
     def grant_network(self, ips: list[str]) -> None:
         arr = (ctypes.c_char_p * len(ips))(*[_encode(ip) for ip in ips])
         _lib.sandlock_ctx_grant_network(self._ptr, arr, len(ips))
+
+    def is_cancelled(self) -> bool:
+        """Whether shutdown cancelled this callback; approval loops must exit when true."""
+        return _lib.sandlock_ctx_is_cancelled(self._ptr)
 
     def restrict_max_memory(self, bytes: int) -> None:
         _lib.sandlock_ctx_restrict_max_memory(self._ptr, bytes)
@@ -1322,11 +1330,12 @@ class _NativePolicy:
         return b
 
     @classmethod
-    def from_dataclass(cls, policy: PolicyDataclass, policy_fn=None) -> _NativePolicy:
+    def from_dataclass(cls, policy: PolicyDataclass) -> _NativePolicy:
         """Build a native policy from a Python Policy dataclass."""
         b = _NativePolicy._build_from_policy(policy)
 
         # Store callback reference to prevent GC
+        policy_fn = policy.policy_fn
         c_callback = None
         if policy_fn is not None:
             def _c_callback(event_p, ctx_p, _user_data):
@@ -1350,7 +1359,7 @@ class _NativePolicy:
                     denied=ev.denied,
                 )
                 py_ctx = PolicyContext(ctx_p)
-                result = policy_fn(py_event, py_ctx)
+                result = policy_fn.callback(py_event, py_ctx)
                 # Return: 0=allow, -1=deny, -2=audit, positive=deny with errno
                 # Python callback can return:
                 #   None/False/0  → allow
@@ -1370,7 +1379,9 @@ class _NativePolicy:
                 return -1
 
             c_callback = _POLICY_FN_TYPE(_c_callback)
-            b = _lib.sandlock_sandbox_builder_policy_fn(b, c_callback, None, None)
+            b = _lib.sandlock_sandbox_builder_policy_fn(
+                b, c_callback, policy_fn._verdict_timeout_ms(), None, None,
+            )
 
         err = ctypes.c_int(0)
         err_msg = ctypes.c_char_p()

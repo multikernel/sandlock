@@ -1173,7 +1173,9 @@ sandlock_result_t *sandlock_gather_run(sandlock_gather_t *g, uint64_t timeout_ms
 void sandlock_gather_free(sandlock_gather_t *g);
 
 /**
- * Set a policy callback on the builder.
+ * Set a policy callback and its held verdict timeout in milliseconds.
+ * Negative disables the timeout; zero denies immediately. Pass 5000 for
+ * the SDK default.
  *
  * # Safety
  * `b` must be a valid builder pointer. `cb` must be a valid function pointer
@@ -1185,8 +1187,18 @@ void sandlock_gather_free(sandlock_gather_t *g);
  */
 sandlock_builder_t *sandlock_sandbox_builder_policy_fn(sandlock_builder_t *b,
                                                        sandlock_policy_fn_t cb,
+                                                       int64_t verdict_timeout_ms,
                                                        void *user_data,
                                                        void (*user_data_drop)(void *user_data));
+
+/**
+ * Whether sandbox shutdown has cancelled the callback. Approval loops must
+ * check this between bounded waits and return promptly when true.
+ *
+ * # Safety
+ * `ctx` must be a valid context pointer from inside a policy callback.
+ */
+bool sandlock_ctx_is_cancelled(const sandlock_ctx_t *ctx);
 
 /**
  * Restrict network to the given IPs. Permanent — cannot grant back.

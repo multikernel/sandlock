@@ -50,6 +50,7 @@ mod transparent_proxy;
 mod transparent_proxy;
 
 pub use error::SandlockError;
+pub use policy_fn::PolicyFn;
 pub use sys::structs::{SeccompData, SeccompNotif};
 #[cfg(feature = "checkpoint")]
 pub use checkpoint::{Checkpoint, SkippedFd};

@@ -806,6 +806,8 @@ impl DeniedSet {
 
 /// Dynamic policy callback state.
 pub struct PolicyFnState {
+    pub(crate) verdict_timeout: Option<std::time::Duration>,
+    pub(crate) cancellation: tokio_util::sync::CancellationToken,
     /// Event sender for dynamic policy callback (None if no policy_fn).
     pub event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::policy_fn::PolicyMsg>>,
     /// Shared live policy for dynamic updates (None if no policy_fn).
@@ -817,6 +819,8 @@ pub struct PolicyFnState {
 impl PolicyFnState {
     pub fn new() -> Self {
         Self {
+            verdict_timeout: Some(std::time::Duration::from_secs(5)),
+            cancellation: tokio_util::sync::CancellationToken::new(),
             event_tx: None,
             live_policy: None,
             denied: std::sync::Arc::new(DeniedSet::default()),

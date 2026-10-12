@@ -13,6 +13,7 @@ libc = "0.2"
 syscalls = { version = "0.8", default-features = false }
 nix = { version = "0.29", features = ["process", "signal", "fs", "ioctl", "poll", "user"] }
 tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros", "io-util", "fs"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 rand = "0.8"

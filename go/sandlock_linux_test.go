@@ -219,11 +219,13 @@ func TestPolicyFnDenyByArgv(t *testing.T) {
 	requireLandlock(t)
 	sb := &sandlock.Sandbox{
 		FSReadable: rootfs,
-		PolicyFn: func(event sandlock.SyscallEvent, ctx *sandlock.PolicyContext) sandlock.PolicyDecision {
-			if event.Syscall == "execve" && event.ArgvContains("sandlock-go-deny-token") {
-				return sandlock.Deny()
-			}
-			return sandlock.Allow()
+		PolicyFn: &sandlock.PolicyFn{
+			Callback: func(event sandlock.SyscallEvent, ctx *sandlock.PolicyContext) sandlock.PolicyDecision {
+				if event.Syscall == "execve" && event.ArgvContains("sandlock-go-deny-token") {
+					return sandlock.Deny()
+				}
+				return sandlock.Allow()
+			},
 		},
 	}
 	res, err := sb.Run(context.Background(), "sh", "-c", "echo sandlock-go-deny-token")
@@ -240,14 +242,16 @@ func TestPolicyFnReceivesExecveArgv(t *testing.T) {
 	seen := make(chan []string, 1)
 	sb := &sandlock.Sandbox{
 		FSReadable: rootfs,
-		PolicyFn: func(event sandlock.SyscallEvent, ctx *sandlock.PolicyContext) sandlock.PolicyDecision {
-			if event.Syscall == "execve" && len(event.Argv) > 0 {
-				select {
-				case seen <- append([]string(nil), event.Argv...):
-				default:
+		PolicyFn: &sandlock.PolicyFn{
+			Callback: func(event sandlock.SyscallEvent, ctx *sandlock.PolicyContext) sandlock.PolicyDecision {
+				if event.Syscall == "execve" && len(event.Argv) > 0 {
+					select {
+					case seen <- append([]string(nil), event.Argv...):
+					default:
+					}
 				}
-			}
-			return sandlock.Allow()
+				return sandlock.Allow()
+			},
 		},
 	}
 	res, err := sb.Run(context.Background(), "echo", "policy-fn-ok")
@@ -948,5 +952,79 @@ print(json.dumps(res))
 	}
 	if !res.Success || strings.TrimSpace(string(res.Stdout)) != "combined" {
 		t.Fatalf("combined policy failed: exit=%d stdout=%q stderr=%q", res.ExitCode, res.Stdout, res.Stderr)
+	}
+}
+
+func TestVerdictTimeoutDeniesLateAllow(t *testing.T) {
+	requireLandlock(t)
+	sb := &sandlock.Sandbox{
+		FSReadable: rootfs,
+		PolicyFn: &sandlock.PolicyFn{
+			VerdictTimeout: 20 * time.Millisecond,
+			Callback: func(event sandlock.SyscallEvent, ctx *sandlock.PolicyContext) sandlock.PolicyDecision {
+				if event.Syscall == "execve" {
+					time.Sleep(150 * time.Millisecond)
+				}
+				return sandlock.Allow()
+			},
+		},
+	}
+	res, err := sb.Run(context.Background(), "/bin/true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Success {
+		t.Fatal("late approval executed the command")
+	}
+}
+
+func TestShutdownCancelsUnlimitedApproval(t *testing.T) {
+	requireLandlock(t)
+	entered := make(chan struct{}, 1)
+	cancelled := make(chan struct{}, 1)
+	sb := &sandlock.Sandbox{
+		FSReadable: rootfs,
+		PolicyFn: &sandlock.PolicyFn{
+			VerdictTimeout: sandlock.NoTimeout,
+			Callback: func(event sandlock.SyscallEvent, ctx *sandlock.PolicyContext) sandlock.PolicyDecision {
+				if event.Syscall == "execve" {
+					entered <- struct{}{}
+					deadline := time.Now().Add(2 * time.Second)
+					for !ctx.IsCancelled() && time.Now().Before(deadline) {
+						time.Sleep(time.Millisecond)
+					}
+					if ctx.IsCancelled() {
+						cancelled <- struct{}{}
+					}
+				}
+				return sandlock.Allow()
+			},
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	res, err := sb.Run(ctx, "/bin/true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Success {
+		t.Fatal("shutdown allowed the command")
+	}
+	select {
+	case <-entered:
+	default:
+		t.Fatal("callback was not entered")
+	}
+	select {
+	case <-cancelled:
+	default:
+		t.Fatal("shutdown did not cancel approval")
+	}
+}
+
+func TestPolicyFnRequiresCallback(t *testing.T) {
+	sb := &sandlock.Sandbox{PolicyFn: &sandlock.PolicyFn{}}
+	if _, err := sb.Run(context.Background(), "/bin/true"); err == nil {
+		t.Fatal("PolicyFn without a callback must be rejected")
 	}
 }

@@ -213,6 +213,11 @@ is an error rather than silently dropped.
 
 ### Dynamic policy callbacks
 
+`PolicyFn.VerdictTimeout` sets the held-verdict wait as a `time.Duration`. Zero uses
+five seconds, and `sandlock.NoTimeout` disables the timeout. Approval callbacks
+must check `ctx.IsCancelled()` between bounded waits and return on shutdown.
+See [verdict timeout and shutdown](../docs/policy-fn.md#verdict-timeout-and-shutdown).
+
 ```go
 type PolicyFunc func(event SyscallEvent, ctx *PolicyContext) PolicyDecision
 
@@ -232,20 +237,22 @@ func (ctx *PolicyContext) DenyPath(path string) error
 func (ctx *PolicyContext) AllowPath(path string) error
 ```
 
-`PolicyFn` receives dynamic syscall events from sandlock's policy-fn worker
+`PolicyFn.Callback` receives dynamic syscall events from sandlock's policy-fn worker
 thread. Path strings are deliberately absent; use Landlock fields for static
 path policy and `DenyPath`/`AllowPath` for the dynamic path-deny hook. `Argv`
 is populated for `execve`/`execveat` events.
 
 ```go
 sb := &sandlock.Sandbox{
-    FSReadable: []string{"/usr", "/lib", "/lib64", "/bin", "/etc"},
-    PolicyFn: func(event sandlock.SyscallEvent, ctx *sandlock.PolicyContext) sandlock.PolicyDecision {
-        if event.Syscall == "execve" && event.ArgvContains("curl") {
-            return sandlock.Deny()
-        }
-        return sandlock.Allow()
-    },
+	FSReadable: []string{"/usr", "/lib", "/lib64", "/bin", "/etc"},
+	PolicyFn: &sandlock.PolicyFn{
+		Callback: func(event sandlock.SyscallEvent, ctx *sandlock.PolicyContext) sandlock.PolicyDecision {
+			if event.Syscall == "execve" && event.ArgvContains("curl") {
+				return sandlock.Deny()
+			}
+			return sandlock.Allow()
+		},
+	},
 }
 ```
 

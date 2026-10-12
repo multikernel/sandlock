@@ -4,17 +4,17 @@
 //! sandbox permissions at runtime (grant, restrict, per-PID overrides).
 //!
 //! ```
-//! use sandlock_core::{Sandbox, policy_fn::Verdict};
+//! use sandlock_core::{Sandbox, PolicyFn, policy_fn::Verdict};
 //!
 //! let blocked_host = "10.0.0.5".parse()?;
 //! let policy = Sandbox::builder()
 //!     .net_allow("tcp://10.0.0.0/24:443")
-//!     .policy_fn(move |event, _ctx| {
+//!     .policy_fn(PolicyFn::new(move |event, _ctx| {
 //!         if event.syscall == "connect" && event.host == Some(blocked_host) {
 //!             return Verdict::Deny;
 //!         }
 //!         Verdict::Allow
-//!     })
+//!     }))
 //!     .build()?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
@@ -33,6 +33,8 @@
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 // ============================================================
 // SyscallCategory
@@ -166,6 +168,7 @@ pub struct LivePolicy {
 /// - `restrict()`: permanently shrink permissions (irreversible)
 /// - `restrict_pid()`: apply per-PID network overrides
 pub struct PolicyContext {
+    cancellation: CancellationToken,
     live: Arc<RwLock<LivePolicy>>,
     ceiling: LivePolicy,
     restricted: HashSet<&'static str>,
@@ -181,12 +184,22 @@ impl PolicyContext {
         denied: Arc<crate::seccomp::state::DeniedSet>,
     ) -> Self {
         Self {
+            cancellation: CancellationToken::new(),
             live,
             ceiling,
             restricted: HashSet::new(),
             pid_overrides,
             denied,
         }
+    }
+
+    /// Whether sandbox shutdown has cancelled this callback.
+    ///
+    /// Interactive approval loops must check this between bounded waits and
+    /// return promptly when true. Shutdown joins the callback thread; it cannot
+    /// interrupt arbitrary user code.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
     }
 
     /// Current effective policy (snapshot).
@@ -327,7 +340,9 @@ impl Default for Verdict {
 /// A callback function invoked for each intercepted syscall.
 ///
 /// Called synchronously on a dedicated thread. For held syscalls the child
-/// process is blocked until the callback returns.
+/// process is blocked until a verdict, the approval timeout, or shutdown.
+/// Approval loops must check [`PolicyContext::is_cancelled`] between bounded
+/// waits. Shutdown waits for running callbacks to return.
 ///
 /// Return `Verdict::Deny` to block the current syscall. Only effective for
 /// held syscalls: exec (execve/execveat), open (open/openat/openat2), and
@@ -337,6 +352,33 @@ impl Default for Verdict {
 ///
 /// Wrapped in `Arc` so that `Policy` remains `Clone`.
 pub type PolicyCallback = Arc<dyn Fn(SyscallEvent, &mut PolicyContext) -> Verdict + Send + Sync + 'static>;
+
+/// A dynamic policy callback and the settings for its held verdicts.
+#[derive(Clone)]
+pub struct PolicyFn {
+    pub(crate) callback: PolicyCallback,
+    pub(crate) verdict_timeout: Option<Duration>,
+}
+
+impl PolicyFn {
+    /// Configure a callback with a five-second verdict timeout.
+    pub fn new(
+        callback: impl Fn(SyscallEvent, &mut PolicyContext) -> Verdict + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            callback: Arc::new(callback),
+            verdict_timeout: Some(Duration::from_secs(5)),
+        }
+    }
+
+    /// Maximum wait for a held verdict, including queue time. `None` waits
+    /// until a decision or shutdown; zero denies immediately. Expiry denies
+    /// the syscall without interrupting a callback already running.
+    pub fn verdict_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.verdict_timeout = timeout;
+        self
+    }
+}
 
 // ============================================================
 // Event channel types (used by supervisor integration)
@@ -361,16 +403,44 @@ pub enum PolicyMsg {
     Shutdown,
 }
 
-/// Owns the policy-callback thread. Dropping it is the guarantee that no
-/// callback runs afterwards: the supervisor's sender clones outlive an
-/// `abort()`, so shutdown is an in-band message rather than channel closure,
-/// and the drop joins the thread.
+pub(crate) async fn wait_for_verdict(
+    gate: tokio::sync::oneshot::Receiver<Verdict>,
+    timeout: Option<Duration>,
+    cancellation: &CancellationToken,
+) -> Verdict {
+    if timeout == Some(Duration::ZERO) {
+        return Verdict::Deny;
+    }
+    let deadline = async {
+        match timeout {
+            Some(duration) => tokio::time::sleep(duration).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Verdict::Deny,
+        _ = deadline => Verdict::Deny,
+        verdict = gate => verdict.unwrap_or(Verdict::Deny),
+    }
+}
+
+/// Cancels pending approvals and joins the callback thread on drop.
 pub(crate) struct PolicyFnWorker {
+    cancellation: CancellationToken,
     tx: tokio::sync::mpsc::UnboundedSender<PolicyMsg>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl PolicyFnWorker {
+    pub(crate) fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+
+    pub(crate) fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
     pub(crate) fn sender(&self) -> tokio::sync::mpsc::UnboundedSender<PolicyMsg> {
         self.tx.clone()
     }
@@ -378,6 +448,7 @@ impl PolicyFnWorker {
 
 impl Drop for PolicyFnWorker {
     fn drop(&mut self) {
+        self.cancel();
         let _ = self.tx.send(PolicyMsg::Shutdown);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
@@ -395,16 +466,28 @@ pub(crate) fn spawn_policy_fn(
 ) -> PolicyFnWorker {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PolicyMsg>();
 
+    let cancellation = CancellationToken::new();
+    let worker_cancellation = cancellation.clone();
     let thread = std::thread::Builder::new()
         .name("sandlock-policy-fn".to_string())
         .spawn(move || {
             let mut ctx = PolicyContext::new(live, ceiling, pid_overrides, denied);
+            ctx.cancellation = worker_cancellation;
 
             while let Some(PolicyMsg::Event(pe)) = rx.blocking_recv() {
+                if ctx.is_cancelled() {
+                    break;
+                }
+                if pe.gate.as_ref().is_some_and(|gate| gate.is_closed()) {
+                    continue;
+                }
                 let verdict = callback(pe.event, &mut ctx);
+                let verdict = if ctx.is_cancelled() {
+                    Verdict::Deny
+                } else {
+                    verdict
+                };
 
-                // Signal the supervisor with the verdict.
-                // For execve, this unblocks the child.
                 if let Some(gate) = pe.gate {
                     let _ = gate.send(verdict);
                 }
@@ -412,7 +495,11 @@ pub(crate) fn spawn_policy_fn(
         })
         .expect("failed to spawn policy-fn thread");
 
-    PolicyFnWorker { tx, thread: Some(thread) }
+    PolicyFnWorker {
+        cancellation,
+        tx,
+        thread: Some(thread),
+    }
 }
 
 // ============================================================
@@ -423,27 +510,9 @@ pub(crate) fn spawn_policy_fn(
 mod tests {
     use super::*;
 
-    #[test]
-    fn worker_drop_waits_for_queued_callbacks() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let calls = Arc::new(AtomicUsize::new(0));
-        let seen = calls.clone();
-        let callback: PolicyCallback = Arc::new(move |_e, _c| {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            seen.fetch_add(1, Ordering::SeqCst);
-            Verdict::Allow
-        });
-        let live = Arc::new(RwLock::new(test_live()));
-        let worker = spawn_policy_fn(
-            callback,
-            live,
-            test_live(),
-            Arc::new(RwLock::new(HashMap::new())),
-            Arc::new(crate::seccomp::state::DeniedSet::default()),
-        );
-        let tx = worker.sender();
-        let event = SyscallEvent {
-            syscall: "close".into(),
+    fn test_event() -> SyscallEvent {
+        SyscallEvent {
+            syscall: "openat".into(),
             category: SyscallCategory::File,
             pid: 1,
             parent_pid: None,
@@ -457,10 +526,187 @@ mod tests {
             fd: None,
             flags: None,
             protocol: None,
-        };
-        tx.send(PolicyMsg::Event(PolicyEvent { event, gate: None })).unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn verdict_timeout_denies_and_closes_gate() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cancellation = CancellationToken::new();
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            wait_for_verdict(rx, Some(std::time::Duration::from_secs(30)), &cancellation).await,
+            Verdict::Deny
+        );
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(30));
+        assert!(tx.is_closed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unlimited_approval_accepts_late_verdict() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cancellation = CancellationToken::new();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            tx.send(Verdict::DenyWith(13)).unwrap();
+        });
+        assert_eq!(
+            wait_for_verdict(rx, None, &cancellation).await,
+            Verdict::DenyWith(13)
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_pending_approval() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cancellation = CancellationToken::new();
+        let signal = cancellation.clone();
+        let waiter = tokio::spawn(async move { wait_for_verdict(rx, None, &signal).await });
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+                .await
+                .unwrap()
+                .unwrap(),
+            Verdict::Deny
+        );
+        assert!(tx.is_closed());
+    }
+
+    #[tokio::test]
+    async fn shutdown_wins_over_ready_approval() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(Verdict::Allow).unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert_eq!(
+            wait_for_verdict(rx, None, &cancellation).await,
+            Verdict::Deny
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_verdict_timeout_denies_ready_verdict() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(Verdict::Allow).unwrap();
+        assert_eq!(
+            wait_for_verdict(rx, Some(Duration::ZERO), &CancellationToken::new()).await,
+            Verdict::Deny
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_approval_channel_denies() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        drop(tx);
+        assert_eq!(
+            wait_for_verdict(rx, None, &CancellationToken::new()).await,
+            Verdict::Deny
+        );
+    }
+
+    #[test]
+    fn worker_skips_expired_queued_approval() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let callback: PolicyCallback = Arc::new(move |_e, _ctx| {
+            if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                started_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap();
+            }
+            Verdict::Allow
+        });
+        let worker = spawn_policy_fn(
+            callback,
+            Arc::new(RwLock::new(test_live())),
+            test_live(),
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(crate::seccomp::state::DeniedSet::default()),
+        );
+        let tx = worker.sender();
+        tx.send(PolicyMsg::Event(PolicyEvent {
+            event: test_event(),
+            gate: None,
+        }))
+        .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (expired_tx, expired_rx) = tokio::sync::oneshot::channel();
+        tx.send(PolicyMsg::Event(PolicyEvent {
+            event: test_event(),
+            gate: Some(expired_tx),
+        }))
+        .unwrap();
+        drop(expired_rx);
+        let (last_tx, last_rx) = tokio::sync::oneshot::channel();
+        tx.send(PolicyMsg::Event(PolicyEvent {
+            event: test_event(),
+            gate: Some(last_tx),
+        }))
+        .unwrap();
+        release_tx.send(()).unwrap();
+        assert_eq!(last_rx.blocking_recv(), Ok(Verdict::Allow));
+        drop(worker);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn worker_shutdown_cancels_callback_and_discards_queue() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let callback: PolicyCallback = Arc::new(move |_e, ctx| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            started_tx.send(()).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !ctx.is_cancelled() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(
+                ctx.is_cancelled(),
+                "shutdown did not cancel the running callback"
+            );
+            Verdict::Allow
+        });
+        let worker = spawn_policy_fn(
+            callback,
+            Arc::new(RwLock::new(test_live())),
+            test_live(),
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(crate::seccomp::state::DeniedSet::default()),
+        );
+        let tx = worker.sender();
+        let (gate_tx, mut gate_rx) = tokio::sync::oneshot::channel();
+        tx.send(PolicyMsg::Event(PolicyEvent {
+            event: test_event(),
+            gate: Some(gate_tx),
+        }))
+        .unwrap();
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        let (queued_tx, mut queued_rx) = tokio::sync::oneshot::channel();
+        tx.send(PolicyMsg::Event(PolicyEvent {
+            event: test_event(),
+            gate: Some(queued_tx),
+        }))
+        .unwrap();
         drop(worker);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(gate_rx.try_recv(), Ok(Verdict::Deny));
+        assert_eq!(
+            queued_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        );
     }
 
     fn test_live() -> LivePolicy {

@@ -414,7 +414,7 @@ and have no TOML counterpart.
 | ----------- | ----------------- | ------- | ---------------------------------------------------------------------------------------------------------- |
 | `name`      | `str \| None`     | `None`  | Sandbox name and virtual hostname inside the sandbox. Auto-generated as `sandbox-{pid}` when omitted. Maximum 64 bytes; must not contain NUL. |
 | `image`     | `Image \| None`   | `None`  | Container image from `sandlock.pull_image()`. Its rootfs becomes the chroot; its env and working directory fill only what `env` and `cwd` leave unset. Writes land in a copy-on-write branch that is always discarded, so the cached image never changes: `workdir` and a non-abort `on_error` are rejected, and output meant to persist goes through `fs_mount`. Runtime rather than policy because it names a local cache path. |
-| `policy_fn` | `Callable \| None`| `None`  | Per-event dynamic policy callback. See [`policy-fn.md`](policy-fn.md).                      |
+| `policy_fn` | `PolicyFn \| None`| `None`  | Callback configuration, including its verdict timeout. See [`policy-fn.md`](policy-fn.md).                      |
 | `init_fn`   | `Callable \| None`| `None`  | Callback invoked once in the template process prior to COW fork.                                           |
 | `work_fn`   | `Callable \| None`| `None`  | Callback invoked in each COW clone; receives `clone_id` as its argument.                                   |
 

@@ -186,6 +186,30 @@ class Image:
     config: ImageConfig = field(default_factory=ImageConfig)
 
 
+@dataclass(frozen=True)
+class PolicyFn:
+    """A policy callback and the timeout for its held verdicts."""
+
+    callback: Callable
+    verdict_timeout: float | None = field(default=5.0, kw_only=True)
+    """Seconds including queue time; None disables the timeout, zero denies immediately."""
+
+    def __post_init__(self):
+        if not callable(self.callback):
+            raise TypeError("callback must be callable")
+        self._verdict_timeout_ms()
+
+    def _verdict_timeout_ms(self) -> int:
+        import math
+
+        if self.verdict_timeout is None:
+            return -1
+        value = self.verdict_timeout
+        if not math.isfinite(value) or value < 0 or value * 1000 >= 2**63:
+            raise ValueError("verdict_timeout must be finite, nonnegative, and fit in signed 64-bit milliseconds")
+        return math.ceil(value * 1000)
+
+
 @dataclass
 class Sandbox:
     """Sandbox configuration and runtime handle.
@@ -476,7 +500,7 @@ class Sandbox:
     """Sandbox name (also exposed as the virtual hostname inside the sandbox).
     Auto-generated as ``sandbox-{pid}-{counter}`` when omitted."""
 
-    policy_fn: Callable | None = field(default=None, repr=False, metadata={"runtime": True})
+    policy_fn: PolicyFn | None = field(default=None, repr=False, metadata={"runtime": True})
     """Optional callback for dynamic per-event policy decisions."""
 
     init_fn: Callable | None = field(default=None, repr=False, metadata={"runtime": True})
@@ -486,6 +510,8 @@ class Sandbox:
     """Callback run in each COW clone, receives clone_id as argument."""
 
     def __post_init__(self):
+        if self.policy_fn is not None and not isinstance(self.policy_fn, PolicyFn):
+            raise TypeError("policy_fn must be a PolicyFn or None")
         # Validate name
         if self.name is not None:
             if not self.name:
@@ -530,7 +556,7 @@ class Sandbox:
         would silently apply outdated config.
         """
         from ._sdk import _NativePolicy
-        self._native = _NativePolicy.from_dataclass(self, policy_fn=self.policy_fn)
+        self._native = _NativePolicy.from_dataclass(self)
         return self._native
 
     # ------------------------------------------------------------------

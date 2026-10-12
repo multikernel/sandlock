@@ -438,6 +438,9 @@ async fn handle_config(
 /// Only the supervisor knows the groups a process has moved into, so
 /// `sandlock kill` asks here before it signals the child's own group.
 async fn handle_kill(stream: &mut ControlStream, ctx: Option<&Arc<SupervisorCtx>>) {
+    if let Some(ctx) = ctx {
+        ctx.policy_fn.lock().await.cancellation.cancel();
+    }
     let resp = match ctx.map(|ctx| ctx.groups.signal(libc::SIGKILL)) {
         Some(Ok(groups)) => ControlResponse {
             v: 1,

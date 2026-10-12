@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
@@ -578,7 +578,7 @@ pub struct Sandbox {
 
     // Dynamic policy callback
     #[serde(skip)]
-    pub policy_fn: Option<crate::policy_fn::PolicyCallback>,
+    pub policy_fn: Option<crate::policy_fn::PolicyFn>,
 
     // Sandbox instance name (exposed as virtual hostname; auto-generated if None).
     // Not serialized — instance names are set at runtime, not in the policy file.
@@ -875,6 +875,9 @@ impl Sandbox {
         let rt = self.runtime.as_ref()
             .filter(|rt| rt.child_pid.is_some())
             .ok_or(SandboxRuntimeError::NotRunning)?;
+        if sig == libc::SIGKILL {
+            if let Some(worker) = &rt.policy_fn_worker { worker.cancel(); }
+        }
         Ok(rt.groups.signal(sig).map_err(SandboxRuntimeError::Io)?)
     }
 
@@ -1343,7 +1346,9 @@ impl Sandbox {
     /// Wait for the child to finish `execve`. Detected by `/proc/<pid>/exe`
     /// no longer matching `/proc/self/exe` (before execve the child still
     /// shares the supervisor's binary). The kernel offers no direct event
-    /// for execve completion, so this polls every 1ms with a 5s ceiling.
+    /// for execve completion, so this polls every 1ms. Policy approvals add
+    /// their configured timeout to the usual five-second startup allowance;
+    /// unlimited approvals also disable the startup deadline.
     async fn wait_until_exec(&self) -> Result<(), crate::error::SandlockError> {
         use crate::error::SandboxRuntimeError;
         let pid = self.pid().ok_or(SandboxRuntimeError::NotRunning)?;
@@ -1351,16 +1356,26 @@ impl Sandbox {
             return Ok(());
         };
         let child_link = format!("/proc/{}/exe", pid);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let startup_allowance = Duration::from_secs(5);
+        let timeout = if let Some(policy_fn) = &self.policy_fn {
+            policy_fn.verdict_timeout.map(|timeout| timeout.saturating_add(startup_allowance))
+        } else {
+            Some(startup_allowance)
+        };
+        let deadline = timeout.and_then(|timeout| std::time::Instant::now().checked_add(timeout));
         loop {
-            if let Ok(child_exe) = std::fs::read_link(&child_link) {
-                if child_exe != our_exe {
-                    return Ok(());
+            match std::fs::read_link(&child_link) {
+                Ok(child_exe) if child_exe != our_exe => return Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(SandboxRuntimeError::Child(
+                        "child exited before exec() completed".into(),
+                    ).into());
                 }
+                _ => {}
             }
-            if std::time::Instant::now() >= deadline {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
                 return Err(SandboxRuntimeError::Child(
-                    "child did not exec() within 5s".into(),
+                    "child did not exec() within the startup timeout".into(),
                 ).into());
             }
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -2327,7 +2342,7 @@ impl Sandbox {
                 policy_fn_state.denied.deny(&path.to_string_lossy());
             }
 
-            if let Some(ref callback) = self.policy_fn {
+            if let Some(ref policy_fn) = self.policy_fn {
                 let mut allowed_ips: std::collections::HashSet<std::net::IpAddr> =
                     std::collections::HashSet::new();
                 for p in [&net_state.tcp_policy, &net_state.udp_policy, &net_state.icmp_policy] {
@@ -2353,8 +2368,10 @@ impl Sandbox {
                 let pid_overrides = net_state.pid_ip_overrides.clone();
                 policy_fn_state.live_policy = Some(live.clone());
                 let worker = crate::policy_fn::spawn_policy_fn(
-                    callback.clone(), live, ceiling, pid_overrides, denied,
+                    policy_fn.callback.clone(), live, ceiling, pid_overrides, denied,
                 );
+                policy_fn_state.verdict_timeout = policy_fn.verdict_timeout;
+                policy_fn_state.cancellation = worker.cancellation();
                 policy_fn_state.event_tx = Some(worker.sender());
                 self.rt_mut().policy_fn_worker = Some(worker);
             }
@@ -2600,6 +2617,7 @@ fn sandbox_restore_tty_foreground(child_pid: i32) {
 impl Drop for Sandbox {
     fn drop(&mut self) {
         if let Some(ref mut rt) = self.runtime {
+            if let Some(worker) = &rt.policy_fn_worker { worker.cancel(); }
             if let Some(pid) = rt.child_pid {
                 if matches!(rt.state, RuntimeState::Created | RuntimeState::Running | RuntimeState::Paused) {
                     let _ = rt.groups.signal(libc::SIGKILL);

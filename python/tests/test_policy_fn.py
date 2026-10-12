@@ -11,7 +11,7 @@ import threading
 
 import pytest
 
-from sandlock import Sandbox, SyscallEvent, PolicyContext
+from sandlock import Sandbox, PolicyFn, SyscallEvent, PolicyContext
 
 
 _PYTHON_READABLE = list(dict.fromkeys([
@@ -97,7 +97,7 @@ class TestPolicyFnEvents:
         def on_event(event, ctx):
             events.append(event.syscall)
 
-        result = _policy(policy_fn=on_event).run(
+        result = _policy(policy_fn=PolicyFn(on_event)).run(
             ["python3", "-c", "print('hello')"]
         )
         assert result.success
@@ -111,7 +111,7 @@ class TestPolicyFnEvents:
             if event.syscall in ("execve", "execveat"):
                 exec_events.append(event)
 
-        result = _policy(policy_fn=on_event).run(
+        result = _policy(policy_fn=PolicyFn(on_event)).run(
             ["python3", "-c", "print('hello')"]
         )
         assert result.success
@@ -124,7 +124,7 @@ class TestPolicyFnEvents:
         def on_event(event, ctx):
             count["n"] += 1
 
-        result = _policy(policy_fn=on_event).run(
+        result = _policy(policy_fn=PolicyFn(on_event)).run(
             ["python3", "-c", "print(6 * 7)"]
         )
         assert result.success
@@ -138,7 +138,7 @@ class TestPolicyFnEvents:
         def on_event(event, ctx):
             pass  # just needs to not crash
 
-        sb = _policy(policy_fn=on_event)
+        sb = _policy(policy_fn=PolicyFn(on_event))
         r1 = sb.run(["echo", "a"])
         r2 = sb.run(["echo", "b"])
         assert r1.success
@@ -179,7 +179,7 @@ class TestPolicyFnRestrict:
                 f"print('allowed=' + probe('{h1}', {p1}), 'denied=' + probe('{h2}', {p2}))\n"
             )
             result = _policy(
-                net_allow=[f"{h1}:{p1}", f"{h2}:{p2}"], policy_fn=on_event
+                net_allow=[f"{h1}:{p1}", f"{h2}:{p2}"], policy_fn=PolicyFn(on_event)
             ).run([sys.executable, "-c", script])
 
         out = result.stdout.decode()
@@ -210,7 +210,7 @@ class TestPolicyFnRestrict:
             return 0
 
         # Restricted: 128 MiB exceeds the tightened 64 MiB limit -> killed.
-        restricted = _policy(max_memory="256M", policy_fn=restrict_to_64mb).run(
+        restricted = _policy(max_memory="256M", policy_fn=PolicyFn(restrict_to_64mb)).run(
             [sys.executable, "-c", alloc_128mb], timeout=15
         )
         assert b"STARTED" in restricted.stdout, restricted.stdout
@@ -248,7 +248,7 @@ class TestPolicyFnRestrict:
                 ctx.restrict_max_processes(1)
             return 0
 
-        restricted = _policy(policy_fn=restrict_to_1).run(
+        restricted = _policy(policy_fn=PolicyFn(restrict_to_1)).run(
             [sys.executable, "-c", fork_once], timeout=15
         )
         out = restricted.stdout.decode()
@@ -258,7 +258,7 @@ class TestPolicyFnRestrict:
         assert "FORK_DENIED 11" in out, out          # EAGAIN from the limit
 
         # Control: no restriction -> the same fork succeeds.
-        baseline = _policy(policy_fn=lambda e, ctx: 0).run(
+        baseline = _policy(policy_fn=PolicyFn(lambda e, ctx: 0)).run(
             [sys.executable, "-c", fork_once], timeout=15
         )
         assert baseline.success, baseline.error
@@ -296,7 +296,7 @@ class TestPolicyFnVerdict:
                 "s.close()\n"
             )
             result = _policy(
-                net_allow=[f"{host}:{port}"], policy_fn=on_event
+                net_allow=[f"{host}:{port}"], policy_fn=PolicyFn(on_event)
             ).run([sys.executable, "-c", script])
 
         out = result.stdout.decode().strip()
@@ -310,7 +310,7 @@ class TestPolicyFnVerdict:
                 return "audit"
             return 0
 
-        result = _policy(policy_fn=on_event).run(
+        result = _policy(policy_fn=PolicyFn(on_event)).run(
             ["cat", "/etc/hostname"]
         )
         assert result.success, "audit should allow the syscall"
@@ -322,7 +322,7 @@ class TestPolicyFnVerdict:
                 return "bogus"  # not a recognized verdict
             return 0
 
-        result = _policy(policy_fn=on_event).run(["echo", "should-not-run"])
+        result = _policy(policy_fn=PolicyFn(on_event)).run(["echo", "should-not-run"])
         assert not result.success, "unrecognized verdict must fail closed (deny)"
 
     def test_deny_returns_true(self):
@@ -347,7 +347,7 @@ class TestPolicyFnVerdict:
                 "s.close(); print('SURVIVED')\n"
             )
             result = _policy(
-                net_allow=[f"{host}:{port}"], policy_fn=on_event
+                net_allow=[f"{host}:{port}"], policy_fn=PolicyFn(on_event)
             ).run([sys.executable, "-c", script])
 
         out = result.stdout.decode()
@@ -367,7 +367,7 @@ class TestPolicyFnVerdict:
                 ctx.deny_path("/etc/hostname")
             return 0
 
-        result = _policy(policy_fn=on_event).run(
+        result = _policy(policy_fn=PolicyFn(on_event)).run(
             ["python3", "-c",
              f"try:\n"
              f"  open('/etc/hostname').read()\n"
@@ -410,10 +410,62 @@ class TestPolicyFnPerPid:
                 f"print('allowed=' + probe('{h1}', {p1}), 'denied=' + probe('{h2}', {p2}))\n"
             )
             result = _policy(
-                net_allow=[f"{h1}:{p1}", f"{h2}:{p2}"], policy_fn=on_event
+                net_allow=[f"{h1}:{p1}", f"{h2}:{p2}"], policy_fn=PolicyFn(on_event)
             ).run([sys.executable, "-c", script])
 
         out = result.stdout.decode()
         assert result.success, result.error
         assert "allowed=OK" in out, out
         assert "denied=ERR111" in out, out
+
+
+@pytest.mark.parametrize("verdict_timeout", [-1, float("inf"), float("nan"), 1e30])
+def test_invalid_verdict_timeout(verdict_timeout):
+    with pytest.raises(ValueError, match="verdict_timeout"):
+        PolicyFn(lambda event, ctx: 0, verdict_timeout=verdict_timeout)
+
+
+def test_verdict_timeout_denies_late_allow():
+    import time
+
+    def on_event(event, ctx):
+        if event.syscall == "execve":
+            time.sleep(0.15)
+        return 0
+
+    result = _policy(policy_fn=PolicyFn(on_event, verdict_timeout=0.02)).run(["/bin/true"])
+    assert not result.success
+
+
+def test_shutdown_cancels_unlimited_approval():
+    import time
+
+    entered = threading.Event()
+    cancelled = threading.Event()
+
+    def on_event(event, ctx):
+        if event.syscall == "execve":
+            entered.set()
+            deadline = time.monotonic() + 2
+            while not ctx.is_cancelled() and time.monotonic() < deadline:
+                time.sleep(0.001)
+            if ctx.is_cancelled():
+                cancelled.set()
+        return 0
+
+    result = _policy(policy_fn=PolicyFn(on_event, verdict_timeout=None)).run(
+        ["/bin/true"], timeout=0.2,
+    )
+    assert entered.is_set()
+    assert cancelled.is_set()
+    assert not result.success
+
+
+def test_policy_fn_requires_callable():
+    with pytest.raises(TypeError, match="callback"):
+        PolicyFn(None)
+
+
+def test_sandbox_requires_policy_fn_configuration():
+    with pytest.raises(TypeError, match="PolicyFn"):
+        Sandbox(policy_fn=lambda event, ctx: 0)

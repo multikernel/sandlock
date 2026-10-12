@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
-use sandlock_core::policy_fn::{SyscallEvent, Verdict};
+use sandlock_core::policy_fn::{PolicyFn, SyscallEvent, Verdict};
 use sandlock_core::profile::{FilesystemSection, ProfileInput};
 use sandlock_core::sandbox::BranchAction;
 use sandlock_core::Sandbox;
@@ -583,7 +583,7 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         // may refuse one before it is recorded.
         .net_allow_bind("*")
         .max_memory(sandlock_core::sandbox::ByteSize(1 << 43)) // 8 TiB
-        .policy_fn(move |event, _ctx| observer_cb.on_event(event));
+        .policy_fn(PolicyFn::new(move |event, _ctx| observer_cb.on_event(event)));
 
     #[cfg(feature = "http")]
     {

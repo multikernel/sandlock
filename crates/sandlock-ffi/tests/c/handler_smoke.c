@@ -133,7 +133,7 @@ static int check_policy_fn_user_data_drop(void) {
     b = sandlock_sandbox_builder_fs_read(b, "/dev");
     b = sandlock_sandbox_builder_fs_write(b, "/tmp");
     b = sandlock_sandbox_builder_policy_fn(
-        b, policy_fn_record_ud, &state, policy_fn_drop_ud);
+        b, policy_fn_record_ud, 5000, &state, policy_fn_drop_ud);
 
     int err = 0;
     sandlock_sandbox_t *p = sandlock_sandbox_build(b, &err, NULL);

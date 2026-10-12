@@ -33,6 +33,7 @@ fn policy_fn_user_data_drop_fires_on_policy_free() {
         sandlock_sandbox_builder_policy_fn(
             builder,
             policy_callback,
+            5000,
             USER_DATA_TOKEN as *mut c_void,
             Some(drop_user_data),
         )

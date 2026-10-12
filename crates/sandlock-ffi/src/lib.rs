@@ -2238,7 +2238,9 @@ fn policy_ret_to_verdict(ret: i32) -> sandlock_core::policy_fn::Verdict {
     }
 }
 
-/// Set a policy callback on the builder.
+/// Set a policy callback and its held verdict timeout in milliseconds.
+/// Negative disables the timeout; zero denies immediately. Pass 5000 for
+/// the SDK default.
 ///
 /// # Safety
 /// `b` must be a valid builder pointer. `cb` must be a valid function pointer
@@ -2251,6 +2253,7 @@ fn policy_ret_to_verdict(ret: i32) -> sandlock_core::policy_fn::Verdict {
 pub unsafe extern "C" fn sandlock_sandbox_builder_policy_fn(
     b: *mut SandboxBuilder,
     cb: sandlock_policy_fn_t,
+    verdict_timeout_ms: i64,
     user_data: *mut c_void,
     user_data_drop: Option<unsafe extern "C" fn(user_data: *mut c_void)>,
 ) -> *mut SandboxBuilder {
@@ -2314,7 +2317,23 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_policy_fn(
         policy_ret_to_verdict(ret)
     };
 
-    Box::into_raw(Box::new(builder.policy_fn(cb_fn)))
+    let timeout = if verdict_timeout_ms < 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_millis(verdict_timeout_ms as u64))
+    };
+    let policy_fn = sandlock_core::PolicyFn::new(cb_fn).verdict_timeout(timeout);
+    Box::into_raw(Box::new(builder.policy_fn(policy_fn)))
+}
+
+/// Whether sandbox shutdown has cancelled the callback. Approval loops must
+/// check this between bounded waits and return promptly when true.
+///
+/// # Safety
+/// `ctx` must be a valid context pointer from inside a policy callback.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_ctx_is_cancelled(ctx: *const sandlock_ctx_t) -> bool {
+    ctx.is_null() || (*(*ctx).ctx).is_cancelled()
 }
 
 /// Restrict network to the given IPs. Permanent — cannot grant back.

@@ -168,6 +168,9 @@ func (s *Sandbox) validateStrings() error {
 // buildPolicy translates the Sandbox configuration into a native policy handle.
 // The returned pointer must be released with C.sandlock_sandbox_free.
 func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
+	if s.PolicyFn != nil && s.PolicyFn.Callback == nil {
+		return nil, fmt.Errorf("sandlock: PolicyFn.Callback must not be nil")
+	}
 	if err := s.validateStrings(); err != nil {
 		return nil, err
 	}
@@ -396,10 +399,20 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 		b = C.sandlock_sandbox_builder_on_error(b, C.uint8_t(s.OnError-1))
 	}
 	if s.PolicyFn != nil {
+		timeoutMs := int64(5000)
+		if s.PolicyFn.VerdictTimeout < 0 {
+			timeoutMs = -1
+		} else if s.PolicyFn.VerdictTimeout > 0 {
+			timeoutMs = int64(s.PolicyFn.VerdictTimeout / time.Millisecond)
+			if s.PolicyFn.VerdictTimeout%time.Millisecond != 0 {
+				timeoutMs++
+			}
+		}
 		b = C.sandlock_sandbox_builder_policy_fn(
 			b,
 			(C.sandlock_policy_fn_t)(C.goPolicyCallback),
-			registerPolicyCallback(s.PolicyFn),
+			C.int64_t(timeoutMs),
+			registerPolicyCallback(s.PolicyFn.Callback),
 			(*[0]byte)(C.goPolicyDrop),
 		)
 	}
@@ -484,6 +497,12 @@ func (c *PolicyContext) cptr() *C.sandlock_ctx_t {
 		return nil
 	}
 	return (*C.sandlock_ctx_t)(c.ptr)
+}
+
+// IsCancelled reports sandbox shutdown. Approval loops must check this
+// between bounded waits and return promptly when true.
+func (c *PolicyContext) IsCancelled() bool {
+	return bool(C.sandlock_ctx_is_cancelled(c.cptr()))
 }
 
 // RestrictNetwork permanently restricts the live network policy to ips.

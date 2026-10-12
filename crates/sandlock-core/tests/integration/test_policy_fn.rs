@@ -1,5 +1,5 @@
 use sandlock_core::{Sandbox};
-use sandlock_core::policy_fn::{Verdict, SyscallCategory};
+use sandlock_core::policy_fn::{PolicyFn, Verdict, SyscallCategory};
 use sandlock_core::sandbox::ByteSize;
 use std::net::{IpAddr, TcpListener};
 use std::path::PathBuf;
@@ -33,10 +33,10 @@ async fn test_policy_fn_receives_events_with_metadata() {
     let events_clone = events.clone();
 
     let policy = base_policy()
-        .policy_fn(move |event, _ctx| {
+        .policy_fn(PolicyFn::new(move |event, _ctx| {
             events_clone.lock().unwrap().push(event.syscall.clone());
             Verdict::Allow
-        })
+        }))
         .build()
         .unwrap();
 
@@ -66,12 +66,12 @@ async fn test_policy_fn_deny_connect() {
 
     let policy = base_policy()
         .net_allow(format!("127.0.0.1:{port}"))
-        .policy_fn(move |event, _ctx| {
+        .policy_fn(PolicyFn::new(move |event, _ctx| {
             if event.syscall == "connect" {
                 return Verdict::Deny; // EPERM
             }
             Verdict::Allow
-        })
+        }))
         .build()
         .unwrap();
 
@@ -102,13 +102,13 @@ async fn test_policy_fn_deny_connect_does_not_leave_socket_connected() {
     listener.set_nonblocking(true).unwrap();
 
     let mut policy = base_policy()
-        .policy_fn(|event, _ctx| {
+        .policy_fn(PolicyFn::new(|event, _ctx| {
             if event.syscall == "connect" {
                 Verdict::Deny
             } else {
                 Verdict::Allow
             }
-        })
+        }))
         .build()
         .unwrap();
 
@@ -164,12 +164,12 @@ async fn test_policy_fn_restrict_network_takes_effect() {
     let policy = base_policy()
         .net_allow(format!("127.0.0.1:{p1}"))
         .net_allow(format!("127.0.0.2:{p2}"))
-        .policy_fn(move |event, ctx| {
+        .policy_fn(PolicyFn::new(move |event, ctx| {
             if event.syscall == "execve" {
                 ctx.restrict_network(&allowed); // narrow to 127.0.0.1
             }
             Verdict::Allow
-        })
+        }))
         .build()
         .unwrap();
 
@@ -199,12 +199,12 @@ async fn test_policy_fn_deny_path() {
     let out = temp_file("deny-path");
 
     let policy = base_policy()
-        .policy_fn(move |event, ctx| {
+        .policy_fn(PolicyFn::new(move |event, ctx| {
             if event.syscall == "execve" {
                 ctx.deny_path("/etc/hostname");
             }
             Verdict::Allow
-        })
+        }))
         .build()
         .unwrap();
 
@@ -232,10 +232,10 @@ async fn test_policy_fn_passthrough() {
     let count_clone = call_count.clone();
 
     let policy = base_policy()
-        .policy_fn(move |_event, _ctx| {
+        .policy_fn(PolicyFn::new(move |_event, _ctx| {
             *count_clone.lock().unwrap() += 1;
             Verdict::Allow
-        })
+        }))
         .build()
         .unwrap();
 
@@ -254,14 +254,14 @@ async fn test_policy_fn_execve_argv() {
     let argvs_clone = argvs.clone();
 
     let policy = base_policy()
-        .policy_fn(move |event, _ctx| {
+        .policy_fn(PolicyFn::new(move |event, _ctx| {
             if event.syscall == "execve" {
                 if let Some(ref args) = event.argv {
                     argvs_clone.lock().unwrap().push(args.clone());
                 }
             }
             Verdict::Allow
-        })
+        }))
         .build()
         .unwrap();
 
@@ -281,12 +281,12 @@ async fn test_policy_fn_execve_argv() {
 #[tokio::test]
 async fn test_policy_fn_deny_by_argv() {
     let policy = base_policy()
-        .policy_fn(move |event, _ctx| {
+        .policy_fn(PolicyFn::new(move |event, _ctx| {
             if event.syscall == "execve" && event.argv_contains("malicious") {
                 return Verdict::Deny;
             }
             Verdict::Allow
-        })
+        }))
         .build()
         .unwrap();
 
@@ -304,12 +304,12 @@ async fn test_policy_fn_connect_metadata() {
 
     let policy = base_policy()
         .net_allow("127.0.0.1:443")
-        .policy_fn(move |event, _ctx| {
+        .policy_fn(PolicyFn::new(move |event, _ctx| {
             if event.syscall == "connect" {
                 events_clone.lock().unwrap().push((event.host, event.port));
             }
             Verdict::Allow
-        })
+        }))
         .build()
         .unwrap();
 
@@ -340,10 +340,10 @@ async fn test_policy_fn_event_categories() {
 
     let policy = base_policy()
         .net_allow("127.0.0.1:443")
-        .policy_fn(move |event, _ctx| {
+        .policy_fn(PolicyFn::new(move |event, _ctx| {
             cats_clone.lock().unwrap().push((event.syscall.clone(), event.category));
             Verdict::Allow
-        })
+        }))
         .build()
         .unwrap();
 
@@ -371,12 +371,12 @@ async fn test_policy_fn_parent_pid() {
     let ppids_clone = ppids.clone();
 
     let policy = base_policy()
-        .policy_fn(move |event, _ctx| {
+        .policy_fn(PolicyFn::new(move |event, _ctx| {
             if event.syscall == "execve" {
                 ppids_clone.lock().unwrap().push(event.parent_pid);
             }
             Verdict::Allow
-        })
+        }))
         .build()
         .unwrap();
 
@@ -402,12 +402,12 @@ async fn test_policy_fn_deny_with_eacces() {
 
     let policy = base_policy()
         .net_allow("127.0.0.1:443")
-        .policy_fn(move |event, _ctx| {
+        .policy_fn(PolicyFn::new(move |event, _ctx| {
             if event.syscall == "connect" {
                 return Verdict::DenyWith(libc::EACCES);
             }
             Verdict::Allow
-        })
+        }))
         .build()
         .unwrap();
 
@@ -445,13 +445,13 @@ async fn test_policy_fn_audit() {
     let audited_clone = audited.clone();
 
     let policy = base_policy()
-        .policy_fn(move |event, _ctx| {
+        .policy_fn(PolicyFn::new(move |event, _ctx| {
             if event.category == SyscallCategory::File {
                 audited_clone.lock().unwrap().push(event.syscall.clone());
                 return Verdict::Audit;
             }
             Verdict::Allow
-        })
+        }))
         .build()
         .unwrap();
 
@@ -478,12 +478,12 @@ async fn test_policy_fn_restrict_pid_network_without_allowlist() {
     // No net_allow: outbound is otherwise unrestricted; the callback restricts
     // the exec'd pid's network to the empty set (deny all) on execve.
     let policy = base_policy()
-        .policy_fn(move |event, ctx| {
+        .policy_fn(PolicyFn::new(move |event, ctx| {
             if event.syscall == "execve" {
                 ctx.restrict_pid_network(event.pid, &[]);
             }
             Verdict::Allow
-        })
+        }))
         .build()
         .unwrap();
 
@@ -528,12 +528,12 @@ async fn test_policy_fn_restrict_max_memory_enforced() {
 
     let restricted = base_policy()
         .max_memory(ByteSize::mib(256))
-        .policy_fn(|event, ctx| {
+        .policy_fn(PolicyFn::new(|event, ctx| {
             if event.syscall == "execve" {
                 ctx.restrict_max_memory(64 * 1024 * 1024);
             }
             Verdict::Allow
-        })
+        }))
         .build()
         .unwrap()
         
@@ -547,7 +547,7 @@ async fn test_policy_fn_restrict_max_memory_enforced() {
 
     let baseline = base_policy()
         .max_memory(ByteSize::mib(256))
-        .policy_fn(|_e, _c| Verdict::Allow)
+        .policy_fn(PolicyFn::new(|_e, _c| Verdict::Allow))
         .build()
         .unwrap()
         
@@ -575,12 +575,12 @@ async fn test_policy_fn_restrict_max_processes_enforced() {
     );
 
     let restricted = base_policy()
-        .policy_fn(|event, ctx| {
+        .policy_fn(PolicyFn::new(|event, ctx| {
             if event.syscall == "execve" {
                 ctx.restrict_max_processes(1);
             }
             Verdict::Allow
-        })
+        }))
         .build()
         .unwrap()
         
@@ -593,7 +593,7 @@ async fn test_policy_fn_restrict_max_processes_enforced() {
     assert!(out.contains("FORK_DENIED 11"), "fork should be denied with EAGAIN, got: {}", out);
 
     let baseline = base_policy()
-        .policy_fn(|_e, _c| Verdict::Allow)
+        .policy_fn(PolicyFn::new(|_e, _c| Verdict::Allow))
         .build()
         .unwrap()
         
@@ -622,7 +622,7 @@ async fn test_policy_fn_fork_does_not_deadlock() {
 
     let mut sb = base_policy()
         // count events so the fork path is exercised under an active callback
-        .policy_fn(|_e, _c| Verdict::Allow)
+        .policy_fn(PolicyFn::new(|_e, _c| Verdict::Allow))
         .build()
         .unwrap()
         ;
@@ -649,10 +649,10 @@ async fn test_policy_fn_fs_mutation_events() {
     let events_clone = events.clone();
 
     let policy = base_policy()
-        .policy_fn(move |event, _ctx| {
+        .policy_fn(PolicyFn::new(move |event, _ctx| {
             events_clone.lock().unwrap().push((event.syscall.clone(), event.path.clone()));
             Verdict::Allow
-        })
+        }))
         .build()
         .unwrap();
 
@@ -691,12 +691,12 @@ async fn test_policy_fn_deny_openat2() {
 
     let policy = base_policy()
         .fs_read("/tmp")
-        .policy_fn(move |event, _ctx| {
+        .policy_fn(PolicyFn::new(move |event, _ctx| {
             if event.syscall == "openat" && event.path.as_deref() == Some(deny_path.as_path()) {
                 return Verdict::Deny; // EPERM
             }
             Verdict::Allow
-        })
+        }))
         .build()
         .unwrap();
 
@@ -734,12 +734,12 @@ async fn test_policy_fn_deny_sendmsg() {
 
     let policy = base_policy()
         .net_allow(format!("udp://127.0.0.1:{port}"))
-        .policy_fn(move |event, _ctx| {
+        .policy_fn(PolicyFn::new(move |event, _ctx| {
             if event.syscall == "sendmsg" {
                 return Verdict::Deny; // EPERM
             }
             Verdict::Allow
-        })
+        }))
         .build()
         .unwrap();
 
@@ -771,9 +771,9 @@ async fn test_policy_fn_deny_sendmmsg_has_no_side_effect() {
     let port = receiver.local_addr().unwrap().port();
     let mut policy = base_policy()
         .net_allow(format!("udp://127.0.0.1:{port}"))
-        .policy_fn(|event, _ctx| {
+        .policy_fn(PolicyFn::new(|event, _ctx| {
             if event.syscall == "sendmmsg" { Verdict::Deny } else { Verdict::Allow }
-        })
+        }))
         .build().unwrap();
     let script = format!(concat!(
         "import ctypes, socket, struct\n",
@@ -838,4 +838,131 @@ async fn test_policy_fn_deny_sendmmsg_has_no_side_effect() {
     assert_eq!(content, "ret=-1 errno=1 msg0_len=0");
     let mut buf = [0; 1];
     assert_eq!(receiver.recv_from(&mut buf).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+}
+
+#[tokio::test]
+async fn verdict_timeout_denies_late_allow() {
+    let policy = base_policy()
+        .policy_fn(
+            PolicyFn::new(|event, _ctx| {
+                if event.syscall == "execve" {
+                    std::thread::sleep(Duration::from_millis(150));
+                }
+                Verdict::Allow
+            })
+            .verdict_timeout(Some(Duration::from_millis(20))),
+        )
+        .build()
+        .unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["/bin/true"])
+        .await
+        .unwrap();
+    assert!(
+        !result.success(),
+        "a late approval must not execute the command"
+    );
+}
+
+#[tokio::test]
+async fn unlimited_approval_survives_old_five_second_limit() {
+    let policy = base_policy()
+        .policy_fn(
+            PolicyFn::new(|event, _ctx| {
+                if event.syscall == "execve" {
+                    std::thread::sleep(Duration::from_millis(5200));
+                }
+                Verdict::Allow
+            })
+            .verdict_timeout(None),
+        )
+        .build()
+        .unwrap();
+    let mut sandbox = policy.clone();
+    sandbox.spawn(&["/bin/sleep", "0.1"]).await.unwrap();
+    let result = sandbox.wait().await.unwrap();
+    assert!(
+        result.success(),
+        "unlimited approval must accept a late verdict"
+    );
+}
+
+#[tokio::test]
+async fn shutdown_cancels_unlimited_approval() {
+    for shutdown in ["drop", "kill", "control"] {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = Mutex::new(Some(entered_tx));
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = cancelled.clone();
+        let name = format!("approval-shutdown-{}-{shutdown}", std::process::id());
+        let mut sandbox = base_policy()
+            .name(name.clone())
+            .policy_fn(
+                PolicyFn::new(move |event, ctx| {
+                    if event.syscall == "execve" {
+                        if let Some(tx) = entered_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                        while !ctx.is_cancelled() && std::time::Instant::now() < deadline {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        observed.store(ctx.is_cancelled(), std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Verdict::Allow
+                })
+                .verdict_timeout(None),
+            )
+            .build()
+            .unwrap();
+        sandbox.create(&["/bin/true"]).await.unwrap();
+        sandbox.start().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        if shutdown != "drop" {
+            if shutdown == "control" {
+                let response = tokio::task::spawn_blocking(move || {
+                    sandlock_core::control::send_control_request(
+                        &name,
+                        "kill",
+                        serde_json::json!({}),
+                    )
+                })
+                .await
+                .unwrap()
+                .unwrap();
+                assert!(response.ok);
+            } else {
+                sandbox.kill().unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("kill must cancel before wait or drop");
+            tokio::time::timeout(Duration::from_secs(2), sandbox.wait())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        drop(sandbox);
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+}
+
+#[tokio::test]
+async fn unlimited_approval_spawn_reports_denied_exec() {
+    let mut sandbox = base_policy()
+        .policy_fn(PolicyFn::new(|_, _| Verdict::Deny).verdict_timeout(None))
+        .build()
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(1), sandbox.spawn(&["/bin/true"]))
+        .await
+        .expect("a denied exec must not wait forever");
+    assert!(result.is_err());
 }

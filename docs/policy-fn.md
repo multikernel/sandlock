@@ -12,7 +12,7 @@ returns a verdict to allow, deny, or audit.
 ## Python
 
 ```python
-from sandlock import Sandbox
+from sandlock import Sandbox, PolicyFn
 import errno
 
 def on_event(event, ctx):
@@ -38,7 +38,7 @@ def on_event(event, ctx):
 sandbox = Sandbox(
     fs_readable=["/usr", "/lib", "/etc"],
     net_allow=["api.example.com:443"],
-    policy_fn=on_event,
+    policy_fn=PolicyFn(on_event),
 )
 result = sandbox.run(["python3", "agent.py"])
 ```
@@ -73,18 +73,18 @@ positive int = deny with errno, `"audit"`/`-2` = allow + flag.
 - `ctx.deny_path(path)` / `ctx.allow_path(path)`: dynamic filesystem restriction
 - `ctx.restrict_pid_network(pid, ips)`: per-PID network override
 
-**Held syscalls** (child blocked until callback returns): `execve`,
+**Held syscalls** (child blocked awaiting a verdict): `execve`,
 `connect`, `sendto`, `bind`, `openat`.
 
 ## Rust
 
 ```rust
 use sandlock_core::Sandbox;
-use sandlock_core::policy_fn::Verdict;
+use sandlock_core::policy_fn::{PolicyFn, Verdict};
 
 let mut dynamic = Sandbox::builder()
     .fs_read("/usr").fs_read("/lib")
-    .policy_fn(|event, ctx| {
+    .policy_fn(PolicyFn::new(|event, ctx| {
         if event.argv_contains("curl") {
             return Verdict::Deny;
         }
@@ -93,9 +93,58 @@ let mut dynamic = Sandbox::builder()
             ctx.deny_path("/etc/shadow");
         }
         Verdict::Allow
-    })
+    }))
     .build()?;
 let result = dynamic.run(&["python3", "agent.py"]).await?;
+```
+
+## Verdict timeout and shutdown
+
+Each `PolicyFn` owns its callback and held-verdict timeout. The timeout defaults
+to five seconds, including time queued behind another callback. Set
+`PolicyFn(approve, verdict_timeout=120.0)` in Python or
+`PolicyFn::new(approve).verdict_timeout(Some(Duration::from_secs(120)))` in Rust
+to allow more time. Use `None` for the timeout in either API to wait without a
+deadline. Zero denies immediately. Timeout expiry and closed verdict channels
+deny the syscall with `EPERM`.
+
+In Go, configure `PolicyFn: &sandlock.PolicyFn{Callback: approve,
+VerdictTimeout: sandlock.NoTimeout}`. Its `VerdictTimeout` is a `time.Duration`:
+zero uses the five-second default, positive values set a timeout, and negative
+values disable it. Python and Go round positive fractional milliseconds up.
+
+In C, pass the timeout in milliseconds alongside the callback:
+`sandlock_sandbox_builder_policy_fn(builder, callback, timeout_ms, user_data,
+user_data_drop)`. Negative values disable the timeout; zero denies immediately;
+pass `5000` for the SDK default. There is no independent sandbox timeout setter.
+
+Shutdown cancels outstanding verdict waits and discards queued events. A running
+callback must cooperate: check `ctx.is_cancelled()` in Rust or Python,
+`ctx.IsCancelled()` in Go, or `sandlock_ctx_is_cancelled(ctx)` in C between
+bounded waits for user input. The context is valid only during its callback.
+Shutdown joins that callback before releasing its data; it cannot forcibly
+interrupt user code. A verdict timeout closes the verdict wait, but does not
+interrupt a callback already running. Its eventual verdict is ignored.
+
+For example, an application can deliver an approval decision through a queue:
+
+```python
+import queue
+from sandlock import Sandbox, PolicyFn
+
+approvals = queue.Queue()
+
+def approve(event, ctx):
+    if event.syscall != "execve":
+        return 0
+    while not ctx.is_cancelled():
+        try:
+            return 0 if approvals.get(timeout=0.1) else -1
+        except queue.Empty:
+            pass
+    return -1
+
+sandbox = Sandbox(policy_fn=PolicyFn(approve, verdict_timeout=None))
 ```
 
 ## Interaction with static rules

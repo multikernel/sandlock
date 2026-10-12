@@ -19,7 +19,7 @@ import sys
 import tempfile
 import threading
 
-from sandlock import Sandbox
+from sandlock import Sandbox, PolicyFn
 
 
 def main():
@@ -103,7 +103,7 @@ print("[agent] done")
         with Sandbox(
             fs_readable=fs_readable,
             fs_writable=fs_writable,
-            policy_fn=install_guard,
+            policy_fn=PolicyFn(install_guard),
         ) as sb:
             result = sb.run(["python3", agent_py])
             print(result.stdout.decode(), end="", flush=True)

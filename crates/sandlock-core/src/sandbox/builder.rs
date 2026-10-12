@@ -216,7 +216,8 @@ pub struct SandboxBuilder {
 
     // Internal callback: never a CLI flag.
     #[cfg_attr(feature = "cli", clap(skip))]
-    pub policy_fn: Option<crate::policy_fn::PolicyCallback>,
+    pub policy_fn: Option<crate::policy_fn::PolicyFn>,
+
 
     // Sandbox instance name: stored for transfer into the Sandbox at build time.
     #[cfg_attr(feature = "cli", clap(skip))]
@@ -795,11 +796,8 @@ impl SandboxBuilder {
         self
     }
 
-    pub fn policy_fn(
-        mut self,
-        f: impl Fn(crate::policy_fn::SyscallEvent, &mut crate::policy_fn::PolicyContext) -> crate::policy_fn::Verdict + Send + Sync + 'static,
-    ) -> Self {
-        self.policy_fn = Some(std::sync::Arc::new(f));
+    pub fn policy_fn(mut self, policy_fn: crate::policy_fn::PolicyFn) -> Self {
+        self.policy_fn = Some(policy_fn);
         self
     }
 

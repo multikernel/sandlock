@@ -649,10 +649,15 @@ access. Users do not interact with the env var directly.
 
 ### Dynamic policy
 
+Configure `PolicyFn(callback, verdict_timeout=...)` with a number of seconds
+(default `5.0`) or `None` for unlimited verdict waits. Approval callbacks must check `ctx.is_cancelled()`
+between bounded waits and return on shutdown. See
+[verdict timeout and shutdown](../docs/policy-fn.md#verdict-timeout-and-shutdown).
+
 Use `policy_fn` to make per-syscall decisions at runtime:
 
 ```python
-from sandlock import Sandbox, SyscallEvent, PolicyContext
+from sandlock import Sandbox, PolicyFn, SyscallEvent, PolicyContext
 
 def my_policy(event: SyscallEvent, ctx: PolicyContext):
     if event.category == "network" and event.host == "evil.com":
@@ -662,7 +667,7 @@ def my_policy(event: SyscallEvent, ctx: PolicyContext):
         return True   # deny
     return False      # allow
 
-sb = Sandbox(..., policy_fn=my_policy)
+sb = Sandbox(..., policy_fn=PolicyFn(my_policy))
 ```
 
 #### SyscallEvent
