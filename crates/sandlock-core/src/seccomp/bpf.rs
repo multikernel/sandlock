@@ -1,7 +1,7 @@
 // cBPF filter assembly for seccomp-bpf
 //
 // Layout:
-//   [arch check block]          2 instructions (LD arch, JEQ arch)
+//   [ABI check block]           3 instructions, plus 3 on x86_64 to reject x32
 //   [arg filter block]          variable length (pre-built SockFilter instructions)
 //   [LD syscall nr]             1 instruction
 //   [notif JEQ instructions]    1 per notif syscall
@@ -9,7 +9,6 @@
 //   [RET ALLOW]                 index = ret_allow_idx   (default fall-through)
 //   [RET USER_NOTIF]            index = ret_notif_idx
 //   [RET ERRNO(EPERM)]          index = ret_errno_idx
-//   [RET KILL_PROCESS]          index = ret_kill_idx
 
 use std::os::unix::io::{FromRawFd, OwnedFd};
 
@@ -74,15 +73,31 @@ pub fn assemble_filter(
         ));
     }
 
-    // ---- compute final layout sizes ----
-    let arch_block = 2usize;                       // LD arch, JEQ arch (KILL is in ret section)
+    let mut prog = vec![
+        stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARCH),
+        jump(BPF_JMP | BPF_JEQ | BPF_K, crate::arch::AUDIT_ARCH, 1, 0),
+        stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+    ];
+    #[cfg(target_arch = "x86_64")]
+    {
+        use crate::sys::structs::BPF_JSET;
+        const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+
+        // x32 shares AUDIT_ARCH_X86_64 but uses a different syscall ABI.
+        prog.extend_from_slice(&[
+            stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR),
+            jump(BPF_JMP | BPF_JSET | BPF_K, X32_SYSCALL_BIT, 0, 1),
+            stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+        ]);
+    }
+    let abi_block_len = prog.len();
     let arg_block_len = arg_block.len();
     let load_nr = 1usize;
     let notif_jmps = notif_syscalls.len();
     let deny_jmps = block_syscalls.len();
-    let ret_section = 4usize;                      // ALLOW, USER_NOTIF, ERRNO, KILL
+    let ret_section = 3usize;                      // ALLOW, USER_NOTIF, ERRNO
 
-    let total = arch_block + arg_block_len + load_nr + notif_jmps + deny_jmps + ret_section;
+    let total = abi_block_len + arg_block_len + load_nr + notif_jmps + deny_jmps + ret_section;
 
     // Linux kernel cBPF program length limit (BPF_MAXINSNS).
     const MAX_BPF_INSNS: usize = 4096;
@@ -93,15 +108,7 @@ pub fn assemble_filter(
         ));
     }
 
-    // Indices of the four return instructions (absolute, 0-based).
-    let ret_kill_idx  = total - 1;
-
-    let mut prog: Vec<SockFilter> = Vec::with_capacity(total);
-
-    // ---- 1. Arch check block ----
-    prog.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARCH));
-    let arch_jf = (ret_kill_idx - 2) as u8;
-    prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, crate::arch::AUDIT_ARCH, 0, arch_jf));
+    prog.reserve(total - prog.len());
 
     // ---- 2. Pre-built arg filter block ----
     prog.extend_from_slice(arg_block);
@@ -110,8 +117,8 @@ pub fn assemble_filter(
     prog.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR));
 
     // ---- 4. Notif syscall JEQ instructions ----
-    let ret_notif_idx = total - 3;
-    let notif_base = arch_block + arg_block_len + load_nr;
+    let ret_notif_idx = total - 2;
+    let notif_base = abi_block_len + arg_block_len + load_nr;
     for (i, &nr) in notif_syscalls.iter().enumerate() {
         let pos = notif_base + i;
         let jt = (ret_notif_idx - (pos + 1)) as u8;
@@ -119,7 +126,7 @@ pub fn assemble_filter(
     }
 
     // ---- 5. Deny syscall JEQ instructions ----
-    let ret_errno_idx = total - 2;
+    let ret_errno_idx = total - 1;
     let deny_base = notif_base + notif_jmps;
     for (i, &nr) in block_syscalls.iter().enumerate() {
         let pos = deny_base + i;
@@ -131,7 +138,6 @@ pub fn assemble_filter(
     prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));                      // ret_allow_idx
     prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF));                 // ret_notif_idx
     prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM as u32));       // ret_errno_idx
-    prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));               // ret_kill_idx
 
     debug_assert_eq!(prog.len(), total, "BPF program length mismatch");
     Ok(prog)
@@ -214,6 +220,125 @@ where
 mod tests {
     use super::*;
 
+    fn evaluate(prog: &[SockFilter], arch: u32, nr: u32) -> u32 {
+        use crate::sys::structs::{BPF_JSET, OFFSET_ARGS0_LO};
+
+        let mut accumulator = 0;
+        let mut pc = 0;
+        while let Some(insn) = prog.get(pc) {
+            match insn.code {
+                code if code == BPF_LD | BPF_W | BPF_ABS => {
+                    accumulator = match insn.k {
+                        OFFSET_ARCH => arch,
+                        OFFSET_NR => nr,
+                        OFFSET_ARGS0_LO => 0,
+                        offset => panic!("unsupported load offset {offset}"),
+                    };
+                }
+                code if code == BPF_JMP | BPF_JEQ | BPF_K || code == BPF_JMP | BPF_JSET | BPF_K => {
+                    let matches = if code == BPF_JMP | BPF_JEQ | BPF_K {
+                        accumulator == insn.k
+                    } else {
+                        accumulator & insn.k != 0
+                    };
+                    pc += usize::from(if matches { insn.jt } else { insn.jf });
+                }
+                code if code == BPF_RET | BPF_K => return insn.k,
+                code => panic!("unsupported opcode {code}"),
+            }
+            pc += 1;
+        }
+        panic!("filter fell through without returning");
+    }
+
+    #[test]
+    fn native_syscall_actions_survive_argument_loads() {
+        let args = [stmt(
+            BPF_LD | BPF_W | BPF_ABS,
+            crate::sys::structs::OFFSET_ARGS0_LO,
+        )];
+        let prog =
+            assemble_filter(&[libc::SYS_openat as u32], &[libc::SYS_mount as u32], &args).unwrap();
+        for (nr, action) in [
+            (libc::SYS_getpid, SECCOMP_RET_ALLOW),
+            (libc::SYS_openat, SECCOMP_RET_USER_NOTIF),
+            (libc::SYS_mount, SECCOMP_RET_ERRNO | EPERM as u32),
+        ] {
+            assert_eq!(evaluate(&prog, crate::arch::AUDIT_ARCH, nr as u32), action);
+        }
+    }
+
+    #[test]
+    fn wrong_arch_is_killed_before_large_argument_block() {
+        let args = vec![stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW); 300];
+        let prog = assemble_filter(&[], &[], &args).unwrap();
+        assert_eq!(evaluate(&prog, 0, 0), SECCOMP_RET_KILL_PROCESS);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x32_syscalls_are_killed_before_policy_rules() {
+        for args in [vec![], vec![stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)]] {
+            let prog =
+                assemble_filter(&[libc::SYS_openat as u32], &[libc::SYS_mount as u32], &args)
+                    .unwrap();
+            for nr in [
+                libc::SYS_getpid as u32,
+                libc::SYS_openat as u32,
+                libc::SYS_mount as u32,
+                515,
+                0,
+                0x3fff_ffff,
+            ] {
+                assert_eq!(
+                    evaluate(&prog, crate::arch::AUDIT_ARCH, nr | 0x4000_0000),
+                    SECCOMP_RET_KILL_PROCESS,
+                    "x32 syscall {nr} bypassed the ABI guard",
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x32_syscall_kills_child_without_requiring_x32_support() {
+        let prog = assemble_filter(&[], &[], &[]).unwrap();
+        let fprog = SockFprog {
+            len: prog.len() as u16,
+            filter: prog.as_ptr(),
+        };
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            // Only raw libc calls after fork: the test runner has other threads.
+            unsafe {
+                if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0
+                    || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                {
+                    libc::_exit(100);
+                }
+                if libc::syscall(libc::SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &fprog) != 0 {
+                    libc::_exit(101);
+                }
+                libc::syscall(libc::SYS_getpid | 0x4000_0000);
+                libc::_exit(102);
+            }
+        }
+        let mut status = 0;
+        loop {
+            let result = unsafe { libc::waitpid(pid, &mut status, 0) };
+            if result == pid {
+                break;
+            }
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EINTR)
+            );
+        }
+        assert!(libc::WIFSIGNALED(status), "child status: {status:#x}");
+        assert_eq!(libc::WTERMSIG(status), libc::SIGSYS);
+    }
+
     #[test]
     fn test_empty_filter_has_arch_check_and_allow() {
         let prog = assemble_filter(&[], &[], &[]).unwrap();
@@ -261,25 +386,20 @@ mod tests {
     }
 
     #[test]
-    fn test_arch_jf_lands_on_kill() {
+    fn wrong_arch_is_killed() {
         let prog = assemble_filter(&[], &[], &[]).unwrap();
-        // prog[1] is the JEQ arch check; jf should reach the KILL return.
-        let arch_jeq = &prog[1];
-        assert_eq!(arch_jeq.code, BPF_JMP | BPF_JEQ | BPF_K);
-        assert_eq!(arch_jeq.k, crate::arch::AUDIT_ARCH);
-        // The instruction following prog[1] is prog[2].
-        // KILL is the last instruction.
-        let kill_idx = prog.len() - 1;
-        let expected_jf = (kill_idx - 2) as u8;
-        assert_eq!(arch_jeq.jf, expected_jf);
-        assert_eq!(prog[kill_idx].k, SECCOMP_RET_KILL_PROCESS);
+        assert_eq!(evaluate(&prog, 0, 0), SECCOMP_RET_KILL_PROCESS);
+        assert_eq!(
+            evaluate(&prog, crate::arch::AUDIT_ARCH, 0),
+            SECCOMP_RET_ALLOW
+        );
     }
 
     #[test]
     fn test_default_allow_is_before_returns() {
         let prog = assemble_filter(&[libc::SYS_openat as u32], &[libc::SYS_mount as u32], &[]).unwrap();
-        // RET section is last 4 instructions; first of them is ALLOW.
-        let allow_instr = &prog[prog.len() - 4];
+        // RET section is last 3 instructions; first of them is ALLOW.
+        let allow_instr = &prog[prog.len() - 3];
         assert_eq!(allow_instr.code, BPF_RET | BPF_K);
         assert_eq!(allow_instr.k, SECCOMP_RET_ALLOW);
     }
@@ -287,15 +407,17 @@ mod tests {
     #[test]
     fn test_notif_jt_lands_on_user_notif() {
         let prog = assemble_filter(&[libc::SYS_openat as u32], &[], &[]).unwrap();
-        // USER_NOTIF return is at prog.len()-3.
-        let ret_notif_idx = prog.len() - 3;
-        // arch_block=2, arg_blocks=0, LD NR at index 2, notif JEQ at index 3.
-        let notif_jeq = &prog[3];
-        assert_eq!(notif_jeq.code, BPF_JMP | BPF_JEQ | BPF_K);
-        assert_eq!(notif_jeq.k, libc::SYS_openat as u32);
-        // jt = ret_notif_idx - (3+1)
-        let expected_jt = (ret_notif_idx - 4) as u8;
-        assert_eq!(notif_jeq.jt, expected_jt);
+        let (pos, notif_jeq) = prog
+            .iter()
+            .enumerate()
+            .find(|(_, insn)| {
+                insn.code == BPF_JMP | BPF_JEQ | BPF_K && insn.k == libc::SYS_openat as u32
+            })
+            .unwrap();
+        assert_eq!(
+            prog[pos + 1 + usize::from(notif_jeq.jt)].k,
+            SECCOMP_RET_USER_NOTIF
+        );
     }
 
     #[test]
@@ -310,24 +432,19 @@ mod tests {
             stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM as u32),
         ];
         let prog = assemble_filter(&[], &[], &arg_block).unwrap();
-        // Arch block = 2, arg block starts at index 2.
-        // [2] LD NR
-        assert_eq!(prog[2].code, BPF_LD | BPF_W | BPF_ABS);
-        assert_eq!(prog[2].k, OFFSET_NR);
-        // [3] JEQ clone
-        assert_eq!(prog[3].code, BPF_JMP | BPF_JEQ | BPF_K);
-        assert_eq!(prog[3].k, libc::SYS_clone as u32);
-        // [4] LD arg0
-        assert_eq!(prog[4].code, BPF_LD | BPF_W | BPF_ABS);
-        assert_eq!(prog[4].k, OFFSET_ARGS0_LO);
-        // [5] JSET value
-        assert_eq!(prog[5].code, BPF_JMP | BPF_JSET | BPF_K);
-        assert_eq!(prog[5].k, 0x0200_0000);
+        assert!(prog.windows(arg_block.len()).any(|window| {
+            window.iter().zip(&arg_block).all(|(actual, expected)| {
+                actual.code == expected.code
+                    && actual.k == expected.k
+                    && actual.jt == expected.jt
+                    && actual.jf == expected.jf
+            })
+        }));
     }
 
     #[test]
     fn test_oversized_filter_is_rejected() {
-        // 4097 distinct deny entries + the 7-instruction frame > 4096.
+        // The deny entries alone exceed the instruction limit.
         let deny: Vec<u32> = (0..4097u32).collect();
         let res = assemble_filter(&[], &deny, &[]);
         let err = match res {
