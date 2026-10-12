@@ -15,9 +15,17 @@
 //! is Docker's image id and names the content whatever the source or layer
 //! compression, so one image is cached once.
 //!
-//! ```ignore
+//! Pulling from a registry requires the `http` feature and network access.
+//!
+//! ```no_run
+//! use sandlock_core::image;
+//!
+//! # #[tokio::main(flavor = "current_thread")]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let image = image::pull("docker://python:3.12", None).await?;
 //! let cmd = image.config.default_cmd();
+//! # Ok(())
+//! # }
 //! ```
 
 use std::fs;

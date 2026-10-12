@@ -15,12 +15,30 @@
 //! [`Pipeline::into_stages`](crate::pipeline::Pipeline::into_stages) — still
 //! possible, and deliberately so, but a caller has to name it.
 //!
-//! ```ignore
+//! This example creates a workspace in the current directory and commits
+//! both stages' output there.
+//!
+//! ```no_run
+//! use sandlock_core::{Sandbox, Stage, Transaction};
+//!
+//! # #[tokio::main(flavor = "current_thread")]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let workdir = std::env::current_dir()?.join("transaction-workspace");
+//! std::fs::create_dir_all(&workdir)?;
+//! let policy = Sandbox::builder()
+//!     .fs_read("/usr").fs_read("/bin").fs_read("/lib")
+//!     .fs_read_if_exists("/lib64")
+//!     .fs_write(&workdir)
+//!     .workdir(&workdir)
+//!     .cwd(&workdir)
+//!     .build()?;
 //! let outcome = Transaction::new([
 //!     Stage::new(&policy, &["sh", "-c", "echo plan > a.txt"]),
 //!     Stage::new(&policy, &["sh", "-c", "cat a.txt && echo built > b.txt"]),
 //! ]).run(None).await?;
 //! assert!(outcome.committed());
+//! # Ok(())
+//! # }
 //! ```
 
 use std::time::Duration;

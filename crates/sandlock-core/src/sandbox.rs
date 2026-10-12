@@ -814,10 +814,13 @@ impl Sandbox {
     /// pipeline fan-out where a base config is cloned and each clone gets a
     /// fresh name:
     ///
-    /// ```ignore
-    /// let template = Sandbox::builder()...build()?;
-    /// let mut s1 = template.clone().with_name("worker-1");
-    /// let mut s2 = template.clone().with_name("worker-2");
+    /// ```
+    /// use sandlock_core::Sandbox;
+    ///
+    /// let template = Sandbox::builder().build()?;
+    /// let s1 = template.clone().with_name("worker-1");
+    /// let s2 = template.clone().with_name("worker-2");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
@@ -1444,12 +1447,19 @@ impl Sandbox {
     /// One-shot: spawn, wait, and return the result. Stdout and stderr are
     /// captured. This is the primary way to run a sandboxed command:
     ///
-    /// ```ignore
+    /// ```no_run
+    /// use sandlock_core::Sandbox;
+    ///
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let mut sandbox = Sandbox::builder()
-    ///     .fs_read("/usr")
+    ///     .fs_read("/usr").fs_read("/bin").fs_read("/lib")
+    ///     .fs_read_if_exists("/lib64")
     ///     .name("my-sandbox")
     ///     .build()?;
     /// let result = sandbox.run(&["echo", "hello"]).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn run(
         &mut self,

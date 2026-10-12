@@ -3,17 +3,20 @@
 //! Allows a user-provided callback to inspect syscall events and adjust
 //! sandbox permissions at runtime (grant, restrict, per-PID overrides).
 //!
-//! ```ignore
-//! let policy = Policy::builder()
-//!     .fs_read("/usr").fs_read("/lib")
-//!     .net_allow_host("127.0.0.1")
-//!     .policy_fn(|event, ctx| {
-//!         if event.syscall == "connect" && event.host == Some("10.0.0.5".parse().unwrap()) {
+//! ```
+//! use sandlock_core::{Sandbox, policy_fn::Verdict};
+//!
+//! let blocked_host = "10.0.0.5".parse()?;
+//! let policy = Sandbox::builder()
+//!     .net_allow("tcp://10.0.0.0/24:443")
+//!     .policy_fn(move |event, _ctx| {
+//!         if event.syscall == "connect" && event.host == Some(blocked_host) {
 //!             return Verdict::Deny;
 //!         }
 //!         Verdict::Allow
 //!     })
 //!     .build()?;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
 //! # TOCTOU and string-typed fields

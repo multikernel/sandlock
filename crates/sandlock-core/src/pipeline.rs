@@ -8,12 +8,22 @@
 //! [`Transaction`](crate::transaction::Transaction): different execution model,
 //! different type.
 //!
-//! ```ignore
+//! ```no_run
+//! use sandlock_core::{Sandbox, Stage};
+//!
+//! # #[tokio::main(flavor = "current_thread")]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let policy = Sandbox::builder()
+//!     .fs_read("/usr").fs_read("/bin").fs_read("/lib")
+//!     .fs_read_if_exists("/lib64")
+//!     .build()?;
 //! let result = (
-//!     Stage::new(&policy_a, &["echo", "hello"])
-//!     | Stage::new(&policy_b, &["tr", "a-z", "A-Z"])
-//!     | Stage::new(&policy_c, &["cat"])
+//!     Stage::new(&policy, &["echo", "hello"])
+//!     | Stage::new(&policy, &["tr", "a-z", "A-Z"])
+//!     | Stage::new(&policy, &["cat"])
 //! ).run(None).await?;
+//! # Ok(())
+//! # }
 //! ```
 
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
@@ -279,13 +289,28 @@ pub struct NamedStage {
 /// The `_SANDLOCK_GATHER` env var is injected into the consumer with
 /// a comma-separated list of `name:fd` pairs.
 ///
-/// ```ignore
+/// This example assumes the three Python scripts are in `/srv/workflow`.
+/// The consumer reads both inputs using the descriptors described above.
+///
+/// ```no_run
+/// use sandlock_core::{Gather, Sandbox, Stage};
+///
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let policy = Sandbox::builder()
+///     .fs_read("/usr").fs_read("/bin").fs_read("/lib")
+///     .fs_read_if_exists("/lib64")
+///     .fs_read("/srv/workflow")
+///     .cwd("/srv/workflow")
+///     .build()?;
 /// let result = Gather::new()
-///     .source("data", Stage::new(&search_policy, &["python3", "search.py"]))
-///     .source("code", Stage::new(&planner_policy, &["python3", "plan.py"]))
-///     .consumer(Stage::new(&executor_policy, &["python3", "run.py"]))
+///     .source("data", Stage::new(&policy, &["python3", "search.py"]))
+///     .source("code", Stage::new(&policy, &["python3", "plan.py"]))
+///     .consumer(Stage::new(&policy, &["python3", "run.py"]))
 ///     .run(None)
 ///     .await?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct Gather {
     sources: Vec<NamedStage>,

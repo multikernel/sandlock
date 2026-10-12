@@ -201,8 +201,13 @@ impl NotifAction {
     /// the caller never sees or closes it. On allocation failure this collapses
     /// to `Errno(EIO)`, so a handler can return it directly:
     ///
-    /// ```ignore
-    /// return NotifAction::inject_bytes(&secret);
+    /// ```no_run
+    /// use sandlock_core::seccomp::notif::NotifAction;
+    ///
+    /// fn secret_file_response(secret: &[u8]) -> NotifAction {
+    ///     NotifAction::inject_bytes(secret)
+    /// }
+    /// # let response = secret_file_response(b"example secret");
     /// ```
     ///
     /// For a *writable* injected fd, build one with
