@@ -106,3 +106,23 @@ def test_wait_rejects_conflicting_start_and_checkpoint():
             sb.kill()
             worker.join(5)
         assert not worker.is_alive()
+
+
+def test_kill_in_fresh_interpreter():
+    import ctypes
+    from sandlock._sdk import _lib
+    assert _lib.sandlock_handle_kill.argtypes == [ctypes.c_void_p]
+    import subprocess
+    import sys
+    result = subprocess.run(
+        [sys.executable, "-c", """
+from sandlock import Sandbox
+with Sandbox(fs_readable=["/usr", "/lib", "/lib64", "/bin", "/etc"]) as sb:
+    sb.spawn(["sleep", "60"])
+    sb.kill()
+    assert not sb.wait().success
+    sb.shutdown()
+"""],
+        capture_output=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr.decode()
