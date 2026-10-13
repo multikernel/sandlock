@@ -6,6 +6,7 @@ use anyhow::{Result, anyhow};
 use std::path::PathBuf;
 
 mod learn;
+mod events;
 #[derive(Parser)]
 #[command(name = "sandlock", about = "Lightweight process sandbox", version)]
 struct Cli {
@@ -132,6 +133,10 @@ struct RunArgs {
     #[arg(long = "status-fd", value_name = "FD")]
     status_fd: Option<i32>,
 
+    /// Write versioned supervisor observations to a new, private JSONL file
+    #[arg(long, value_name = "PATH")]
+    events_jsonl: Option<PathBuf>,
+
     /// Sandbox name (also exposed as the virtual hostname; auto-generated if omitted)
     #[arg(long)]
     name: Option<String>,
@@ -152,6 +157,10 @@ struct RunArgs {
     /// No-supervisor mode: apply Landlock rules + deny-only seccomp filter, then exec directly
     #[arg(long)]
     no_supervisor: bool,
+
+    /// Do not add the minimal standard character-device grants
+    #[arg(long)]
+    no_default_devices: bool,
 
     /// Allow the named protection to degrade silently if the host kernel ABI lacks support.
     /// Repeatable. Accepted values: fs-refer, fs-truncate, net-tcp, fs-ioctl-dev,
@@ -688,6 +697,29 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         builder = builder.disable(parse_protection(s).map_err(|e| anyhow!(e))?);
     }
 
+    if !args.no_default_devices {
+        builder = builder.standard_devices()?;
+    }
+    let events = if let Some(ref path) = args.events_jsonl {
+        let mut grants = builder.fs_writable.clone();
+        grants.extend(builder.workdir.iter().cloned());
+        grants.extend(builder.chroot.iter().cloned());
+        grants.extend(builder.fs_mount.iter().map(|(_, host)| host.clone()));
+        let (sink, path) = events::Events::create(path, &grants)?;
+        let callback = sink.clone();
+        builder = builder.fs_deny(path).policy_fn(move |event, _ctx| {
+            // Never relax the static policy. On logging failure held operations
+            // fail closed; observation-only operations cannot be recalled.
+            if callback.syscall(event).is_ok() {
+                sandlock_core::policy_fn::Verdict::Allow
+            } else {
+                sandlock_core::policy_fn::Verdict::Deny
+            }
+        });
+        Some(sink)
+    } else {
+        None
+    };
     let policy = builder.build()?;
     let cmd_strs: Vec<&str> = if let Some(ref shell_cmd) = args.exec_shell {
         vec!["/bin/sh", "-c", shell_cmd.as_str()]
@@ -718,20 +750,60 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         policy.on_error = BranchAction::Abort;
     }
 
+    if let Some(ref sink) = events {
+        sink.emit("start", serde_json::json!({
+            "supervisor_pid": std::process::id(), "argv_omitted": true,
+            "dry_run": args.dry_run, "timeout_seconds": args.timeout,
+            "coverage": "policy_fn observations, not all kernel outcomes",
+        }))?;
+    }
     let result = if let Some(secs) = args.timeout {
         match tokio::time::timeout(
             std::time::Duration::from_secs(secs),
             policy.run_interactive(&cmd_strs),
         ).await {
-            Ok(r) => r?,
+            Ok(r) => r,
             Err(_) => {
                 eprintln!("sandlock: timeout after {}s", secs);
+                drop(policy);
+                if let Some(ref sink) = events {
+                    sink.emit("finish", serde_json::json!({
+                        "status": "timed_out", "exit_code": 124, "changes_available": false,
+                    }))?;
+                    sink.sync()?;
+                }
                 return Ok(124);
             }
         }
     } else {
-        policy.run_interactive(&cmd_strs).await?
+        policy.run_interactive(&cmd_strs).await
     };
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            drop(policy);
+            if let Some(ref sink) = events {
+                sink.emit("finish", serde_json::json!({
+                    "status": "runtime_error", "changes_available": false,
+                }))?;
+                sink.sync()?;
+            }
+            return Err(error.into());
+        }
+    };
+    // Drain observation callbacks and finalize the existing branch lifecycle
+    // before emitting a terminal event. Changes still describe the pre-action
+    // COW snapshot, not an independently verified commit receipt.
+    drop(policy);
+    if let Some(ref sink) = events {
+        sink.changes(&result.changes, args.dry_run)?;
+        sink.emit("finish", serde_json::json!({
+            "status": if result.success() { "succeeded" } else { "failed" },
+            "exit_code": result.code(), "exit_status": format!("{:?}", result.exit_status),
+            "changes_available": true, "change_count": result.changes.len(),
+        }))?;
+        sink.sync()?;
+    }
 
     if args.dry_run {
         if result.changes.is_empty() {
@@ -816,6 +888,7 @@ fn validate_no_supervisor(args: &RunArgs) -> Result<()> {
     if args.gpu.is_some() { bad.push("--gpu"); }
     if args.dry_run { bad.push("--dry-run"); }
     if args.status_fd.is_some() { bad.push("--status-fd"); }
+    if args.events_jsonl.is_some() { bad.push("--events-jsonl"); }
     if !pb.fs_denied.is_empty() { bad.push("--fs-deny"); }
     if !args.fs_mount.is_empty() { bad.push("--fs-mount"); }
 
