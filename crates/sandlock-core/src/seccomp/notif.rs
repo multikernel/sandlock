@@ -2240,6 +2240,15 @@ fn decode_sendmmsg_extras(
     extras
 }
 
+fn policy_holds_syscall(nr: i64) -> bool {
+    nr == libc::SYS_execve || nr == libc::SYS_execveat
+        || nr == libc::SYS_openat || nr == arch::SYS_OPENAT2
+        || Some(nr) == arch::sys_open()
+        || nr == libc::SYS_connect || nr == libc::SYS_bind
+        || nr == libc::SYS_sendto || nr == libc::SYS_sendmsg
+        || nr == libc::SYS_sendmmsg
+}
+
 async fn emit_policy_event(
     notif: &SeccompNotif,
     action: &NotifAction,
@@ -2437,12 +2446,7 @@ async fn emit_policy_event(
     // The child is blocked until the callback returns. Filesystem-mutation
     // events (mkdir/unlink/symlink/link/rename/truncate) are observation-only
     // per the `PolicyCallback` contract; use `fs_deny` to block paths.
-    let is_held = nr == libc::SYS_execve || nr == libc::SYS_execveat
-        || nr == libc::SYS_openat || nr == arch::SYS_OPENAT2
-        || Some(nr) == arch::sys_open()
-        || nr == libc::SYS_connect || nr == libc::SYS_bind
-        || nr == libc::SYS_sendto || nr == libc::SYS_sendmsg
-        || nr == libc::SYS_sendmmsg;
+    let is_held = policy_holds_syscall(nr);
 
     let verdict = if is_held {
         let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
@@ -2450,9 +2454,7 @@ async fn emit_policy_event(
             event,
             gate: Some(gate_tx),
         }));
-        Some(Box::pin(async move {
-            crate::policy_fn::wait_for_verdict(gate_rx, timeout, &cancellation).await
-        }) as VerdictWait)
+        Some(Box::pin(crate::policy_fn::wait_for_verdict(gate_rx, timeout, cancellation)) as VerdictWait)
     } else {
         let _ = tx.send(crate::policy_fn::PolicyMsg::Event(crate::policy_fn::PolicyEvent {
             event,
@@ -2534,6 +2536,7 @@ struct PendingNotification {
     action: Option<NotifAction>,
     exec_freeze: Option<crate::freeze::SandboxFreeze>,
     fork_counted: bool,
+    open: Option<Arc<OpenRequest>>,
     fd: Arc<OwnedFd>,
 }
 
@@ -2679,13 +2682,71 @@ async fn handle_notification(
 
     let verdict = emit_policy_event(&notif, &action, &ctx.policy_fn, fd).await;
     let notification = PendingNotification {
-        notif, action: Some(action), exec_freeze, fork_counted, fd: Arc::clone(notif_fd),
+        notif, action: Some(action), exec_freeze, fork_counted, open, fd: Arc::clone(notif_fd),
     };
     if let Some(verdict) = verdict {
         return Some(PendingApproval { notification, verdict });
     }
     finish_notification(notification, None, ctx, defer_sem).await;
     None
+}
+
+async fn recheck_policy(
+    mut action: NotifAction,
+    pending: &PendingNotification,
+    ctx: &Arc<super::ctx::SupervisorCtx>,
+) -> NotifAction {
+    if matches!(action, NotifAction::Errno(_)) { return action; }
+    let notif = &pending.notif;
+    if let NotifAction::Prepared(operation) = &action {
+        if notif.data.nr as i64 != libc::SYS_bind
+            && (operation.host.is_some() || operation.extra_destinations.iter().any(|(host, _)| host.is_some()))
+        {
+            use crate::network::Protocol;
+            let protocol = match operation.protocol.as_deref() {
+                Some("tcp") => Protocol::Tcp,
+                Some("udp") => Protocol::Udp,
+                Some("icmp") => Protocol::Icmp,
+                _ => return NotifAction::Errno(libc::ECONNREFUSED),
+            };
+            for (host, port) in std::iter::once(&(operation.host, operation.port))
+                .chain(operation.extra_destinations.iter())
+            {
+                if let Some(host) = host {
+                    if let Err(errno) = crate::network::check_ip_destination(
+                        ctx, notif.pid, protocol, *host, *port,
+                    ).await {
+                        return NotifAction::Errno(errno);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(open) = &pending.open {
+        if ctx.policy.chroot_root.is_none() {
+            let pfs = ctx.policy_fn.lock().await;
+            if pfs.has_denied_paths() {
+                if open.target_str().is_some_and(|path| is_denied_with_symlink_resolve(&pfs, path)) {
+                    return NotifAction::Errno(libc::EACCES);
+                }
+                match &action {
+                    NotifAction::InjectFdSend { srcfd, .. }
+                    | NotifAction::InjectFdSendTracked { srcfd, .. } => {
+                        let denied_id = super::state::file_id_of_fd(srcfd.as_raw_fd())
+                            .is_some_and(|id| pfs.is_id_denied(&id));
+                        let denied_path = realpath_of_fd(srcfd.as_raw_fd())
+                            .is_some_and(|path| is_denied_with_symlink_resolve(&pfs, &path.to_string_lossy()));
+                        if denied_id || denied_path { return NotifAction::Errno(libc::EACCES); }
+                    }
+                    NotifAction::Continue => {
+                        action = on_behalf_open(notif, open, ctx, &pfs, pending.fd.as_raw_fd(), true).await;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    action
 }
 
 async fn finish_notification(
@@ -2710,6 +2771,7 @@ async fn finish_notification(
         if id_valid(fd, notif.id).is_err() {
             return;
         }
+        action = recheck_policy(action, &pending, ctx).await;
     }
 
     if let NotifAction::Prepared(operation) = action {
@@ -2911,7 +2973,10 @@ pub async fn supervisor(
                         Err(_) => break,
                     }
                 };
-                if pending.len() + waiting_exec.len() >= DEFER_MAX_INFLIGHT {
+                if pending.len() + waiting_exec.len() >= DEFER_MAX_INFLIGHT
+                    && (policy_holds_syscall(notif.data.nr as i64)
+                        || crate::resource::requires_process_creation_tracking(&notif, &ctx.policy))
+                {
                     let _ = send_response(fd, notif.id, NotifAction::Errno(libc::EAGAIN));
                     continue;
                 }

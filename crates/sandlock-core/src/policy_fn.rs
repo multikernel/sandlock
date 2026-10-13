@@ -454,25 +454,28 @@ pub enum PolicyMsg {
     Shutdown,
 }
 
-pub(crate) async fn wait_for_verdict(
+pub(crate) fn wait_for_verdict(
     gate: tokio::sync::oneshot::Receiver<Verdict>,
     timeout: Option<Duration>,
-    cancellation: &CancellationToken,
-) -> Verdict {
-    if timeout == Some(Duration::ZERO) {
-        return Verdict::Deny;
-    }
-    let deadline = async {
-        match timeout {
-            Some(duration) => tokio::time::sleep(duration).await,
-            None => std::future::pending::<()>().await,
+    cancellation: CancellationToken,
+) -> impl std::future::Future<Output = Verdict> + Send {
+    let deadline = timeout.map(|duration| tokio::time::Instant::now() + duration);
+    async move {
+        if deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
+            return Verdict::Deny;
         }
-    };
-    tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => Verdict::Deny,
-        _ = deadline => Verdict::Deny,
-        verdict = gate => verdict.unwrap_or(Verdict::Deny),
+        let deadline = async {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Verdict::Deny,
+            _ = deadline => Verdict::Deny,
+            verdict = gate => verdict.unwrap_or(Verdict::Deny),
+        }
     }
 }
 
@@ -524,6 +527,7 @@ pub(crate) fn spawn_policy_fn(
         .spawn(move || {
             let mut ctx = PolicyContext::new(live, ceiling, pid_overrides, denied);
             ctx.cancellation = worker_cancellation;
+            let _cancel_on_exit = ctx.cancellation.clone().drop_guard();
 
             while let Some(PolicyMsg::Event(pe)) = rx.blocking_recv() {
                 if ctx.is_cancelled() {
@@ -578,7 +582,7 @@ mod tests {
         let cancellation = CancellationToken::new();
         let start = tokio::time::Instant::now();
         assert_eq!(
-            wait_for_verdict(rx, Some(std::time::Duration::from_secs(30)), &cancellation).await,
+            wait_for_verdict(rx, Some(std::time::Duration::from_secs(30)), cancellation.clone()).await,
             Verdict::Deny
         );
         assert_eq!(start.elapsed(), std::time::Duration::from_secs(30));
@@ -594,7 +598,7 @@ mod tests {
             tx.send(Verdict::DenyWith(13)).unwrap();
         });
         assert_eq!(
-            wait_for_verdict(rx, None, &cancellation).await,
+            wait_for_verdict(rx, None, cancellation.clone()).await,
             Verdict::DenyWith(13)
         );
     }
@@ -604,7 +608,7 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cancellation = CancellationToken::new();
         let signal = cancellation.clone();
-        let waiter = tokio::spawn(async move { wait_for_verdict(rx, None, &signal).await });
+        let waiter = tokio::spawn(async move { wait_for_verdict(rx, None, signal).await });
         tokio::task::yield_now().await;
         cancellation.cancel();
         assert_eq!(
@@ -624,7 +628,7 @@ mod tests {
         let cancellation = CancellationToken::new();
         cancellation.cancel();
         assert_eq!(
-            wait_for_verdict(rx, None, &cancellation).await,
+            wait_for_verdict(rx, None, cancellation.clone()).await,
             Verdict::Deny
         );
     }
@@ -634,7 +638,7 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         tx.send(Verdict::Allow).unwrap();
         assert_eq!(
-            wait_for_verdict(rx, Some(Duration::ZERO), &CancellationToken::new()).await,
+            wait_for_verdict(rx, Some(Duration::ZERO), CancellationToken::new()).await,
             Verdict::Deny
         );
     }
@@ -644,7 +648,7 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         drop(tx);
         assert_eq!(
-            wait_for_verdict(rx, None, &CancellationToken::new()).await,
+            wait_for_verdict(rx, None, CancellationToken::new()).await,
             Verdict::Deny
         );
     }
@@ -752,6 +756,15 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn deferred_deadline_starts_before_first_poll() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let wait = wait_for_verdict(rx, Some(Duration::from_secs(1)), CancellationToken::new());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tx.send(Verdict::Allow).unwrap();
+        assert_eq!(wait.await, Verdict::Deny);
+    }
+
     #[tokio::test]
     async fn deferred_approval_lifecycle() {
         let cancellation = CancellationToken::new();
@@ -763,7 +776,7 @@ mod tests {
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         drop(Approval::new(tx, cancellation.clone()));
-        assert_eq!(wait_for_verdict(rx, None, &cancellation).await, Verdict::Deny);
+        assert_eq!(wait_for_verdict(rx, None, cancellation.clone()).await, Verdict::Deny);
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         let mut approval = Approval::new(tx, cancellation.clone());
@@ -776,7 +789,7 @@ mod tests {
         cancellation.cancel();
         assert!(approval.is_cancelled());
         assert!(approval.resolve(Verdict::Allow).is_err());
-        assert_eq!(wait_for_verdict(rx, None, &cancellation).await, Verdict::Deny);
+        assert_eq!(wait_for_verdict(rx, None, cancellation.clone()).await, Verdict::Deny);
     }
 
     #[test]

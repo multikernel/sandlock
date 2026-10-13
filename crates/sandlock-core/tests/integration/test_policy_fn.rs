@@ -969,6 +969,15 @@ async fn unlimited_approval_spawn_reports_denied_exec() {
 
 #[tokio::test]
 async fn deferred_approval_does_not_stall_other_notifications() {
+    deferred_network_approval(false).await;
+}
+
+#[tokio::test]
+async fn deferred_approval_rechecks_network_restrictions() {
+    deferred_network_approval(true).await;
+}
+
+async fn deferred_network_approval(restrict: bool) {
     let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let second = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let first_port = first.local_addr().unwrap().port();
@@ -976,13 +985,14 @@ async fn deferred_approval_does_not_stall_other_notifications() {
     let held = Arc::new(Mutex::new(None::<sandlock_core::policy_fn::Approval>));
     let pending = held.clone();
     let mut sandbox = base_policy()
-        .policy_fn(PolicyFn::deferred(move |event, _, approval| {
+        .policy_fn(PolicyFn::deferred(move |event, ctx, approval| {
             let Some(mut approval) = approval else { return };
             if event.syscall == "connect" && event.port == Some(first_port) {
                 *pending.lock().unwrap() = Some(approval);
                 return;
             }
             if event.syscall == "connect" && event.port == Some(second_port) {
+                if restrict { ctx.restrict_network(&["192.0.2.1".parse().unwrap()]); }
                 if let Some(mut earlier) = pending.lock().unwrap().take() {
                     earlier.resolve(Verdict::Allow).unwrap();
                 }
@@ -1003,9 +1013,83 @@ t.start()
 time.sleep(0.2)
 connect({second_port})
 t.join()
-assert not errors, errors
-"#);
+assert len(errors) == {expected_errors}, errors
+"#, expected_errors = if restrict { 2 } else { 0 });
     let result = sandbox.run_interactive(&["python3", "-c", &script]).await.unwrap();
-    assert!(result.success(), "an unanswered approval stalled another notification");
+    assert!(result.success(), "deferred network approval violated progress or restrictions");
+    assert!(held.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn deferred_approval_is_cancelled_on_shutdown() {
+    for kill in [false, true] {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tx = Mutex::new(Some(tx));
+        let mut sandbox = base_policy()
+            .policy_fn(PolicyFn::deferred(move |_, _, approval| {
+                if let Some(approval) = approval {
+                    if let Some(tx) = tx.lock().unwrap().take() {
+                        let _ = tx.send(approval);
+                    }
+                }
+            }).verdict_timeout(None))
+            .build().unwrap();
+        sandbox.create(&["/bin/true"]).await.unwrap();
+        sandbox.start().unwrap();
+        let mut approval = tokio::time::timeout(Duration::from_secs(2), rx).await.unwrap().unwrap();
+        if kill {
+            sandbox.kill().unwrap();
+            assert!(approval.is_cancelled());
+            tokio::time::timeout(Duration::from_secs(2), sandbox.wait()).await.unwrap().unwrap();
+        }
+        drop(sandbox);
+        assert!(approval.is_cancelled());
+        assert!(approval.resolve(Verdict::Allow).is_err());
+    }
+}
+
+#[tokio::test]
+async fn deferred_approval_rechecks_path_restrictions() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("first");
+    let second = dir.path().join("second");
+    std::fs::write(&first, "secret").unwrap();
+    std::fs::write(&second, "public").unwrap();
+    let held = Arc::new(Mutex::new(None::<sandlock_core::policy_fn::Approval>));
+    let pending = held.clone();
+    let denied = first.clone();
+    let trigger = second.clone();
+    let mut sandbox = base_policy()
+        .policy_fn(PolicyFn::deferred(move |event, ctx, approval| {
+            let Some(mut approval) = approval else { return };
+            if event.path.as_ref() == Some(&denied) {
+                *pending.lock().unwrap() = Some(approval);
+                return;
+            }
+            if event.path.as_ref() == Some(&trigger) {
+                ctx.deny_path(denied.to_str().unwrap());
+                if let Some(mut earlier) = pending.lock().unwrap().take() {
+                    earlier.resolve(Verdict::Allow).unwrap();
+                }
+            }
+            approval.resolve(Verdict::Allow).unwrap();
+        }).verdict_timeout(Some(Duration::from_secs(2))))
+        .build().unwrap();
+    let script = format!(r#"
+import threading, time
+errors = []
+def read():
+    try:
+        with open({first:?}) as f: errors.append(f.read())
+    except PermissionError:
+        pass
+t = threading.Thread(target=read)
+t.start()
+time.sleep(0.2)
+with open({second:?}) as f: assert f.read() == 'public'
+t.join()
+assert not errors, errors
+"#, first = first.to_str().unwrap(), second = second.to_str().unwrap());
+    assert!(sandbox.run_interactive(&["python3", "-c", &script]).await.unwrap().success());
     assert!(held.lock().unwrap().is_none());
 }
