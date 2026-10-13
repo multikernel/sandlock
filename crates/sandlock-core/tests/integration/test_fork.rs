@@ -29,7 +29,8 @@ async fn test_fork_basic() {
 
     // Each clone is a live Sandbox — wait for all
     for c in clones.iter_mut() {
-        let r = c.wait().await.unwrap();
+        c.wait().await.unwrap();
+        let r = c.shutdown().await.unwrap();
         assert!(r.success());
     }
 
@@ -61,7 +62,7 @@ async fn test_fork_cow_sharing() {
         });
 
     let mut clones = sb.fork(3).await.unwrap();
-    for c in clones.iter_mut() { let _ = c.wait().await; }
+    for c in clones.iter_mut() { let _ = async { c.wait().await?; c.shutdown().await }.await; }
 
     for i in 0..3u32 {
         let content = std::fs::read_to_string(out_dir.join(format!("{}", i))).unwrap_or_default();
@@ -87,7 +88,7 @@ async fn test_fork_clone_id_env() {
         });
 
     let mut clones = sb.fork(3).await.unwrap();
-    for c in clones.iter_mut() { let _ = c.wait().await; }
+    for c in clones.iter_mut() { let _ = async { c.wait().await?; c.shutdown().await }.await; }
 
     for i in 0..3u32 {
         let content = std::fs::read_to_string(out_dir.join(format!("{}", i))).unwrap_or_default();
@@ -142,7 +143,8 @@ async fn test_fork_clone_exit_status() {
 
     // All clones should have succeeded (already finished)
     for (i, c) in clones.iter_mut().enumerate() {
-        let r = c.wait().await.unwrap();
+        c.wait().await.unwrap();
+        let r = c.shutdown().await.unwrap();
         assert!(r.success(), "clone {} should succeed", i);
     }
 

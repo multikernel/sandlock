@@ -907,7 +907,7 @@ async fn serve_running(
                             RunningCmd::Continue => {}
                             RunningCmd::Shutdown => {
                                 let _ = sandbox.kill();
-                                return exit_info_from(sandbox.wait().await);
+                                return exit_info_from(sandbox.shutdown().await);
                             }
                         }
                     }
@@ -928,7 +928,7 @@ async fn serve_running(
 async fn reap_and_collapse(
     sandbox: &mut sandlock_core::Sandbox,
 ) -> Option<crate::state::ExitInfo> {
-    let info = exit_info_from(sandbox.wait().await);
+    let info = exit_info_from(sandbox.shutdown().await);
     let _ = sandbox.signal(libc::SIGKILL);
     info
 }

@@ -748,7 +748,7 @@ async fn test_control_parked_child_does_not_pin_other_names() {
     parked.create(&["true"]).await.unwrap();
 
     first.start().unwrap();
-    first.wait().await.unwrap();
+    async { first.wait().await?; first.shutdown().await }.await.unwrap();
 
     let again = policy
         .clone()
@@ -756,7 +756,7 @@ async fn test_control_parked_child_does_not_pin_other_names() {
         .run(&["true"])
         .await;
     parked.start().unwrap();
-    let _ = parked.wait().await;
+    let _ = async { parked.wait().await?; parked.shutdown().await }.await;
     assert!(again.is_ok(), "a parked sibling must not pin the name: {:?}", again.err());
 }
 
@@ -773,7 +773,7 @@ async fn test_control_child_pid_is_published_before_start() {
         assert_eq!(pids.supervisor, std::process::id() as i32);
     }
     sb.start().unwrap();
-    assert!(sb.wait().await.unwrap().success());
+    assert!(async { sb.wait().await?; sb.shutdown().await }.await.unwrap().success());
 }
 
 // ============================================================

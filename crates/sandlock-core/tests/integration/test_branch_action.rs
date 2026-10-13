@@ -201,3 +201,43 @@ async fn commit_and_abort_need_a_pending_branch() {
     let _ = fs::remove_dir_all(&workdir);
     let _ = fs::remove_dir_all(&storage);
 }
+
+#[tokio::test]
+async fn background_changes_are_committed_only_at_shutdown() {
+    use std::time::Duration;
+    let workdir = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let control = tempfile::tempdir().unwrap();
+    let ready = control.path().join("ready");
+    let release = control.path().join("release");
+    let done = control.path().join("done");
+    let script = format!(r#"
+import os, time
+if os.fork() == 0:
+    open({ready:?}, "w").close()
+    while not os.path.exists({release:?}):
+        time.sleep(0.01)
+    open("late.txt", "w").write("background change")
+    open({done:?}, "w").close()
+    while True:
+        time.sleep(1)
+while not os.path.exists({ready:?}):
+    time.sleep(0.01)
+os._exit(0)
+"#);
+    let mut sb = policy(workdir.path(), storage.path())
+        .fs_write(control.path()).build().unwrap();
+    sb.spawn(&["python3", "-c", &script]).await.unwrap();
+    assert_eq!(sb.wait().await.unwrap(), sandlock_core::ExitStatus::Code(0));
+    fs::write(release, "go").unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !done.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert!(!workdir.path().join("late.txt").exists());
+    let result = sb.shutdown().await.unwrap();
+    assert!(result.success());
+    assert_eq!(fs::read_to_string(workdir.path().join("late.txt")).unwrap(), "background change");
+    assert!(result.changes.iter().any(|c| c.path == Path::new("late.txt")));
+}

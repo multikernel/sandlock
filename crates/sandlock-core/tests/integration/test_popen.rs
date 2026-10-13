@@ -44,7 +44,8 @@ async fn test_popen_pipe_roundtrip() {
     stdout.read_to_string(&mut out).unwrap();
     assert_eq!(out, "hello\n");
 
-    let res = child.wait().await.unwrap();
+    child.wait().await.unwrap();
+    let res = child.shutdown().await.unwrap();
     assert!(res.success());
 }
 
@@ -62,7 +63,7 @@ async fn test_popen_stdout_only() {
     let mut out = String::new();
     stdout.read_to_string(&mut out).unwrap();
     assert_eq!(out, "hi\n");
-    assert!(child.wait().await.unwrap().success());
+    assert!(async { child.wait().await?; child.shutdown().await }.await.unwrap().success());
 }
 
 /// Null stdout is actually wired to `/dev/null`, not left inherited. The child
@@ -71,7 +72,7 @@ async fn test_popen_stdout_only() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_popen_null_stdout_is_dev_null() {
     let mut sb = base().with_name("popen-null");
-    let child = sb
+    let mut child = sb
         .popen(
             // Stat the *shell's* fd 1 via $$ — `$(...)` would rebind fd 1 for the
             // inner stat itself, so /proc/self/fd/1 there is the substitution pipe.
@@ -82,7 +83,8 @@ async fn test_popen_null_stdout_is_dev_null() {
         )
         .await
         .unwrap();
-    let res = child.wait().await.unwrap();
+    child.wait().await.unwrap();
+    let res = child.shutdown().await.unwrap();
     assert!(res.success(), "fd 1 was not /dev/null (1:3): exit={:?}", res.exit_status);
 }
 
@@ -100,7 +102,7 @@ async fn test_popen_stderr_piped() {
     let mut out = String::new();
     stderr.read_to_string(&mut out).unwrap();
     assert_eq!(out, "oops\n");
-    assert!(child.wait().await.unwrap().success());
+    assert!(async { child.wait().await?; child.shutdown().await }.await.unwrap().success());
 }
 
 /// A piped stdin the caller never takes must still reach EOF at `wait`, or a
@@ -109,12 +111,13 @@ async fn test_popen_stderr_piped() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_popen_untaken_stdin_reaches_eof() {
     let mut sb = base().with_name("popen-stdin-eof");
-    let child = sb
+    let mut child = sb
         .popen(&["cat"], StdioMode::Piped, StdioMode::Null, StdioMode::Inherit)
         .await
         .unwrap();
     // Deliberately do not take stdin. cat reads to EOF; wait must deliver it.
-    let res = child.wait().await.unwrap();
+    child.wait().await.unwrap();
+    let res = child.shutdown().await.unwrap();
     assert!(res.success(), "cat did not exit — untaken stdin never EOF'd");
 }
 
@@ -178,7 +181,8 @@ async fn test_wait_kills_descendants_the_main_process_left_behind() {
     let bg_pid: i32 = line.trim().parse().expect("background pid");
     assert!(unsafe { libc::kill(bg_pid, 0) } == 0, "background job should be alive");
 
-    let res = child.wait().await.unwrap();
+    child.wait().await.unwrap();
+    let res = child.shutdown().await.unwrap();
     assert!(res.success());
 
     // A killed orphan stays a zombie until init/subreaper reaps it.
@@ -225,18 +229,18 @@ async fn test_popen_all_three_piped() {
     stderr.read_to_string(&mut err).unwrap();
     assert_eq!(out, "data\n");
     assert_eq!(err, "err\n");
-    assert!(child.wait().await.unwrap().success());
+    assert!(async { child.wait().await?; child.shutdown().await }.await.unwrap().success());
 }
 
 /// Null stdin delivers immediate EOF: `cat` reading /dev/null exits 0 at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_popen_null_stdin_is_eof() {
     let mut sb = base().with_name("popen-null-stdin");
-    let child = sb
+    let mut child = sb
         .popen(&["cat"], StdioMode::Null, StdioMode::Null, StdioMode::Inherit)
         .await
         .unwrap();
-    assert!(child.wait().await.unwrap().success());
+    assert!(async { child.wait().await?; child.shutdown().await }.await.unwrap().success());
 }
 
 /// Explicit Process::kill terminates the child; wait still collects a
@@ -249,7 +253,8 @@ async fn test_popen_explicit_kill_then_wait() {
         .await
         .unwrap();
     child.kill().expect("kill");
-    let res = child.wait().await.unwrap();
+    child.wait().await.unwrap();
+    let res = child.shutdown().await.unwrap();
     assert!(!res.success(), "a killed process must not report success");
 }
 
@@ -258,11 +263,11 @@ async fn test_popen_explicit_kill_then_wait() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_popen_rejects_second_spawn() {
     let mut sb = base().with_name("popen-twice");
-    let first = sb
+    let mut first = sb
         .popen(&["echo", "first"], StdioMode::Inherit, StdioMode::Inherit, StdioMode::Inherit)
         .await
         .unwrap();
-    first.wait().await.unwrap(); // consume the Process → releases the &mut borrow
+    async { first.wait().await?; first.shutdown().await }.await.unwrap(); // consume the Process → releases the &mut borrow
 
     let second = sb
         .popen(&["echo", "second"], StdioMode::Inherit, StdioMode::Inherit, StdioMode::Inherit)
@@ -293,7 +298,8 @@ async fn test_popen_taken_stdout_is_not_drained_by_wait() {
     stdout.read_to_string(&mut out).unwrap();
     assert_eq!(out, "out", "the taken stream must still carry the child's output");
 
-    let res = child.wait().await.unwrap();
+    child.wait().await.unwrap();
+    let res = child.shutdown().await.unwrap();
     assert!(res.success());
     assert!(res.stdout.is_none(), "a taken stdout must be None in the RunResult");
     assert_eq!(

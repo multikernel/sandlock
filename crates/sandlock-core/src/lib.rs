@@ -16,6 +16,7 @@ pub mod protection;
 pub mod seccomp;
 pub(crate) mod resource;
 pub(crate) mod pgroup;
+pub(crate) mod reaper;
 pub(crate) mod network;
 pub mod context;
 pub(crate) mod resolved;

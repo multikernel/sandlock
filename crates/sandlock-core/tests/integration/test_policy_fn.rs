@@ -881,7 +881,8 @@ async fn unlimited_approval_survives_old_five_second_limit() {
         .unwrap();
     let mut sandbox = policy.clone();
     sandbox.spawn(&["/bin/sleep", "0.1"]).await.unwrap();
-    let result = sandbox.wait().await.unwrap();
+    sandbox.wait().await.unwrap();
+    let result = sandbox.shutdown().await.unwrap();
     assert!(
         result.success(),
         "unlimited approval must accept a late verdict"
@@ -945,7 +946,7 @@ async fn shutdown_cancels_unlimited_approval() {
             })
             .await
             .expect("kill must cancel before wait or drop");
-            tokio::time::timeout(Duration::from_secs(2), sandbox.wait())
+            tokio::time::timeout(Duration::from_secs(2), async { sandbox.wait().await?; sandbox.shutdown().await })
                 .await
                 .unwrap()
                 .unwrap();

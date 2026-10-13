@@ -52,6 +52,21 @@ impl ProcessGroups {
             .unwrap_or(false)
     }
 
+    pub fn live(&self) -> io::Result<Vec<i32>> {
+        let leaders = self.leaders.lock()
+            .map_err(|_| io::Error::other("process group table poisoned"))?;
+        let mut groups = Vec::new();
+        for (&pgid, leader) in leaders.iter() {
+            match pidfd_signal_group(leader, 0) {
+                Ok(()) => groups.push(pgid),
+                Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        groups.sort_unstable();
+        Ok(groups)
+    }
+
     /// Signal every group, returning how many had members. Holding the lock
     /// for the whole sweep keeps a group recorded meanwhile from being
     /// skipped: its creator is still in a group this sweep reaches.

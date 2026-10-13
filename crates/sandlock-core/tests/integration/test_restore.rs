@@ -168,7 +168,7 @@ async fn test_restore_glibc_vdso_program_resumes() {
 
     // Clean up before asserting so a failure never leaks the child/files.
     let _ = sb2.kill();
-    let exit = sb2.wait().await.map(|r| r.exit_status);
+    let exit = sb2.wait().await;
     let _ = std::fs::remove_dir_all(&tmp);
 
     assert!(

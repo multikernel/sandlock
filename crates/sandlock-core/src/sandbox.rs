@@ -287,6 +287,7 @@ struct Runtime {
     name: String,
     state: RuntimeState,
     child_pid: Option<i32>,
+    reaper: Option<crate::reaper::Reaper>,
     pidfd: Option<std::os::fd::OwnedFd>,
     groups: Arc<crate::pgroup::ProcessGroups>,
     notif_handle: Option<JoinHandle<()>>,
@@ -325,7 +326,7 @@ struct Runtime {
     /// Set when this sandbox is a stage of a [`Transaction`](crate::transaction::Transaction)
     /// that shares one COW upper across all stages. When present, `do_create_stdio`
     /// reuses this `CowState` (instead of building its own branch), and neither
-    /// `wait()` nor `Drop` take/commit/abort the branch — the transaction
+    /// `shutdown()` nor `Drop` take/commit/abort the branch — the transaction
     /// coordinator owns the single commit/abort. See [`SharedCow`].
     #[cfg(feature = "cow")]
     shared_cow: Option<SharedCow>,
@@ -356,6 +357,7 @@ enum RuntimeState {
     Created,
     Running,
     Paused,
+    MainExited(crate::result::ExitStatus),
     Stopped(crate::result::ExitStatus),
 }
 
@@ -892,14 +894,18 @@ impl Sandbox {
     /// Send SIGSTOP to the sandbox's process groups.
     pub fn pause(&mut self) -> Result<(), crate::error::SandlockError> {
         self.signal_live_groups(libc::SIGSTOP)?;
-        self.rt_mut().state = RuntimeState::Paused;
+        if !matches!(self.rt().state, RuntimeState::MainExited(_)) {
+            self.rt_mut().state = RuntimeState::Paused;
+        }
         Ok(())
     }
 
     /// Send SIGCONT to the sandbox's process groups.
     pub fn resume(&mut self) -> Result<(), crate::error::SandlockError> {
         self.signal_live_groups(libc::SIGCONT)?;
-        self.rt_mut().state = RuntimeState::Running;
+        if !matches!(self.rt().state, RuntimeState::MainExited(_)) {
+            self.rt_mut().state = RuntimeState::Running;
+        }
         Ok(())
     }
 
@@ -938,35 +944,29 @@ impl Sandbox {
         }
     }
 
-    /// Wait for the child process to exit.
-    ///
-    /// Dropping the returned future does not cost the captured output: the pipe
-    /// drains belong to the `Sandbox`, so a caller that cancels this `wait()`
-    /// (a `timeout` or `select!` around it) and calls `wait()` again still gets
-    /// what the child wrote. That holds wherever the cancellation lands —
-    /// before the drains start, while the child is still running, or while the
-    /// final join is blocked because a descendant is still holding the write
-    /// end open past the child's own exit.
-    pub async fn wait(&mut self) -> Result<crate::result::RunResult, crate::error::SandlockError> {
+    /// Snapshot of the sandbox's remaining process group IDs, sorted by ID.
+    /// Membership may change as soon as this returns.
+    pub fn process_groups(&self) -> Result<Vec<i32>, crate::error::SandlockError> {
         use crate::error::SandboxRuntimeError;
-        use crate::result::RunResult;
+        let rt = self.runtime.as_ref()
+            .filter(|rt| rt.child_pid.is_some())
+            .ok_or(SandboxRuntimeError::NotRunning)?;
+        Ok(rt.groups.live().map_err(SandboxRuntimeError::Io)?)
+    }
 
-        let pid = self.rt().child_pid.ok_or(SandboxRuntimeError::NotRunning)?;
-
-        // Already reaped: hand back the same status again, plus whatever the
-        // drains collected. They outlive the `wait()` that started them, so a
-        // second call still reports the output of a first one that was
-        // cancelled — including one cancelled while joining them here, since a
-        // join only unparks a drain once it has completed. A `wait()` that ran
-        // to the end took them with it, and both streams are then `None`.
-        let stopped = match self.rt().state {
-            RuntimeState::Stopped(ref es) => Some(es.clone()),
-            _ => None,
-        };
-        if let Some(exit_status) = stopped {
-            let changes = self.settle_branch().await;
-            let (stdout, stderr) = self.collect_pipe_drains().await;
-            return Ok(RunResult { exit_status, stdout, stderr, changes });
+    /// Wait only for the main process, keeping background jobs supervised.
+    ///
+    /// Returns the same status on repeated calls. Capture pipes keep draining
+    /// until `shutdown()` collects them; this does not wait for EOF
+    /// or settle the COW branch. Untaken piped stdin is closed here.
+    /// Call `shutdown()` to terminate remaining jobs and collect their output.
+    pub async fn wait(&mut self) -> Result<crate::result::ExitStatus, crate::error::SandlockError> {
+        use crate::error::SandboxRuntimeError;
+        let rt = self.runtime.as_ref().ok_or(SandboxRuntimeError::NotRunning)?;
+        let pid = rt.child_pid.ok_or(SandboxRuntimeError::NotRunning)?;
+        match &rt.state {
+            RuntimeState::MainExited(status) | RuntimeState::Stopped(status) => return Ok(status.clone()),
+            _ => {}
         }
 
         // Deliver EOF to a piped stdin the caller never took: otherwise a child
@@ -987,7 +987,7 @@ impl Sandbox {
         //
         // The drains are parked in the runtime rather than in this future: a
         // caller that cancels `wait()` (a `timeout` or `select!` around it) must
-        // be able to `wait()` again and still be given the output. The
+        // be able to `shutdown()` later and still be given the output. The
         // `is_none()` guard is what makes that second call reuse them instead of
         // starting a second reader. A stream the caller took through
         // `Process::take_stdout`/`take_stderr` is `None` here and stays theirs.
@@ -1002,37 +1002,66 @@ impl Sandbox {
             }
         }
 
-        // Wait for the top-level child to exit. Prefer the child's pidfd via
-        // `AsyncFd`: pidfd readiness fires only on *exit*, so — unlike a
-        // `waitpid` loop — it never consumes the child's ptrace-stops, which
-        // the `policy_fn` fork-tracking worker reaps (`waitpid` with any flags
-        // reaps a tracee's ptrace-stops, so a concurrent `waitpid` here would
-        // race the worker for fork events and hang it). Mirrors
-        // `spawn_pid_watcher`. Falls back to a blocking `waitpid` only when no
-        // pidfd is available (kernel without `pidfd_open`).
-        let exit_status = match self.rt_mut().pidfd.take() {
-            Some(pidfd) => wait_child_exit_via_pidfd(pidfd, pid).await,
-            None => wait_child_exit_blocking(pid).await,
+        let exit_status = if let Some(reaper) = &self.rt().reaper {
+            sandbox_wait_status_to_exit(reaper.main_status().await.map_err(SandboxRuntimeError::Io)?)
+        } else {
+            match self.rt().pidfd.as_ref() {
+                Some(pidfd) => {
+                    let pidfd = pidfd.try_clone().map_err(SandboxRuntimeError::Io)?;
+                    wait_child_exit_via_pidfd(pidfd, pid).await
+                }
+                None => wait_child_exit_blocking(pid).await,
+            }
         };
-        // The sandbox ends with its main process: descendants left behind
-        // would run on with every supervised syscall failing, holding the
-        // caller's stdio.
-        let _ = self.rt().groups.signal(libc::SIGKILL);
-
-        self.rt_mut().state = RuntimeState::Stopped(exit_status.clone());
+        self.rt_mut().state = RuntimeState::MainExited(exit_status.clone());
 
         if self.rt().tty_foreground_taken {
             sandbox_restore_tty_foreground(pid);
             self.rt_mut().tty_foreground_taken = false;
         }
+        Ok(exit_status)
+    }
+
+    /// Kill remaining jobs, reap owned children, and release supervision.
+    /// Returns the main process's status and collected output, settling COW
+    /// only after all tracked groups have exited. Safe to call repeatedly.
+    pub async fn shutdown(&mut self) -> Result<crate::result::RunResult, crate::error::SandlockError> {
+        use crate::error::SandboxRuntimeError;
+        use crate::result::RunResult;
+        if let Some(reaper) = self.runtime.as_mut().and_then(|rt| rt.reaper.as_mut()) {
+            reaper.shutdown();
+        }
+        self.kill()?;
+        let exit_status = self.wait().await?;
+        loop {
+            if self.rt().groups.signal(libc::SIGKILL).map_err(SandboxRuntimeError::Io)? == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        if let Some(reaper) = &self.rt().reaper {
+            loop {
+                let ret = unsafe { libc::waitpid(reaper.pid, std::ptr::null_mut(), libc::WNOHANG) };
+                if ret > 0 { break; }
+                if ret < 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.raw_os_error() == Some(libc::EINTR) { continue; }
+                    return Err(SandboxRuntimeError::Io(e).into());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+        self.rt_mut().reaper = None;
+        self.rt_mut().state = RuntimeState::Stopped(exit_status.clone());
 
         let rt = self.rt_mut();
         rt.control_claim = None;
+        rt.http_acl_handle = None;
         if let Some(h) = rt.notif_handle.take() { h.abort(); }
         rt.policy_fn_worker = None;
         if let Some(h) = rt.throttle_handle.take() { h.abort(); }
         if let Some(h) = rt.loadavg_handle.take() { h.abort(); }
-        // Finish shutting down the old endpoint before wait() returns.
+        // Finish shutting down the old endpoint before releasing the name.
         if let Some(h) = rt.control_handle.take() {
             h.abort();
             let _ = h.await;
@@ -1083,7 +1112,7 @@ impl Sandbox {
     /// exited non-zero.
     fn branch_action(&self) -> BranchAction {
         let failed = self.runtime.as_ref().is_some_and(|rt| {
-            matches!(rt.state, RuntimeState::Stopped(ref s) if !matches!(s, crate::result::ExitStatus::Code(0)))
+            matches!(rt.state, RuntimeState::MainExited(ref s) | RuntimeState::Stopped(ref s) if !matches!(s, crate::result::ExitStatus::Code(0)))
         });
         if failed { self.on_error.clone() } else { self.on_exit.clone() }
     }
@@ -1156,7 +1185,7 @@ impl Sandbox {
     /// completes; see `finish_parked_drain`.
     ///
     /// `None` means the stream was never piped, was taken by the caller, or was
-    /// already collected by an earlier `wait()`; a drain that panicked or was
+    /// already collected by an earlier `shutdown()`; a drain that panicked or was
     /// aborted reports empty bytes rather than failing the run.
     async fn collect_pipe_drains(&mut self) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
         // Finish both first — each stores its bytes into the runtime as it
@@ -1174,7 +1203,7 @@ impl Sandbox {
     /// supervisor + rlimits + landlock + COW + network/HTTP proxies).
     /// The child is parked between policy install and `execve`; call
     /// `start()` to release it. Stdout/stderr are captured for later
-    /// retrieval via `wait()`.
+    /// retrieval via `shutdown()`.
     pub async fn create(&mut self, cmd: &[&str]) -> Result<(), crate::error::SandlockError> {
         self.do_create(cmd, true).await
     }
@@ -1515,7 +1544,8 @@ impl Sandbox {
     ) -> Result<crate::result::RunResult, crate::error::SandlockError> {
         self.do_create(cmd, true).await?;
         self.do_start()?;
-        self.wait().await
+        self.wait().await?;
+        self.shutdown().await
     }
 
     /// Run with inherited stdio (interactive mode).
@@ -1525,7 +1555,8 @@ impl Sandbox {
     ) -> Result<crate::result::RunResult, crate::error::SandlockError> {
         self.do_create(cmd, false).await?;
         self.do_start()?;
-        self.wait().await
+        self.wait().await?;
+        self.shutdown().await
     }
 
     /// One-shot run with user-supplied syscall handlers.
@@ -1544,7 +1575,8 @@ impl Sandbox {
         self.rt_mut().handlers = pending;
         self.do_create(cmd, true).await?;
         self.do_start()?;
-        self.wait().await
+        self.wait().await?;
+        self.shutdown().await
     }
 
     /// Interactive-stdio counterpart of `run_with_handlers`.
@@ -1563,7 +1595,8 @@ impl Sandbox {
         self.rt_mut().handlers = pending;
         self.do_create(cmd, false).await?;
         self.do_start()?;
-        self.wait().await
+        self.wait().await?;
+        self.shutdown().await
     }
 
     /// Create N COW clones of this sandbox.
@@ -1687,6 +1720,7 @@ impl Sandbox {
                     crate::result::ExitStatus::Killed
                 }),
                 child_pid: Some(clone_pid),
+                reaper: None,
                 pidfd: None,
                 groups: Arc::new(crate::pgroup::ProcessGroups::new()),
                 notif_handle: None,
@@ -1766,7 +1800,8 @@ impl Sandbox {
         unsafe { libc::close(stdin_fds[0]) };
 
         let _ = write_handle.await;
-        reducer.wait().await
+        reducer.wait().await?;
+        reducer.shutdown().await
     }
 
     /// Whether named (pathname) `AF_UNIX` connects should be gated by the
@@ -1792,6 +1827,7 @@ impl Sandbox {
             name,
             state: RuntimeState::Created,
             child_pid: None,
+            reaper: None,
             pidfd: None,
             groups: Arc::new(crate::pgroup::ProcessGroups::new()),
             notif_handle: None,
@@ -2050,10 +2086,6 @@ impl Sandbox {
             None
         };
 
-        // Capture our PID before fork so the child can detect parent death
-        // without assuming PID 1 is always init (wrong in containers).
-        let parent_pid = unsafe { libc::getpid() };
-
         // Interactive (fully inherited) stdio on a terminal: the child will
         // take the tty foreground group, and this process must take it back
         // once the child is reaped.
@@ -2085,12 +2117,11 @@ impl Sandbox {
         };
         let child_publisher = control_socket.as_ref().and_then(|s| s.claim.as_ref()).map(|c| c.child_publisher());
 
-        let pid = crate::control::fork_without_control_fds();
-        if pid < 0 {
-            return Err(SandboxRuntimeError::Fork(std::io::Error::last_os_error()).into());
-        }
+        let (pid, reaper) = crate::reaper::fork().map_err(SandboxRuntimeError::Fork)?;
+        self.rt_mut().reaper = reaper;
 
         if pid == 0 {
+            let parent_pid = unsafe { libc::getppid() };
             // ===== CHILD PROCESS =====
             // Publish only after the process group exists, before confinement denies IPC.
             if unsafe { libc::setpgid(0, 0) } != 0 {
@@ -2190,14 +2221,12 @@ impl Sandbox {
         // State remains `Created` until `do_start` writes ready_w to release
         // the child to execve.
 
-        let pidfd = match syscall::pidfd_open(pid as u32, 0) {
-            Ok(fd) => Some(fd),
-            Err(_) => None,
-        };
+        let pidfd = Some(self.rt().reaper.as_ref().expect("parent has a reaper")
+            .main_pidfd.try_clone().map_err(SandboxRuntimeError::Io)?);
         // The child's first act is setpgid(0, 0), so its pid names its group.
-        if let Some(leader) = pidfd.as_ref().and_then(|pfd| pfd.try_clone().ok()) {
-            self.rt_mut().groups.track(pid, leader);
-        }
+        let leader = pidfd.as_ref().expect("reaper pins the child")
+            .try_clone().map_err(SandboxRuntimeError::Io)?;
+        self.rt_mut().groups.track(pid, leader);
 
         let notif_fd_num = read_u32_fd(pipes.notif_r.as_raw_fd())
             .map_err(|e| SandboxRuntimeError::Child(format!("read notif fd from child: {}", e)))?;
@@ -2534,9 +2563,9 @@ impl Sandbox {
 /// the process is killed and reaped when that `Sandbox` is dropped, or eagerly
 /// via [`Process::kill`].
 ///
-/// A `Process` that is dropped without [`Process::wait`] leaves the child
-/// running until the `Sandbox` is dropped — call `wait` (or `kill`) to end it.
-#[must_use = "a Process is a live confined child; call wait() (or kill()) or it runs until the Sandbox is dropped"]
+/// Dropping a `Process` leaves the session owned by the `Sandbox`. Call
+/// [`Process::shutdown`] to terminate its jobs and collect captured output.
+#[must_use = "a Process is a live confined child; call shutdown() to end the session or it runs until the Sandbox is dropped"]
 pub struct Process<'a> {
     sandbox: &'a mut Sandbox,
 }
@@ -2579,14 +2608,21 @@ impl Process<'_> {
         self.sandbox.kill()
     }
 
-    /// Wait for the child to exit. Any `Piped` stdout/stderr the caller did not
-    /// take is drained into the returned `RunResult`; taken streams are `None`
-    /// because the caller owns them. An untaken piped stdin is closed here so the
-    /// child sees EOF; a *taken* stdin the caller must close itself first (see
-    /// [`Process::take_stdin`]) or this blocks forever.
-    pub async fn wait(self) -> Result<crate::result::RunResult, crate::error::SandlockError> {
+    /// Wait for the main process while background jobs remain supervised.
+    pub async fn wait(&mut self) -> Result<crate::result::ExitStatus, crate::error::SandlockError> {
         self.sandbox.wait().await
     }
+
+    /// Snapshot of the sandbox's remaining process group IDs.
+    pub fn process_groups(&self) -> Result<Vec<i32>, crate::error::SandlockError> {
+        self.sandbox.process_groups()
+    }
+
+    /// Terminate remaining jobs and collect the main status and untaken output.
+    pub async fn shutdown(self) -> Result<crate::result::RunResult, crate::error::SandlockError> {
+        self.sandbox.shutdown().await
+    }
+
 }
 
 /// Hand the terminal's foreground process group back to this process after
@@ -2618,18 +2654,32 @@ impl Drop for Sandbox {
     fn drop(&mut self) {
         if let Some(ref mut rt) = self.runtime {
             if let Some(worker) = &rt.policy_fn_worker { worker.cancel(); }
+            let _ = rt.groups.signal(libc::SIGKILL);
+            if let Some(reaper) = &mut rt.reaper {
+                reaper.shutdown();
+                use std::os::fd::AsRawFd;
+                unsafe { libc::syscall(libc::SYS_pidfd_send_signal, reaper.main_pidfd.as_raw_fd(), libc::SIGKILL, 0, 0) };
+            }
             if let Some(pid) = rt.child_pid {
                 if matches!(rt.state, RuntimeState::Created | RuntimeState::Running | RuntimeState::Paused) {
-                    let _ = rt.groups.signal(libc::SIGKILL);
                     // The waitpid below must not hang on a child whose group
                     // was never recorded. Unreaped, its pid is still ours.
-                    unsafe { libc::kill(pid, libc::SIGKILL) };
-                    let mut status: i32 = 0;
-                    unsafe { libc::waitpid(pid, &mut status, 0) };
+                    if rt.reaper.is_none() {
+                        unsafe { libc::kill(pid, libc::SIGKILL) };
+                        let mut status: i32 = 0;
+                        unsafe { libc::waitpid(pid, &mut status, 0) };
+                    }
                 }
                 if rt.tty_foreground_taken {
                     sandbox_restore_tty_foreground(pid);
                     rt.tty_foreground_taken = false;
+                }
+            }
+
+            if let Some(reaper) = rt.reaper.take() {
+                loop {
+                    if unsafe { libc::waitpid(reaper.pid, std::ptr::null_mut(), 0) } >= 0 { break; }
+                    if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) { break; }
                 }
             }
 
@@ -2649,8 +2699,8 @@ impl Drop for Sandbox {
 
         }
 
-        // wait() settles the branch, so this only sees one it left behind: a
-        // deferred branch nobody decided on, or one a cancelled wait() never
+        // shutdown() settles the branch, so this only sees one it left behind: a
+        // deferred branch nobody decided on, or one a cancelled shutdown() never
         // reached.
         let action = self.branch_action();
         #[cfg(feature = "cow")]

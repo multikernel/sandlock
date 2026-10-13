@@ -492,7 +492,8 @@ async fn test_spawn_and_kill() {
     sb.start().unwrap();
     sb.kill().unwrap();
 
-    let result = sb.wait().await.unwrap();
+    sb.wait().await.unwrap();
+    let result = sb.shutdown().await.unwrap();
     assert!(
         matches!(result.exit_status, ExitStatus::Signal(_) | ExitStatus::Killed),
         "expected Signal or Killed, got {:?}",
@@ -681,7 +682,8 @@ async fn test_pause_resume() {
     sb.resume().expect("resume should succeed");
 
     sb.kill().unwrap();
-    let result = sb.wait().await.unwrap();
+    sb.wait().await.unwrap();
+    let result = sb.shutdown().await.unwrap();
 
     // Process should have been killed cleanly after pause/resume cycle
     assert!(

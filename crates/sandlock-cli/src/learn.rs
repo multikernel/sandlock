@@ -632,7 +632,7 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         match tokio::time::timeout(deadline, sandbox.wait()).await {
             Ok(r) => {
                 let result = r.map_err(|e| anyhow!("sandbox error: {e}"))?;
-                require_clean_exit(&result.exit_status)?;
+                require_clean_exit(&result)?;
                 false
             }
             Err(_elapsed) => {
@@ -647,9 +647,11 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     } else {
         let result = sandbox.wait().await
             .map_err(|e| anyhow!("sandbox error: {e}"))?;
-        require_clean_exit(&result.exit_status)?;
+        require_clean_exit(&result)?;
         false
     };
+
+    sandbox.shutdown().await.map_err(|e| anyhow!("sandbox error: {e}"))?;
 
     if timed_out {
         eprintln!("sandlock learn: writing partial profile from observations before timeout");

@@ -738,7 +738,8 @@ async fn drive_txn_stages(
         let drain =
             tokio::task::spawn_blocking(move || drain_capped_tee(read_fd, STAGE_STDERR_CAP, tee));
 
-        let mut result = sb.wait().await.map_err(at)?;
+        sb.wait().await.map_err(at)?;
+        let mut result = sb.shutdown().await.map_err(at)?;
         // wait() returns stderr: None on the inherit path; the captured bytes are
         // authoritative.
         result.stderr = Some(drain.await.unwrap_or_default());

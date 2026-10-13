@@ -247,7 +247,8 @@ async fn run_pipeline(stages: Vec<Stage>) -> Result<RunResult, SandlockError> {
     };
 
     for (i, mut sb) in sandboxes.into_iter().enumerate() {
-        let result = sb.wait().await?;
+        sb.wait().await?;
+        let result = sb.shutdown().await?;
         if i == n - 1 {
             last_result.exit_status = result.exit_status;
         }
@@ -459,7 +460,8 @@ async fn run_gather(
         changes: Vec::new(),
     };
     for (i, mut sb) in sandboxes.into_iter().enumerate() {
-        let result = sb.wait().await?;
+        sb.wait().await?;
+        let result = sb.shutdown().await?;
         if i == total - 1 {
             last_result.exit_status = result.exit_status;
         }

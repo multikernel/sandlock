@@ -180,7 +180,7 @@ async fn test_nested_sandbox() {
     // separately verifying that running Sandbox::run after another
     // Sandbox::run works (the seccomp filter stacks).
     outer_sb.kill().unwrap();
-    let _ = outer_sb.wait().await;
+    let _ = async { outer_sb.wait().await?; outer_sb.shutdown().await }.await;
 
     // Sequential sandboxes: first sandbox applies Landlock + seccomp,
     // second sandbox from the same parent gets EBUSY on seccomp
@@ -900,12 +900,12 @@ async fn test_cancelled_wait_keeps_the_capture_for_the_next_wait() {
     sb.spawn(&["sh", "-c", "printf hello; sleep 5"]).await.unwrap();
 
     // The child sleeps well past this, so the first wait is cancelled mid-flight.
-    let first = tokio::time::timeout(std::time::Duration::from_millis(500), sb.wait()).await;
+    let first = tokio::time::timeout(std::time::Duration::from_millis(500), async { sb.wait().await?; sb.shutdown().await }).await;
     assert!(first.is_err(), "the child sleeps 5s: this wait must be cancelled, not complete");
 
     sb.kill().unwrap();
 
-    let result = tokio::time::timeout(std::time::Duration::from_secs(30), sb.wait())
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), async { sb.wait().await?; sb.shutdown().await })
         .await
         .expect("the second wait() hung")
         .unwrap();
@@ -945,7 +945,7 @@ fn test_capture_wait_does_not_park_blocking_pool_threads() {
 
         let mut quick = capture_policy().with_name("drain-quick");
 
-        let idle_wait = idle.wait();
+        let idle_wait = async { idle.wait().await?; idle.shutdown().await };
         let quick_run = quick.run(&["echo", "hi"]);
         tokio::pin!(idle_wait);
         tokio::pin!(quick_run);

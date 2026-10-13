@@ -1440,7 +1440,7 @@ pub unsafe extern "C" fn sandlock_handle_wait(h: *mut sandlock_handle_t) -> *mut
         return ptr::null_mut();
     }
     let h = &mut *h;
-    match block_on_runtime(&h.runtime, h.sandbox.wait()) {
+    match block_on_runtime(&h.runtime, async { h.sandbox.wait().await?; h.sandbox.shutdown().await }) {
         Some(Ok(result)) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
         _ => ptr::null_mut(),
     }
@@ -1464,7 +1464,7 @@ pub unsafe extern "C" fn sandlock_handle_wait_timeout(
 
     if timeout_ms == 0 {
         // No timeout -- same as sandlock_handle_wait.
-        return match block_on_runtime(&h.runtime, h.sandbox.wait()) {
+        return match block_on_runtime(&h.runtime, async { h.sandbox.wait().await?; h.sandbox.shutdown().await }) {
             Some(Ok(result)) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
             _ => ptr::null_mut(),
         };
@@ -1472,7 +1472,7 @@ pub unsafe extern "C" fn sandlock_handle_wait_timeout(
 
     let dur = Duration::from_millis(timeout_ms);
     match block_on_runtime(&h.runtime, async {
-        tokio::time::timeout(dur, h.sandbox.wait()).await
+        tokio::time::timeout(dur, async { h.sandbox.wait().await?; h.sandbox.shutdown().await }).await
     }) {
         Some(Ok(Ok(result))) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
         Some(Ok(Err(_))) | None => ptr::null_mut(),
@@ -2607,7 +2607,7 @@ pub unsafe extern "C" fn sandlock_wait(sb: *mut Sandbox) -> c_int {
     }
     let sb = &mut *sb;
 
-    match with_runtime(|rt| rt.block_on(sb.wait())) {
+    match with_runtime(|rt| rt.block_on(async { sb.wait().await?; sb.shutdown().await })) {
         Some(Ok(r)) => r.code().unwrap_or(-1),
         _ => -1,
     }
