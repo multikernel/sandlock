@@ -2,7 +2,7 @@
 // notifications from the kernel, dispatches them to handler functions, and
 // sends responses.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io;
 use std::net::IpAddr;
@@ -2245,7 +2245,7 @@ async fn emit_policy_event(
     action: &NotifAction,
     policy_fn_state: &Arc<tokio::sync::Mutex<super::state::PolicyFnState>>,
     notif_fd: RawFd,
-) -> Option<crate::policy_fn::Verdict> {
+) -> Option<VerdictWait> {
     let pfs = policy_fn_state.lock().await;
     let tx = match pfs.event_tx.as_ref() {
         Some(tx) => tx.clone(),
@@ -2450,7 +2450,9 @@ async fn emit_policy_event(
             event,
             gate: Some(gate_tx),
         }));
-        Some(crate::policy_fn::wait_for_verdict(gate_rx, timeout, &cancellation).await)
+        Some(Box::pin(async move {
+            crate::policy_fn::wait_for_verdict(gate_rx, timeout, &cancellation).await
+        }) as VerdictWait)
     } else {
         let _ = tx.send(crate::policy_fn::PolicyMsg::Event(crate::policy_fn::PolicyEvent {
             event,
@@ -2525,13 +2527,52 @@ fn spawn_deferred(
     });
 }
 
+type VerdictWait = Pin<Box<dyn Future<Output = crate::policy_fn::Verdict> + Send>>;
+
+struct PendingNotification {
+    notif: SeccompNotif,
+    action: Option<NotifAction>,
+    exec_freeze: Option<crate::freeze::SandboxFreeze>,
+    fork_counted: bool,
+    fd: Arc<OwnedFd>,
+}
+
+impl Drop for PendingNotification {
+    fn drop(&mut self) {
+        if self.action.is_some() {
+            let _ = send_response(self.fd.as_raw_fd(), self.notif.id, NotifAction::Errno(libc::EPERM));
+        }
+        if let Some(freeze) = self.exec_freeze.take() {
+            crate::freeze::detach_all(&freeze);
+            crate::freeze::reap_pending(&freeze.pending_tids);
+        }
+    }
+}
+
+struct PendingApproval {
+    notification: PendingNotification,
+    verdict: VerdictWait,
+}
+
+async fn next_approval(pending: &mut [PendingApproval]) -> (usize, crate::policy_fn::Verdict) {
+    std::future::poll_fn(|cx| {
+        for (index, approval) in pending.iter_mut().enumerate() {
+            if let std::task::Poll::Ready(verdict) = approval.verdict.as_mut().poll(cx) {
+                return std::task::Poll::Ready((index, verdict));
+            }
+        }
+        std::task::Poll::Pending
+    }).await
+}
+
 async fn handle_notification(
     notif: SeccompNotif,
     ctx: &Arc<super::ctx::SupervisorCtx>,
     dispatch_table: &super::dispatch::DispatchTable,
-    fd: RawFd,
+    notif_fd: &Arc<OwnedFd>,
     defer_sem: &Arc<tokio::sync::Semaphore>,
-) {
+) -> Option<PendingApproval> {
+    let fd = notif_fd.as_raw_fd();
     let policy = &ctx.policy;
 
     // Ensure every pid that produces a notification has per-process
@@ -2636,16 +2677,38 @@ async fn handle_notification(
         }
     }
 
-    // Emit event to policy_fn callback if active. For execve, argv is
-    // only populated after `exec_freeze` has stopped every possible
-    // writer, and those tasks stay stopped until after NOTIF_SEND.
-    if let Some(verdict) = emit_policy_event(&notif, &action, &ctx.policy_fn, fd).await {
+    let verdict = emit_policy_event(&notif, &action, &ctx.policy_fn, fd).await;
+    let notification = PendingNotification {
+        notif, action: Some(action), exec_freeze, fork_counted, fd: Arc::clone(notif_fd),
+    };
+    if let Some(verdict) = verdict {
+        return Some(PendingApproval { notification, verdict });
+    }
+    finish_notification(notification, None, ctx, defer_sem).await;
+    None
+}
+
+async fn finish_notification(
+    mut pending: PendingNotification,
+    verdict: Option<crate::policy_fn::Verdict>,
+    ctx: &Arc<super::ctx::SupervisorCtx>,
+    defer_sem: &Arc<tokio::sync::Semaphore>,
+) {
+    let notif = pending.notif;
+    let nr = notif.data.nr as i64;
+    let fd = pending.fd.as_raw_fd();
+    let policy = &ctx.policy;
+    let fork_counted = pending.fork_counted;
+    let mut action = pending.action.take().unwrap();
+    if let Some(verdict) = verdict {
         use crate::policy_fn::Verdict;
         match verdict {
-            Verdict::Deny => { action = NotifAction::Errno(libc::EPERM); }
-            Verdict::DenyWith(errno) => { action = NotifAction::Errno(errno); }
-            Verdict::Audit => { /* allow, but could log here */ }
-            Verdict::Allow => {}
+            Verdict::Deny => action = NotifAction::Errno(libc::EPERM),
+            Verdict::DenyWith(errno) => action = NotifAction::Errno(errno),
+            Verdict::Allow | Verdict::Audit => {}
+        }
+        if id_valid(fd, notif.id).is_err() {
+            return;
         }
     }
 
@@ -2712,7 +2775,7 @@ async fn handle_notification(
     }
 
     // Ignore error — child may have exited between recv and response.
-    let exec_continued = exec_freeze.is_some() && matches!(action, NotifAction::Continue);
+    let exec_continued = pending.exec_freeze.is_some() && matches!(action, NotifAction::Continue);
     let send_result = send_response(fd, notif.id, action);
 
     if let Some(trace) = creation_trace {
@@ -2736,7 +2799,7 @@ async fn handle_notification(
         }
     }
 
-    if let Some(freeze) = exec_freeze {
+    if let Some(freeze) = pending.exec_freeze.take() {
         if exec_continued && send_result.is_ok() {
             crate::freeze::detach_peers(&freeze.peer_tids);
         } else {
@@ -2769,7 +2832,7 @@ pub async fn supervisor(
     // Register the notif fd with the Tokio IO driver so we can wait for
     // readiness via epoll instead of a dedicated blocking thread.
     let async_fd = match tokio::io::unix::AsyncFd::with_interest(
-        notif_fd,
+        Arc::new(notif_fd),
         tokio::io::Interest::READABLE,
     ) {
         Ok(fd) => fd,
@@ -2808,48 +2871,71 @@ pub async fn supervisor(
     // processes.
     let defer_sem = Arc::new(tokio::sync::Semaphore::new(DEFER_MAX_INFLIGHT));
 
-    // Edge-triggered drain: each `readable().await` returns once per
-    // epoll edge, then we drain the kernel queue via `probe_notif_fd`
-    // until empty. The drain is necessary because tokio's AsyncFd is
-    // edge-triggered and `recv_notif` does not signal "would block",
-    // so a burst of arrivals between two `readable().await` calls
-    // would coalesce into a single wake event.
-    //
-    // Notifications are processed sequentially (not spawned) to avoid
-    // mutex contention between concurrent handlers.
-    'outer: loop {
-        let mut ready = match async_fd.readable().await {
-            Ok(r) => r,
-            Err(_) => break 'outer,
-        };
-        ready.clear_ready();
-        drop(ready);
+    let cancellation = ctx.policy_fn.lock().await.cancellation.clone();
+    let _cancel_on_drop = cancellation.clone().drop_guard();
+    let mut pending: Vec<PendingApproval> = Vec::new();
+    let mut waiting_exec = VecDeque::new();
+    let mut drain = false;
 
-        loop {
-            match probe_notif_fd(fd) {
-                NotifFdState::Pending => {
-                    let notif = match recv_notif(fd) {
-                        Ok(n) => n,
-                        Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
-                        // The notification the probe saw can be withdrawn
-                        // before RECV picks it up: the target was killed
-                        // while the notification was being generated
-                        // (seccomp_unotify(2), RECV ENOENT). Other tasks'
-                        // notifications may still be queued or coming, so
-                        // this is an empty probe, not a dead fd. Breaking
-                        // here retired the whole supervisor and parked
-                        // every later intercepted syscall forever.
-                        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue,
-                        Err(_) => break 'outer,
-                    };
-                    handle_notification(notif, &ctx, &dispatch_table, fd, &defer_sem).await;
+    loop {
+        let freeze_pending = pending.iter().any(|p| p.notification.exec_freeze.is_some());
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => break,
+            (index, verdict) = next_approval(&mut pending), if !pending.is_empty() => {
+                let approval = pending.swap_remove(index);
+                finish_notification(approval.notification, Some(verdict), &ctx, &defer_sem).await;
+            }
+            ready = async {
+                if drain || (!freeze_pending && !waiting_exec.is_empty()) {
+                    return Ok(());
                 }
-                NotifFdState::Empty => break,
-                NotifFdState::Terminal => break 'outer,
+                let mut ready = async_fd.readable().await?;
+                ready.clear_ready();
+                Ok::<(), io::Error>(())
+            } => {
+                if ready.is_err() { break; }
+                let queued = if !freeze_pending { waiting_exec.pop_front() } else { None };
+                let notif = if let Some(notif) = queued {
+                    notif
+                } else {
+                    match probe_notif_fd(fd) {
+                        NotifFdState::Empty => { drain = false; continue; }
+                        NotifFdState::Terminal => break,
+                        NotifFdState::Pending => {}
+                    }
+                    drain = true;
+                    match recv_notif(fd) {
+                        Ok(n) => n,
+                        Err(e) if matches!(e.raw_os_error(), Some(libc::EINTR) | Some(libc::ENOENT)) => continue,
+                        Err(_) => break,
+                    }
+                };
+                if pending.len() + waiting_exec.len() >= DEFER_MAX_INFLIGHT {
+                    let _ = send_response(fd, notif.id, NotifAction::Errno(libc::EAGAIN));
+                    continue;
+                }
+                // An overlapping freeze or creation trace would invalidate argv protection.
+                if freeze_pending && (crate::freeze::requires_freeze_on_continue(notif.data.nr as i64)
+                    || crate::resource::requires_process_creation_tracking(&notif, &ctx.policy))
+                {
+                    waiting_exec.push_back(notif);
+                    continue;
+                }
+                if let Some(approval) = handle_notification(
+                    notif, &ctx, &dispatch_table, async_fd.get_ref(), &defer_sem,
+                ).await {
+                    pending.push(approval);
+                }
             }
         }
     }
 
+    cancellation.cancel();
+    drop(pending);
+    for notif in waiting_exec {
+        let _ = send_response(fd, notif.id, NotifAction::Errno(libc::EPERM));
+    }
     gc.abort();
 }
 

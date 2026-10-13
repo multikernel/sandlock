@@ -966,3 +966,46 @@ async fn unlimited_approval_spawn_reports_denied_exec() {
         .expect("a denied exec must not wait forever");
     assert!(result.is_err());
 }
+
+#[tokio::test]
+async fn deferred_approval_does_not_stall_other_notifications() {
+    let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let second = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let first_port = first.local_addr().unwrap().port();
+    let second_port = second.local_addr().unwrap().port();
+    let held = Arc::new(Mutex::new(None::<sandlock_core::policy_fn::Approval>));
+    let pending = held.clone();
+    let mut sandbox = base_policy()
+        .policy_fn(PolicyFn::deferred(move |event, _, approval| {
+            let Some(mut approval) = approval else { return };
+            if event.syscall == "connect" && event.port == Some(first_port) {
+                *pending.lock().unwrap() = Some(approval);
+                return;
+            }
+            if event.syscall == "connect" && event.port == Some(second_port) {
+                if let Some(mut earlier) = pending.lock().unwrap().take() {
+                    earlier.resolve(Verdict::Allow).unwrap();
+                }
+            }
+            approval.resolve(Verdict::Allow).unwrap();
+        }).verdict_timeout(Some(Duration::from_secs(2))))
+        .build().unwrap();
+    let script = format!(r#"
+import socket, threading, time
+errors = []
+def connect(port):
+    try:
+        with socket.create_connection(('127.0.0.1', port)): pass
+    except OSError as e:
+        errors.append(e)
+t = threading.Thread(target=connect, args=({first_port},))
+t.start()
+time.sleep(0.2)
+connect({second_port})
+t.join()
+assert not errors, errors
+"#);
+    let result = sandbox.run_interactive(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "an unanswered approval stalled another notification");
+    assert!(held.lock().unwrap().is_none());
+}
