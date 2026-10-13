@@ -410,3 +410,66 @@ fn popen_piped_stream_with_null_out_ptr_is_closed_not_leaked() {
          stream with a null out-pointer is leaking its fd instead of being closed"
     );
 }
+
+#[test]
+fn wait_retains_background_session_until_shutdown() {
+    use sandlock_ffi::*;
+    let policy = build_policy();
+    let (_owned, av) = argv(&["sh", "-c", "sleep 60 & echo background; exit 7"]);
+    unsafe {
+        let h = sandlock_create(policy, ptr::null(), av.as_ptr(), av.len() as c_uint);
+        assert!(!h.is_null());
+        assert_eq!(sandlock_start(h), 0);
+        for _ in 0..2 {
+            let status = sandlock_handle_wait_timeout(h, 5000);
+            assert!(!status.is_null());
+            assert_eq!(sandlock_result_exit_code(status), 7);
+            let mut len = 0;
+            sandlock_result_stdout_bytes(status, &mut len);
+            assert_eq!(len, 0);
+            sandlock_result_free(status);
+        }
+        let groups = sandlock_handle_process_groups(h);
+        assert!(!groups.is_null());
+        let groups: Vec<i32> = {
+            let parsed = serde_json::from_slice(std::ffi::CStr::from_ptr(groups).to_bytes()).unwrap();
+            sandlock_string_free(groups);
+            parsed
+        };
+        assert!(!groups.is_empty());
+        let result = sandlock_handle_shutdown(h);
+        assert!(!result.is_null());
+        assert_eq!(sandlock_result_exit_code(result), 7);
+        let mut len = 0;
+        let bytes = sandlock_result_stdout_bytes(result, &mut len);
+        assert_eq!(std::slice::from_raw_parts(bytes, len), b"background\n");
+        sandlock_result_free(result);
+        let groups = sandlock_handle_process_groups(h);
+        assert_eq!(std::ffi::CStr::from_ptr(groups).to_bytes(), b"[]");
+        sandlock_string_free(groups);
+        sandlock_handle_free(h);
+        sandlock_sandbox_free(policy);
+    }
+}
+
+#[test]
+fn wait_timeout_leaves_main_alive_for_a_later_wait() {
+    use sandlock_ffi::*;
+    let policy = build_policy();
+    let (_owned, av) = argv(&["sh", "-c", "sleep 0.2; exit 9"]);
+    unsafe {
+        let h = sandlock_create(policy, ptr::null(), av.as_ptr(), av.len() as c_uint);
+        assert!(!h.is_null());
+        assert_eq!(sandlock_start(h), 0);
+        let status = sandlock_handle_wait_timeout(h, 1);
+        assert!(!status.is_null());
+        assert!(matches!(sandlock_result_reason(status), sandlock_exit_reason_t::Timeout));
+        sandlock_result_free(status);
+        let status = sandlock_handle_wait_timeout(h, 5000);
+        assert_eq!(sandlock_result_exit_code(status), 9);
+        sandlock_result_free(status);
+        sandlock_result_free(sandlock_handle_shutdown(h));
+        sandlock_handle_free(h);
+        sandlock_sandbox_free(policy);
+    }
+}

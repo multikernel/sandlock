@@ -10,7 +10,7 @@ use std::ptr;
 
 use sandlock_ffi::{
     sandlock_create_for_run, sandlock_handle_abort, sandlock_handle_commit, sandlock_handle_free,
-    sandlock_handle_pending, sandlock_handle_upper_dir, sandlock_handle_wait,
+    sandlock_handle_pending, sandlock_handle_upper_dir, sandlock_handle_shutdown, sandlock_handle_wait,
     sandlock_result_change_entry, sandlock_result_change_path, sandlock_result_changes_len,
     sandlock_result_free, sandlock_result_success, sandlock_sandbox_build,
     sandlock_sandbox_builder_cwd, sandlock_sandbox_builder_fs_read,
@@ -57,7 +57,8 @@ fn run_deferred(workdir: &Path, storage: &Path) -> *mut sandlock_ffi::sandlock_h
     unsafe { sandlock_sandbox_free(policy) };
     assert!(!h.is_null(), "create failed");
     assert_eq!(unsafe { sandlock_start(h) }, 0);
-    let r = unsafe { sandlock_handle_wait(h) };
+    unsafe { sandlock_result_free(sandlock_handle_wait(h)) };
+    let r = unsafe { sandlock_handle_shutdown(h) };
     assert!(!r.is_null(), "wait failed");
     assert!(unsafe { sandlock_result_success(r) });
 
@@ -131,7 +132,8 @@ fn a_committing_handle_is_never_pending() {
     let h = unsafe { sandlock_create_for_run(policy, ptr::null(), av.as_ptr(), av.len() as c_uint) };
     unsafe { sandlock_sandbox_free(policy) };
     assert_eq!(unsafe { sandlock_start(h) }, 0);
-    let r = unsafe { sandlock_handle_wait(h) };
+    unsafe { sandlock_result_free(sandlock_handle_wait(h)) };
+    let r = unsafe { sandlock_handle_shutdown(h) };
     assert!(unsafe { sandlock_result_success(r) });
     assert_eq!(unsafe { sandlock_result_changes_len(r) }, 1);
     unsafe { sandlock_result_free(r) };

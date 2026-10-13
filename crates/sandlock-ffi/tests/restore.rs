@@ -16,7 +16,7 @@ use sandlock_ffi::{
     sandlock_checkpoint_free, sandlock_handle_checkpoint, sandlock_handle_free,
     sandlock_handle_kill, sandlock_handle_pid, sandlock_handle_restore_skipped_fd,
     sandlock_handle_restore_skipped_len, sandlock_handle_restore_skipped_path,
-    sandlock_handle_wait, sandlock_result_free, sandlock_restore_interactive,
+    sandlock_handle_shutdown, sandlock_handle_wait, sandlock_result_free, sandlock_restore_interactive,
     sandlock_sandbox_build, sandlock_sandbox_builder_fs_read, sandlock_sandbox_builder_fs_write,
     sandlock_sandbox_builder_new, sandlock_sandbox_free, sandlock_sandbox_t, sandlock_start,
     sandlock_string_free,
@@ -149,7 +149,8 @@ fn restore_interactive_resumes_via_c_abi() {
     assert!(baseline > 2, "counter should have advanced, got {baseline}");
 
     assert_eq!(unsafe { sandlock_handle_kill(h) }, 0);
-    let r = unsafe { sandlock_handle_wait(h) };
+    unsafe { sandlock_result_free(sandlock_handle_wait(h)) };
+    let r = unsafe { sandlock_handle_shutdown(h) };
     if !r.is_null() {
         unsafe { sandlock_result_free(r) };
     }
@@ -197,7 +198,8 @@ fn restore_interactive_resumes_via_c_abi() {
     // Clean up before asserting so a failure never leaks the child/files.
     unsafe {
         sandlock_handle_kill(h2);
-        let r2 = sandlock_handle_wait(h2);
+        sandlock_result_free(sandlock_handle_wait(h2));
+        let r2 = sandlock_handle_shutdown(h2);
         if !r2.is_null() {
             sandlock_result_free(r2);
         }
