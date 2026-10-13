@@ -194,6 +194,19 @@ class PolicyFn:
     verdict_timeout: float | None = field(default=5.0, kw_only=True)
     """Seconds including queue time; None disables the timeout, zero denies immediately."""
 
+    _deferred: bool = field(default=False, init=False, repr=False)
+
+    @classmethod
+    def deferred(cls, callback: Callable, *, verdict_timeout: float | None = 5.0):
+        """Deliver owned approvals; the callback must return promptly.
+
+        Held events receive an Approval, observation events receive None.
+        Only the approval may outlive the callback, not its context.
+        """
+        policy = cls(callback, verdict_timeout=verdict_timeout)
+        object.__setattr__(policy, "_deferred", True)
+        return policy
+
     def __post_init__(self):
         if not callable(self.callback):
             raise TypeError("callback must be callable")

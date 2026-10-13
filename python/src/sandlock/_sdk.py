@@ -200,6 +200,20 @@ _lib.sandlock_sandbox_builder_policy_fn.argtypes = [
     ctypes.c_void_p,
 ]
 
+_DEFERRED_POLICY_FN_TYPE = ctypes.CFUNCTYPE(
+    None, ctypes.POINTER(_CEvent), _c_ctx_p, ctypes.c_void_p, ctypes.c_void_p,
+)
+_lib.sandlock_sandbox_builder_policy_fn_deferred.restype = _c_builder_p
+_lib.sandlock_sandbox_builder_policy_fn_deferred.argtypes = [
+    _c_builder_p, _DEFERRED_POLICY_FN_TYPE, ctypes.c_int64, ctypes.c_void_p, ctypes.c_void_p,
+]
+_lib.sandlock_approval_resolve.restype = ctypes.c_bool
+_lib.sandlock_approval_resolve.argtypes = [ctypes.c_void_p, ctypes.c_int32]
+_lib.sandlock_approval_is_cancelled.restype = ctypes.c_bool
+_lib.sandlock_approval_is_cancelled.argtypes = [ctypes.c_void_p]
+_lib.sandlock_approval_free.restype = None
+_lib.sandlock_approval_free.argtypes = [ctypes.c_void_p]
+
 _lib.sandlock_ctx_restrict_network.restype = None
 _lib.sandlock_ctx_restrict_network.argtypes = [_c_ctx_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint32]
 
@@ -706,6 +720,50 @@ class SyscallEvent:
         Only meaningful for execve/execveat events.
         """
         return self.argv is not None and any(s in a for a in self.argv)
+
+
+class Approval:
+    """One owned policy decision. Close an unanswered handle to deny it."""
+
+    def __init__(self, ptr):
+        import threading
+        self._lock = threading.Lock()
+        self._ptr = ptr
+
+    def _resolve(self, verdict):
+        with self._lock:
+            if not self._ptr:
+                raise RuntimeError("approval is no longer pending")
+            ptr, self._ptr = self._ptr, None
+            try:
+                if not _lib.sandlock_approval_resolve(ptr, verdict):
+                    raise RuntimeError("approval is no longer pending")
+            finally:
+                _lib.sandlock_approval_free(ptr)
+
+    def allow(self):
+        """Allow once; raise RuntimeError after cancellation or resolution."""
+        self._resolve(0)
+
+    def deny(self, errno=1):
+        """Deny with a positive errno (EPERM by default)."""
+        if not isinstance(errno, int) or not 0 < errno < 2**31:
+            raise ValueError("errno must be a positive signed 32-bit integer")
+        self._resolve(errno)
+
+    def is_cancelled(self):
+        with self._lock:
+            return not self._ptr or _lib.sandlock_approval_is_cancelled(self._ptr)
+
+    def close(self):
+        """Release the handle, denying an unanswered request. Idempotent."""
+        with self._lock:
+            if self._ptr:
+                ptr, self._ptr = self._ptr, None
+                _lib.sandlock_approval_free(ptr)
+
+    def __del__(self):
+        self.close()
 
 
 class PolicyContext:
@@ -1338,7 +1396,7 @@ class _NativePolicy:
         policy_fn = policy.policy_fn
         c_callback = None
         if policy_fn is not None:
-            def _c_callback(event_p, ctx_p, _user_data):
+            def _invoke(event_p, ctx_p, approval=None):
                 ev = event_p.contents
                 py_argv = None
                 if ev.argv and ev.argc > 0:
@@ -1359,6 +1417,9 @@ class _NativePolicy:
                     denied=ev.denied,
                 )
                 py_ctx = PolicyContext(ctx_p)
+                if policy_fn._deferred:
+                    policy_fn.callback(py_event, py_ctx, approval)
+                    return
                 result = policy_fn.callback(py_event, py_ctx)
                 # Return: 0=allow, -1=deny, -2=audit, positive=deny with errno
                 # Python callback can return:
@@ -1378,10 +1439,31 @@ class _NativePolicy:
                 # silently allowing the syscall.
                 return -1
 
-            c_callback = _POLICY_FN_TYPE(_c_callback)
-            b = _lib.sandlock_sandbox_builder_policy_fn(
-                b, c_callback, policy_fn._verdict_timeout_ms(), None, None,
-            )
+            if policy_fn._deferred:
+                def _c_deferred(event_p, ctx_p, approval_p, _user_data):
+                    approval = Approval(approval_p) if approval_p else None
+                    try:
+                        _invoke(event_p, ctx_p, approval)
+                    except BaseException:
+                        if approval is not None:
+                            approval.close()
+                        import traceback
+                        traceback.print_exc()
+
+                c_callback = _DEFERRED_POLICY_FN_TYPE(_c_deferred)
+                register = _lib.sandlock_sandbox_builder_policy_fn_deferred
+            else:
+                def _c_callback(event_p, ctx_p, _user_data):
+                    try:
+                        return _invoke(event_p, ctx_p)
+                    except BaseException:
+                        import traceback
+                        traceback.print_exc()
+                        return -1
+
+                c_callback = _POLICY_FN_TYPE(_c_callback)
+                register = _lib.sandlock_sandbox_builder_policy_fn
+            b = register(b, c_callback, policy_fn._verdict_timeout_ms(), None, None)
 
         err = ctypes.c_int(0)
         err_msg = ctypes.c_char_p()

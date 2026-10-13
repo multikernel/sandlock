@@ -469,3 +469,76 @@ def test_policy_fn_requires_callable():
 def test_sandbox_requires_policy_fn_configuration():
     with pytest.raises(TypeError, match="PolicyFn"):
         Sandbox(policy_fn=lambda event, ctx: 0)
+
+class TestDeferredPolicy:
+    def test_deferred_configuration(self):
+        callback = lambda event, ctx, approval: None
+        policy = PolicyFn.deferred(callback, verdict_timeout=None)
+        assert policy.callback is callback
+        assert policy._verdict_timeout_ms() == -1
+
+    def test_deferred_answer_from_another_thread(self):
+        import queue
+        import threading
+
+        approvals = queue.Queue()
+        errors = []
+
+        def callback(event, ctx, approval):
+            if approval is not None:
+                approvals.put(approval)
+
+        def answer():
+            while True:
+                approval = approvals.get()
+                if approval is None:
+                    return
+                try:
+                    approval.allow()
+                    with pytest.raises(RuntimeError):
+                        approval.deny()
+                except BaseException as exc:
+                    errors.append(exc)
+
+        worker = threading.Thread(target=answer)
+        worker.start()
+        try:
+            result = _policy(policy_fn=PolicyFn.deferred(callback)).run(["/bin/true"])
+            assert result.success
+        finally:
+            approvals.put(None)
+            worker.join(timeout=5)
+        assert not worker.is_alive()
+        assert not errors
+
+    def test_deferred_abandonment_denies(self):
+        result = _policy(policy_fn=PolicyFn.deferred(lambda event, ctx, approval: None)).run(["/bin/true"])
+        assert not result.success
+
+    def test_deferred_exception_denies_retained_approval(self):
+        held = []
+
+        def callback(event, ctx, approval):
+            if approval is not None:
+                held.append(approval)
+                raise ValueError("approval callback failed")
+
+        result = _policy(policy_fn=PolicyFn.deferred(callback)).run(["/bin/true"])
+        assert not result.success
+        assert held[0].is_cancelled()
+        with pytest.raises(RuntimeError):
+            held[0].allow()
+
+    def test_deferred_timeout_rejects_late_answer(self):
+        held = []
+
+        def callback(event, ctx, approval):
+            if approval is not None:
+                held.append(approval)
+
+        result = _policy(policy_fn=PolicyFn.deferred(callback, verdict_timeout=0.02)).run(["/bin/true"])
+        assert not result.success
+        assert held[0].is_cancelled()
+        with pytest.raises(RuntimeError):
+            held[0].allow()
+        held[0].close()
