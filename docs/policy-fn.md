@@ -126,7 +126,12 @@ Shutdown joins that callback before releasing its data; it cannot forcibly
 interrupt user code. A verdict timeout closes the verdict wait, but does not
 interrupt a callback already running. Its eventual verdict is ignored.
 
-For example, an application can deliver an approval decision through a queue:
+## Deferred approval
+
+Use `PolicyFn.deferred` when a decision needs user input or another service.
+The callback receives an owned approval handle and returns promptly. The
+supervisor continues processing other notifications while the requesting task
+waits in its syscall. Existing synchronous callbacks remain supported.
 
 ```python
 import queue
@@ -134,18 +139,91 @@ from sandlock import Sandbox, PolicyFn
 
 approvals = queue.Queue()
 
-def approve(event, ctx):
-    if event.syscall != "execve":
-        return 0
-    while not ctx.is_cancelled():
-        try:
-            return 0 if approvals.get(timeout=0.1) else -1
-        except queue.Empty:
-            pass
-    return -1
+def on_event(event, ctx, approval):
+    if approval is None:
+        return
+    if event.syscall == "connect":
+        approvals.put((event, approval))
+    else:
+        approval.allow()
 
-sandbox = Sandbox(policy_fn=PolicyFn(approve, verdict_timeout=None))
+sandbox = Sandbox(policy_fn=PolicyFn.deferred(on_event, verdict_timeout=120))
 ```
+
+Your UI or another thread consumes `approvals` while the sandbox runs:
+
+```python
+event, approval = approvals.get()
+approval.allow()
+# Alternatively: approval.deny() or approval.deny(errno.EACCES).
+```
+
+`approval.allow()` and `approval.deny(errno=1)` accept one decision. They raise
+`RuntimeError` if the request was already answered, timed out, or cancelled.
+`approval.is_cancelled()` reports whether it can no longer accept a decision.
+`approval.close()` releases the handle and denies an unanswered request; it is
+safe to call repeatedly. Garbage collection also releases it, but use `close()`
+for deterministic abandonment, especially when disabling the timeout.
+Callback exceptions close unanswered handles even if they were retained.
+
+Observation-only events receive `None`. Retain the event and approval as needed,
+but the context remains valid only during its callback. The existing timeout
+includes callback queue time. Shutdown cancels pending approvals without waiting
+for applications to release their handles. Callbacks themselves must still
+return promptly.
+
+The supervisor bounds outstanding approvals and queued exec preparations to 64;
+when full it rejects additional held requests with `EAGAIN`. Exec approval retains
+the existing sandbox-wide argv freeze. The supervisor stays responsive, but
+frozen sandbox tasks cannot make progress until that exec is decided. Overlapping
+exec and process-creation preparations wait until the freeze is released.
+
+In Rust, use the same ownership model:
+
+```rust
+use sandlock_core::policy_fn::{PolicyFn, Verdict};
+
+let (tx, rx) = std::sync::mpsc::channel();
+let policy = PolicyFn::deferred(move |event, _ctx, approval| {
+    if let Some(approval) = approval {
+        tx.send((event, approval)).unwrap();
+    }
+});
+// In an application worker while the sandbox runs:
+let (_event, mut approval) = rx.recv()?;
+approval.resolve(Verdict::Allow)?;
+```
+
+Dropping an unanswered Rust handle denies. `resolve` returns `ApprovalClosed`
+for a late or repeated decision.
+
+In Go, set `PolicyFn.Deferred` instead of `PolicyFn.Callback`:
+
+```go
+approvals := make(chan *sandlock.Approval, 64)
+policy := &sandlock.PolicyFn{
+    Deferred: func(event sandlock.SyscallEvent, ctx *sandlock.PolicyContext, approval *sandlock.Approval) {
+        if approval != nil {
+            approvals <- approval
+        }
+    },
+}
+// In another goroutine:
+approval := <-approvals
+err := approval.Resolve(sandlock.Allow())
+```
+
+Exactly one callback field must be set. Use `Close()` to abandon an approval
+and `IsCancelled()` to inspect it. `Resolve` releases the native handle even
+when the decision arrives too late. Go finalization is only a fallback; always
+resolve or close each received handle.
+
+In C, register `sandlock_sandbox_builder_policy_fn_deferred`. Its callback
+receives an owned `sandlock_approval_t *`, or NULL for observation events.
+Use `sandlock_approval_resolve` with the existing integer verdict encoding,
+`sandlock_approval_is_cancelled`, and `sandlock_approval_free`. Release each
+handle exactly once, including after resolution or cancellation. Serialize
+access to a handle; freeing it concurrently with resolution is invalid.
 
 ## Interaction with static rules
 

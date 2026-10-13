@@ -71,6 +71,13 @@ The async notification supervisor (tokio) handles intercepted syscalls:
 | `getdents64` | PID filtering, COW directory merging |
 | `getsockname` | Port remap translation |
 
+Policy approval waits are owned by the supervisor and polled alongside new
+notifications. Dispatch and response finalization remain sequential; a pending
+approval retains its prepared action and any exec argv freeze. Cancellation
+releases these resources before the notification descriptor closes. Deferred
+policy callbacks can hand approval handles to an embedder without blocking the
+callback worker.
+
 ## Control discovery
 
 Sandbox names are reserved in a per-user System V semaphore registry in the
