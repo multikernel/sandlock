@@ -70,7 +70,8 @@ class TestSpawn:
     def test_spawn_then_wait_returns_result(self):
         with _policy() as sb:
             sb.spawn(["sh", "-c", "echo hello; exit 0"])
-            result = sb.wait()
+            assert sb.wait().success
+            result = sb.shutdown()
             assert result.exit_code == 0
             assert b"hello" in result.stdout
 
@@ -102,7 +103,8 @@ class TestCreateStart:
         with _policy() as sb:
             sb.create(["sh", "-c", "echo two-step"])
             sb.start()
-            result = sb.wait()
+            assert sb.wait().success
+            result = sb.shutdown()
             assert result.exit_code == 0
             assert b"two-step" in result.stdout
 

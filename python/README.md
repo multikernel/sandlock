@@ -331,7 +331,7 @@ result = sandbox.run(["python3", "-c", "print(42)"], timeout=10.0)
 #### `sandbox.spawn(cmd) -> None`
 
 Spawn `cmd` without waiting. Use `pid`, `pause()`, `resume()`, `kill()`,
-and `wait()` to manage the process lifecycle.
+`wait()`, and `shutdown()` to manage the session.
 
 Raises `RuntimeError` if a process is already running.
 
@@ -353,9 +353,34 @@ Release a previously `create()`d child to `execve`.
 
 Raises `RuntimeError` if no child has been created.
 
-#### `sandbox.wait() -> Result`
+#### `sandbox.wait(timeout=None) -> ExitStatus`
 
-Wait for the running process to finish and return its `Result`.
+Wait for the main process while background jobs remain supervised. The status
+contains `success`, `exit_code`, `reason`, and `signal`. Repeated waits return
+the same status. A timeout raises `TimeoutError` and leaves the session alive.
+
+#### `sandbox.process_groups() -> list[int]`
+
+Return a sorted snapshot of tracked live process group IDs.
+
+#### `sandbox.shutdown() -> Result`
+
+Terminate remaining jobs with SIGKILL, reap them, collect captured output, and
+apply the configured filesystem branch action. `run()` waits and shuts down
+automatically; its timeout still terminates the session. A sandbox remains
+busy after `wait()` until shutdown or context exit.
+
+```python
+with sandbox:
+    sandbox.spawn(["sh", "-c", "sleep 60 &"])
+    status = sandbox.wait()
+    groups = sandbox.process_groups()
+    result = sandbox.shutdown()
+```
+
+A `Process` returned by `popen()` exposes the same wait, process-group, and
+shutdown methods. Its piped output remains caller-owned. Exiting its context
+terminates the session and closes its streams.
 
 #### Inspecting and deferring COW changes
 

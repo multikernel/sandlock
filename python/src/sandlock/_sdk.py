@@ -319,6 +319,15 @@ _lib.sandlock_handle_wait.argtypes = [_c_handle_p]
 _lib.sandlock_handle_wait_timeout.restype = _c_result_p
 _lib.sandlock_handle_wait_timeout.argtypes = [_c_handle_p, ctypes.c_uint64]
 
+_lib.sandlock_handle_shutdown.restype = _c_result_p
+_lib.sandlock_handle_shutdown.argtypes = [_c_handle_p]
+_lib.sandlock_handle_process_groups.restype = ctypes.c_void_p
+_lib.sandlock_handle_process_groups.argtypes = [_c_handle_p]
+for _name in ("sandlock_handle_pause", "sandlock_handle_resume"):
+    getattr(_lib, _name).restype = ctypes.c_int
+    getattr(_lib, _name).argtypes = [_c_handle_p]
+
+
 _lib.sandlock_handle_free.restype = None
 _lib.sandlock_handle_free.argtypes = [_c_handle_p]
 
@@ -905,6 +914,15 @@ class ExitReason(IntEnum):
     """Killed with no recoverable signal number."""
     TIMEOUT = 3
     """Killed by sandlock because it exceeded its timeout."""
+
+
+@dataclass(frozen=True)
+class ExitStatus:
+    """Main-process status returned by wait(), without ending the session."""
+    success: bool
+    exit_code: int
+    reason: ExitReason
+    signal: int = -1
 
 
 @dataclass

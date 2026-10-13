@@ -261,9 +261,14 @@ class TestRestoreInteractive:
         counter.write_text("0\n")
 
         sb2 = _policy(**policy_kw)
+        sb2.spawn(["sh", "-c", "exit 7"])
+        assert sb2.wait().exit_code == 7
+        sb2.shutdown()
         assert sb2.restore_skipped == []
         ret = sb2.restore_interactive(cp)
         assert ret is None
+        with pytest.raises(TimeoutError):
+            sb2.wait(timeout=0.01)
         skipped = sb2.restore_skipped
         assert isinstance(skipped, list)
         for s in skipped:

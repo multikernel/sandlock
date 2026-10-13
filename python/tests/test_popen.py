@@ -149,7 +149,7 @@ def test_wait_is_idempotent_and_cached():
     proc = _policy().popen(["echo", "hi"], stdout=StdioMode.PIPED)
     assert proc.stdout.read() == b"hi\n"
     first = proc.wait()
-    second = proc.wait()  # handle already freed → cached result, no double-free
+    second = proc.wait()  # cached status, session remains alive
     assert first is second
     assert first.exit_code == 0
 
@@ -181,7 +181,7 @@ def test_popen_rejects_second_process_on_same_sandbox():
         proc.wait()
 
 
-def test_wait_timeout_kills_and_returns_nonsuccess():
+def test_wait_timeout_leaves_session_alive():
     # A child that never exits within the timeout: wait(timeout) must RETURN (not
     # hang), killing the child and yielding a non-success result — parity with
     # Sandbox.run(timeout=...). Run under a watchdog so a regression (ignored
@@ -191,7 +191,9 @@ def test_wait_timeout_kills_and_returns_nonsuccess():
     box = {}
 
     def _run():
-        box["result"] = proc.wait(timeout=0.5)
+        with pytest.raises(TimeoutError):
+            proc.wait(timeout=0.5)
+        box["timed_out"] = True
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
@@ -201,7 +203,9 @@ def test_wait_timeout_kills_and_returns_nonsuccess():
         t.join(timeout=5)
         pytest.fail("wait(timeout) did not return — timeout was ignored")
 
-    assert not box["result"].success, "a timed-out (killed) process is not success"
+    assert box["timed_out"]
+    assert proc.process_groups()
+    proc.shutdown()
 
 
 def test_wait_without_timeout_completes_for_quick_child():
@@ -256,7 +260,8 @@ def test_stale_process_does_not_alias_reused_sandbox():
     sandbox = _policy()
     p1 = sandbox.popen(["echo", "one"], stdout=StdioMode.PIPED)
     assert p1.stdout.read() == b"one\n"
-    p1.wait()  # frees p1's handle, releases the sandbox
+    p1.wait()
+    p1.shutdown()
 
     p2 = sandbox.popen(["sleep", "100"])
     try:
@@ -267,7 +272,7 @@ def test_stale_process_does_not_alias_reused_sandbox():
         assert p2.pid is not None, "p2 must still be alive"
     finally:
         p2.kill()
-        p2.wait()
+        p2.shutdown()
     assert not sandbox.is_running
 
 
@@ -300,7 +305,7 @@ def test_sandbox_pid_and_ports_delegate_to_popen_process():
         assert sandbox.ports() == proc.ports()  # both {} without port_remap
     finally:
         proc.kill()
-        proc.wait()
+        proc.shutdown()
     assert sandbox.pid is None
     assert sandbox.ports() == {}
 
@@ -314,7 +319,9 @@ def test_wait_timeout_zero_does_not_wait_forever():
     box = {}
 
     def _run():
-        box["result"] = proc.wait(timeout=0)
+        with pytest.raises(TimeoutError):
+            proc.wait(timeout=0)
+        box["timed_out"] = True
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
@@ -324,7 +331,8 @@ def test_wait_timeout_zero_does_not_wait_forever():
         t.join(timeout=5)
         pytest.fail("wait(timeout=0) hung — 0 collapsed to wait-forever")
 
-    assert not box["result"].success
+    assert box["timed_out"]
+    proc.shutdown()
 
 
 def test_abandoned_process_is_reaped_by_del():
