@@ -163,6 +163,13 @@ enum sandlock_exception
 typedef uint32_t sandlock_exception;
 #endif // __cplusplus
 
+typedef struct Option_sandlock_policy_ud_drop_t Option_sandlock_policy_ud_drop_t;
+
+/**
+ * An owned approval. Release it even after resolving or cancellation.
+ */
+typedef struct sandlock_approval_t sandlock_approval_t;
+
 /**
  * Opaque handle wrapping a [`Checkpoint`].
  */
@@ -238,6 +245,14 @@ typedef struct {
 typedef int32_t (*sandlock_policy_fn_t)(const sandlock_event_t *event,
                                         sandlock_ctx_t *ctx,
                                         void *user_data);
+
+/**
+ * The callback owns `approval` when non-null; event and context are borrowed.
+ */
+typedef void (*sandlock_deferred_policy_fn_t)(const sandlock_event_t *event,
+                                              sandlock_ctx_t *ctx,
+                                              sandlock_approval_t *approval,
+                                              void *user_data);
 
 /**
  * C callback types for fork init and work functions.
@@ -1173,6 +1188,31 @@ sandlock_result_t *sandlock_gather_run(sandlock_gather_t *g, uint64_t timeout_ms
 void sandlock_gather_free(sandlock_gather_t *g);
 
 /**
+ * Resolve an approval once. Returns false if it expired or was already answered.
+ * Verdict encoding is the same as the synchronous policy callback.
+ *
+ * # Safety
+ * `approval` must be live, with exclusive access for the duration of this call.
+ */
+bool sandlock_approval_resolve(sandlock_approval_t *approval, int32_t verdict);
+
+/**
+ * Whether an approval can no longer accept a decision.
+ *
+ * # Safety
+ * `approval` must be live and must not be concurrently resolved or freed.
+ */
+bool sandlock_approval_is_cancelled(const sandlock_approval_t *approval);
+
+/**
+ * Release an approval. An unanswered approval fails closed.
+ *
+ * # Safety
+ * `approval` must be null or an owned handle, released exactly once, without concurrent access.
+ */
+void sandlock_approval_free(sandlock_approval_t *approval);
+
+/**
  * Set a policy callback and its held verdict timeout in milliseconds.
  * Negative disables the timeout; zero denies immediately. Pass 5000 for
  * the SDK default.
@@ -1190,6 +1230,21 @@ sandlock_builder_t *sandlock_sandbox_builder_policy_fn(sandlock_builder_t *b,
                                                        int64_t verdict_timeout_ms,
                                                        void *user_data,
                                                        void (*user_data_drop)(void *user_data));
+
+/**
+ * Set a deferred callback. Non-null approvals are owned by the callback and
+ * may outlive it. Release every handle with sandlock_approval_free.
+ * Timeout settings match sandlock_sandbox_builder_policy_fn.
+ *
+ * # Safety
+ * Builder, callback and user data follow sandlock_sandbox_builder_policy_fn's
+ * lifetime requirements. Event and context are valid only during the callback.
+ */
+sandlock_builder_t *sandlock_sandbox_builder_policy_fn_deferred(sandlock_builder_t *b,
+                                                                sandlock_deferred_policy_fn_t cb,
+                                                                int64_t verdict_timeout_ms,
+                                                                void *user_data,
+                                                                Option_sandlock_policy_ud_drop_t user_data_drop);
 
 /**
  * Whether sandbox shutdown has cancelled the callback. Approval loops must

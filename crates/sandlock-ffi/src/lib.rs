@@ -2186,6 +2186,49 @@ pub type sandlock_policy_fn_t = unsafe extern "C" fn(
     user_data: *mut c_void,
 ) -> i32;
 
+/// An owned approval. Release it even after resolving or cancellation.
+#[allow(non_camel_case_types)]
+pub struct sandlock_approval_t {
+    approval: sandlock_core::policy_fn::Approval,
+}
+
+/// The callback owns `approval` when non-null; event and context are borrowed.
+#[allow(non_camel_case_types)]
+pub type sandlock_deferred_policy_fn_t = unsafe extern "C" fn(
+    event: *const sandlock_event_t,
+    ctx: *mut sandlock_ctx_t,
+    approval: *mut sandlock_approval_t,
+    user_data: *mut c_void,
+);
+
+/// Resolve an approval once. Returns false if it expired or was already answered.
+/// Verdict encoding is the same as the synchronous policy callback.
+///
+/// # Safety
+/// `approval` must be live, with exclusive access for the duration of this call.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_approval_resolve(approval: *mut sandlock_approval_t, verdict: i32) -> bool {
+    !approval.is_null() && (*approval).approval.resolve(policy_ret_to_verdict(verdict)).is_ok()
+}
+
+/// Whether an approval can no longer accept a decision.
+///
+/// # Safety
+/// `approval` must be live and must not be concurrently resolved or freed.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_approval_is_cancelled(approval: *const sandlock_approval_t) -> bool {
+    approval.is_null() || (*approval).approval.is_cancelled()
+}
+
+/// Release an approval. An unanswered approval fails closed.
+///
+/// # Safety
+/// `approval` must be null or an owned handle, released exactly once, without concurrent access.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_approval_free(approval: *mut sandlock_approval_t) {
+    if !approval.is_null() { drop(Box::from_raw(approval)); }
+}
+
 /// C destructor type for policy_fn user data.
 ///
 /// Called when the native policy callback is dropped. This may be later than a
@@ -2195,7 +2238,8 @@ pub type sandlock_policy_fn_t = unsafe extern "C" fn(
 pub type sandlock_policy_ud_drop_t = unsafe extern "C" fn(user_data: *mut c_void);
 
 struct PolicyCallbackState {
-    cb: sandlock_policy_fn_t,
+    cb: Option<sandlock_policy_fn_t>,
+    deferred: Option<sandlock_deferred_policy_fn_t>,
     user_data: *mut c_void,
     user_data_drop: Option<sandlock_policy_ud_drop_t>,
 }
@@ -2207,8 +2251,17 @@ unsafe impl Send for PolicyCallbackState {}
 unsafe impl Sync for PolicyCallbackState {}
 
 impl PolicyCallbackState {
-    unsafe fn call(&self, event: *const sandlock_event_t, ctx: *mut sandlock_ctx_t) -> i32 {
-        (self.cb)(event, ctx, self.user_data)
+    unsafe fn call(&self, event: *const sandlock_event_t, ctx: *mut sandlock_ctx_t,
+                   approval: Option<sandlock_core::policy_fn::Approval>) {
+        if let Some(cb) = self.deferred {
+            let handle = approval.map_or(ptr::null_mut(), |approval| {
+                Box::into_raw(Box::new(sandlock_approval_t { approval }))
+            });
+            cb(event, ctx, handle, self.user_data);
+        } else if let Some(cb) = self.cb {
+            let verdict = policy_ret_to_verdict(cb(event, ctx, self.user_data));
+            if let Some(mut approval) = approval { let _ = approval.resolve(verdict); }
+        }
     }
 }
 
@@ -2257,19 +2310,43 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_policy_fn(
     user_data: *mut c_void,
     user_data_drop: Option<unsafe extern "C" fn(user_data: *mut c_void)>,
 ) -> *mut SandboxBuilder {
-    if b.is_null() {
-        return b;
-    }
+    build_policy_callback(b, verdict_timeout_ms, PolicyCallbackState {
+        cb: Some(cb), deferred: None, user_data, user_data_drop,
+    })
+}
+
+/// Set a deferred callback. Non-null approvals are owned by the callback and
+/// may outlive it. Release every handle with sandlock_approval_free.
+/// Timeout settings match sandlock_sandbox_builder_policy_fn.
+///
+/// # Safety
+/// Builder, callback and user data follow sandlock_sandbox_builder_policy_fn's
+/// lifetime requirements. Event and context are valid only during the callback.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_policy_fn_deferred(
+    b: *mut SandboxBuilder,
+    cb: sandlock_deferred_policy_fn_t,
+    verdict_timeout_ms: i64,
+    user_data: *mut c_void,
+    user_data_drop: Option<sandlock_policy_ud_drop_t>,
+) -> *mut SandboxBuilder {
+    build_policy_callback(b, verdict_timeout_ms, PolicyCallbackState {
+        cb: None, deferred: Some(cb), user_data, user_data_drop,
+    })
+}
+
+unsafe fn build_policy_callback(
+    b: *mut SandboxBuilder,
+    verdict_timeout_ms: i64,
+    state: PolicyCallbackState,
+) -> *mut SandboxBuilder {
+    if b.is_null() { return b; }
     let builder = *Box::from_raw(b);
-    let state = PolicyCallbackState {
-        cb,
-        user_data,
-        user_data_drop,
-    };
 
     // Wrap the C callback in a Rust closure
     let cb_fn = move |event: sandlock_core::policy_fn::SyscallEvent,
-                      ctx: &mut sandlock_core::policy_fn::PolicyContext| {
+                      ctx: &mut sandlock_core::policy_fn::PolicyContext,
+                      approval: Option<sandlock_core::policy_fn::Approval>| {
         let syscall_c = CString::new(event.syscall.as_str()).unwrap_or_default();
         let host_c = event
             .host
@@ -2313,8 +2390,7 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_policy_fn(
 
         let mut c_ctx = sandlock_ctx_t { ctx: ctx as *mut _ };
 
-        let ret = unsafe { state.call(&c_event, &mut c_ctx) };
-        policy_ret_to_verdict(ret)
+        unsafe { state.call(&c_event, &mut c_ctx, approval) };
     };
 
     let timeout = if verdict_timeout_ms < 0 {
@@ -2322,7 +2398,7 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_policy_fn(
     } else {
         Some(std::time::Duration::from_millis(verdict_timeout_ms as u64))
     };
-    let policy_fn = sandlock_core::PolicyFn::new(cb_fn).verdict_timeout(timeout);
+    let policy_fn = sandlock_core::PolicyFn::deferred(cb_fn).verdict_timeout(timeout);
     Box::into_raw(Box::new(builder.policy_fn(policy_fn)))
 }
 
