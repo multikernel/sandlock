@@ -1028,16 +1028,22 @@ impl Sandbox {
     pub async fn shutdown(&mut self) -> Result<crate::result::RunResult, crate::error::SandlockError> {
         use crate::error::SandboxRuntimeError;
         use crate::result::RunResult;
-        if let Some(reaper) = self.runtime.as_mut().and_then(|rt| rt.reaper.as_mut()) {
+        let rt = self.runtime.as_mut().ok_or(SandboxRuntimeError::NotRunning)?;
+        let signal_groups = rt.reaper.is_none() && !matches!(rt.state, RuntimeState::Stopped(_));
+        if let Some(reaper) = &mut rt.reaper {
+            // The reaper owns descendant cleanup even on kernels without pidfd group signals.
             reaper.shutdown();
+            if let Some(worker) = &rt.policy_fn_worker { worker.cancel(); }
         }
-        self.kill()?;
+        if signal_groups { self.kill()?; }
         let exit_status = self.wait().await?;
-        loop {
-            if self.rt().groups.signal(libc::SIGKILL).map_err(SandboxRuntimeError::Io)? == 0 {
-                break;
+        if signal_groups {
+            loop {
+                if self.rt().groups.signal(libc::SIGKILL).map_err(SandboxRuntimeError::Io)? == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         if let Some(reaper) = &self.rt().reaper {
             loop {

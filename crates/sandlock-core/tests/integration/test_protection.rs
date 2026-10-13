@@ -534,3 +534,135 @@ async fn degraded_policy_confines_and_runs_below_v6() {
         "degraded-mode confinement must still execute the child"
     );
 }
+
+#[test]
+fn shutdown_without_pidfd_group_signals() {
+    const CHILD: &str = "SANDLOCK_TEST_NO_PIDFD_GROUP_SIGNALS";
+    if std::env::var_os(CHILD).is_none() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "test_protection::shutdown_without_pidfd_group_signals",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("shutdown hung without pidfd group signals");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    // Emulate kernels that reject PIDFD_SIGNAL_PROCESS_GROUP, including 6.8.
+    let filter = [
+        libc::sock_filter {
+            code: 0x20,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+        libc::sock_filter {
+            code: 0x15,
+            jt: 0,
+            jf: 3,
+            k: libc::SYS_pidfd_send_signal as u32,
+        },
+        libc::sock_filter {
+            code: 0x20,
+            jt: 0,
+            jf: 0,
+            k: 16 + 3 * 8,
+        },
+        libc::sock_filter {
+            code: 0x45,
+            jt: 0,
+            jf: 1,
+            k: 1 << 2,
+        },
+        libc::sock_filter {
+            code: 0x06,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ERRNO | libc::EINVAL as u32,
+        },
+        libc::sock_filter {
+            code: 0x06,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ALLOW,
+        },
+    ];
+    let program = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_ptr() as *mut _,
+    };
+    unsafe {
+        assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+        assert_eq!(
+            libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program),
+            0
+        );
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let ready = dir.path().join("ready");
+    let mut builder = sandlock_core::Sandbox::builder();
+    for protection in Protection::all() {
+        builder = builder.allow_degraded(protection);
+    }
+    let mut sb = builder
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_write(dir.path())
+        .build()
+        .unwrap();
+    let policy = sb.clone();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let result = sb.run(&["echo", "ok"]).await.unwrap();
+            assert!(result.success());
+            assert_eq!(result.stdout.as_deref(), Some(b"ok\n".as_slice()));
+            assert!(sb.shutdown().await.unwrap().success());
+            let mut sb = policy;
+            let script = format!(
+                r#"
+import os, signal, time
+if os.fork() == 0:
+    os.setsid()
+    open({ready:?}, "w").write(str(os.getpid()))
+    signal.pause()
+while not os.path.exists({ready:?}):
+    time.sleep(0.01)
+os._exit(7)
+"#
+            );
+            sb.spawn(&["python3", "-c", &script]).await.unwrap();
+            assert_eq!(sb.wait().await.unwrap(), sandlock_core::ExitStatus::Code(7));
+            let child: i32 = std::fs::read_to_string(&ready).unwrap().parse().unwrap();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), sb.shutdown())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.code(), Some(7));
+            assert_eq!(unsafe { libc::kill(child, 0) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+        });
+}
