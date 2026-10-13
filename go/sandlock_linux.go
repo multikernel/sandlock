@@ -14,6 +14,7 @@ package sandlock
 #include "sandlock.h"
 
 extern int32_t goPolicyCallback(sandlock_event_t *event, sandlock_ctx_t *ctx, void *user_data);
+extern void goDeferredPolicyCallback(sandlock_event_t *event, sandlock_ctx_t *ctx, sandlock_approval_t *approval, void *user_data);
 extern void goPolicyDrop(void *user_data);
 */
 import "C"
@@ -43,7 +44,7 @@ var (
 	policyCallbacks      sync.Map // uint64 -> PolicyFunc
 )
 
-func registerPolicyCallback(fn PolicyFunc) unsafe.Pointer {
+func registerPolicyCallback(fn any) unsafe.Pointer {
 	id := nextPolicyCallbackID.Add(1)
 	userData := C.malloc(C.size_t(unsafe.Sizeof(C.uint64_t(0))))
 	if userData == nil {
@@ -115,6 +116,68 @@ func goPolicyCallback(event *C.sandlock_event_t, ctx *C.sandlock_ctx_t, userData
 	return C.int32_t(decision)
 }
 
+// Approval owns a pending verdict. Use Resolve or Close; do not copy it.
+type Approval struct {
+	mu  sync.Mutex
+	ptr *C.sandlock_approval_t
+}
+
+// Resolve answers once and releases the native handle.
+func (a *Approval) Resolve(decision PolicyDecision) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.ptr == nil {
+		return fmt.Errorf("sandlock: approval is no longer pending")
+	}
+	ptr := a.ptr
+	a.ptr = nil
+	ok := C.sandlock_approval_resolve(ptr, C.int32_t(decision))
+	C.sandlock_approval_free(ptr)
+	if !bool(ok) {
+		return fmt.Errorf("sandlock: approval is no longer pending")
+	}
+	return nil
+}
+
+// Close denies an unanswered request and releases the handle. It is idempotent.
+func (a *Approval) Close() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.ptr != nil {
+		C.sandlock_approval_free(a.ptr)
+		a.ptr = nil
+	}
+}
+
+// IsCancelled reports whether a decision can no longer be accepted.
+func (a *Approval) IsCancelled() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.ptr == nil || bool(C.sandlock_approval_is_cancelled(a.ptr))
+}
+
+//export goDeferredPolicyCallback
+func goDeferredPolicyCallback(event *C.sandlock_event_t, ctx *C.sandlock_ctx_t, ptr *C.sandlock_approval_t, userData unsafe.Pointer) {
+	var approval *Approval
+	if ptr != nil {
+		approval = &Approval{ptr: ptr}
+		runtime.SetFinalizer(approval, (*Approval).Close)
+	}
+	defer func() {
+		if recover() != nil && approval != nil {
+			approval.Close()
+		}
+	}()
+	fn, ok := policyCallbacks.Load(policyCallbackID(userData))
+	if !ok {
+		if approval != nil {
+			approval.Close()
+		}
+		return
+	}
+	fn.(DeferredPolicyFunc)(policyEventFromC(event), &PolicyContext{ptr: unsafe.Pointer(ctx)}, approval)
+}
+
 //export goPolicyDrop
 func goPolicyDrop(userData unsafe.Pointer) {
 	unregisterPolicyCallback(userData)
@@ -168,8 +231,8 @@ func (s *Sandbox) validateStrings() error {
 // buildPolicy translates the Sandbox configuration into a native policy handle.
 // The returned pointer must be released with C.sandlock_sandbox_free.
 func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
-	if s.PolicyFn != nil && s.PolicyFn.Callback == nil {
-		return nil, fmt.Errorf("sandlock: PolicyFn.Callback must not be nil")
+	if s.PolicyFn != nil && (s.PolicyFn.Callback == nil) == (s.PolicyFn.Deferred == nil) {
+		return nil, fmt.Errorf("sandlock: PolicyFn requires exactly one of Callback and Deferred")
 	}
 	if err := s.validateStrings(); err != nil {
 		return nil, err
@@ -408,13 +471,19 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 				timeoutMs++
 			}
 		}
-		b = C.sandlock_sandbox_builder_policy_fn(
-			b,
-			(C.sandlock_policy_fn_t)(C.goPolicyCallback),
-			C.int64_t(timeoutMs),
-			registerPolicyCallback(s.PolicyFn.Callback),
-			(*[0]byte)(C.goPolicyDrop),
-		)
+		if s.PolicyFn.Deferred != nil {
+			b = C.sandlock_sandbox_builder_policy_fn_deferred(
+				b, (C.sandlock_deferred_policy_fn_t)(C.goDeferredPolicyCallback),
+				C.int64_t(timeoutMs), registerPolicyCallback(s.PolicyFn.Deferred),
+				(*[0]byte)(C.goPolicyDrop),
+			)
+		} else {
+			b = C.sandlock_sandbox_builder_policy_fn(
+				b, (C.sandlock_policy_fn_t)(C.goPolicyCallback),
+				C.int64_t(timeoutMs), registerPolicyCallback(s.PolicyFn.Callback),
+				(*[0]byte)(C.goPolicyDrop),
+			)
+		}
 	}
 
 	var errCode C.int

@@ -1028,3 +1028,39 @@ func TestPolicyFnRequiresCallback(t *testing.T) {
 		t.Fatal("PolicyFn without a callback must be rejected")
 	}
 }
+
+func TestDeferredPolicy(t *testing.T) {
+	requireLandlock(t)
+	approvals := make(chan *sandlock.Approval, 64)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for approval := range approvals {
+			if err := approval.Resolve(sandlock.Allow()); err != nil {
+				t.Error(err)
+			}
+			if err := approval.Resolve(sandlock.Deny()); err == nil {
+				t.Error("duplicate decision accepted")
+			}
+		}
+	}()
+	sb := &sandlock.Sandbox{
+		FSReadable: rootfs,
+		PolicyFn: &sandlock.PolicyFn{
+			Deferred: func(event sandlock.SyscallEvent, ctx *sandlock.PolicyContext, approval *sandlock.Approval) {
+				if approval != nil {
+					approvals <- approval
+				}
+			},
+		},
+	}
+	res, err := sb.Run(context.Background(), "/bin/true")
+	close(approvals)
+	<-done
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Success {
+		t.Fatal("deferred approval denied")
+	}
+}

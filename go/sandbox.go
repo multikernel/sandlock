@@ -162,8 +162,12 @@ type PolicyFunc func(event SyscallEvent, ctx *PolicyContext) PolicyDecision
 const NoTimeout time.Duration = -1
 
 // PolicyFn groups a dynamic policy callback with its held-verdict settings.
+type DeferredPolicyFunc func(event SyscallEvent, ctx *PolicyContext, approval *Approval)
+
+// PolicyFn accepts exactly one of Callback and Deferred.
 type PolicyFn struct {
 	Callback PolicyFunc
+	Deferred DeferredPolicyFunc
 	// VerdictTimeout includes queue time. Zero uses five seconds; a negative
 	// value, conventionally NoTimeout, disables the deadline.
 	VerdictTimeout time.Duration

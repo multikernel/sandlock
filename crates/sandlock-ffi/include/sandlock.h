@@ -163,8 +163,6 @@ enum sandlock_exception
 typedef uint32_t sandlock_exception;
 #endif // __cplusplus
 
-typedef struct Option_sandlock_policy_ud_drop_t Option_sandlock_policy_ud_drop_t;
-
 /**
  * An owned approval. Release it even after resolving or cancellation.
  */
@@ -1244,7 +1242,7 @@ sandlock_builder_t *sandlock_sandbox_builder_policy_fn_deferred(sandlock_builder
                                                                 sandlock_deferred_policy_fn_t cb,
                                                                 int64_t verdict_timeout_ms,
                                                                 void *user_data,
-                                                                Option_sandlock_policy_ud_drop_t user_data_drop);
+                                                                void (*user_data_drop)(void *user_data));
 
 /**
  * Whether sandbox shutdown has cancelled the callback. Approval loops must

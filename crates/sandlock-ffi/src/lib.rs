@@ -2328,7 +2328,7 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_policy_fn_deferred(
     cb: sandlock_deferred_policy_fn_t,
     verdict_timeout_ms: i64,
     user_data: *mut c_void,
-    user_data_drop: Option<sandlock_policy_ud_drop_t>,
+    user_data_drop: Option<unsafe extern "C" fn(user_data: *mut c_void)>,
 ) -> *mut SandboxBuilder {
     build_policy_callback(b, verdict_timeout_ms, PolicyCallbackState {
         cb: None, deferred: Some(cb), user_data, user_data_drop,
