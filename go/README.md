@@ -139,8 +139,8 @@ func (s *Sandbox) Popen(stdio Stdio, cmd ...string) (*Process, error)
   `Stdio` inherits all three (identical to Spawn). Close a piped `Stdin` before
   `Wait` (or let `Wait` close it for you) so a reader child sees EOF; drain a
   piped `Stdout`/`Stderr` before `Wait`, or `Kill` from another goroutine to
-  interrupt a blocked `Wait`. `Wait` returns a `Result` with the exit status
-  only — a Popen'd process sends piped output to the `Stdout`/`Stderr` fields
+  interrupt a blocked `Wait`. `Wait` returns an `ExitStatus` and retains the session.
+  A Popen'd process sends piped output to the `Stdout`/`Stderr` fields
   (inherited/null streams go to the parent fd or `/dev/null`), so (unlike `Run`)
   `Result.Stdout`/`Result.Stderr` are always empty.
 
@@ -260,14 +260,16 @@ sb := &sandlock.Sandbox{
 
 ```go
 func (p *Process) Pid() int
-func (p *Process) Wait() (*Result, error)
+func (p *Process) Wait() (*ExitStatus, error)
+func (p *Process) Shutdown() (*Result, error)
+func (p *Process) ProcessGroups() ([]int, error)
 func (p *Process) Pause() error           // SIGSTOP to the process group
 func (p *Process) Resume() error          // SIGCONT
 func (p *Process) Kill() error            // SIGKILL
 func (p *Process) Ports() (map[int]int, error) // virtual→real, with PortRemap
 func (p *Process) Close() error           // release the handle (kills if running), close piped streams
 
-// BranchActionDefer only: after Wait, the change set stays on the Process.
+// BranchActionDefer only: after Shutdown, the change set stays on the Process.
 func (p *Process) Pending() bool          // exited under Defer and undecided
 func (p *Process) UpperDir() string       // new bytes of added/modified files, laid out like Workdir
 func (p *Process) Commit() error          // merge into Workdir (blocks up to 5s on a contended workdir)
@@ -278,6 +280,12 @@ p.Stdin  // *os.File
 p.Stdout // *os.File
 p.Stderr // *os.File
 ```
+
+`Wait` reports the main process's status while background jobs remain supervised.
+`ProcessGroups` returns a sorted snapshot of tracked live groups. `Shutdown`
+terminates remaining jobs with SIGKILL, reaps them, and returns captured output
+and filesystem changes. `Run` performs both steps automatically. Use `Close`
+when no result is needed; it also closes caller-owned streams.
 
 ### Confine the current process
 

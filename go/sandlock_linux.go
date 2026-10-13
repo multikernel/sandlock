@@ -731,13 +731,23 @@ func (s *Sandbox) Run(ctx context.Context, cmd ...string) (*Result, error) {
 		C.sandlock_handle_free(h)
 		return nil, fmt.Errorf("sandlock: failed to start sandbox")
 	}
-	r := C.sandlock_handle_wait_timeout(h, timeoutMs(ctx))
+	status := C.sandlock_handle_wait_timeout(h, timeoutMs(ctx))
+	if status == nil {
+		C.sandlock_handle_free(h)
+		return nil, fmt.Errorf("sandlock: wait failed")
+	}
+	timedOut := ExitReason(C.sandlock_result_reason(status)) == ReasonTimeout
+	C.sandlock_result_free(status)
+	r := C.sandlock_handle_shutdown(h)
 	C.sandlock_handle_free(h)
 	if r == nil {
-		return nil, fmt.Errorf("sandlock: wait failed")
+		return nil, fmt.Errorf("sandlock: shutdown failed")
 	}
 	res := readResult(r)
 	C.sandlock_result_free(r)
+	if timedOut {
+		res.ExitCode, res.Reason, res.Signal, res.Success = -1, ReasonTimeout, -1, false
+	}
 	return res, nil
 }
 
@@ -852,21 +862,19 @@ func SyscallNr(name string) (int, error) {
 	return int(nr), nil
 }
 
-// Process is a live sandboxed process started by Spawn. It supports PID
-// inspection, pause/resume/kill via the process group, and Wait. A Process
-// holds at most one running command; create separate Spawns for concurrency.
-//
-// The underlying FFI handle is not safe for concurrent access, so all handle
-// operations are serialized. Pause/Resume/Kill act on the OS process group by
-// PID and touch no handle state, so they remain usable while Wait blocks on
-// the handle — that is how Kill interrupts a blocked Wait. Ports, by contrast,
-// reads the handle and is reported as empty while a Wait is in flight.
+// Process owns a sandbox session started by Spawn or Popen. Wait reports the
+// main process's status; Shutdown terminates remaining jobs and collects output.
+// Close releases the session and caller-owned streams without returning output.
+// Handle operations are serialized, including signals during a blocked Wait.
 type Process struct {
-	mu      sync.Mutex
-	h       *C.sandlock_handle_t
-	pid     int
-	waiting bool // a Wait owns the handle; other handle ops must defer to it
-	pending bool // the run exited under BranchActionDefer; Commit/Abort own the handle now
+	mu             sync.Mutex
+	h              *C.sandlock_handle_t
+	pid            int
+	waiting        bool // a Wait reserves the session between bounded native calls
+	closeRequested bool
+	status         *ExitStatus
+	result         *Result
+	pending        bool // the run exited under BranchActionDefer; Commit/Abort own the handle now
 
 	// Caller-owned stdio for a process started by Popen. Each is non-nil only
 	// for a stream wired StdioPiped; it owns the pipe fd (closing the file
@@ -980,7 +988,7 @@ func (s *Sandbox) Popen(stdio Stdio, cmd ...string) (*Process, error) {
 }
 
 // finalize is the SetFinalizer cleanup for a Process abandoned without
-// Wait/Close. It can only run once the Process is unreachable, which implies
+// Shutdown/Close. It can only run once the Process is unreachable, which implies
 // no Wait is in flight (a blocked Wait keeps the Process reachable), so the
 // handle is not concurrently borrowed and is safe to free here. The piped
 // streams are intentionally left alone: once the Process is unreachable so are
@@ -990,9 +998,6 @@ func (p *Process) finalize() {
 	defer p.mu.Unlock()
 	if p.h == nil {
 		return
-	}
-	if p.pid > 0 {
-		_ = syscall.Kill(-p.pid, syscall.SIGKILL)
 	}
 	C.sandlock_handle_free(p.h)
 	p.h = nil
@@ -1005,59 +1010,115 @@ func (p *Process) Pid() int {
 	return p.pid
 }
 
-// Wait blocks until the process exits, returns its Result, and releases the
-// handle. After Wait the Process is no longer running.
-//
-// The Result carries the exit status only. Unlike Run, a Popen'd process sends
-// any StdioPiped output to the caller through the Stdout/Stderr fields (and
-// StdioInherit/StdioNull output to the inherited fd or /dev/null), so it is
-// never captured into Result.Stdout/Result.Stderr — read piped bytes off
-// p.Stdout/p.Stderr, not off the Result.
-//
-// The blocking native wait runs without holding the mutex so that Kill (and
-// Pause/Resume), which signal the process group by PID, can run concurrently
-// and interrupt it. The waiting flag reserves exclusive use of the handle for
-// the duration, so no other handle operation aliases it.
-//
-// Wait closes a still-open piped Stdin to deliver EOF, so do not write to Stdin
-// from another goroutine while Wait runs — the write would race a closing fd.
-func (p *Process) Wait() (*Result, error) {
+// Wait returns the main process's status, retaining background supervision.
+// It closes piped Stdin; caller-owned output must be drained concurrently if
+// needed. Repeated waits return the cached status. Kill can interrupt a wait.
+func (p *Process) Wait() (*ExitStatus, error) {
 	p.mu.Lock()
-	if p.h == nil || p.waiting {
+	if p.waiting {
 		p.mu.Unlock()
 		return nil, ErrNotRunning
 	}
-	h := p.h
-	stdin := p.Stdin
-	p.waiting = true
-	p.mu.Unlock()
-
-	// Deliver EOF to a still-open piped stdin so a reader child (e.g. cat) can
-	// exit; otherwise the native wait blocks forever. Harmless if already closed.
-	if stdin != nil {
-		_ = stdin.Close()
+	if p.status != nil {
+		status := *p.status
+		p.mu.Unlock()
+		return &status, nil
 	}
+	if p.h == nil {
+		p.mu.Unlock()
+		return nil, ErrNotRunning
+	}
+	p.waiting = true
+	if p.Stdin != nil {
+		_ = p.Stdin.Close()
+	}
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		p.waiting = false
+		if p.closeRequested {
+			C.sandlock_handle_free(p.h)
+			p.h = nil
+			runtime.SetFinalizer(p, nil)
+		}
+	}()
+	for {
+		p.mu.Lock()
+		// Bounded waits let signals use the same handle without aliasing Rust borrows.
+		r := C.sandlock_handle_wait_timeout(p.h, 50)
+		if r == nil {
+			p.mu.Unlock()
+			return nil, fmt.Errorf("sandlock: wait failed")
+		}
+		status := ExitStatus{
+			ExitCode: int(C.sandlock_result_exit_code(r)),
+			Reason:   ExitReason(C.sandlock_result_reason(r)),
+			Signal:   int(C.sandlock_result_signal(r)),
+			Success:  bool(C.sandlock_result_success(r)),
+		}
+		C.sandlock_result_free(r)
+		if status.Reason != ReasonTimeout {
+			p.status = &status
+			p.mu.Unlock()
+			copy := status
+			return &copy, nil
+		}
+		p.mu.Unlock()
+		runtime.Gosched()
+	}
+}
 
-	r := C.sandlock_handle_wait(h)
-
+// Shutdown sends SIGKILL to remaining jobs, reaps them, and collects output and
+// filesystem changes. Caller-owned output streams stay open. A deferred branch
+// stays available for Commit or Abort. Repeated calls return the cached result.
+func (p *Process) Shutdown() (*Result, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.waiting = false
-	// A deferred branch keeps the handle alive until Commit/Abort/Close; the
-	// finalizer stays armed so a leaked Process still preserves it.
-	if C.sandlock_handle_pending(h) != 0 {
+	if p.waiting {
+		return nil, ErrNotRunning
+	}
+	if p.result != nil {
+		return p.result, nil
+	}
+	if p.h == nil {
+		return nil, ErrNotRunning
+	}
+	r := C.sandlock_handle_shutdown(p.h)
+	if r == nil {
+		return nil, fmt.Errorf("sandlock: shutdown failed")
+	}
+	p.result = readResult(r)
+	C.sandlock_result_free(r)
+	p.status = &ExitStatus{ExitCode: p.result.ExitCode, Reason: p.result.Reason,
+		Signal: p.result.Signal, Success: p.result.Success}
+	if C.sandlock_handle_pending(p.h) != 0 {
 		p.pending = true
 	} else {
-		C.sandlock_handle_free(h)
+		C.sandlock_handle_free(p.h)
 		p.h = nil
 		runtime.SetFinalizer(p, nil)
 	}
-	if r == nil {
-		return nil, fmt.Errorf("sandlock: wait failed")
+	return p.result, nil
+}
+
+// ProcessGroups returns a sorted snapshot of tracked live process group IDs.
+func (p *Process) ProcessGroups() ([]int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.h == nil {
+		return nil, ErrNotRunning
 	}
-	res := readResult(r)
-	C.sandlock_result_free(r)
-	return res, nil
+	raw := C.sandlock_handle_process_groups(p.h)
+	if raw == nil {
+		return nil, fmt.Errorf("sandlock: process group inspection failed")
+	}
+	defer C.sandlock_string_free(raw)
+	var groups []int
+	if err := json.Unmarshal([]byte(C.GoString(raw)), &groups); err != nil {
+		return nil, err
+	}
+	return groups, nil
 }
 
 // Pending reports whether the process exited under BranchActionDefer and its
@@ -1118,45 +1179,35 @@ func (p *Process) dispose(op func(*C.sandlock_handle_t) C.int, name string) erro
 func (p *Process) signal(sig syscall.Signal) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.h == nil || p.pid <= 0 || p.pending {
-		return ErrNotRunning
-	}
-	// The sandbox child leads its own process group; signal the whole group.
-	return syscall.Kill(-p.pid, sig)
-}
-
-// Pause sends SIGSTOP to the sandbox process group.
-func (p *Process) Pause() error { return p.signal(syscall.SIGSTOP) }
-
-// Resume sends SIGCONT to the sandbox process group.
-func (p *Process) Resume() error { return p.signal(syscall.SIGCONT) }
-
-// Kill sends SIGKILL to the sandbox process group. It is idempotent: a process
-// that already exited (ESRCH) or was already reaped by Wait (ErrNotRunning) is
-// not an error — killing it is a no-op success, matching the FFI
-// (sandlock_handle_kill returns 0) and the Python binding (silent no-op after
-// wait()). This keeps the "Kill from another goroutine" escape hatch race-free:
-// a Kill that fires just as Wait reaps the child still returns nil.
-func (p *Process) Kill() error {
-	err := p.signal(syscall.SIGKILL)
-	if err == syscall.ESRCH {
-		return nil // child already exited (still unreaped) — no-op
-	}
-	if err == ErrNotRunning {
-		// signal() returns ErrNotRunning for two causes: the handle was already
-		// reaped by Wait (h == nil) — an idempotent no-op — or a live handle with
-		// no pid. Only the reaped case is a success; a missing pid is a genuine
-		// error we must surface (and must never turn into killpg(-0), which would
-		// signal our own process group).
-		p.mu.Lock()
-		reaped := p.h == nil
-		p.mu.Unlock()
-		if reaped {
+	if p.h == nil || p.pending {
+		if sig == syscall.SIGKILL {
 			return nil
 		}
+		return ErrNotRunning
 	}
-	return err
+	var rc C.int
+	switch sig {
+	case syscall.SIGSTOP:
+		rc = C.sandlock_handle_pause(p.h)
+	case syscall.SIGCONT:
+		rc = C.sandlock_handle_resume(p.h)
+	case syscall.SIGKILL:
+		rc = C.sandlock_handle_kill(p.h)
+	}
+	if rc != 0 {
+		return fmt.Errorf("sandlock: signal failed")
+	}
+	return nil
 }
+
+// Pause sends SIGSTOP to the tracked live process groups.
+func (p *Process) Pause() error { return p.signal(syscall.SIGSTOP) }
+
+// Resume sends SIGCONT to the tracked live process groups.
+func (p *Process) Resume() error { return p.signal(syscall.SIGCONT) }
+
+// Kill sends SIGKILL to the tracked live process groups. It is idempotent.
+func (p *Process) Kill() error { return p.signal(syscall.SIGKILL) }
 
 // Ports returns the current virtual-to-real TCP port mappings while the
 // process is running. It is non-empty only when PortRemap is enabled and at
@@ -1206,10 +1257,9 @@ func (p *Process) Close() error {
 		return nil
 	}
 	if p.waiting {
-		// A Wait owns the handle and will free it; just kill the process
-		// group by PID to unblock that Wait, without touching the handle.
-		if p.pid > 0 {
-			_ = syscall.Kill(-p.pid, syscall.SIGKILL)
+		p.closeRequested = true
+		if C.sandlock_handle_kill(p.h) != 0 {
+			return fmt.Errorf("sandlock: kill failed")
 		}
 		return nil
 	}

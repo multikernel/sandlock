@@ -321,6 +321,14 @@ const (
 	ReasonTimeout ExitReason = 3
 )
 
+// ExitStatus describes the main process without ending its sandbox session.
+type ExitStatus struct {
+	ExitCode int
+	Reason   ExitReason
+	Signal   int
+	Success  bool
+}
+
 // Result is the outcome of a captured run.
 type Result struct {
 	ExitCode int        // process exit code, or -1 if terminated abnormally
