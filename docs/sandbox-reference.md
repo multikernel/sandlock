@@ -480,6 +480,54 @@ The two `allow_degraded` calls let the sandbox build on Linux kernels
 below 6.12, where the v6 IPC scopes are unavailable. On a kernel that
 does support them, the scopes remain enforced.
 
+## Session lifecycle
+
+A sandbox session owns the main process launched by the caller and its
+background jobs. The main process exiting does not end the session:
+remaining jobs continue under the configured supervision until shutdown.
+
+The operations below describe the shared lifecycle. Method spelling and
+return types vary by binding.
+
+| Operation | Behavior |
+| :-------- | :------- |
+| Create and start | Create a confined main process, then release it to execute the command. Spawn combines these steps. |
+| Wait | Wait for the main process and return its exit status, retaining the session and background supervision. Repeated waits return the same main status. |
+| Inspect process groups | Return a sorted snapshot of tracked live process group IDs. Membership can change immediately after inspection. |
+| Pause, resume, kill | Send SIGSTOP, SIGCONT, or SIGKILL to tracked live process groups. Sending a signal does not collect the session's final result. |
+| Shutdown | Send SIGKILL to remaining jobs, reap the session's children, release supervision, and return the main status, captured output, and filesystem changes. |
+| Run | Start a command, wait for its main process, then shut down the session and return the complete result. |
+
+For a command that launches a background service, wait can report the
+launcher's exit while the service remains available. Keep the session
+alive while using the service, then shut it down. Run ends the session
+as soon as the main process finishes, terminating any remaining jobs.
+Shutdown can also be called before the main process exits to terminate
+the whole session; it does not perform a graceful termination sequence.
+
+Where a wait timeout is supported, expiration leaves the session alive.
+The caller can wait again or shut down. A run timeout terminates the
+session and reports a timeout result.
+
+### Output and filesystem changes
+
+Wait returns the main status without waiting for output EOF: background
+jobs may still hold output pipes open and write to them. Captured output
+continues draining and is collected at shutdown. With streaming stdio,
+caller-owned output streams must be drained as needed to prevent a full
+pipe from blocking the workload; their bytes are not included in the
+collected result.
+
+COW writes remain staged while the session is active, including writes
+made by background jobs after the main process exits. Shutdown collects
+the change set and applies the configured branch action after the jobs
+have exited. The main process's status selects `on_exit` or `on_error`.
+With `DEFER`, the branch becomes pending at session completion and stays
+available for an explicit commit or abort.
+
+Releasing the owning session handle also terminates and reaps its jobs.
+Use explicit shutdown when the caller needs the complete result.
+
 ## Enumerations
 
 ### `BranchAction`
@@ -547,7 +595,7 @@ parse_ports([80, "443", "8000-8005"])
    so a dynamic override can never erase it.
 3. **Seccomp COW with `workdir`.** When `workdir` is set, the
    seccomp-based COW path intercepts writes under `workdir` and stages
-   them in an upper layer, committed or aborted on exit per `on_exit` /
+   them in an upper layer, committed or aborted at session completion per `on_exit` /
    `on_error`. Staging covers regular files, directories, and symlinks.
    A FIFO, socket, or device node under `workdir` is a kernel object:
    opening it or changing its metadata goes to the kernel under the
