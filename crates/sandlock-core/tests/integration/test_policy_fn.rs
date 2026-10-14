@@ -1093,3 +1093,35 @@ assert not errors, errors
     assert!(sandbox.run_interactive(&["python3", "-c", &script]).await.unwrap().success());
     assert!(held.lock().unwrap().is_none());
 }
+
+#[tokio::test]
+async fn deferred_approval_waits_for_pending_exec() {
+    let (listener, port) = loopback_listener("127.0.0.1");
+    listener.set_nonblocking(true).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut sandbox = base_policy()
+        .policy_fn(PolicyFn::deferred(move |event, _, approval| {
+            let Some(mut approval) = approval else { return };
+            let marked = event.argv.as_ref().is_some_and(|argv| argv.iter().any(|a| a == "marker"));
+            if event.port == Some(port) || marked {
+                let _ = tx.send(approval);
+            } else {
+                approval.resolve(Verdict::Allow).unwrap();
+            }
+        }).verdict_timeout(Some(Duration::from_secs(10))))
+        .build().unwrap();
+    let script = format!(r#"
+import os, socket, threading, time
+threading.Thread(target=socket.create_connection, args=(('127.0.0.1', {port}),), daemon=True).start()
+time.sleep(0.2)
+os.execv('/bin/true', ['true', 'marker'])
+"#);
+    let run = tokio::spawn(async move { sandbox.run_interactive(&["python3", "-c", &script]).await });
+    let mut connect = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+    let mut exec = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+    connect.resolve(Verdict::Allow).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(listener.accept().is_err(), "a sibling ran while execve argv was under review");
+    exec.resolve(Verdict::Allow).unwrap();
+    assert!(run.await.unwrap().unwrap().success());
+}

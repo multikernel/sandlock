@@ -2558,8 +2558,14 @@ struct PendingApproval {
 }
 
 async fn next_approval(pending: &mut [PendingApproval]) -> (usize, crate::policy_fn::Verdict) {
+    // The exec freeze skips tasks blocked in a notification, so releasing one
+    // before the exec is decided would let it rewrite argv policy_fn approved.
+    let frozen = pending.iter().any(|p| p.notification.exec_freeze.is_some());
     std::future::poll_fn(|cx| {
         for (index, approval) in pending.iter_mut().enumerate() {
+            if frozen && approval.notification.exec_freeze.is_none() {
+                continue;
+            }
             if let std::task::Poll::Ready(verdict) = approval.verdict.as_mut().poll(cx) {
                 return std::task::Poll::Ready((index, verdict));
             }
