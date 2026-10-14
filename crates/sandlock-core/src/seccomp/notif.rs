@@ -106,6 +106,9 @@ pub struct PreparedOperation {
     pub(crate) port: Option<u16>,
     pub(crate) protocol: Option<String>,
     pub(crate) extra_destinations: Vec<(Option<std::net::IpAddr>, Option<u16>)>,
+    /// Destinations the handler checked; checked again if policy narrows
+    /// while the operation waits for its verdict.
+    pub(crate) checked: Vec<crate::network::CheckedDestination>,
     execute: Box<dyn FnOnce() -> NotifAction + Send + Sync>,
 }
 
@@ -184,8 +187,16 @@ impl NotifAction {
                 Protocol::Icmp => "icmp",
             }.to_string()),
             extra_destinations: Vec::new(),
+            checked: Vec::new(),
             execute: Box::new(execute),
         })
+    }
+
+    pub(crate) fn checked(mut self, destinations: impl IntoIterator<Item = crate::network::CheckedDestination>) -> Self {
+        if let Self::Prepared(operation) = &mut self {
+            operation.checked.extend(destinations);
+        }
+        self
     }
 
     /// Construct a [`NotifAction::Defer`] from a `'static` future.  Ergonomic
@@ -2669,26 +2680,9 @@ async fn recheck_policy(
     if matches!(action, NotifAction::Errno(_)) { return action; }
     let notif = &pending.notif;
     if let NotifAction::Prepared(operation) = &action {
-        if notif.data.nr as i64 != libc::SYS_bind
-            && (operation.host.is_some() || operation.extra_destinations.iter().any(|(host, _)| host.is_some()))
-        {
-            use crate::network::Protocol;
-            let protocol = match operation.protocol.as_deref() {
-                Some("tcp") => Protocol::Tcp,
-                Some("udp") => Protocol::Udp,
-                Some("icmp") => Protocol::Icmp,
-                _ => return NotifAction::Errno(libc::ECONNREFUSED),
-            };
-            for (host, port) in std::iter::once(&(operation.host, operation.port))
-                .chain(operation.extra_destinations.iter())
-            {
-                if let Some(host) = host {
-                    if let Err(errno) = crate::network::check_ip_destination(
-                        ctx, notif.pid, protocol, *host, *port,
-                    ).await {
-                        return NotifAction::Errno(errno);
-                    }
-                }
+        for destination in &operation.checked {
+            if let Err(errno) = destination.recheck(ctx, notif.pid).await {
+                return NotifAction::Errno(errno);
             }
         }
     }

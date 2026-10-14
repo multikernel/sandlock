@@ -16,7 +16,7 @@ use super::materialize::{
     set_port_in_sockaddr, sockaddr_is_ipv6,
 };
 use super::unix::connect_named_unix_on_behalf;
-use super::verdict::{layered_destination_verdict, path_under_any};
+use super::verdict::{layered_destination_verdict, path_under_any, CheckedDestination};
 use super::query_socket_protocol;
 
 // ============================================================
@@ -114,6 +114,7 @@ pub(super) async fn connect_on_behalf(
             }
             connect_dup(dup_fd.as_raw_fd(), &plan.addr)
         })
+        .checked([CheckedDestination { protocol, ip, port: dest_port }])
     } else {
         // Non-IP family. A NAMED (pathname) AF_UNIX connect is a gap Landlock
         // cannot close (it has no access right for unix-socket connect), so a

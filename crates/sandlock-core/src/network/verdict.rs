@@ -69,7 +69,7 @@ pub(crate) async fn check_ip_destination(
     protocol: Protocol,
     ip: IpAddr,
     port: Option<u16>,
-) -> Result<(), i32> {
+) -> Result<CheckedDestination, i32> {
     let ns = ctx.network.lock().await;
     let live_policy = {
         let pfs = ctx.policy_fn.lock().await;
@@ -77,7 +77,23 @@ pub(crate) async fn check_ip_destination(
     };
     let effective = ns.effective_network_policy(pid, protocol, live_policy.as_ref());
     drop(ns);
-    layered_destination_verdict(&effective, ip, port)
+    layered_destination_verdict(&effective, ip, port)?;
+    Ok(CheckedDestination { protocol, ip, port })
+}
+
+/// A destination that passed the verdict, kept so a held operation can be
+/// judged again against the policy that is live when it commits.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CheckedDestination {
+    pub(crate) protocol: Protocol,
+    pub(crate) ip: IpAddr,
+    pub(crate) port: Option<u16>,
+}
+
+impl CheckedDestination {
+    pub(crate) async fn recheck(self, ctx: &Arc<SupervisorCtx>, pid: u32) -> Result<(), i32> {
+        check_ip_destination(ctx, pid, self.protocol, self.ip, self.port).await.map(drop)
+    }
 }
 
 /// True if `real` (an already-canonical path) is at or under any of `prefixes`,

@@ -22,7 +22,7 @@ use super::unix::{
     sendto_pinned_unix_on_behalf, unix_sendmsg_gate,
 };
 use super::verdict::{
-    check_ip_destination, classify_send_path, path_under_any, DestShape, SendPath,
+    check_ip_destination, classify_send_path, CheckedDestination, path_under_any, DestShape, SendPath,
 };
 use super::{query_socket_protocol, socket_is_unix, Protocol};
 
@@ -81,9 +81,10 @@ pub(super) async fn sendto_on_behalf(
             Some(p) => p,
             None => return NotifAction::Errno(ECONNREFUSED),
         };
-        if let Err(e) = check_ip_destination(ctx, notif.pid, protocol, ip, dest_port).await {
-            return NotifAction::Errno(e);
-        }
+        let checked = match check_ip_destination(ctx, notif.pid, protocol, ip, dest_port).await {
+            Ok(checked) => checked,
+            Err(e) => return NotifAction::Errno(e),
+        };
 
         // 3. Copy data buffer from child memory
         let data = match read_child_mem(notif_fd, notif.id, notif.pid, buf_ptr, buf_len) {
@@ -103,7 +104,7 @@ pub(super) async fn sendto_on_behalf(
             _pinned: None,
         };
         let blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
-        prepare_send(dup_fd, m, flags, blocking)
+        prepare_send(dup_fd, m, flags, blocking).checked([checked])
     } else {
         // Non-IP family. Gate a NAMED AF_UNIX datagram the same way as connect:
         // sendto to a named socket is a WRITE on its inode, so deny unless the
@@ -287,9 +288,9 @@ pub(super) async fn sendmsg_on_behalf(
     let protocol = query_socket_protocol(dup_fd.as_raw_fd());
 
     match send_msghdr_on_behalf(notif, ctx, notif_fd, &dup_fd, protocol, msghdr_ptr).await {
-        Ok(m) => {
+        Ok((m, checked)) => {
             let blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
-            prepare_send(dup_fd, m, flags, blocking)
+            prepare_send(dup_fd, m, flags, blocking).checked(checked)
         }
         Err(errno) => NotifAction::Errno(errno),
     }
@@ -367,7 +368,7 @@ async fn send_msghdr_on_behalf(
     dup_fd: &std::os::unix::io::OwnedFd,
     protocol: Option<Protocol>,
     msghdr_ptr: u64,
-) -> Result<MaterializedMsg, i32> {
+) -> Result<(MaterializedMsg, Option<CheckedDestination>), i32> {
     let hdr = ChildMsghdr::read(notif, notif_fd, msghdr_ptr)?;
 
     // A connected socket carries no per-message address (`msg_name == NULL` or
@@ -386,6 +387,7 @@ async fn send_msghdr_on_behalf(
             Err(e) => return Err(e),
         }
     };
+    let mut checked = None;
     if !connected {
         let ip = match parse_ip_from_sockaddr(&addr_bytes) {
             Some(ip) => ip,
@@ -397,20 +399,21 @@ async fn send_msghdr_on_behalf(
         // A non-connected IP send must have a resolved protocol to key the
         // per-protocol allowlist. If it couldn't be resolved, fail closed.
         let protocol = protocol.ok_or(ECONNREFUSED)?;
-        check_ip_destination(ctx, notif.pid, protocol, ip, dest_port).await?;
+        checked = Some(check_ip_destination(ctx, notif.pid, protocol, ip, dest_port).await?);
     }
 
     // Translate SCM_RIGHTS / reject creds only for a unix socket; an IP socket's
     // control carries no fds or credentials and passes through untouched.
     // (`addr_bytes` is already empty for a connected send.)
-    materialize_msg(
+    let message = materialize_msg(
         notif,
         notif_fd,
         &hdr,
         addr_bytes,
         socket_is_unix(dup_fd.as_raw_fd()),
         None,
-    )
+    )?;
+    Ok((message, checked))
 }
 
 // ============================================================
@@ -509,6 +512,7 @@ pub(super) async fn sendmmsg_on_behalf(
         // it TOCTOU-safe against a racing fd swap.
         let protocol = query_socket_protocol(dup_fd.as_raw_fd());
         let mut entries = Vec::new();
+    let mut checked = Vec::new();
         let mut batch_bytes = 0usize;
         let mut first_errno: Option<i32> = None;
         for i in 0..vlen {
@@ -516,7 +520,10 @@ pub(super) async fn sendmmsg_on_behalf(
             let m = match send_msghdr_on_behalf(notif, ctx, notif_fd, &dup_fd, protocol, entry_ptr)
                 .await
             {
-                Ok(m) => m,
+                Ok((m, destination)) => {
+                    checked.extend(destination);
+                    m
+                }
                 Err(errno) => {
                     first_errno = Some(errno);
                     break;
@@ -534,7 +541,7 @@ pub(super) async fn sendmmsg_on_behalf(
             entries.push((socket, m, mmsg_msglen_addr(entry_ptr)));
         }
         return prepare_batch(entries, flags, notif_fd, notif.id, notif.pid,
-            first_errno.unwrap_or(ECONNREFUSED));
+            first_errno.unwrap_or(ECONNREFUSED)).checked(checked);
     }
 
     // No destination policy: the connected fast path is safe (nothing to
@@ -561,6 +568,7 @@ pub(super) async fn sendmmsg_on_behalf(
     };
 
     let mut entries = Vec::new();
+    let mut checked = Vec::new();
     let mut batch_bytes = 0usize;
     let mut first_errno: Option<i32> = None;
 
@@ -569,7 +577,10 @@ pub(super) async fn sendmmsg_on_behalf(
         // Every entry is OnBehalf (IP, non-connected) per the prescan above, so
         // the resolved protocol is always required and present here.
         let m = match send_msghdr_on_behalf(notif, ctx, notif_fd, &dup_fd, Some(protocol), entry_ptr).await {
-            Ok(m) => m,
+            Ok((m, destination)) => {
+                checked.extend(destination);
+                m
+            }
             Err(errno) => {
                 first_errno = Some(errno);
                 break;
@@ -588,5 +599,5 @@ pub(super) async fn sendmmsg_on_behalf(
     }
 
     prepare_batch(entries, flags, notif_fd, notif.id, notif.pid,
-        first_errno.unwrap_or(ECONNREFUSED))
+        first_errno.unwrap_or(ECONNREFUSED)).checked(checked)
 }

@@ -45,7 +45,7 @@ pub use rules::{
     NetRule, NetTarget, Protocol, ResolvedNetAllow, ResolvedNetAllowSet, ResolvedNetDenySet,
 };
 
-pub(crate) use verdict::check_ip_destination;
+pub(crate) use verdict::CheckedDestination;
 
 use connect::connect_on_behalf;
 use send::{sendmmsg_on_behalf, sendmsg_on_behalf, sendto_on_behalf};
