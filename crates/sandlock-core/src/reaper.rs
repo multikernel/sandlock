@@ -3,31 +3,31 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 pub(crate) struct Reaper {
     pub pid: i32,
+    pub pidfd: OwnedFd,
     pub main_pidfd: OwnedFd,
     status: OwnedFd,
-    command: Option<OwnedFd>,
+    finish: Option<OwnedFd>,
+    /// Set once the main process is known to have been the last one left.
+    pub empty: bool,
+}
+
+pub(crate) struct MainExit {
+    pub status: i32,
+    pub last: bool,
 }
 
 impl Reaper {
-    pub fn shutdown(&mut self) {
-        self.command.take();
-    }
-
-    pub async fn main_status(&self) -> io::Result<i32> {
+    pub async fn main_exit(&self) -> io::Result<MainExit> {
         let fd = tokio::io::unix::AsyncFd::new(self.status.try_clone()?)?;
         loop {
             let mut ready = fd.readable().await?;
             let result = ready.try_io(|fd| {
-                let mut status = 0i32;
+                let mut message = [0i32; 2];
                 let n = unsafe {
-                    libc::read(
-                        fd.get_ref().as_raw_fd(),
-                        (&mut status as *mut i32).cast(),
-                        4,
-                    )
+                    libc::read(fd.get_ref().as_raw_fd(), message.as_mut_ptr().cast(), 8)
                 };
                 match n {
-                    4 => Ok(status),
+                    8 => Ok(MainExit { status: message[0], last: message[1] != 0 }),
                     -1 => Err(io::Error::last_os_error()),
                     _ => Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -42,10 +42,30 @@ impl Reaper {
             }
         }
     }
+
+    /// Collect what has exited, then exit. Children still alive are not in
+    /// any tracked group, so nothing could kill them; they are released.
+    pub fn finish(&mut self) {
+        // A byte, not EOF: children parked before exec may hold a copy of this fd.
+        if let Some(fd) = self.finish.take() {
+            unsafe { send(fd.as_raw_fd(), &[0]) };
+        }
+    }
+
+    pub async fn join(&self) -> io::Result<()> {
+        crate::sandbox::wait_child_exit_via_pidfd(self.pidfd.try_clone()?, self.pid).await;
+        Ok(())
+    }
+
+    pub fn join_blocking(self) {
+        reap(self.pid);
+    }
 }
 
 /// A private subreaper keeps orphans below the supervisor for Yama checks,
-/// without changing the embedding process's child-adoption policy.
+/// without changing the embedding process's child-adoption policy. It never
+/// kills: the supervisor kills through the tracked process groups, and the
+/// reaper exits once nothing is left to reap or it is told to finish.
 pub(crate) fn fork() -> io::Result<(i32, Option<Reaper>)> {
     let mut pipe = [0; 2];
     if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
@@ -79,6 +99,13 @@ pub(crate) fn fork() -> io::Result<(i32, Option<Reaper>)> {
             {
                 libc::_exit(127);
             }
+            let mut chld = std::mem::zeroed();
+            libc::sigemptyset(&mut chld);
+            libc::sigaddset(&mut chld, libc::SIGCHLD);
+            let signal_fd = libc::signalfd(-1, &chld, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK);
+            if signal_fd < 0 {
+                libc::_exit(127);
+            }
             let parent = libc::getpid();
             let child = libc::fork();
             if child < 0 {
@@ -100,16 +127,17 @@ pub(crate) fn fork() -> io::Result<(i32, Option<Reaper>)> {
             }
             let fd = write.as_raw_fd();
             let gate = pinned_r.as_raw_fd();
-            let lo = fd.min(gate) as u32;
-            let hi = fd.max(gate) as u32;
-            if lo > 0 {
-                libc::syscall(libc::SYS_close_range, 0u32, lo - 1, 0u32);
+            let mut keep = [fd, gate, signal_fd];
+            keep.sort_unstable();
+            let mut next = 0u32;
+            for kept in keep {
+                if kept as u32 > next {
+                    libc::syscall(libc::SYS_close_range, next, kept as u32 - 1, 0u32);
+                }
+                next = kept as u32 + 1;
             }
-            if hi > lo + 1 {
-                libc::syscall(libc::SYS_close_range, lo + 1, hi - 1, 0u32);
-            }
-            libc::syscall(libc::SYS_close_range, hi + 1, u32::MAX, 0u32);
-            if !send(fd, child) {
+            libc::syscall(libc::SYS_close_range, next, u32::MAX, 0u32);
+            if !send(fd, &[child]) {
                 libc::_exit(127);
             }
             // Keep the main PID pinned as a child until the supervisor has a pidfd.
@@ -120,10 +148,13 @@ pub(crate) fn fork() -> io::Result<(i32, Option<Reaper>)> {
                     break n == 4;
                 }
                 if io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-                    libc::_exit(127);
+                    break false;
                 }
             };
-            supervise(child, fd, gate, !acknowledged);
+            if !acknowledged {
+                libc::kill(child, libc::SIGKILL);
+            }
+            supervise(child, fd, gate, signal_fd);
         }
     }
     drop(write);
@@ -134,123 +165,80 @@ pub(crate) fn fork() -> io::Result<(i32, Option<Reaper>)> {
             result => break result,
         }
     };
-    match child {
-        Ok(pid) if pid > 0 => {
-            let main_pidfd = match crate::sys::syscall::pidfd_open(pid, 0) {
-                Ok(fd) => fd,
-                Err(e) => {
-                    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-                    drop(pinned_w);
-                    reap(reaper);
-                    return Err(e);
-                }
-            };
-            unsafe { send(pinned_w.as_raw_fd(), 1) };
+    let opened = match child {
+        Ok(pid) if pid > 0 => crate::sys::syscall::pidfd_open(pid, 0)
+            .and_then(|main| Ok((pid as i32, main, crate::sys::syscall::pidfd_open(reaper as u32, 0)?))),
+        _ => Err(io::Error::other("session reaper failed to start")),
+    };
+    match opened {
+        Ok((pid, main_pidfd, pidfd)) => {
+            unsafe { send(pinned_w.as_raw_fd(), &[1]) };
             unsafe { libc::fcntl(read.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
             Ok((
-                pid as i32,
+                pid,
                 Some(Reaper {
                     pid: reaper,
+                    pidfd,
                     main_pidfd,
                     status: read,
-                    command: Some(pinned_w),
+                    finish: Some(pinned_w),
+                    empty: false,
                 }),
             ))
         }
-        _ => {
+        Err(e) => {
+            // Without the ack the reaper kills its pinned child itself.
             drop(pinned_w);
             reap(reaper);
-            Err(io::Error::other("session reaper failed to start"))
+            Err(e)
         }
     }
 }
 
-unsafe fn supervise(main: i32, status_fd: i32, command_fd: i32, mut stopping: bool) -> ! {
-    let mut mask = std::mem::zeroed();
-    libc::sigemptyset(&mut mask);
-    libc::sigaddset(&mut mask, libc::SIGCHLD);
-    let signal_fd = libc::signalfd(-1, &mask, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK);
+unsafe fn supervise(main: i32, status_fd: i32, finish_fd: i32, signal_fd: i32) -> ! {
     let mut poll = [
-        libc::pollfd {
-            fd: command_fd,
-            events: libc::POLLIN,
-            revents: 0,
-        },
-        libc::pollfd {
-            fd: signal_fd,
-            events: libc::POLLIN,
-            revents: 0,
-        },
+        libc::pollfd { fd: finish_fd, events: libc::POLLIN, revents: 0 },
+        libc::pollfd { fd: signal_fd, events: libc::POLLIN, revents: 0 },
     ];
+    let mut finishing = false;
     loop {
-        if stopping {
-            kill_children();
-        }
-        loop {
+        let alive = loop {
             let mut status = 0;
-            let pid = libc::waitpid(-1, &mut status, libc::WNOHANG);
-            if pid == 0 {
-                break;
-            }
-            if pid < 0 {
-                if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                    continue;
+            match libc::waitpid(-1, &mut status, libc::WNOHANG | libc::__WALL) {
+                0 => break true,
+                pid if pid == main => {
+                    let last = !has_children();
+                    send(status_fd, &[status, last as i32]);
                 }
-                libc::_exit(0);
+                pid if pid > 0 => {}
+                _ if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) => {}
+                // No child means no descendant: the session is over.
+                _ => break false,
             }
-            if pid == main && !send(status_fd, status) {
-                stopping = true;
-            }
+        };
+        if !alive || finishing {
+            libc::_exit(0);
         }
-        // A killed parent may have just transferred more children to us.
-        if stopping {
-            kill_children();
-        }
-        libc::poll(poll.as_mut_ptr(), 2, if signal_fd < 0 { 10 } else { -1 });
+        libc::poll(poll.as_mut_ptr(), 2, -1);
         if poll[0].revents != 0 {
-            stopping = true;
-            poll[0].fd = -1;
+            finishing = true;
         }
         if poll[1].revents != 0 {
-            let mut signal: libc::signalfd_siginfo = std::mem::zeroed();
-            libc::read(
-                signal_fd,
-                (&mut signal as *mut libc::signalfd_siginfo).cast(),
-                std::mem::size_of_val(&signal),
-            );
+            let mut info: libc::signalfd_siginfo = std::mem::zeroed();
+            libc::read(signal_fd, (&mut info as *mut libc::signalfd_siginfo).cast(), std::mem::size_of_val(&info));
         }
     }
 }
 
-unsafe fn kill_children() {
-    let fd = libc::open(
-        b"/proc/thread-self/children\0".as_ptr().cast(),
-        libc::O_RDONLY | libc::O_CLOEXEC,
-    );
-    if fd < 0 {
-        return;
-    }
-    let mut buffer = [0u8; 4096];
-    let mut pid = 0i32;
+unsafe fn has_children() -> bool {
     loop {
-        let n = libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len());
-        if n <= 0 {
-            break;
-        }
-        for &byte in &buffer[..n as usize] {
-            if byte.is_ascii_digit() {
-                pid = pid * 10 + (byte - b'0') as i32;
-            } else if pid > 0 {
-                // Only this process reaps these children, so their PIDs cannot be reused here.
-                libc::kill(pid, libc::SIGKILL);
-                pid = 0;
-            }
+        match libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG | libc::__WALL) {
+            0 => return true,
+            pid if pid > 0 => {}
+            _ if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) => {}
+            _ => return false,
         }
     }
-    if pid > 0 {
-        libc::kill(pid, libc::SIGKILL);
-    }
-    libc::close(fd);
 }
 
 fn reap(pid: i32) {
@@ -264,9 +252,10 @@ fn reap(pid: i32) {
     }
 }
 
-unsafe fn send(fd: i32, value: i32) -> bool {
+unsafe fn send(fd: i32, values: &[i32]) -> bool {
+    let len = std::mem::size_of_val(values);
     loop {
-        if libc::write(fd, (&value as *const i32).cast(), 4) == 4 {
+        if libc::write(fd, values.as_ptr().cast(), len) == len as isize {
             return true;
         }
         if io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
@@ -287,18 +276,70 @@ mod tests {
         }
         let reaper = reaper.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        let status = reaper.main_status().await.unwrap();
-        assert!(libc::WIFEXITED(status));
-        assert_eq!(libc::WEXITSTATUS(status), 42);
+        let exit = reaper.main_exit().await.unwrap();
+        assert!(libc::WIFEXITED(exit.status));
+        assert_eq!(libc::WEXITSTATUS(exit.status), 42);
+        assert!(exit.last);
         let mut ready = libc::pollfd {
             fd: reaper.main_pidfd.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
         assert_eq!(unsafe { libc::poll(&mut ready, 1, 0) }, 1);
-        assert_eq!(
-            unsafe { libc::waitpid(reaper.pid, std::ptr::null_mut(), 0) },
-            reaper.pid
-        );
+        reaper.join().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn outlives_the_main_process_until_orphans_are_reaped() {
+        let (pid, reaper) = fork().unwrap();
+        if pid == 0 {
+            unsafe {
+                if libc::fork() == 0 {
+                    libc::usleep(300_000);
+                    libc::_exit(0);
+                }
+                libc::_exit(7);
+            }
+        }
+        let reaper = reaper.unwrap();
+        let exit = reaper.main_exit().await.unwrap();
+        assert_eq!(libc::WEXITSTATUS(exit.status), 7);
+        assert!(!exit.last);
+        let mut ready = libc::pollfd {
+            fd: reaper.pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut ready, 1, 50) }, 0);
+        reaper.join().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn finish_releases_children_still_running() {
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let (pid, reaper) = fork().unwrap();
+        if pid == 0 {
+            unsafe {
+                let orphan = libc::fork();
+                if orphan == 0 {
+                    libc::pause();
+                    libc::_exit(0);
+                }
+                libc::write(pipe[1], (&orphan as *const i32).cast(), 4);
+                libc::_exit(0);
+            }
+        }
+        let mut orphan = 0i32;
+        assert_eq!(unsafe { libc::read(pipe[0], (&mut orphan as *mut i32).cast(), 4) }, 4);
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+        let mut reaper = reaper.unwrap();
+        assert!(!reaper.main_exit().await.unwrap().last);
+        reaper.finish();
+        reaper.join().await.unwrap();
+        assert_eq!(unsafe { libc::kill(orphan, libc::SIGKILL) }, 0);
     }
 }

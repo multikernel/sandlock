@@ -442,7 +442,7 @@ fn test_creation_under_fd_pressure_does_not_leave_children() {
 }
 
 #[tokio::test]
-async fn test_shutdown_reaps_untracked_groups_without_syscall_supervision() {
+async fn test_shutdown_releases_untracked_groups_without_syscall_supervision() {
     let dir = tempfile::tempdir().unwrap();
     let ready = dir.path().join("ready");
     let script = format!(
@@ -462,12 +462,11 @@ while not os.path.exists({ready:?}):
     sb.spawn(&["python3", "-c", &script]).await.unwrap();
     sb.wait().await.unwrap();
     let leader: i32 = std::fs::read_to_string(ready).unwrap().parse().unwrap();
-    let cleanup = tokio::time::timeout(std::time::Duration::from_secs(5), sb.shutdown()).await;
-    if cleanup.is_err() {
-        unsafe { libc::kill(leader, libc::SIGKILL) };
-    }
-    cleanup
-        .expect("shutdown must also clean untracked descendants")
-        .unwrap();
+    // Without a supervisor nothing records the new group, so shutdown
+    // releases its leader instead of waiting on it forever.
+    let shutdown = tokio::time::timeout(std::time::Duration::from_secs(5), sb.shutdown()).await;
+    let alive = unsafe { libc::kill(leader, libc::SIGKILL) } == 0;
+    shutdown.expect("shutdown must not wait on untracked descendants").unwrap();
+    assert!(alive);
     assert!(wait_gone(leader));
 }

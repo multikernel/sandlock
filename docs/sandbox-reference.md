@@ -259,7 +259,7 @@ fields on `Sandbox`.
 | `clean_env`     | `clean_env`     | `bool`              | `False` | When `True`, start with a minimal environment (`PATH`, `HOME`, `USER`, `TERM`, `LANG`) instead of inheriting the parent's.                            |
 | `no_coredump`   | `no_coredump`   | `bool`              | `False` | Apply `prctl(PR_SET_DUMPABLE, 0)`. Disables core dumps and restricts `/proc/<pid>` access from other processes. Breaks `gdb`, `strace`, and `perf`.   |
 | `no_huge_pages` | `no_huge_pages` | `bool`              | `False` | Disable transparent huge pages via `prctl(PR_SET_THP_DISABLE)`.                                                                                      |
-| `no_supervisor` | `no_supervisor` | `bool`              | `False` | Skip the seccomp user-notification supervisor. The sandbox runs with Landlock + a kernel-only deny filter, without IP allowlisting, resource limits, COW, chroot mediation, `/proc` virtualization, or custom handlers. Required when nesting inside another sandlock (the kernel only allows one `SECCOMP_FILTER_FLAG_NEW_LISTENER` per task). |
+| `no_supervisor` | `no_supervisor` | `bool`              | `False` | Skip the seccomp user-notification supervisor. The sandbox runs with Landlock + a kernel-only deny filter, without IP allowlisting, resource limits, COW, chroot mediation, `/proc` virtualization, or custom handlers. Required at one level when nesting sandlock, inner or outer (the kernel allows only one `SECCOMP_FILTER_FLAG_NEW_LISTENER` per filter chain). |
 
 ## Variable expansion
 
@@ -527,6 +527,13 @@ available for an explicit commit or abort.
 
 Releasing the owning session handle also terminates and reaps its jobs.
 Use explicit shutdown when the caller needs the complete result.
+
+Jobs are terminated through their process groups, which requires Linux
+6.9 or later. On older kernels, shutdown fails if any job outlives the
+main process, and releasing the handle leaves those jobs running
+without supervision. With `no_supervisor`, a job that moves to a new
+process group or session is not tracked; shutdown releases it instead
+of terminating it, still confined by Landlock and the deny filter.
 
 ## Enumerations
 

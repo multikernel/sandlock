@@ -303,6 +303,9 @@ struct Runtime {
     // the runtime rather than to the `wait()` that started them, so a cancelled
     // `wait()` takes neither the reader nor what it has already produced.
     stdout_drain: Option<ParkedDrain>,
+    /// Ends the drains once the reaper is gone: what still holds the write
+    /// ends was released and may never close them.
+    drain_cut: tokio_util::sync::CancellationToken,
     stderr_drain: Option<ParkedDrain>,
     // Parent-held write end of a piped stdin (popen). The caller takes it via
     // `Process::take_stdin`; closing it signals EOF to the child.
@@ -993,17 +996,19 @@ impl Sandbox {
         // `Process::take_stdout`/`take_stderr` is `None` here and stays theirs.
         if self.rt().stdout_drain.is_none() {
             if let Some(fd) = self.rt_mut()._stdout_read.take() {
-                self.rt_mut().stdout_drain = sandbox_spawn_pipe_drain(fd);
+                self.rt_mut().stdout_drain = sandbox_spawn_pipe_drain(fd, self.rt().drain_cut.clone());
             }
         }
         if self.rt().stderr_drain.is_none() {
             if let Some(fd) = self.rt_mut()._stderr_read.take() {
-                self.rt_mut().stderr_drain = sandbox_spawn_pipe_drain(fd);
+                self.rt_mut().stderr_drain = sandbox_spawn_pipe_drain(fd, self.rt().drain_cut.clone());
             }
         }
 
         let exit_status = if let Some(reaper) = &self.rt().reaper {
-            sandbox_wait_status_to_exit(reaper.main_status().await.map_err(SandboxRuntimeError::Io)?)
+            let exit = reaper.main_exit().await.map_err(SandboxRuntimeError::Io)?;
+            if let Some(reaper) = &mut self.rt_mut().reaper { reaper.empty = exit.last; }
+            sandbox_wait_status_to_exit(exit.status)
         } else {
             match self.rt().pidfd.as_ref() {
                 Some(pidfd) => {
@@ -1028,16 +1033,19 @@ impl Sandbox {
     pub async fn shutdown(&mut self) -> Result<crate::result::RunResult, crate::error::SandlockError> {
         use crate::error::SandboxRuntimeError;
         use crate::result::RunResult;
-        let rt = self.runtime.as_mut().ok_or(SandboxRuntimeError::NotRunning)?;
-        let signal_groups = rt.reaper.is_none() && !matches!(rt.state, RuntimeState::Stopped(_));
-        if let Some(reaper) = &mut rt.reaper {
-            // The reaper owns descendant cleanup even on kernels without pidfd group signals.
-            reaper.shutdown();
-            if let Some(worker) = &rt.policy_fn_worker { worker.cancel(); }
+        use std::os::fd::AsRawFd;
+        let rt = self.runtime.as_ref().ok_or(SandboxRuntimeError::NotRunning)?;
+        // A main process that already exited delivers its status promptly,
+        // and that status says whether it left anything behind to kill.
+        if rt.reaper.as_ref().is_some_and(|r| crate::pgroup::has_exited(r.main_pidfd.as_raw_fd())) {
+            self.wait().await?;
         }
-        if signal_groups { self.kill()?; }
+        let rt = self.rt();
+        let empty = matches!(rt.state, RuntimeState::Stopped(_))
+            || rt.reaper.as_ref().is_some_and(|r| r.empty || crate::pgroup::has_exited(r.pidfd.as_raw_fd()));
+        if !empty { self.kill()?; }
         let exit_status = self.wait().await?;
-        if signal_groups {
+        if !empty {
             loop {
                 if self.rt().groups.signal(libc::SIGKILL).map_err(SandboxRuntimeError::Io)? == 0 {
                     break;
@@ -1045,17 +1053,10 @@ impl Sandbox {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         }
-        if let Some(reaper) = &self.rt().reaper {
-            loop {
-                let ret = unsafe { libc::waitpid(reaper.pid, std::ptr::null_mut(), libc::WNOHANG) };
-                if ret > 0 { break; }
-                if ret < 0 {
-                    let e = std::io::Error::last_os_error();
-                    if e.raw_os_error() == Some(libc::EINTR) { continue; }
-                    return Err(SandboxRuntimeError::Io(e).into());
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-            }
+        if let Some(reaper) = &mut self.rt_mut().reaper {
+            reaper.finish();
+            reaper.join().await.map_err(SandboxRuntimeError::Io)?;
+            self.rt().drain_cut.cancel();
         }
         self.rt_mut().reaper = None;
         self.rt_mut().state = RuntimeState::Stopped(exit_status.clone());
@@ -1736,6 +1737,7 @@ impl Sandbox {
                 _stdout_read: None,
                 _stderr_read: None,
                 stdout_drain: None,
+                drain_cut: tokio_util::sync::CancellationToken::new(),
                 stderr_drain: None,
                 _stdin_write: None,
                 #[cfg(feature = "cow")]
@@ -1845,6 +1847,7 @@ impl Sandbox {
             _stdout_read: None,
             _stderr_read: None,
             stdout_drain: None,
+            drain_cut: tokio_util::sync::CancellationToken::new(),
             stderr_drain: None,
             _stdin_write: None,
             #[cfg(feature = "cow")]
@@ -2661,10 +2664,14 @@ impl Drop for Sandbox {
         if let Some(ref mut rt) = self.runtime {
             if let Some(worker) = &rt.policy_fn_worker { worker.cancel(); }
             let _ = rt.groups.signal(libc::SIGKILL);
-            if let Some(reaper) = &mut rt.reaper {
-                reaper.shutdown();
+            if let Some(reaper) = &rt.reaper {
                 use std::os::fd::AsRawFd;
                 unsafe { libc::syscall(libc::SYS_pidfd_send_signal, reaper.main_pidfd.as_raw_fd(), libc::SIGKILL, 0, 0) };
+                // The reaper collects the zombies that keep a swept group
+                // counted, so the branch below settles after the jobs are gone.
+                while matches!(rt.groups.signal(libc::SIGKILL), Ok(n) if n > 0) {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
             }
             if let Some(pid) = rt.child_pid {
                 if matches!(rt.state, RuntimeState::Created | RuntimeState::Running | RuntimeState::Paused) {
@@ -2682,11 +2689,9 @@ impl Drop for Sandbox {
                 }
             }
 
-            if let Some(reaper) = rt.reaper.take() {
-                loop {
-                    if unsafe { libc::waitpid(reaper.pid, std::ptr::null_mut(), 0) } >= 0 { break; }
-                    if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) { break; }
-                }
+            if let Some(mut reaper) = rt.reaper.take() {
+                reaper.finish();
+                reaper.join_blocking();
             }
 
             if let Some(h) = rt.notif_handle.take() { h.abort(); }
@@ -2919,7 +2924,10 @@ enum ParkedDrain {
 /// dropping output. The conversion can only fail if the fd is not a readable
 /// pipe, which cannot happen for the pipes `do_create_stdio` creates; if it
 /// somehow did, the stream is left uncaptured rather than the run failing.
-fn sandbox_spawn_pipe_drain(fd: std::os::fd::OwnedFd) -> Option<ParkedDrain> {
+fn sandbox_spawn_pipe_drain(
+    fd: std::os::fd::OwnedFd,
+    cut: tokio_util::sync::CancellationToken,
+) -> Option<ParkedDrain> {
     let mut rx = match tokio::net::unix::pipe::Receiver::from_owned_fd(fd) {
         Ok(rx) => rx,
         Err(_) => return None,
@@ -2927,7 +2935,17 @@ fn sandbox_spawn_pipe_drain(fd: std::os::fd::OwnedFd) -> Option<ParkedDrain> {
     Some(ParkedDrain::Running(tokio::spawn(async move {
         use tokio::io::AsyncReadExt;
         let mut buf = Vec::new();
-        let _ = rx.read_to_end(&mut buf).await;
+        loop {
+            buf.reserve(8192);
+            tokio::select! {
+                biased;
+                _ = cut.cancelled() => {
+                    while matches!(rx.try_read_buf(&mut buf), Ok(n) if n > 0) {}
+                    break;
+                }
+                n = rx.read_buf(&mut buf) => if !matches!(n, Ok(n) if n > 0) { break },
+            }
+        }
         buf
     })))
 }
@@ -3002,7 +3020,7 @@ fn sandbox_wait_status_to_exit(status: i32) -> crate::result::ExitStatus {
 /// already exited, it does not consume the child's ptrace-stops the way a
 /// `waitpid`-loop would — so it doesn't race the `policy_fn` fork-tracking
 /// worker. Falls back to the blocking waiter on any pidfd/`AsyncFd` error.
-async fn wait_child_exit_via_pidfd(
+pub(crate) async fn wait_child_exit_via_pidfd(
     pidfd: std::os::unix::io::OwnedFd,
     pid: libc::pid_t,
 ) -> crate::result::ExitStatus {

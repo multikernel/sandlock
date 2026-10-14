@@ -103,7 +103,7 @@ impl Default for ProcessGroups {
     }
 }
 
-fn has_exited(pidfd: RawFd) -> bool {
+pub(crate) fn has_exited(pidfd: RawFd) -> bool {
     let mut pfd = libc::pollfd {
         fd: pidfd,
         events: libc::POLLIN,
