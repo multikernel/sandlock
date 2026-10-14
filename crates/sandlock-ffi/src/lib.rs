@@ -1495,7 +1495,8 @@ pub unsafe extern "C" fn sandlock_handle_wait_timeout(
 /// Prepare to wait and return a new descriptor that becomes readable once the
 /// main process exits, or -1 on error. Poll it without holding the handle, so
 /// other threads can signal the session, then call `sandlock_handle_wait`,
-/// which no longer blocks. The caller closes the descriptor.
+/// which no longer blocks. The caller closes the descriptor. Handles from
+/// `sandlock_create_for_run` are refused: wait on those natively.
 ///
 /// # Safety
 /// `h` must be a valid handle with no concurrent handle operations.
@@ -1505,6 +1506,11 @@ pub unsafe extern "C" fn sandlock_handle_main_exit_fd(h: *mut sandlock_handle_t)
         return -1;
     }
     let h = &mut *h;
+    // A current_thread runtime runs the supervisor only inside block_on, so
+    // a caller blocked on the descriptor would starve it and never return.
+    if h.runtime.handle().runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+        return -1;
+    }
     // Starting the output drains spawns tasks on the handle's runtime.
     let _runtime = h.runtime.enter();
     match h.sandbox.main_exit_fd() {

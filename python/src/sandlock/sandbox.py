@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import inspect
 import itertools
+import math
 import os
 import re
 import threading
@@ -777,11 +778,14 @@ class Sandbox:
 
         handle, self._handle = self._handle, None
         try:
-            timed_out = False
-            try:
-                _wait_status(handle, timeout)
-            except TimeoutError:
-                timed_out = True
+            # This handle's runtime advances only inside native calls, so
+            # wait natively; no other thread shares it.
+            status_p = _lib.sandlock_handle_wait_timeout(
+                handle, 0 if timeout is None else max(1, math.ceil(timeout * 1000)))
+            if not status_p:
+                raise RuntimeError("sandlock_handle_wait failed")
+            timed_out = ExitReason(_lib.sandlock_result_reason(status_p)) == ExitReason.TIMEOUT
+            _lib.sandlock_result_free(status_p)
             result_p = _lib.sandlock_handle_shutdown(handle)
         finally:
             self._park_or_free(handle)
@@ -1736,14 +1740,12 @@ class Process:
             pass
 
 
-def _wait_status(handle, timeout, lock=None):
-    import contextlib
+def _wait_status(handle, timeout, lock):
     import math
     import os
     import select
     from ._sdk import _lib, ExitStatus, ExitReason
-    guard = lock if lock is not None else contextlib.nullcontext()
-    with guard:
+    with lock:
         fd = _lib.sandlock_handle_main_exit_fd(handle)
     if fd < 0:
         raise RuntimeError("sandlock_handle_main_exit_fd failed")
@@ -1755,7 +1757,7 @@ def _wait_status(handle, timeout, lock=None):
             raise TimeoutError("main process has not exited")
     finally:
         os.close(fd)
-    with guard:
+    with lock:
         ptr = _lib.sandlock_handle_wait(handle)
     if not ptr:
         raise RuntimeError("sandlock_handle_wait failed")

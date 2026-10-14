@@ -929,7 +929,8 @@ sandlock_result_t *sandlock_handle_wait_timeout(sandlock_handle_t *h, uint64_t t
  * Prepare to wait and return a new descriptor that becomes readable once the
  * main process exits, or -1 on error. Poll it without holding the handle, so
  * other threads can signal the session, then call `sandlock_handle_wait`,
- * which no longer blocks. The caller closes the descriptor.
+ * which no longer blocks. The caller closes the descriptor. Handles from
+ * `sandlock_create_for_run` are refused: wait on those natively.
  *
  * # Safety
  * `h` must be a valid handle with no concurrent handle operations.
