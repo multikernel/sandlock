@@ -38,6 +38,23 @@ def test_wait_timeout_retains_main_for_retry():
         assert sb.shutdown().exit_code == 9
 
 
+def test_handle_stays_usable_while_another_thread_waits():
+    import threading
+    import time
+    with policy() as sb:
+        sb.spawn(["sleep", "60"])
+        statuses = []
+        waiter = threading.Thread(target=lambda: statuses.append(sb.wait()))
+        waiter.start()
+        time.sleep(0.1)
+        assert sb.process_groups()
+        sb.kill()
+        waiter.join(timeout=5)
+        assert not waiter.is_alive()
+        assert statuses[0].reason == ExitReason.KILLED
+        sb.shutdown()
+
+
 def test_popen_context_cleans_background_jobs_after_wait():
     with policy().popen(["sh", "-c", "sleep 60 & echo $!"], stdout=StdioMode.PIPED) as proc:
         child = int(proc.stdout.readline())

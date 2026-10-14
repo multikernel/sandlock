@@ -1085,7 +1085,7 @@ class Sandbox:
         """Return a sorted snapshot of tracked live process group IDs."""
         self._reject_if_popen()
         with self._lock:
-            if self._handle is None or self._waiting:
+            if self._handle is None:
                 raise RuntimeError("session is unavailable")
             return _read_process_groups(self._handle)
 
@@ -1345,7 +1345,7 @@ class Sandbox:
             # this can't race a concurrent shutdown() freeing it.
             return proc.ports()
         with self._lock:
-            if self._handle is None or self._waiting:
+            if self._handle is None:
                 return {}
             return _read_port_mappings(self._handle)
 
@@ -1611,10 +1611,9 @@ class Process:
 
     def ports(self) -> dict[int, int]:
         """Current virtual→real port mappings while running, else ``{}`` (needs
-        ``port_remap``). Reads the handle under the lock, and reports ``{}``
-        while a lifecycle operation holds it."""
+        ``port_remap``). Reads the handle under the lock."""
         with self._lock:
-            if self._handle is None or self._waiting:
+            if self._handle is None:
                 return {}
             return _read_port_mappings(self._handle)
 
@@ -1659,7 +1658,7 @@ class Process:
     def process_groups(self) -> list[int]:
         """Return a sorted snapshot of tracked live process group IDs."""
         with self._lock:
-            if self._handle is None or self._waiting:
+            if self._handle is None:
                 raise RuntimeError("session is unavailable")
             return _read_process_groups(self._handle)
 
@@ -1739,31 +1738,34 @@ class Process:
 
 def _wait_status(handle, timeout, lock=None):
     import contextlib
-    import time
+    import math
+    import os
+    import select
     from ._sdk import _lib, ExitStatus, ExitReason
-    deadline = time.monotonic() + max(0, timeout) if timeout is not None else None
-    while True:
-        remaining = max(0, deadline - time.monotonic()) if deadline is not None else None
-        interval = min(remaining, 0.05) if remaining is not None and lock is not None else remaining
-        if interval is None and lock is not None:
-            interval = 0.05
-        timeout_ms = max(1, int(interval * 1000)) if interval is not None else 0
-        # Bounded waits let another thread signal through the same handle safely.
-        with lock if lock is not None else contextlib.nullcontext():
-            ptr = _lib.sandlock_handle_wait_timeout(handle, timeout_ms)
-        if not ptr:
-            raise RuntimeError("sandlock_handle_wait failed")
-        try:
-            reason = ExitReason(_lib.sandlock_result_reason(ptr))
-            if reason != ExitReason.TIMEOUT:
-                return ExitStatus(bool(_lib.sandlock_result_success(ptr)),
-                                  _lib.sandlock_result_exit_code(ptr), reason,
-                                  _lib.sandlock_result_signal(ptr))
-        finally:
-            _lib.sandlock_result_free(ptr)
-        if deadline is not None and time.monotonic() >= deadline:
+    guard = lock if lock is not None else contextlib.nullcontext()
+    with guard:
+        fd = _lib.sandlock_handle_main_exit_fd(handle)
+    if fd < 0:
+        raise RuntimeError("sandlock_handle_main_exit_fd failed")
+    # Block outside the lock so other threads can signal the session meanwhile.
+    try:
+        poller = select.poll()
+        poller.register(fd, select.POLLIN)
+        if not poller.poll(None if timeout is None else math.ceil(max(0, timeout) * 1000)):
             raise TimeoutError("main process has not exited")
-        time.sleep(0)
+    finally:
+        os.close(fd)
+    with guard:
+        ptr = _lib.sandlock_handle_wait(handle)
+    if not ptr:
+        raise RuntimeError("sandlock_handle_wait failed")
+    try:
+        return ExitStatus(bool(_lib.sandlock_result_success(ptr)),
+                          _lib.sandlock_result_exit_code(ptr),
+                          ExitReason(_lib.sandlock_result_reason(ptr)),
+                          _lib.sandlock_result_signal(ptr))
+    finally:
+        _lib.sandlock_result_free(ptr)
 
 
 def _read_process_groups(handle):

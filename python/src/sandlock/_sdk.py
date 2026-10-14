@@ -323,7 +323,8 @@ _lib.sandlock_handle_shutdown.restype = _c_result_p
 _lib.sandlock_handle_shutdown.argtypes = [_c_handle_p]
 _lib.sandlock_handle_process_groups.restype = ctypes.c_void_p
 _lib.sandlock_handle_process_groups.argtypes = [_c_handle_p]
-for _name in ("sandlock_handle_pause", "sandlock_handle_resume", "sandlock_handle_kill"):
+for _name in ("sandlock_handle_pause", "sandlock_handle_resume", "sandlock_handle_kill",
+              "sandlock_handle_main_exit_fd"):
     getattr(_lib, _name).restype = ctypes.c_int
     getattr(_lib, _name).argtypes = [_c_handle_p]
 
