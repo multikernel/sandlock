@@ -159,16 +159,19 @@ fn track_new_group(
     caller: i32,
     leader: i32,
 ) -> NotifAction {
-    let Ok(pidfd) = pidfd_open(leader as u32, 0) else {
-        return NotifAction::Continue;
+    // An unrecorded group is out of reach of kill, so refuse rather than allow it.
+    let pidfd = match pidfd_open(leader as u32, 0) {
+        Ok(pidfd) => pidfd,
+        Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EAGAIN)),
     };
     // The kernel moves only the caller or one of its children. Anything
-    // else fails there with ESRCH, and recording it would aim later signals
-    // at a process outside the sandbox. The caller is parked in this
+    // else fails there with ESRCH, so answer that here: recording it would
+    // aim later signals outside the sandbox, and letting a misread through
+    // could form a group nobody recorded. The caller is parked in this
     // syscall, and a leader still alive after the read kept its number
     // throughout, so neither pid was recycled under the check.
     if leader != caller && (read_ppid(leader) != Some(caller) || has_exited(pidfd.as_raw_fd())) {
-        return NotifAction::Continue;
+        return NotifAction::Errno(libc::ESRCH);
     }
     if id_valid(notif_fd, notif.id).is_err() {
         return NotifAction::Continue;
