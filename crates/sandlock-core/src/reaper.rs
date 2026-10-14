@@ -93,8 +93,11 @@ pub(crate) fn fork() -> io::Result<(i32, Option<Reaper>)> {
             let mut default_chld: libc::sigaction = std::mem::zeroed();
             default_chld.sa_sigaction = libc::SIG_DFL;
             libc::sigaction(libc::SIGCHLD, &default_chld, &mut previous_chld);
+            // Watch the owning process rather than set PDEATHSIG, which fires
+            // when the forking thread exits and would end the session with it.
+            let owner_fd = libc::syscall(libc::SYS_pidfd_open, owner, 0) as i32;
             if libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0
-                || libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0
+                || owner_fd < 0
                 || libc::getppid() != owner
             {
                 libc::_exit(127);
@@ -127,7 +130,7 @@ pub(crate) fn fork() -> io::Result<(i32, Option<Reaper>)> {
             }
             let fd = write.as_raw_fd();
             let gate = pinned_r.as_raw_fd();
-            let mut keep = [fd, gate, signal_fd];
+            let mut keep = [fd, gate, signal_fd, owner_fd];
             keep.sort_unstable();
             let mut next = 0u32;
             for kept in keep {
@@ -154,7 +157,7 @@ pub(crate) fn fork() -> io::Result<(i32, Option<Reaper>)> {
             if !acknowledged {
                 libc::kill(child, libc::SIGKILL);
             }
-            supervise(child, fd, gate, signal_fd);
+            supervise(child, fd, gate, signal_fd, owner_fd);
         }
     }
     drop(write);
@@ -195,18 +198,21 @@ pub(crate) fn fork() -> io::Result<(i32, Option<Reaper>)> {
     }
 }
 
-unsafe fn supervise(main: i32, status_fd: i32, finish_fd: i32, signal_fd: i32) -> ! {
+unsafe fn supervise(main: i32, status_fd: i32, finish_fd: i32, signal_fd: i32, owner_fd: i32) -> ! {
     let mut poll = [
         libc::pollfd { fd: finish_fd, events: libc::POLLIN, revents: 0 },
         libc::pollfd { fd: signal_fd, events: libc::POLLIN, revents: 0 },
+        libc::pollfd { fd: owner_fd, events: libc::POLLIN, revents: 0 },
     ];
     let mut finishing = false;
+    let mut main_alive = true;
     loop {
         let alive = loop {
             let mut status = 0;
             match libc::waitpid(-1, &mut status, libc::WNOHANG | libc::__WALL) {
                 0 => break true,
                 pid if pid == main => {
+                    main_alive = false;
                     let last = !has_children();
                     send(status_fd, &[status, last as i32]);
                 }
@@ -219,8 +225,15 @@ unsafe fn supervise(main: i32, status_fd: i32, finish_fd: i32, signal_fd: i32) -
         if !alive || finishing {
             libc::_exit(0);
         }
-        libc::poll(poll.as_mut_ptr(), 2, -1);
+        libc::poll(poll.as_mut_ptr(), 3, -1);
         if poll[0].revents != 0 {
+            finishing = true;
+        }
+        if poll[2].revents != 0 {
+            // Unreaped, the main pid cannot have been reused.
+            if main_alive {
+                libc::kill(main, libc::SIGKILL);
+            }
             finishing = true;
         }
         if poll[1].revents != 0 {
@@ -311,6 +324,31 @@ mod tests {
             revents: 0,
         };
         assert_eq!(unsafe { libc::poll(&mut ready, 1, 50) }, 0);
+        reaper.join().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn outlives_the_thread_that_created_it() {
+        let (pid, reaper) = std::thread::spawn(|| {
+            let (pid, reaper) = fork().unwrap();
+            if pid == 0 {
+                unsafe {
+                    libc::pause();
+                    libc::_exit(0);
+                }
+            }
+            (pid, reaper)
+        })
+        .join()
+        .unwrap();
+        let mut reaper = reaper.unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        for fd in [&reaper.pidfd, &reaper.main_pidfd] {
+            let mut ready = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            assert_eq!(unsafe { libc::poll(&mut ready, 1, 0) }, 0);
+        }
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        reaper.finish();
         reaper.join().await.unwrap();
     }
 
