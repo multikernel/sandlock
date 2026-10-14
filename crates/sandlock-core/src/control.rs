@@ -825,8 +825,8 @@ mod tests {
     fn raw_info_request(name: &str) -> Vec<u8> {
         let mut s = UnixStream::connect_addr(&socket_addr(name).unwrap()).unwrap();
         let body = br#"{"v":1,"verb":"info","args":{}}"#;
-        s.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
-        s.write_all(body).unwrap();
+        // A server refusing the peer may close before the request is written.
+        let _ = s.write_all(&(body.len() as u32).to_be_bytes()).and_then(|()| s.write_all(body));
         s.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
         let mut out = Vec::new();
         let _ = s.read_to_end(&mut out);
