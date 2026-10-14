@@ -10,8 +10,21 @@ package sandlock
 //
 // The C declarations come from the cbindgen-generated header, so the cgo
 // prototypes stay in lock-step with crates/sandlock-ffi automatically.
+#include <errno.h>
+#include <poll.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include "sandlock.h"
+
+// Go's runtime signals interrupt poll on cgo threads, so retry on EINTR.
+static int sandlock_go_await_readable(int fd) {
+	struct pollfd p = { .fd = fd, .events = POLLIN };
+	int r;
+	do {
+		r = poll(&p, 1, -1);
+	} while (r < 0 && errno == EINTR);
+	return r;
+}
 
 extern int32_t goPolicyCallback(sandlock_event_t *event, sandlock_ctx_t *ctx, void *user_data);
 extern void goPolicyDrop(void *user_data);
@@ -1043,30 +1056,34 @@ func (p *Process) Wait() (*ExitStatus, error) {
 			runtime.SetFinalizer(p, nil)
 		}
 	}()
-	for {
-		p.mu.Lock()
-		// Bounded waits let signals use the same handle without aliasing Rust borrows.
-		r := C.sandlock_handle_wait_timeout(p.h, 50)
-		if r == nil {
-			p.mu.Unlock()
-			return nil, fmt.Errorf("sandlock: wait failed")
-		}
-		status := ExitStatus{
-			ExitCode: int(C.sandlock_result_exit_code(r)),
-			Reason:   ExitReason(C.sandlock_result_reason(r)),
-			Signal:   int(C.sandlock_result_signal(r)),
-			Success:  bool(C.sandlock_result_success(r)),
-		}
-		C.sandlock_result_free(r)
-		if status.Reason != ReasonTimeout {
-			p.status = &status
-			p.mu.Unlock()
-			copy := status
-			return &copy, nil
-		}
-		p.mu.Unlock()
-		runtime.Gosched()
+	p.mu.Lock()
+	fd := C.sandlock_handle_main_exit_fd(p.h)
+	p.mu.Unlock()
+	if fd < 0 {
+		return nil, fmt.Errorf("sandlock: wait failed")
 	}
+	// Block without the lock so Kill and Close can reach the handle meanwhile.
+	ready := C.sandlock_go_await_readable(fd)
+	C.close(fd)
+	if ready < 0 {
+		return nil, fmt.Errorf("sandlock: wait failed")
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	r := C.sandlock_handle_wait(p.h)
+	if r == nil {
+		return nil, fmt.Errorf("sandlock: wait failed")
+	}
+	status := ExitStatus{
+		ExitCode: int(C.sandlock_result_exit_code(r)),
+		Reason:   ExitReason(C.sandlock_result_reason(r)),
+		Signal:   int(C.sandlock_result_signal(r)),
+		Success:  bool(C.sandlock_result_success(r)),
+	}
+	C.sandlock_result_free(r)
+	p.status = &status
+	copy := status
+	return &copy, nil
 }
 
 // Shutdown sends SIGKILL to remaining jobs, reaps them, and collects output and
@@ -1215,9 +1232,7 @@ func (p *Process) Kill() error { return p.signal(syscall.SIGKILL) }
 func (p *Process) Ports() (map[int]int, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	// While a Wait holds the handle, reading port mappings would alias it;
-	// report empty rather than touch the handle concurrently.
-	if p.h == nil || p.waiting {
+	if p.h == nil {
 		return map[int]int{}, nil
 	}
 	c := C.sandlock_handle_port_mappings(p.h)
