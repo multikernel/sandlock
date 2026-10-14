@@ -2870,6 +2870,7 @@ async fn finish_notification(
     if let Some(freeze) = pending.exec_freeze.take() {
         if exec_continued && send_result.is_ok() {
             crate::freeze::detach_peers(&freeze.peer_tids);
+            crate::freeze::release_siblings(&freeze.sibling_tids);
         } else {
             crate::freeze::detach_all(&freeze);
         }

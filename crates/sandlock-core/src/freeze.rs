@@ -371,6 +371,43 @@ pub(crate) fn reap_pending(pending: &[i32]) {
     }
 }
 
+/// Release siblings after an allowed execve. de_thread kills them, but a
+/// killed tracee stays a zombie until its tracer reaps it, which wedges
+/// de_thread. A sibling still stopped at the deadline means the exec failed.
+pub(crate) fn release_siblings(siblings: &[i32]) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    for &tid in siblings {
+        loop {
+            let mut status: i32 = 0;
+            let r = unsafe { libc::waitpid(tid, &mut status, libc::__WALL | libc::WNOHANG) };
+            if r == tid && (libc::WIFEXITED(status) || libc::WIFSIGNALED(status)) {
+                break;
+            }
+            if r < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                break;
+            }
+            if !is_traced(tid) {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                detach(tid);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
+
+fn is_traced(tid: i32) -> bool {
+    fs::read_to_string(format!("/proc/{}/status", tid))
+        .ok()
+        .and_then(|status| {
+            let line = status.lines().find(|l| l.starts_with("TracerPid:"))?;
+            line.split_whitespace().nth(1)?.parse::<i32>().ok()
+        })
+        .is_some_and(|tracer| tracer != 0)
+}
+
 /// Detach peer TIDs after the kernel has re-read execve argv. Errors
 /// are ignored: a peer that already exited returns ESRCH, which is
 /// harmless.

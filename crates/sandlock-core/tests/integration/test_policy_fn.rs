@@ -1125,3 +1125,19 @@ os.execv('/bin/true', ['true', 'marker'])
     exec.resolve(Verdict::Allow).unwrap();
     assert!(run.await.unwrap().unwrap().success());
 }
+
+#[tokio::test]
+async fn exec_with_live_sibling_thread_completes() {
+    let mut sandbox = base_policy()
+        .policy_fn(PolicyFn::new(|_, _| Verdict::Allow))
+        .build().unwrap();
+    let script = r#"
+import os, threading, time
+threading.Thread(target=time.sleep, args=(5,), daemon=True).start()
+os.execv('/bin/true', ['true'])
+"#;
+    let result = tokio::time::timeout(Duration::from_secs(5), sandbox.run_interactive(&["python3", "-c", script]))
+        .await
+        .expect("exec hung behind a frozen sibling thread");
+    assert!(result.unwrap().success());
+}
