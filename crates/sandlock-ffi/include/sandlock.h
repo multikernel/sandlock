@@ -926,6 +926,17 @@ sandlock_result_t *sandlock_handle_wait(sandlock_handle_t *h);
 sandlock_result_t *sandlock_handle_wait_timeout(sandlock_handle_t *h, uint64_t timeout_ms);
 
 /**
+ * Prepare to wait and return a new descriptor that becomes readable once the
+ * main process exits, or -1 on error. Poll it without holding the handle, so
+ * other threads can signal the session, then call `sandlock_handle_wait`,
+ * which no longer blocks. The caller closes the descriptor.
+ *
+ * # Safety
+ * `h` must be a valid handle with no concurrent handle operations.
+ */
+int sandlock_handle_main_exit_fd(sandlock_handle_t *h);
+
+/**
  * Terminate remaining jobs with SIGKILL, reap them, and release supervision.
  * Returns the main status, captured output, and filesystem changes, or null
  * on error. The handle remains valid until `sandlock_handle_free`.

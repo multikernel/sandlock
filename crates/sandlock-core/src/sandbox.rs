@@ -957,21 +957,21 @@ impl Sandbox {
         Ok(rt.groups.live().map_err(SandboxRuntimeError::Io)?)
     }
 
-    /// Wait only for the main process, keeping background jobs supervised.
-    ///
-    /// Returns the same status on repeated calls. Capture pipes keep draining
-    /// until `shutdown()` collects them; this does not wait for EOF
-    /// or settle the COW branch. Untaken piped stdin is closed here.
-    /// Call `shutdown()` to terminate remaining jobs and collect their output.
-    pub async fn wait(&mut self) -> Result<crate::result::ExitStatus, crate::error::SandlockError> {
+    /// A descriptor that turns readable once the main process has exited.
+    /// Blocking on it needs no `&mut self`, so other threads can signal the
+    /// session meanwhile; `wait()` then returns without blocking.
+    pub fn main_exit_fd(&mut self) -> Result<std::os::fd::OwnedFd, crate::error::SandlockError> {
         use crate::error::SandboxRuntimeError;
-        let rt = self.runtime.as_ref().ok_or(SandboxRuntimeError::NotRunning)?;
-        let pid = rt.child_pid.ok_or(SandboxRuntimeError::NotRunning)?;
-        match &rt.state {
-            RuntimeState::MainExited(status) | RuntimeState::Stopped(status) => return Ok(status.clone()),
-            _ => {}
-        }
+        let pidfd = self.runtime.as_ref()
+            .and_then(|rt| rt.pidfd.as_ref())
+            .ok_or(SandboxRuntimeError::NotRunning)?
+            .try_clone()
+            .map_err(SandboxRuntimeError::Io)?;
+        self.prepare_wait();
+        Ok(pidfd)
+    }
 
+    fn prepare_wait(&mut self) {
         // Deliver EOF to a piped stdin the caller never took: otherwise a child
         // that reads stdin (e.g. `cat`) blocks forever and this wait never
         // returns. A taken stdin is already None here (the caller owns it).
@@ -1004,6 +1004,24 @@ impl Sandbox {
                 self.rt_mut().stderr_drain = sandbox_spawn_pipe_drain(fd, self.rt().drain_cut.clone());
             }
         }
+    }
+
+    /// Wait only for the main process, keeping background jobs supervised.
+    ///
+    /// Returns the same status on repeated calls. Capture pipes keep draining
+    /// until `shutdown()` collects them; this does not wait for EOF
+    /// or settle the COW branch. Untaken piped stdin is closed here.
+    /// Call `shutdown()` to terminate remaining jobs and collect their output.
+    pub async fn wait(&mut self) -> Result<crate::result::ExitStatus, crate::error::SandlockError> {
+        use crate::error::SandboxRuntimeError;
+        let rt = self.runtime.as_ref().ok_or(SandboxRuntimeError::NotRunning)?;
+        let pid = rt.child_pid.ok_or(SandboxRuntimeError::NotRunning)?;
+        match &rt.state {
+            RuntimeState::MainExited(status) | RuntimeState::Stopped(status) => return Ok(status.clone()),
+            _ => {}
+        }
+
+        self.prepare_wait();
 
         let exit_status = if let Some(reaper) = &self.rt().reaper {
             let exit = reaper.main_exit().await.map_err(SandboxRuntimeError::Io)?;
