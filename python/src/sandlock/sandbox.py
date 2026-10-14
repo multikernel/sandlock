@@ -754,7 +754,11 @@ class Sandbox:
                 killed and a timeout result is returned if exceeded.
                 None means no timeout.
         """
-        from ._sdk import _lib, _make_argv, _read_result_bytes, _read_result_changes, Result, ExitReason
+        import ctypes
+        from ._sdk import (
+            _c_result_p, _lib, _make_argv, _read_result_bytes, _read_result_changes,
+            Result, ExitReason,
+        )
 
         self._check_not_running()
 
@@ -780,11 +784,13 @@ class Sandbox:
         try:
             # This handle's runtime advances only inside native calls, so
             # wait natively; no other thread shares it.
-            status_p = _lib.sandlock_handle_wait_timeout(
-                handle, 0 if timeout is None else max(1, math.ceil(timeout * 1000)))
-            if not status_p:
+            status_p = _c_result_p()
+            rc = _lib.sandlock_handle_wait_timeout(
+                handle, 0 if timeout is None else max(1, math.ceil(timeout * 1000)),
+                ctypes.byref(status_p))
+            if rc < 0:
                 raise RuntimeError("sandlock_handle_wait failed")
-            timed_out = ExitReason(_lib.sandlock_result_reason(status_p)) == ExitReason.TIMEOUT
+            timed_out = rc == 1
             _lib.sandlock_result_free(status_p)
             result_p = _lib.sandlock_handle_shutdown(handle)
         finally:

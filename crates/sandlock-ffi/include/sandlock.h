@@ -70,7 +70,7 @@ enum sandlock_exit_reason
    */
   SANDLOCK_EXIT_REASON_KILLED = 2,
   /**
-   * A run or wait exceeded its timeout. A wait timeout leaves the session alive.
+   * A run exceeded its timeout and was killed.
    */
   SANDLOCK_EXIT_REASON_TIMEOUT = 3,
 };
@@ -916,14 +916,17 @@ sandlock_result_t *sandlock_handle_wait(sandlock_handle_t *h);
 
 /**
  * Wait for the main process with a timeout in milliseconds (0 means unlimited).
- * Returns a status-only result, or null on error. A timeout returns
- * the timeout reason without killing jobs or releasing supervision;
- * callers may wait again or shut down the session.
+ * Returns 0 and stores a status-only result in `*out` once main exits, 1 if
+ * the timeout elapsed first, or -1 on error. A timeout leaves the session
+ * untouched: callers may wait again or shut it down.
  *
  * # Safety
- * `h` must be a valid handle with no concurrent handle operations.
+ * `h` must be a valid handle with no concurrent handle operations, and
+ * `out` must be a valid pointer.
  */
-sandlock_result_t *sandlock_handle_wait_timeout(sandlock_handle_t *h, uint64_t timeout_ms);
+int sandlock_handle_wait_timeout(sandlock_handle_t *h,
+                                 uint64_t timeout_ms,
+                                 sandlock_result_t **out);
 
 /**
  * Prepare to wait and return a new descriptor that becomes readable once the

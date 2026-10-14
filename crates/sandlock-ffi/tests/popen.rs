@@ -421,8 +421,8 @@ fn wait_retains_background_session_until_shutdown() {
         assert!(!h.is_null());
         assert_eq!(sandlock_start(h), 0);
         for _ in 0..2 {
-            let status = sandlock_handle_wait_timeout(h, 5000);
-            assert!(!status.is_null());
+            let mut status = ptr::null_mut();
+            assert_eq!(sandlock_handle_wait_timeout(h, 5000, &mut status), 0);
             assert_eq!(sandlock_result_exit_code(status), 7);
             let mut len = 0;
             sandlock_result_stdout_bytes(status, &mut len);
@@ -461,11 +461,10 @@ fn wait_timeout_leaves_main_alive_for_a_later_wait() {
         let h = sandlock_create(policy, ptr::null(), av.as_ptr(), av.len() as c_uint);
         assert!(!h.is_null());
         assert_eq!(sandlock_start(h), 0);
-        let status = sandlock_handle_wait_timeout(h, 1);
-        assert!(!status.is_null());
-        assert!(matches!(sandlock_result_reason(status), sandlock_exit_reason_t::Timeout));
-        sandlock_result_free(status);
-        let status = sandlock_handle_wait_timeout(h, 5000);
+        let mut status = ptr::null_mut();
+        assert_eq!(sandlock_handle_wait_timeout(h, 1, &mut status), 1);
+        assert!(status.is_null());
+        assert_eq!(sandlock_handle_wait_timeout(h, 5000, &mut status), 0);
         assert_eq!(sandlock_result_exit_code(status), 9);
         sandlock_result_free(status);
         sandlock_result_free(sandlock_handle_shutdown(h));

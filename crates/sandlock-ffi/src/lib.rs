@@ -1455,40 +1455,49 @@ pub unsafe extern "C" fn sandlock_handle_resume(h: *mut sandlock_handle_t) -> c_
 /// `h` must be a valid handle with no concurrent handle operations.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_handle_wait(h: *mut sandlock_handle_t) -> *mut sandlock_result_t {
-    sandlock_handle_wait_timeout(h, 0)
+    let mut out = ptr::null_mut();
+    sandlock_handle_wait_timeout(h, 0, &mut out);
+    out
 }
 
 /// Wait for the main process with a timeout in milliseconds (0 means unlimited).
-/// Returns a status-only result, or null on error. A timeout returns
-/// the timeout reason without killing jobs or releasing supervision;
-/// callers may wait again or shut down the session.
+/// Returns 0 and stores a status-only result in `*out` once main exits, 1 if
+/// the timeout elapsed first, or -1 on error. A timeout leaves the session
+/// untouched: callers may wait again or shut it down.
 ///
 /// # Safety
-/// `h` must be a valid handle with no concurrent handle operations.
+/// `h` must be a valid handle with no concurrent handle operations, and
+/// `out` must be a valid pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_handle_wait_timeout(
     h: *mut sandlock_handle_t,
     timeout_ms: u64,
-) -> *mut sandlock_result_t {
-    if h.is_null() {
-        return ptr::null_mut();
+    out: *mut *mut sandlock_result_t,
+) -> c_int {
+    if h.is_null() || out.is_null() {
+        return -1;
     }
+    *out = ptr::null_mut();
     let h = &mut *h;
     let status = block_on_runtime(&h.runtime, async {
         if timeout_ms == 0 {
-            h.sandbox.wait().await
+            h.sandbox.wait().await.map(Some)
         } else {
             match tokio::time::timeout(Duration::from_millis(timeout_ms), h.sandbox.wait()).await {
-                Ok(result) => result,
-                Err(_) => Ok(ExitStatus::Timeout),
+                Ok(result) => result.map(Some),
+                Err(_) => Ok(None),
             }
         }
     });
     match status {
-        Some(Ok(exit_status)) => Box::into_raw(Box::new(sandlock_result_t {
-            _private: RunResult { exit_status, stdout: None, stderr: None, changes: Vec::new() },
-        })),
-        _ => ptr::null_mut(),
+        Some(Ok(Some(exit_status))) => {
+            *out = Box::into_raw(Box::new(sandlock_result_t {
+                _private: RunResult { exit_status, stdout: None, stderr: None, changes: Vec::new() },
+            }));
+            0
+        }
+        Some(Ok(None)) => 1,
+        _ => -1,
     }
 }
 
@@ -1707,7 +1716,7 @@ pub enum sandlock_exit_reason_t {
     Signaled = 1,
     /// Killed with no recoverable signal number.
     Killed = 2,
-    /// A run or wait exceeded its timeout. A wait timeout leaves the session alive.
+    /// A run exceeded its timeout and was killed.
     Timeout = 3,
 }
 

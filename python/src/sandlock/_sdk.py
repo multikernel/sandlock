@@ -316,8 +316,9 @@ _lib.sandlock_handle_pid.argtypes = [_c_handle_p]
 _lib.sandlock_handle_wait.restype = _c_result_p
 _lib.sandlock_handle_wait.argtypes = [_c_handle_p]
 
-_lib.sandlock_handle_wait_timeout.restype = _c_result_p
-_lib.sandlock_handle_wait_timeout.argtypes = [_c_handle_p, ctypes.c_uint64]
+_lib.sandlock_handle_wait_timeout.restype = ctypes.c_int
+_lib.sandlock_handle_wait_timeout.argtypes = [
+    _c_handle_p, ctypes.c_uint64, ctypes.POINTER(_c_result_p)]
 
 _lib.sandlock_handle_shutdown.restype = _c_result_p
 _lib.sandlock_handle_shutdown.argtypes = [_c_handle_p]

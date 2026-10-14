@@ -744,12 +744,13 @@ func (s *Sandbox) Run(ctx context.Context, cmd ...string) (*Result, error) {
 		C.sandlock_handle_free(h)
 		return nil, fmt.Errorf("sandlock: failed to start sandbox")
 	}
-	status := C.sandlock_handle_wait_timeout(h, timeoutMs(ctx))
-	if status == nil {
+	var status *C.sandlock_result_t
+	rc := C.sandlock_handle_wait_timeout(h, timeoutMs(ctx), &status)
+	if rc < 0 {
 		C.sandlock_handle_free(h)
 		return nil, fmt.Errorf("sandlock: wait failed")
 	}
-	timedOut := ExitReason(C.sandlock_result_reason(status)) == ReasonTimeout
+	timedOut := rc == 1
 	C.sandlock_result_free(status)
 	r := C.sandlock_handle_shutdown(h)
 	C.sandlock_handle_free(h)
