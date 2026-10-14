@@ -1063,18 +1063,23 @@ impl Sandbox {
             || rt.reaper.as_ref().is_some_and(|r| r.empty || crate::pgroup::has_exited(r.pidfd.as_raw_fd()));
         if !empty { self.kill()?; }
         let exit_status = self.wait().await?;
-        if !empty {
+        let no_supervisor = self.no_supervisor;
+        if let Some(reaper) = &mut self.rt_mut().reaper {
+            // Supervised, every process was in a swept group, so the reaper
+            // exits on its own once the last is reaped. Only without a
+            // supervisor can untracked jobs remain, and there is no COW then
+            // that must outwait them.
+            if no_supervisor { reaper.finish(); }
+            reaper.join().await.map_err(SandboxRuntimeError::Io)?;
+            self.rt().drain_cut.cancel();
+        } else if !empty {
+            // Nothing reports the end of a clone's descendants.
             loop {
                 if self.rt().groups.signal(libc::SIGKILL).map_err(SandboxRuntimeError::Io)? == 0 {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-        }
-        if let Some(reaper) = &mut self.rt_mut().reaper {
-            reaper.finish();
-            reaper.join().await.map_err(SandboxRuntimeError::Io)?;
-            self.rt().drain_cut.cancel();
         }
         self.rt_mut().reaper = None;
         self.rt_mut().state = RuntimeState::Stopped(exit_status.clone());
@@ -2681,15 +2686,10 @@ impl Drop for Sandbox {
     fn drop(&mut self) {
         if let Some(ref mut rt) = self.runtime {
             if let Some(worker) = &rt.policy_fn_worker { worker.cancel(); }
-            let _ = rt.groups.signal(libc::SIGKILL);
+            let swept = rt.groups.signal(libc::SIGKILL);
             if let Some(reaper) = &rt.reaper {
                 use std::os::fd::AsRawFd;
                 unsafe { libc::syscall(libc::SYS_pidfd_send_signal, reaper.main_pidfd.as_raw_fd(), libc::SIGKILL, 0, 0) };
-                // The reaper collects the zombies that keep a swept group
-                // counted, so the branch below settles after the jobs are gone.
-                while matches!(rt.groups.signal(libc::SIGKILL), Ok(n) if n > 0) {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
             }
             if let Some(pid) = rt.child_pid {
                 if matches!(rt.state, RuntimeState::Created | RuntimeState::Running | RuntimeState::Paused) {
@@ -2708,7 +2708,8 @@ impl Drop for Sandbox {
             }
 
             if let Some(mut reaper) = rt.reaper.take() {
-                reaper.finish();
+                // As in shutdown(): only jobs no sweep reached can keep it alive.
+                if self.no_supervisor || swept.is_err() { reaper.finish(); }
                 reaper.join_blocking();
             }
 
