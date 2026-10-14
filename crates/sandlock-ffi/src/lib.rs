@@ -2154,7 +2154,7 @@ pub unsafe extern "C" fn sandlock_gather_free(g: *mut sandlock_gather_t) {
 ///
 /// Path strings are intentionally absent (issue #27); use static Landlock
 /// rules for path-based access control. argv is exposed for execve only
-/// and is TOCTOU-safe via sibling-thread freeze before Continue.
+/// and is re-verified under a sandbox-wide freeze before Continue.
 #[repr(C)]
 pub struct sandlock_event_t {
     pub syscall: *const c_char,

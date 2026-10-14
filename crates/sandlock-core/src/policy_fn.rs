@@ -71,13 +71,14 @@ pub enum SyscallCategory {
 /// construction: with `policy_fn` active, fork-like syscalls are traced
 /// for one ptrace creation event, so children are registered in
 /// `ProcessIndex` before they can run user code. Before the supervisor
-/// exposes `argv` to `policy_fn` or returns `Continue` for an execve, it
-/// then `PTRACE_SEIZE`+`PTRACE_INTERRUPT`s every task that could write
+/// returns `Continue` for an execve, it `PTRACE_SEIZE`+`PTRACE_INTERRUPT`s
+/// every task that could write
 /// the memory — both sibling threads of the calling tid (same TGID, share
 /// `mm_struct`) and peer threads in other TGIDs that may alias argv
 /// pages via `MAP_SHARED` mappings or share `mm_struct` via
-/// `clone(CLONE_VM)`. The kernel's post-Continue re-read therefore
-/// sees the same memory the supervisor inspected. Siblings are killed
+/// `clone(CLONE_VM)`, then re-reads argv and denies the exec unless it
+/// matches what `policy_fn` saw. The kernel's post-Continue re-read
+/// therefore sees the argv the callback approved. Siblings are killed
 /// by the kernel during execve's `de_thread` step; peer threads are
 /// detached after `NOTIF_SEND` and resume normally. See
 /// `crate::freeze`.

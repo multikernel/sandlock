@@ -57,10 +57,11 @@ positive int = deny with errno, `"audit"`/`-2` = allow + flag.
 >   belongs in static Landlock rules (`fs_readable` / `fs_writable` /
 >   `fs_denied`), kernel-enforced and TOCTOU-immune. Use
 >   `ctx.deny_path()` for runtime additions.
-> - **`event.argv` is exposed and TOCTOU-safe.** Before exposing
->   `argv` to `policy_fn` or returning `Continue` for an
->   `execve`, the supervisor freezes every task in `ProcessIndex`,
->   including peer processes that may alias argv through shared memory.
+> - **`event.argv` is exposed and TOCTOU-safe.** Before returning
+>   `Continue` for an `execve`, the supervisor freezes every task in
+>   `ProcessIndex`, including peer processes that may alias argv through
+>   shared memory, and re-reads argv and the path. If either differs from
+>   what `policy_fn` saw, the exec is denied with `EPERM`.
 >   With `policy_fn` active, fork-like syscalls are traced for one
 >   ptrace creation event, so children are registered in `ProcessIndex`
 >   before they can run user code. If the freeze or creation tracking
@@ -172,11 +173,10 @@ includes callback queue time. Shutdown cancels pending approvals without waiting
 for applications to release their handles. Callbacks themselves must still
 return promptly.
 
-The supervisor bounds outstanding approvals and queued exec preparations to 64;
-when full it rejects additional held requests with `EAGAIN`. Exec approval retains
-the existing sandbox-wide argv freeze. The supervisor stays responsive, but
-frozen sandbox tasks cannot make progress until that exec is decided. Overlapping
-exec and process-creation preparations wait until the freeze is released.
+The supervisor bounds outstanding approvals to 64; when full it rejects
+additional held requests with `EAGAIN`. Other sandbox tasks keep running while
+an exec awaits approval; the argv freeze is taken only after the verdict, so an
+exec whose argv changed in the meantime is denied.
 
 In Rust, use the same ownership model:
 

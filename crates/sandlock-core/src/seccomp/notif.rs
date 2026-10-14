@@ -2,7 +2,7 @@
 // notifications from the kernel, dispatches them to handler functions, and
 // sends responses.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io;
 use std::net::IpAddr;
@@ -2252,6 +2252,7 @@ fn policy_holds_syscall(nr: i64) -> bool {
 async fn emit_policy_event(
     notif: &SeccompNotif,
     action: &NotifAction,
+    exec_image: Option<&ExecImage>,
     policy_fn_state: &Arc<tokio::sync::Mutex<super::state::PolicyFnState>>,
     notif_fd: RawFd,
 ) -> Option<VerdictWait> {
@@ -2283,10 +2284,9 @@ async fn emit_policy_event(
     // in static Landlock rules.
     //
     // argv IS extracted for allowed execve/execveat notifications:
-    // the supervisor freezes every task in the sandbox (siblings +
-    // peers) before this callback reads argv and keeps that freeze
-    // through Continue, so the post-Continue re-read sees the same
-    // memory we read here.
+    // before Continue the supervisor freezes every task in the sandbox,
+    // re-reads argv and denies the exec unless it matches what the
+    // callback saw, and keeps that freeze until the kernel has read it.
     //
     // Network fields are TOCTOU-safe because connect/sendto/bind are
     // performed on-behalf via pidfd_getfd; the kernel never re-reads
@@ -2299,17 +2299,9 @@ async fn emit_policy_event(
     let mut path2 = None;
     let mut flags = None;
 
-    if !denied && (nr == libc::SYS_execve || nr == libc::SYS_execveat) {
-        // execve(pathname, argv, envp):       args[1] = argv ptr
-        // execveat(dirfd, pathname, argv, ..): args[2] = argv ptr
-        let argv_ptr = if nr == libc::SYS_execveat {
-            notif.data.args[2]
-        } else {
-            notif.data.args[1]
-        };
-        argv = read_argv_for_event(notif, argv_ptr, notif_fd);
-        path = resolve_path_for_notif(notif, notif_fd)
-            .map(std::path::PathBuf::from);
+    if let Some(image) = exec_image {
+        argv = image.argv.clone();
+        path = image.path.clone();
     }
 
     let mut protocol = None;
@@ -2531,10 +2523,29 @@ fn spawn_deferred(
 
 type VerdictWait = Pin<Box<dyn Future<Output = crate::policy_fn::Verdict> + Send>>;
 
+/// What policy_fn is shown for an execve; the kernel must exec exactly this.
+#[derive(PartialEq)]
+struct ExecImage {
+    argv: Option<Vec<String>>,
+    path: Option<std::path::PathBuf>,
+}
+
+fn read_exec_image(notif: &SeccompNotif, notif_fd: RawFd) -> ExecImage {
+    let argv_ptr = if notif.data.nr as i64 == libc::SYS_execveat {
+        notif.data.args[2]
+    } else {
+        notif.data.args[1]
+    };
+    ExecImage {
+        argv: read_argv_for_event(notif, argv_ptr, notif_fd),
+        path: resolve_path_for_notif(notif, notif_fd).map(std::path::PathBuf::from),
+    }
+}
+
 struct PendingNotification {
     notif: SeccompNotif,
     action: Option<NotifAction>,
-    exec_freeze: Option<crate::freeze::SandboxFreeze>,
+    exec_image: Option<ExecImage>,
     fork_counted: bool,
     open: Option<Arc<OpenRequest>>,
     fd: Arc<OwnedFd>,
@@ -2545,10 +2556,6 @@ impl Drop for PendingNotification {
         if self.action.is_some() {
             let _ = send_response(self.fd.as_raw_fd(), self.notif.id, NotifAction::Errno(libc::EPERM));
         }
-        if let Some(freeze) = self.exec_freeze.take() {
-            crate::freeze::detach_all(&freeze);
-            crate::freeze::reap_pending(&freeze.pending_tids);
-        }
     }
 }
 
@@ -2558,14 +2565,8 @@ struct PendingApproval {
 }
 
 async fn next_approval(pending: &mut [PendingApproval]) -> (usize, crate::policy_fn::Verdict) {
-    // The exec freeze skips tasks blocked in a notification, so releasing one
-    // before the exec is decided would let it rewrite argv policy_fn approved.
-    let frozen = pending.iter().any(|p| p.notification.exec_freeze.is_some());
     std::future::poll_fn(|cx| {
         for (index, approval) in pending.iter_mut().enumerate() {
-            if frozen && approval.notification.exec_freeze.is_none() {
-                continue;
-            }
             if let std::task::Poll::Ready(verdict) = approval.verdict.as_mut().poll(cx) {
                 return std::task::Poll::Ready((index, verdict));
             }
@@ -2642,53 +2643,16 @@ async fn handle_notification(
     let fork_counted = matches!(action, NotifAction::Continue)
         && crate::resource::fork_counted_on_continue(&notif);
 
-    // TOCTOU-close for execve (issue #27): freeze every sandbox task
-    // that could mutate argv before policy_fn reads argv and before the
-    // kernel re-reads it after Continue. This covers two writer classes:
-    //   1. Sibling threads of the calling tid (same TGID, share mm).
-    //   2. Peer processes in other TGIDs that alias argv pages via
-    //      MAP_SHARED mappings or share mm via clone(CLONE_VM).
-    //
-    // The freeze enumerates ProcessIndex. With policy_fn active, that
-    // index is complete: fork-like syscalls are traced at creation time
-    // below, before new children can run user code.
-    //
-    // Strict on failure: if we cannot establish the freeze, we cannot
-    // safely expose argv or allow execve, so we deny with EPERM.
-    let mut exec_freeze = None;
-    if matches!(action, NotifAction::Continue)
+    // Read unfrozen so the sandbox keeps running while policy_fn decides;
+    // finish_notification re-reads it under a freeze before Continue.
+    let exec_image = (matches!(action, NotifAction::Continue)
         && policy.argv_safety_required
-        && crate::freeze::requires_freeze_on_continue(nr)
-    {
-        match crate::freeze::freeze_sandbox_for_execve(
-            &ctx.processes,
-            notif.pid as i32,
-        ) {
-            Ok(outcome) => {
-                exec_freeze = Some(outcome);
-            }
-            Err(e) => {
-                eprintln!(
-                    "sandlock: argv-safety freeze failed for pid {}: {} \
-                     — denying execve to preserve TOCTOU invariant",
-                    notif.pid, e
-                );
-                action = NotifAction::Errno(libc::EPERM);
-                // Rollback could not release tasks that had not entered
-                // ptrace-stop yet; carry them to the post-send reap.
-                if !e.pending_tids.is_empty() {
-                    exec_freeze = Some(crate::freeze::SandboxFreeze {
-                        pending_tids: e.pending_tids,
-                        ..Default::default()
-                    });
-                }
-            }
-        }
-    }
+        && crate::freeze::requires_freeze_on_continue(nr))
+        .then(|| read_exec_image(&notif, fd));
 
-    let verdict = emit_policy_event(&notif, &action, &ctx.policy_fn, fd).await;
+    let verdict = emit_policy_event(&notif, &action, exec_image.as_ref(), &ctx.policy_fn, fd).await;
     let notification = PendingNotification {
-        notif, action: Some(action), exec_freeze, fork_counted, open, fd: Arc::clone(notif_fd),
+        notif, action: Some(action), exec_image, fork_counted, open, fd: Arc::clone(notif_fd),
     };
     if let Some(verdict) = verdict {
         return Some(PendingApproval { notification, verdict });
@@ -2755,6 +2719,32 @@ async fn recheck_policy(
     action
 }
 
+/// TOCTOU-close for execve (issue #27): stop every task that could write
+/// argv, then confirm it still matches what policy_fn approved. The freeze
+/// is held until the kernel has read argv after Continue.
+fn freeze_approved_exec(
+    notif: &SeccompNotif,
+    approved: &ExecImage,
+    ctx: &super::ctx::SupervisorCtx,
+    fd: RawFd,
+) -> (NotifAction, Option<crate::freeze::SandboxFreeze>) {
+    match crate::freeze::freeze_sandbox_for_execve(&ctx.processes, notif.pid as i32) {
+        Ok(freeze) if read_exec_image(notif, fd) == *approved => (NotifAction::Continue, Some(freeze)),
+        Ok(freeze) => (NotifAction::Errno(libc::EPERM), Some(freeze)),
+        Err(e) => {
+            eprintln!(
+                "sandlock: argv-safety freeze failed for pid {}: {}; \
+                 denying execve to preserve TOCTOU invariant",
+                notif.pid, e
+            );
+            // Rollback could not release tasks that had not entered
+            // ptrace-stop yet; carry them to the post-send reap.
+            let pending = crate::freeze::SandboxFreeze { pending_tids: e.pending_tids, ..Default::default() };
+            (NotifAction::Errno(libc::EPERM), Some(pending))
+        }
+    }
+}
+
 async fn finish_notification(
     mut pending: PendingNotification,
     verdict: Option<crate::policy_fn::Verdict>,
@@ -2782,6 +2772,11 @@ async fn finish_notification(
 
     if let NotifAction::Prepared(operation) = action {
         action = operation.execute();
+    }
+
+    let mut exec_freeze = None;
+    if let (NotifAction::Continue, Some(image)) = (&action, &pending.exec_image) {
+        (action, exec_freeze) = freeze_approved_exec(&notif, image, ctx, fd);
     }
 
     if fork_counted && !matches!(action, NotifAction::Continue) {
@@ -2843,7 +2838,7 @@ async fn finish_notification(
     }
 
     // Ignore error — child may have exited between recv and response.
-    let exec_continued = pending.exec_freeze.is_some() && matches!(action, NotifAction::Continue);
+    let exec_continued = exec_freeze.is_some() && matches!(action, NotifAction::Continue);
     let send_result = send_response(fd, notif.id, action);
 
     if let Some(trace) = creation_trace {
@@ -2867,7 +2862,7 @@ async fn finish_notification(
         }
     }
 
-    if let Some(freeze) = pending.exec_freeze.take() {
+    if let Some(freeze) = exec_freeze {
         if exec_continued && send_result.is_ok() {
             crate::freeze::detach_peers(&freeze.peer_tids);
             crate::freeze::release_siblings(&freeze.sibling_tids);
@@ -2943,11 +2938,9 @@ pub async fn supervisor(
     let cancellation = ctx.policy_fn.lock().await.cancellation.clone();
     let _cancel_on_drop = cancellation.clone().drop_guard();
     let mut pending: Vec<PendingApproval> = Vec::new();
-    let mut waiting_exec = VecDeque::new();
     let mut drain = false;
 
     loop {
-        let freeze_pending = pending.iter().any(|p| p.notification.exec_freeze.is_some());
         tokio::select! {
             biased;
             _ = cancellation.cancelled() => break,
@@ -2956,7 +2949,7 @@ pub async fn supervisor(
                 finish_notification(approval.notification, Some(verdict), &ctx, &defer_sem).await;
             }
             ready = async {
-                if drain || (!freeze_pending && !waiting_exec.is_empty()) {
+                if drain {
                     return Ok(());
                 }
                 let mut ready = async_fd.readable().await?;
@@ -2964,34 +2957,19 @@ pub async fn supervisor(
                 Ok::<(), io::Error>(())
             } => {
                 if ready.is_err() { break; }
-                let queued = if !freeze_pending { waiting_exec.pop_front() } else { None };
-                let notif = if let Some(notif) = queued {
-                    notif
-                } else {
-                    match probe_notif_fd(fd) {
-                        NotifFdState::Empty => { drain = false; continue; }
-                        NotifFdState::Terminal => break,
-                        NotifFdState::Pending => {}
-                    }
-                    drain = true;
-                    match recv_notif(fd) {
-                        Ok(n) => n,
-                        Err(e) if matches!(e.raw_os_error(), Some(libc::EINTR) | Some(libc::ENOENT)) => continue,
-                        Err(_) => break,
-                    }
-                };
-                if pending.len() + waiting_exec.len() >= DEFER_MAX_INFLIGHT
-                    && (policy_holds_syscall(notif.data.nr as i64)
-                        || crate::resource::requires_process_creation_tracking(&notif, &ctx.policy))
-                {
-                    let _ = send_response(fd, notif.id, NotifAction::Errno(libc::EAGAIN));
-                    continue;
+                match probe_notif_fd(fd) {
+                    NotifFdState::Empty => { drain = false; continue; }
+                    NotifFdState::Terminal => break,
+                    NotifFdState::Pending => {}
                 }
-                // An overlapping freeze or creation trace would invalidate argv protection.
-                if freeze_pending && (crate::freeze::requires_freeze_on_continue(notif.data.nr as i64)
-                    || crate::resource::requires_process_creation_tracking(&notif, &ctx.policy))
-                {
-                    waiting_exec.push_back(notif);
+                drain = true;
+                let notif = match recv_notif(fd) {
+                    Ok(n) => n,
+                    Err(e) if matches!(e.raw_os_error(), Some(libc::EINTR) | Some(libc::ENOENT)) => continue,
+                    Err(_) => break,
+                };
+                if pending.len() >= DEFER_MAX_INFLIGHT && policy_holds_syscall(notif.data.nr as i64) {
+                    let _ = send_response(fd, notif.id, NotifAction::Errno(libc::EAGAIN));
                     continue;
                 }
                 if let Some(approval) = handle_notification(
@@ -3005,9 +2983,6 @@ pub async fn supervisor(
 
     cancellation.cancel();
     drop(pending);
-    for notif in waiting_exec {
-        let _ = send_response(fd, notif.id, NotifAction::Errno(libc::EPERM));
-    }
     gc.abort();
 }
 

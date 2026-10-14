@@ -217,7 +217,7 @@ typedef struct {
  *
  * Path strings are intentionally absent (issue #27); use static Landlock
  * rules for path-based access control. argv is exposed for execve only
- * and is TOCTOU-safe via sibling-thread freeze before Continue.
+ * and is re-verified under a sandbox-wide freeze before Continue.
  */
 typedef struct {
   const char *syscall;

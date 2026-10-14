@@ -93,8 +93,8 @@ func (c SyscallCategory) String() string {
 //
 // Path strings are intentionally absent. Path-based access control belongs in
 // Landlock rules (FSReadable, FSWritable, FSDenied). Argv is populated only for
-// execve/execveat events, where sandlock freezes sibling tasks before exposing
-// it to the policy callback.
+// execve/execveat events, where sandlock denies the exec unless argv still
+// matches what the policy callback saw once sibling tasks are frozen.
 type SyscallEvent struct {
 	Syscall   string
 	Category  SyscallCategory

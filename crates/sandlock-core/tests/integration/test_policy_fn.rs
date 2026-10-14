@@ -1094,22 +1094,26 @@ assert not errors, errors
     assert!(held.lock().unwrap().is_none());
 }
 
+/// Hands the exec marked with `marker` to the test; allows everything else.
+fn hold_marked_exec(port: Option<u16>) -> (PolicyFn, tokio::sync::mpsc::UnboundedReceiver<sandlock_core::policy_fn::Approval>) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let policy = PolicyFn::deferred(move |event, _, approval| {
+        let Some(mut approval) = approval else { return };
+        let marked = event.argv.as_ref().is_some_and(|argv| argv.iter().any(|a| a == "marker"));
+        if marked || (port.is_some() && event.port == port) {
+            let _ = tx.send(approval);
+        } else {
+            approval.resolve(Verdict::Allow).unwrap();
+        }
+    }).verdict_timeout(Some(Duration::from_secs(10)));
+    (policy, rx)
+}
+
 #[tokio::test]
-async fn deferred_approval_waits_for_pending_exec() {
+async fn pending_exec_approval_does_not_freeze_sandbox() {
     let (listener, port) = loopback_listener("127.0.0.1");
-    listener.set_nonblocking(true).unwrap();
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut sandbox = base_policy()
-        .policy_fn(PolicyFn::deferred(move |event, _, approval| {
-            let Some(mut approval) = approval else { return };
-            let marked = event.argv.as_ref().is_some_and(|argv| argv.iter().any(|a| a == "marker"));
-            if event.port == Some(port) || marked {
-                let _ = tx.send(approval);
-            } else {
-                approval.resolve(Verdict::Allow).unwrap();
-            }
-        }).verdict_timeout(Some(Duration::from_secs(10))))
-        .build().unwrap();
+    let (policy, mut rx) = hold_marked_exec(Some(port));
+    let mut sandbox = base_policy().policy_fn(policy).build().unwrap();
     let script = format!(r#"
 import os, socket, threading, time
 threading.Thread(target=socket.create_connection, args=(('127.0.0.1', {port}),), daemon=True).start()
@@ -1120,8 +1124,9 @@ os.execv('/bin/true', ['true', 'marker'])
     let mut connect = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
     let mut exec = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
     connect.resolve(Verdict::Allow).unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(listener.accept().is_err(), "a sibling ran while execve argv was under review");
+    let accepted = tokio::task::spawn_blocking(move || listener.accept().is_ok());
+    assert!(tokio::time::timeout(Duration::from_secs(5), accepted).await.unwrap().unwrap(),
+        "a sibling stalled behind a pending exec approval");
     exec.resolve(Verdict::Allow).unwrap();
     assert!(run.await.unwrap().unwrap().success());
 }
@@ -1140,4 +1145,26 @@ os.execv('/bin/true', ['true'])
         .await
         .expect("exec hung behind a frozen sibling thread");
     assert!(result.unwrap().success());
+}
+
+#[tokio::test]
+async fn exec_argv_rewritten_during_approval_is_denied() {
+    let (policy, mut rx) = hold_marked_exec(None);
+    let mut sandbox = base_policy().policy_fn(policy).build().unwrap();
+    let script = r#"
+import ctypes, sys, threading, time
+arg = ctypes.create_string_buffer(b'marker')
+argv = (ctypes.c_char_p * 3)(b'true', ctypes.addressof(arg), None)
+def rewrite():
+    time.sleep(0.3)
+    arg.value = b'MARKER'
+threading.Thread(target=rewrite, daemon=True).start()
+ctypes.CDLL(None, use_errno=True).execv(b'/bin/true', argv)
+sys.exit(3 if ctypes.get_errno() == 1 else 4)
+"#;
+    let run = tokio::spawn(async move { sandbox.run_interactive(&["python3", "-c", script]).await });
+    let mut exec = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    exec.resolve(Verdict::Allow).unwrap();
+    assert_eq!(run.await.unwrap().unwrap().code(), Some(3), "exec ran with argv policy_fn never saw");
 }

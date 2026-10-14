@@ -73,7 +73,8 @@ The async notification supervisor (tokio) handles intercepted syscalls:
 
 Policy approval waits are owned by the supervisor and polled alongside new
 notifications. Dispatch and response finalization remain sequential; a pending
-approval retains its prepared action and any exec argv freeze. Cancellation
+approval retains its prepared action and the exec argv it exposed, which is
+re-verified under a sandbox-wide freeze before `Continue`. Cancellation
 releases these resources before the notification descriptor closes. Deferred
 policy callbacks can hand approval handles to an embedder without blocking the
 callback worker.

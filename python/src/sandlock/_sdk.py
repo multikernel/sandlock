@@ -169,7 +169,7 @@ def _validate_protection(p: int, *, field: str) -> int:
 
 # Policy callback (policy_fn).
 # Path strings absent (issue #27 — path-based control belongs in Landlock).
-# argv is populated for execve only; TOCTOU-safe via sibling freeze.
+# argv is populated for execve only; re-verified under a freeze before Continue.
 class _CEvent(ctypes.Structure):
     _fields_ = [
         ("syscall", ctypes.c_char_p),
@@ -699,11 +699,9 @@ class SyscallEvent:
     Landlock rules (``fs_readable``, ``fs_writable``, ``fs_denied``).
 
     ``argv`` *is* exposed for execve/execveat events and is TOCTOU-safe:
-    the supervisor freezes the calling process's sibling threads via
-    PTRACE_INTERRUPT before returning Continue, so the kernel's re-read
-    sees the same memory the supervisor inspected. Siblings die during
-    execve's de_thread step regardless, so the freeze has no observable
-    cost.
+    before returning Continue the supervisor freezes every task that could
+    write it, re-reads argv, and denies the exec unless it matches what the
+    callback saw. Other tasks keep running while the callback decides.
     """
     syscall: str
     category: str  # "file", "network", "process", "memory"
