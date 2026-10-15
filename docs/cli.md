@@ -226,8 +226,8 @@ sandlock run -p build -- make test  # trailing command overrides [program]
 
 `sandlock ps` lists every running sandbox with its uptime, port mappings,
 and command. `sandlock inspect NAME` prints the effective policy as JSON
-(`--toml` prints it in profile syntax). `sandlock kill NAME` stops a
-sandbox and its supervisor.
+(`--toml` prints it in profile syntax). `sandlock kill NAME` asks the
+supervisor to kill every process group the sandbox created.
 
 ```
 $ sandlock ps
@@ -243,7 +243,7 @@ http_inject_ca = []
 ...
 
 $ sandlock kill web.local
-Killed sandbox 'web.local' (child PID 12346, supervisor PID 12340)
+Killed sandbox 'web.local'
 ```
 
 Ports show as `virtual→real` when `--port-remap` is active; see

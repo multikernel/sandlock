@@ -2513,6 +2513,7 @@ impl Sandbox {
                 self.rt_mut().control_handle = Some(crate::control::spawn_control_loop(
                     sockets,
                     Some(control_ctx),
+                    Arc::clone(&self.rt().groups),
                     sandbox_snapshot,
                     control_info.clone(),
                 ));
@@ -2538,6 +2539,7 @@ impl Sandbox {
             self.rt_mut().control_handle = Some(crate::control::spawn_control_loop(
                 sockets,
                 None,
+                Arc::clone(&self.rt().groups),
                 self.clone(),
                 control_info,
             ));

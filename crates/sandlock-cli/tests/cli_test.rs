@@ -672,6 +672,61 @@ fn test_kill_stops_sandbox() {
 }
 
 #[test]
+fn test_kill_stops_sandbox_without_supervisor() {
+    let name = format!("test-kill-nosup-{}", std::process::id());
+    let mut args = sandlock_sleep_args(&name);
+    args.insert(1, "--no-supervisor".into());
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_sandlock"))
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn sandlock");
+    if let Err(e) = wait_for_sandbox(&mut child, &name) {
+        panic!("{}", e);
+    }
+    let out = sandlock_bin().args(["kill", &name]).output().expect("sandlock kill");
+    assert!(
+        out.status.success(),
+        "kill should succeed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!child.wait().expect("wait for killed child").success());
+}
+
+#[test]
+fn test_kill_wedged_supervisor_kills_main() {
+    use std::os::unix::process::ExitStatusExt;
+    let name = format!("test-kill-wedged-{}", std::process::id());
+    let mut child = spawn_sandbox(&name);
+    if let Err(e) = wait_for_sandbox(&mut child, &name) {
+        panic!("{}", e);
+    }
+    let ps = sandlock_bin().args(["ps"]).output().expect("sandlock ps");
+    let main: i32 = String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next() == Some(name.as_str())).then(|| fields.next()?.parse().ok())?
+        })
+        .expect("main pid in ps output");
+
+    unsafe { libc::kill(child.id() as i32, libc::SIGSTOP) };
+    let out = sandlock_bin().args(["kill", &name]).output().expect("sandlock kill");
+    assert!(
+        out.status.success(),
+        "kill should succeed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(child.wait().expect("wait for supervisor").signal(), Some(libc::SIGKILL));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while unsafe { libc::kill(main, 0) } == 0 {
+        assert!(std::time::Instant::now() < deadline, "main {main} outlived its supervisor");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
 fn test_kill_nonexistent_sandbox() {
     let out = sandlock_bin()
         .args(["kill", "nonexistent-sandbox-xyz-99999"])

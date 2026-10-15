@@ -358,30 +358,11 @@ async fn main() -> Result<()> {
                 eprintln!("sandlock: {e}");
                 std::process::exit(1);
             }
-            // Both pids come from the kernel, so this works on a supervisor
-            // that is stopped or wedged.
-            let pids = match sandlock_core::control::sandbox_pids(&name) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("sandlock: {}", e);
-                    std::process::exit(1);
-                }
-            };
-            // Groups the sandbox created are known only to the supervisor,
-            // and a wedged one cannot answer, so the child's own group is
-            // signalled here regardless. The supervisor may sit in a
-            // different group, so signal it directly too.
-            let _ = sandlock_core::control::send_control_request(
-                &name,
-                "kill",
-                serde_json::Value::Object(Default::default()),
-            );
-            unsafe { libc::killpg(pids.child, libc::SIGKILL) };
-            unsafe { libc::kill(pids.supervisor, libc::SIGKILL) };
-            println!(
-                "Killed sandbox '{}' (child PID {}, supervisor PID {})",
-                name, pids.child, pids.supervisor
-            );
+            if let Err(e) = sandlock_core::control::kill_sandbox(&name) {
+                eprintln!("sandlock: kill '{}': {}", name, e);
+                std::process::exit(1);
+            }
+            println!("Killed sandbox '{}'", name);
         }
 
         Command::Check => {
