@@ -3,7 +3,7 @@
 
 A Sandbox holds both the configuration (policy fields) and the runtime
 state for executing commands. Configuration fields are set at construction
-time; runtime state (``_native``, ``_handle``) is initialized lazily.
+time; runtime state (``_native``, ``_session``) is initialized lazily.
 """
 
 from __future__ import annotations
@@ -530,16 +530,12 @@ class Sandbox:
         self.on_error = BranchAction(self.on_error)
         # Runtime state — not dataclass fields, not serialized
         self._native = None   # _NativePolicy created lazily on first use
-        self._handle = None   # live sandbox handle during start()/run()
+        self._session = _Session(None)  # the create()/start() lifecycle handle
         self._pending = None  # handle kept after a DEFER run until commit()/abort()
         self._process = None  # weakref to the live popen() Process; it OWNS its
                               # own handle (see `_popen_process`), this is only a
                               # non-owning busy marker
         self._restore_skipped = []  # SkippedFd entries from the last restore
-        self._lock = threading.RLock()
-        self._idle = threading.Condition(self._lock)
-        self._waiting = False
-        self._status = None
 
     @staticmethod
     def _next_name() -> str:
@@ -588,15 +584,13 @@ class Sandbox:
 
     def _live_handle(self):
         """The handle owning the currently running child, from either source:
-        the ``create``/``start``/``run``/``spawn`` lifecycle (``self._handle``) or
+        the ``create``/``start``/``spawn`` lifecycle (``self._session``) or
         a :meth:`popen` :class:`Process` (which owns its handle). Returns ``None``
         when nothing is running. This is the single source of truth for "busy"."""
-        if self._handle is not None:
-            return self._handle
+        if self._session.handle is not None:
+            return self._session.handle
         proc = self._popen_process()
-        if proc is not None and proc._handle is not None:
-            return proc._handle
-        return None
+        return proc._session.handle if proc is not None else None
 
     def _check_not_running(self) -> None:
         """Raise if any child is live, so a second lifecycle call can't leak the
@@ -612,7 +606,7 @@ class Sandbox:
         must not touch a handle the ``Process`` owns — freeing or signalling it
         behind the ``Process``'s back is exactly the aliasing this split avoids."""
         proc = self._popen_process()
-        if proc is not None and proc._handle is not None:
+        if proc is not None and proc._session.handle is not None:
             raise RuntimeError(
                 "this sandbox is running a process started with popen(); manage it "
                 "through the returned Process (proc.wait() / proc.kill()), not the "
@@ -632,16 +626,7 @@ class Sandbox:
         proc = self._popen_process()
         if proc is not None:
             proc.__exit__(exc_type, exc_val, exc_tb)
-        with self._lock:
-            if self._handle is not None:
-                from ._sdk import _lib
-                if self._waiting:
-                    _lib.sandlock_handle_kill(self._handle)
-                    while self._waiting:
-                        self._idle.wait()
-                if self._handle is not None:
-                    _lib.sandlock_handle_free(self._handle)
-                    self._handle = None
+        self._session.close(self._session.free)
         # Freeing an undecided branch preserves it, same as KEEP.
         self._release_pending()
         return False
@@ -660,10 +645,7 @@ class Sandbox:
             # reading it can't race a concurrent shutdown() freeing the handle.
             return proc.pid
         from ._sdk import _lib
-        with self._lock:
-            if self._handle is None:
-                return None
-            return _lib.sandlock_handle_pid(self._handle) or None
+        return self._session.peek(lambda h: _lib.sandlock_handle_pid(h) or None)
 
     @property
     def is_running(self) -> bool:
@@ -755,10 +737,7 @@ class Sandbox:
                 None means no timeout.
         """
         import ctypes
-        from ._sdk import (
-            _c_result_p, _lib, _make_argv, _read_result_bytes, _read_result_changes,
-            Result, ExitReason,
-        )
+        from ._sdk import _c_result_p, _lib, _make_argv, Result, ExitReason
 
         self._check_not_running()
 
@@ -770,17 +749,15 @@ class Sandbox:
         # The one-shot run path immediately drives wait on this same Python
         # thread, so it can use the FFI current-thread runtime and avoid
         # eager Tokio worker-thread creation.
-        self._handle = _lib.sandlock_create_for_run(
+        handle = _lib.sandlock_create_for_run(
             native.ptr, _encode(resolved_name), argv, argc,
         )
-        if not self._handle:
+        if not handle:
             return Result(success=False, exit_code=-1, error="sandlock_create failed")
-        if _lib.sandlock_start(self._handle) != 0:
-            _lib.sandlock_handle_free(self._handle)
-            self._handle = None
+        if _lib.sandlock_start(handle) != 0:
+            _lib.sandlock_handle_free(handle)
             return Result(success=False, exit_code=-1, error="sandlock_start failed")
 
-        handle, self._handle = self._handle, None
         try:
             # This handle's runtime advances only inside native calls, so
             # wait natively; no other thread shares it.
@@ -790,7 +767,6 @@ class Sandbox:
                 ctypes.byref(status_p))
             if rc < 0:
                 raise RuntimeError("sandlock_handle_wait failed")
-            timed_out = rc == 1
             _lib.sandlock_result_free(status_p)
             result_p = _lib.sandlock_handle_shutdown(handle)
         finally:
@@ -798,27 +774,11 @@ class Sandbox:
 
         if not result_p:
             return Result(success=False, exit_code=-1, error="sandlock_handle_wait failed")
-
-        exit_code = _lib.sandlock_result_exit_code(result_p)
-        success = _lib.sandlock_result_success(result_p)
-        reason = ExitReason(_lib.sandlock_result_reason(result_p))
-        signal = _lib.sandlock_result_signal(result_p)
-        if timed_out:
-            exit_code, success, reason, signal = -1, False, ExitReason.TIMEOUT, -1
-        stdout = _read_result_bytes(result_p, _lib.sandlock_result_stdout_bytes)
-        stderr = _read_result_bytes(result_p, _lib.sandlock_result_stderr_bytes)
-        changes = _read_result_changes(result_p)
-        _lib.sandlock_result_free(result_p)
-
-        return Result(
-            success=bool(success),
-            exit_code=exit_code,
-            reason=reason,
-            signal=signal,
-            stdout=stdout,
-            stderr=stderr,
-            changes=changes,
-        )
+        result = _take_result(result_p)
+        if rc == 1:
+            result.exit_code, result.success, result.reason, result.signal = (
+                -1, False, ExitReason.TIMEOUT, -1)
+        return result
 
     def run_with_handlers(
         self,
@@ -1028,12 +988,12 @@ class Sandbox:
         argv, argc = _make_argv(list(cmd))
         resolved_name = self._resolve_name()
 
-        self._status = None
-        self._handle = _lib.sandlock_create(
+        handle = _lib.sandlock_create(
             native.ptr, _encode(resolved_name), argv, argc,
         )
-        if not self._handle:
+        if not handle:
             raise RuntimeError("sandlock_create failed")
+        self._session = _Session(handle)
 
     def start(self) -> None:
         """Release a previously ``create()``d child to ``execve`` the
@@ -1044,14 +1004,11 @@ class Sandbox:
         """
         from ._sdk import _lib
 
-        with self._lock:
-            if self._waiting:
-                raise RuntimeError("lifecycle operation already in progress")
-            if self._handle is None:
-                raise RuntimeError("sandbox has not been created")
-            if _lib.sandlock_start(self._handle) != 0:
-                _lib.sandlock_handle_free(self._handle)
-                self._handle = None
+        session = self._session
+        with session.lock:
+            if session.call(_lib.sandlock_start, exclusive=True,
+                            missing="sandbox has not been created") != 0:
+                session.free()
                 raise RuntimeError("sandlock_start failed")
 
     def spawn(self, cmd: Sequence[str]) -> None:
@@ -1074,49 +1031,17 @@ class Sandbox:
         shutdown() to terminate remaining jobs and collect output and changes.
         """
         self._reject_if_popen()
-        with self._lock:
-            if self._handle is None:
-                raise RuntimeError("sandbox is not running")
-            if self._waiting:
-                raise RuntimeError("lifecycle operation already in progress")
-            if self._status is not None:
-                return self._status
-            handle = self._handle
-            self._waiting = True
-        try:
-            self._status = _wait_status(handle, timeout, self._lock)
-            return self._status
-        finally:
-            with self._lock:
-                self._waiting = False
-                self._idle.notify_all()
+        return self._session.wait(timeout)
 
     def process_groups(self) -> list[int]:
         """Return a sorted snapshot of tracked live process group IDs."""
         self._reject_if_popen()
-        with self._lock:
-            if self._handle is None:
-                raise RuntimeError("session is unavailable")
-            return _read_process_groups(self._handle)
+        return self._session.call(_read_process_groups)
 
     def shutdown(self) -> "Result":
         """SIGKILL remaining jobs, reap them, and collect output and changes."""
-        from ._sdk import _lib
         self._reject_if_popen()
-        with self._lock:
-            if self._handle is None or self._waiting:
-                raise RuntimeError("session is unavailable")
-            handle = self._handle
-            self._waiting = True
-        try:
-            with self._lock:
-                return _take_result(_lib.sandlock_handle_shutdown(handle))
-        finally:
-            with self._lock:
-                self._park_or_free(handle)
-                self._handle = None
-                self._waiting = False
-                self._idle.notify_all()
+        return self._session.shutdown(self._park_or_free)
 
     def popen(
         self,
@@ -1172,7 +1097,7 @@ class Sandbox:
         fd_out = ctypes.c_int(-1)
         fd_err = ctypes.c_int(-1)
         # The handle is owned by the returned Process, not the Sandbox: it is
-        # never stored in self._handle. self._process (set below) is the busy
+        # never stored in self._session. self._process (set below) is the busy
         # marker (`_live_handle`), so a stale Process can never alias a later
         # child through the sandbox.
         handle = _lib.sandlock_popen(
@@ -1323,11 +1248,7 @@ class Sandbox:
     def _signal(self, name: str) -> None:
         from ._sdk import _lib
         self._reject_if_popen()
-        with self._lock:
-            if self._handle is None:
-                raise RuntimeError("sandbox is not running")
-            if getattr(_lib, name)(self._handle) != 0:
-                raise RuntimeError("sandbox signal failed")
+        self._session.signal(getattr(_lib, name))
 
     def pause(self) -> None:
         """Send SIGSTOP to the tracked live process groups."""
@@ -1354,10 +1275,7 @@ class Sandbox:
             # The Process owns the handle; its ports() reads it under the lock so
             # this can't race a concurrent shutdown() freeing it.
             return proc.ports()
-        with self._lock:
-            if self._handle is None:
-                return {}
-            return _read_port_mappings(self._handle)
+        return self._session.peek(_read_port_mappings, {})
 
     def checkpoint(
         self,
@@ -1386,12 +1304,9 @@ class Sandbox:
         # would fight the streaming Process for it, so reject rather than reach
         # past it — consistent with wait/pause/resume/kill.
         self._reject_if_popen()
-        with self._lock:
-            if self._waiting:
-                raise RuntimeError("lifecycle operation already in progress")
-            if self._handle is None:
-                raise RuntimeError("sandbox is not running (use start() or run() first)")
-            ptr = _lib.sandlock_handle_checkpoint(self._handle)
+        ptr = self._session.call(
+            _lib.sandlock_handle_checkpoint, exclusive=True,
+            missing="sandbox is not running (use start() or run() first)")
         if not ptr:
             raise RuntimeError("checkpoint capture failed")
         cp = Checkpoint(ptr)
@@ -1439,8 +1354,7 @@ class Sandbox:
         )
         if not handle:
             raise RuntimeError("checkpoint restore failed")
-        self._status = None
-        self._handle = handle
+        self._session = _Session(handle)
         # Copy the skipped-fd diagnostics out eagerly: the native entries live
         # on the handle, which shutdown() frees.
         skipped = []
@@ -1566,23 +1480,14 @@ class Process:
 
     def __init__(self, sandbox: "Sandbox", handle, stdin_fd: int, stdout_fd: int, stderr_fd: int):
         import os
-        import threading
         from ._sdk import _lib
 
         self._sandbox = sandbox
-        # _lock guards _handle (and the _waiting reservation) so kill()/pid on
-        # one thread can't observe or act on a handle shutdown() is freeing on
-        # another — the "kill from another thread while wait() blocks" pattern.
-        self._lock = threading.RLock()
-        self._idle = threading.Condition(self._lock)
-        self._waiting = False
         # The handle and pid are set only AFTER the fds are wrapped below: if an
         # fdopen raises, this Process never takes ownership, so popen()'s caller
         # frees the handle exactly once (no double free via __del__).
-        self._handle = None
+        self._session = _Session(None)
         self._pid = -1
-        self._result = None
-        self._status = None
         self.stdin = self.stdout = self.stderr = None
         # os.fdopen takes ownership of each fd: closing the stream closes the fd,
         # so a Process that is closed/exited never leaks the pipe ends. Wrap the
@@ -1611,30 +1516,22 @@ class Process:
         self.stdin, self.stdout, self.stderr = opened
         # Take ownership only after every stream has been wrapped successfully.
         self._pid = _lib.sandlock_handle_pid(handle) or -1
-        self._handle = handle
+        self._session = _Session(handle)
 
     @property
     def pid(self) -> int | None:
         """The child PID while running, else ``None`` (after :meth:`shutdown`)."""
-        with self._lock:
-            return self._pid if self._handle is not None and self._pid > 0 else None
+        return self._session.peek(lambda _h: self._pid if self._pid > 0 else None)
 
     def ports(self) -> dict[int, int]:
         """Current virtual→real port mappings while running, else ``{}`` (needs
-        ``port_remap``). Reads the handle under the lock."""
-        with self._lock:
-            if self._handle is None:
-                return {}
-            return _read_port_mappings(self._handle)
+        ``port_remap``)."""
+        return self._session.peek(_read_port_mappings, {})
 
     def kill(self) -> None:
         """SIGKILL tracked live groups; usable from another thread during wait."""
         from ._sdk import _lib
-        with self._lock:
-            if self._handle is None:
-                return
-            if _lib.sandlock_handle_kill(self._handle) != 0:
-                raise RuntimeError("sandbox kill failed")
+        self._session.signal(_lib.sandlock_handle_kill, missing_ok=True)
 
     def wait(self, timeout: float | None = None) -> "ExitStatus":
         """Wait for the main process while retaining the session.
@@ -1643,34 +1540,16 @@ class Process:
         A timeout raises TimeoutError without terminating jobs. Repeated waits
         return the cached main status.
         """
-        with self._lock:
-            if self._waiting:
-                raise RuntimeError("lifecycle operation already in progress")
-            if self._status is not None:
-                return self._status
-            if self._handle is None:
-                raise RuntimeError("process is not running")
-            handle = self._handle
-            self._waiting = True
-        try:
-            if self.stdin is not None and not self.stdin.closed:
-                try:
-                    self.stdin.close()
-                except OSError:
-                    pass
-            self._status = _wait_status(handle, timeout, self._lock)
-            return self._status
-        finally:
-            with self._lock:
-                self._waiting = False
-                self._idle.notify_all()
+        if self.stdin is not None and not self.stdin.closed:
+            try:
+                self.stdin.close()
+            except OSError:
+                pass
+        return self._session.wait(timeout)
 
     def process_groups(self) -> list[int]:
         """Return a sorted snapshot of tracked live process group IDs."""
-        with self._lock:
-            if self._handle is None:
-                raise RuntimeError("session is unavailable")
-            return _read_process_groups(self._handle)
+        return self._session.call(_read_process_groups)
 
     def shutdown(self) -> "Result":
         """Terminate and reap remaining jobs, returning the complete result.
@@ -1678,43 +1557,17 @@ class Process:
         Caller-owned output streams remain open. A repeated call returns the
         cached result; a deferred branch remains available on the Sandbox.
         """
-        from ._sdk import _lib, ExitStatus
-        with self._lock:
-            if self._waiting:
-                raise RuntimeError("lifecycle operation already in progress")
-            if self._result is not None:
-                return self._result
-            if self._handle is None:
-                raise RuntimeError("process is not running")
-            handle = self._handle
-            self._waiting = True
         try:
-            with self._lock:
-                self._result = _take_result(_lib.sandlock_handle_shutdown(handle))
-            r = self._result
-            self._status = ExitStatus(r.success, r.exit_code, r.reason, r.signal)
-            return r
+            return self._session.shutdown(self._sandbox._park_or_free)
         finally:
-            with self._lock:
-                self._sandbox._park_or_free(handle)
-                self._handle = None
-                self._waiting = False
-                self._idle.notify_all()
-            if self._sandbox._popen_process() is self:
+            if self._session.handle is None and self._sandbox._popen_process() is self:
                 self._sandbox._process = None
 
     def __enter__(self) -> "Process":
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        with self._lock:
-            if self._handle is not None:
-                if self._waiting:
-                    self.kill()
-                    while self._waiting:
-                        self._idle.wait()
-                if self._handle is not None:
-                    self.shutdown()
+        self._session.close(self.shutdown)
         for stream in (self.stdin, self.stdout, self.stderr):
             if stream is not None and not stream.closed:
                 try:
@@ -1730,7 +1583,8 @@ class Process:
         # run during interpreter shutdown when imports/globals are gone — so this
         # is strictly best-effort inside a broad guard.
         try:
-            if getattr(self, "_handle", None) is None:
+            session = getattr(self, "_session", None)
+            if session is None or session.handle is None:
                 return
             import warnings
 
@@ -1744,6 +1598,86 @@ class Process:
             self.shutdown()
         except Exception:
             pass
+
+
+class _Session:
+    """A native handle shared between threads. The lock serializes handle
+    calls, which the FFI requires, but wait() blocks outside it so another
+    thread can still kill the session."""
+
+    def __init__(self, handle):
+        self.handle = handle
+        self.lock = threading.RLock()
+        self._idle = threading.Condition(self.lock)
+        self._waiting = False
+        self.status = None
+        self.result = None
+
+    def call(self, fn, *args, exclusive=False, missing="sandbox is not running"):
+        with self.lock:
+            if exclusive and self._waiting:
+                raise RuntimeError("lifecycle operation already in progress")
+            if self.handle is None:
+                raise RuntimeError(missing)
+            return fn(self.handle, *args)
+
+    def peek(self, fn, default=None):
+        with self.lock:
+            return default if self.handle is None else fn(self.handle)
+
+    def signal(self, fn, missing_ok=False):
+        with self.lock:
+            if self.handle is None and missing_ok:
+                return
+            if self.call(fn) != 0:
+                raise RuntimeError("sandbox signal failed")
+
+    def wait(self, timeout):
+        with self.lock:
+            if self.status is not None:
+                return self.status
+            handle = self.call(lambda h: h, exclusive=True)
+            self._waiting = True
+        try:
+            self.status = _wait_status(handle, timeout, self.lock)
+            return self.status
+        finally:
+            with self.lock:
+                self._waiting = False
+                self._idle.notify_all()
+
+    def shutdown(self, release):
+        """Shut down under the lock, then hand the handle to ``release``."""
+        from ._sdk import _lib, ExitStatus
+        with self.lock:
+            if self.result is None:
+                handle = self.call(lambda h: h, exclusive=True)
+                try:
+                    self.result = _take_result(_lib.sandlock_handle_shutdown(handle))
+                finally:
+                    self.handle = None
+                    release(handle)
+                r = self.result
+                self.status = ExitStatus(r.success, r.exit_code, r.reason, r.signal)
+            return self.result
+
+    def close(self, finish):
+        """Kill an in-flight wait so it returns, then ``finish`` the session."""
+        from ._sdk import _lib
+        with self.lock:
+            if self.handle is not None and self._waiting:
+                _lib.sandlock_handle_kill(self.handle)
+                while self._waiting:
+                    self._idle.wait()
+            if self.handle is not None:
+                finish()
+
+    def free(self):
+        from ._sdk import _lib
+        with self.lock:
+            if self.handle is not None:
+                _lib.sandlock_handle_free(self.handle)
+                self.handle = None
 
 
 def _wait_status(handle, timeout, lock):

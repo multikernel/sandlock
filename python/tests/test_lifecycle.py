@@ -9,7 +9,6 @@ import time
 import pytest
 
 from sandlock import Sandbox, ExitReason
-from sandlock._sdk import _lib
 
 
 _BIN_READABLE = ["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc"]
@@ -125,8 +124,7 @@ class TestDropReapsParkedChild:
         assert _proc_state(pid) == "S"
 
         # Free the handle without start() — Rust Drop should SIGKILL + waitpid.
-        _lib.sandlock_handle_free(sb._handle)
-        sb._handle = None
+        sb._session.free()
 
         # After Drop, /proc/<pid> must be gone. If it's still there as 'Z',
         # the reap is missing.

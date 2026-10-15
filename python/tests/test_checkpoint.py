@@ -13,7 +13,6 @@ import time
 import pytest
 
 from sandlock import Sandbox, Checkpoint, SkippedFd
-from sandlock._sdk import _encode, _lib, _make_argv
 
 
 _PYTHON_READABLE = list(dict.fromkeys([
@@ -32,20 +31,9 @@ def _policy(**overrides):
 def running_sandbox():
     """A sandbox with a long-running process for checkpoint tests."""
     sb = _policy()
-    argv, argc = _make_argv(["sleep", "60"])
-    native = sb._ensure_native()
-    sb._handle = _lib.sandlock_create(
-        native.ptr,
-        _encode(sb._resolve_name()),
-        argv,
-        argc,
-    )
-    assert sb._handle, "create failed"
-    assert _lib.sandlock_start(sb._handle) == 0, "start failed"
+    sb.spawn(["sleep", "60"])
     yield sb
-    if sb._handle:
-        _lib.sandlock_handle_free(sb._handle)
-        sb._handle = None
+    sb._session.free()
 
 
 class TestCheckpointCapture:
