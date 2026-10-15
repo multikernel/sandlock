@@ -614,7 +614,6 @@ fn shutdown_without_pidfd_group_signals() {
         );
     }
     let dir = tempfile::tempdir().unwrap();
-    let ready = dir.path().join("ready");
     let mut builder = sandlock_core::Sandbox::builder();
     for protection in Protection::all() {
         builder = builder.allow_degraded(protection);
@@ -638,29 +637,50 @@ fn shutdown_without_pidfd_group_signals() {
             assert!(result.success());
             assert_eq!(result.stdout.as_deref(), Some(b"ok\n".as_slice()));
             assert!(sb.shutdown().await.unwrap().success());
-            let mut sb = policy;
-            let script = format!(
-                r#"
+            let spawn = |name: &str, job: &str| {
+                let ready = dir.path().join(name);
+                let tmp = ready.with_extension("tmp");
+                let script = format!(
+                    r#"
 import os, signal, time
+def publish():
+    open({tmp:?}, "w").write(str(os.getpid()))
+    os.rename({tmp:?}, {ready:?})
+    signal.pause()
 if os.fork() == 0:
     os.setsid()
-    open({ready:?}, "w").write(str(os.getpid()))
-    signal.pause()
+    {job}
 while not os.path.exists({ready:?}):
     time.sleep(0.01)
 os._exit(7)
 "#
-            );
-            sb.spawn(&["python3", "-c", &script]).await.unwrap();
-            assert_eq!(sb.wait().await.unwrap(), sandlock_core::ExitStatus::Code(7));
-            let child: i32 = std::fs::read_to_string(&ready).unwrap().parse().unwrap();
-            // Only group signals reach a job in another session, so shutdown
-            // reports that it cannot end the session instead of hanging.
+                );
+                let mut sb = policy.clone();
+                async move {
+                    sb.spawn(&["python3", "-c", &script]).await.unwrap();
+                    assert_eq!(sb.wait().await.unwrap(), sandlock_core::ExitStatus::Code(7));
+                    let job: i32 = std::fs::read_to_string(&ready).unwrap().parse().unwrap();
+                    (sb, job)
+                }
+            };
+
+            // A job whose group leader is still alive is reached by number.
+            let (mut sb, leader) = spawn("leader", "publish()").await;
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), sb.shutdown())
+                .await
+                .unwrap();
+            assert_eq!(result.unwrap().exit_status, sandlock_core::ExitStatus::Code(7));
+            assert_eq!(unsafe { libc::kill(leader, 0) }, -1);
+
+            // Once the leader is gone its number may be reused, so shutdown
+            // reports the job as unreachable instead of hanging.
+            let (mut sb, orphan) =
+                spawn("orphan", "publish() if os.fork() == 0 else os._exit(0)").await;
             assert!(tokio::time::timeout(std::time::Duration::from_secs(5), sb.shutdown())
                 .await
                 .unwrap()
                 .is_err());
             drop(sb);
-            assert_eq!(unsafe { libc::kill(child, libc::SIGKILL) }, 0);
+            assert_eq!(unsafe { libc::kill(orphan, libc::SIGKILL) }, 0);
         });
 }

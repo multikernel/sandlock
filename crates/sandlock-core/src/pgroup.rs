@@ -47,7 +47,7 @@ impl ProcessGroups {
             .map(|leaders| {
                 leaders
                     .get(&pgid)
-                    .is_some_and(|leader| pidfd_signal_group(leader, 0).is_ok())
+                    .is_some_and(|leader| signal_group(pgid, leader, 0).is_ok())
             })
             .unwrap_or(false)
     }
@@ -57,7 +57,7 @@ impl ProcessGroups {
             .map_err(|_| io::Error::other("process group table poisoned"))?;
         let mut groups = Vec::new();
         for (&pgid, leader) in leaders.iter() {
-            match pidfd_signal_group(leader, 0) {
+            match signal_group(pgid, leader, 0) {
                 Ok(()) => groups.push(pgid),
                 Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {}
                 Err(e) => return Err(e),
@@ -77,7 +77,7 @@ impl ProcessGroups {
             .map_err(|_| io::Error::other("process group table poisoned"))?;
         let mut reached = 0;
         let mut failure = None;
-        leaders.retain(|_, leader| match pidfd_signal_group(leader, sig) {
+        leaders.retain(|&pgid, leader| match signal_group(pgid, leader, sig) {
             Ok(()) => {
                 reached += 1;
                 true
@@ -101,6 +101,22 @@ impl Default for ProcessGroups {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Kernels before 6.9 refuse group signals by pidfd. A leader that has not
+/// exited still holds its pid, so no other group can have taken the number.
+/// Once it has, the number is reusable: only a probe finding no group at all
+/// is conclusive, since an empty group can never regain members.
+fn signal_group(pgid: i32, leader: &OwnedFd, sig: i32) -> io::Result<()> {
+    let refused = match pidfd_signal_group(leader, sig) {
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => e,
+        result => return result,
+    };
+    let reachable = !has_exited(leader.as_raw_fd());
+    if unsafe { libc::kill(-pgid, if reachable { sig } else { 0 }) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if reachable { Ok(()) } else { Err(refused) }
 }
 
 pub(crate) fn has_exited(pidfd: RawFd) -> bool {
