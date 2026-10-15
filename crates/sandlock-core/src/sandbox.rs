@@ -2153,7 +2153,6 @@ impl Sandbox {
         self.rt_mut().reaper = reaper;
 
         if pid == 0 {
-            let parent_pid = unsafe { libc::getppid() };
             // ===== CHILD PROCESS =====
             // Publish only after the process group exists, before confinement denies IPC.
             if unsafe { libc::setpgid(0, 0) } != 0 {
@@ -2235,7 +2234,6 @@ impl Sandbox {
                 keep_fds: &gather_keep_fds,
                 sandbox_name: Some(sandbox_name.as_str()),
                 extra_syscalls: &extra_syscalls,
-                parent_pid,
                 foreground,
             });
         }

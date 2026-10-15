@@ -237,10 +237,6 @@ pub(crate) struct ChildSpawnArgs<'a> {
     /// Merged into the child's BPF notif list so the kernel actually
     /// raises USER_NOTIF for them.
     pub extra_syscalls: &'a [u32],
-    /// PID of the parent process captured before fork. Used to detect
-    /// parent death in the child without assuming PID 1 is always init
-    /// (incorrect in containers where the entrypoint runs as PID 1).
-    pub parent_pid: libc::pid_t,
     /// Make the child the terminal's foreground process group before exec.
     /// Only interactive (fully inherited) stdio wants this; a captured or
     /// piped run taking the foreground demotes the embedding process to a
@@ -291,7 +287,6 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         keep_fds,
         sandbox_name,
         extra_syscalls,
-        parent_pid,
         foreground,
     } = args;
     // Helper: abort child on error. Includes the OS error automatically.
@@ -317,19 +312,6 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
             libc::tcsetpgrp(0, libc::getpgrp());
             libc::signal(libc::SIGTTOU, libc::SIG_DFL);
         }
-    }
-
-    // 2. Die if parent exits
-    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
-        fail!("prctl(PR_SET_PDEATHSIG)");
-    }
-
-    // 3. Check parent didn't die between fork and prctl.
-    // Compare against the actual parent PID captured before fork rather than
-    // hardcoding 1, since containers often run the entrypoint as PID 1 and a
-    // child forked from it legitimately has getppid() == 1.
-    if unsafe { libc::getppid() } != parent_pid {
-        fail!("parent died before confinement");
     }
 
     // 4. Optional: disable ASLR
