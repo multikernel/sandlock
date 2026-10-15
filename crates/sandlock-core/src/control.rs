@@ -169,6 +169,16 @@ pub(crate) fn bind_control_socket(name: &str) -> std::io::Result<ControlSocket> 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct SandboxInfo {
     pub mode: Option<String>,
+    /// Background jobs can keep a session alive after its main process
+    /// exits, and the main pid in the registry is then free for reuse.
+    #[serde(default)]
+    pub main_exited: bool,
+}
+
+/// The live session the control loop answers for.
+pub(crate) struct Session {
+    pub groups: Arc<crate::pgroup::ProcessGroups>,
+    pub main: OwnedFd,
 }
 
 /// Spawn the control-loop task. `ctx` is `None` for sandboxes without a
@@ -177,7 +187,7 @@ pub struct SandboxInfo {
 pub(crate) fn spawn_control_loop(
     sockets: ControlSocket,
     ctx: Option<Arc<SupervisorCtx>>,
-    groups: Arc<crate::pgroup::ProcessGroups>,
+    session: Session,
     sandbox: Sandbox,
     info: SandboxInfo,
 ) -> tokio::task::JoinHandle<()> {
@@ -186,7 +196,7 @@ pub(crate) fn spawn_control_loop(
     let sandbox = Arc::new(tokio::sync::Mutex::new(sandbox));
     tokio::spawn(async move {
         let ControlSocket { control, claim: _claim } = sockets;
-        control_loop(control, ctx, groups, sandbox, info, unsafe { libc::getuid() }).await;
+        control_loop(control, ctx, session, sandbox, info, unsafe { libc::getuid() }).await;
     })
 }
 
@@ -272,7 +282,7 @@ impl tokio::io::AsyncWrite for ControlStream {
 async fn control_loop(
     listener: ControlFd,
     ctx: Option<Arc<SupervisorCtx>>,
-    groups: Arc<crate::pgroup::ProcessGroups>,
+    session: Session,
     sandbox: Arc<tokio::sync::Mutex<Sandbox>>,
     info: SandboxInfo,
     my_uid: u32,
@@ -291,7 +301,7 @@ async fn control_loop(
         let Ok(stream) = AsyncFd::new(stream).map(ControlStream) else { continue };
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            serve_one(stream, ctx.as_ref(), &groups, &sandbox, &info),
+            serve_one(stream, ctx.as_ref(), &session, &sandbox, &info),
         )
         .await;
     }
@@ -323,7 +333,7 @@ pub struct ControlResponse {
 async fn serve_one(
     stream: ControlStream,
     ctx: Option<&Arc<SupervisorCtx>>,
-    groups: &crate::pgroup::ProcessGroups,
+    session: &Session,
     sandbox: &Arc<tokio::sync::Mutex<Sandbox>>,
     info: &SandboxInfo,
 ) {
@@ -370,10 +380,10 @@ async fn serve_one(
     }
 
     match req.verb.as_str() {
-        "info" => handle_info(&mut stream, info).await,
+        "info" => handle_info(&mut stream, info, session).await,
         "config" => handle_config(&mut stream, ctx, sandbox).await,
         "ports" => handle_ports(&mut stream, ctx).await,
-        "kill" => handle_kill(&mut stream, ctx, groups).await,
+        "kill" => handle_kill(&mut stream, ctx, &session.groups).await,
         _ => {
             let resp = ControlResponse {
                 v: 1,
@@ -386,8 +396,12 @@ async fn serve_one(
     }
 }
 
-async fn handle_info(stream: &mut ControlStream, info: &SandboxInfo) {
-    let resp = match serde_json::to_value(info) {
+async fn handle_info(stream: &mut ControlStream, info: &SandboxInfo, session: &Session) {
+    let info = SandboxInfo {
+        main_exited: crate::pgroup::has_exited(session.main.as_raw_fd()),
+        ..info.clone()
+    };
+    let resp = match serde_json::to_value(&info) {
         Ok(data) => ControlResponse { v: 1, ok: true, data: Some(data), err: None },
         Err(e) => ControlResponse {
             v: 1,
@@ -832,7 +846,7 @@ mod tests {
     }
 
     fn info() -> SandboxInfo {
-        SandboxInfo { mode: Some("test".into()) }
+        SandboxInfo { mode: Some("test".into()), main_exited: false }
     }
 
     /// Bind a listener for `name`, run the control loop on it with
@@ -842,8 +856,11 @@ mod tests {
         let sandbox = Arc::new(tokio::sync::Mutex::new(test_sandbox()));
         tokio::spawn(async move {
             let _claim = sockets.claim;
-            let groups = Arc::new(crate::pgroup::ProcessGroups::new());
-            control_loop(sockets.control, None, groups, sandbox, info(), expected_uid).await;
+            let session = Session {
+                groups: Arc::new(crate::pgroup::ProcessGroups::new()),
+                main: crate::sys::syscall::pidfd_open(std::process::id(), 0).unwrap(),
+            };
+            control_loop(sockets.control, None, session, sandbox, info(), expected_uid).await;
         })
     }
 

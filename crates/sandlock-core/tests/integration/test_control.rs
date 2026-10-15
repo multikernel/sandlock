@@ -875,3 +875,33 @@ async fn test_control_cancelled_creation_releases_its_name() {
     assert!(!sandlock_core::control::list_sandboxes().unwrap().contains(&name));
     drop(cancelled);
 }
+
+/// A session can outlive its main process, whose pid is then free for
+/// reuse; ps must stop reporting it instead of reading a recycled /proc entry.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_control_ps_hides_the_pid_of_an_exited_main() {
+    let name = format!("test-ctrl-main-exited-{}", std::process::id());
+    let mut sb = sandlock_core::Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .build()
+        .unwrap()
+        .with_name(&name);
+    sb.spawn(&["sh", "-c", "sleep 60 & exit 0"]).await.unwrap();
+    sb.wait().await.unwrap();
+    assert!(!sb.process_groups().unwrap().is_empty());
+
+    let info = sandlock_core::control::sandbox_info(&name).expect("info");
+    assert!(info.main_exited);
+    let out = sandlock_bin().args(["ps"]).output().expect("sandlock ps");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let row = stdout.lines().find(|l| l.starts_with(&name)).expect("ps lists the session");
+    let fields: Vec<&str> = row.split_whitespace().collect();
+    assert_eq!(fields[1], "-", "exited main has no pid: {row}");
+    assert!(row.ends_with("(main exited)"), "{row}");
+    sb.shutdown().await.unwrap();
+}

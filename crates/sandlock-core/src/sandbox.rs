@@ -2261,7 +2261,15 @@ impl Sandbox {
         let notif_fd_num = read_u32_fd(pipes.notif_r.as_raw_fd())
             .map_err(|e| SandboxRuntimeError::Child(format!("read notif fd from child: {}", e)))?;
 
-        let control_info = crate::control::SandboxInfo { mode: self.mode.clone() };
+        let control_info = crate::control::SandboxInfo { mode: self.mode.clone(), main_exited: false };
+        let control_groups = Arc::clone(&self.rt().groups);
+        let control_session = || -> Result<crate::control::Session, SandboxRuntimeError> {
+            Ok(crate::control::Session {
+                groups: Arc::clone(&control_groups),
+                main: pidfd.as_ref().expect("reaper pins the child")
+                    .try_clone().map_err(SandboxRuntimeError::Io)?,
+            })
+        };
 
         let is_nested_mode = notif_fd_num == 0;
 
@@ -2513,7 +2521,7 @@ impl Sandbox {
                 self.rt_mut().control_handle = Some(crate::control::spawn_control_loop(
                     sockets,
                     Some(control_ctx),
-                    Arc::clone(&self.rt().groups),
+                    control_session()?,
                     sandbox_snapshot,
                     control_info.clone(),
                 ));
@@ -2539,7 +2547,7 @@ impl Sandbox {
             self.rt_mut().control_handle = Some(crate::control::spawn_control_loop(
                 sockets,
                 None,
-                Arc::clone(&self.rt().groups),
+                control_session()?,
                 self.clone(),
                 control_info,
             ));
