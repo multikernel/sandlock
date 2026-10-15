@@ -65,6 +65,20 @@ def test_popen_context_cleans_background_jobs_after_wait():
         os.kill(child, 0)
 
 
+def test_abandoned_sandbox_ends_background_jobs(tmp_path):
+    import gc
+    pidfile = tmp_path / "job"
+    sb = policy(fs_writable=[str(tmp_path)])
+    sb.spawn(["sh", "-c", f"sleep 60 & echo $! > {pidfile}"])
+    assert sb.wait(timeout=5).success
+    child = int(pidfile.read_text())
+    os.kill(child, 0)
+    del sb
+    gc.collect()
+    with pytest.raises(ProcessLookupError):
+        os.kill(child, 0)
+
+
 def test_shutdown_defers_cow_until_jobs_finish(tmp_path):
     with policy(fs_writable=[str(tmp_path)], workdir=str(tmp_path), on_exit=BranchAction.DEFER) as sb:
         sb.spawn(["sh", "-c", f"echo data > {tmp_path}/out"])

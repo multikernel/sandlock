@@ -614,8 +614,10 @@ class Sandbox:
             )
 
     def __del__(self):
+        # A running wait() keeps self reachable, so there is none to interrupt.
         try:
-            self.__exit__(None, None, None)
+            self._session.free()
+            self._release_pending()
         except Exception:
             pass
 
