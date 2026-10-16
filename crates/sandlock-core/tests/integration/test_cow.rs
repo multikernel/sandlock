@@ -3,6 +3,112 @@ use sandlock_core::sandbox::BranchAction;
 use std::fs;
 use std::path::PathBuf;
 
+/// PR #274 review r4174284508: unchanged lower links retain host semantics.
+/// Raw syscalls are independent of shell PATH lookup and execve behavior.
+#[tokio::test]
+async fn test_review274_cow_external_lower_symlink_access() {
+    use std::os::unix::fs::symlink;
+    let workdir = temp_dir("review274-external-link");
+    let helper = helper_binary();
+    symlink(&helper, workdir.join("absolute")).unwrap();
+    let relative = pathdiff::diff_paths(&helper, &workdir).unwrap();
+    symlink(relative, workdir.join("relative")).unwrap();
+    let policy = Sandbox::builder().fs_read(&helper).fs_write(&workdir)
+        .workdir(&workdir).cwd(&workdir).on_exit(BranchAction::Abort)
+        .build().unwrap();
+    let native = Sandbox::builder().no_supervisor(true).fs_read(&helper)
+        .fs_write(&workdir).cwd(&workdir).build().unwrap();
+    let mut failures = Vec::new();
+    for spelling in ["access", "faccessat", "faccessat2"] {
+        for link in ["absolute", "relative"] {
+            for mode in 0..=7 {
+                let args = [helper.to_str().unwrap(), "access-mode", spelling, link, &mode.to_string()];
+                let expected = native.clone().run(&args).await.unwrap();
+                let result = policy.clone().run(&args).await.expect("review regression must execute");
+                assert!(expected.success() && result.success(), "{:?}", result.stderr_str());
+                if result.stdout_str() != expected.stdout_str() {
+                    failures.push(format!("{spelling}({link}, {mode}): kernel={:?}, cow={:?}",
+                        expected.stdout_str(), result.stdout_str()));
+                }
+            }
+        }
+    }
+    fs::remove_dir_all(workdir).unwrap();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// An unchanged link can point at an object changed in the COW view.
+/// Deciding solely from the link's own upper entry misses this case.
+#[tokio::test]
+async fn test_review274_cow_access_follows_visible_link_target() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let workdir = temp_dir("review274-visible-link-target");
+    fs::write(workdir.join("target"), b"KEEP").unwrap();
+    fs::set_permissions(workdir.join("target"), fs::Permissions::from_mode(0o600)).unwrap();
+    symlink("target", workdir.join("alias")).unwrap();
+    fs::create_dir(workdir.join("blocked")).unwrap();
+    fs::set_permissions(workdir.join("blocked"), fs::Permissions::from_mode(0)).unwrap();
+    symlink("blocked/../target", workdir.join("search-alias")).unwrap();
+    let helper = helper_binary();
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/bin").fs_read("/lib").fs_read_if_exists("/lib64")
+        .fs_read(&helper).fs_write(&workdir).workdir(&workdir).cwd(&workdir)
+        .on_exit(BranchAction::Abort).build().unwrap();
+    let query = format!("'{}' access-empty name alias", helper.display());
+    let script = format!(
+        "set -e\n{query} 4 0\nchmod 000 target\n'{}' access-empty name search-alias 2 0\n{query} 4 0\n{query} 2 0\n{query} 6 0\nrm target\n{query} 0 0\n{query} 2 0\n{query} 0 {}\n",
+        helper.display(), libc::AT_SYMLINK_NOFOLLOW,
+    );
+    let result = policy.clone().run(&["sh", "-c", &script]).await.expect("visible link test must run");
+    assert!(result.success(), "{:?}", result.stderr_str());
+    let expected = format!("OK\nERR:{}\nERR:{}\nOK\nERR:{}\nERR:{}\nERR:{}\nOK\n",
+        libc::EACCES, libc::EACCES, libc::EACCES, libc::ENOENT, libc::ENOENT);
+    let actual: Vec<_> = result.stdout_str().unwrap().lines().collect();
+    let expected: Vec<_> = expected.lines().collect();
+    assert_eq!(actual, expected, "upper permissions and whiteouts apply to the link target");
+    fs::set_permissions(workdir.join("blocked"), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::remove_dir_all(workdir).unwrap();
+}
+
+#[tokio::test]
+async fn test_review274_cow_link_search_and_depth_limits() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let workdir = temp_dir("review274-link-limits");
+    fs::write(workdir.join("target"), b"KEEP").unwrap();
+    fs::create_dir(workdir.join("blocked")).unwrap();
+    symlink("blocked/../target", workdir.join("search")).unwrap();
+    fs::set_permissions(workdir.join("blocked"), fs::Permissions::from_mode(0)).unwrap();
+    for index in 0..40 {
+        let target = if index == 39 { "target".to_owned() } else { format!("chain{}", index + 1) };
+        symlink(target, workdir.join(format!("chain{index}"))).unwrap();
+    }
+    symlink("chain0", workdir.join("too-long")).unwrap();
+    let helper = helper_binary();
+    let policy = Sandbox::builder().fs_read(&helper).fs_write(&workdir)
+        .workdir(&workdir).cwd(&workdir).on_exit(BranchAction::Abort).build().unwrap();
+    let mut failures = Vec::new();
+    for (path, mode, flags, errno) in [
+        ("search", libc::R_OK, 0, libc::EACCES),
+        ("search", libc::W_OK, 0, libc::EACCES),
+        ("search", libc::X_OK, 0, libc::EACCES),
+        ("search", libc::R_OK | libc::W_OK, 0, libc::EACCES),
+        ("search", libc::F_OK, libc::AT_SYMLINK_NOFOLLOW, 0),
+        ("chain0", libc::R_OK, 0, 0),
+        ("too-long", libc::R_OK, 0, libc::ELOOP),
+    ] {
+        let result = policy.clone().run(&[helper.to_str().unwrap(), "access-empty", "name", path,
+            &mode.to_string(), &flags.to_string()]).await.expect("link limits must execute");
+        assert!(result.success(), "{:?}", result.stderr_str());
+        let expected = if errno == 0 { "OK".to_owned() } else { format!("ERR:{errno}") };
+        if result.stdout_str().unwrap().trim() != expected {
+            failures.push(format!("{path}, mode={mode}, flags={flags}: {:?}", result.stdout_str()));
+        }
+    }
+    fs::set_permissions(workdir.join("blocked"), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::remove_dir_all(workdir).unwrap();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("sandlock-test-cow-{}-{}", name, std::process::id()));
     let _ = fs::create_dir_all(&dir);
@@ -17,9 +123,87 @@ fn helper_binary() -> PathBuf {
         .expect("rootfs-helper not found — build.rs should have compiled it")
 }
 
+/// Review r4174284517: compare the mediated query with a kernel query in
+/// a sandbox using the same user mapping. W_OK is intentionally omitted:
+/// pathname COW writes have different semantics from lower inode writes.
+#[tokio::test]
+async fn test_review274_cow_access_matches_child_identity() {
+    use std::os::unix::fs::PermissionsExt;
+    let workdir = temp_dir("review274-identity");
+    let helper = helper_binary();
+    let mut failures = Vec::new();
+    for permissions in [0o600, 0o400, 0o000, 0o100, 0o040] {
+        let target = workdir.join(format!("mode-{permissions:o}"));
+        fs::write(&target, b"fixture").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(permissions)).unwrap();
+        for mapped in [None, Some(0), Some(1000)] {
+            for flags in [0, libc::AT_EACCESS] {
+                for mode in [libc::R_OK, libc::X_OK, libc::R_OK | libc::X_OK] {
+                    let mut outputs = Vec::new();
+                    for cow in [false, true] {
+                        let mut builder = Sandbox::builder().fs_read(&helper).fs_write(&workdir);
+                        if let Some(uid) = mapped { builder = builder.user(uid, uid); }
+                        if cow { builder = builder.workdir(&workdir).on_exit(BranchAction::Abort); }
+                        // Without this, the generic metadata handler also
+                        // queries using supervisor credentials: not a reference.
+                        else { builder = builder.no_supervisor(true); }
+                        let result = builder.build().unwrap().run(&[
+                            helper.to_str().unwrap(), "access-empty", "name", target.to_str().unwrap(),
+                            &mode.to_string(), &flags.to_string(),
+                        ]).await.expect("identity test must execute, not skip userns failures");
+                        assert!(result.success(), "{:?}", result.stderr_str());
+                        outputs.push(result.stdout_str().unwrap().trim().to_owned());
+                    }
+                    assert!(outputs[0] == "OK" || outputs[0] == format!("ERR:{}", libc::EACCES),
+                        "native reference must reach the fixture: {}", outputs[0]);
+                    if outputs[0] != outputs[1] {
+                        failures.push(format!("mode={permissions:o}, userns={mapped:?}, access={mode}, flags={flags}: kernel={}, COW={}", outputs[0], outputs[1]));
+                    }
+                }
+            }
+        }
+    }
+    fs::remove_dir_all(workdir).unwrap();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 // ============================================================
 // Seccomp-based COW tests (workdir set)
 // ============================================================
+
+/// Query with the child's current capabilities, including after it has
+/// discarded privileges. Run also as root to exercise a privileged supervisor.
+#[tokio::test]
+async fn test_review274_cow_access_matches_dropped_capabilities() {
+    use std::os::unix::fs::PermissionsExt;
+    let workdir = temp_dir("review274-drop-caps");
+    let target = workdir.join("mode-000");
+    fs::write(&target, b"fixture").unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0)).unwrap();
+    let helper = helper_binary();
+    let mut failures = Vec::new();
+    for flags in [0, libc::AT_EACCESS] {
+        let mut outputs = Vec::new();
+        for cow in [false, true] {
+            let mut builder = Sandbox::builder().fs_read(&helper).fs_write(&workdir);
+            if cow { builder = builder.workdir(&workdir).on_exit(BranchAction::Abort); }
+            else { builder = builder.no_supervisor(true); }
+            let result = builder.build().unwrap().run(&[
+                helper.to_str().unwrap(), "access-drop-caps", "name",
+                target.to_str().unwrap(), "4", &flags.to_string(),
+            ]).await.expect("capability comparison must execute");
+            assert!(result.success(), "{:?}", result.stderr_str());
+            outputs.push(result.stdout_str().unwrap().trim().to_owned());
+        }
+        assert_eq!(outputs[0], format!("ERR:{}", libc::EACCES),
+            "native reference must deny reading mode 000 after dropping capabilities");
+        if outputs[0] != outputs[1] {
+            failures.push(format!("flags={flags}: kernel={}, COW={}", outputs[0], outputs[1]));
+        }
+    }
+    fs::remove_dir_all(workdir).unwrap();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
 
 /// Test that seccomp COW creates files in upper, committed on exit.
 #[tokio::test]
@@ -1537,4 +1721,62 @@ async fn test_seccomp_cow_fchmodat2_is_virtualized() {
     assert_eq!(real, 0o644, "the abort must leave the real file untouched");
     assert!(!workdir.join("made").exists());
     let _ = fs::remove_dir_all(&workdir);
+}
+
+/// COW may waive lower-layer W_OK, but must still check every other bit
+/// against the visible layer, including after a whiteout or copy-up.
+#[tokio::test]
+async fn test_seccomp_cow_access_modes_and_visible_layer() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let workdir = temp_dir("access-modes-visible");
+    for (name, mode) in [("readable", 0o400), ("unreadable", 0o000),
+                         ("executable", 0o500), ("removed", 0o600)] {
+        fs::write(workdir.join(name), b"KEEP").unwrap();
+        fs::set_permissions(workdir.join(name), fs::Permissions::from_mode(mode)).unwrap();
+    }
+    symlink("absent", workdir.join("dangling")).unwrap();
+    let helper = helper_binary();
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
+        .fs_read("/bin").fs_read("/etc").fs_read(&helper)
+        .fs_write(&workdir).workdir(&workdir).cwd(&workdir)
+        .on_exit(BranchAction::Abort).build().unwrap();
+    let mut script = String::from("set -e\n");
+    let mut expected = Vec::new();
+    for changed in [false, true] {
+        if changed {
+            script.push_str("chmod 000 readable\nchmod 500 executable\nrm removed\n");
+        }
+        for spelling in ["access", "faccessat", "faccessat2"] {
+            for (name, mode, errno) in [
+                ("readable", libc::W_OK, if changed { 0 } else { libc::EACCES }),
+                ("readable", libc::R_OK, if changed { libc::EACCES } else { 0 }),
+                ("readable", libc::R_OK | libc::W_OK, libc::EACCES),
+                ("readable", libc::W_OK | libc::X_OK, libc::EACCES),
+                ("unreadable", libc::R_OK | libc::W_OK, libc::EACCES),
+                ("executable", libc::R_OK | libc::W_OK | libc::X_OK, if changed { 0 } else { libc::EACCES }),
+                ("readable", 10, libc::EINVAL),
+                ("removed", libc::W_OK, if changed { libc::ENOENT } else { 0 }),
+                ("dangling", libc::F_OK, libc::ENOENT),
+                ("dangling", libc::W_OK, libc::ENOENT),
+                ("absent", libc::F_OK, libc::ENOENT),
+            ] {
+                script.push_str(&format!("'{}' access-mode {spelling} {name} {mode}\n", helper.display()));
+                expected.push(if errno == 0 { "OK".into() } else { format!("ERR:{errno}") });
+            }
+        }
+        for (name, mode, flags, errno) in [
+            ("dangling", 0, libc::AT_SYMLINK_NOFOLLOW, 0),
+            ("readable", 2, 0x40000000, libc::EINVAL),
+            ("readable", 2, libc::AT_EMPTY_PATH, if changed { 0 } else { libc::EACCES }),
+        ] {
+            script.push_str(&format!("'{}' access-empty name {name} {mode} {flags}\n", helper.display()));
+            expected.push(if errno == 0 { "OK".into() } else { format!("ERR:{errno}") });
+        }
+    }
+    let result = policy.clone().run(&["sh", "-c", &script]).await.expect("COW access regression must run");
+    assert!(result.success(), "helper failed: {:?}", result.stderr_str());
+    let actual: Vec<_> = result.stdout_str().unwrap().lines().collect();
+    assert_eq!(actual, expected, "COW access must preserve DAC and visible-layer existence");
+    fs::remove_dir_all(workdir).unwrap();
 }

@@ -14,6 +14,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/capability.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -276,6 +277,90 @@ static int cmd_access(int argc, char **argv) {
     }
     printf("OK\n");
     return 0;
+}
+
+/* Exercise the raw access ABIs: libc may replace access with faccessat2. */
+static int cmd_access_mode(int argc, char **argv) {
+    if (argc != 3) return 2;
+    int mode = (int)strtol(argv[2], NULL, 0);
+    long result;
+    if (strcmp(argv[0], "access") == 0) {
+#ifdef SYS_access
+        result = syscall(SYS_access, argv[1], mode);
+#else
+        result = syscall(SYS_faccessat, AT_FDCWD, argv[1], mode);
+#endif
+    } else if (strcmp(argv[0], "faccessat") == 0) {
+        result = syscall(SYS_faccessat, AT_FDCWD, argv[1], mode);
+    } else if (strcmp(argv[0], "faccessat2") == 0) {
+        /* faccessat2 is syscall 439 on the supported Linux architectures. */
+        result = syscall(439, AT_FDCWD, argv[1], mode, 0);
+    } else return 2;
+    if (result < 0) printf("ERR:%d\n", errno);
+    else puts("OK");
+    return 0;
+}
+
+static int cmd_access_repeat(int argc, char **argv) {
+    if (argc != 1) return 2;
+    unsigned int successes = 0;
+    for (unsigned int i = 0; i < 1000; ++i) {
+        if (syscall(439, AT_FDCWD, argv[0], R_OK, 0) == 0) ++successes;
+    }
+    printf("SUCCESSES:%u\n", successes);
+    return 0;
+}
+
+static int cmd_access_empty(int argc, char **argv) {
+    if (argc != 4) return 2;
+    int mode = (int)strtol(argv[2], NULL, 0);
+    int flags = (int)strtol(argv[3], NULL, 0);
+    int fd = AT_FDCWD;
+    const char *path = "";
+    if (strcmp(argv[0], "name") == 0) path = argv[1];
+    else if (strcmp(argv[0], "inherited") == 0) fd = (int)strtol(argv[1], NULL, 10);
+    else if (strcmp(argv[0], "cwd") == 0) {
+        if (chdir(argv[1]) < 0) return 3;
+    } else if (strcmp(argv[0], "invalid") == 0) fd = -1;
+    else if (strcmp(argv[0], "anonymous") == 0) {
+        fd = syscall(SYS_memfd_create, "access-empty", 0);
+        if (fd < 0) return 3;
+    } else {
+        int open_flags = strcmp(argv[0], "upper") == 0
+            ? O_RDWR | O_CREAT | O_TRUNC
+            : strcmp(argv[0], "opath") == 0 ? O_PATH : O_RDONLY;
+        fd = open(argv[1], open_flags, 0600);
+        if (fd < 0) { perror("access-empty open"); return 3; }
+        if (strcmp(argv[0], "deleted") == 0 && unlink(argv[1]) < 0) return 3;
+    }
+    long result = syscall(439, fd, path, mode, flags);
+    int error = errno;
+    if (fd >= 0) close(fd);
+    if (result < 0) printf("ERR:%d\n", error);
+    else puts("OK");
+    return 0;
+}
+
+/* The caller can discard capabilities after exec; the supervisor keeps its
+ * own credentials. Verify the transition before comparing access results. */
+static int cmd_access_drop_caps(int argc, char **argv) {
+    struct __user_cap_header_struct header = { _LINUX_CAPABILITY_VERSION_3, 0 };
+    struct __user_cap_data_struct data[2] = {{0}, {0}};
+    if (syscall(SYS_capset, &header, data) < 0) {
+        perror("capset");
+        return 3;
+    }
+    if (syscall(SYS_capget, &header, data) < 0) {
+        perror("capget");
+        return 3;
+    }
+    for (int i = 0; i < 2; ++i) {
+        if (data[i].effective || data[i].permitted || data[i].inheritable) {
+            fputs("capabilities were not cleared\n", stderr);
+            return 3;
+        }
+    }
+    return cmd_access_empty(argc, argv);
 }
 
 /* ── getxattr (non-standard: print an extended attribute value) ── */
@@ -731,6 +816,31 @@ struct helper_open_how {
     unsigned long long resolve;
 };
 
+/* Report the raw errno without hiding failed syscall execution behind a skip. */
+static int cmd_open_flags(int argc, char **argv) {
+    if (argc != 3) return 2;
+    int flags = (int)strtol(argv[2], NULL, 0);
+    unsigned int mode = (flags & O_CREAT) ? 0600 : 0;
+    long fd;
+    if (strcmp(argv[0], "openat2") == 0) {
+        struct helper_open_how how = { .flags = (unsigned int)flags, .mode = mode };
+        fd = syscall(__NR_openat2, AT_FDCWD, argv[1], &how, sizeof(how));
+    } else if (strcmp(argv[0], "openat") == 0) {
+        fd = syscall(SYS_openat, AT_FDCWD, argv[1], flags, mode);
+    } else if (strcmp(argv[0], "open") == 0) {
+#ifdef SYS_open
+        fd = syscall(SYS_open, argv[1], flags, mode);
+#else
+        fd = syscall(SYS_openat, AT_FDCWD, argv[1], flags, mode);
+#endif
+    } else {
+        return 2;
+    }
+    if (fd < 0) printf("ERR:%d\n", errno);
+    else { close((int)fd); puts("OPENED"); }
+    return 0;
+}
+
 static int cmd_openat2(int argc, char **argv) {
     if (argc < 1) { fprintf(stderr, "openat2: missing operand\n"); return 1; }
     /* Second operand, when present, is a RESOLVE_* mask (decimal). */
@@ -880,6 +990,11 @@ static int cmd_fexecve(int argc, char **argv) {
 /* ── dispatch ───────────────────────────────────────────────── */
 
 static int dispatch(const char *cmd, int argc, char **argv) {
+    if (strcmp(cmd, "access-repeat") == 0) return cmd_access_repeat(argc, argv);
+    if (strcmp(cmd, "access-empty") == 0) return cmd_access_empty(argc, argv);
+    if (strcmp(cmd, "access-drop-caps") == 0) return cmd_access_drop_caps(argc, argv);
+    if (strcmp(cmd, "access-mode") == 0)   return cmd_access_mode(argc, argv);
+    if (strcmp(cmd, "open-flags") == 0)    return cmd_open_flags(argc, argv);
     if (strcmp(cmd, "chdir") == 0)          return cmd_chdir(argc, argv);
     if (strcmp(cmd, "fchdir") == 0)         return cmd_fchdir(argc, argv);
     if (strcmp(cmd, "openat2") == 0)        return cmd_openat2(argc, argv);

@@ -5,11 +5,9 @@
 //!
 //! # Continue safety (issue #27)
 //!
-//! Every `Continue` in this module is a *fall-through* — the COW layer
-//! decided the syscall is outside its scope, so it lets the kernel handle
-//! the original syscall normally. No COW path was modified or rewritten
-//! when we return Continue, so the kernel's re-read sees exactly what the
-//! child originally passed. The fall-through happens when:
+//! `Continue` lets later handlers, and ultimately the kernel, process the
+//! original syscall. The COW handler does not rewrite the child's pathname.
+//! Fall-through includes unchanged access targets, as well as:
 //!
 //!   * No COW branch is active (`cow_state.branch == None`).
 //!   * The path doesn't match the COW prefix (`!cow.matches(path)`).
@@ -17,14 +15,12 @@
 //!   * The supervisor's own open/copy attempt failed and we want the
 //!     kernel to surface its own error.
 //!
-//! Because Continue means "we didn't intervene," the seccomp_unotify
-//! TOCTOU concern doesn't apply: we're not making a security decision
-//! whose validity depends on the kernel re-reading the same memory we
-//! read. Path-based security enforcement for these fall-throughs is
-//! provided by Landlock (or by the chroot dispatcher, when chroot mode
-//! is active and runs before COW).
+//! Kernel checks use the caller's credentials and Landlock confinement.
+//! The child can still change memory/pathnames before the kernel re-read;
+//! classifying a path as unchanged is not a snapshot or a resolution of #27.
+//! Chroot dispatch runs before COW and mediates its own pathname queries.
 
-use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -701,9 +697,53 @@ pub(crate) async fn handle_cow_write(
 // access() handler — fake W_OK for COW-managed paths
 // ============================================================
 
-/// Handle faccessat/faccessat2/access — return success for W_OK checks on
-/// COW-managed paths so programs that pre-check write permissions (like dpkg)
-/// don't fail before the COW layer can redirect their writes.
+/// Find a changed visible target, including one reached through unchanged
+/// lower links. None means COW has no replacement for the kernel's answer.
+/// This classifies COW state; it is not a permission/authorization decision.
+fn changed_access_target(cow: &SeccompCowBranch, path: &str, nofollow: bool) -> Result<Option<String>, i32> {
+    let mut path = PathBuf::from(path);
+    let mut search_error = None;
+    for links in 0..=40 {
+        let Some(name) = path.to_str() else { return Ok(None) };
+        if cow.needs_read_intercept(name) {
+            return match search_error { Some(errno) => Err(errno), None => Ok(Some(name.to_owned())) };
+        }
+        if links == 40 { break; }
+        let components: Vec<_> = path.components().collect();
+        let mut prefix = PathBuf::new();
+        let mut next = None;
+        for (index, part) in components.iter().enumerate() {
+            prefix.push(part.as_os_str());
+            if nofollow && index + 1 == components.len() { break; }
+            let Ok(target) = std::fs::read_link(&prefix) else { continue };
+            let mut replaced = if target.is_absolute() { target }
+                else { prefix.parent().ok_or(libc::ENOENT)?.join(target) };
+            for tail in &components[index + 1..] { replaced.push(tail.as_os_str()); }
+            // Before lexical normalization, retain search failures such as
+            // blocked/../target. Do not turn those into a successful upper
+            // query by erasing the blocked directory. Unchanged requests
+            // still go to the kernel even if the supervisor cannot search.
+            if let Err(error) = std::fs::symlink_metadata(&replaced) {
+                if let Some(errno @ (libc::EACCES | libc::ENOTDIR)) = error.raw_os_error() {
+                    search_error = Some(errno);
+                }
+            }
+            next = Some(normalize_path(replaced));
+            break;
+        }
+        match next {
+            Some(next) => path = next,
+            None => return Ok(None),
+        }
+    }
+    // An unchanged loop remains the kernel's responsibility (ELOOP).
+    Ok(None)
+}
+
+/// Leave unchanged paths to the caller's kernel credentials. For copied-up
+/// paths only, waive W_OK and check the remaining bits against the visible
+/// object. Whiteouts still answer ENOENT. Generic metadata must not recapture
+/// the Continue returned here (see dispatch table registration).
 pub(crate) async fn handle_cow_access(
     notif: &SeccompNotif,
     cow_state: &Arc<Mutex<CowState>>,
@@ -711,54 +751,65 @@ pub(crate) async fn handle_cow_access(
     notif_fd: RawFd,
 ) -> NotifAction {
     let nr = notif.data.nr as i64;
-    let virtual_cwd = current_virtual_cwd(processes, notif.pid).await;
-
-    // access(pathname, mode): args[0]=path, args[1]=mode
-    // faccessat(dirfd, pathname, mode, flags): args[0]=dirfd, args[1]=path, args[2]=mode
-    let (path, mode) = if Some(nr) == arch::sys_access() {
-        let p = match read_path(notif, notif.data.args[0], notif_fd) {
-            Some(p) => resolve_at_path_with_virtual(
-                notif,
-                libc::AT_FDCWD as i64,
-                &p,
-                virtual_cwd.as_deref(),
-            ),
-            None => return NotifAction::Continue,
-        };
-        (p, notif.data.args[1] as i32)
+    let (dirfd, path_ptr, mode) = if Some(nr) == arch::sys_access() {
+        (libc::AT_FDCWD as i64, notif.data.args[0], notif.data.args[1] as i32)
     } else {
-        let dirfd = notif.data.args[0] as i64;
-        let p = match read_path(notif, notif.data.args[1], notif_fd) {
-            Some(p) => resolve_at_path_with_virtual(notif, dirfd, &p, virtual_cwd.as_deref()),
-            None => return NotifAction::Continue,
-        };
-        (p, notif.data.args[2] as i32)
+        (notif.data.args[0] as i64, notif.data.args[1], notif.data.args[2] as i32)
     };
-
-    // Only intercept W_OK checks
-    if mode & libc::W_OK == 0 {
-        return NotifAction::Continue;
-    }
-
-    let st = cow_state.lock().await;
-    let cow = match st.branch.as_ref() {
-        Some(c) => c,
+    // The raw faccessat syscall has only three arguments.
+    let flags = if nr == arch::SYS_FACCESSAT2 { notif.data.args[3] as i32 } else { 0 };
+    let raw_path = match read_path(notif, path_ptr, notif_fd) {
+        Some(p) => p,
         None => return NotifAction::Continue,
     };
-
-    let path = map_cow_upper_path(cow, &path);
-    if !cow.matches(&path) {
+    // An empty path refers to an actual held descriptor (or the kernel cwd),
+    // not a pathname to redirect. In particular it must not gain fake W_OK.
+    if raw_path.is_empty() {
         return NotifAction::Continue;
     }
-
-    // Path is under workdir and W_OK was requested — writes will be
-    // redirected to the COW upper layer, so report success.
-    // Check the path actually exists on the real filesystem.
-    if std::path::Path::new(&path).exists() || cow.handle_stat(&path).is_some() {
-        return NotifAction::ReturnValue(0);
+    let virtual_cwd = current_virtual_cwd(processes, notif.pid).await;
+    let path = resolve_at_path_with_virtual(notif, dirfd, &raw_path, virtual_cwd.as_deref());
+    let pinned = {
+        let st = cow_state.lock().await;
+        let cow = match st.branch.as_ref() {
+            Some(c) => c,
+            None => return NotifAction::Continue,
+        };
+        let path = map_cow_upper_path(cow, &path);
+        if !cow.matches(&path) {
+            return NotifAction::Continue;
+        }
+        if mode & !(libc::R_OK | libc::W_OK | libc::X_OK) != 0
+            || flags & !(libc::AT_EACCESS | libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH) != 0
+        {
+            return NotifAction::Errno(libc::EINVAL);
+        }
+        let nofollow = flags & libc::AT_SYMLINK_NOFOLLOW != 0;
+        let changed = match changed_access_target(cow, &path, nofollow) {
+            Ok(Some(path)) => path,
+            Ok(None) => return NotifAction::Continue,
+            Err(errno) => return NotifAction::Errno(errno),
+        };
+        let Some(real) = cow.handle_stat(&changed) else { return NotifAction::Errno(libc::ENOENT) };
+        let open_flags = libc::O_PATH | libc::O_CLOEXEC
+            | if nofollow { libc::O_NOFOLLOW } else { 0 };
+        match open_confined(cow.upper_dir(), cow.workdir(), &real, open_flags, 0) {
+            Ok(fd) => unsafe { OwnedFd::from_raw_fd(fd) },
+            Err(e) => return NotifAction::Errno(e),
+        }
+    };
+    // Query the pinned object, avoiding a second pathname resolution after
+    // confinement. This currently queries with the supervisor's credentials;
+    // user-namespace mappings alone do not prove credential equivalence.
+    let result = unsafe {
+        libc::syscall(arch::SYS_FACCESSAT2, pinned.as_raw_fd(), c"".as_ptr(),
+            mode & !libc::W_OK, flags | libc::AT_EMPTY_PATH)
+    };
+    if result < 0 {
+        NotifAction::Errno(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
+    } else {
+        NotifAction::ReturnValue(0)
     }
-
-    NotifAction::Continue
 }
 
 // ============================================================
@@ -841,7 +892,7 @@ pub(crate) async fn handle_cow_utimensat(
 // Read operation handlers (stat, readlink, getdents)
 // ============================================================
 
-/// Handle newfstatat / faccessat — resolve path then Continue to let kernel stat.
+/// Handle newfstatat / stat / lstat against the visible COW layer.
 /// The trick: we rewrite the path pointer in child memory to point to the resolved path.
 /// Actually, simpler: for stat, we do the stat ourselves and write the result.
 pub(crate) async fn handle_cow_stat(
@@ -853,8 +904,7 @@ pub(crate) async fn handle_cow_stat(
     let nr = notif.data.nr as i64;
 
     // newfstatat(dirfd, pathname, statbuf, flags)
-    // faccessat(dirfd, pathname, mode, flags)
-    // stat/lstat(pathname, statbuf), access(pathname, mode)
+    // stat/lstat(pathname, statbuf)
     //
     // The legacy x86_64 variants carry the path in args[0] and have no
     // dirfd or flags. Parsing them with the at-variant layout reads the
@@ -862,7 +912,7 @@ pub(crate) async fn handle_cow_stat(
     // through to the kernel, which leaks whiteouted lower entries to any
     // static-libc child that emits legacy stat (same register-layout bug
     // handle_cow_open fixed for legacy open).
-    let legacy = [arch::sys_stat(), arch::sys_lstat(), arch::sys_access()]
+    let legacy = [arch::sys_stat(), arch::sys_lstat()]
         .into_iter()
         .flatten()
         .any(|l| l == nr);
@@ -895,22 +945,6 @@ pub(crate) async fn handle_cow_stat(
         };
         (real, upper_root, workdir_root)
     };
-
-    if nr == libc::SYS_faccessat
-        || nr == crate::arch::SYS_FACCESSAT2
-        || arch::sys_access() == Some(nr)
-    {
-        // Existence check, confined: lstat succeeds for any present entry
-        // (including a dangling symlink), matching the prior semantics.
-        let (root, rel) = match pick_root_rel(&upper_root, &workdir_root, &real_path) {
-            Ok(v) => v,
-            Err(_) => return NotifAction::Errno(libc::ENOENT),
-        };
-        if crate::sys::fs::statat_in_root(root, &rel, false).is_ok() {
-            return NotifAction::ReturnValue(0);
-        }
-        return NotifAction::Errno(libc::ENOENT);
-    }
 
     // newfstatat/stat/lstat — stat the resolved path (confined to its layer
     // root) and write the native libc layout back to the child. Do not

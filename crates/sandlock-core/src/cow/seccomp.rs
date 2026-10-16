@@ -978,7 +978,7 @@ impl SeccompCowBranch {
     /// read must be redirected there, never fall through to the lower file.
     pub fn needs_read_intercept(&self, path: &str) -> bool {
         if let Some(rel) = self.safe_rel(path) {
-            self.deleted.covers(&rel) || self.upper.join(&rel).exists()
+            self.deleted.covers(&rel) || self.upper_has(&rel)
         } else {
             false
         }
