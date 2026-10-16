@@ -36,6 +36,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 )
@@ -158,12 +159,26 @@ type PolicyContext struct {
 // activity, so captured state should be synchronized when mutated.
 type PolicyFunc func(event SyscallEvent, ctx *PolicyContext) PolicyDecision
 
+// DeferredPolicyFunc is a policy callback that may keep a held syscall's
+// Approval and resolve it later from any goroutine. approval is nil for
+// observation-only events.
+type DeferredPolicyFunc func(event SyscallEvent, ctx *PolicyContext, approval *Approval)
+
+// Approval is the pending verdict of one held syscall. Resolve it once, or
+// Close it to deny; an Approval dropped unanswered is denied when collected.
+type Approval struct {
+	mu  sync.Mutex
+	ptr unsafe.Pointer
+}
+
 // NoTimeout disables the verdict deadline for a PolicyFn.
 const NoTimeout time.Duration = -1
 
 // PolicyFn groups a dynamic policy callback with its held-verdict settings.
+// Exactly one of Callback and Deferred must be set.
 type PolicyFn struct {
 	Callback PolicyFunc
+	Deferred DeferredPolicyFunc
 	// VerdictTimeout includes queue time. Zero uses five seconds; a negative
 	// value, conventionally NoTimeout, disables the deadline.
 	VerdictTimeout time.Duration

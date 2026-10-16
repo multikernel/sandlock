@@ -2240,12 +2240,34 @@ fn decode_sendmmsg_extras(
     extras
 }
 
+type VerdictWait = Pin<Box<dyn Future<Output = crate::policy_fn::Verdict> + Send>>;
+
+/// What an execve asks the kernel to run, read from the caller's memory.
+#[derive(PartialEq)]
+struct ExecImage {
+    argv: Option<Vec<String>>,
+    path: Option<std::path::PathBuf>,
+}
+
+fn read_exec_image(notif: &SeccompNotif, notif_fd: RawFd) -> ExecImage {
+    let argv_ptr = if notif.data.nr as i64 == libc::SYS_execveat {
+        notif.data.args[2]
+    } else {
+        notif.data.args[1]
+    };
+    ExecImage {
+        argv: read_argv_for_event(notif, argv_ptr, notif_fd),
+        path: resolve_path_for_notif(notif, notif_fd).map(std::path::PathBuf::from),
+    }
+}
+
 async fn emit_policy_event(
     notif: &SeccompNotif,
     action: &NotifAction,
+    exec_image: Option<&ExecImage>,
     policy_fn_state: &Arc<tokio::sync::Mutex<super::state::PolicyFnState>>,
     notif_fd: RawFd,
-) -> Option<crate::policy_fn::Verdict> {
+) -> Option<VerdictWait> {
     let pfs = policy_fn_state.lock().await;
     let tx = match pfs.event_tx.as_ref() {
         Some(tx) => tx.clone(),
@@ -2273,11 +2295,9 @@ async fn emit_policy_event(
     // decision is racy (issue #27). Path-based access control belongs
     // in static Landlock rules.
     //
-    // argv IS extracted for allowed execve/execveat notifications:
-    // the supervisor freezes every task in the sandbox (siblings +
-    // peers) before this callback reads argv and keeps that freeze
-    // through Continue, so the post-Continue re-read sees the same
-    // memory we read here.
+    // argv IS extracted for allowed execve/execveat notifications: it is
+    // read unfrozen, and the exec continues only if a re-read under the
+    // freeze still matches it.
     //
     // Network fields are TOCTOU-safe because connect/sendto/bind are
     // performed on-behalf via pidfd_getfd; the kernel never re-reads
@@ -2290,17 +2310,9 @@ async fn emit_policy_event(
     let mut path2 = None;
     let mut flags = None;
 
-    if !denied && (nr == libc::SYS_execve || nr == libc::SYS_execveat) {
-        // execve(pathname, argv, envp):       args[1] = argv ptr
-        // execveat(dirfd, pathname, argv, ..): args[2] = argv ptr
-        let argv_ptr = if nr == libc::SYS_execveat {
-            notif.data.args[2]
-        } else {
-            notif.data.args[1]
-        };
-        argv = read_argv_for_event(notif, argv_ptr, notif_fd);
-        path = resolve_path_for_notif(notif, notif_fd)
-            .map(std::path::PathBuf::from);
+    if let Some(image) = exec_image {
+        argv = image.argv.clone();
+        path = image.path.clone();
     }
 
     let mut protocol = None;
@@ -2434,9 +2446,10 @@ async fn emit_policy_event(
     // variant (openat2 and legacy open emit the same "openat" event, so a
     // deny that skipped them would be silently bypassable), and every
     // network-send variant (same reasoning for sendmsg/sendmmsg vs sendto).
-    // The child is blocked until the callback returns. Filesystem-mutation
-    // events (mkdir/unlink/symlink/link/rename/truncate) are observation-only
-    // per the `PolicyCallback` contract; use `fs_deny` to block paths.
+    // The child stays blocked until the verdict; the supervisor does not.
+    // Filesystem-mutation events (mkdir/unlink/symlink/link/rename/truncate)
+    // are observation-only per the `PolicyCallback` contract; use `fs_deny`
+    // to block paths.
     let is_held = nr == libc::SYS_execve || nr == libc::SYS_execveat
         || nr == libc::SYS_openat || nr == arch::SYS_OPENAT2
         || Some(nr) == arch::sys_open()
@@ -2450,7 +2463,9 @@ async fn emit_policy_event(
             event,
             gate: Some(gate_tx),
         }));
-        Some(crate::policy_fn::wait_for_verdict(gate_rx, timeout, &cancellation).await)
+        Some(Box::pin(async move {
+            crate::policy_fn::wait_for_verdict(gate_rx, timeout, &cancellation).await
+        }) as VerdictWait)
     } else {
         let _ = tx.send(crate::policy_fn::PolicyMsg::Event(crate::policy_fn::PolicyEvent {
             event,
@@ -2504,24 +2519,37 @@ async fn run_deferred_within(deferred: Deferred, limit: std::time::Duration) -> 
     }
 }
 
-/// Spawn a worker task that drives a deferred handler future to its terminal
-/// action and sends the seccomp response, keyed by `id`. The `permit` is
-/// held for the worker's lifetime, releasing its `DEFER_MAX_INFLIGHT` slot on
-/// completion. A stale `id` (child exited mid-defer) makes `send_response`
-/// a no-op, matching the inline path's "child may have exited" tolerance.
-fn spawn_deferred(
-    fd: RawFd,
+/// A notification whose response is decided off the loop. The loop sends
+/// it: a response sent while an exec freeze is held would release a task
+/// the freeze skipped because it was parked in seccomp.
+enum Parked {
+    Approval(Box<Prepared>, crate::policy_fn::Verdict),
+    Deferred(u64, NotifAction),
+}
+
+type ParkedSet = tokio::task::JoinSet<Parked>;
+
+/// A dispatched notification waiting for its policy verdict, if any.
+struct Prepared {
+    notif: SeccompNotif,
+    action: NotifAction,
+    fork_counted: bool,
+    exec_image: Option<ExecImage>,
+}
+
+fn park_deferred(
+    parked: &mut ParkedSet,
     id: u64,
     deferred: Deferred,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
-    tokio::spawn(async move {
-        let _permit = permit; // released when the worker finishes
+    parked.spawn(async move {
+        let _permit = permit;
         let action = match deferred.patient {
             true => finalize_deferred(deferred.run().await),
             false => run_deferred_within(deferred, DEFER_TIMEOUT).await,
         };
-        let _ = send_response(fd, id, action);
+        Parked::Deferred(id, action)
     });
 }
 
@@ -2530,6 +2558,7 @@ async fn handle_notification(
     ctx: &Arc<super::ctx::SupervisorCtx>,
     dispatch_table: &super::dispatch::DispatchTable,
     fd: RawFd,
+    parked: &mut ParkedSet,
     defer_sem: &Arc<tokio::sync::Semaphore>,
 ) {
     let policy = &ctx.policy;
@@ -2592,61 +2621,70 @@ async fn handle_notification(
     let fork_counted = matches!(action, NotifAction::Continue)
         && crate::resource::fork_counted_on_continue(&notif);
 
-    // TOCTOU-close for execve (issue #27): freeze every sandbox task
-    // that could mutate argv before policy_fn reads argv and before the
-    // kernel re-reads it after Continue. This covers two writer classes:
-    //   1. Sibling threads of the calling tid (same TGID, share mm).
-    //   2. Peer processes in other TGIDs that alias argv pages via
-    //      MAP_SHARED mappings or share mm via clone(CLONE_VM).
-    //
-    // The freeze enumerates ProcessIndex. With policy_fn active, that
-    // index is complete: fork-like syscalls are traced at creation time
-    // below, before new children can run user code.
-    //
-    // Strict on failure: if we cannot establish the freeze, we cannot
-    // safely expose argv or allow execve, so we deny with EPERM.
-    let mut exec_freeze = None;
-    if matches!(action, NotifAction::Continue)
+    // Read without freezing so the sandbox keeps running while policy_fn
+    // decides; `freeze_exec` re-reads it under the freeze before Continue.
+    let exec_image = (matches!(action, NotifAction::Continue)
         && policy.argv_safety_required
-        && crate::freeze::requires_freeze_on_continue(nr)
-    {
-        match crate::freeze::freeze_sandbox_for_execve(
-            &ctx.processes,
-            notif.pid as i32,
-        ) {
-            Ok(outcome) => {
-                exec_freeze = Some(outcome);
-            }
-            Err(e) => {
-                eprintln!(
-                    "sandlock: argv-safety freeze failed for pid {}: {} \
-                     — denying execve to preserve TOCTOU invariant",
-                    notif.pid, e
-                );
-                action = NotifAction::Errno(libc::EPERM);
-                // Rollback could not release tasks that had not entered
-                // ptrace-stop yet; carry them to the post-send reap.
-                if !e.pending_tids.is_empty() {
-                    exec_freeze = Some(crate::freeze::SandboxFreeze {
-                        pending_tids: e.pending_tids,
-                        ..Default::default()
-                    });
-                }
-            }
+        && crate::freeze::requires_freeze_on_continue(nr))
+        .then(|| read_exec_image(&notif, fd));
+
+    let wait = emit_policy_event(&notif, &action, exec_image.as_ref(), &ctx.policy_fn, fd).await;
+    let prepared = Prepared { notif, action, fork_counted, exec_image };
+    match wait {
+        Some(wait) => {
+            parked.spawn(async move {
+                let verdict = wait.await;
+                Parked::Approval(Box::new(prepared), verdict)
+            });
+        }
+        None => finish_notification(prepared, None, ctx, fd, parked, defer_sem).await,
+    }
+}
+
+/// TOCTOU-close for execve (issue #27): stop every task that could write
+/// the caller's argv, then continue only if it still reads as judged.
+fn freeze_exec(
+    notif: &SeccompNotif,
+    judged: &ExecImage,
+    ctx: &super::ctx::SupervisorCtx,
+    fd: RawFd,
+) -> (NotifAction, crate::freeze::SandboxFreeze) {
+    match crate::freeze::freeze_sandbox_for_execve(&ctx.processes, notif.pid as i32) {
+        Ok(freeze) if read_exec_image(notif, fd) == *judged => (NotifAction::Continue, freeze),
+        Ok(freeze) => (NotifAction::Errno(libc::EPERM), freeze),
+        Err(e) => {
+            eprintln!(
+                "sandlock: argv-safety freeze failed for pid {}: {}; \
+                 denying execve to preserve TOCTOU invariant",
+                notif.pid, e
+            );
+            // Rollback could not release tasks that had not entered
+            // ptrace-stop yet; carry them to the post-send reap.
+            let pending = crate::freeze::SandboxFreeze {
+                pending_tids: e.pending_tids,
+                ..Default::default()
+            };
+            (NotifAction::Errno(libc::EPERM), pending)
         }
     }
+}
 
-    // Emit event to policy_fn callback if active. For execve, argv is
-    // only populated after `exec_freeze` has stopped every possible
-    // writer, and those tasks stay stopped until after NOTIF_SEND.
-    if let Some(verdict) = emit_policy_event(&notif, &action, &ctx.policy_fn, fd).await {
-        use crate::policy_fn::Verdict;
-        match verdict {
-            Verdict::Deny => { action = NotifAction::Errno(libc::EPERM); }
-            Verdict::DenyWith(errno) => { action = NotifAction::Errno(errno); }
-            Verdict::Audit => { /* allow, but could log here */ }
-            Verdict::Allow => {}
-        }
+async fn finish_notification(
+    prepared: Prepared,
+    verdict: Option<crate::policy_fn::Verdict>,
+    ctx: &Arc<super::ctx::SupervisorCtx>,
+    fd: RawFd,
+    parked: &mut ParkedSet,
+    defer_sem: &Arc<tokio::sync::Semaphore>,
+) {
+    let policy = &ctx.policy;
+    let Prepared { notif, mut action, fork_counted, exec_image } = prepared;
+    let nr = notif.data.nr as i64;
+
+    match verdict {
+        Some(crate::policy_fn::Verdict::Deny) => action = NotifAction::Errno(libc::EPERM),
+        Some(crate::policy_fn::Verdict::DenyWith(errno)) => action = NotifAction::Errno(errno),
+        _ => {}
     }
 
     if let NotifAction::Prepared(operation) = action {
@@ -2683,16 +2721,13 @@ async fn handle_notification(
         }
     }
 
-    // Deferred response: run the handler's future on a worker task so the
-    // single supervisor loop is not blocked waiting for slow work (a network
-    // round-trip, a blocking syscall). The trapped child stays parked in the
-    // syscall; the worker sends the real response later, keyed by notif.id.
+    // Deferred response: run the handler's future off the loop so slow work
+    // (a network round-trip, a blocking syscall) does not stall it. The
+    // trapped child stays parked; the loop sends the result when it lands.
     //
     // Deferral is refused on syscalls whose Continue path requires the
-    // execve argv-safety freeze or fork creation-tracking: sending the
-    // response off-loop would skip that TOCTOU-closing work. (When `action`
-    // is Defer it is not Continue, so `exec_freeze`/`creation_trace` above
-    // are already None — there is nothing to unwind here.)
+    // execve argv-safety freeze or fork creation-tracking: answering later
+    // would skip that TOCTOU-closing work.
     if let NotifAction::Defer(deferred) = action {
         if crate::freeze::requires_freeze_on_continue(nr)
             || crate::resource::requires_process_creation_tracking(&notif, policy)
@@ -2701,7 +2736,7 @@ async fn handle_notification(
             return;
         }
         match Arc::clone(defer_sem).try_acquire_owned() {
-            Ok(permit) => spawn_deferred(fd, notif.id, deferred, permit),
+            Ok(permit) => park_deferred(parked, notif.id, deferred, permit),
             // Too many deferrals in flight: fail fast with EAGAIN rather than
             // blocking the loop or letting unbounded workers accrete.
             Err(_) => {
@@ -2711,9 +2746,30 @@ async fn handle_notification(
         return;
     }
 
+    // From the freeze to its release nothing may await: the tracer is this
+    // thread, and the loop must not release any parked task meanwhile.
+    let mut exec_freeze = None;
+    if let (NotifAction::Continue, Some(judged)) = (&action, &exec_image) {
+        let (frozen_action, freeze) = freeze_exec(&notif, judged, ctx, fd);
+        action = frozen_action;
+        exec_freeze = Some(freeze);
+    }
+
     // Ignore error — child may have exited between recv and response.
     let exec_continued = exec_freeze.is_some() && matches!(action, NotifAction::Continue);
     let send_result = send_response(fd, notif.id, action);
+
+    if let Some(freeze) = exec_freeze {
+        if exec_continued && send_result.is_ok() {
+            crate::freeze::release_after_exec(&freeze);
+        } else {
+            crate::freeze::detach_all(&freeze);
+        }
+        // Now that the response is out, the kernel wait holding any pending
+        // task (the vfork parent waiting on this very execve) can clear;
+        // reap the queued interrupts and detach.
+        crate::freeze::reap_pending(&freeze.pending_tids);
+    }
 
     if let Some(trace) = creation_trace {
         if send_result.is_ok() {
@@ -2735,17 +2791,22 @@ async fn handle_notification(
             crate::resource::abort_process_creation_tracking(trace).await;
         }
     }
+}
 
-    if let Some(freeze) = exec_freeze {
-        if exec_continued && send_result.is_ok() {
-            crate::freeze::detach_peers(&freeze.peer_tids);
-        } else {
-            crate::freeze::detach_all(&freeze);
+async fn settle_parked(
+    parked: Parked,
+    ctx: &Arc<super::ctx::SupervisorCtx>,
+    fd: RawFd,
+    set: &mut ParkedSet,
+    defer_sem: &Arc<tokio::sync::Semaphore>,
+) {
+    match parked {
+        Parked::Approval(prepared, verdict) => {
+            finish_notification(*prepared, Some(verdict), ctx, fd, set, defer_sem).await
         }
-        // Now that the response is out, the kernel wait holding any pending
-        // task (the vfork parent waiting on this very execve) can clear;
-        // reap the queued interrupts and detach.
-        crate::freeze::reap_pending(&freeze.pending_tids);
+        Parked::Deferred(id, action) => {
+            let _ = send_response(fd, id, action);
+        }
     }
 }
 
@@ -2807,6 +2868,7 @@ pub async fn supervisor(
     // `DEFER_MAX_INFLIGHT`). Shared across all notifications this supervisor
     // processes.
     let defer_sem = Arc::new(tokio::sync::Semaphore::new(DEFER_MAX_INFLIGHT));
+    let mut parked = ParkedSet::new();
 
     // Edge-triggered drain: each `readable().await` returns once per
     // epoll edge, then we drain the kernel queue via `probe_notif_fd`
@@ -2816,11 +2878,20 @@ pub async fn supervisor(
     // would coalesce into a single wake event.
     //
     // Notifications are processed sequentially (not spawned) to avoid
-    // mutex contention between concurrent handlers.
+    // mutex contention between concurrent handlers. Policy verdicts and
+    // deferred handlers resolve in `parked` and are answered here too.
     'outer: loop {
-        let mut ready = match async_fd.readable().await {
-            Ok(r) => r,
-            Err(_) => break 'outer,
+        let mut ready = tokio::select! {
+            ready = async_fd.readable() => match ready {
+                Ok(r) => r,
+                Err(_) => break 'outer,
+            },
+            Some(done) = parked.join_next() => {
+                if let Ok(done) = done {
+                    settle_parked(done, &ctx, fd, &mut parked, &defer_sem).await;
+                }
+                continue;
+            }
         };
         ready.clear_ready();
         drop(ready);
@@ -2842,7 +2913,7 @@ pub async fn supervisor(
                         Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue,
                         Err(_) => break 'outer,
                     };
-                    handle_notification(notif, &ctx, &dispatch_table, fd, &defer_sem).await;
+                    handle_notification(notif, &ctx, &dispatch_table, fd, &mut parked, &defer_sem).await;
                 }
                 NotifFdState::Empty => break,
                 NotifFdState::Terminal => break 'outer,

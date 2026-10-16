@@ -2204,8 +2204,8 @@ pub unsafe extern "C" fn sandlock_gather_free(g: *mut sandlock_gather_t) {
 /// C-compatible syscall event passed to the policy callback.
 ///
 /// Path strings are intentionally absent (issue #27); use static Landlock
-/// rules for path-based access control. argv is exposed for execve only
-/// and is TOCTOU-safe via sibling-thread freeze before Continue.
+/// rules for path-based access control. argv is exposed for execve only;
+/// the exec continues only if argv re-reads the same under a freeze.
 #[repr(C)]
 pub struct sandlock_event_t {
     pub syscall: *const c_char,
@@ -2245,8 +2245,26 @@ pub type sandlock_policy_fn_t = unsafe extern "C" fn(
 #[allow(non_camel_case_types)]
 pub type sandlock_policy_ud_drop_t = unsafe extern "C" fn(user_data: *mut c_void);
 
-struct PolicyCallbackState {
-    cb: sandlock_policy_fn_t,
+/// A held syscall's pending verdict, owned by the C caller.
+#[allow(non_camel_case_types)]
+pub struct sandlock_approval_t {
+    approval: sandlock_core::policy_fn::Approval,
+}
+
+/// C callback type for a deferred policy_fn.
+/// `approval` is NULL for observation-only events. Otherwise the callee owns
+/// it and must pass it to exactly one of `sandlock_approval_resolve` or
+/// `sandlock_approval_free`, from any thread, now or later.
+#[allow(non_camel_case_types)]
+pub type sandlock_policy_deferred_fn_t = unsafe extern "C" fn(
+    event: *const sandlock_event_t,
+    ctx: *mut sandlock_ctx_t,
+    approval: *mut sandlock_approval_t,
+    user_data: *mut c_void,
+);
+
+struct PolicyCallbackState<F> {
+    cb: F,
     user_data: *mut c_void,
     user_data_drop: Option<sandlock_policy_ud_drop_t>,
 }
@@ -2254,16 +2272,27 @@ struct PolicyCallbackState {
 // SAFETY: `user_data` is opaque to Rust. The FFI caller promises it remains
 // valid for the callback lifetime and is safe to access from sandlock's
 // policy-fn worker thread. The function pointers are immutable.
-unsafe impl Send for PolicyCallbackState {}
-unsafe impl Sync for PolicyCallbackState {}
+unsafe impl<F> Send for PolicyCallbackState<F> {}
+unsafe impl<F> Sync for PolicyCallbackState<F> {}
 
-impl PolicyCallbackState {
+impl PolicyCallbackState<sandlock_policy_fn_t> {
     unsafe fn call(&self, event: *const sandlock_event_t, ctx: *mut sandlock_ctx_t) -> i32 {
         (self.cb)(event, ctx, self.user_data)
     }
 }
 
-impl Drop for PolicyCallbackState {
+impl PolicyCallbackState<sandlock_policy_deferred_fn_t> {
+    unsafe fn call(
+        &self,
+        event: *const sandlock_event_t,
+        ctx: *mut sandlock_ctx_t,
+        approval: *mut sandlock_approval_t,
+    ) {
+        (self.cb)(event, ctx, approval, self.user_data)
+    }
+}
+
+impl<F> Drop for PolicyCallbackState<F> {
     fn drop(&mut self) {
         if let Some(drop_fn) = self.user_data_drop {
             unsafe { drop_fn(self.user_data) };
@@ -2287,6 +2316,55 @@ fn policy_ret_to_verdict(ret: i32) -> sandlock_core::policy_fn::Verdict {
         errno if errno > 0 => Verdict::DenyWith(errno),
         _ => Verdict::Deny,
     }
+}
+
+/// Present `event` to C for the duration of `f`.
+fn with_c_event<R>(
+    event: &sandlock_core::policy_fn::SyscallEvent,
+    f: impl FnOnce(&sandlock_event_t) -> R,
+) -> R {
+    let syscall_c = CString::new(event.syscall.as_str()).unwrap_or_default();
+    let host_c = event
+        .host
+        .map(|ip| CString::new(ip.to_string()).unwrap_or_default());
+
+    // Convert argv to C string array. CStrings live until `f` returns.
+    let argv_c: Vec<CString> = event
+        .argv
+        .as_ref()
+        .map(|args| {
+            args.iter()
+                .filter_map(|s| CString::new(s.as_str()).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let argv_ptrs: Vec<*const c_char> = argv_c.iter().map(|c| c.as_ptr()).collect();
+    let argc = argv_ptrs.len() as u32;
+
+    let category = match event.category {
+        sandlock_core::policy_fn::SyscallCategory::File => 0u8,
+        sandlock_core::policy_fn::SyscallCategory::Network => 1,
+        sandlock_core::policy_fn::SyscallCategory::Process => 2,
+        sandlock_core::policy_fn::SyscallCategory::Memory => 3,
+    };
+
+    let c_event = sandlock_event_t {
+        syscall: syscall_c.as_ptr(),
+        category,
+        pid: event.pid,
+        parent_pid: event.parent_pid.unwrap_or(0),
+        host: host_c.as_ref().map_or(ptr::null(), |c| c.as_ptr()),
+        port: event.port.unwrap_or(0),
+        denied: event.denied,
+        argv: if argv_ptrs.is_empty() {
+            ptr::null()
+        } else {
+            argv_ptrs.as_ptr()
+        },
+        argc,
+    };
+
+    f(&c_event)
 }
 
 /// Set a policy callback and its held verdict timeout in milliseconds.
@@ -2318,53 +2396,12 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_policy_fn(
         user_data_drop,
     };
 
-    // Wrap the C callback in a Rust closure
     let cb_fn = move |event: sandlock_core::policy_fn::SyscallEvent,
                       ctx: &mut sandlock_core::policy_fn::PolicyContext| {
-        let syscall_c = CString::new(event.syscall.as_str()).unwrap_or_default();
-        let host_c = event
-            .host
-            .map(|ip| CString::new(ip.to_string()).unwrap_or_default());
-
-        // Convert argv to C string array. CStrings live until end of closure.
-        let argv_c: Vec<CString> = event
-            .argv
-            .as_ref()
-            .map(|args| {
-                args.iter()
-                    .filter_map(|s| CString::new(s.as_str()).ok())
-                    .collect()
-            })
-            .unwrap_or_default();
-        let argv_ptrs: Vec<*const c_char> = argv_c.iter().map(|c| c.as_ptr()).collect();
-        let argc = argv_ptrs.len() as u32;
-
-        let category = match event.category {
-            sandlock_core::policy_fn::SyscallCategory::File => 0u8,
-            sandlock_core::policy_fn::SyscallCategory::Network => 1,
-            sandlock_core::policy_fn::SyscallCategory::Process => 2,
-            sandlock_core::policy_fn::SyscallCategory::Memory => 3,
-        };
-
-        let c_event = sandlock_event_t {
-            syscall: syscall_c.as_ptr(),
-            category,
-            pid: event.pid,
-            parent_pid: event.parent_pid.unwrap_or(0),
-            host: host_c.as_ref().map_or(ptr::null(), |c| c.as_ptr()),
-            port: event.port.unwrap_or(0),
-            denied: event.denied,
-            argv: if argv_ptrs.is_empty() {
-                ptr::null()
-            } else {
-                argv_ptrs.as_ptr()
-            },
-            argc,
-        };
-
-        let mut c_ctx = sandlock_ctx_t { ctx: ctx as *mut _ };
-
-        let ret = unsafe { state.call(&c_event, &mut c_ctx) };
+        let ret = with_c_event(&event, |c_event| {
+            let mut c_ctx = sandlock_ctx_t { ctx: ctx as *mut _ };
+            unsafe { state.call(c_event, &mut c_ctx) }
+        });
         policy_ret_to_verdict(ret)
     };
 
@@ -2375,6 +2412,78 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_policy_fn(
     };
     let policy_fn = sandlock_core::PolicyFn::new(cb_fn).verdict_timeout(timeout);
     Box::into_raw(Box::new(builder.policy_fn(policy_fn)))
+}
+
+/// Set a deferred policy callback, which may keep each held syscall's
+/// approval and resolve it after returning. The timeout and `user_data`
+/// contract are those of `sandlock_sandbox_builder_policy_fn`.
+///
+/// # Safety
+/// As for `sandlock_sandbox_builder_policy_fn`.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_policy_fn_deferred(
+    b: *mut SandboxBuilder,
+    cb: sandlock_policy_deferred_fn_t,
+    verdict_timeout_ms: i64,
+    user_data: *mut c_void,
+    user_data_drop: Option<unsafe extern "C" fn(user_data: *mut c_void)>,
+) -> *mut SandboxBuilder {
+    if b.is_null() {
+        return b;
+    }
+    let builder = *Box::from_raw(b);
+    let state = PolicyCallbackState { cb, user_data, user_data_drop };
+    let cb_fn = move |event: sandlock_core::policy_fn::SyscallEvent,
+                      ctx: &mut sandlock_core::policy_fn::PolicyContext,
+                      approval: Option<sandlock_core::policy_fn::Approval>| {
+        let approval = approval.map_or(ptr::null_mut(), |approval| {
+            Box::into_raw(Box::new(sandlock_approval_t { approval }))
+        });
+        with_c_event(&event, |c_event| {
+            let mut c_ctx = sandlock_ctx_t { ctx: ctx as *mut _ };
+            unsafe { state.call(c_event, &mut c_ctx, approval) }
+        });
+    };
+    let timeout = if verdict_timeout_ms < 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_millis(verdict_timeout_ms as u64))
+    };
+    let policy_fn = sandlock_core::PolicyFn::deferred(cb_fn).verdict_timeout(timeout);
+    Box::into_raw(Box::new(builder.policy_fn(policy_fn)))
+}
+
+/// Resolve and free an approval. `verdict` uses the policy callback's return
+/// encoding.
+///
+/// # Safety
+/// `approval` must be null or an approval not yet resolved or freed.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_approval_resolve(approval: *mut sandlock_approval_t, verdict: i32) {
+    if !approval.is_null() {
+        Box::from_raw(approval).approval.resolve(policy_ret_to_verdict(verdict));
+    }
+}
+
+/// Whether shutdown or the verdict timeout already decided the syscall, so
+/// resolving no longer matters.
+///
+/// # Safety
+/// `approval` must be null or a live approval.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_approval_is_cancelled(approval: *const sandlock_approval_t) -> bool {
+    approval.is_null() || (*approval).approval.is_cancelled()
+}
+
+/// Free an approval without resolving it, which denies the syscall.
+///
+/// # Safety
+/// `approval` must be null or an approval not yet resolved or freed.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_approval_free(approval: *mut sandlock_approval_t) {
+    if !approval.is_null() {
+        drop(Box::from_raw(approval));
+    }
 }
 
 /// Whether sandbox shutdown has cancelled the callback. Approval loops must

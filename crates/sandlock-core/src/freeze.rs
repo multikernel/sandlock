@@ -371,12 +371,34 @@ pub(crate) fn reap_pending(pending: &[i32]) {
     }
 }
 
-/// Detach peer TIDs after the kernel has re-read execve argv. Errors
-/// are ignored: a peer that already exited returns ESRCH, which is
-/// harmless.
-pub(crate) fn detach_peers(peer_tids: &[i32]) {
-    for tid in peer_tids {
-        detach(*tid);
+/// Release a freeze after its execve was continued.
+///
+/// de_thread kills the siblings, but a killed tracee stays a zombie until
+/// its tracer reaps it, and de_thread waits for that reap. de_thread also
+/// runs only after the kernel copied argv, so peers stay stopped until every
+/// sibling is reaped. A sibling still stopped at the deadline means the exec
+/// failed before de_thread.
+pub(crate) fn release_after_exec(freeze: &SandboxFreeze) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    for &tid in &freeze.sibling_tids {
+        loop {
+            let mut status: i32 = 0;
+            let r = unsafe { libc::waitpid(tid, &mut status, libc::__WALL | libc::WNOHANG) };
+            if r == tid && (libc::WIFEXITED(status) || libc::WIFSIGNALED(status)) {
+                break;
+            }
+            if r < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                detach(tid);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    for &tid in &freeze.peer_tids {
+        detach(tid);
     }
 }
 
@@ -506,7 +528,7 @@ mod tests {
         );
 
         // Cleanup: detach the peer so it can resume and be killed.
-        detach_peers(&outcome.peer_tids);
+        detach_all(&outcome);
         let _ = peer.kill();
         let _ = peer.wait();
         let _ = caller.kill();
@@ -577,7 +599,7 @@ mod tests {
         if let Ok(freeze) = &outcome {
             // Detach before killing: a traced thread that dies stays a
             // zombie until its tracer reaps it, and that would wedge wait().
-            detach_peers(&freeze.peer_tids);
+            detach_all(freeze);
         }
         let _ = peer.kill();
         let _ = caller.kill();

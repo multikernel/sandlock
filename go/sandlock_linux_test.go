@@ -1034,3 +1034,86 @@ func TestPolicyFnRequiresCallback(t *testing.T) {
 		t.Fatal("PolicyFn without a callback must be rejected")
 	}
 }
+
+func runDeferred(t *testing.T, answer func(*sandlock.Approval)) bool {
+	t.Helper()
+	requireLandlock(t)
+	approvals := make(chan *sandlock.Approval, 16)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for a := range approvals {
+			if a.IsCancelled() {
+				t.Error("approval cancelled before it was answered")
+			}
+			answer(a)
+		}
+	}()
+	sb := &sandlock.Sandbox{
+		FSReadable: rootfs,
+		PolicyFn: &sandlock.PolicyFn{
+			Deferred: func(event sandlock.SyscallEvent, ctx *sandlock.PolicyContext, approval *sandlock.Approval) {
+				if approval != nil {
+					approvals <- approval
+				}
+			},
+		},
+	}
+	res, err := sb.Run(context.Background(), "/bin/true")
+	close(approvals)
+	<-done
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	return res.Success
+}
+
+func TestDeferredApprovalResolvedFromGoroutine(t *testing.T) {
+	if !runDeferred(t, func(a *sandlock.Approval) {
+		if err := a.Resolve(sandlock.Allow()); err != nil {
+			t.Error(err)
+		}
+		if err := a.Resolve(sandlock.Allow()); err != sandlock.ErrApprovalAnswered {
+			t.Errorf("second Resolve = %v, want ErrApprovalAnswered", err)
+		}
+	}) {
+		t.Fatal("allowed approval must let /bin/true run")
+	}
+	if runDeferred(t, func(a *sandlock.Approval) { _ = a.Resolve(sandlock.DenyWith(13)) }) {
+		t.Fatal("denied approval must stop the exec")
+	}
+	if runDeferred(t, (*sandlock.Approval).Close) {
+		t.Fatal("closed approval must deny")
+	}
+}
+
+func TestDeferredCallbackPanicDenies(t *testing.T) {
+	requireLandlock(t)
+	sb := &sandlock.Sandbox{
+		FSReadable: rootfs,
+		PolicyFn: &sandlock.PolicyFn{
+			Deferred: func(event sandlock.SyscallEvent, ctx *sandlock.PolicyContext, approval *sandlock.Approval) {
+				if approval != nil {
+					panic("approver failed")
+				}
+			},
+		},
+	}
+	res, err := sb.Run(context.Background(), "/bin/true")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Success {
+		t.Fatal("a panicking callback must deny")
+	}
+}
+
+func TestPolicyFnRejectsBothCallbacks(t *testing.T) {
+	sb := &sandlock.Sandbox{PolicyFn: &sandlock.PolicyFn{
+		Callback: func(sandlock.SyscallEvent, *sandlock.PolicyContext) sandlock.PolicyDecision { return sandlock.Allow() },
+		Deferred: func(sandlock.SyscallEvent, *sandlock.PolicyContext, *sandlock.Approval) {},
+	}}
+	if _, err := sb.Run(context.Background(), "/bin/true"); err == nil {
+		t.Fatal("PolicyFn with both callbacks must be rejected")
+	}
+}

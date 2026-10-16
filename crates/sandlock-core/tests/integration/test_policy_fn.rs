@@ -966,3 +966,163 @@ async fn unlimited_approval_spawn_reports_denied_exec() {
         .expect("a denied exec must not wait forever");
     assert!(result.is_err());
 }
+
+/// A held connect waits for its verdict while another thread's supervised
+/// syscall completes; the callback only approves once it saw that happen.
+#[tokio::test]
+async fn pending_approval_does_not_stall_supervisor() {
+    let marker = temp_file("pending-marker");
+    let _ = std::fs::remove_dir(&marker);
+    let (_listener, port) = loopback_listener("127.0.0.1");
+    let saw_marker = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = saw_marker.clone();
+    let watched = marker.clone();
+
+    let policy = base_policy()
+        .net_allow(format!("127.0.0.1:{port}"))
+        .policy_fn(PolicyFn::new(move |event, _ctx| {
+            if event.syscall == "connect" && event.port == Some(port) {
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                while std::time::Instant::now() < deadline {
+                    if watched.exists() {
+                        observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            Verdict::Allow
+        }).verdict_timeout(Some(Duration::from_secs(10))))
+        .build()
+        .unwrap();
+
+    let script = format!(concat!(
+        "import os, socket, threading, time\n",
+        "def dial():\n",
+        "  socket.create_connection(('127.0.0.1', {port}), timeout=10)\n",
+        "t = threading.Thread(target=dial)\n",
+        "t.start()\n",
+        "time.sleep(0.2)\n",
+        "os.mkdir('{marker}')\n",
+        "t.join()\n",
+    ), port = port, marker = marker.display());
+
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let _ = std::fs::remove_dir(&marker);
+    assert!(result.success());
+    assert!(
+        saw_marker.load(std::sync::atomic::Ordering::SeqCst),
+        "mkdir must complete while the connect approval is pending"
+    );
+}
+
+/// argv is judged without a freeze; a thread that rewrites it while the
+/// approval is pending must not get the rewritten argv executed.
+#[tokio::test]
+async fn argv_rewritten_during_approval_is_refused() {
+    let out = temp_file("argv-rewrite");
+    let policy = base_policy()
+        .fs_write(std::env::temp_dir())
+        .policy_fn(PolicyFn::new(|event, _ctx| {
+            if event.syscall == "execve" && event.argv_contains("safe") {
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            Verdict::Allow
+        }))
+        .build()
+        .unwrap();
+
+    let script = format!(concat!(
+        "import ctypes, threading, time\n",
+        "libc = ctypes.CDLL(None, use_errno=True)\n",
+        "arg = ctypes.create_string_buffer(b'safe')\n",
+        "argv = (ctypes.c_char_p * 3)(b'/bin/echo', ctypes.cast(arg, ctypes.c_char_p), None)\n",
+        "def rewrite():\n",
+        "  time.sleep(0.05)\n",
+        "  ctypes.memmove(arg, b'evil', 4)\n",
+        "threading.Thread(target=rewrite).start()\n",
+        "libc.execv(b'/bin/echo', argv)\n",
+        "open('{out}', 'w').write('ERRNO:%d' % ctypes.get_errno())\n",
+    ), out = out.display());
+
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert!(result.success());
+    assert_eq!(content, "ERRNO:1", "exec of rewritten argv must fail with EPERM");
+}
+
+/// Siblings frozen for an allowed exec die in de_thread as tracees; the
+/// exec only completes once the supervisor reaps them.
+#[tokio::test]
+async fn exec_with_live_sibling_thread_completes() {
+    let policy = base_policy()
+        .policy_fn(PolicyFn::new(|_, _| Verdict::Allow))
+        .build()
+        .unwrap();
+    let script = concat!(
+        "import os, threading, time\n",
+        "threading.Thread(target=time.sleep, args=(30,), daemon=True).start()\n",
+        "os.execv('/bin/true', ['true'])\n",
+    );
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        policy.clone().run_interactive(&["python3", "-c", script]),
+    )
+    .await
+    .expect("exec hung behind a frozen sibling thread");
+    assert!(result.unwrap().success());
+}
+
+/// A deferred callback keeps the connect's approval and answers it only
+/// when a later event arrives, which needs both the callback thread and
+/// the supervisor to keep going while the connect is held.
+#[tokio::test]
+async fn deferred_approval_resolved_by_later_event() {
+    let marker = temp_file("deferred-marker");
+    let _ = std::fs::remove_dir(&marker);
+    let out = temp_file("deferred-out");
+    let (_listener, port) = loopback_listener("127.0.0.1");
+    let held: Arc<Mutex<Option<sandlock_core::policy_fn::Approval>>> = Arc::new(Mutex::new(None));
+    let marker_name = marker.file_name().unwrap().to_owned();
+
+    let policy = base_policy()
+        .net_allow(format!("127.0.0.1:{port}"))
+        .policy_fn(PolicyFn::deferred(move |event, _ctx, approval| {
+            if event.syscall == "connect" && event.port == Some(port) {
+                *held.lock().unwrap() = approval;
+                return;
+            }
+            if event.syscall == "mkdirat"
+                && event.path.as_ref().and_then(|p| p.file_name()) == Some(&marker_name)
+            {
+                if let Some(connect) = held.lock().unwrap().take() {
+                    connect.allow();
+                }
+            }
+            if let Some(approval) = approval {
+                approval.allow();
+            }
+        }))
+        .build()
+        .unwrap();
+
+    let script = format!(concat!(
+        "import os, socket, threading, time\n",
+        "def dial():\n",
+        "  socket.create_connection(('127.0.0.1', {port}), timeout=10)\n",
+        "  open('{out}', 'w').write('CONNECTED')\n",
+        "t = threading.Thread(target=dial)\n",
+        "t.start()\n",
+        "time.sleep(0.2)\n",
+        "os.mkdir('{marker}')\n",
+        "t.join()\n",
+    ), port = port, marker = marker.display(), out = out.display());
+
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_dir(&marker);
+    let _ = std::fs::remove_file(&out);
+    assert!(result.success());
+    assert_eq!(content, "CONNECTED");
+}

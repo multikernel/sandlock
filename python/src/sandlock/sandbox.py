@@ -194,6 +194,10 @@ class PolicyFn:
     callback: Callable
     verdict_timeout: float | None = field(default=5.0, kw_only=True)
     """Seconds including queue time; None disables the timeout, zero denies immediately."""
+    deferred: bool = field(default=False, kw_only=True)
+    """Call ``callback(event, ctx, approval)`` instead of using its return
+    value. ``approval`` is an :class:`Approval` for held syscalls, which may be
+    kept and answered later from any thread, and None otherwise."""
 
     def __post_init__(self):
         if not callable(self.callback):

@@ -164,6 +164,11 @@ typedef uint32_t sandlock_exception;
 #endif // __cplusplus
 
 /**
+ * A held syscall's pending verdict, owned by the C caller.
+ */
+typedef struct sandlock_approval_t sandlock_approval_t;
+
+/**
  * Opaque handle wrapping a [`Checkpoint`].
  */
 typedef struct sandlock_checkpoint_t sandlock_checkpoint_t;
@@ -211,8 +216,8 @@ typedef struct {
  * C-compatible syscall event passed to the policy callback.
  *
  * Path strings are intentionally absent (issue #27); use static Landlock
- * rules for path-based access control. argv is exposed for execve only
- * and is TOCTOU-safe via sibling-thread freeze before Continue.
+ * rules for path-based access control. argv is exposed for execve only;
+ * the exec continues only if argv re-reads the same under a freeze.
  */
 typedef struct {
   const char *syscall;
@@ -238,6 +243,17 @@ typedef struct {
 typedef int32_t (*sandlock_policy_fn_t)(const sandlock_event_t *event,
                                         sandlock_ctx_t *ctx,
                                         void *user_data);
+
+/**
+ * C callback type for a deferred policy_fn.
+ * `approval` is NULL for observation-only events. Otherwise the callee owns
+ * it and must pass it to exactly one of `sandlock_approval_resolve` or
+ * `sandlock_approval_free`, from any thread, now or later.
+ */
+typedef void (*sandlock_policy_deferred_fn_t)(const sandlock_event_t *event,
+                                              sandlock_ctx_t *ctx,
+                                              sandlock_approval_t *approval,
+                                              void *user_data);
 
 /**
  * C callback types for fork init and work functions.
@@ -1223,6 +1239,46 @@ sandlock_builder_t *sandlock_sandbox_builder_policy_fn(sandlock_builder_t *b,
                                                        int64_t verdict_timeout_ms,
                                                        void *user_data,
                                                        void (*user_data_drop)(void *user_data));
+
+/**
+ * Set a deferred policy callback, which may keep each held syscall's
+ * approval and resolve it after returning. The timeout and `user_data`
+ * contract are those of `sandlock_sandbox_builder_policy_fn`.
+ *
+ * # Safety
+ * As for `sandlock_sandbox_builder_policy_fn`.
+ */
+sandlock_builder_t *sandlock_sandbox_builder_policy_fn_deferred(sandlock_builder_t *b,
+                                                                sandlock_policy_deferred_fn_t cb,
+                                                                int64_t verdict_timeout_ms,
+                                                                void *user_data,
+                                                                void (*user_data_drop)(void *user_data));
+
+/**
+ * Resolve and free an approval. `verdict` uses the policy callback's return
+ * encoding.
+ *
+ * # Safety
+ * `approval` must be null or an approval not yet resolved or freed.
+ */
+void sandlock_approval_resolve(sandlock_approval_t *approval, int32_t verdict);
+
+/**
+ * Whether shutdown or the verdict timeout already decided the syscall, so
+ * resolving no longer matters.
+ *
+ * # Safety
+ * `approval` must be null or a live approval.
+ */
+bool sandlock_approval_is_cancelled(const sandlock_approval_t *approval);
+
+/**
+ * Free an approval without resolving it, which denies the syscall.
+ *
+ * # Safety
+ * `approval` must be null or an approval not yet resolved or freed.
+ */
+void sandlock_approval_free(sandlock_approval_t *approval);
 
 /**
  * Whether sandbox shutdown has cancelled the callback. Approval loops must

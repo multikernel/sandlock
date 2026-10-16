@@ -220,6 +220,9 @@ is an error rather than silently dropped.
 five seconds, and `sandlock.NoTimeout` disables the timeout. Approval callbacks
 must check `ctx.IsCancelled()` between bounded waits and return on shutdown.
 See [verdict timeout and shutdown](../docs/policy-fn.md#verdict-timeout-and-shutdown).
+Set `PolicyFn.Deferred` instead of `Callback` to receive an `*Approval` for each
+held syscall and `Resolve` it later from any goroutine; see
+[deferred approval](../docs/policy-fn.md#deferred-approval).
 
 ```go
 type PolicyFunc func(event SyscallEvent, ctx *PolicyContext) PolicyDecision

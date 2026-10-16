@@ -14,6 +14,7 @@ package sandlock
 #include "sandlock.h"
 
 extern int32_t goPolicyCallback(sandlock_event_t *event, sandlock_ctx_t *ctx, void *user_data);
+extern void goDeferredPolicyCallback(sandlock_event_t *event, sandlock_ctx_t *ctx, sandlock_approval_t *approval, void *user_data);
 extern void goPolicyDrop(void *user_data);
 */
 import "C"
@@ -40,10 +41,10 @@ func cbool(v bool) C.bool { return C.bool(v) }
 
 var (
 	nextPolicyCallbackID atomic.Uint64
-	policyCallbacks      sync.Map // uint64 -> PolicyFunc
+	policyCallbacks      sync.Map // uint64 -> PolicyFunc or DeferredPolicyFunc
 )
 
-func registerPolicyCallback(fn PolicyFunc) unsafe.Pointer {
+func registerPolicyCallback(fn any) unsafe.Pointer {
 	id := nextPolicyCallbackID.Add(1)
 	userData := C.malloc(C.size_t(unsafe.Sizeof(C.uint64_t(0))))
 	if userData == nil {
@@ -115,6 +116,63 @@ func goPolicyCallback(event *C.sandlock_event_t, ctx *C.sandlock_ctx_t, userData
 	return C.int32_t(decision)
 }
 
+//export goDeferredPolicyCallback
+func goDeferredPolicyCallback(event *C.sandlock_event_t, ctx *C.sandlock_ctx_t, approval *C.sandlock_approval_t, userData unsafe.Pointer) {
+	var a *Approval
+	if approval != nil {
+		a = &Approval{ptr: unsafe.Pointer(approval)}
+		runtime.SetFinalizer(a, (*Approval).Close)
+	}
+	defer func() {
+		if recover() != nil {
+			a.Close()
+		}
+	}()
+
+	fn, ok := policyCallbacks.Load(policyCallbackID(userData))
+	if !ok {
+		a.Close()
+		return
+	}
+	fn.(DeferredPolicyFunc)(policyEventFromC(event), &PolicyContext{ptr: unsafe.Pointer(ctx)}, a)
+}
+
+// Resolve answers the held syscall with decision.
+func (a *Approval) Resolve(decision PolicyDecision) error {
+	ptr := a.take()
+	if ptr == nil {
+		return ErrApprovalAnswered
+	}
+	C.sandlock_approval_resolve((*C.sandlock_approval_t)(ptr), C.int32_t(decision))
+	return nil
+}
+
+// IsCancelled reports that shutdown or the verdict timeout already decided
+// the syscall, so resolving no longer matters.
+func (a *Approval) IsCancelled() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.ptr == nil || bool(C.sandlock_approval_is_cancelled((*C.sandlock_approval_t)(a.ptr)))
+}
+
+// Close denies the held syscall unless it was already resolved.
+func (a *Approval) Close() {
+	if ptr := a.take(); ptr != nil {
+		C.sandlock_approval_free((*C.sandlock_approval_t)(ptr))
+	}
+}
+
+func (a *Approval) take() unsafe.Pointer {
+	if a == nil {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	ptr := a.ptr
+	a.ptr = nil
+	return ptr
+}
+
 //export goPolicyDrop
 func goPolicyDrop(userData unsafe.Pointer) {
 	unregisterPolicyCallback(userData)
@@ -168,8 +226,8 @@ func (s *Sandbox) validateStrings() error {
 // buildPolicy translates the Sandbox configuration into a native policy handle.
 // The returned pointer must be released with C.sandlock_sandbox_free.
 func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
-	if s.PolicyFn != nil && s.PolicyFn.Callback == nil {
-		return nil, fmt.Errorf("sandlock: PolicyFn.Callback must not be nil")
+	if s.PolicyFn != nil && (s.PolicyFn.Callback == nil) == (s.PolicyFn.Deferred == nil) {
+		return nil, fmt.Errorf("sandlock: PolicyFn needs exactly one of Callback and Deferred")
 	}
 	if err := s.validateStrings(); err != nil {
 		return nil, err
@@ -408,13 +466,23 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 				timeoutMs++
 			}
 		}
-		b = C.sandlock_sandbox_builder_policy_fn(
-			b,
-			(C.sandlock_policy_fn_t)(C.goPolicyCallback),
-			C.int64_t(timeoutMs),
-			registerPolicyCallback(s.PolicyFn.Callback),
-			(*[0]byte)(C.goPolicyDrop),
-		)
+		if s.PolicyFn.Deferred != nil {
+			b = C.sandlock_sandbox_builder_policy_fn_deferred(
+				b,
+				(C.sandlock_policy_deferred_fn_t)(C.goDeferredPolicyCallback),
+				C.int64_t(timeoutMs),
+				registerPolicyCallback(s.PolicyFn.Deferred),
+				(*[0]byte)(C.goPolicyDrop),
+			)
+		} else {
+			b = C.sandlock_sandbox_builder_policy_fn(
+				b,
+				(C.sandlock_policy_fn_t)(C.goPolicyCallback),
+				C.int64_t(timeoutMs),
+				registerPolicyCallback(s.PolicyFn.Callback),
+				(*[0]byte)(C.goPolicyDrop),
+			)
+		}
 	}
 
 	var errCode C.int

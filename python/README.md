@@ -665,6 +665,8 @@ Configure `PolicyFn(callback, verdict_timeout=...)` with a number of seconds
 (default `5.0`) or `None` for unlimited verdict waits. Approval callbacks must check `ctx.is_cancelled()`
 between bounded waits and return on shutdown. See
 [verdict timeout and shutdown](../docs/policy-fn.md#verdict-timeout-and-shutdown).
+Pass `deferred=True` to receive an `Approval` for each held syscall and answer it
+later from any thread; see [deferred approval](../docs/policy-fn.md#deferred-approval).
 
 Use `policy_fn` to make per-syscall decisions at runtime:
 

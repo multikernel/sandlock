@@ -57,15 +57,19 @@ positive int = deny with errno, `"audit"`/`-2` = allow + flag.
 >   belongs in static Landlock rules (`fs_readable` / `fs_writable` /
 >   `fs_denied`), kernel-enforced and TOCTOU-immune. Use
 >   `ctx.deny_path()` for runtime additions.
-> - **`event.argv` is exposed and TOCTOU-safe.** Before exposing
->   `argv` to `policy_fn` or returning `Continue` for an
+> - **`event.argv` is exposed and TOCTOU-safe.** `argv` is read without
+>   stopping the sandbox, so other tasks keep running while an approval
+>   is pending. After an allow, and before returning `Continue` for the
 >   `execve`, the supervisor freezes every task in `ProcessIndex`,
->   including peer processes that may alias argv through shared memory.
->   With `policy_fn` active, fork-like syscalls are traced for one
->   ptrace creation event, so children are registered in `ProcessIndex`
->   before they can run user code. If the freeze or creation tracking
->   cannot be established (e.g., YAMA blocks ptrace), the syscall is
->   denied with `EPERM`; the safety invariant is never silently relaxed.
+>   including peer processes that may alias argv through shared memory,
+>   re-reads `argv` and the path, and denies the `execve` with `EPERM`
+>   unless they match what the callback judged. The freeze lasts until
+>   the kernel has copied `argv`. With `policy_fn` active, fork-like
+>   syscalls are traced for one ptrace creation event, so children are
+>   registered in `ProcessIndex` before they can run user code. If the
+>   freeze or creation tracking cannot be established (e.g., YAMA blocks
+>   ptrace), the syscall is denied with `EPERM`; the safety invariant is
+>   never silently relaxed.
 
 **Context methods:**
 - `ctx.restrict_network(ips)` / `ctx.grant_network(ips)`: network control
@@ -73,8 +77,9 @@ positive int = deny with errno, `"audit"`/`-2` = allow + flag.
 - `ctx.deny_path(path)` / `ctx.allow_path(path)`: dynamic filesystem restriction
 - `ctx.restrict_pid_network(pid, ips)`: per-PID network override
 
-**Held syscalls** (child blocked awaiting a verdict): `execve`,
-`connect`, `sendto`, `bind`, `openat`.
+**Held syscalls** (the calling task is blocked awaiting a verdict; the
+rest of the sandbox keeps running): `execve`, `connect`, `sendto`,
+`bind`, `openat`.
 
 ## Rust
 
@@ -126,26 +131,46 @@ Shutdown joins that callback before releasing its data; it cannot forcibly
 interrupt user code. A verdict timeout closes the verdict wait, but does not
 interrupt a callback already running. Its eventual verdict is ignored.
 
-For example, an application can deliver an approval decision through a queue:
+## Deferred approval
+
+A callback that returns its verdict holds the callback thread until it
+decides, so later events queue behind a slow approval. A deferred callback
+instead receives an approval handle for each held syscall, returns at once,
+and answers later from any thread. The handle is absent for
+observation-only events. Answering twice is an error; dropping or closing an
+unanswered handle denies with `EPERM`, as does a callback that raises or
+panics while holding one. The handle reports cancellation once shutdown or
+the verdict timeout has decided, after which an answer is ignored.
+
+A verdict decides only the event it answers: policy changed while an approval
+was pending is not re-applied to that event.
 
 ```python
 import queue
 from sandlock import Sandbox, PolicyFn
 
-approvals = queue.Queue()
+pending = queue.Queue()
 
-def approve(event, ctx):
+def on_event(event, ctx, approval):
+    if approval is None:
+        return
     if event.syscall != "execve":
-        return 0
-    while not ctx.is_cancelled():
-        try:
-            return 0 if approvals.get(timeout=0.1) else -1
-        except queue.Empty:
-            pass
-    return -1
+        approval.allow()
+        return
+    pending.put((event, approval))   # a UI thread calls allow() or deny()
 
-sandbox = Sandbox(policy_fn=PolicyFn(approve, verdict_timeout=None))
+sandbox = Sandbox(policy_fn=PolicyFn(on_event, deferred=True, verdict_timeout=None))
 ```
+
+| API | Deferred callback | Answer | Abandon | Cancelled |
+|---|---|---|---|---|
+| Python | `PolicyFn(cb, deferred=True)`, `cb(event, ctx, approval)` | `allow()`, `deny(errno=None)`, `resolve(verdict)` | `close()` | `cancelled` |
+| Rust | `PolicyFn::deferred(\|event, ctx, approval\| ..)` | `allow()`, `deny()`, `resolve(Verdict)` | drop | `is_cancelled()` |
+| Go | `PolicyFn{Deferred: cb}` | `Resolve(decision)` | `Close()` | `IsCancelled()` |
+| C | `sandlock_sandbox_builder_policy_fn_deferred` | `sandlock_approval_resolve` | `sandlock_approval_free` | `sandlock_approval_is_cancelled` |
+
+`resolve` takes the same verdict encoding as a synchronous callback's return
+value.
 
 ## Interaction with static rules
 

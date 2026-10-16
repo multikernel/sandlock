@@ -10,6 +10,9 @@ var ErrInvalidString = errors.New("sandlock: string contains NUL byte")
 // currently running in the handle.
 var ErrNotRunning = errors.New("sandlock: process is not running")
 
+// ErrApprovalAnswered is returned when an Approval is resolved twice.
+var ErrApprovalAnswered = errors.New("sandlock: approval already answered")
+
 // ErrTimeout is returned by WaitTimeout when the main process is still
 // running; the session is left untouched.
 var ErrTimeout = errors.New("sandlock: main process has not exited")

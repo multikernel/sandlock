@@ -469,3 +469,97 @@ def test_policy_fn_requires_callable():
 def test_sandbox_requires_policy_fn_configuration():
     with pytest.raises(TypeError, match="PolicyFn"):
         Sandbox(policy_fn=lambda event, ctx: 0)
+
+
+def _approve_from_thread(verdict):
+    import queue
+
+    approvals = queue.Queue()
+
+    def answer():
+        while (approval := approvals.get()) is not None:
+            assert not approval.cancelled
+            approval.resolve(verdict)
+
+    worker = threading.Thread(target=answer)
+    worker.start()
+    return approvals, worker
+
+
+@pytest.mark.parametrize("verdict, success", [(None, True), (13, False), (True, False)])
+def test_deferred_approval_resolved_from_another_thread(verdict, success):
+    approvals, worker = _approve_from_thread(verdict)
+
+    def on_event(event, ctx, approval):
+        if approval is not None:
+            approvals.put(approval)
+
+    try:
+        result = _policy(policy_fn=PolicyFn(on_event, deferred=True)).run(["/bin/true"])
+    finally:
+        approvals.put(None)
+        worker.join()
+    assert result.success is success
+
+
+def test_deferred_unanswered_approval_denies():
+    result = _policy(policy_fn=PolicyFn(lambda event, ctx, approval: None, deferred=True)).run(
+        ["/bin/true"],
+    )
+    assert not result.success
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
+def test_deferred_callback_exception_denies():
+    def on_event(event, ctx, approval):
+        if approval is not None:
+            raise RuntimeError("approver failed")
+
+    result = _policy(policy_fn=PolicyFn(on_event, deferred=True)).run(["/bin/true"])
+    assert not result.success
+
+
+def test_deferred_approval_cancelled_by_timeout():
+    kept = []
+
+    def on_event(event, ctx, approval):
+        if approval is not None:
+            kept.append(approval)
+
+    result = _policy(policy_fn=PolicyFn(on_event, deferred=True, verdict_timeout=0.05)).run(
+        ["/bin/true"],
+    )
+    assert not result.success
+    assert kept and kept[0].cancelled
+    kept[0].allow()
+    with pytest.raises(RuntimeError, match="already answered"):
+        kept[0].allow()
+
+
+def test_deferred_approval_answered_by_later_event():
+    with _loopback_listener() as (host, first), _loopback_listener() as (_, second):
+        held = []
+
+        def on_event(event, ctx, approval):
+            if event.syscall == "connect" and event.port == first:
+                held.append(approval)
+                return
+            if event.syscall == "connect" and event.port == second:
+                held.pop().allow()
+            if approval is not None:
+                approval.allow()
+
+        script = (
+            "import socket, threading, time\n"
+            f"t = threading.Thread(target=socket.create_connection, args=(('{host}', {first}),), kwargs={{'timeout': 10}})\n"
+            "t.start()\n"
+            "time.sleep(0.2)\n"
+            f"socket.create_connection(('{host}', {second}), timeout=10)\n"
+            "t.join()\n"
+        )
+        policy = _policy(
+            net_allow=[f"{host}:{first}", f"{host}:{second}"],
+            policy_fn=PolicyFn(on_event, deferred=True),
+        )
+        result = policy.run([sys.executable, "-c", script])
+    assert result.success, result.stderr

@@ -7,7 +7,7 @@ without root or namespaces.
 
 from ._version import __version__
 from ._sdk import (
-    Stage, Pipeline, Result, ExitReason, ExitStatus, SyscallEvent, PolicyContext, Checkpoint, SkippedFd,
+    Stage, Pipeline, Result, ExitReason, ExitStatus, SyscallEvent, PolicyContext, Approval, Checkpoint, SkippedFd,
     NamedStage, Gather, GatherPipeline,
     Protection,
     landlock_abi_version, min_landlock_abi, confine, pull_image,
@@ -49,6 +49,7 @@ __all__ = [
     "ExitStatus",
     "SyscallEvent",
     "PolicyContext",
+    "Approval",
     "Checkpoint",
     "SkippedFd",
     "NamedStage",
