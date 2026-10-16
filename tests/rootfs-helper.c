@@ -731,6 +731,31 @@ struct helper_open_how {
     unsigned long long resolve;
 };
 
+/* Report the raw errno without hiding failed syscall execution behind a skip. */
+static int cmd_open_flags(int argc, char **argv) {
+    if (argc != 3) return 2;
+    int flags = (int)strtol(argv[2], NULL, 0);
+    unsigned int mode = (flags & O_CREAT) ? 0600 : 0;
+    long fd;
+    if (strcmp(argv[0], "openat2") == 0) {
+        struct helper_open_how how = { .flags = (unsigned int)flags, .mode = mode };
+        fd = syscall(__NR_openat2, AT_FDCWD, argv[1], &how, sizeof(how));
+    } else if (strcmp(argv[0], "openat") == 0) {
+        fd = syscall(SYS_openat, AT_FDCWD, argv[1], flags, mode);
+    } else if (strcmp(argv[0], "open") == 0) {
+#ifdef SYS_open
+        fd = syscall(SYS_open, argv[1], flags, mode);
+#else
+        fd = syscall(SYS_openat, AT_FDCWD, argv[1], flags, mode);
+#endif
+    } else {
+        return 2;
+    }
+    if (fd < 0) printf("ERR:%d\n", errno);
+    else { close((int)fd); puts("OPENED"); }
+    return 0;
+}
+
 static int cmd_openat2(int argc, char **argv) {
     if (argc < 1) { fprintf(stderr, "openat2: missing operand\n"); return 1; }
     /* Second operand, when present, is a RESOLVE_* mask (decimal). */
@@ -880,6 +905,7 @@ static int cmd_fexecve(int argc, char **argv) {
 /* ── dispatch ───────────────────────────────────────────────── */
 
 static int dispatch(const char *cmd, int argc, char **argv) {
+    if (strcmp(cmd, "open-flags") == 0)    return cmd_open_flags(argc, argv);
     if (strcmp(cmd, "chdir") == 0)          return cmd_chdir(argc, argv);
     if (strcmp(cmd, "fchdir") == 0)         return cmd_fchdir(argc, argv);
     if (strcmp(cmd, "openat2") == 0)        return cmd_openat2(argc, argv);
